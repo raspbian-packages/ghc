@@ -18,9 +18,9 @@ data Flavour = Flavour {
     args :: Args,
     -- | Build these packages.
     packages :: Stage -> Action [Package],
-    -- | 'native', 'gmp', 'ffi'.
+    -- | Bignum backend: 'native', 'gmp', 'ffi', etc.
     bignumBackend :: String,
-    -- | Check selected backend against native backend
+    -- | Check selected bignum backend against native backend
     bignumCheck :: Bool,
     -- | Build libraries these ways.
     libraryWays :: Ways,
@@ -29,15 +29,22 @@ data Flavour = Flavour {
     -- | Build dynamic GHC programs.
     dynamicGhcPrograms :: Action Bool,
     -- | Enable GHCi debugger.
-    ghciWithDebugger :: Bool,
+    ghciWithDebugger :: Stage -- ^ stage of the /built/ compiler
+                     -> Bool,
     -- | Build profiled GHC.
-    ghcProfiled :: Bool,
+    ghcProfiled :: Stage -- ^ stage of the /built/ compiler
+                -> Bool,
     -- | Build GHC with the debug RTS.
-    ghcDebugged :: Bool,
-    -- | Build GHC with debug assertions.
-    ghcDebugAssertions :: Bool,
+    ghcDebugged :: Stage -- ^ stage of the /built/ compiler
+                -> Bool,
+    -- | Build GHC with debug assertions (-DDEBUG).
+    ghcDebugAssertions :: Stage -- ^ stage of the /built/ compiler
+                       -> Bool,
     -- | Build the GHC executable against the threaded runtime system.
-    ghcThreaded :: Bool,
+    ghcThreaded :: Stage -- ^ stage of the /built/ compiler
+                -> Bool,
+
+    ghcSplitSections :: Bool, -- ^ Whether to enable split sections
     -- | Whether to build docs and which ones
     --   (haddocks, user manual, haddock manual)
     ghcDocs :: Action DocTargets }

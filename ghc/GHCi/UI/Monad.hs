@@ -1,6 +1,5 @@
 {-# LANGUAGE FlexibleInstances, DeriveFunctor, DerivingVia #-}
 {-# OPTIONS_GHC -fno-warn-orphans #-}
-{-# OPTIONS -fno-warn-name-shadowing #-}
 
 -----------------------------------------------------------------------------
 --
@@ -365,21 +364,21 @@ printForUserNeverQualify doc = do
 printForUserModInfo :: GhcMonad m => GHC.ModuleInfo -> SDoc -> m ()
 printForUserModInfo info doc = do
   dflags <- GHC.getInteractiveDynFlags
-  mUnqual <- GHC.mkPrintUnqualifiedForModule info
-  unqual <- maybe GHC.getPrintUnqual return mUnqual
-  liftIO $ Ppr.printForUser dflags stdout unqual AllTheWay doc
+  m_name_ppr_ctx <- GHC.mkNamePprCtxForModule info
+  name_ppr_ctx <- maybe GHC.getNamePprCtx return m_name_ppr_ctx
+  liftIO $ Ppr.printForUser dflags stdout name_ppr_ctx AllTheWay doc
 
 printForUser :: GhcMonad m => SDoc -> m ()
 printForUser doc = do
-  unqual <- GHC.getPrintUnqual
+  name_ppr_ctx <- GHC.getNamePprCtx
   dflags <- GHC.getInteractiveDynFlags
-  liftIO $ Ppr.printForUser dflags stdout unqual AllTheWay doc
+  liftIO $ Ppr.printForUser dflags stdout name_ppr_ctx AllTheWay doc
 
 printForUserPartWay :: GhcMonad m => SDoc -> m ()
 printForUserPartWay doc = do
-  unqual <- GHC.getPrintUnqual
+  name_ppr_ctx <- GHC.getNamePprCtx
   dflags <- GHC.getInteractiveDynFlags
-  liftIO $ Ppr.printForUser dflags stdout unqual DefaultDepth doc
+  liftIO $ Ppr.printForUser dflags stdout name_ppr_ctx DefaultDepth doc
 
 -- | Run a single Haskell expression
 runStmt
@@ -474,10 +473,10 @@ printStats dflags ActionStats{actionAllocs = mallocs, actionElapsedTime = secs}
                            Just allocs ->
                              text (separateThousands allocs) <+> text "bytes")))
   where
-    separateThousands n = reverse . sep . reverse . show $ n
-      where sep n'
+    separateThousands n = reverse . separate . reverse . show $ n
+      where separate n'
               | n' `lengthAtMost` 3 = n'
-              | otherwise           = take 3 n' ++ "," ++ sep (drop 3 n')
+              | otherwise           = take 3 n' ++ "," ++ separate (drop 3 n')
 
 -----------------------------------------------------------------------------
 -- reverting CAFs
@@ -503,8 +502,8 @@ initInterpBuffering = do
       mkHelperExpr occ =
         GHC.compileParsedExprRemote
         $ GHC.nlHsVar $ RdrName.mkOrig gHC_GHCI_HELPERS occ
-  nobuf <- mkHelperExpr $ mkVarOcc "disableBuffering"
-  flush <- mkHelperExpr $ mkVarOcc "flushAll"
+  nobuf <- mkHelperExpr $ mkVarOccFS (fsLit "disableBuffering")
+  flush <- mkHelperExpr $ mkVarOccFS (fsLit "flushAll")
   return (nobuf, flush)
 
 -- | Invoke "hFlush stdout; hFlush stderr" in the interpreter
@@ -526,14 +525,14 @@ turnOffBuffering_ fhv = do
   liftIO $ evalIO interp fhv
 
 mkEvalWrapper :: GhcMonad m => String -> [String] ->  m ForeignHValue
-mkEvalWrapper progname args =
+mkEvalWrapper progname' args' =
   runInternal $ GHC.compileParsedExprRemote
-  $ evalWrapper `GHC.mkHsApp` nlHsString progname
-                `GHC.mkHsApp` nlList (map nlHsString args)
+  $ evalWrapper' `GHC.mkHsApp` nlHsString progname'
+                 `GHC.mkHsApp` nlList (map nlHsString args')
   where
     nlHsString = nlHsLit . mkHsString
-    evalWrapper =
-      GHC.nlHsVar $ RdrName.mkOrig gHC_GHCI_HELPERS (mkVarOcc "evalWrapper")
+    evalWrapper' =
+      GHC.nlHsVar $ RdrName.mkOrig gHC_GHCI_HELPERS (mkVarOccFS (fsLit "evalWrapper"))
 
 -- | Run a 'GhcMonad' action to compile an expression for internal usage.
 runInternal :: GhcMonad m => m a -> m a

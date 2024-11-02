@@ -26,6 +26,7 @@ module GHC.Tc.Gen.Sig(
    ) where
 
 import GHC.Prelude
+import GHC.Data.FastString
 
 import GHC.Driver.Session
 import GHC.Driver.Backend
@@ -51,9 +52,10 @@ import GHC.Tc.Types.Evidence( HsWrapper, (<.>) )
 import GHC.Core( hasSomeUnfolding )
 import GHC.Core.Type ( mkTyVarBinders )
 import GHC.Core.Multiplicity
+import GHC.Core.TyCo.Rep( mkNakedFunTy )
 
 import GHC.Types.Error
-import GHC.Types.Var ( TyVar, Specificity(..), tyVarKind, binderVars )
+import GHC.Types.Var ( TyVar, Specificity(..), tyVarKind, binderVars, invisArgTypeLike )
 import GHC.Types.Id  ( Id, idName, idType, setInlinePragma
                      , mkLocalId, realIdUnfolding )
 import GHC.Types.Basic
@@ -68,9 +70,10 @@ import GHC.Utils.Misc as Utils ( singleton )
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
 
-import GHC.Data.Maybe( orElse )
+import GHC.Data.Maybe( orElse, whenIsJust )
 
 import Data.Maybe( mapMaybe )
+import qualified Data.List.NonEmpty as NE
 import Control.Monad( unless )
 
 
@@ -111,7 +114,7 @@ especially on value bindings.  Here's an overview.
   but for /partial/ signatures it starts from the HsSyn, so it
   has to kind-check it etc: tcHsPartialSigType.  It's convenient
   to do this at the same time as instantiation, because we can
-  make the wildcards into unification variables right away, raather
+  make the wildcards into unification variables right away, rather
   than somehow quantifying over them.  And the "TcLevel" of those
   unification variables is correct because we are in tcMonoBinds.
 
@@ -188,7 +191,7 @@ tcTySigs hs_sigs
        ; return (poly_ids, lookupNameEnv env) }
 
 tcTySig :: LSig GhcRn -> TcM [TcSigInfo]
-tcTySig (L _ (IdSig _ id))
+tcTySig (L _ (XSig (IdSig id)))
   = do { let ctxt = FunSigCtxt (idName id) NoRRC
                     -- NoRRC: do not report redundant constraints
                     -- The user has no control over the signature!
@@ -228,7 +231,7 @@ tcUserTypeSig loc hs_sig_ty mb_name
   = do { sigma_ty <- tcHsSigWcType ctxt_no_rrc hs_sig_ty
        ; traceTc "tcuser" (ppr sigma_ty)
        ; return $
-         CompleteSig { sig_bndr  = mkLocalId name Many sigma_ty
+         CompleteSig { sig_bndr  = mkLocalId name ManyTy sigma_ty
                                    -- We use `Many' as the multiplicity here,
                                    -- as if this identifier corresponds to
                                    -- anything, it is a top-level
@@ -245,7 +248,7 @@ tcUserTypeSig loc hs_sig_ty mb_name
   where
     name   = case mb_name of
                Just n  -> n
-               Nothing -> mkUnboundName (mkVarOcc "<expression>")
+               Nothing -> mkUnboundName (mkVarOccFS (fsLit "<expression>"))
 
     ctxt_rrc    = ctxt_fn (lhsSigWcTypeContextSpan hs_sig_ty)
     ctxt_no_rrc = ctxt_fn NoRRC
@@ -315,8 +318,8 @@ no_anon_wc_ty lty = go lty
                                         && go ty
       HsQualTy { hst_ctxt = ctxt
                , hst_body = ty }  -> gos (unLoc ctxt) && go ty
-      HsSpliceTy _ (HsSpliced _ _ (HsSplicedTy ty)) -> go $ L noSrcSpanA ty
-      HsSpliceTy{} -> True
+      HsSpliceTy (HsUntypedSpliceTop _ ty) _ -> go ty
+      HsSpliceTy (HsUntypedSpliceNested _) _ -> True
       HsTyLit{} -> True
       HsTyVar{} -> True
       HsStarTy{} -> True
@@ -454,7 +457,7 @@ tcPatSynSig name sig_ty@(L _ (HsSig{sig_bndrs = hs_outer_bndrs, sig_body = hs_ty
 
        -- Neither argument types nor the return type may be representation polymorphic.
        -- This is because, when creating a matcher:
-       --   - the argument types become the the binder types (see test RepPolyPatySynArg),
+       --   - the argument types become the binder types (see test RepPolyPatySynArg),
        --   - the return type becomes the scrutinee type (see test RepPolyPatSynRes).
        ; let (arg_tys, res_ty) = tcSplitFunTys body_ty
        ; mapM_
@@ -483,10 +486,18 @@ tcPatSynSig name sig_ty@(L _ (HsSig{sig_bndrs = hs_outer_bndrs, sig_body = hs_ty
     build_patsyn_type implicit_bndrs univ_bndrs req ex_bndrs prov body
       = mkInvisForAllTys implicit_bndrs $
         mkInvisForAllTys univ_bndrs $
-        mkPhiTy req $
+        mk_naked_phi_ty req $
         mkInvisForAllTys ex_bndrs $
-        mkPhiTy prov $
+        mk_naked_phi_ty prov $
         body
+
+    -- Use mk_naked_phi_ty because we call build_patsyn_type /before zonking/
+    -- just before kindGeneraliseAll, and the invariants that mkPhiTy checks
+    -- don't hold of the un-zonked types.  #22521 was a case in point.
+    -- (We also called build_patsyn_type on the fully zonked type, so mkPhiTy
+    --  would work; but it doesn't seem worth duplicating the code.)
+    mk_naked_phi_ty :: [TcPredType] -> TcType -> TcType
+    mk_naked_phi_ty theta body = foldr (mkNakedFunTy invisArgTypeLike) body theta
 
 ppr_tvs :: [TyVar] -> SDoc
 ppr_tvs tvs = braces (vcat [ ppr tv <+> dcolon <+> ppr (tyVarKind tv)
@@ -504,7 +515,7 @@ tcInstSig :: TcIdSigInfo -> TcM TcIdSigInst
 -- Instantiate a type signature; only used with plan InferGen
 tcInstSig sig@(CompleteSig { sig_bndr = poly_id, sig_loc = loc })
   = setSrcSpan loc $  -- Set the binding site of the tyvars
-    do { (tv_prs, theta, tau) <- tcInstTypeBndrs poly_id
+    do { (tv_prs, theta, tau) <- tcInstTypeBndrs (idType poly_id)
               -- See Note [Pattern bindings and complete signatures]
 
        ; return (TISI { sig_inst_sig   = sig
@@ -521,6 +532,7 @@ tcInstSig hs_sig@(PartialSig { psig_hs_ty = hs_ty
     do { traceTc "Staring partial sig {" (ppr hs_sig)
        ; (wcs, wcx, tv_prs, theta, tau) <- tcHsPartialSigType ctxt hs_ty
          -- See Note [Checking partial type signatures] in GHC.Tc.Gen.HsType
+
        ; let inst_sig = TISI { sig_inst_sig   = hs_sig
                              , sig_inst_skols = tv_prs
                              , sig_inst_wcs   = wcs
@@ -579,7 +591,7 @@ mkPragEnv sigs binds
     get_sig :: LSig GhcRn -> Maybe (Name, LSig GhcRn)
     get_sig sig@(L _ (SpecSig _ (L _ nm) _ _))   = Just (nm, add_arity nm sig)
     get_sig sig@(L _ (InlineSig _ (L _ nm) _))   = Just (nm, add_arity nm sig)
-    get_sig sig@(L _ (SCCFunSig _ _ (L _ nm) _)) = Just (nm, sig)
+    get_sig sig@(L _ (SCCFunSig _ (L _ nm) _)) = Just (nm, sig)
     get_sig _ = Nothing
 
     add_arity n sig  -- Adjust inl_sat field to match visible arity of function
@@ -631,14 +643,8 @@ addInlinePrags poly_id prags_for_me
          warn_multiple_inlines inl2 inls
        | otherwise
        = setSrcSpanA loc $
-         let dia = TcRnUnknownMessage $
-               mkPlainDiagnostic WarningWithoutFlag noHints $
-                 (hang (text "Multiple INLINE pragmas for" <+> ppr poly_id)
-                   2 (vcat (text "Ignoring all but the first"
-                            : map pp_inl (inl1:inl2:inls))))
+         let dia = TcRnMultipleInlinePragmas poly_id inl1 (inl2 NE.:| inls)
          in addDiagnosticTc dia
-
-    pp_inl (L loc prag) = ppr prag <+> parens (ppr loc)
 
 
 {- Note [Pattern synonym inline arity]
@@ -776,7 +782,7 @@ tcSpecPrags :: Id -> [LSig GhcRn]
 -- Reason: required by tcSubExp
 tcSpecPrags poly_id prag_sigs
   = do { traceTc "tcSpecPrags" (ppr poly_id <+> ppr spec_sigs)
-       ; unless (null bad_sigs) warn_discarded_sigs
+       ; whenIsJust (NE.nonEmpty bad_sigs) warn_discarded_sigs
        ; pss <- mapAndRecoverM (wrapLocMA (tcSpecPrag poly_id)) spec_sigs
        ; return $ concatMap (\(L l ps) -> map (L (locA l)) ps) pss }
   where
@@ -784,11 +790,8 @@ tcSpecPrags poly_id prag_sigs
     bad_sigs  = filter is_bad_sig prag_sigs
     is_bad_sig s = not (isSpecLSig s || isInlineLSig s || isSCCFunSig s)
 
-    warn_discarded_sigs
-      = let dia = TcRnUnknownMessage $
-              mkPlainDiagnostic WarningWithoutFlag noHints $
-                (hang (text "Discarding unexpected pragmas for" <+> ppr poly_id)
-                    2 (vcat (map (ppr . getLoc) bad_sigs)))
+    warn_discarded_sigs bad_sigs_ne
+      = let dia = TcRnUnexpectedPragmas poly_id bad_sigs_ne
         in addDiagnosticTc dia
 
 --------------
@@ -803,9 +806,7 @@ tcSpecPrag poly_id prag@(SpecSig _ fun_name hs_tys inl)
 -- what the user wrote (#8537)
   = addErrCtxt (spec_ctxt prag) $
     do  { warnIf (not (isOverloadedTy poly_ty || isInlinePragma inl)) $
-                 TcRnUnknownMessage $ mkPlainDiagnostic WarningWithoutFlag noHints
-                   (text "SPECIALISE pragma for non-overloaded function"
-                    <+> quotes (ppr fun_name))
+                 TcRnNonOverloadedSpecialisePragma fun_name
                     -- Note [SPECIALISE pragmas]
         ; spec_prags <- mapM tc_one hs_tys
         ; traceTc "tcSpecPrag" (ppr poly_id $$ nest 2 (vcat (map ppr spec_prags)))
@@ -858,12 +859,8 @@ tcImpPrags prags
     -- when we aren't specialising, or when we aren't generating
     -- code.  The latter happens when Haddocking the base library;
     -- we don't want complaints about lack of INLINABLE pragmas
-    not_specialising dflags
-      | not (gopt Opt_Specialise dflags) = True
-      | otherwise = case backend dflags of
-                      NoBackend   -> True
-                      Interpreter -> True
-                      _other      -> False
+    not_specialising dflags =
+      not (gopt Opt_Specialise dflags) || not (backendRespectsSpecialise (backend dflags))
 
 tcImpSpec :: (Name, Sig GhcRn) -> TcM [TcSpecPrag]
 tcImpSpec (name, prag)
@@ -871,20 +868,9 @@ tcImpSpec (name, prag)
       ; if hasSomeUnfolding (realIdUnfolding id)
            -- See Note [SPECIALISE pragmas for imported Ids]
         then tcSpecPrag id prag
-        else do { let dia = TcRnUnknownMessage $
-                        mkPlainDiagnostic WarningWithoutFlag noHints (impSpecErr name)
+        else do { let dia = TcRnSpecialiseNotVisible name
                 ; addDiagnosticTc dia
                 ; return [] } }
-
-impSpecErr :: Name -> SDoc
-impSpecErr name
-  = hang (text "You cannot SPECIALISE" <+> quotes (ppr name))
-       2 (vcat [ text "because its definition is not visible in this module"
-               , text "Hint: make sure" <+> ppr mod <+> text "is compiled with -O"
-               , text "      and that" <+> quotes (ppr name)
-                 <+> text "has an INLINABLE pragma" ])
-  where
-    mod = nameModule name
 
 {- Note [SPECIALISE pragmas for imported Ids]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

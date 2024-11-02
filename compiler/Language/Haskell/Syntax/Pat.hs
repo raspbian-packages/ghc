@@ -1,4 +1,5 @@
 
+{-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE ConstraintKinds #-}
 {-# LANGUAGE DeriveTraversable #-}
 {-# LANGUAGE FlexibleContexts #-}
@@ -8,7 +9,6 @@
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE UndecidableInstances #-} -- Wrinkle in Note [Trees That Grow]
                                       -- in module Language.Haskell.Syntax.Extension
-{-# LANGUAGE ViewPatterns #-}
 {-# LANGUAGE DataKinds #-}
 {-
 (c) The University of Glasgow 2006
@@ -23,26 +23,35 @@ module Language.Haskell.Syntax.Pat (
         ConLikeP,
 
         HsConPatDetails, hsConPatArgs,
+        HsConPatTyArg(..),
         HsRecFields(..), HsFieldBind(..), LHsFieldBind,
         HsRecField, LHsRecField,
         HsRecUpdField, LHsRecUpdField,
+        RecFieldsDotDot(..),
         hsRecFields, hsRecFieldSel, hsRecFieldsArgs,
     ) where
 
-import GHC.Prelude
-
-import {-# SOURCE #-} Language.Haskell.Syntax.Expr (SyntaxExpr, LHsExpr, HsSplice)
+import {-# SOURCE #-} Language.Haskell.Syntax.Expr (SyntaxExpr, LHsExpr, HsUntypedSplice)
 
 -- friends:
+import Language.Haskell.Syntax.Basic
 import Language.Haskell.Syntax.Lit
+import Language.Haskell.Syntax.Concrete
 import Language.Haskell.Syntax.Extension
 import Language.Haskell.Syntax.Type
-import GHC.Types.Basic
--- others:
-import GHC.Core.Ppr ( {- instance OutputableBndr TyVar -} )
-import GHC.Utils.Outputable
-import GHC.Types.SrcLoc
+
 -- libraries:
+import Data.Maybe
+import Data.Functor
+import Data.Foldable
+import Data.Traversable
+import Data.Bool
+import Data.Data
+import Data.Eq
+import Data.Ord
+import Data.Int
+import Data.Function
+import qualified Data.List
 
 type LPat p = XRec p (Pat p)
 
@@ -69,7 +78,9 @@ data Pat p
     -- For details on above see Note [exact print annotations] in GHC.Parser.Annotation
 
   | AsPat       (XAsPat p)
-                (LIdP p) (LPat p)    -- ^ As pattern
+                (LIdP p)
+               !(LHsToken "@" p)
+                (LPat p)    -- ^ As pattern
     -- ^ - 'GHC.Parser.Annotation.AnnKeywordId' : 'GHC.Parser.Annotation.AnnAt'
 
     -- For details on above see Note [exact print annotations] in GHC.Parser.Annotation
@@ -129,7 +140,7 @@ data Pat p
   | SumPat      (XSumPat p)        -- after typechecker, types of the alternative
                 (LPat p)           -- Sum sub-pattern
                 ConTag             -- Alternative (one-based)
-                Arity              -- Arity (INVARIANT: ≥ 2)
+                SumWidth           -- Arity (INVARIANT: ≥ 2)
     -- ^ Anonymous sum pattern
     --
     -- - 'GHC.Parser.Annotation.AnnKeywordId' :
@@ -161,7 +172,7 @@ data Pat p
 
   -- For details on above see Note [exact print annotations] in GHC.Parser.Annotation
   | SplicePat       (XSplicePat p)
-                    (HsSplice p)    -- ^ Splice Pattern (Includes quasi-quotes)
+                    (HsUntypedSplice p)    -- ^ Splice Pattern (Includes quasi-quotes)
 
         ------------ Literal and n+k patterns ---------------
   | LitPat          (XLitPat p)
@@ -217,13 +228,19 @@ type family ConLikeP x
 
 -- ---------------------------------------------------------------------
 
+-- | Type argument in a data constructor pattern,
+--   e.g. the @\@a@ in @f (Just \@a x) = ...@.
+data HsConPatTyArg p =
+  HsConPatTyArg
+    !(LHsToken "@" p)
+     (HsPatSigType p)
 
 -- | Haskell Constructor Pattern Details
-type HsConPatDetails p = HsConDetails (HsPatSigType (NoGhcTc p)) (LPat p) (HsRecFields p (LPat p))
+type HsConPatDetails p = HsConDetails (HsConPatTyArg (NoGhcTc p)) (LPat p) (HsRecFields p (LPat p))
 
 hsConPatArgs :: forall p . (UnXRec p) => HsConPatDetails p -> [LPat p]
 hsConPatArgs (PrefixCon _ ps) = ps
-hsConPatArgs (RecCon fs)      = map (hfbRHS . unXRec @p) (rec_flds fs)
+hsConPatArgs (RecCon fs)      = Data.List.map (hfbRHS . unXRec @p) (rec_flds fs)
 hsConPatArgs (InfixCon p1 p2) = [p1,p2]
 
 -- | Haskell Record Fields
@@ -234,10 +251,13 @@ data HsRecFields p arg         -- A bunch of record fields
                                 --      { x = 3, y = True }
         -- Used for both expressions and patterns
   = HsRecFields { rec_flds   :: [LHsRecField p arg],
-                  rec_dotdot :: Maybe (Located Int) }  -- Note [DotDot fields]
+                  rec_dotdot :: Maybe (XRec p RecFieldsDotDot) }  -- Note [DotDot fields]
   -- AZ:The XRec for LHsRecField makes the derivings fail.
   -- deriving (Functor, Foldable, Traversable)
 
+-- | Newtype to be able to have a specific XRec instance for the Int in `rec_dotdot`
+newtype RecFieldsDotDot = RecFieldsDotDot { unRecFieldsDotDot :: Int }
+    deriving (Data, Eq, Ord)
 
 -- Note [DotDot fields]
 -- ~~~~~~~~~~~~~~~~~~~~
@@ -336,34 +356,11 @@ data HsFieldBind lhs rhs = HsFieldBind {
 -- See also Note [Disambiguating record fields] in GHC.Tc.Gen.Head.
 
 hsRecFields :: forall p arg.UnXRec p => HsRecFields p arg -> [XCFieldOcc p]
-hsRecFields rbinds = map (hsRecFieldSel . unXRec @p) (rec_flds rbinds)
+hsRecFields rbinds = Data.List.map (hsRecFieldSel . unXRec @p) (rec_flds rbinds)
 
 hsRecFieldsArgs :: forall p arg. UnXRec p => HsRecFields p arg -> [arg]
-hsRecFieldsArgs rbinds = map (hfbRHS . unXRec @p) (rec_flds rbinds)
+hsRecFieldsArgs rbinds = Data.List.map (hfbRHS . unXRec @p) (rec_flds rbinds)
 
 hsRecFieldSel :: forall p arg. UnXRec p => HsRecField p arg -> XCFieldOcc p
 hsRecFieldSel = foExt . unXRec @p . hfbLHS
 
-
-{-
-************************************************************************
-*                                                                      *
-*              Printing patterns
-*                                                                      *
-************************************************************************
--}
-
-instance (Outputable arg, Outputable (XRec p (HsRecField p arg)))
-      => Outputable (HsRecFields p arg) where
-  ppr (HsRecFields { rec_flds = flds, rec_dotdot = Nothing })
-        = braces (fsep (punctuate comma (map ppr flds)))
-  ppr (HsRecFields { rec_flds = flds, rec_dotdot = Just (unLoc -> n) })
-        = braces (fsep (punctuate comma (map ppr (take n flds) ++ [dotdot])))
-        where
-          dotdot = text ".." <+> whenPprDebug (ppr (drop n flds))
-
-instance (Outputable p, OutputableBndr p, Outputable arg)
-      => Outputable (HsFieldBind p arg) where
-  ppr (HsFieldBind { hfbLHS = f, hfbRHS = arg,
-                     hfbPun = pun })
-    = pprPrefixOcc f <+> (ppUnless pun $ equals <+> ppr arg)

@@ -25,7 +25,6 @@
 #include "StgRun.h"
 #include "Prelude.h"            /* fixupRTStoPreludeRefs */
 #include "Adjustor.h"           /* initAdjustors */
-#include "ThreadLabels.h"
 #include "sm/BlockAlloc.h"
 #include "Trace.h"
 #include "StableName.h"
@@ -204,6 +203,9 @@ static void initBuiltinGcRoots(void)
     getStablePtr((StgPtr)cannotCompactPinned_closure);
     getStablePtr((StgPtr)cannotCompactMutable_closure);
     getStablePtr((StgPtr)nestedAtomically_closure);
+    getStablePtr((StgPtr)underflowException_closure);
+    getStablePtr((StgPtr)overflowException_closure);
+    getStablePtr((StgPtr)divZeroException_closure);
     getStablePtr((StgPtr)runSparks_closure);
     getStablePtr((StgPtr)ensureIOManagerIsRunning_closure);
     getStablePtr((StgPtr)interruptIOManager_closure);
@@ -221,9 +223,6 @@ static void initBuiltinGcRoots(void)
      * GHC.Core.Make.mkExceptionId.
      */
     getStablePtr((StgPtr)absentSumFieldError_closure);
-    getStablePtr((StgPtr)raiseUnderflowException_closure);
-    getStablePtr((StgPtr)raiseOverflowException_closure);
-    getStablePtr((StgPtr)raiseDivZeroException_closure);
 }
 
 void
@@ -252,6 +251,17 @@ hs_init_ghc(int *argc, char **argv[], RtsConfig rts_config)
         errorBelch("hs_init_ghc: reinitializing the RTS after shutdown is not currently supported");
         stg_exit(1);
     }
+
+#if defined(wasm32_HOST_ARCH)
+    char *pwd = getenv("PWD");
+    if (pwd != NULL) {
+        int chdir_result = chdir(pwd);
+        if (chdir_result != 0) {
+            errorBelch("hs_init_ghc: chdir(%s) failed with %d", pwd, chdir_result);
+            stg_exit(1);
+        }
+    }
+#endif
 
     setlocale(LC_CTYPE,"");
 
@@ -384,9 +394,6 @@ hs_init_ghc(int *argc, char **argv[], RtsConfig rts_config)
     /* initialise file locking, if necessary */
     initFileLocking();
 
-    /* initialise thread label table (tso->char*) */
-    initThreadLabelTable();
-
 #if defined(PROFILING)
     initProfiling();
 #endif
@@ -510,7 +517,7 @@ hs_exit_(bool wait_foreign)
 #endif
 
     // set the terminal settings back to what they were
-#if !defined(mingw32_HOST_OS)
+#if !defined(mingw32_HOST_OS) && !defined(wasm32_HOST_ARCH)
     resetTerminalSettings();
 #endif
 
@@ -558,9 +565,6 @@ hs_exit_(bool wait_foreign)
 
     /* free the stable name table */
     exitStableNameTable();
-
-    /* free the thread label table */
-    freeThreadLabelTable();
 
 #if defined(PROFILING)
     reportCCSProfiling();
@@ -616,8 +620,10 @@ hs_exit_(bool wait_foreign)
     // Free the various argvs
     freeRtsArgs();
 
+#if !defined(wasm32_HOST_ARCH)
     // Free threading resources
     freeThreadingResources();
+#endif
 
     exitIpe();
 }
@@ -667,8 +673,8 @@ shutdownHaskellAndExit(int n, int fastExit)
     stg_exit(n);
 }
 
-#if !defined(mingw32_HOST_OS)
-static void exitBySignal(int sig) GNUC3_ATTRIBUTE(__noreturn__);
+#if !defined(mingw32_HOST_OS) && defined(HAVE_SIGNAL_H)
+static void exitBySignal(int sig) STG_NORETURN;
 
 void
 shutdownHaskellAndSignal(int sig, int fastExit)

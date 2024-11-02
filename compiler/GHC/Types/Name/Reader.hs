@@ -93,8 +93,12 @@ import GHC.Utils.Misc as Utils
 import GHC.Utils.Panic
 import GHC.Types.Name.Env
 
+import Language.Haskell.Syntax.Basic (FieldLabelString(..))
+
 import Data.Data
 import Data.List( sortBy )
+import qualified Data.Semigroup as S
+import Control.DeepSeq
 import GHC.Data.Bag
 
 {-
@@ -339,10 +343,10 @@ instance Ord RdrName where
 
     compare (Qual _ _)   (Exact _)    = GT
     compare (Qual _ _)   (Unqual _)   = GT
-    compare (Qual m1 o1) (Qual m2 o2) = (o1 `compare` o2) `thenCmp` (m1 `compare` m2)
+    compare (Qual m1 o1) (Qual m2 o2) = compare o1 o2 S.<> compare m1 m2
     compare (Qual _ _)   (Orig _ _)   = LT
 
-    compare (Orig m1 o1) (Orig m2 o2) = (o1 `compare` o2) `thenCmp` (m1 `compare` m2)
+    compare (Orig m1 o1) (Orig m2 o2) = compare o1 o2 S.<> compare m1 m2
     compare (Orig _ _)   _            = GT
 
 {-
@@ -491,14 +495,22 @@ data GlobalRdrElt
          -- INVARIANT: either gre_lcl = True or gre_imp is non-empty
          -- See Note [GlobalRdrElt provenance]
 
+instance NFData GlobalRdrElt where
+  rnf (GRE name par _ imp) = rnf name `seq` rnf par `seq` rnf imp
+
+
 -- | See Note [Parents]
 data Parent = NoParent
-            | ParentIs  { par_is :: Name }
+            | ParentIs  { par_is :: !Name }
             deriving (Eq, Data)
 
 instance Outputable Parent where
    ppr NoParent        = empty
    ppr (ParentIs n)    = text "parent:" <> ppr n
+
+instance NFData Parent where
+  rnf NoParent = ()
+  rnf (ParentIs n) = rnf n
 
 plusParent :: Parent -> Parent -> Parent
 -- See Note [Combining parents]
@@ -709,7 +721,7 @@ greDefinitionModule = nameModule_maybe . greMangledName
 greQualModName :: GlobalRdrElt -> ModuleName
 -- Get a suitable module qualifier for the GRE
 -- (used in mkPrintUnqualified)
--- Prerecondition: the greMangledName is always External
+-- Precondition: the greMangledName is always External
 greQualModName gre@(GRE { gre_lcl = lcl, gre_imp = iss })
  | lcl, Just mod <- greDefinitionModule gre = moduleName mod
  | Just is <- headMaybe iss                 = is_as (is_decl is)
@@ -822,12 +834,12 @@ pprGlobalRdrEnv locals_only env
     remove_locals gres | locals_only = filter isLocalGRE gres
                        | otherwise   = gres
     pp []   = empty
-    pp gres = hang (ppr occ
+    pp gres@(gre:_) = hang (ppr occ
                      <+> parens (text "unique" <+> ppr (getUnique occ))
                      <> colon)
                  2 (vcat (map ppr gres))
       where
-        occ = nameOccName (greMangledName (head gres))
+        occ = nameOccName (greMangledName gre)
 
 lookupGlobalRdrEnv :: GlobalRdrEnv -> OccName -> [GlobalRdrElt]
 lookupGlobalRdrEnv env occ_name = case lookupOccEnv env occ_name of
@@ -867,7 +879,7 @@ lookupGRE_FieldLabel :: GlobalRdrEnv -> FieldLabel -> Maybe GlobalRdrElt
 -- selector name and field label may be different: the GlobalRdrEnv is keyed on
 -- the label.  See Note [GreNames] for why this happens.
 lookupGRE_FieldLabel env fl
-  = lookupGRE_Name_OccName env (flSelector fl) (mkVarOccFS (flLabel fl))
+  = lookupGRE_Name_OccName env (flSelector fl) (mkVarOccFS (field_label $ flLabel fl))
 
 lookupGRE_Name_OccName :: GlobalRdrEnv -> Name -> OccName -> Maybe GlobalRdrElt
 -- ^ Look for precisely this 'Name' in the environment, but with an 'OccName'
@@ -1187,9 +1199,12 @@ shadowNames = minusOccEnv_C (\gres _ -> Just (mapMaybe shadow gres))
 --
 -- The 'ImportSpec' of something says how it came to be imported
 -- It's quite elaborate so that we can give accurate unused-name warnings.
-data ImportSpec = ImpSpec { is_decl :: ImpDeclSpec,
-                            is_item :: ImpItemSpec }
+data ImportSpec = ImpSpec { is_decl :: !ImpDeclSpec,
+                            is_item :: !ImpItemSpec }
                 deriving( Eq, Data )
+
+instance NFData ImportSpec where
+  rnf = rwhnf -- All fields are strict, so we don't need to do anything
 
 -- | Import Declaration Specification
 --
@@ -1197,15 +1212,15 @@ data ImportSpec = ImpSpec { is_decl :: ImpDeclSpec,
 -- shared among all the 'Provenance's for that decl
 data ImpDeclSpec
   = ImpDeclSpec {
-        is_mod      :: ModuleName, -- ^ Module imported, e.g. @import Muggle@
+        is_mod      :: !ModuleName, -- ^ Module imported, e.g. @import Muggle@
                                    -- Note the @Muggle@ may well not be
                                    -- the defining module for this thing!
 
                                    -- TODO: either should be Module, or there
                                    -- should be a Maybe UnitId here too.
-        is_as       :: ModuleName, -- ^ Import alias, e.g. from @as M@ (or @Muggle@ if there is no @as@ clause)
-        is_qual     :: Bool,       -- ^ Was this import qualified?
-        is_dloc     :: SrcSpan     -- ^ The location of the entire import declaration
+        is_as       :: !ModuleName, -- ^ Import alias, e.g. from @as M@ (or @Muggle@ if there is no @as@ clause)
+        is_qual     :: !Bool,       -- ^ Was this import qualified?
+        is_dloc     :: !SrcSpan     -- ^ The location of the entire import declaration
     } deriving (Eq, Data)
 
 -- | Import Item Specification
@@ -1216,8 +1231,8 @@ data ImpItemSpec
                         -- or had a hiding list
 
   | ImpSome {
-        is_explicit :: Bool,
-        is_iloc     :: SrcSpan  -- Location of the import item
+        is_explicit :: !Bool,
+        is_iloc     :: !SrcSpan  -- Location of the import item
     }   -- ^ The import had an import list.
         -- The 'is_explicit' field is @True@ iff the thing was named
         -- /explicitly/ in the import specs rather
@@ -1243,8 +1258,7 @@ bestImport iss
     -- earlier declaration wins over later
     best (ImpSpec { is_item = item1, is_decl = d1 })
          (ImpSpec { is_item = item2, is_decl = d2 })
-      = (is_qual d1 `compare` is_qual d2) `thenCmp`
-        (best_item item1 item2)           `thenCmp`
+      = (is_qual d1 `compare` is_qual d2) S.<> best_item item1 item2 S.<>
         SrcLoc.leftmost_smallest (is_dloc d1) (is_dloc d2)
 
     best_item :: ImpItemSpec -> ImpItemSpec -> Ordering

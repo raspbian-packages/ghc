@@ -1,9 +1,12 @@
 module Rules.Generate (
     isGeneratedCmmFile, compilerDependencies, generatePackageCode,
     generateRules, copyRules, generatedDependencies,
-    ghcPrimDependencies
+    ghcPrimDependencies,
+    templateRules
     ) where
 
+import Data.Char (isSpace)
+import qualified Data.Set as Set
 import Base
 import qualified Context
 import Expression
@@ -11,6 +14,8 @@ import Hadrian.Oracles.TextFile (lookupSystemConfig)
 import Oracles.Flag
 import Oracles.ModuleFiles
 import Oracles.Setting
+import Hadrian.Haskell.Cabal.Type (PackageData(version))
+import Hadrian.Oracles.Cabal (readPackageData)
 import Packages
 import Rules.Libffi
 import Settings
@@ -40,23 +45,24 @@ rtsDependencies :: Expr [FilePath]
 rtsDependencies = do
     stage   <- getStage
     rtsPath <- expr (rtsBuildPath stage)
+    jsTarget <- expr isJsTarget
     useSystemFfi <- expr (flag UseSystemFfi)
 
-    let headers =
+    let -- headers common to native and JS RTS
+        common_headers =
             [ "ghcautoconf.h", "ghcplatform.h"
             , "DerivedConstants.h"
-            , "rts" -/- "EventTypes.h"
+            ]
+        -- headers specific to the native RTS
+        native_headers =
+            [ "rts" -/- "EventTypes.h"
             , "rts" -/- "EventLogConstants.h"
             ]
             ++ (if useSystemFfi then [] else libffiHeaderFiles)
+        headers
+          | jsTarget  = common_headers
+          | otherwise = common_headers ++ native_headers
     pure $ ((rtsPath -/- "include") -/-) <$> headers
-
-genapplyDependencies :: Expr [FilePath]
-genapplyDependencies = do
-    stage   <- getStage
-    rtsPath <- expr (rtsBuildPath $ succStage stage)
-    ((stage /= Stage3) ?) $ pure $ ((rtsPath -/- "include") -/-) <$>
-        [ "ghcautoconf.h", "ghcplatform.h" ]
 
 compilerDependencies :: Expr [FilePath]
 compilerDependencies = do
@@ -88,7 +94,6 @@ generatedDependencies = do
     mconcat [ package compiler ? compilerDependencies
             , package ghcPrim  ? ghcPrimDependencies
             , package rts      ? rtsDependencies
-            , package genapply ? genapplyDependencies
             ]
 
 generate :: FilePath -> Context -> Expr String -> Action ()
@@ -98,7 +103,7 @@ generate file context expr = do
     putSuccess $ "| Successfully generated " ++ file ++ "."
 
 generatePackageCode :: Context -> Rules ()
-generatePackageCode context@(Context stage pkg _) = do
+generatePackageCode context@(Context stage pkg _ _) = do
     root <- buildRootRules
     let dir         = buildDir context
         generated f = (root -/- dir -/- "**/*.hs") ?== f && not ("//autogen/*" ?== f)
@@ -106,7 +111,9 @@ generatePackageCode context@(Context stage pkg _) = do
     generated ?> \file -> do
         let unpack = fromMaybe . error $ "No generator for " ++ file ++ "."
         (src, builder) <- unpack <$> findGenerator context file
-        need [src]
+        -- Make sure we have configured the package before running the builder
+        pkg_setup <- pkgSetupConfigFile context
+        need [src, pkg_setup]
         build $ target context builder [src] [file]
         let boot = src -<.> "hs-boot"
         whenM (doesFileExist boot) $ do
@@ -132,8 +139,12 @@ generatePackageCode context@(Context stage pkg _) = do
             build $ target context HsCpp [primopsSource] [file]
 
     when (pkg == rts) $ do
-        root -/- "**" -/- dir -/- "cmm/AutoApply.cmm" %> \file ->
-            build $ target context GenApply [] [file]
+        root -/- "**" -/- dir -/- "cmm/AutoApply.cmm" %> \file -> do
+            -- See Note [How genapply gets target info] for details
+            path <- buildPath context
+            let h = path -/- "include/DerivedConstants.h"
+            need [h]
+            build $ target context GenApply [h] [file]
         let go gen file = generate file (semiEmptyTarget stage) gen
         root -/- "**" -/- dir -/- "include/ghcautoconf.h" %> go generateGhcAutoconfH
         root -/- "**" -/- dir -/- "include/ghcplatform.h" %> go generateGhcPlatformH
@@ -149,7 +160,7 @@ genEventTypes flag file = do
       [] []
 
 genPrimopCode :: Context -> FilePath -> Action ()
-genPrimopCode context@(Context stage _pkg _) file = do
+genPrimopCode context@(Context stage _pkg _ _) file = do
     root <- buildRoot
     need [root -/- primopsTxt stage]
     build $ target context GenPrimopCode [root -/- primopsTxt stage] [file]
@@ -191,7 +202,8 @@ copyRules = do
         prefix -/- "html/**"           <~ return "utils/haddock/haddock-api/resources"
         prefix -/- "latex/**"          <~ return "utils/haddock/haddock-api/resources"
 
-        root -/- relativePackageDbPath stage -/- systemCxxStdLibConf %> \file -> do
+        forM_ [Inplace, Final] $ \iplace ->
+          root -/- relativePackageDbPath (PackageDbLoc stage iplace) -/- systemCxxStdLibConf %> \file -> do
             copyFile ("mk" -/- "system-cxx-std-lib-1.0.conf") file
 
 generateRules :: Rules ()
@@ -221,6 +233,109 @@ emptyTarget :: Context
 emptyTarget = vanillaContext (error "Rules.Generate.emptyTarget: unknown stage")
                              (error "Rules.Generate.emptyTarget: unknown package")
 
+-- | A set of interpolation variable substitutions.
+newtype Interpolations = Interpolations (Action [(String, String)])
+
+instance Semigroup Interpolations where
+    Interpolations m <> Interpolations n = Interpolations ((++) <$> m <*> n)
+
+instance Monoid Interpolations where
+    mempty = Interpolations $ return []
+
+-- | @interpolateVar var value@ is an interpolation which replaces @\@var\@@
+-- with the result of @value@.
+interpolateVar :: String -> Action String -> Interpolations
+interpolateVar var value = Interpolations $ do
+    val <- value
+    return [(var, val)]
+
+runInterpolations :: Interpolations -> String -> Action String
+runInterpolations (Interpolations mk_substs) input = do
+    substs <- mk_substs
+    let subst :: String -> String
+        subst = foldr (.) id [replace ("@"++k++"@") v | (k,v) <- substs]
+    return (subst input)
+
+toCabalBool :: Bool -> String
+toCabalBool True  = "True"
+toCabalBool False = "False"
+
+-- | Interpolate the given variable with the value of the given 'Flag', using
+-- Cabal's boolean syntax.
+interpolateCabalFlag :: String -> Flag -> Interpolations
+interpolateCabalFlag name flg = interpolateVar name $ do
+    val <- flag flg
+    return (toCabalBool val)
+
+-- | Interpolate the given variable with the value of the given 'Setting'.
+interpolateSetting :: String -> Setting -> Interpolations
+interpolateSetting name settng = interpolateVar name $ setting settng
+
+-- | Interpolate the @ProjectVersion@ and @ProjectVersionMunged@ variables.
+projectVersion :: Interpolations
+projectVersion = mconcat
+    [ interpolateSetting "ProjectVersion" ProjectVersion
+    , interpolateSetting "ProjectVersionMunged" ProjectVersionMunged
+    ]
+
+rtsCabalFlags :: Interpolations
+rtsCabalFlags = mconcat
+    [ flag "CabalHaveLibdw" UseLibdw
+    , flag "CabalHaveLibm" UseLibm
+    , flag "CabalHaveLibrt" UseLibrt
+    , flag "CabalHaveLibdl" UseLibdl
+    , flag "CabalNeedLibpthread" UseLibpthread
+    , flag "CabalHaveLibbfd" UseLibbfd
+    , flag "CabalHaveLibNuma" UseLibnuma
+    , flag "CabalNeedLibatomic" NeedLibatomic
+    , flag "CabalUseSystemLibFFI" UseSystemFfi
+    , flag "CabalLibffiAdjustors" UseLibffiForAdjustors
+    , flag "CabalLeadingUnderscore" LeadingUnderscore
+    , interpolateVar "Cabal64bit" $ do
+        let settingWord :: Setting -> Action Word
+            settingWord s = read <$> setting s
+        ws <- settingWord TargetWordSize
+        return $ toCabalBool (ws == 8)
+    ]
+  where
+    flag = interpolateCabalFlag
+
+packageVersions :: Interpolations
+packageVersions = foldMap f [ base, ghcPrim, compiler, ghc, cabal, templateHaskell, ghcCompact, array ]
+  where
+    f :: Package -> Interpolations
+    f pkg = interpolateVar var $ version <$> readPackageData pkg
+      where var = "LIBRARY_" <> pkgName pkg <> "_VERSION"
+
+templateRule :: FilePath -> Interpolations -> Rules ()
+templateRule outPath interps = do
+    outPath %> \_ -> do
+        s <- readFile' (outPath <.> "in")
+        result <- runInterpolations interps s
+        writeFile' outPath result
+        putSuccess ("| Successfully generated " ++ outPath ++ " from its template")
+
+templateRules :: Rules ()
+templateRules = do
+  templateRule "compiler/ghc.cabal" $ projectVersion
+  templateRule "rts/rts.cabal" $ rtsCabalFlags
+  templateRule "driver/ghci/ghci-wrapper.cabal" $ projectVersion
+  templateRule "ghc/ghc-bin.cabal" $ projectVersion
+  templateRule "utils/iserv/iserv.cabal" $ projectVersion
+  templateRule "utils/iserv-proxy/iserv-proxy.cabal" $ projectVersion
+  templateRule "utils/remote-iserv/remote-iserv.cabal" $ projectVersion
+  templateRule "utils/runghc/runghc.cabal" $ projectVersion
+  templateRule "libraries/ghc-boot/ghc-boot.cabal" $ projectVersion
+  templateRule "libraries/ghc-boot-th/ghc-boot-th.cabal" $ projectVersion
+  templateRule "libraries/ghci/ghci.cabal" $ projectVersion
+  templateRule "libraries/ghc-heap/ghc-heap.cabal" $ projectVersion
+  templateRule "utils/ghc-pkg/ghc-pkg.cabal" $ projectVersion
+  templateRule "libraries/libiserv/libiserv.cabal" $ projectVersion
+  templateRule "libraries/template-haskell/template-haskell.cabal" $ projectVersion
+  templateRule "libraries/prologue.txt" $ packageVersions
+  templateRule "docs/index.html" $ packageVersions
+
+
 -- Generators
 
 -- | GHC wrapper scripts used for passing the path to the right package database
@@ -228,12 +343,13 @@ emptyTarget = vanillaContext (error "Rules.Generate.emptyTarget: unknown stage")
 ghcWrapper :: Stage -> Expr String
 ghcWrapper (Stage0 {}) = error "Stage0 GHC does not require a wrapper script to run."
 ghcWrapper stage  = do
-    dbPath  <- expr $ (</>) <$> topDirectory <*> packageDbPath stage
+    dbPath  <- expr $ (</>) <$> topDirectory <*> packageDbPath (PackageDbLoc stage Final)
     ghcPath <- expr $ (</>) <$> topDirectory
                             <*> programPath (vanillaContext (predStage stage) ghc)
     return $ unwords $ map show $ [ ghcPath ]
                                ++ (if stage == Stage1
                                      then ["-no-global-package-db"
+                                          , "-package-env=-"
                                           , "-package-db " ++ dbPath
                                           ]
                                      else [])
@@ -309,9 +425,9 @@ generateSettings = do
         , ("ld command", expr $ settingsFileSetting SettingsFileSetting_LdCommand)
         , ("ld flags", expr $ settingsFileSetting SettingsFileSetting_LdFlags)
         , ("ld supports compact unwind", expr $ lookupSystemConfig "ld-has-no-compact-unwind")
-        , ("ld supports build-id", expr $ lookupSystemConfig "ld-has-build-id")
         , ("ld supports filelist", expr $ lookupSystemConfig "ld-has-filelist")
         , ("ld is GNU ld", expr $ lookupSystemConfig "ld-is-gnu-ld")
+        , ("ld supports single module", expr $ lookupSystemConfig "ld-supports-single-module")
         , ("Merge objects command", expr $ settingsFileSetting SettingsFileSetting_MergeObjectsCommand)
         , ("Merge objects flags", expr $ settingsFileSetting SettingsFileSetting_MergeObjectsFlags)
         , ("ar command", expr $ settingsFileSetting SettingsFileSetting_ArCommand)
@@ -324,7 +440,6 @@ generateSettings = do
         , ("touch command", expr $ settingsFileSetting SettingsFileSetting_TouchCommand)
         , ("dllwrap command", expr $ settingsFileSetting SettingsFileSetting_DllWrapCommand)
         , ("windres command", expr $ settingsFileSetting SettingsFileSetting_WindresCommand)
-        , ("libtool command", expr $ settingsFileSetting SettingsFileSetting_LibtoolCommand)
         , ("unlit command", ("$topdir/bin/" <>) <$> expr (programName (ctx { Context.package = unlit })))
         , ("cross compiling", expr $ yesNo <$> flag CrossCompiling)
         , ("target platform string", getSetting TargetPlatform)
@@ -346,11 +461,11 @@ generateSettings = do
 
         , ("Use interpreter", expr $ yesNo <$> ghcWithInterpreter)
         , ("Support SMP", expr $ yesNo <$> targetSupportsSMP)
-        , ("RTS ways", unwords . map show <$> getRtsWays)
+        , ("RTS ways", escapeArgs . map show . Set.toList <$> getRtsWays)
         , ("Tables next to code", expr $ yesNo <$> flag TablesNextToCode)
         , ("Leading underscore", expr $ yesNo <$> flag LeadingUnderscore)
         , ("Use LibFFI", expr $ yesNo <$> useLibffiForAdjustors)
-        , ("RTS expects libdw", yesNo <$> getFlag WithLibdw)
+        , ("RTS expects libdw", yesNo <$> getFlag UseLibdw)
         ]
     let showTuple (k, v) = "(" ++ show k ++ ", " ++ show v ++ ")"
     pure $ case settings of
@@ -381,7 +496,7 @@ generateConfigHs = do
         , "  , cStage"
         , "  ) where"
         , ""
-        , "import GHC.Prelude"
+        , "import GHC.Prelude.Basic"
         , ""
         , "import GHC.Version"
         , ""
@@ -482,3 +597,19 @@ generatePlatformHostHs = do
         , "hostPlatformArchOS :: ArchOS"
         , "hostPlatformArchOS = ArchOS hostPlatformArch hostPlatformOS"
         ]
+
+-- | Just like 'GHC.ResponseFile.escapeArgs', but use spaces instead of newlines
+-- for splitting elements.
+escapeArgs :: [String] -> String
+escapeArgs = unwords . map escapeArg
+
+escapeArg :: String -> String
+escapeArg = reverse . foldl' escape []
+
+escape :: String -> Char -> String
+escape cs c
+  |    isSpace c
+    || '\\' == c
+    || '\'' == c
+    || '"'  == c = c:'\\':cs -- n.b., our caller must reverse the result
+  | otherwise    = c:cs

@@ -9,6 +9,7 @@ which is declared in the various \tr{Hs*} modules.  This module,
 therefore, is almost nothing but re-exporting.
 -}
 
+{-# OPTIONS_GHC -Wno-orphans    #-} -- Outputable
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE StandaloneDeriving #-}
 {-# LANGUAGE FlexibleContexts #-}
@@ -34,7 +35,7 @@ module GHC.Hs (
         Fixity,
 
         HsModule(..), AnnsModule(..),
-        HsParsedModule(..)
+        HsParsedModule(..), XModulePs(..)
 ) where
 
 -- friends:
@@ -58,53 +59,18 @@ import GHC.Hs.Instances () -- For Data instances
 import GHC.Utils.Outputable
 import GHC.Types.Fixity         ( Fixity )
 import GHC.Types.SrcLoc
-import GHC.Unit.Module          ( ModuleName )
 import GHC.Unit.Module.Warnings ( WarningTxt )
 
 -- libraries:
 import Data.Data hiding ( Fixity )
 
--- | Haskell Module
---
--- All we actually declare here is the top-level structure for a module.
-data HsModule
-  =  -- | 'GHC.Parser.Annotation.AnnKeywordId's
-     --
-     --  - 'GHC.Parser.Annotation.AnnModule','GHC.Parser.Annotation.AnnWhere'
-     --
-     --  - 'GHC.Parser.Annotation.AnnOpen','GHC.Parser.Annotation.AnnSemi',
-     --    'GHC.Parser.Annotation.AnnClose' for explicit braces and semi around
-     --    hsmodImports,hsmodDecls if this style is used.
-
-     -- For details on above see Note [exact print annotations] in GHC.Parser.Annotation
-    HsModule {
+-- | Haskell Module extension point: GHC specific
+data XModulePs
+  = XModulePs {
       hsmodAnn :: EpAnn AnnsModule,
-      hsmodLayout :: LayoutInfo,
+      hsmodLayout :: LayoutInfo GhcPs,
         -- ^ Layout info for the module.
         -- For incomplete modules (e.g. the output of parseHeader), it is NoLayoutInfo.
-      hsmodName :: Maybe (LocatedA ModuleName),
-        -- ^ @Nothing@: \"module X where\" is omitted (in which case the next
-        --     field is Nothing too)
-      hsmodExports :: Maybe (LocatedL [LIE GhcPs]),
-        -- ^ Export list
-        --
-        --  - @Nothing@: export list omitted, so export everything
-        --
-        --  - @Just []@: export /nothing/
-        --
-        --  - @Just [...]@: as you would expect...
-        --
-        --
-        --  - 'GHC.Parser.Annotation.AnnKeywordId's : 'GHC.Parser.Annotation.AnnOpen'
-        --                                   ,'GHC.Parser.Annotation.AnnClose'
-
-        -- For details on above see Note [exact print annotations] in GHC.Parser.Annotation
-      hsmodImports :: [LImportDecl GhcPs],
-        -- ^ We snaffle interesting stuff out of the imported interfaces early
-        -- on, adding that info to TyDecls/etc; so this list is often empty,
-        -- downstream.
-      hsmodDecls :: [LHsDecl GhcPs],
-        -- ^ Type, class, value, and interface signature decls
       hsmodDeprecMessage :: Maybe (LocatedP (WarningTxt GhcPs)),
         -- ^ reason\/explanation for warning/deprecation of this module
         --
@@ -121,8 +87,16 @@ data HsModule
 
         -- For details on above see Note [exact print annotations] in GHC.Parser.Annotation
    }
+   deriving Data
 
-deriving instance Data HsModule
+type instance XCModule GhcPs = XModulePs
+type instance XCModule GhcRn = DataConCantHappen
+type instance XCModule GhcTc = DataConCantHappen
+type instance XXModule p = DataConCantHappen
+
+type instance Anno ModuleName = SrcSpanAnnA
+
+deriving instance Data (HsModule GhcPs)
 
 data AnnsModule
   = AnnsModule {
@@ -130,20 +104,27 @@ data AnnsModule
     am_decls :: AnnList
     } deriving (Data, Eq)
 
-instance Outputable HsModule where
-
-    ppr (HsModule _ _ Nothing _ imports decls _ mbDoc)
+instance Outputable (HsModule GhcPs) where
+    ppr (HsModule { hsmodExt = XModulePs { hsmodHaddockModHeader = mbDoc }
+                  , hsmodName = Nothing
+                  , hsmodImports = imports
+                  , hsmodDecls = decls })
       = pprMaybeWithDoc mbDoc $ pp_nonnull imports
                              $$ pp_nonnull decls
 
-    ppr (HsModule _ _ (Just name) exports imports decls deprec mbDoc)
+    ppr (HsModule { hsmodExt = XModulePs { hsmodDeprecMessage = deprec
+                                         , hsmodHaddockModHeader = mbDoc }
+                  , hsmodName = (Just name)
+                  , hsmodExports = exports
+                  , hsmodImports = imports
+                  , hsmodDecls = decls })
       = pprMaybeWithDoc mbDoc $
         vcat
           [ case exports of
               Nothing -> pp_header (text "where")
               Just es -> vcat [
                            pp_header lparen,
-                           nest 8 (fsep (punctuate comma (map ppr (unLoc es)))),
+                           nest 8 (pprWithCommas ppr (unLoc es)),
                            nest 4 (text ") where")
                           ],
             pp_nonnull imports,
@@ -161,7 +142,7 @@ pp_nonnull [] = empty
 pp_nonnull xs = vcat (map ppr xs)
 
 data HsParsedModule = HsParsedModule {
-    hpm_module    :: Located HsModule,
+    hpm_module    :: Located (HsModule GhcPs),
     hpm_src_files :: [FilePath]
        -- ^ extra source files (e.g. from #includes).  The lexer collects
        -- these from '# <file> <line>' pragmas, which the C preprocessor

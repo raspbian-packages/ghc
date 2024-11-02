@@ -30,7 +30,6 @@ import GHC.Types.Name
 import GHC.Types.SrcLoc
 import GHC.Types.Var
 import GHC.Types.SourceText
-import GHC.Unit.Module
 import GHC.Utils.Outputable
 
 import Data.Data hiding (Fixity)
@@ -145,7 +144,7 @@ showAstData bs ba a0 = blankLine $$ showAstData' a0
               _                -> parens $ text "SourceText" <+> text "blanked"
 
             epaAnchor :: EpaLocation -> SDoc
-            epaAnchor (EpaSpan r)  = parens $ text "EpaSpan" <+> realSrcSpan r
+            epaAnchor (EpaSpan r _) = parens $ text "EpaSpan" <+> realSrcSpan r
             epaAnchor (EpaDelta d cs) = case ba of
               NoBlankEpAnnotations -> parens $ text "EpaDelta" <+> deltaPos d <+> showAstData' cs
               BlankEpAnnotations -> parens $ text "EpaDelta" <+> deltaPos d <+> text "blanked"
@@ -159,7 +158,7 @@ showAstData bs ba a0 = blankLine $$ showAstData' a0
 
             occName n  =  braces $
                           text "OccName:"
-                      <+> text (occNameString n)
+                      <+> ftext (occNameFS n)
 
             moduleName :: ModuleName -> SDoc
             moduleName m = braces $ text "ModuleName:" <+> ppr m

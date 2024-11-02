@@ -44,29 +44,35 @@ import GHC.Tc.Utils.Monad
 import GHC.Tc.Gen.HsType
 import GHC.Tc.Gen.Expr
 import GHC.Tc.Utils.Env
-
+import GHC.Tc.Utils.TcType
 import GHC.Tc.Instance.Family
+
 import GHC.Core.FamInstEnv
 import GHC.Core.Coercion
 import GHC.Core.Reduction
 import GHC.Core.Type
 import GHC.Core.Multiplicity
-import GHC.Types.ForeignCall
-import GHC.Utils.Error
-import GHC.Types.Id
-import GHC.Types.Name
-import GHC.Types.Name.Reader
 import GHC.Core.DataCon
 import GHC.Core.TyCon
 import GHC.Core.TyCon.RecWalk
-import GHC.Tc.Utils.TcType
+
+import GHC.Types.ForeignCall
+import GHC.Types.Id
+import GHC.Types.Name
+import GHC.Types.Name.Reader
+import GHC.Types.SrcLoc
+
 import GHC.Builtin.Names
+import GHC.Builtin.Types.Prim( isArrowTyCon )
+
 import GHC.Driver.Session
 import GHC.Driver.Backend
+
+import GHC.Utils.Error
 import GHC.Utils.Outputable as Outputable
 import GHC.Utils.Panic
 import GHC.Platform
-import GHC.Types.SrcLoc
+
 import GHC.Data.Bag
 import GHC.Driver.Hooks
 import qualified GHC.LanguageExtensions as LangExt
@@ -96,7 +102,7 @@ declaration. If we have
 newtype Age = MkAge Int
 
 we want to see that Age -> IO () is the same as Int -> IO (). But, we don't
-need to recur on any type parameters, because no paramaterized types (with
+need to recur on any type parameters, because no parameterized types (with
 interesting parameters) are marshalable! The full list of marshalable types
 is in the body of boxedMarshalableTyCon in GHC.Tc.Utils.TcType. The only members of that
 list not at kind * are Ptr, FunPtr, and StablePtr, all of which get marshaled
@@ -122,13 +128,13 @@ normaliseFfiType' env ty0 = runWriterT $ go Representational initRecTc ty0
   where
     go :: Role -> RecTcChecker -> Type -> WriterT (Bag GlobalRdrElt) TcM Reduction
     go role rec_nts ty
-      | Just ty' <- tcView ty     -- Expand synonyms
+      | Just ty' <- coreView ty     -- Expand synonyms
       = go role rec_nts ty'
 
       | Just (tc, tys) <- splitTyConApp_maybe ty
       = go_tc_app role rec_nts tc tys
 
-      | (bndrs, inner_ty) <- splitForAllTyCoVarBinders ty
+      | (bndrs, inner_ty) <- splitForAllForAllTyBinders ty
       , not (null bndrs)
       = do redn <- go role rec_nts inner_ty
            return $ mkHomoForAllRedn bndrs redn
@@ -139,14 +145,18 @@ normaliseFfiType' env ty0 = runWriterT $ go Representational initRecTc ty0
     go_tc_app :: Role -> RecTcChecker -> TyCon -> [Type]
               -> WriterT (Bag GlobalRdrElt) TcM Reduction
     go_tc_app role rec_nts tc tys
+        | isArrowTyCon tc  -- Recurse through arrows, or at least the top
+        = children_only    -- level arrows.  Remember, the default case is
+                           -- "don't recurse" (see last eqn for go_tc_app)
+
+        | tc_key `elem` [ioTyConKey, funPtrTyConKey]
         -- We don't want to look through the IO newtype, even if it is
         -- in scope, so we have a special case for it:
-        | tc_key `elem` [ioTyConKey, funPtrTyConKey, funTyConKey]
         = children_only
 
         | isNewTyCon tc         -- Expand newtypes
         , Just rec_nts' <- checkRecTc rec_nts tc
-                   -- See Note [Expanding newtypes] in GHC.Core.TyCon
+                   -- See Note [Expanding newtypes and products] in GHC.Core.TyCon.RecWalk
                    -- We can't just use isRecursiveTyCon; sometimes recursion is ok:
                    --     newtype T = T (Ptr T)
                    --   Here, we don't reject the type for being recursive.
@@ -173,7 +183,7 @@ normaliseFfiType' env ty0 = runWriterT $ go Representational initRecTc ty0
           children_only
             = do { args <- unzipRedns <$>
                             zipWithM ( \ ty r -> go r rec_nts ty )
-                                     tys (tyConRolesX role tc)
+                                     tys (tyConRoleListX role tc)
                  ; return $ mkTyConAppRedn role tc args }
           nt_co  = mkUnbranchedAxInstCo role (newTyConCo tc) tys []
           nt_rhs = newTyConInstRhs tc tys
@@ -198,7 +208,7 @@ used even though it is not mentioned expclitly in the source, so we don't
 want to report it as "defined but not used" or "imported but not used".
 eg     newtype D = MkD Int
        foreign import foo :: D -> IO ()
-Here 'MkD' us used.  See #7408.
+Here 'MkD' is used.  See #7408.
 
 GHC also expands type functions during this process, so it's not enough
 just to look at the free variables of the declaration.
@@ -244,10 +254,17 @@ tcFImport (L dloc fo@(ForeignImport { fd_name = L nloc nm, fd_sig_ty = hs_ty
     do { sig_ty <- tcHsSigType (ForSigCtxt nm) hs_ty
        ; (Reduction norm_co norm_sig_ty, gres) <- normaliseFfiType sig_ty
        ; let
-           -- Drop the foralls before inspecting the
-           -- structure of the foreign type.
-             (arg_tys, res_ty) = tcSplitFunTys (dropForAlls norm_sig_ty)
-             id                = mkLocalId nm Many sig_ty
+             -- Drop the foralls before inspecting the
+             -- structure of the foreign type.
+             -- Use splitFunTys, which splits (=>) as well as (->)
+             -- so that for  foreign import foo :: Eq a => a -> blah
+             -- we get "unacceptable argument Eq a" rather than
+             --        "unacceptable result Eq a => a -> blah"
+             -- Not a big deal.  We could make a better error message specially
+             -- for overloaded functions, but doesn't seem worth it
+             (arg_tys, res_ty) = splitFunTys (dropForAlls norm_sig_ty)
+
+             id = mkLocalId nm ManyTy sig_ty
                  -- Use a LocalId to obey the invariant that locally-defined
                  -- things are LocalIds.  However, it does not need zonking,
                  -- (so GHC.Tc.Utils.Zonk.zonkForeignExports ignores it).
@@ -264,24 +281,24 @@ tcFImport d = pprPanic "tcFImport" (ppr d)
 
 -- ------------ Checking types for foreign import ----------------------
 
-tcCheckFIType :: [Scaled Type] -> Type -> ForeignImport -> TcM ForeignImport
+tcCheckFIType :: [Scaled Type] -> Type -> ForeignImport GhcRn -> TcM (ForeignImport GhcTc)
 
-tcCheckFIType arg_tys res_ty idecl@(CImport (L lc cconv) safety mh l@(CLabel _) src)
+tcCheckFIType arg_tys res_ty idecl@(CImport src (L lc cconv) safety mh l@(CLabel _))
   -- Foreign import label
-  = do checkCg (Right idecl) checkCOrAsmOrLlvmOrInterp
+  = do checkCg (Right idecl) backendValidityOfCImport
        -- NB check res_ty not sig_ty!
        --    In case sig_ty is (forall a. ForeignPtr a)
-       check (isFFILabelTy (mkVisFunTys arg_tys res_ty))
+       check (isFFILabelTy (mkScaledFunTys arg_tys res_ty))
              (TcRnIllegalForeignType Nothing)
        cconv' <- checkCConv (Right idecl) cconv
-       return (CImport (L lc cconv') safety mh l src)
+       return (CImport src (L lc cconv') safety mh l)
 
-tcCheckFIType arg_tys res_ty idecl@(CImport (L lc cconv) safety mh CWrapper src) = do
+tcCheckFIType arg_tys res_ty idecl@(CImport src (L lc cconv) safety mh CWrapper) = do
         -- Foreign wrapper (former f.e.d.)
         -- The type must be of the form ft -> IO (FunPtr ft), where ft is a valid
         -- foreign type.  For legacy reasons ft -> IO (Ptr ft) is accepted, too.
         -- The use of the latter form is DEPRECATED, though.
-    checkCg (Right idecl) checkCOrAsmOrLlvmOrInterp
+    checkCg (Right idecl) backendValidityOfCImport
     cconv' <- checkCConv (Right idecl) cconv
     case arg_tys of
         [Scaled arg1_mult arg1_ty] -> do
@@ -292,39 +309,44 @@ tcCheckFIType arg_tys res_ty idecl@(CImport (L lc cconv) safety mh CWrapper src)
                   where
                      (arg1_tys, res1_ty) = tcSplitFunTys arg1_ty
         _ -> addErrTc (TcRnIllegalForeignType Nothing OneArgExpected)
-    return (CImport (L lc cconv') safety mh CWrapper src)
+    return (CImport src (L lc cconv') safety mh CWrapper)
 
-tcCheckFIType arg_tys res_ty idecl@(CImport (L lc cconv) (L ls safety) mh
-                                            (CFunction target) src)
+tcCheckFIType arg_tys res_ty idecl@(CImport src (L lc cconv) (L ls safety) mh
+                                            (CFunction target))
   | isDynamicTarget target = do -- Foreign import dynamic
-      checkCg (Right idecl) checkCOrAsmOrLlvmOrInterp
+      checkCg (Right idecl) backendValidityOfCImport
       cconv' <- checkCConv (Right idecl) cconv
       case arg_tys of           -- The first arg must be Ptr or FunPtr
         []                ->
           addErrTc (TcRnIllegalForeignType Nothing AtLeastOneArgExpected)
         (Scaled arg1_mult arg1_ty:arg_tys) -> do
           dflags <- getDynFlags
-          let curried_res_ty = mkVisFunTys arg_tys res_ty
+          let curried_res_ty = mkScaledFunTys arg_tys res_ty
           checkNoLinearFFI arg1_mult
           check (isFFIDynTy curried_res_ty arg1_ty)
                 (TcRnIllegalForeignType (Just Arg))
           checkForeignArgs (isFFIArgumentTy dflags safety) arg_tys
           checkForeignRes nonIOok checkSafe (isFFIImportResultTy dflags) res_ty
-      return $ CImport (L lc cconv') (L ls safety) mh (CFunction target) src
+      return $ CImport src (L lc cconv') (L ls safety) mh (CFunction target)
   | cconv == PrimCallConv = do
       dflags <- getDynFlags
       checkTc (xopt LangExt.GHCForeignImportPrim dflags)
               (TcRnForeignImportPrimExtNotSet idecl)
-      checkCg (Right idecl) checkCOrAsmOrLlvmOrInterp
+      checkCg (Right idecl) backendValidityOfCImport
       checkCTarget idecl target
       checkTc (playSafe safety)
               (TcRnForeignImportPrimSafeAnn idecl)
       checkForeignArgs (isFFIPrimArgumentTy dflags) arg_tys
       -- prim import result is more liberal, allows (#,,#)
       checkForeignRes nonIOok checkSafe (isFFIPrimResultTy dflags) res_ty
-      return idecl
+      return (CImport src (L lc cconv) (L ls safety) mh (CFunction target))
+  | cconv == JavaScriptCallConv = do
+      cconv' <- checkCConv (Right idecl) cconv
+      checkCg (Right idecl) backendValidityOfCImport
+      -- leave the rest to the JS backend (at least for now)
+      return (CImport src (L lc cconv') (L ls safety) mh (CFunction target))
   | otherwise = do              -- Normal foreign import
-      checkCg (Right idecl) checkCOrAsmOrLlvmOrInterp
+      checkCg (Right idecl) backendValidityOfCImport
       cconv' <- checkCConv (Right idecl) cconv
       checkCTarget idecl target
       dflags <- getDynFlags
@@ -336,18 +358,18 @@ tcCheckFIType arg_tys res_ty idecl@(CImport (L lc cconv) (L ls safety) mh
            | not (null arg_tys) ->
               addErrTc (TcRnForeignFunctionImportAsValue idecl)
           _ -> return ()
-      return $ CImport (L lc cconv') (L ls safety) mh (CFunction target) src
+      return $ CImport src (L lc cconv') (L ls safety) mh (CFunction target)
 
 -- This makes a convenient place to check
 -- that the C identifier is valid for C
-checkCTarget :: ForeignImport -> CCallTarget -> TcM ()
+checkCTarget :: ForeignImport GhcRn -> CCallTarget -> TcM ()
 checkCTarget idecl (StaticTarget _ str _ _) = do
-    checkCg (Right idecl) checkCOrAsmOrLlvmOrInterp
+    checkCg (Right idecl) backendValidityOfCImport
     checkTc (isCLabelString str) (TcRnInvalidCIdentifier str)
 
 checkCTarget _ DynamicTarget = panic "checkCTarget DynamicTarget"
 
-checkMissingAmpersand :: ForeignImport -> [Type] -> Type -> TcM ()
+checkMissingAmpersand :: ForeignImport GhcRn -> [Type] -> Type -> TcM ()
 checkMissingAmpersand idecl arg_tys res_ty
   | null arg_tys && isFunPtrTy res_ty
   = addDiagnosticTc $ TcRnFunPtrImportWithoutAmpersand idecl
@@ -413,14 +435,14 @@ tcFExport d = pprPanic "tcFExport" (ppr d)
 
 -- ------------ Checking argument types for foreign export ----------------------
 
-tcCheckFEType :: Type -> ForeignExport -> TcM ForeignExport
-tcCheckFEType sig_ty edecl@(CExport (L l (CExportStatic esrc str cconv)) src) = do
-    checkCg (Left edecl) checkCOrAsmOrLlvm
+tcCheckFEType :: Type -> ForeignExport GhcRn -> TcM (ForeignExport GhcTc)
+tcCheckFEType sig_ty edecl@(CExport src (L l (CExportStatic esrc str cconv))) = do
+    checkCg (Left edecl) backendValidityOfCExport
     checkTc (isCLabelString str) (TcRnInvalidCIdentifier str)
     cconv' <- checkCConv (Left edecl) cconv
     checkForeignArgs isFFIExternalTy arg_tys
     checkForeignRes nonIOok noCheckSafe isFFIExportResultTy res_ty
-    return (CExport (L l (CExportStatic esrc str cconv')) src)
+    return (CExport src (L l (CExportStatic esrc str cconv')))
   where
       -- Drop the foralls before inspecting
       -- the structure of the foreign type.
@@ -442,8 +464,8 @@ checkForeignArgs pred tys = mapM_ go tys
                           check (pred ty) (TcRnIllegalForeignType (Just Arg))
 
 checkNoLinearFFI :: Mult -> TcM ()  -- No linear types in FFI (#18472)
-checkNoLinearFFI Many = return ()
-checkNoLinearFFI _    = addErrTc $ TcRnIllegalForeignType (Just Arg)
+checkNoLinearFFI ManyTy = return ()
+checkNoLinearFFI _      = addErrTc $ TcRnIllegalForeignType (Just Arg)
                                    LinearTypesNotAllowed
 
 ------------ Checking result types for foreign calls ----------------------
@@ -464,7 +486,7 @@ checkForeignRes non_io_result_ok check_safe pred_res_ty ty
 
   -- We disallow nested foralls in foreign types
   -- (at least, for the time being). See #16702.
-  | tcIsForAllTy ty
+  | isForAllTy ty
   = addErrTc $ TcRnIllegalForeignType (Just Result) UnexpectedNestedForall
 
   -- Case for non-IO result type with FFI Import
@@ -497,36 +519,20 @@ checkSafe, noCheckSafe :: Bool
 checkSafe   = True
 noCheckSafe = False
 
--- | Checking a supported backend is in use
-checkCOrAsmOrLlvm :: Backend -> Validity' ExpectedBackends
-checkCOrAsmOrLlvm ViaC = IsValid
-checkCOrAsmOrLlvm NCG  = IsValid
-checkCOrAsmOrLlvm LLVM = IsValid
-checkCOrAsmOrLlvm _    = NotValid COrAsmOrLlvm
-
--- | Checking a supported backend is in use
-checkCOrAsmOrLlvmOrInterp :: Backend -> Validity' ExpectedBackends
-checkCOrAsmOrLlvmOrInterp ViaC        = IsValid
-checkCOrAsmOrLlvmOrInterp NCG         = IsValid
-checkCOrAsmOrLlvmOrInterp LLVM        = IsValid
-checkCOrAsmOrLlvmOrInterp Interpreter = IsValid
-checkCOrAsmOrLlvmOrInterp _           = NotValid COrAsmOrLlvmOrInterp
-
-checkCg :: Either ForeignExport ForeignImport -> (Backend -> Validity' ExpectedBackends) -> TcM ()
+checkCg :: Either (ForeignExport GhcRn) (ForeignImport GhcRn)
+        -> (Backend -> Validity' ExpectedBackends) -> TcM ()
 checkCg decl check = do
     dflags <- getDynFlags
     let bcknd = backend dflags
-    case bcknd of
-      NoBackend -> return ()
-      _ ->
-        case check bcknd of
-          IsValid -> return ()
-          NotValid expectedBcknd ->
-            addErrTc $ TcRnIllegalForeignDeclBackend decl bcknd expectedBcknd
+    case check bcknd of
+      IsValid -> return ()
+      NotValid expectedBcknds ->
+        addErrTc $ TcRnIllegalForeignDeclBackend decl bcknd expectedBcknds
 
 -- Calling conventions
 
-checkCConv :: Either ForeignExport ForeignImport -> CCallConv -> TcM CCallConv
+checkCConv :: Either (ForeignExport GhcRn) (ForeignImport GhcRn)
+           -> CCallConv -> TcM CCallConv
 checkCConv _ CCallConv    = return CCallConv
 checkCConv _ CApiConv     = return CApiConv
 checkCConv decl StdCallConv = do

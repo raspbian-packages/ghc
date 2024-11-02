@@ -2,14 +2,16 @@
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE DeriveFunctor #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {- cabal:
-build-depends: base, monoidal-containers, aeson >= 1.8.1, containers, bytestring
+build-depends: base, aeson >= 1.8.1, containers, bytestring
 -}
 
-import Data.String (String)
 import Data.Aeson as A
-import qualified Data.Map.Monoidal as M
-import qualified Data.ByteString.Lazy as B hiding (putStrLn)
+import qualified Data.Map as Map
+import Data.Map (Map)
+import Data.Maybe
+import qualified Data.ByteString.Lazy as B
 import qualified Data.ByteString.Lazy.Char8 as B
 import Data.List (intercalate)
 import Data.Set (Set)
@@ -82,6 +84,16 @@ names of jobs to update these other places.
 3. The ghc-head-from script downloads release artifacts based on a pipeline change.
 4. Some subsequent CI jobs have explicit dependencies (for example docs-tarball, perf, perf-nofib)
 
+Note [Generation Modes]
+~~~~~~~~~~~~~~~~~~~~~~~
+
+There are two different modes this  script can operate in:
+
+* `gitlab`: Generates a job.yaml which defines all the pipelines for the platforms
+* `metadata`: Generates a file which maps a platform the the "default" validate and
+              nightly pipeline. This file is intended to be used when generating
+              ghcup metadata.
+
 -}
 
 -----------------------------------------------------------------------------
@@ -96,15 +108,27 @@ data Opsys
   | Windows deriving (Eq)
 
 data LinuxDistro
-  = Debian11 | Debian10 | Debian9 | Fedora27 | Fedora33 | Ubuntu2004 | Centos7 | Alpine deriving (Eq)
+  = Debian11 | Debian10 | Debian9
+  | Fedora33
+  | Ubuntu2004
+  | Ubuntu1804
+  | Centos7
+  | Alpine
+  | Rocky8
+  deriving (Eq)
 
-data Arch = Amd64 | AArch64 | ARMv7 | I386
+data Arch = Amd64 | AArch64 | I386
 
 data BignumBackend = Native | Gmp deriving Eq
 
 bignumString :: BignumBackend -> String
 bignumString Gmp = "gmp"
 bignumString Native = "native"
+
+data CrossEmulator
+  = NoEmulator
+  | NoEmulatorNeeded
+  | Emulator String
 
 -- | A BuildConfig records all the options which can be modified to affect the
 -- bindists produced by the compiler.
@@ -116,16 +140,23 @@ data BuildConfig
                 , llvmBootstrap  :: Bool
                 , withAssertions :: Bool
                 , withNuma       :: Bool
+                , crossTarget    :: Maybe String
+                , crossEmulator  :: CrossEmulator
+                , configureWrapper :: Maybe String
                 , fullyStatic    :: Bool
                 , tablesNextToCode :: Bool
                 , threadSanitiser :: Bool
+                , noSplitSections :: Bool
+                , validateNonmovingGc :: Bool
                 }
 
 -- Extra arguments to pass to ./configure due to the BuildConfig
 configureArgsStr :: BuildConfig -> String
-configureArgsStr bc = intercalate " " $
+configureArgsStr bc = unwords $
   ["--enable-unregisterised"| unregisterised bc ]
   ++ ["--disable-tables-next-to-code" | not (tablesNextToCode bc) ]
+  ++ ["--with-intree-gmp" | Just _ <- pure (crossTarget bc) ]
+  ++ ["--with-system-libffi" | crossTarget bc == Just "wasm32-wasi" ]
 
 -- Compute the hadrian flavour from the BuildConfig
 mkJobFlavour :: BuildConfig -> Flavour
@@ -134,13 +165,17 @@ mkJobFlavour BuildConfig{..} = Flavour buildFlavour opts
     opts = [Llvm | llvmBootstrap] ++
            [Dwarf | withDwarf] ++
            [FullyStatic | fullyStatic] ++
-           [ThreadSanitiser | threadSanitiser]
+           [ThreadSanitiser | threadSanitiser] ++
+           [NoSplitSections | noSplitSections, buildFlavour == Release ] ++
+           [BootNonmovingGc | validateNonmovingGc ]
 
 data Flavour = Flavour BaseFlavour [FlavourTrans]
 
-data FlavourTrans = Llvm | Dwarf | FullyStatic | ThreadSanitiser
+data FlavourTrans
+    = Llvm | Dwarf | FullyStatic | ThreadSanitiser | NoSplitSections
+    | BootNonmovingGc
 
-data BaseFlavour = Release | Validate | SlowValidate
+data BaseFlavour = Release | Validate | SlowValidate deriving Eq
 
 -----------------------------------------------------------------------------
 -- Build Configs
@@ -156,10 +191,18 @@ vanilla = BuildConfig
   , llvmBootstrap  = False
   , withAssertions = False
   , withNuma = False
+  , crossTarget = Nothing
+  , crossEmulator = NoEmulator
+  , configureWrapper = Nothing
   , fullyStatic = False
   , tablesNextToCode = True
   , threadSanitiser = False
+  , noSplitSections = False
+  , validateNonmovingGc = False
   }
+
+splitSectionsBroken :: BuildConfig -> BuildConfig
+splitSectionsBroken bc = bc { noSplitSections = True }
 
 nativeInt :: BuildConfig
 nativeInt = vanilla { bignumBackend = Native }
@@ -186,6 +229,16 @@ static = vanilla { fullyStatic = True }
 staticNativeInt :: BuildConfig
 staticNativeInt = static { bignumBackend = Native }
 
+crossConfig :: String       -- ^ target triple
+            -> CrossEmulator -- ^ emulator for testing
+            -> Maybe String -- ^ Configure wrapper
+            -> BuildConfig
+crossConfig triple emulator configure_wrapper =
+    vanilla { crossTarget = Just triple
+            , crossEmulator = emulator
+            , configureWrapper = configure_wrapper
+            }
+
 llvm :: BuildConfig
 llvm = vanilla { llvmBootstrap = True }
 
@@ -201,16 +254,16 @@ noTntc = vanilla { tablesNextToCode = False }
 
 -- | These tags have to match what we call the runners on gitlab
 runnerTag :: Arch -> Opsys -> String
-runnerTag arch (Linux distro) =
+runnerTag arch (Linux _) =
   case arch of
     Amd64   -> "x86_64-linux"
     AArch64 -> "aarch64-linux"
-    ARMv7   -> "armv7-linux"
     I386    -> "x86_64-linux"
 runnerTag AArch64 Darwin = "aarch64-darwin"
 runnerTag Amd64 Darwin = "x86_64-darwin-m1"
 runnerTag Amd64 Windows = "new-x86_64-windows"
 runnerTag Amd64 FreeBSD13 = "x86_64-freebsd13"
+runnerTag _ _ = error "Invalid arch/opsys"
 
 tags :: Arch -> Opsys -> BuildConfig -> [String]
 tags arch opsys _bc = [runnerTag arch opsys] -- Tag for which runners we can use
@@ -221,11 +274,12 @@ distroName :: LinuxDistro -> String
 distroName Debian11  = "deb11"
 distroName Debian10   = "deb10"
 distroName Debian9   = "deb9"
-distroName Fedora27  = "fedora27"
 distroName Fedora33  = "fedora33"
+distroName Ubuntu1804 = "ubuntu18_04"
 distroName Ubuntu2004 = "ubuntu20_04"
 distroName Centos7    = "centos7"
 distroName Alpine     = "alpine3_12"
+distroName Rocky8     = "rocky8"
 
 opsysName :: Opsys -> String
 opsysName (Linux distro) = "linux-" ++ distroName distro
@@ -236,7 +290,6 @@ opsysName Windows = "windows"
 archName :: Arch -> String
 archName Amd64 = "x86_64"
 archName AArch64 = "aarch64"
-archName ARMv7 = "armv7"
 archName I386  = "i386"
 
 binDistName :: Arch -> Opsys -> BuildConfig -> String
@@ -253,6 +306,7 @@ testEnv arch opsys bc = intercalate "-" $
                         ++ ["unreg" | unregisterised bc ]
                         ++ ["numa"  | withNuma bc ]
                         ++ ["no_tntc"  | not (tablesNextToCode bc) ]
+                        ++ ["cross_"++triple  | Just triple <- pure $ crossTarget bc ]
                         ++ [flavourString (mkJobFlavour bc)]
 
 -- | The hadrian flavour string we are going to use for this build
@@ -267,6 +321,8 @@ flavourString (Flavour base trans) = baseString base ++ concatMap (("+" ++) . fl
     flavourString Dwarf = "debug_info"
     flavourString FullyStatic = "fully_static"
     flavourString ThreadSanitiser = "thread_sanitizer"
+    flavourString NoSplitSections = "no_split_sections"
+    flavourString BootNonmovingGc = "boot_nonmoving_gc"
 
 -- The path to the docker image (just for linux builders)
 dockerImage :: Arch -> Opsys -> Maybe String
@@ -294,10 +350,25 @@ dockerImage _ _ = Nothing
 -- The "proper" solution would be to use a dependent monoidal map where each key specifies
 -- the combination behaviour of it's values. Ie, whether setting it multiple times is an error
 -- or they should be combined.
-type Variables = M.MonoidalMap String [String]
+newtype MonoidalMap k v = MonoidalMap { unMonoidalMap :: Map k v }
+    deriving (Eq, Show, Functor, ToJSON)
+
+instance (Ord k, Semigroup v) => Semigroup (MonoidalMap k v) where
+    (MonoidalMap a) <> (MonoidalMap b) = MonoidalMap (Map.unionWith (<>) a b)
+
+instance (Ord k, Semigroup v) => Monoid (MonoidalMap k v) where
+    mempty = MonoidalMap Map.empty
+
+mminsertWith :: Ord k => (a -> a -> a) -> k -> a -> MonoidalMap k a -> MonoidalMap k a
+mminsertWith f k v (MonoidalMap m) = MonoidalMap (Map.insertWith f k v m)
+
+mmlookup :: Ord k => k -> MonoidalMap k a -> Maybe a
+mmlookup k (MonoidalMap m) = Map.lookup k m
+
+type Variables = MonoidalMap String [String]
 
 (=:) :: String -> String -> Variables
-a =: b = M.singleton a [b]
+a =: b = MonoidalMap (Map.singleton a [b])
 
 opsysVariables :: Arch -> Opsys -> Variables
 opsysVariables _ FreeBSD13 = mconcat
@@ -307,21 +378,9 @@ opsysVariables _ FreeBSD13 = mconcat
     -- [1] https://www.freebsd.org/doc/en/books/porters-handbook/using-iconv.html)
     "CONFIGURE_ARGS" =:  "--with-gmp-includes=/usr/local/include --with-gmp-libraries=/usr/local/lib --with-iconv-includes=/usr/local/include --with-iconv-libraries=/usr/local/lib"
   , "HADRIAN_ARGS" =: "--docs=no-sphinx"
-  , "GHC_VERSION" =: "9.2.2"
-  , "CABAL_INSTALL_VERSION" =: "3.6.2.0"
+  , "GHC_VERSION" =: "9.4.3"
+  , "CABAL_INSTALL_VERSION" =: "3.8.1.0"
   ]
-opsysVariables ARMv7 (Linux distro) =
-  distroVariables distro <>
-  mconcat [ "CONFIGURE_ARGS" =: "--host=armv7-linux-gnueabihf --build=armv7-linux-gnueabihf --target=armv7-linux-gnueabihf"
-            -- N.B. We disable ld.lld explicitly here because it appears to fail
-            -- non-deterministically on ARMv7. See #18280.
-          , "LD" =: "ld.gold"
-          , "GccUseLdOpt" =: "-fuse-ld=gold"
-            -- Awkwardly, this appears to be necessary to work around a
-            -- live-lock exhibited by the CPython (at least in 3.9 and 3.8)
-            -- interpreter on ARMv7
-          , "HADRIAN_ARGS" =: "--test-verbose=3"
-          ]
 opsysVariables _ (Linux distro) = distroVariables distro
 opsysVariables AArch64 (Darwin {}) =
   mconcat [ "NIX_SYSTEM" =: "aarch64-darwin"
@@ -348,8 +407,8 @@ opsysVariables _ (Windows {}) =
   mconcat [ "MSYSTEM" =: "MINGW64"
           , "HADRIAN_ARGS" =: "--docs=no-sphinx"
           , "LANG" =: "en_US.UTF-8"
-          , "CABAL_INSTALL_VERSION" =: "3.2.0.0"
-          , "GHC_VERSION" =: "9.2.2" ]
+          , "CABAL_INSTALL_VERSION" =: "3.8.1.0"
+          , "GHC_VERSION" =: "9.4.3" ]
 opsysVariables _ _ = mempty
 
 
@@ -361,18 +420,14 @@ distroVariables Alpine = mconcat
   , "HADRIAN_ARGS" =: "--docs=no-sphinx"
     -- encoding004: due to lack of locale support
     -- T10458, ghcilink002: due to #17869
-    -- linker_unload_native: due to musl not supporting any means of probing dynlib dependencies
-    -- (see Note [Object unloading]).
-  , "BROKEN_TESTS" =: "encoding004 T10458 linker_unload_native"
+  , "BROKEN_TESTS" =: "encoding004 T10458"
   ]
 distroVariables Centos7 = mconcat [
-  "HADRIAN_ARGS" =: "--docs=no-sphinx"
+    "HADRIAN_ARGS" =: "--docs=no-sphinx"
+  , "BROKEN_TESTS" =: "T22012" -- due to #23979
   ]
-distroVariables Fedora27 = mconcat
-  -- There is no reasonably new version of LLVM available on Fedora 27.
-  [ "LLC" =: "/bin/false"
-  , "OPT" =: "/bin/false"
-  , "HADRIAN_ARGS" =: "--docs=no-sphinx"
+distroVariables Rocky8 = mconcat [
+  "HADRIAN_ARGS" =: "--docs=no-sphinx"
   ]
 distroVariables Fedora33 = mconcat
   -- LLC/OPT do not work for some reason in our fedora images
@@ -474,13 +529,13 @@ instance ToJSON ManualFlag where
   toJSON OnSuccess = "on_success"
 
 instance ToJSON OnOffRules where
-  toJSON rules = toJSON [(object ([
+  toJSON rules = toJSON [object ([
     "if" A..= and_all (map one_rule (enumRules rules))
     , "when" A..= toJSON (when rules)]
     -- Necessary to stop manual jobs stopping pipeline progress
     -- https://docs.gitlab.com/ee/ci/yaml/#rulesallow_failure
     ++
-    ["allow_failure" A..= True | when rules == Manual ]))]
+    ["allow_failure" A..= True | when rules == Manual ])]
 
     where
       one_rule (OnOffRule onoff r) = ruleString onoff r
@@ -494,7 +549,7 @@ data Rule = FastCI       -- ^ Run this job when the fast-ci label is set
           | Nightly      -- ^ Only run this job in the nightly pipeline
           | LLVMBackend  -- ^ Only run this job when the "LLVM backend" label is present
           | FreeBSDLabel -- ^ Only run this job when the "FreeBSD" label is set.
-          | ARMLabel    -- ^ Only run this job when the "ARM" label is set.
+          | NonmovingGc  -- ^ Only run this job when the "non-moving GC" label is set.
           | Disable      -- ^ Don't run this job.
           deriving (Bounded, Enum, Ord, Eq)
 
@@ -515,8 +570,8 @@ ruleString On LLVMBackend = "$CI_MERGE_REQUEST_LABELS =~ /.*LLVM backend.*/"
 ruleString Off LLVMBackend = true
 ruleString On FreeBSDLabel = "$CI_MERGE_REQUEST_LABELS =~ /.*FreeBSD.*/"
 ruleString Off FreeBSDLabel = true
-ruleString On ARMLabel = "$CI_MERGE_REQUEST_LABELS =~ /.*ARM.*/"
-ruleString Off ARMLabel = true
+ruleString On NonmovingGc = "$CI_MERGE_REQUEST_LABELS =~ /.*non-moving GC.*/"
+ruleString Off NonmovingGc = true
 ruleString On ReleaseOnly = "$RELEASE_JOB == \"yes\""
 ruleString Off ReleaseOnly = "$RELEASE_JOB != \"yes\""
 ruleString On Nightly = "$NIGHTLY"
@@ -545,6 +600,7 @@ data Job
         , jobArtifacts :: Artifacts
         , jobCache :: Cache
         , jobRules :: OnOffRules
+        , jobPlatform  :: (Arch, Opsys)
         }
 
 instance ToJSON Job where
@@ -559,7 +615,7 @@ instance ToJSON Job where
     , "allow_failure" A..= jobAllowFailure
     -- Joining up variables like this may well be the wrong thing to do but
     -- at least it doesn't lose information silently by overriding.
-    , "variables" A..= (M.map (intercalate " ") jobVariables)
+    , "variables" A..= fmap unwords jobVariables
     , "artifacts" A..= jobArtifacts
     , "cache" A..= jobCache
     , "after_script" A..= jobAfterScript
@@ -568,9 +624,11 @@ instance ToJSON Job where
     ]
 
 -- | Build a job description from the system description and 'BuildConfig'
-job :: Arch -> Opsys -> BuildConfig -> (String, Job)
-job arch opsys buildConfig = (jobName, Job {..})
+job :: Arch -> Opsys -> BuildConfig -> NamedJob Job
+job arch opsys buildConfig = NamedJob { name = jobName, jobInfo = Job {..} }
   where
+    jobPlatform = (arch, opsys)
+
     jobRules = emptyRules
 
     jobName = testEnv arch opsys buildConfig
@@ -587,6 +645,7 @@ job arch opsys buildConfig = (jobName, Job {..})
         , "bash .gitlab/ci.sh test_hadrian" ]
       | otherwise
       = [ "find libraries -name config.sub -exec cp config.sub {} \\;" | Darwin == opsys ] ++
+        [ "sudo apk del --purge glibc*" | opsys == Linux Alpine, isNothing $ crossTarget buildConfig ] ++
         [ "sudo chown ghc:ghc -R ." | Linux {} <- [opsys]] ++
         [ ".gitlab/ci.sh setup"
         , ".gitlab/ci.sh configure"
@@ -609,13 +668,23 @@ job arch opsys buildConfig = (jobName, Job {..})
     jobDependencies = []
     jobVariables = mconcat
       [ opsysVariables arch opsys
-      ,"TEST_ENV" =: testEnv arch opsys buildConfig
+      , "TEST_ENV" =: testEnv arch opsys buildConfig
       , "BIN_DIST_NAME" =: binDistName arch opsys buildConfig
       , "BUILD_FLAVOUR" =: flavourString jobFlavour
       , "BIGNUM_BACKEND" =: bignumString (bignumBackend buildConfig)
       , "CONFIGURE_ARGS" =: configureArgsStr buildConfig
-
-      , if withNuma buildConfig then "ENABLE_NUMA" =: "1" else M.empty
+      , maybe mempty ("CONFIGURE_WRAPPER" =:) (configureWrapper buildConfig)
+      , maybe mempty ("CROSS_TARGET" =:) (crossTarget buildConfig)
+      , case crossEmulator buildConfig of
+          NoEmulator       -> case crossTarget buildConfig of
+            Nothing -> mempty
+            Just _  -> "CROSS_EMULATOR" =: "NOT_SET" -- we need an emulator but it isn't set. Won't run the testsuite
+          Emulator s       -> "CROSS_EMULATOR" =: s
+          NoEmulatorNeeded -> mempty
+      , if withNuma buildConfig then "ENABLE_NUMA" =: "1" else mempty
+      , if validateNonmovingGc buildConfig
+           then "RUNTEST_ARGS" =: "--way=nonmoving --way=nonmoving_thr --way=nonmoving_thr_sanity"
+           else mempty
       ]
 
     jobArtifacts = Artifacts
@@ -649,11 +718,11 @@ job arch opsys buildConfig = (jobName, Job {..})
 
 -- | Modify all jobs in a 'JobGroup'
 modifyJobs :: (a -> a) -> JobGroup a -> JobGroup a
-modifyJobs f = fmap f
+modifyJobs = fmap
 
 -- | Modify just the validate jobs in a 'JobGroup'
 modifyValidateJobs :: (a -> a) -> JobGroup a -> JobGroup a
-modifyValidateJobs f jg = jg { v = f <$> (v jg) }
+modifyValidateJobs f jg = jg { v = f <$> v jg }
 
 -- Generic helpers
 
@@ -661,24 +730,31 @@ addJobRule :: Rule -> Job -> Job
 addJobRule r j = j { jobRules = enableRule r (jobRules j) }
 
 addVariable :: String -> String -> Job -> Job
-addVariable k v j = j { jobVariables = M.insertWith (++) k [v] (jobVariables j) }
+addVariable k v j = j { jobVariables = mminsertWith (++) k [v] (jobVariables j) }
+
+setVariable :: String -> String -> Job -> Job
+setVariable k v j = j { jobVariables = MonoidalMap $ Map.insert k [v] $ unMonoidalMap $ jobVariables j }
+
+delVariable :: String -> Job -> Job
+delVariable k j = j { jobVariables = MonoidalMap $ Map.delete k $ unMonoidalMap $ jobVariables j }
 
 -- Building the standard jobs
 --
 -- | Make a normal validate CI job
-validate :: Arch -> Opsys -> BuildConfig -> (String, Job)
-validate arch opsys bc =
-  job arch opsys bc
+validate :: Arch -> Opsys -> BuildConfig -> NamedJob Job
+validate = job
 
 -- | Make a normal nightly CI job
+nightly :: Arch -> Opsys -> BuildConfig -> NamedJob Job
 nightly arch opsys bc =
-  let (n, j) = job arch opsys bc
-  in ("nightly-" ++ n, addJobRule Nightly . keepArtifacts "8 weeks" . highCompression $ j)
+  let NamedJob n j = job arch opsys bc
+  in NamedJob { name = "nightly-" ++ n, jobInfo = addJobRule Nightly . keepArtifacts "8 weeks" . highCompression $ j}
 
 -- | Make a normal release CI job
+release :: Arch -> Opsys -> BuildConfig -> NamedJob Job
 release arch opsys bc =
-  let (n, j) = job arch opsys (bc { buildFlavour = Release })
-  in ("release-" ++ n, addJobRule ReleaseOnly . keepArtifacts "1 year" . ignorePerfFailures . highCompression $ j)
+  let NamedJob n j = job arch opsys (bc { buildFlavour = Release })
+  in NamedJob { name = "release-" ++ n, jobInfo = addJobRule ReleaseOnly . keepArtifacts "1 year" . ignorePerfFailures . highCompression $ j}
 
 -- Specific job modification functions
 
@@ -721,17 +797,33 @@ addValidateRule t = modifyValidateJobs (addJobRule t)
 disableValidate :: JobGroup Job -> JobGroup Job
 disableValidate = addValidateRule Disable
 
+data NamedJob a = NamedJob { name :: String, jobInfo :: a } deriving Functor
+
+renameJob :: (String -> String) -> NamedJob a -> NamedJob a
+renameJob f (NamedJob n i) = NamedJob (f n) i
+
+instance ToJSON a => ToJSON (NamedJob a) where
+  toJSON nj = object
+    [ "name" A..= name nj
+    , "jobInfo" A..= jobInfo nj ]
+
 -- Jobs are grouped into either triples or pairs depending on whether the
 -- job is just validate and nightly, or also release.
-data JobGroup a = StandardTriple { v :: (String, a)
-                                 , n :: (String, a)
-                                 , r :: (String, a) }
-                | ValidateOnly   { v :: (String, a)
-                                 , n :: (String, a) } deriving Functor
+data JobGroup a = StandardTriple { v :: NamedJob a
+                                 , n :: NamedJob a
+                                 , r :: NamedJob a }
+                | ValidateOnly   { v :: NamedJob a
+                                 , n :: NamedJob a } deriving Functor
+
+instance ToJSON a => ToJSON (JobGroup a) where
+  toJSON jg = object
+    [ "n" A..= n jg
+    , "r" A..= r jg
+    ]
 
 rename :: (String -> String) -> JobGroup a -> JobGroup a
-rename f (StandardTriple (nv, v) (nn, n) (nr, r)) = StandardTriple (f nv, v) (f nn, n) (f nr, r)
-rename f (ValidateOnly (nv, v) (nn, n)) = ValidateOnly (f nv, v) (f nn, n)
+rename f (StandardTriple nv nn nr) = StandardTriple (renameJob f nv) (renameJob f nn) (renameJob f nr)
+rename f (ValidateOnly nv nn) = ValidateOnly (renameJob f nv) (renameJob f nn)
 
 -- | Construct a 'JobGroup' which consists of a validate, nightly and release build with
 -- a specific config.
@@ -752,16 +844,24 @@ validateBuilds :: Arch -> Opsys -> BuildConfig -> JobGroup Job
 validateBuilds a op bc = ValidateOnly (validate a op bc) (nightly a op bc)
 
 flattenJobGroup :: JobGroup a -> [(String, a)]
-flattenJobGroup (StandardTriple a b c) = [a,b,c]
-flattenJobGroup (ValidateOnly a b) = [a, b]
+flattenJobGroup (StandardTriple a b c) = map flattenNamedJob [a,b,c]
+flattenJobGroup (ValidateOnly a b) = map flattenNamedJob [a, b]
+
+flattenNamedJob :: NamedJob a -> (String, a)
+flattenNamedJob (NamedJob n i) = (n, i)
 
 
 -- | Specification for all the jobs we want to build.
-jobs :: M.MonoidalMap String Job
-jobs = M.fromList $ concatMap flattenJobGroup $
+jobs :: Map String Job
+jobs = Map.fromList $ concatMap (filter is_enabled_job . flattenJobGroup) job_groups
+  where
+    is_enabled_job (_, Job {jobRules = OnOffRules {..}}) = not $ Disable `S.member` rule_set
+
+job_groups :: [JobGroup Job]
+job_groups =
      [ disableValidate (standardBuilds Amd64 (Linux Debian10))
-     , (standardBuildsWithConfig Amd64 (Linux Debian10) dwarf)
-     , (validateBuilds Amd64 (Linux Debian10) nativeInt)
+     , standardBuildsWithConfig Amd64 (Linux Debian10) dwarf
+     , validateBuilds Amd64 (Linux Debian10) nativeInt
      , fastCI (validateBuilds Amd64 (Linux Debian10) unreg)
      , fastCI (validateBuilds Amd64 (Linux Debian10) debug)
      , modifyValidateJobs manual tsan_jobs
@@ -771,35 +871,47 @@ jobs = M.fromList $ concatMap flattenJobGroup $
      , disableValidate (standardBuilds Amd64 (Linux Debian11))
      -- We still build Deb9 bindists for now due to Ubuntu 18 and Linux Mint 19
      -- not being at EOL until April 2023 and they still need tinfo5.
-     , disableValidate (standardBuilds Amd64 (Linux Debian9))
+     , disableValidate (standardBuildsWithConfig Amd64 (Linux Debian9) (splitSectionsBroken vanilla))
+     , disableValidate (standardBuilds Amd64 (Linux Ubuntu1804))
      , disableValidate (standardBuilds Amd64 (Linux Ubuntu2004))
-     , disableValidate (standardBuilds Amd64 (Linux Centos7))
+     , disableValidate (standardBuilds Amd64 (Linux Rocky8))
+     , disableValidate (standardBuildsWithConfig Amd64 (Linux Centos7) (splitSectionsBroken vanilla))
      -- Fedora33 job is always built with perf so there's one job in the normal
      -- validate pipeline which is built with perf.
-     , (standardBuildsWithConfig Amd64 (Linux Fedora33) releaseConfig)
-     , (standardBuildsWithConfig Amd64 (Linux Fedora27) releaseConfig)
+     , standardBuildsWithConfig Amd64 (Linux Fedora33) releaseConfig
      -- This job is only for generating head.hackage docs
      , hackage_doc_job (disableValidate (standardBuildsWithConfig Amd64 (Linux Fedora33) releaseConfig))
      , disableValidate (standardBuildsWithConfig Amd64 (Linux Fedora33) dwarf)
-     , fastCI (standardBuilds Amd64 Windows)
+     , fastCI (standardBuildsWithConfig Amd64 Windows vanilla)
      , disableValidate (standardBuildsWithConfig Amd64 Windows nativeInt)
      , standardBuilds Amd64 Darwin
-     , allowFailureGroup (addValidateRule FreeBSDLabel (standardBuilds Amd64 FreeBSD13))
+     , allowFailureGroup (addValidateRule FreeBSDLabel (validateBuilds Amd64 FreeBSD13 vanilla))
      , standardBuilds AArch64 Darwin
-     , standardBuilds AArch64 (Linux Debian10)
-     , allowFailureGroup (addValidateRule ARMLabel (standardBuilds ARMv7 (Linux Debian10)))
-     , standardBuilds I386 (Linux Debian9)
+     , standardBuildsWithConfig AArch64 (Linux Debian10) (splitSectionsBroken vanilla)
+     , standardBuildsWithConfig I386 (Linux Debian9) (splitSectionsBroken vanilla)
      -- Fully static build, in theory usable on any linux distribution.
-     , allowFailureGroup (fullyStaticBrokenTests (standardBuildsWithConfig Amd64 (Linux Alpine) static))
-     , disableValidate (fullyStaticBrokenTests (allowFailureGroup (standardBuildsWithConfig Amd64 (Linux Alpine) staticNativeInt)))
+     , fullyStaticBrokenTests (standardBuildsWithConfig Amd64 (Linux Alpine) (splitSectionsBroken static))
      -- Dynamically linked build, suitable for building your own static executables on alpine
-     , disableValidate (standardBuildsWithConfig Amd64 (Linux Alpine) vanilla)
+     , disableValidate (standardBuildsWithConfig Amd64 (Linux Alpine) (splitSectionsBroken vanilla))
+     , fullyStaticBrokenTests (disableValidate (allowFailureGroup (standardBuildsWithConfig Amd64 (Linux Alpine) staticNativeInt)))
+     , validateBuilds Amd64 (Linux Debian11) (crossConfig "aarch64-linux-gnu" (Emulator "qemu-aarch64 -L /usr/aarch64-linux-gnu") Nothing)
+     , validateBuilds Amd64 (Linux Debian11) (crossConfig "javascript-unknown-ghcjs" NoEmulatorNeeded (Just "emconfigure")
+        )
+        { bignumBackend = Native
+        }
+     , make_wasm_jobs wasm_build_config
+     , disableValidate $ make_wasm_jobs wasm_build_config { bignumBackend = Native }
+     , disableValidate $ make_wasm_jobs wasm_build_config { unregisterised = True }
+     , addValidateRule NonmovingGc (standardBuildsWithConfig Amd64 (Linux Debian11) vanilla {validateNonmovingGc = True})
      ]
 
   where
 
     -- ghcilink002 broken due to #17869
-    fullyStaticBrokenTests = modifyJobs (addVariable "BROKEN_TESTS" "ghcilink002 ")
+    --
+    -- linker_unload_native: due to musl not supporting any means of probing dynlib dependencies
+    -- (see Note [Object unloading]).
+    fullyStaticBrokenTests = modifyJobs (addVariable "BROKEN_TESTS" "ghcilink002 linker_unload_native")
 
     hackage_doc_job = rename (<> "-hackage") . modifyJobs (addVariable "HADRIAN_ARGS" "--haddock-base-url")
 
@@ -811,10 +923,73 @@ jobs = M.fromList $ concatMap flattenJobGroup $
         . addVariable "HADRIAN_ARGS" "--docs=none") $
       validateBuilds Amd64 (Linux Debian10) tsan
 
+    make_wasm_jobs cfg =
+      modifyJobs
+        ( delVariable "BROKEN_TESTS"
+            . setVariable "HADRIAN_ARGS" "--docs=none"
+            . delVariable "INSTALL_CONFIGURE_ARGS"
+        )
+        $ validateBuilds Amd64 (Linux Alpine) cfg
+
+    wasm_build_config =
+      (crossConfig "wasm32-wasi" NoEmulatorNeeded Nothing)
+        {
+          fullyStatic = True
+          , buildFlavour     = Release -- TODO: This needs to be validate but wasm backend doesn't pass yet
+        }
+
+
+mkPlatform :: Arch -> Opsys -> String
+mkPlatform arch opsys = archName arch <> "-" <> opsysName opsys
+
+-- | This map tells us for a specific arch/opsys combo what the job name for
+-- nightly/release pipelines is. This is used by the ghcup metadata generation so that
+-- things like bindist names etc are kept in-sync.
+--
+-- For cases where there are just
+--
+-- Otherwise:
+--  * Prefer jobs which have a corresponding release pipeline
+--  * Explicitly require tie-breaking for other cases.
+platform_mapping :: Map String (JobGroup BindistInfo)
+platform_mapping = Map.map go $
+  Map.fromListWith combine [ (uncurry mkPlatform (jobPlatform (jobInfo $ v j)), j) | j <- filter hasReleaseBuild job_groups ]
+  where
+    whitelist = [ "x86_64-linux-alpine3_12-validate"
+                , "x86_64-linux-deb10-validate"
+                , "x86_64-linux-deb11-validate"
+                , "x86_64-linux-fedora33-release"
+                , "x86_64-windows-validate"
+                ]
+
+    combine a b
+      | name (v a) `elem` whitelist = a -- Explicitly selected
+      | name (v b) `elem` whitelist = b
+      | otherwise = error (show (name (v a)) ++ show (name (v b)))
+
+    go = fmap (BindistInfo . unwords . fromJust . mmlookup "BIN_DIST_NAME" . jobVariables)
+
+    hasReleaseBuild (StandardTriple{}) = True
+    hasReleaseBuild (ValidateOnly{}) = False
+
+data BindistInfo = BindistInfo { bindistName :: String }
+
+instance ToJSON BindistInfo where
+  toJSON (BindistInfo n) = object [ "bindistName" A..= n ]
+
+
+main :: IO ()
 main = do
-  as <- getArgs
+  ass <- getArgs
+  case ass of
+    -- See Note [Generation Modes]
+    ("gitlab":as) -> write_result as jobs
+    ("metadata":as) -> write_result as platform_mapping
+    _ -> error "gen_ci.hs <gitlab|metadata> [file.json]"
+
+write_result as obj =
   (case as of
     [] -> B.putStrLn
     (fp:_) -> B.writeFile fp)
-    (A.encode jobs)
+    (A.encode obj)
 

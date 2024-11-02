@@ -48,7 +48,7 @@ Alternative approaches that did not work properly:
 -}
 module GHC.Parser.PostProcess.Haddock (addHaddockToModule) where
 
-import GHC.Prelude hiding (mod)
+import GHC.Prelude hiding (head, init, last, mod, tail)
 
 import GHC.Hs
 
@@ -60,6 +60,8 @@ import Data.Semigroup
 import Data.Foldable
 import Data.Traversable
 import Data.Maybe
+import Data.List.NonEmpty (nonEmpty)
+import qualified Data.List.NonEmpty as NE
 import Control.Monad
 import Control.Monad.Trans.State.Strict
 import Control.Monad.Trans.Reader
@@ -178,7 +180,7 @@ we have to use 'flattenBindsAndSigs' to traverse it in the correct order.
 -- to a parsed HsModule.
 --
 -- Reports badly positioned comments when -Winvalid-haddock is enabled.
-addHaddockToModule :: Located HsModule -> P (Located HsModule)
+addHaddockToModule :: Located (HsModule GhcPs) -> P (Located (HsModule GhcPs))
 addHaddockToModule lmod = do
   pState <- getPState
   let all_comments = toList (hdk_comments pState)
@@ -239,7 +241,7 @@ instance HasHaddock a => HasHaddock [a] where
 --        item4
 --      ) where
 --
-instance HasHaddock (Located HsModule) where
+instance HasHaddock (Located (HsModule GhcPs)) where
   addHaddock (L l_mod mod) = do
     -- Step 1, get the module header documentation comment:
     --
@@ -287,13 +289,13 @@ instance HasHaddock (Located HsModule) where
     --      data C = MkC  -- ^ Comment on MkC
     --      -- ^ Comment on C
     --
-    let layout_info = hsmodLayout mod
+    let layout_info = hsmodLayout (hsmodExt mod)
     hsmodDecls' <- addHaddockInterleaveItems layout_info (mkDocHsDecl layout_info) (hsmodDecls mod)
 
     pure $ L l_mod $
       mod { hsmodExports = hsmodExports'
           , hsmodDecls = hsmodDecls'
-          , hsmodHaddockModHeader = join @Maybe headerDocs }
+          , hsmodExt = (hsmodExt mod) { hsmodHaddockModHeader = join @Maybe headerDocs } }
 
 lexHsDocString :: HsDocString -> HsDoc GhcPs
 lexHsDocString = lexHsDoc parseIdentifier
@@ -338,7 +340,7 @@ In this case, we should produce four HsDecl items (pseudo-code):
 
 The inputs to addHaddockInterleaveItems are:
 
-  * layout_info :: LayoutInfo
+  * layout_info :: LayoutInfo GhcPs
 
     In the example above, note that the indentation level inside the module is
     2 spaces. It would be represented as layout_info = VirtualBraces 2.
@@ -370,7 +372,7 @@ The inputs to addHaddockInterleaveItems are:
 addHaddockInterleaveItems
   :: forall a.
      HasHaddock a
-  => LayoutInfo
+  => LayoutInfo GhcPs
   -> (PsLocated HdkComment -> Maybe a) -- Get a documentation item
   -> [a]           -- Unprocessed (non-documentation) items
   -> HdkA [a]      -- Documentation items & processed non-documentation items
@@ -387,7 +389,7 @@ addHaddockInterleaveItems layout_info get_doc_item = go
     with_layout_info :: HdkA a -> HdkA a
     with_layout_info = case layout_info of
       NoLayoutInfo -> id
-      ExplicitBraces -> id
+      ExplicitBraces{} -> id
       VirtualBraces n ->
         let loc_range = mempty { loc_range_col = ColumnFrom (n+1) }
         in hoistHdkA (inLocRange loc_range)
@@ -496,7 +498,7 @@ instance HasHaddock (HsDecl GhcPs) where
   --      -- ^ Comment on the second method
   --
   addHaddock (TyClD _ decl)
-    | ClassDecl { tcdCExt = (x, NoAnnSortKey, tcdLayout),
+    | ClassDecl { tcdCExt = (x, NoAnnSortKey), tcdLayout,
                   tcdCtxt, tcdLName, tcdTyVars, tcdFixity, tcdFDs,
                   tcdSigs, tcdMeths, tcdATs, tcdATDefs } <- decl
     = do
@@ -507,7 +509,7 @@ instance HasHaddock (HsDecl GhcPs) where
           flattenBindsAndSigs (tcdMeths, tcdSigs, tcdATs, tcdATDefs, [], [])
         pure $
           let (tcdMeths', tcdSigs', tcdATs', tcdATDefs', _, tcdDocs) = partitionBindsAndSigs where_cls'
-              decl' = ClassDecl { tcdCExt = (x, NoAnnSortKey, tcdLayout)
+              decl' = ClassDecl { tcdCExt = (x, NoAnnSortKey), tcdLayout
                                 , tcdCtxt, tcdLName, tcdTyVars, tcdFixity, tcdFDs
                                 , tcdSigs = tcdSigs'
                                 , tcdMeths = tcdMeths'
@@ -584,7 +586,7 @@ instance HasHaddock (HsDataDefn GhcPs) where
     --      = MkT1 Int Bool  -- ^ Comment on MkT1
     --      | MkT2 Char Int  -- ^ Comment on MkT2
     --
-    dd_cons' <- addHaddock (dd_cons defn)
+    dd_cons' <- traverse addHaddock (dd_cons defn)
 
     -- Process the deriving clauses:
     --
@@ -696,9 +698,9 @@ instance HasHaddock (LocatedA (ConDecl GhcPs)) where
   addHaddock (L l_con_decl con_decl) =
     extendHdkA (locA l_con_decl) $
     case con_decl of
-      ConDeclGADT { con_g_ext, con_names, con_bndrs, con_mb_cxt, con_g_args, con_res_ty } -> do
+      ConDeclGADT { con_g_ext, con_names, con_dcolon, con_bndrs, con_mb_cxt, con_g_args, con_res_ty } -> do
         -- discardHasInnerDocs is ok because we don't need this info for GADTs.
-        con_doc' <- discardHasInnerDocs $ getConDoc (getLocA (head con_names))
+        con_doc' <- discardHasInnerDocs $ getConDoc (getLocA (NE.head con_names))
         con_g_args' <-
           case con_g_args of
             PrefixConGADT ts -> PrefixConGADT <$> addHaddock ts
@@ -708,7 +710,7 @@ instance HasHaddock (LocatedA (ConDecl GhcPs)) where
               pure $ RecConGADT (L l_rec flds') arr
         con_res_ty' <- addHaddock con_res_ty
         pure $ L l_con_decl $
-          ConDeclGADT { con_g_ext, con_names, con_bndrs, con_mb_cxt,
+          ConDeclGADT { con_g_ext, con_names, con_dcolon, con_bndrs, con_mb_cxt,
                         con_doc = lexLHsDocString <$> con_doc',
                         con_g_args = con_g_args',
                         con_res_ty = con_res_ty' }
@@ -872,13 +874,13 @@ addConTrailingDoc l_sep =
                     doc <- selectDocString trailingDocs
                     return $ L l' (con_fld { cd_fld_doc = fmap lexLHsDocString doc })
               con_args' <- case con_args con_decl of
-                x@(PrefixCon _ [])  -> x <$ reportExtraDocs trailingDocs
-                x@(RecCon (L _ [])) -> x <$ reportExtraDocs trailingDocs
-                PrefixCon _ ts -> PrefixCon noTypeArgs <$> mapLastM mk_doc_ty ts
+                x@(PrefixCon _ ts) -> case nonEmpty ts of
+                    Nothing -> x <$ reportExtraDocs trailingDocs
+                    Just ts -> PrefixCon noTypeArgs . toList <$> mapLastM mk_doc_ty ts
+                x@(RecCon (L l_rec flds)) -> case nonEmpty flds of
+                    Nothing -> x <$ reportExtraDocs trailingDocs
+                    Just flds -> RecCon . L l_rec . toList <$> mapLastM mk_doc_fld flds
                 InfixCon t1 t2 -> InfixCon t1 <$> mk_doc_ty t2
-                RecCon (L l_rec flds) -> do
-                  flds' <- mapLastM mk_doc_fld flds
-                  return (RecCon (L l_rec flds'))
               return $ L l (con_decl{ con_args = con_args' })
             else do
               con_doc' <- selectDoc (con_doc con_decl `mcons` (map lexLHsDocString trailingDocs))
@@ -1307,10 +1309,10 @@ reportExtraDocs =
 *                                                                      *
 ********************************************************************* -}
 
-mkDocHsDecl :: LayoutInfo -> PsLocated HdkComment -> Maybe (LHsDecl GhcPs)
-mkDocHsDecl layout_info a = mapLoc (DocD noExtField) <$> mkDocDecl layout_info a
+mkDocHsDecl :: LayoutInfo GhcPs -> PsLocated HdkComment -> Maybe (LHsDecl GhcPs)
+mkDocHsDecl layout_info a = fmap (DocD noExtField) <$> mkDocDecl layout_info a
 
-mkDocDecl :: LayoutInfo -> PsLocated HdkComment -> Maybe (LDocDecl GhcPs)
+mkDocDecl :: LayoutInfo GhcPs -> PsLocated HdkComment -> Maybe (LDocDecl GhcPs)
 mkDocDecl layout_info (L l_comment hdk_comment)
   | indent_mismatch = Nothing
   | otherwise =
@@ -1344,7 +1346,7 @@ mkDocDecl layout_info (L l_comment hdk_comment)
     --         -- ^ indent mismatch
     indent_mismatch = case layout_info of
       NoLayoutInfo -> False
-      ExplicitBraces -> False
+      ExplicitBraces{} -> False
       VirtualBraces n -> n /= srcSpanStartCol (psRealSpan l_comment)
 
 mkDocIE :: PsLocated HdkComment -> Maybe (LIE GhcPs)
@@ -1530,7 +1532,7 @@ mcons = maybe id (:)
 
 -- Map a function over a list of located items.
 mapLL :: (a -> b) -> [GenLocated l a] -> [GenLocated l b]
-mapLL f = map (mapLoc f)
+mapLL f = map (fmap f)
 
 {- Note [Old solution: Haddock in the grammar]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1576,7 +1578,7 @@ constructs that are separated by a keyword. For example:
 
 We could use EPA (exactprint annotations) to fix this, but not without
 modification. For example, EpaLocation contains RealSrcSpan but not BufSpan.
-Also, the fix would be more straghtforward after #19623.
+Also, the fix would be more straightforward after #19623.
 
 For examples, see tests/haddock/should_compile_flag_haddock/T17544_kw.hs
 -}

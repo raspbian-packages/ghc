@@ -1,6 +1,9 @@
 {-# LANGUAGE DeriveFunctor #-}
+{-# LANGUAGE DerivingVia   #-}
 {-# LANGUAGE GADTs         #-}
 {-# LANGUAGE LambdaCase    #-}
+{-# LANGUAGE PatternSynonyms #-}
+{-# LANGUAGE ViewPatterns #-}
 
 -----------------------------------------------------------------------------
 --
@@ -33,8 +36,7 @@ import GHC.CmmToAsm.CPrim
 
 import GHC.Cmm.BlockId
 import GHC.Cmm.CLabel
-import GHC.Cmm hiding (pprBBlock)
-import GHC.Cmm.Ppr () -- For Outputable instances
+import GHC.Cmm hiding (pprBBlock, pprStatic)
 import GHC.Cmm.Dataflow.Block
 import GHC.Cmm.Dataflow.Collections
 import GHC.Cmm.Dataflow.Graph
@@ -49,16 +51,16 @@ import GHC.Types.Unique
 
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
+import GHC.Utils.Monad.State.Strict (State (..), runState, state)
 import GHC.Utils.Misc
-import GHC.Utils.Trace
 
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.Char
 import Data.List (intersperse)
+import Data.List.NonEmpty (NonEmpty (..))
 import Data.Map (Map)
 import qualified Data.Map as Map
-import Control.Monad (ap)
 import GHC.Float
 
 -- --------------------------------------------------------------------------
@@ -85,7 +87,7 @@ pprTop platform = \case
            blankLine,
            extern_decls,
            (if (externallyVisibleCLabel clbl)
-                    then mkFN_ else mkIF_) (pprCLabel platform CStyle clbl) <+> lbrace,
+                    then mkFN_ else mkIF_) (pprCLabel platform clbl) <+> lbrace,
            nest 8 temp_decls,
            vcat (map (pprBBlock platform) blocks),
            rbrace ]
@@ -107,14 +109,14 @@ pprTop platform = \case
   (CmmData section (CmmStaticsRaw lbl [CmmString str])) ->
     pprExternDecl platform lbl $$
     hcat [
-      pprLocalness lbl, pprConstness (isSecConstant section), text "char ", pprCLabel platform CStyle lbl,
+      pprLocalness lbl, pprConstness (isSecConstant section), text "char ", pprCLabel platform lbl,
       text "[] = ", pprStringInCStyle str, semi
     ]
 
   (CmmData section (CmmStaticsRaw lbl [CmmUninitialised size])) ->
     pprExternDecl platform lbl $$
     hcat [
-      pprLocalness lbl, pprConstness (isSecConstant section), text "char ", pprCLabel platform CStyle lbl,
+      pprLocalness lbl, pprConstness (isSecConstant section), text "char ", pprCLabel platform lbl,
       brackets (int size), semi
     ]
 
@@ -131,7 +133,7 @@ pprTop platform = \case
 -- BasicBlocks are self-contained entities: they always end in a jump.
 --
 -- Like nativeGen/AsmCodeGen, we could probably reorder blocks to turn
--- as many jumps as possible into fall throughs.
+-- as many jumps as possible into fallthroughs.
 --
 
 pprBBlock :: Platform -> CmmBlock -> SDoc
@@ -150,7 +152,7 @@ pprWordArray platform is_ro lbl ds
   = -- TODO: align closures only
     pprExternDecl platform lbl $$
     hcat [ pprLocalness lbl, pprConstness is_ro, text "StgWord"
-         , space, pprCLabel platform CStyle lbl, text "[]"
+         , space, pprCLabel platform lbl, text "[]"
          -- See Note [StgWord alignment]
          , pprAlignment (wordWidth platform)
          , text "= {" ]
@@ -242,16 +244,16 @@ pprStmt platform stmt =
             case fn of
               CmmLit (CmmLabel lbl)
                 | StdCallConv <- cconv ->
-                    pprCall platform (pprCLabel platform CStyle lbl) cconv hresults hargs
+                    pprCall platform (pprCLabel platform lbl) cconv hresults hargs
                         -- stdcall functions must be declared with
                         -- a function type, otherwise the C compiler
                         -- doesn't add the @n suffix to the label.  We
                         -- can't add the @n suffix ourselves, because
                         -- it isn't valid C.
                 | CmmNeverReturns <- ret ->
-                    pprCall platform cast_fn cconv hresults hargs <> semi
+                    pprCall platform cast_fn cconv hresults hargs <> semi <> text "__builtin_unreachable();"
                 | not (isMathFun lbl) ->
-                    pprForeignCall platform (pprCLabel platform CStyle lbl) cconv hresults hargs
+                    pprForeignCall platform (pprCLabel platform lbl) cconv hresults hargs
               _ ->
                     pprCall platform cast_fn cconv hresults hargs <> semi
                         -- for a dynamic call, no declaration is necessary.
@@ -345,7 +347,7 @@ pprSwitch platform e ids
     rep = typeWidth (cmmExprType platform e)
 
     -- fall through case
-    caseify (ix:ixs, ident) = vcat (map do_fallthrough ixs) $$ final_branch ix
+    caseify (ix:|ixs, ident) = vcat (map do_fallthrough ixs) $$ final_branch ix
         where
         do_fallthrough ix =
                  hsep [ text "case" , pprHexVal platform ix rep <> colon ,
@@ -354,8 +356,6 @@ pprSwitch platform e ids
         final_branch ix =
                 hsep [ text "case" , pprHexVal platform ix rep <> colon ,
                        text "goto" , (pprBlockId ident) <> semi ]
-
-    caseify (_     , _    ) = panic "pprSwitch: switch with no cases!"
 
     def | Just l <- mbdef = text "default: goto" <+> pprBlockId l <> semi
         | otherwise       = text "default: __builtin_unreachable();"
@@ -430,8 +430,7 @@ pprMachOpApp :: Platform -> MachOp -> [CmmExpr] -> SDoc
 pprMachOpApp platform op args
   | isMulMayOfloOp op
   = text "mulIntMayOflo" <> parens (commafy (map (pprExpr platform) args))
-  where isMulMayOfloOp (MO_U_MulMayOflo _) = True
-        isMulMayOfloOp (MO_S_MulMayOflo _) = True
+  where isMulMayOfloOp (MO_S_MulMayOflo _) = True
         isMulMayOfloOp _ = False
 
 pprMachOpApp platform mop args
@@ -594,7 +593,7 @@ pprLit platform lit = case lit of
         -> mkW_ <> pprCLabelAddr clbl1 <> char '+' <> int i
 
     where
-        pprCLabelAddr lbl = char '&' <> pprCLabel platform CStyle lbl
+        pprCLabelAddr lbl = char '&' <> pprCLabel platform lbl
 
 pprLit1 :: Platform -> CmmLit -> SDoc
 pprLit1 platform lit = case lit of
@@ -775,10 +774,6 @@ pprMachOp_for_C platform mop = case mop of
                                 (text "MO_S_MulMayOflo")
                                 (panic $ "PprC.pprMachOp_for_C: MO_S_MulMayOflo"
                                       ++ " should have been handled earlier!")
-        MO_U_MulMayOflo _ -> pprTrace "offending mop:"
-                                (text "MO_U_MulMayOflo")
-                                (panic $ "PprC.pprMachOp_for_C: MO_U_MulMayOflo"
-                                      ++ " should have been handled earlier!")
 
         MO_V_Insert {}    -> pprTrace "offending mop:"
                                 (text "MO_V_Insert")
@@ -854,7 +849,7 @@ pprMachOp_for_C platform mop = case mop of
                                 (panic $ "PprC.pprMachOp_for_C: MO_VF_Quot"
                                       ++ " should have been handled earlier!")
 
-        MO_AlignmentCheck {} -> panic "-falignment-santisation not supported by unregisterised backend"
+        MO_AlignmentCheck {} -> panic "-falignment-sanitisation not supported by unregisterised backend"
 
 signedOp :: MachOp -> Bool      -- Argument type(s) are signed ints
 signedOp (MO_S_Quot _)    = True
@@ -969,39 +964,37 @@ pprCallishMachOp_for_C mop
         -- Not adding it for now
         (MO_Prefetch_Data _ ) -> unsupported
 
-        MO_I64_ToI   -> dontReach64
-        MO_I64_FromI -> dontReach64
-        MO_W64_ToW   -> dontReach64
-        MO_W64_FromW -> dontReach64
-        MO_x64_Neg   -> dontReach64
-        MO_x64_Add   -> dontReach64
-        MO_x64_Sub   -> dontReach64
-        MO_x64_Mul   -> dontReach64
-        MO_I64_Quot  -> dontReach64
-        MO_I64_Rem   -> dontReach64
-        MO_W64_Quot  -> dontReach64
-        MO_W64_Rem   -> dontReach64
-        MO_x64_And   -> dontReach64
-        MO_x64_Or    -> dontReach64
-        MO_x64_Xor   -> dontReach64
-        MO_x64_Not   -> dontReach64
-        MO_x64_Shl   -> dontReach64
-        MO_I64_Shr   -> dontReach64
-        MO_W64_Shr   -> dontReach64
-        MO_x64_Eq    -> dontReach64
-        MO_x64_Ne    -> dontReach64
-        MO_I64_Ge    -> dontReach64
-        MO_I64_Gt    -> dontReach64
-        MO_I64_Le    -> dontReach64
-        MO_I64_Lt    -> dontReach64
-        MO_W64_Ge    -> dontReach64
-        MO_W64_Gt    -> dontReach64
-        MO_W64_Le    -> dontReach64
-        MO_W64_Lt    -> dontReach64
+        MO_I64_ToI   -> text "hs_int64ToInt"
+        MO_I64_FromI -> text "hs_intToInt64"
+        MO_W64_ToW   -> text "hs_word64ToWord"
+        MO_W64_FromW -> text "hs_wordToWord64"
+        MO_x64_Neg   -> text "hs_neg64"
+        MO_x64_Add   -> text "hs_add64"
+        MO_x64_Sub   -> text "hs_sub64"
+        MO_x64_Mul   -> text "hs_mul64"
+        MO_I64_Quot  -> text "hs_quotInt64"
+        MO_I64_Rem   -> text "hs_remInt64"
+        MO_W64_Quot  -> text "hs_quotWord64"
+        MO_W64_Rem   -> text "hs_remWord64"
+        MO_x64_And   -> text "hs_and64"
+        MO_x64_Or    -> text "hs_or64"
+        MO_x64_Xor   -> text "hs_xor64"
+        MO_x64_Not   -> text "hs_not64"
+        MO_x64_Shl   -> text "hs_uncheckedShiftL64"
+        MO_I64_Shr   -> text "hs_uncheckedIShiftRA64"
+        MO_W64_Shr   -> text "hs_uncheckedShiftRL64"
+        MO_x64_Eq    -> text "hs_eq64"
+        MO_x64_Ne    -> text "hs_ne64"
+        MO_I64_Ge    -> text "hs_geInt64"
+        MO_I64_Gt    -> text "hs_gtInt64"
+        MO_I64_Le    -> text "hs_leInt64"
+        MO_I64_Lt    -> text "hs_ltInt64"
+        MO_W64_Ge    -> text "hs_geWord64"
+        MO_W64_Gt    -> text "hs_gtWord64"
+        MO_W64_Le    -> text "hs_leWord64"
+        MO_W64_Lt    -> text "hs_ltWord64"
     where unsupported = panic ("pprCallishMachOp_for_C: " ++ show mop
                             ++ " not supported!")
-          dontReach64 = panic ("pprCallishMachOp_for_C: " ++ show mop
-                            ++ " should be not be encountered because the regular primop for this 64-bit operation is used instead.")
 
 -- ---------------------------------------------------------------------
 -- Useful #defines
@@ -1210,7 +1203,7 @@ pprExternDecl platform lbl
   | not (needsCDecl lbl) = empty
   | Just sz <- foreignLabelStdcallInfo lbl = stdcall_decl sz
   | otherwise =
-        hcat [ visibility, label_type lbl , lparen, pprCLabel platform CStyle lbl, text ");"
+        hcat [ visibility, label_type lbl , lparen, pprCLabel platform lbl, text ");"
              -- occasionally useful to see label type
              -- , text "/* ", pprDebugCLabel lbl, text " */"
              ]
@@ -1233,19 +1226,19 @@ pprExternDecl platform lbl
   -- we must generate an appropriate prototype for it, so that the C compiler will
   -- add the @n suffix to the label (#2276)
   stdcall_decl sz =
-        text "extern __attribute__((stdcall)) void " <> pprCLabel platform CStyle lbl
+        text "extern __attribute__((stdcall)) void " <> pprCLabel platform lbl
         <> parens (commafy (replicate (sz `quot` platformWordSizeInBytes platform) (machRep_U_CType platform (wordWidth platform))))
         <> semi
 
 type TEState = (UniqSet LocalReg, Map CLabel ())
-newtype TE a = TE { unTE :: TEState -> (a, TEState) } deriving (Functor)
+newtype TE a = TE' (State TEState a)
+  deriving stock (Functor)
+  deriving (Applicative, Monad) via State TEState
 
-instance Applicative TE where
-      pure a = TE $ \s -> (a, s)
-      (<*>) = ap
-
-instance Monad TE where
-   TE m >>= k  = TE $ \s -> case m s of (a, s') -> unTE (k a) s'
+pattern TE :: (TEState -> (a, TEState)) -> TE a
+pattern TE f <- TE' (runState -> f)
+  where TE f  = TE' (state f)
+{-# COMPLETE TE #-}
 
 te_lbl :: CLabel -> TE ()
 te_lbl lbl = TE $ \(temps,lbls) -> ((), (temps, Map.insert lbl () lbls))
@@ -1503,8 +1496,8 @@ pprCtorArray platform initOrFini lbls =
     <> text "void _hs_" <> attribute <> text "()"
     <> braces body
   where
-    body = vcat [ pprCLabel platform CStyle lbl <> text " ();" | lbl <- lbls ]
-    decls = vcat [ text "void" <+> pprCLabel platform CStyle lbl <> text " (void);" | lbl <- lbls ]
+    body = vcat [ pprCLabel platform lbl <> text " ();" | lbl <- lbls ]
+    decls = vcat [ text "void" <+> pprCLabel platform lbl <> text " (void);" | lbl <- lbls ]
     attribute = case initOrFini of
                   IsInitArray -> text "constructor"
                   IsFiniArray -> text "destructor"

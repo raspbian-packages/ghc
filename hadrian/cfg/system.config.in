@@ -91,13 +91,14 @@ ghc-patch-level       = @GhcPatchLevel@
 
 bootstrap-threaded-rts      = @GhcThreadedRts@
 
-project-name          = @ProjectName@
-project-version       = @ProjectVersion@
-project-version-int   = @ProjectVersionInt@
-project-patch-level   = @ProjectPatchLevel@
-project-patch-level1  = @ProjectPatchLevel1@
-project-patch-level2  = @ProjectPatchLevel2@
-project-git-commit-id = @ProjectGitCommitId@
+project-name           = @ProjectName@
+project-version        = @ProjectVersion@
+project-version-munged = @ProjectVersionMunged@
+project-version-int    = @ProjectVersionInt@
+project-patch-level    = @ProjectPatchLevel@
+project-patch-level1   = @ProjectPatchLevel1@
+project-patch-level2   = @ProjectPatchLevel2@
+project-git-commit-id  = @ProjectGitCommitId@
 
 # Compilation and linking flags:
 #===============================
@@ -138,9 +139,9 @@ conf-merge-objects-args-stage3  = @MergeObjsArgs@
 
 gcc-extra-via-c-opts = @GccExtraViaCOpts@
 ld-has-no-compact-unwind = @LdHasNoCompactUnwind@
-ld-has-build-id = @LdHasBuildId@
 ld-has-filelist = @LdHasFilelist@
 ld-is-gnu-ld = @LdIsGNULd@
+ld-supports-single-module = @LdHasSingleModule@
 ar-args = @ArArgs@
 
 settings-c-compiler-command = @SettingsCCompilerCommand@
@@ -161,7 +162,6 @@ settings-otool-command = @SettingsOtoolCommand@
 settings-install_name_tool-command = @SettingsInstallNameToolCommand@
 settings-dll-wrap-command = @SettingsDllWrapCommand@
 settings-windres-command = @SettingsWindresCommand@
-settings-libtool-command = @SettingsLibtoolCommand@
 settings-touch-command = @SettingsTouchCommand@
 settings-clang-command = @SettingsClangCommand@
 settings-llc-command = @SettingsLlcCommand@
@@ -204,5 +204,11 @@ libnuma-lib-dir       = @LibNumaLibDir@
 # Optional Dependencies:
 #=======================
 
-with-libdw = @UseLibdw@
-with-libnuma = @UseLibNuma@
+use-lib-dw        = @UseLibdw@
+use-lib-numa      = @UseLibNuma@
+use-lib-m         = @UseLibm@
+use-lib-rt        = @UseLibrt@
+use-lib-dl        = @UseLibdl@
+use-lib-bfd       = @UseLibbfd@
+use-lib-pthread   = @UseLibpthread@
+need-libatomic    = @NeedLibatomic@

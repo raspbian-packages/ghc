@@ -1,4 +1,5 @@
 {-# LANGUAGE CPP #-}
+{-# LANGUAGE ViewPatterns #-}
 {-# LANGUAGE ConstraintKinds #-}
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE FlexibleContexts #-}
@@ -28,9 +29,11 @@ module GHC.Hs.Pat (
         XXPatGhcTc(..),
 
         HsConPatDetails, hsConPatArgs,
+        HsConPatTyArg(..),
         HsRecFields(..), HsFieldBind(..), LHsFieldBind,
         HsRecField, LHsRecField,
         HsRecUpdField, LHsRecUpdField,
+        RecFieldsDotDot(..),
         hsRecFields, hsRecFieldSel, hsRecFieldId, hsRecFieldsArgs,
         hsRecUpdFieldId, hsRecUpdFieldOcc, hsRecUpdFieldRdr,
 
@@ -53,7 +56,7 @@ import GHC.Prelude
 import Language.Haskell.Syntax.Pat
 import Language.Haskell.Syntax.Expr ( HsExpr )
 
-import {-# SOURCE #-} GHC.Hs.Expr (pprLExpr, pprSplice)
+import {-# SOURCE #-} GHC.Hs.Expr (pprLExpr, pprUntypedSplice, HsUntypedSpliceResult(..))
 
 -- friends:
 import GHC.Hs.Binds
@@ -78,7 +81,7 @@ import GHC.Core.Type
 import GHC.Types.SrcLoc
 import GHC.Data.Bag -- collect ev vars from pats
 import GHC.Data.Maybe
-import GHC.Types.Name (Name)
+import GHC.Types.Name (Name, dataName)
 import GHC.Driver.Session
 import qualified GHC.LanguageExtensions as LangExt
 import Data.Data
@@ -94,7 +97,7 @@ type instance XLazyPat GhcPs = EpAnn [AddEpAnn] -- For '~'
 type instance XLazyPat GhcRn = NoExtField
 type instance XLazyPat GhcTc = NoExtField
 
-type instance XAsPat   GhcPs = EpAnn [AddEpAnn] -- For '@'
+type instance XAsPat   GhcPs = EpAnnCO
 type instance XAsPat   GhcRn = NoExtField
 type instance XAsPat   GhcTc = NoExtField
 
@@ -137,7 +140,7 @@ type instance XViewPat GhcTc = Type
   -- (= the argument type of the view function), for hsPatType.
 
 type instance XSplicePat GhcPs = NoExtField
-type instance XSplicePat GhcRn = NoExtField
+type instance XSplicePat GhcRn = HsUntypedSpliceResult (Pat GhcRn) -- See Note [Lifecycle of a splice] in GHC.Hs.Expr
 type instance XSplicePat GhcTc = DataConCantHappen
 
 type instance XLitPat    (GhcPass _) = NoExtField
@@ -259,6 +262,24 @@ hsRecUpdFieldOcc = fmap unambiguousFieldOcc . hfbLHS
 ************************************************************************
 -}
 
+instance Outputable (HsPatSigType p) => Outputable (HsConPatTyArg p) where
+  ppr (HsConPatTyArg _ ty) = char '@' <> ppr ty
+
+instance (Outputable arg, Outputable (XRec p (HsRecField p arg)), XRec p RecFieldsDotDot ~ Located RecFieldsDotDot)
+      => Outputable (HsRecFields p arg) where
+  ppr (HsRecFields { rec_flds = flds, rec_dotdot = Nothing })
+        = braces (fsep (punctuate comma (map ppr flds)))
+  ppr (HsRecFields { rec_flds = flds, rec_dotdot = Just (unLoc -> RecFieldsDotDot n) })
+        = braces (fsep (punctuate comma (map ppr (take n flds) ++ [dotdot])))
+        where
+          dotdot = text ".." <+> whenPprDebug (ppr (drop n flds))
+
+instance (Outputable p, OutputableBndr p, Outputable arg)
+      => Outputable (HsFieldBind p arg) where
+  ppr (HsFieldBind { hfbLHS = f, hfbRHS = arg,
+                     hfbPun = pun })
+    = pprPrefixOcc f <+> (ppUnless pun $ equals <+> ppr arg)
+
 instance OutputableBndrId p => Outputable (Pat (GhcPass p)) where
     ppr = pprPat
 
@@ -307,7 +328,7 @@ pprPat (VarPat _ lvar)          = pprPatBndr (unLoc lvar)
 pprPat (WildPat _)              = char '_'
 pprPat (LazyPat _ pat)          = char '~' <> pprParendLPat appPrec pat
 pprPat (BangPat _ pat)          = char '!' <> pprParendLPat appPrec pat
-pprPat (AsPat _ name pat)       = hcat [pprPrefixOcc (unLoc name), char '@',
+pprPat (AsPat _ name _ pat)     = hcat [pprPrefixOcc (unLoc name), char '@',
                                         pprParendLPat appPrec pat]
 pprPat (ViewPat _ expr pat)     = hcat [pprLExpr expr, text " -> ", ppr pat]
 pprPat (ParPat _ _ pat _)      = parens (ppr pat)
@@ -319,15 +340,20 @@ pprPat (NPlusKPat _ n k _ _ _)  = hcat [ppr_n, char '+', ppr k]
                   GhcPs -> ppr n
                   GhcRn -> ppr n
                   GhcTc -> ppr n
-pprPat (SplicePat _ splice)     = pprSplice splice
+pprPat (SplicePat ext splice)   =
+    case ghcPass @p of
+      GhcPs -> pprUntypedSplice True Nothing splice
+      GhcRn | HsUntypedSpliceNested n <- ext -> pprUntypedSplice True (Just n) splice
+      GhcRn | HsUntypedSpliceTop _ p  <- ext -> ppr p
+      GhcTc -> dataConCantHappen ext
 pprPat (SigPat _ pat ty)        = ppr pat <+> dcolon <+> ppr ty
 pprPat (ListPat _ pats)         = brackets (interpp'SP pats)
 pprPat (TuplePat _ pats bx)
     -- Special-case unary boxed tuples so that they are pretty-printed as
-    -- `Solo x`, not `(x)`
+    -- `MkSolo x`, not `(x)`
   | [pat] <- pats
   , Boxed <- bx
-  = hcat [text (mkTupleStr Boxed 1), pprParendLPat appPrec pat]
+  = hcat [text (mkTupleStr Boxed dataName 1), pprParendLPat appPrec pat]
   | otherwise
   = tupleParens (boxityTupleSort bx) (pprWithCommas ppr pats)
 pprPat (SumPat _ pat alt arity) = sumParens (pprAlternative ppr pat alt arity)
@@ -377,7 +403,7 @@ pprConArgs :: (OutputableBndrId p,
                      Outputable (Anno (IdGhcP p)))
            => HsConPatDetails (GhcPass p) -> SDoc
 pprConArgs (PrefixCon ts pats) = fsep (pprTyArgs ts : map (pprParendLPat appPrec) pats)
-  where pprTyArgs tyargs = fsep (map (\ty -> char '@' <> ppr ty) tyargs)
+  where pprTyArgs tyargs = fsep (map ppr tyargs)
 pprConArgs (InfixCon p1 p2)    = sep [ pprParendLPat appPrec p1
                                      , pprParendLPat appPrec p2 ]
 pprConArgs (RecCon rpats)      = ppr rpats
@@ -470,7 +496,7 @@ looksLazyLPat = looksLazyPat . unLoc
 
 looksLazyPat :: Pat (GhcPass p) -> Bool
 looksLazyPat (ParPat _ _ p _)  = looksLazyLPat p
-looksLazyPat (AsPat _ _ p)     = looksLazyLPat p
+looksLazyPat (AsPat _ _ _ p)   = looksLazyLPat p
 looksLazyPat (BangPat {})  = False
 looksLazyPat (VarPat {})   = False
 looksLazyPat (WildPat {})  = False
@@ -537,7 +563,7 @@ isIrrefutableHsPat' is_strict = goL
       | otherwise          = True
     go (BangPat _ pat)     = goL pat
     go (ParPat _ _ pat _)  = goL pat
-    go (AsPat _ _ pat)     = goL pat
+    go (AsPat _ _ _ pat)   = goL pat
     go (ViewPat _ _ pat)   = goL pat
     go (SigPat _ pat _)    = goL pat
     go (TuplePat _ pats _) = all goL pats
@@ -694,7 +720,7 @@ collectEvVarsPat :: Pat GhcTc -> Bag EvVar
 collectEvVarsPat pat =
   case pat of
     LazyPat _ p      -> collectEvVarsLPat p
-    AsPat _ _ p      -> collectEvVarsLPat p
+    AsPat _ _ _ p    -> collectEvVarsLPat p
     ParPat  _ _ p _  -> collectEvVarsLPat p
     BangPat _ p      -> collectEvVarsLPat p
     ListPat _ ps     -> unionManyBags $ map collectEvVarsLPat ps
@@ -728,3 +754,4 @@ type instance Anno (Pat (GhcPass p)) = SrcSpanAnnA
 type instance Anno (HsOverLit (GhcPass p)) = SrcAnn NoEpAnns
 type instance Anno ConLike = SrcSpanAnnN
 type instance Anno (HsFieldBind lhs rhs) = SrcSpanAnnA
+type instance Anno RecFieldsDotDot = SrcSpan

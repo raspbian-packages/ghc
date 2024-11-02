@@ -2,17 +2,17 @@ module GHC.Driver.Config.StgToCmm
   ( initStgToCmmConfig
   ) where
 
+import GHC.Prelude.Basic
+
 import GHC.StgToCmm.Config
 
 import GHC.Driver.Backend
 import GHC.Driver.Session
 import GHC.Platform
 import GHC.Platform.Profile
+import GHC.Utils.Error
 import GHC.Unit.Module
 import GHC.Utils.Outputable
-
-import Data.Maybe
-import Prelude
 
 initStgToCmmConfig :: DynFlags -> Module -> StgToCmmConfig
 initStgToCmmConfig dflags mod = StgToCmmConfig
@@ -21,7 +21,7 @@ initStgToCmmConfig dflags mod = StgToCmmConfig
   , stgToCmmThisModule    = mod
   , stgToCmmTmpDir        = tmpDir          dflags
   , stgToCmmContext       = initSDocContext dflags defaultDumpStyle
-  , stgToCmmDebugLevel    = debugLevel      dflags
+  , stgToCmmEmitDebugInfo = debugLevel      dflags > 0
   , stgToCmmBinBlobThresh = b_blob
   , stgToCmmMaxInlAllocSize = maxInlineAllocSize           dflags
   -- ticky options
@@ -38,6 +38,8 @@ initStgToCmmConfig dflags mod = StgToCmmConfig
   , stgToCmmSCCProfiling  = sccProfilingEnabled            dflags
   , stgToCmmEagerBlackHole = gopt Opt_EagerBlackHoling     dflags
   , stgToCmmInfoTableMap  = gopt Opt_InfoTableMap          dflags
+  , stgToCmmInfoTableMapWithFallback = gopt Opt_InfoTableMapWithFallback dflags
+  , stgToCmmInfoTableMapWithStack = gopt Opt_InfoTableMapWithStack dflags
   , stgToCmmOmitYields    = gopt Opt_OmitYields            dflags
   , stgToCmmOmitIfPragmas = gopt Opt_OmitInterfacePragmas  dflags
   , stgToCmmPIC           = gopt Opt_PIC                   dflags
@@ -46,12 +48,11 @@ initStgToCmmConfig dflags mod = StgToCmmConfig
   , stgToCmmDoBoundsCheck = gopt Opt_DoBoundsChecking      dflags
   , stgToCmmDoTagCheck    = gopt Opt_DoTagInferenceChecks  dflags
   -- backend flags
-  , stgToCmmAllowBigArith             = not ncg
+  , stgToCmmAllowBigArith             = not ncg || platformArch platform == ArchWasm32
   , stgToCmmAllowQuotRemInstr         = ncg  && (x86ish || ppc)
   , stgToCmmAllowQuotRem2             = (ncg && (x86ish || ppc)) || llvm
   , stgToCmmAllowExtendedAddSubInstrs = (ncg && (x86ish || ppc)) || llvm
   , stgToCmmAllowIntMul2Instr         = (ncg && x86ish) || llvm
-  , stgToCmmAllowFabsInstrs           = (ncg && (x86ish || ppc || aarch64)) || llvm
   -- SIMD flags
   , stgToCmmVecInstrsErr  = vec_err
   , stgToCmmAvx           = isAvxEnabled                   dflags
@@ -61,9 +62,12 @@ initStgToCmmConfig dflags mod = StgToCmmConfig
   } where profile  = targetProfile dflags
           platform = profilePlatform profile
           bk_end  = backend dflags
-          ncg     = bk_end == NCG
-          llvm    = bk_end == LLVM
           b_blob  = if not ncg then Nothing else binBlobThreshold dflags
+          (ncg, llvm) = case backendPrimitiveImplementation bk_end of
+                          GenericPrimitives -> (False, False)
+                          JSPrimitives      -> (False, False)
+                          NcgPrimitives     -> (True, False)
+                          LlvmPrimitives    -> (False, True)
           x86ish  = case platformArch platform of
                       ArchX86    -> True
                       ArchX86_64 -> True
@@ -72,7 +76,6 @@ initStgToCmmConfig dflags mod = StgToCmmConfig
                       ArchPPC      -> True
                       ArchPPC_64 _ -> True
                       _            -> False
-          aarch64 = platformArch platform == ArchAArch64
-          vec_err = case backend dflags of
-                      LLVM -> Nothing
-                      _    -> Just (unlines ["SIMD vector instructions require the LLVM back-end.", "Please use -fllvm."])
+          vec_err = case backendSimdValidity (backend dflags) of
+                      IsValid -> Nothing
+                      NotValid msg -> Just msg

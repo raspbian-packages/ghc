@@ -7,6 +7,8 @@
 -- (c) The University of Glasgow 2004-2006
 --
 -----------------------------------------------------------------------------
+{-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE TupleSections #-}
 
 module GHC.StgToCmm.Utils (
         emitDataLits, emitRODataLits,
@@ -43,10 +45,11 @@ module GHC.StgToCmm.Utils (
         emitUpdRemSetPush,
         emitUpdRemSetPushThunk,
 
-        convertInfoProvMap, cmmInfoTableToInfoProvEnt
+        convertInfoProvMap, cmmInfoTableToInfoProvEnt, IPEStats(..),
+        closureIpeStats, fallbackIpeStats, skippedIpeStats,
   ) where
 
-import GHC.Prelude
+import GHC.Prelude hiding ( head, init, last, tail )
 
 import GHC.Platform
 import GHC.StgToCmm.Monad
@@ -90,6 +93,8 @@ import GHC.Types.Unique.FM
 import GHC.Data.Maybe
 import Control.Monad
 import qualified Data.Map.Strict as Map
+import qualified Data.IntMap.Strict as I
+import qualified Data.Semigroup (Semigroup(..))
 
 --------------------------------------------------------------------------
 --
@@ -266,7 +271,7 @@ emitRODataLits lbl lits = emitDecl (mkRODataLits lbl lits)
 
 emitDataCon :: CLabel -> CmmInfoTable -> CostCentreStack -> [CmmLit] -> FCode ()
 emitDataCon lbl itbl ccs payload =
-  emitDecl (CmmData (Section Data lbl) (CmmStatics lbl itbl ccs payload))
+  emitDecl (CmmData (Section Data lbl) (CmmStatics lbl itbl ccs payload []))
 
 -------------------------------------------------------------------------
 --
@@ -448,8 +453,8 @@ emitCmmLitSwitch :: CmmExpr                    -- Tag to switch on
                -> [(Literal, CmmAGraphScoped)] -- Tagged branches
                -> CmmAGraphScoped              -- Default branch (always)
                -> FCode ()                     -- Emit the code
-emitCmmLitSwitch _scrut []       deflt = emit $ fst deflt
-emitCmmLitSwitch scrut  branches deflt = do
+emitCmmLitSwitch _scrut [] deflt = emit $ fst deflt
+emitCmmLitSwitch scrut branches@(branch:_) deflt = do
     scrut' <- assignTemp' scrut
     join_lbl <- newBlockId
     deflt_lbl <- label_code join_lbl deflt
@@ -460,7 +465,7 @@ emitCmmLitSwitch scrut  branches deflt = do
         rep = typeWidth cmm_ty
 
     -- We find the necessary type information in the literals in the branches
-    let (signed,range) = case head branches of
+    let (signed,range) = case branch of
           (LitNumber nt _, _) -> (signed,range)
             where
               signed = litNumIsSigned nt
@@ -603,39 +608,96 @@ cmmInfoTableToInfoProvEnt this_mod cmit =
         cn  = rtsClosureType (cit_rep cmit)
     in InfoProvEnt cl cn "" this_mod Nothing
 
+data IPEStats = IPEStats { ipe_total :: !Int
+                         , ipe_closure_types :: !(I.IntMap Int)
+                         , ipe_fallback :: !Int
+                         , ipe_skipped :: !Int }
+
+instance Semigroup IPEStats where
+  (IPEStats a1 a2 a3 a4) <> (IPEStats b1 b2 b3 b4) = IPEStats (a1 + b1) (I.unionWith (+) a2 b2) (a3 + b3) (a4 + b4)
+
+instance Monoid IPEStats where
+  mempty = IPEStats 0 I.empty 0 0
+
+fallbackIpeStats :: IPEStats
+fallbackIpeStats = mempty { ipe_total = 1, ipe_fallback = 1 }
+
+closureIpeStats :: Int -> IPEStats
+closureIpeStats t = mempty { ipe_total = 1, ipe_closure_types = I.singleton t 1 }
+
+skippedIpeStats :: IPEStats
+skippedIpeStats = mempty { ipe_skipped = 1 }
+
+instance Outputable IPEStats where
+  ppr = pprIPEStats
+
+pprIPEStats :: IPEStats -> SDoc
+pprIPEStats (IPEStats{..}) =
+  vcat $ [ text "Tables with info:" <+> ppr ipe_total
+         , text "Tables with fallback:" <+> ppr ipe_fallback
+         , text "Tables skipped:" <+> ppr ipe_skipped
+         ] ++ [ text "Info(" <> ppr k <> text "):" <+> ppr n | (k, n) <- I.assocs ipe_closure_types ]
+
 -- | Convert source information collected about identifiers in 'GHC.STG.Debug'
--- to entries suitable for placing into the info table provenenance table.
-convertInfoProvMap :: [CmmInfoTable] -> Module -> InfoTableProvMap -> [InfoProvEnt]
-convertInfoProvMap defns this_mod (InfoTableProvMap (UniqMap dcenv) denv infoTableToSourceLocationMap) =
-  map (\cmit ->
-    let cl = cit_lbl cmit
+-- to entries suitable for placing into the info table provenance table.
+--
+-- The initial stats given to this function will (or should) only contain stats
+-- for stack info tables skipped during 'generateCgIPEStub'. As the fold
+-- progresses, counts of tables per closure type will be accumulated.
+convertInfoProvMap :: StgToCmmConfig -> Module -> InfoTableProvMap -> IPEStats -> [CmmInfoTable] -> (IPEStats, [InfoProvEnt])
+convertInfoProvMap cfg this_mod (InfoTableProvMap (UniqMap dcenv) denv infoTableToSourceLocationMap) initStats cmits =
+    foldl' convertInfoProvMap' (initStats, []) cmits
+  where
+    convertInfoProvMap' :: (IPEStats, [InfoProvEnt]) -> CmmInfoTable -> (IPEStats, [InfoProvEnt])
+    convertInfoProvMap' (!stats, acc) cmit = do
+      let
+        cl = cit_lbl cmit
         cn  = rtsClosureType (cit_rep cmit)
 
         tyString :: Outputable a => a -> String
         tyString = renderWithContext defaultSDocContext . ppr
 
-        lookupClosureMap :: Maybe InfoProvEnt
+        lookupClosureMap :: Maybe (IPEStats, InfoProvEnt)
         lookupClosureMap = case hasHaskellName cl >>= lookupUniqMap denv of
-                                Just (ty, mbspan) -> Just (InfoProvEnt cl cn (tyString ty) this_mod mbspan)
+                                Just (ty, mbspan) -> Just (closureIpeStats cn, (InfoProvEnt cl cn (tyString ty) this_mod mbspan))
                                 Nothing -> Nothing
 
-        lookupDataConMap = do
+        lookupDataConMap :: Maybe (IPEStats, InfoProvEnt)
+        lookupDataConMap = (closureIpeStats cn,) <$> do
             UsageSite _ n <- hasIdLabelInfo cl >>= getConInfoTableLocation
             -- This is a bit grimy, relies on the DataCon and Name having the same Unique, which they do
             (dc, ns) <- hasHaskellName cl >>= lookupUFM_Directly dcenv . getUnique
             -- Lookup is linear but lists will be small (< 100)
-            return $ InfoProvEnt cl cn (tyString (dataConTyCon dc)) this_mod (join $ lookup n (NE.toList ns))
+            return $ (InfoProvEnt cl cn (tyString (dataConTyCon dc)) this_mod (join $ lookup n (NE.toList ns)))
 
+        lookupInfoTableToSourceLocation :: Maybe (IPEStats, InfoProvEnt)
         lookupInfoTableToSourceLocation = do
             sourceNote <- Map.lookup (cit_lbl cmit) infoTableToSourceLocationMap
-            return $ InfoProvEnt cl cn "" this_mod sourceNote
+            return $ (closureIpeStats cn, (InfoProvEnt cl cn "" this_mod sourceNote))
 
         -- This catches things like prim closure types and anything else which doesn't have a
         -- source location
-        simpleFallback = cmmInfoTableToInfoProvEnt this_mod cmit
+        simpleFallback =
+          if stgToCmmInfoTableMapWithFallback cfg then
+            -- Create a default entry with fallback IPE data
+            Just (fallbackIpeStats, cmmInfoTableToInfoProvEnt this_mod cmit)
+          else
+            -- If we are omitting tables with fallback info
+            -- (-fno-info-table-map-with-fallback was given), do not create an
+            -- entry
+            Nothing
 
-  in
-    if (isStackRep . cit_rep) cmit then
-      fromMaybe simpleFallback lookupInfoTableToSourceLocation
-    else
-      fromMaybe simpleFallback (lookupDataConMap `firstJust` lookupClosureMap)) defns
+        trackSkipped :: Maybe (IPEStats, InfoProvEnt) -> (IPEStats, [InfoProvEnt])
+        trackSkipped Nothing =
+          (stats Data.Semigroup.<> skippedIpeStats, acc)
+        trackSkipped (Just (s, !c)) =
+          (stats Data.Semigroup.<> s, c:acc)
+
+      trackSkipped $
+        if (isStackRep . cit_rep) cmit then
+          -- Note that we should have already skipped STACK info tables if
+          -- necessary in 'generateCgIPEStub', so we should not need to worry
+          -- about doing that here.
+          fromMaybe simpleFallback (Just <$> lookupInfoTableToSourceLocation)
+        else
+          fromMaybe simpleFallback (Just <$> firstJust lookupDataConMap lookupClosureMap)

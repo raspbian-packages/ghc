@@ -83,6 +83,8 @@ import GHC.Types.Unique.Set
 import GHC.Types.TyThing
 import qualified GHC.LanguageExtensions as LangExt
 
+import Language.Haskell.Syntax.Basic (FieldLabelString(..))
+
 import Control.Monad
 
 {-
@@ -139,14 +141,15 @@ synonymTyConsOfType ty
      go_co (TyConAppCo _ tc cs)   = go_tc tc `plusNameEnv` go_co_s cs
      go_co (AppCo co co')         = go_co co `plusNameEnv` go_co co'
      go_co (ForAllCo _ co co')    = go_co co `plusNameEnv` go_co co'
-     go_co (FunCo _ co_mult co co') = go_co co_mult `plusNameEnv` go_co co `plusNameEnv` go_co co'
+     go_co (FunCo { fco_mult = m, fco_arg = a, fco_res = r })
+                                  = go_co m `plusNameEnv` go_co a `plusNameEnv` go_co r
      go_co (CoVarCo _)            = emptyNameEnv
      go_co (HoleCo {})            = emptyNameEnv
      go_co (AxiomInstCo _ _ cs)   = go_co_s cs
      go_co (UnivCo p _ ty ty')    = go_prov p `plusNameEnv` go ty `plusNameEnv` go ty'
      go_co (SymCo co)             = go_co co
      go_co (TransCo co co')       = go_co co `plusNameEnv` go_co co'
-     go_co (NthCo _ _ co)         = go_co co
+     go_co (SelCo _ co)           = go_co co
      go_co (LRCo _ co)            = go_co co
      go_co (InstCo co co')        = go_co co `plusNameEnv` go_co co'
      go_co (KindCo co)            = go_co co
@@ -172,7 +175,7 @@ newtype SynCycleM a = SynCycleM {
 
 -- TODO: TyConSet is implemented as IntMap over uniques.
 -- But we could get away with something based on IntSet
--- since we only check membershib, but never extract the
+-- since we only check membership, but never extract the
 -- elements.
 type SynCycleState = TyConSet
 
@@ -208,7 +211,7 @@ checkTyConIsAcyclic tc m = SynCycleM $ \s ->
 checkSynCycles :: Unit -> [TyCon] -> [LTyClDecl GhcRn] -> TcM ()
 checkSynCycles this_uid tcs tyclds =
     case runSynCycleM (mapM_ (go emptyTyConSet []) tcs) emptyTyConSet of
-        Left (loc, err) -> setSrcSpan loc $ failWithTc (TcRnUnknownMessage $ mkPlainError noHints err)
+        Left (loc, err) -> setSrcSpan loc $ failWithTc (mkTcRnUnknownMessage $ mkPlainError noHints err)
         Right _  -> return ()
   where
     -- Try our best to print the LTyClDecl for locally defined things
@@ -500,8 +503,8 @@ initialRoleEnv1 hsc_src annots_env tc
   | otherwise             = pprPanic "initialRoleEnv1" (ppr tc)
   where name         = tyConName tc
         bndrs        = tyConBinders tc
-        argflags     = map tyConBinderArgFlag bndrs
-        num_exps     = count isVisibleArgFlag argflags
+        argflags     = map tyConBinderForAllTyFlag bndrs
+        num_exps     = count isVisibleForAllTyFlag argflags
 
           -- if the number of annotations in the role annotation decl
           -- is wrong, just ignore it. We check this in the validity check.
@@ -513,7 +516,7 @@ initialRoleEnv1 hsc_src annots_env tc
         default_roles = build_default_roles argflags role_annots
 
         build_default_roles (argf : argfs) (m_annot : ras)
-          | isVisibleArgFlag argf
+          | isVisibleForAllTyFlag argf
           = (m_annot `orElse` default_role) : build_default_roles argfs ras
         build_default_roles (_argf : argfs) ras
           = Nominal : build_default_roles argfs ras
@@ -855,14 +858,14 @@ when typechecking the [d| .. |] quote, and typecheck them later.
 
 tcRecSelBinds :: [(Id, LHsBind GhcRn)] -> TcM TcGblEnv
 tcRecSelBinds sel_bind_prs
-  = tcExtendGlobalValEnv [sel_id | (L _ (IdSig _ sel_id)) <- sigs] $
+  = tcExtendGlobalValEnv [sel_id | (L _ (XSig (IdSig sel_id))) <- sigs] $
     do { (rec_sel_binds, tcg_env) <- discardWarnings $
                                      -- See Note [Impredicative record selectors]
                                      setXOptM LangExt.ImpredicativeTypes $
                                      tcValBinds TopLevel binds sigs getGblEnv
        ; return (tcg_env `addTypecheckedBinds` map snd rec_sel_binds) }
   where
-    sigs = [ L (noAnnSrcSpan loc) (IdSig noExtField sel_id)
+    sigs = [ L (noAnnSrcSpan loc) (XSig $ IdSig sel_id)
                                              | (sel_id, _) <- sel_bind_prs
                                              , let loc = getSrcSpan sel_id ]
     binds = [(NonRecursive, unitBag bind) | (_, bind) <- sel_bind_prs]
@@ -902,14 +905,30 @@ mkOneRecordSelector all_cons idDetails fl has_sel
     con1 = assert (not (null cons_w_field)) $ head cons_w_field
 
     -- Selector type; Note [Polymorphic selectors]
-    field_ty   = conLikeFieldType con1 lbl
-    data_tvbs  = filter (\tvb -> binderVar tvb `elemVarSet` data_tv_set) $
-                 conLikeUserTyVarBinders con1
-    data_tv_set= tyCoVarsOfTypes inst_tys
-    is_naughty = not (tyCoVarsOfType field_ty `subVarSet` data_tv_set)
-                    || has_sel == NoFieldSelectors
+    (univ_tvs, _, _, _, req_theta, _, data_ty) = conLikeFullSig con1
+
+    field_ty     = conLikeFieldType con1 lbl
+    field_ty_tvs = tyCoVarsOfType field_ty
+    data_ty_tvs  = tyCoVarsOfType data_ty
+    sel_tvs      = field_ty_tvs `unionVarSet` data_ty_tvs
+    sel_tvbs     = filter (\tvb -> binderVar tvb `elemVarSet` sel_tvs) $
+                   conLikeUserTyVarBinders con1
+
+    -- is_naughty: see Note [Naughty record selectors]
+    is_naughty = not ok_scoping || no_selectors
+    ok_scoping = case con1 of
+                   RealDataCon {} -> field_ty_tvs `subVarSet` data_ty_tvs
+                   PatSynCon {}   -> field_ty_tvs `subVarSet` mkVarSet univ_tvs
+       -- In the PatSynCon case, the selector type is (data_ty -> field_ty), but
+       -- fvs(data_ty) are all universals (see Note [Pattern synonym result type] in
+       -- GHC.Core.PatSyn, so no need to check them.
+
+    no_selectors   = has_sel == NoFieldSelectors  -- No field selectors => all are naughty
+                                                  -- thus suppressing making a binding
+                                                  -- A slight hack!
+
     sel_ty | is_naughty = unitTy  -- See Note [Naughty record selectors]
-           | otherwise  = mkForAllTys (tyVarSpecToBinders data_tvbs) $
+           | otherwise  = mkForAllTys (tyVarSpecToBinders sel_tvbs) $
                           -- Urgh! See Note [The stupid context] in GHC.Core.DataCon
                           mkPhiTy (conLikeStupidTheta con1) $
                           -- req_theta is empty for normal DataCon
@@ -920,7 +939,7 @@ mkOneRecordSelector all_cons idDetails fl has_sel
                             -- fields in all the constructor have multiplicity Many.
                           field_ty
 
-    -- Make the binding: sel (C2 { fld = x }) = x
+    -- make the binding: sel (C2 { fld = x }) = x
     --                   sel (C7 { fld = x }) = x
     --    where cons_w_field = [C2,C7]
     sel_bind = mkTopFunBind Generated sel_lname alts
@@ -937,7 +956,7 @@ mkOneRecordSelector all_cons idDetails fl has_sel
                         { hfbAnn = noAnn
                         , hfbLHS
                            = L locc (FieldOcc sel_name
-                                      (L locn $ mkVarUnqual lbl))
+                                      (L locn $ mkVarUnqual (field_label lbl)))
                         , hfbRHS
                            = L loc' (VarPat noExtField (L locn field_var))
                         , hfbPun = False })
@@ -966,26 +985,13 @@ mkOneRecordSelector all_cons idDetails fl has_sel
         --                 B :: { fld :: Int } -> T Int Char
     dealt_with :: ConLike -> Bool
     dealt_with (PatSynCon _) = False -- We can't predict overlap
-    dealt_with con@(RealDataCon dc) =
-      con `elem` cons_w_field || dataConCannotMatch inst_tys dc
-
-    (univ_tvs, _, eq_spec, _, req_theta, _, data_ty) = conLikeFullSig con1
-
-    eq_subst = mkTvSubstPrs (map eqSpecPair eq_spec)
-    -- inst_tys corresponds to one of the following:
-    --
-    --  * The arguments to the user-written return type (for GADT constructors).
-    --    In this scenario, eq_subst provides a mapping from the universally
-    --    quantified type variables to the argument types. Note that eq_subst
-    --    does not need to be applied to any other part of the DataCon
-    --    (see Note [The dcEqSpec domain invariant] in GHC.Core.DataCon).
-    --  * The universally quantified type variables
-    --    (for Haskell98-style constructors and pattern synonyms). In these
-    --    scenarios, eq_subst is an empty substitution.
-    inst_tys = substTyVars eq_subst univ_tvs
+    dealt_with con@(RealDataCon dc)
+      = con `elem` cons_w_field || dataConCannotMatch inst_tys dc
+      where
+        inst_tys = dataConResRepTyArgs dc
 
     unit_rhs = mkLHsTupleExpr [] noExtField
-    msg_lit = HsStringPrim NoSourceText (bytesFS lbl)
+    msg_lit = HsStringPrim NoSourceText (bytesFS (field_label lbl))
 
 {-
 Note [Polymorphic selectors]
@@ -1042,16 +1048,41 @@ so that if the user tries to use 'x' as a selector we can bleat
 helpfully, rather than saying unhelpfully that 'x' is not in scope.
 Hence the sel_naughty flag, to identify record selectors that don't really exist.
 
-In general, a field is "naughty" if its type mentions a type variable that
-isn't in the result type of the constructor.  Note that this *allows*
-GADT record selectors (Note [GADT record selectors]) whose types may look
-like     sel :: T [a] -> a
-
 For naughty selectors we make a dummy binding
    sel = ()
 so that the later type-check will add them to the environment, and they'll be
 exported.  The function is never called, because the typechecker spots the
 sel_naughty field.
+
+To determine naughtiness we distingish two cases:
+
+* For RealDataCons, a field is "naughty" if its type mentions a
+  type variable that isn't in the (original, user-written) result type
+  of the constructor. Note that this *allows* GADT record selectors
+  (Note [GADT record selectors]) whose types may look like sel :: T [a] -> a
+
+* For a PatSynCon, a field is "naughty" if its type mentions a type variable
+  that isn't in the universal type variables.
+
+  This is a bit subtle. Consider test patsyn/should_run/records_run:
+    pattern ReadP :: forall a. ReadP a => a -> String
+    pattern ReadP {fld} <- (read -> readp)
+  The selector is defined like this:
+    $selReadPfld :: forall a. ReadP a => String -> a
+    $selReadPfld @a (d::ReadP a) s = readp @a d s
+  Perfectly fine!  The (ReadP a) constraint lets us contruct a value of type
+  'a' from a bare String.
+
+  Another curious case (#23038):
+     pattern N :: forall a. () => forall. () => a -> Any
+     pattern N { fld } <- ( unsafeCoerce -> fld1 ) where N = unsafeCoerce
+  The selector looks like this
+     $selNfld :: forall a. Any -> a
+     $selNfld @a x = unsafeCoerce @Any @a x
+  Pretty strange (but used in the `cleff` package).
+
+  TL;DR for pattern synonyms, the selector is OK if the field type mentions only
+  the universal type variables of the pattern synonym.
 
 Note [NoFieldSelectors and naughty record selectors]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

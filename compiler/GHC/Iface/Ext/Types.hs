@@ -28,7 +28,6 @@ import GHC.Types.SrcLoc
 import GHC.Types.Avail
 import GHC.Types.Unique
 import qualified GHC.Utils.Outputable as O ( (<>) )
-import GHC.Utils.Misc
 import GHC.Utils.Panic
 
 import qualified Data.Array as A
@@ -41,6 +40,7 @@ import Data.Word                  ( Word8 )
 import Control.Applicative        ( (<|>) )
 import Data.Coerce                ( coerce  )
 import Data.Function              ( on )
+import qualified Data.Semigroup as S
 
 type Span = RealSrcSpan
 
@@ -143,7 +143,7 @@ data HieType a
   = HTyVarTy Name
   | HAppTy a (HieArgs a)
   | HTyConApp IfaceTyCon (HieArgs a)
-  | HForAllTy ((Name, a),ArgFlag) a
+  | HForAllTy ((Name, a),ForAllTyFlag) a
   | HFunTy a a a
   | HQualTy a a           -- ^ type with constraint: @t1 => t2@ (see 'IfaceDFunTy')
   | HLitTy IfaceTyLit
@@ -206,7 +206,7 @@ instance Binary (HieType TypeIndex) where
 
 
 -- | A list of type arguments along with their respective visibilities (ie. is
--- this an argument that would return 'True' for 'isVisibleArgFlag'?).
+-- this an argument that would return 'True' for 'isVisibleForAllTyFlag'?).
 newtype HieArgs a = HieArgs [(Bool,a)]
   deriving (Functor, Foldable, Traversable, Eq)
 
@@ -251,12 +251,12 @@ data HieAST a =
 instance Binary (HieAST TypeIndex) where
   put_ bh ast = do
     put_ bh $ sourcedNodeInfo ast
-    put_ bh $ nodeSpan ast
+    put_ bh $ BinSpan $ nodeSpan ast
     put_ bh $ nodeChildren ast
 
   get bh = Node
     <$> get bh
-    <*> get bh
+    <*> (unBinSpan <$> get bh)
     <*> get bh
 
 instance Outputable a => Outputable (HieAST a) where
@@ -486,19 +486,19 @@ instance Binary ContextInfo where
     putByte bh 3
     put_ bh bt
     put_ bh sc
-    put_ bh msp
+    put_ bh $ BinSpan <$> msp
   put_ bh (PatternBind a b c) = do
     putByte bh 4
     put_ bh a
     put_ bh b
-    put_ bh c
+    put_ bh $ BinSpan <$> c
   put_ bh (ClassTyDecl sp) = do
     putByte bh 5
-    put_ bh sp
+    put_ bh $ BinSpan <$> sp
   put_ bh (Decl a b) = do
     putByte bh 6
     put_ bh a
-    put_ bh b
+    put_ bh $ BinSpan <$> b
   put_ bh (TyVarBind a b) = do
     putByte bh 7
     put_ bh a
@@ -506,13 +506,13 @@ instance Binary ContextInfo where
   put_ bh (RecField a b) = do
     putByte bh 8
     put_ bh a
-    put_ bh b
+    put_ bh $ BinSpan <$> b
   put_ bh MatchBind = putByte bh 9
   put_ bh (EvidenceVarBind a b c) = do
     putByte bh 10
     put_ bh a
     put_ bh b
-    put_ bh c
+    put_ bh $ BinSpan <$> c
   put_ bh EvidenceVarUse = putByte bh 11
 
   get bh = do
@@ -521,14 +521,14 @@ instance Binary ContextInfo where
       0 -> return Use
       1 -> IEThing <$> get bh
       2 -> return TyDecl
-      3 -> ValBind <$> get bh <*> get bh <*> get bh
-      4 -> PatternBind <$> get bh <*> get bh <*> get bh
-      5 -> ClassTyDecl <$> get bh
-      6 -> Decl <$> get bh <*> get bh
+      3 -> ValBind <$> get bh <*> get bh <*> (fmap unBinSpan <$> get bh)
+      4 -> PatternBind <$> get bh <*> get bh <*> (fmap unBinSpan <$> get bh)
+      5 -> ClassTyDecl <$> (fmap unBinSpan <$> get bh)
+      6 -> Decl <$> get bh <*> (fmap unBinSpan <$> get bh)
       7 -> TyVarBind <$> get bh <*> get bh
-      8 -> RecField <$> get bh <*> get bh
+      8 -> RecField <$> get bh <*> (fmap unBinSpan <$> get bh)
       9 -> return MatchBind
-      10 -> EvidenceVarBind <$> get bh <*> get bh <*> get bh
+      10 -> EvidenceVarBind <$> get bh <*> get bh <*> (fmap unBinSpan <$> get bh)
       11 -> return EvidenceVarUse
       _ -> panic "Binary ContextInfo: invalid tag"
 
@@ -621,7 +621,7 @@ instance Outputable RecFieldContext where
   ppr RecFieldDecl = text "declaration"
   ppr RecFieldAssign = text "assignment"
   ppr RecFieldMatch = text "pattern match"
-  ppr RecFieldOcc = text "occurence"
+  ppr RecFieldOcc = text "occurrence"
 
 instance Binary RecFieldContext where
   put_ bh b = putByte bh (fromIntegral (fromEnum b))
@@ -679,14 +679,14 @@ instance Binary Scope where
   put_ bh NoScope = putByte bh 0
   put_ bh (LocalScope span) = do
     putByte bh 1
-    put_ bh span
+    put_ bh $ BinSpan span
   put_ bh ModuleScope = putByte bh 2
 
   get bh = do
     (t :: Word8) <- get bh
     case t of
       0 -> return NoScope
-      1 -> LocalScope <$> get bh
+      1 -> LocalScope . unBinSpan <$> get bh
       2 -> return ModuleScope
       _ -> panic "Binary Scope: invalid tag"
 
@@ -732,13 +732,13 @@ instance Binary TyVarScope where
   put_ bh (UnresolvedScope ns span) = do
     putByte bh 1
     put_ bh ns
-    put_ bh span
+    put_ bh (BinSpan <$> span)
 
   get bh = do
     (t :: Word8) <- get bh
     case t of
       0 -> ResolvedScopes <$> get bh
-      1 -> UnresolvedScope <$> get bh <*> get bh
+      1 -> UnresolvedScope <$> get bh <*> (fmap unBinSpan <$> get bh)
       _ -> panic "Binary TyVarScope: invalid tag"
 
 -- | `Name`'s get converted into `HieName`'s before being written into @.hie@
@@ -751,9 +751,9 @@ data HieName
   deriving (Eq)
 
 instance Ord HieName where
-  compare (ExternalName a b c) (ExternalName d e f) = compare (a,b) (d,e) `thenCmp` leftmost_smallest c f
+  compare (ExternalName a b c) (ExternalName d e f) = compare (a,b) (d,e) S.<> leftmost_smallest c f
     -- TODO (int-index): Perhaps use RealSrcSpan in HieName?
-  compare (LocalName a b) (LocalName c d) = compare a c `thenCmp` leftmost_smallest b d
+  compare (LocalName a b) (LocalName c d) = compare a c S.<> leftmost_smallest b d
     -- TODO (int-index): Perhaps use RealSrcSpan in HieName?
   compare (KnownKeyName a) (KnownKeyName b) = nonDetCmpUnique a b
     -- Not actually non deterministic as it is a KnownKey
@@ -774,7 +774,7 @@ hieNameOcc (KnownKeyName u) =
   case lookupKnownKeyName u of
     Just n -> nameOccName n
     Nothing -> pprPanic "hieNameOcc:unknown known-key unique"
-                        (ppr (unpkUnique u))
+                        (ppr u)
 
 toHieName :: Name -> HieName
 toHieName name

@@ -154,7 +154,6 @@ import Data.Maybe
 import qualified Data.Char
 import Control.Monad ( when, unless )
 import GHC.Types.Id.Info
-import GHC.Utils.Trace
 import GHC.StgToCmm.Env (getCgInfo_maybe)
 import Data.Coerce (coerce)
 import GHC.Utils.Json
@@ -363,7 +362,7 @@ emitTickyCounter cloType tickee
                                       Just (CgIdInfo { cg_lf = cg_lf })
                                           | isLFThunk cg_lf
                                           -> return $! CmmLabel $ mkClosureInfoTableLabel (profilePlatform profile) tickee cg_lf
-                                      _   -> pprTraceDebug "tickyThunkUnknown" (text t <> colon <> ppr name <+> ppr (mkInfoTableLabel name NoCafRefs))
+                                      _   -> pprTraceDebug "tickyThunkUnknown" (text t <> colon <> ppr name <+> pprDebugCLabel (profilePlatform profile) (mkInfoTableLabel name NoCafRefs))
                                             return $! zeroCLit platform
 
                             TickyLNE {} -> return $! zeroCLit platform
@@ -887,7 +886,7 @@ showTypeCategory ty
   Just (tycon, _) ->
     let anyOf us = getUnique tycon `elem` us in
     case () of
-      _ | anyOf [funTyConKey] -> '>'
+      _ | anyOf [fUNTyConKey] -> '>'
         | anyOf [charTyConKey] -> 'C'
         | anyOf [charPrimTyConKey] -> 'c'
         | anyOf [doubleTyConKey] -> 'D'

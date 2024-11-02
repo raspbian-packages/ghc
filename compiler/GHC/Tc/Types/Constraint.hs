@@ -3,8 +3,6 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE TypeApplications #-}
 
-{-# OPTIONS_GHC -Wno-incomplete-record-updates #-}
-
 -- | This module defines types and simple operations over constraints, as used
 -- in the type-checker and constraint solver.
 module GHC.Tc.Types.Constraint (
@@ -126,6 +124,7 @@ import GHC.Data.Bag
 import GHC.Utils.Misc
 import GHC.Utils.Panic
 import GHC.Utils.Constants (debugIsOn)
+import GHC.Types.Name.Reader
 
 import Data.Coerce
 import Data.Monoid ( Endo(..) )
@@ -200,17 +199,11 @@ data Ct
       cc_class  :: Class,
       cc_tyargs :: [Xi],   -- cc_tyargs are rewritten w.r.t. inerts, so Xi
 
-      cc_pend_sc :: Bool,
+      cc_pend_sc :: Bool
           -- See Note [The superclass story] in GHC.Tc.Solver.Canonical
           -- True <=> (a) cc_class has superclasses
           --          (b) we have not (yet) added those
           --              superclasses as Givens
-
-      cc_fundeps :: Bool
-          -- See Note [Fundeps with instances] in GHC.Tc.Solver.Interact
-          -- True <=> the class has fundeps, and we have not yet
-          --          compared this constraint with the global
-          --          instances for fundep improvement
     }
 
   | CIrredCan {  -- These stand for yet-unusable predicates
@@ -235,8 +228,9 @@ data Ct
        --               Note [CEqCan occurs check]
        --   * (TyEq:F) rhs has no foralls
        --       (this avoids substituting a forall for the tyvar in other types)
-       --   * (TyEq:K) tcTypeKind lhs `tcEqKind` tcTypeKind rhs; Note [Ct kind invariant]
-       --   * (TyEq:N) If the equality is representational, rhs has no top-level newtype
+       --   * (TyEq:K) typeKind lhs `tcEqKind` typeKind rhs; Note [Ct kind invariant]
+       --   * (TyEq:N) If the equality is representational, rhs is not headed by a saturated
+       --     application of a newtype TyCon.
        --     See Note [No top-level newtypes on RHS of representational equalities]
        --     in GHC.Tc.Solver.Canonical. (Applies only when constructor of newtype is
        --     in scope.)
@@ -314,7 +308,7 @@ instance Outputable DelayedError where
 -- signatures). See Note [Holes].
 data Hole
   = Hole { hole_sort :: HoleSort -- ^ What flavour of hole is this?
-         , hole_occ  :: OccName  -- ^ The name of this hole
+         , hole_occ  :: RdrName  -- ^ The name of this hole
          , hole_ty   :: TcType   -- ^ Type to be printed to the user
                                  -- For expression holes: type of expr
                                  -- For type holes: the missing type
@@ -385,7 +379,7 @@ data NotConcreteReason
   | ContainsCast TcType TcCoercionN
 
   -- | The type contains a forall.
-  | ContainsForall TyCoVarBinder TcType
+  | ContainsForall ForAllTyBinder TcType
 
   -- | The type contains a 'CoercionTy'.
   | ContainsCoercionTy TcCoercion
@@ -678,10 +672,8 @@ instance Outputable Ct where
       pp_sort = case ct of
          CEqCan {}        -> text "CEqCan"
          CNonCanonical {} -> text "CNonCanonical"
-         CDictCan { cc_pend_sc = psc, cc_fundeps = fds }
-            | psc, fds     -> text "CDictCan(psc,fds)"
-            | psc, not fds -> text "CDictCan(psc)"
-            | not psc, fds -> text "CDictCan(fds)"
+         CDictCan { cc_pend_sc = psc }
+            | psc          -> text "CDictCan(psc)"
             | otherwise    -> text "CDictCan"
          CIrredCan { cc_reason = reason } -> text "CIrredCan" <> ppr reason
          CQuantCan (QCI { qci_pend_sc = pend_sc })
@@ -694,7 +686,7 @@ instance Outputable Ct where
 -- Does not look through type synonyms.
 canEqLHS_maybe :: Xi -> Maybe CanEqLHS
 canEqLHS_maybe xi
-  | Just tv <- tcGetTyVar_maybe xi
+  | Just tv <- getTyVar_maybe xi
   = Just $ TyVarLHS tv
 
   | Just (tc, args) <- tcSplitTyConApp_maybe xi
@@ -1242,7 +1234,7 @@ insolubleCt ct
 -- | Does this hole represent an "out of scope" error?
 -- See Note [Insoluble holes]
 isOutOfScopeHole :: Hole -> Bool
-isOutOfScopeHole (Hole { hole_occ = occ }) = not (startsWithUnderscore occ)
+isOutOfScopeHole (Hole { hole_occ = occ }) = not (startsWithUnderscore (occName occ))
 
 instance Outputable WantedConstraints where
   ppr (WC {wc_simple = s, wc_impl = i, wc_errors = e})
@@ -1346,6 +1338,7 @@ data Implication
       -- NB: including stuff used by nested implications that have since
       --     been discarded
       -- See Note [Needed evidence variables]
+      -- and (RC2) in Note [Tracking redundant constraints]a
       ic_need_inner :: VarSet,    -- Includes all used Given evidence
       ic_need_outer :: VarSet,    -- Includes only the free Given evidence
                                   --  i.e. ic_need_inner after deleting
@@ -1411,7 +1404,7 @@ The GivenEqs data type describes the Given constraints of an implication constra
 
 * LocalGivenEqs: definitely no Given equalities that would affect principal
   types.  But may have equalities that affect only skolems of this implication
-  (and hence do not affect princial types)
+  (and hence do not affect principal types)
   Examples: forall a. F a ~ Int => ...
             forall a b. F a ~ G b => ...
 
@@ -1564,7 +1557,7 @@ Note [Shadowing in a constraint]
 We assume NO SHADOWING in a constraint.  Specifically
  * The unification variables are all implicitly quantified at top
    level, and are all unique
- * The skolem variables bound in ic_skols are all freah when the
+ * The skolem variables bound in ic_skols are all fresh when the
    implication is created.
 So we can safely substitute. For example, if we have
    forall a.  a~Int => ...(forall b. ...a...)...
@@ -1698,7 +1691,7 @@ checkSkolInfoAnon sk1 sk2 = go sk1 sk2
     go (DerivSkol pred1)    (DerivSkol pred2)    = pred1 `tcEqType` pred2
     go (TyConSkol f1 n1)    (TyConSkol f2 n2)    = f1==f2 && n1==n2
     go (DataConSkol n1)     (DataConSkol n2)     = n1==n2
-    go InstSkol             InstSkol             = True
+    go (InstSkol {})        (InstSkol {})        = True
     go FamInstSkol          FamInstSkol          = True
     go BracketSkol          BracketSkol          = True
     go (RuleSkol n1)        (RuleSkol n2)        = n1==n2
@@ -1708,7 +1701,6 @@ checkSkolInfoAnon sk1 sk2 = go sk1 sk2
                                                    and (zipWith eq_pr ids1 ids2)
     go (UnifyForAllSkol t1) (UnifyForAllSkol t2) = t1 `tcEqType` t2
     go ReifySkol            ReifySkol            = True
-    go QuantCtxtSkol        QuantCtxtSkol        = True
     go RuntimeUnkSkol       RuntimeUnkSkol       = True
     go ArrowReboundIfSkol   ArrowReboundIfSkol   = True
     go (UnkSkol _)          (UnkSkol _)          = True
@@ -1724,7 +1716,7 @@ checkSkolInfoAnon sk1 sk2 = go sk1 sk2
     -- in tcConDecl for MkT we'll have a SkolemInfo in the implication of
     -- DataConSkol, but 'a' will have SkolemInfo of FamInstSkol
 
-    go FamInstSkol          InstSkol             = True
+    go FamInstSkol          (InstSkol {})         = True
     -- In instance C (T a) where { type F (T a) b = ... }
     -- we have 'a' with SkolemInfo InstSkol, but we make an implication wi
     -- SkolemInfo of FamInstSkol.  Very like the ConDecl/TyConSkol case
@@ -1899,7 +1891,7 @@ ctEvExpr ev = evId (ctEvEvId ev)
 
 ctEvCoercion :: HasDebugCallStack => CtEvidence -> TcCoercion
 ctEvCoercion (CtGiven { ctev_evar = ev_id })
-  = mkTcCoVarCo ev_id
+  = mkCoVarCo ev_id
 ctEvCoercion (CtWanted { ctev_dest = dest })
   | HoleDest hole <- dest
   = -- ctEvCoercion is only called on type equalities
@@ -1933,23 +1925,17 @@ arisesFromGivens ct = isGivenCt ct || isGivenLoc (ctLoc ct)
 -- the evidence and the ctev_pred in sync with each other.
 -- See Note [CtEvidence invariants].
 setCtEvPredType :: HasDebugCallStack => CtEvidence -> Type -> CtEvidence
-setCtEvPredType old_ctev new_pred
-  = case old_ctev of
-    CtGiven { ctev_evar = ev, ctev_loc = loc } ->
-      CtGiven { ctev_pred = new_pred
-              , ctev_evar = setVarType ev new_pred
-              , ctev_loc  = loc
-              }
-    CtWanted { ctev_dest = dest, ctev_loc = loc, ctev_rewriters = rewriters } ->
-      CtWanted { ctev_pred      = new_pred
-               , ctev_dest      = new_dest
-               , ctev_loc       = loc
-               , ctev_rewriters = rewriters
-               }
-        where
-          new_dest = case dest of
-            EvVarDest ev -> EvVarDest (setVarType ev new_pred)
-            HoleDest h   -> HoleDest  (setCoHoleType h new_pred)
+setCtEvPredType old_ctev@(CtGiven { ctev_evar = ev }) new_pred
+  = old_ctev { ctev_pred = new_pred
+             , ctev_evar = setVarType ev new_pred }
+
+setCtEvPredType old_ctev@(CtWanted { ctev_dest = dest }) new_pred
+  = old_ctev { ctev_pred = new_pred
+             , ctev_dest = new_dest }
+  where
+    new_dest = case dest of
+      EvVarDest ev -> EvVarDest (setVarType ev new_pred)
+      HoleDest h   -> HoleDest  (setCoHoleType h new_pred)
 
 instance Outputable TcEvDest where
   ppr (HoleDest h)   = text "hole" <> ppr h
@@ -2142,10 +2128,10 @@ uses GHC.Tc.Utils.anyUnfilledCoercionHoles to look through any filled coercion
 holes. The idea is that we wish to report the "root cause" -- the error that
 rewrote all the others.
 
-Worry: It seems possible that *all* unsolved wanteds are rewritten by other
-unsolved wanteds, so that e.g. w1 has w2 in its rewriter set, and w2 has
-w1 in its rewiter set. We are unable to come up with an example of this in
-practice, however, and so we believe this case cannot happen.
+Wrinkle: In #22707, we have a case where all of the Wanteds have rewritten
+each other. In order to report /some/ error in this case, we simply report
+all the Wanteds. The user will get a perhaps-confusing error message, but
+they've written a confusing program!
 
 Note [Avoiding rewriting cycles]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -2255,7 +2241,7 @@ equality simplification, and type family reduction. (Why combine these? Because
 it's actually quite easy to mistake one for another, in sufficiently involved
 scenarios, like ConstraintKinds.)
 
-The flag -freduction-depth=n fixes the maximium level.
+The flag -freduction-depth=n fixes the maximum level.
 
 * The counter includes the depth of type class instance declarations.  Example:
      [W] d{7} : Eq [Int]

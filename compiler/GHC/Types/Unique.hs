@@ -59,6 +59,8 @@ import GHC.Exts (indexCharOffAddr#, Char(..), Int(..))
 
 import Data.Char        ( chr, ord )
 
+import Language.Haskell.Syntax.Module.Name
+
 {-
 ************************************************************************
 *                                                                      *
@@ -75,7 +77,7 @@ A `Unique` in GHC is a Word-sized value composed of two pieces:
 The mask is typically an ASCII character.  It is typically used to make it easier
 to distinguish uniques constructed by different parts of the compiler.
 There is a (potentially incomplete) list of unique masks used given in
-GHC.Builtin.Uniques. See Note [Uniques-prelude - Uniques for wired-in Prelude things]
+GHC.Builtin.Uniques. See Note [Uniques for wired-in prelude things and known masks]
 
 `mkUnique` constructs a `Unique` from its pieces
   mkUnique :: Char -> Int -> Unique
@@ -187,6 +189,10 @@ instance Uniquable FastString where
 instance Uniquable Int where
  getUnique i = mkUniqueGrimily i
 
+instance Uniquable ModuleName where
+  getUnique (ModuleName nm) = getUnique nm
+
+
 {-
 ************************************************************************
 *                                                                      *
@@ -275,13 +281,15 @@ showUnique uniq
   = case unpkUnique uniq of
       (tag, u) -> tag : iToBase62 u
 
-pprUniqueAlways :: Unique -> SDoc
+pprUniqueAlways :: IsLine doc => Unique -> doc
 -- The "always" means regardless of -dsuppress-uniques
 -- It replaces the old pprUnique to remind callers that
 -- they should consider whether they want to consult
 -- Opt_SuppressUniques
 pprUniqueAlways u
   = text (showUnique u)
+{-# SPECIALIZE pprUniqueAlways :: Unique -> SDoc #-}
+{-# SPECIALIZE pprUniqueAlways :: Unique -> HLine #-} -- see Note [SPECIALIZE to HDoc] in GHC.Utils.Outputable
 
 instance Outputable Unique where
     ppr = pprUniqueAlways

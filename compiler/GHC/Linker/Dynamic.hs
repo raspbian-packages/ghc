@@ -11,7 +11,9 @@ where
 import GHC.Prelude
 import GHC.Platform
 import GHC.Platform.Ways
+import GHC.Settings (ToolSettings(toolSettings_ldSupportsSingleModule))
 
+import GHC.Driver.Config.Linker
 import GHC.Driver.Session
 
 import GHC.Unit.Env
@@ -23,6 +25,7 @@ import GHC.SysTools.Tasks
 import GHC.Utils.Logger
 import GHC.Utils.TmpFs
 
+import Control.Monad (when)
 import System.FilePath
 
 linkDynLib :: Logger -> TmpFs -> DynFlags -> UnitEnv -> [String] -> [UnitId] -> IO ()
@@ -83,7 +86,10 @@ linkDynLib logger tmpfs dflags0 unit_env o_files dep_packages
          | gopt Opt_LinkRts dflags = pkgs_with_rts
          | otherwise               = pkgs_without_rts
         pkg_link_opts = package_hs_libs ++ extra_libs ++ other_flags
-          where (package_hs_libs, extra_libs, other_flags) = collectLinkOpts dflags pkgs
+          where
+            namever = ghcNameVersion dflags
+            ways_   = ways dflags
+            (package_hs_libs, extra_libs, other_flags) = collectLinkOpts namever ways_ pkgs
 
         -- probably _stub.o files
         -- and last temporary shared object file
@@ -91,7 +97,7 @@ linkDynLib logger tmpfs dflags0 unit_env o_files dep_packages
 
     -- frameworks
     pkg_framework_opts <- getUnitFrameworkOpts unit_env (map unitId pkgs)
-    let framework_opts = getFrameworkOpts dflags platform
+    let framework_opts = getFrameworkOpts (initFrameworkOpts dflags) platform
 
     case os of
         OSMinGW32 -> do
@@ -145,6 +151,9 @@ linkDynLib logger tmpfs dflags0 unit_env o_files dep_packages
             --   dynamic binding nonsense when referring to symbols from
             --   within the library. The NCG assumes that this option is
             --   specified (on i386, at least).
+            --   In XCode 15, -single_module is the default and passing the
+            --   flag is now obsolete and raises a warning (#24168). We encode
+            --   this information into the toolchain field ...SupportsSingleModule.
             -- -install_name
             --   Mac OS/X stores the path where a dynamic library is (to
             --   be) installed in the library itself.  It's called the
@@ -170,8 +179,11 @@ linkDynLib logger tmpfs dflags0 unit_env o_files dep_packages
                     ]
                  ++ map Option o_files
                  ++ [ Option "-undefined",
-                      Option "dynamic_lookup",
-                      Option "-single_module" ]
+                      Option "dynamic_lookup"
+                    ]
+                 ++ (if toolSettings_ldSupportsSingleModule (toolSettings dflags)
+                        then [ Option "-single_module" ]
+                        else [ ])
                  ++ (if platformArch platform `elem` [ ArchX86_64, ArchAArch64 ]
                      then [ ]
                      else [ Option "-Wl,-read_only_relocs,suppress" ])
@@ -190,7 +202,9 @@ linkDynLib logger tmpfs dflags0 unit_env o_files dep_packages
                  -- See Note [Dynamic linking on macOS]
                  ++ [ Option "-Wl,-dead_strip_dylibs", Option "-Wl,-headerpad,8000" ]
               )
-            runInjectRPaths logger dflags pkg_lib_paths output_fn
+            -- Make sure to honour -fno-use-rpaths if set on darwin as well; see #20004
+            when (gopt Opt_RPath dflags) $
+              runInjectRPaths logger (toolSettings dflags) pkg_lib_paths output_fn
         _ -> do
             -------------------------------------------------------------------
             -- Making a DSO

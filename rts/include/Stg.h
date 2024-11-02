@@ -220,6 +220,8 @@
 #endif
 
 #define STG_UNUSED    GNUC3_ATTRIBUTE(__unused__)
+#define STG_USED      GNUC3_ATTRIBUTE(__used__)
+#define STG_WARN_UNUSED_RESULT GNUC3_ATTRIBUTE(warn_unused_result)
 
 /* Prevent functions from being optimized.
    See Note [Windows Stack allocations] */
@@ -239,6 +241,67 @@
 #else
 /* However, on OS X, "gnu_printf" isn't recognised */
 #define STG_PRINTF_ATTR(fmt_arg, rest) GNUC3_ATTRIBUTE(format(printf, fmt_arg, rest))
+#endif
+
+#define STG_NORETURN GNU_ATTRIBUTE(__noreturn__)
+
+#define STG_MALLOC GNUC3_ATTRIBUTE(__malloc__)
+
+/* Instead of relying on GCC version checks to expand attributes,
+ * use `__has_attribute` which is supported by GCC >= 5 and Clang. Hence, the
+ * following macros won't expand on older compiler versions, but since they're
+ * purely for optimization or static analysis purposes, there's no harm done.
+ *
+ * See: https://gcc.gnu.org/onlinedocs/cpp/_005f_005fhas_005fattribute.html
+ * See: https://clang.llvm.org/docs/LanguageExtensions.html#has-attribute
+ */
+#ifdef __has_attribute
+# define stg__has_attribute(attr) __has_attribute(attr)
+#else
+# define stg__has_attribute(attr) (0)
+#endif
+
+#ifdef __GNUC__
+# define STG_GNUC_GUARD_VERSION(major, minor) \
+    ((__GNUC__ > (major)) || \
+      ((__GNUC__ == (major)) && (__GNUC_MINOR__ >= (minor))))
+#else
+# define STG_GNUC_GUARD_VERSION(major, minor) (0)
+#endif
+
+/*
+ * The versions of the `__malloc__` attribute which take arguments are only
+ * supported in GCC 11 and later.
+ *
+ * See: https://gcc.gnu.org/onlinedocs/gcc/Common-Function-Attributes.html#index-malloc-function-attribute
+ * See: https://developers.redhat.com/blog/2021/04/30/detecting-memory-management-bugs-with-gcc-11-part-1-understanding-dynamic-allocation#attribute_malloc
+ */
+#if stg__has_attribute(__malloc__) && STG_GNUC_GUARD_VERSION(11, 0)
+# define STG_MALLOC1(deallocator) __attribute__((__malloc__(deallocator)))
+# define STG_MALLOC2(deallocator, ptrIndex) __attribute__((__malloc__(deallocator, ptrIndex)))
+#else
+# define STG_MALLOC1(deallocator)
+# define STG_MALLOC2(deallocator, ptrIndex)
+#endif
+
+/*
+ * https://gcc.gnu.org/onlinedocs/gcc/Common-Function-Attributes.html#index-alloc_005fsize-function-attribute
+ */
+#if stg__has_attribute(__alloc_size__)
+# define STG_ALLOC_SIZE1(position) __attribute__((__alloc_size__(position)))
+# define STG_ALLOC_SIZE2(position1, position2) __attribute__((__alloc_size__(position1, position2)))
+#else
+# define STG_ALLOC_SIZE1(position)
+# define STG_ALLOC_SIZE2(position1, position2)
+#endif
+
+/*
+ * https://gcc.gnu.org/onlinedocs/gcc/Common-Function-Attributes.html#index-returns_005fnonnull-function-attribute
+ */
+#if stg__has_attribute(__returns_nonnull__)
+# define STG_RETURNS_NONNULL __attribute__((__returns_nonnull__))
+#else
+# define STG_RETURNS_NONNULL
 #endif
 
 /* -----------------------------------------------------------------------------
@@ -263,8 +326,8 @@ typedef StgFunPtr       F_;
 #define EB_(X)    extern const char X[]
 #define IB_(X)    static const char X[]
 /* static (non-heap) closures (requires alignment for pointer tagging): */
-#define EC_(X)    extern       StgWordArray (X) GNU_ATTRIBUTE(aligned (8))
-#define IC_(X)    static       StgWordArray (X) GNU_ATTRIBUTE(aligned (8))
+#define EC_(X)    extern       StgWordArray (X) GNU_ATTRIBUTE(aligned (SIZEOF_VOID_P))
+#define IC_(X)    static       StgWordArray (X) GNU_ATTRIBUTE(aligned (SIZEOF_VOID_P))
 /* writable data (does not require alignment): */
 #define ERW_(X)   extern       StgWordArray (X)
 #define IRW_(X)   static       StgWordArray (X)
@@ -325,7 +388,11 @@ external prototype return neither of these types to workaround #11395.
    Tail calls
    -------------------------------------------------------------------------- */
 
-#define JMP_(cont) return((StgFunPtr)(cont))
+#if defined(HAS_MUSTTAIL)
+#define JMP_(cont) { StgFunPtr (*_f)(void) = (StgFunPtr (*)(void))(cont); __attribute__((musttail)) return _f(); }
+#else
+#define JMP_(cont) return (StgFunPtr)(cont)
+#endif
 
 /* -----------------------------------------------------------------------------
    Other Stg stuff...
@@ -591,4 +658,3 @@ typedef union {
   c;                                            \
 })
 #endif
-

@@ -36,7 +36,7 @@
 #include "CheckUnload.h" // createOCSectionIndices
 #include "ReportMemoryMap.h"
 
-#if !defined(mingw32_HOST_OS)
+#if !defined(mingw32_HOST_OS) && defined(HAVE_SIGNAL_H)
 #include "posix/Signals.h"
 #endif
 
@@ -950,6 +950,8 @@ SymbolAddr* lookupDependentSymbol (SymbolName* lbl, ObjectCode *dependent, SymTy
         }
         return internal_dlsym(lbl + 1);
 
+#       elif defined(OBJFORMAT_WASM32)
+        return NULL;
 #       else
 #       error No OBJFORMAT_* macro set
 #       endif
@@ -1375,6 +1377,10 @@ mkOc( ObjectType type, pathchar *path, char *image, int imageSize,
 #if defined(NEED_M32)
    oc->rw_m32 = m32_allocator_new(false);
    oc->rx_m32 = m32_allocator_new(true);
+#endif
+
+#if defined(OBJFORMAT_ELF) && defined(SHN_XINDEX)
+   oc->shndx_table = SHNDX_TABLE_UNINIT;
 #endif
 
    oc->nc_ranges = NULL;
@@ -1975,7 +1981,7 @@ void * loadNativeObj (pathchar *path, char **errmsg)
    return r;
 }
 #else
-void * GNU_ATTRIBUTE(__noreturn__)
+void * STG_NORETURN
 loadNativeObj (pathchar *path, char **errmsg)
 {
    UNUSED(path);

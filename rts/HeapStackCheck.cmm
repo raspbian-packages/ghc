@@ -20,6 +20,28 @@ import pthread_mutex_unlock;
 import AcquireSRWLockExclusive;
 import ReleaseSRWLockExclusives;
 
+#if !defined(UnregisterisedCompiler)
+import CLOSURE g0;
+import CLOSURE large_alloc_lim;
+import CLOSURE stg_MSG_THROWTO_info;
+import CLOSURE stg_MVAR_DIRTY_info;
+import CLOSURE stg_WHITEHOLE_info;
+import CLOSURE stg_arg_bitmaps;
+import CLOSURE stg_block_putmvar_info;
+import CLOSURE stg_block_readmvar_info;
+import CLOSURE stg_block_takemvar_info;
+import CLOSURE stg_block_throwto_info;
+import CLOSURE stg_enter_info;
+import CLOSURE stg_gc_fun_info;
+import CLOSURE stg_gc_prim_p_ll_info;
+import CLOSURE stg_gc_prim_pp_ll_info;
+import CLOSURE stg_ret_d_info;
+import CLOSURE stg_ret_f_info;
+import CLOSURE stg_ret_l_info;
+import CLOSURE stg_ret_n_info;
+import CLOSURE stg_ret_p_info;
+#endif
+
 /* Stack/Heap Check Failure
  * ------------------------
  *
@@ -231,6 +253,35 @@ stg_gc_prim_p_ll
     Sp(2) = fun;
     Sp(1) = arg;
     Sp(0) = stg_gc_prim_p_ll_info;
+    jump stg_gc_noregs [];
+}
+
+INFO_TABLE_RET(stg_gc_prim_pp_ll, RET_SMALL, W_ info, P_ arg1, P_ arg2, W_ fun)
+    /* explicit stack */
+{
+    W_ fun;
+    P_ arg1, arg2;
+    fun = Sp(3);
+    arg2 = Sp(2);
+    arg1 = Sp(1);
+    Sp_adj(4);
+    R1 = arg1;
+    R2 = arg2;
+    jump fun [R1, R2];
+}
+
+stg_gc_prim_pp_ll
+{
+    W_ fun;
+    P_ arg1, arg2;
+    fun = R3;
+    arg1 = R1;
+    arg2 = R2;
+    Sp_adj(-4);
+    Sp(3) = fun;
+    Sp(2) = arg2;
+    Sp(1) = arg1;
+    Sp(0) = stg_gc_prim_pp_ll_info;
     jump stg_gc_noregs [];
 }
 

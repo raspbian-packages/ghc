@@ -7,6 +7,9 @@
 
 -- TODO: use the new Windows IO manager
 module GHC.Event.TimerManager
+#if defined(javascript_HOST_ARCH)
+    () where
+#else
     ( -- * Types
       TimerManager
 
@@ -212,6 +215,10 @@ expirationTime us = do
 -- returned 'TimeoutKey' can be used to later unregister or update the
 -- timeout.  The timeout is automatically unregistered after the given
 -- time has passed.
+--
+-- Be careful not to exceed @maxBound :: Int@, which on 32-bit machines is only
+-- 2147483647 μs, less than 36 minutes.
+--
 registerTimeout :: TimerManager -> Int -> TimeoutCallback -> IO TimeoutKey
 registerTimeout mgr us cb = do
   !key <- newUnique (emUniqueSource mgr)
@@ -231,6 +238,10 @@ unregisterTimeout mgr (TK key) =
 
 -- | Update an active timeout to fire in the given number of
 -- microseconds.
+--
+-- Be careful not to exceed @maxBound :: Int@, which on 32-bit machines is only
+-- 2147483647 μs, less than 36 minutes.
+--
 updateTimeout :: TimerManager -> TimeoutKey -> Int -> IO ()
 updateTimeout mgr (TK key) us = do
   expTime <- expirationTime us
@@ -253,3 +264,5 @@ editTimeouts mgr g = do
                       -- minimum element didn't change.
                       t0 /= t1
                     _ -> True
+
+#endif

@@ -2,8 +2,6 @@
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE ExistentialQuantification #-}
 
-{-# OPTIONS_GHC -Wno-incomplete-record-updates #-}
-
 module GHC.Tc.Errors.Hole
    ( findValidHoleFits
    , tcCheckHoleFit
@@ -82,8 +80,7 @@ import GHC.Builtin.Utils (knownKeyNames)
 import GHC.Tc.Errors.Hole.FitTypes
 import qualified Data.Set as Set
 import GHC.Types.SrcLoc
-import GHC.Utils.Trace (warnPprTrace)
-import GHC.Data.FastString (unpackFS)
+import GHC.Data.FastString (NonDetFastString(..))
 import GHC.Types.Unique.Map
 
 
@@ -400,7 +397,7 @@ is discarded.
 
 Note [Speeding up valid hole-fits]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-To fix #16875 we noted that a lot of time was being spent on uneccessary work.
+To fix #16875 we noted that a lot of time was being spent on unecessary work.
 
 When we'd call `tcCheckHoleFit hole hole_ty ty`, we would end up by generating
 a constraint to show that `hole_ty ~ ty`, including any constraints in `ty`. For
@@ -462,7 +459,7 @@ addHoleFitDocs fits =
      ; if showDocs
        then do { dflags <- getDynFlags
                ; mb_local_docs <- extractDocs dflags =<< getGblEnv
-               ; (mods_without_docs, fits') <- mapAccumM (upd mb_local_docs) Set.empty fits
+               ; (mods_without_docs, fits') <- mapAccumLM (upd mb_local_docs) Set.empty fits
                ; report mods_without_docs
                ; return fits' }
        else return fits }
@@ -483,16 +480,16 @@ addHoleFitDocs fits =
      Just m  -> Right m
      Nothing ->
        Left $ case nameSrcLoc name of
-         RealSrcLoc r _ -> unpackFS $ srcLocFile r
-         UnhelpfulLoc s -> unpackFS $ s
+         -- Nondeterminism is fine, this is used only to display a warning
+         RealSrcLoc r _ -> NonDetFastString $ srcLocFile r
+         UnhelpfulLoc s -> NonDetFastString s
    report mods = do
      { let warning =
              text "WARNING: Couldn't find any documentation for the following modules:" $+$
              nest 2
-                  (fsep (punctuate comma
-                                   (either text ppr <$> Set.toList mods)) $+$
+                  (pprWithCommas (either ppr ppr) (Set.toList mods) $+$
                    text "Make sure the modules are compiled with '-haddock'.")
-     ; warnPprTrace (not $ Set.null mods)"addHoleFitDocs" warning (pure ())
+     ; warnPprTrace (not $ Set.null mods) "addHoleFitDocs" warning (pure ())
      }
 
 -- For pretty printing hole fits, we display the name and type of the fit,
@@ -503,7 +500,7 @@ pprHoleFit _ (RawHoleFit sd) = sd
 pprHoleFit (HFDC sWrp sWrpVars sTy sProv sMs) (HoleFit {..}) =
  hang display 2 provenance
  where tyApp = sep $ zipWithEqual "pprHoleFit" pprArg vars hfWrap
-         where pprArg b arg = case binderArgFlag b of
+         where pprArg b arg = case binderFlag b of
                                 Specified -> text "@" <> pprParendType arg
                                   -- Do not print type application for inferred
                                   -- variables (#16456)
@@ -521,11 +518,11 @@ pprHoleFit (HFDC sWrp sWrpVars sTy sProv sMs) (HoleFit {..}) =
            -- e.g.
            -- return :: forall (m :: * -> *) Monad m => (forall a . a -> m a)
            -- into [m, a]
-           unwrapTypeVars :: Type -> [TyCoVarBinder]
+           unwrapTypeVars :: Type -> [ForAllTyBinder]
            unwrapTypeVars t = vars ++ case splitFunTy_maybe unforalled of
-                               Just (_, _, unfunned) -> unwrapTypeVars unfunned
+                               Just (_, _, _, unfunned) -> unwrapTypeVars unfunned
                                _ -> []
-             where (vars, unforalled) = splitForAllTyCoVarBinders t
+             where (vars, unforalled) = splitForAllForAllTyBinders t
        holeVs = sep $ map (parens . (text "_" <+> dcolon <+>) . ppr) hfMatches
        holeDisp = if sMs then holeVs
                   else sep $ replicate (length hfMatches) $ text "_"
@@ -677,8 +674,7 @@ findValidHoleFits tidy_env implics simples h@(Hole { hole_sort = ExprHole _
     -- of only concrete hole fits like `sum`.
     mkRefTy :: Int -> TcM (TcType, [TcTyVar])
     mkRefTy refLvl = (wrapWithVars &&& id) <$> newTyVars
-      where newTyVars = replicateM refLvl $ setLvl <$>
-                            (newOpenTypeKind >>= newFlexiTyVar)
+      where newTyVars = replicateM refLvl $ setLvl <$> newOpenFlexiTyVar
             setLvl = flip setMetaTyVarTcLevel hole_lvl
             wrapWithVars vars = mkVisFunTysMany (map mkTyVarTy vars) hole_ty
 
@@ -919,7 +915,7 @@ tcFilterHoleFits limit typed_hole ht@(hole_ty, _) candidates =
                                               _ -> True
                             allConcrete = all notAbstract z_wrp_tys
                       ; z_vars  <- zonkTcTyVars ref_vars
-                      ; let z_mtvs = mapMaybe tcGetTyVar_maybe z_vars
+                      ; let z_mtvs = mapMaybe getTyVar_maybe z_vars
                       ; allFilled <- not <$> anyM isFlexiTyVar z_mtvs
                       ; allowAbstract <- goptM Opt_AbstractRefHoleFits
                       ; if allowAbstract || (allFilled && allConcrete )

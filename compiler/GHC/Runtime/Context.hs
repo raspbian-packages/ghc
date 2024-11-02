@@ -10,7 +10,7 @@ module GHC.Runtime.Context
    , icReaderEnv
    , icInteractiveModule
    , icInScopeTTs
-   , icPrintUnqual
+   , icNamePprCtx
    )
 where
 
@@ -198,7 +198,7 @@ For example:
 
 
 It would be correct ot re-construct the env from scratch based on
-`ic_tythings`, but that'd be quite expensive if there are many entires in
+`ic_tythings`, but that'd be quite expensive if there are many entries in
 `ic_tythings` that shadow each other.
 
 Therefore we keep around a that `GlobalRdrEnv` in `igre_prompt_env` that
@@ -285,7 +285,7 @@ data InteractiveContext
 
          ic_plugins :: !Plugins
              -- ^ Cache of loaded plugins. We store them here to avoid having to
-             -- load them everytime we switch to the interctive context.
+             -- load them every time we switch to the interactive context.
     }
 
 data InteractiveImport
@@ -349,9 +349,10 @@ icInScopeTTs ictxt = filter in_scope_unqualified (ic_tythings ictxt)
         ]
 
 
--- | Get the PrintUnqualified function based on the flags and this InteractiveContext
-icPrintUnqual :: UnitEnv -> InteractiveContext -> PrintUnqualified
-icPrintUnqual unit_env ictxt = mkPrintUnqualified unit_env (icReaderEnv ictxt)
+-- | Get the NamePprCtx function based on the flags and this InteractiveContext
+icNamePprCtx :: UnitEnv -> InteractiveContext -> NamePprCtx
+icNamePprCtx unit_env ictxt = mkNamePprCtx ptc unit_env (icReaderEnv ictxt)
+  where ptc = initPromotionTickContext (ic_dflags ictxt)
 
 -- | extendInteractiveContext is called with new TyThings recently defined to update the
 -- InteractiveContext to include them. By putting new things first, unqualified
@@ -441,7 +442,7 @@ icExtendGblRdrEnv env tythings
                              _            -> False
     is_sub_bndr _ = False
 
-substInteractiveContext :: InteractiveContext -> TCvSubst -> InteractiveContext
+substInteractiveContext :: InteractiveContext -> Subst -> InteractiveContext
 substInteractiveContext ictxt@InteractiveContext{ ic_tythings = tts } subst
   | isEmptyTCvSubst subst = ictxt
   | otherwise             = ictxt { ic_tythings = map subst_ty tts }

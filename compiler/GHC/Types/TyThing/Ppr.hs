@@ -21,7 +21,7 @@ import GHC.Prelude
 import GHC.Types.TyThing ( TyThing(..), tyThingParent_maybe )
 import GHC.Types.Name
 
-import GHC.Core.Type    ( ArgFlag(..), mkTyVarBinders )
+import GHC.Core.Type    ( ForAllTyFlag(..), mkTyVarBinders )
 import GHC.Core.Coercion.Axiom ( coAxiomTyCon )
 import GHC.Core.FamInstEnv( FamInst(..), FamFlavor(..) )
 import GHC.Core.TyCo.Ppr ( pprUserForAll, pprTypeApp )
@@ -31,7 +31,8 @@ import GHC.Iface.Syntax ( ShowSub(..), ShowHowMuch(..), AltPpr(..)
 import GHC.Iface.Make ( tyThingToIfaceDecl )
 
 import GHC.Utils.Outputable
-import GHC.Utils.Trace
+
+import Data.Maybe ( isJust )
 
 -- -----------------------------------------------------------------------------
 -- Pretty-printing entities that we get from the GHC API
@@ -178,7 +179,7 @@ pprTyThing ss ty_thing
 
     ppr_bndr :: Name -> Maybe (OccName -> SDoc)
     ppr_bndr name
-      | isBuiltInSyntax name
+      | isBuiltInSyntax name || isJust (namePun_maybe name)
          = Nothing
       | otherwise
          = case nameModule_maybe name of

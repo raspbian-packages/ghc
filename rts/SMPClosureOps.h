@@ -28,8 +28,7 @@
 #endif
 
 #define unlockClosure(ptr,info)                 \
-    prim_write_barrier;                         \
-    StgHeader_info(ptr) = info;
+    %release StgHeader_info(ptr) = info;
 
 #else
 

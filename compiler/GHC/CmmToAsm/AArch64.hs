@@ -1,6 +1,6 @@
 {-# OPTIONS_GHC -fno-warn-orphans #-}
 
--- | Native code generator for x86 and x86-64 architectures
+-- | Native code generator for AArch64 architectures
 module GHC.CmmToAsm.AArch64
    ( ncgAArch64 )
 where
@@ -11,6 +11,7 @@ import GHC.CmmToAsm.Instr
 import GHC.CmmToAsm.Monad
 import GHC.CmmToAsm.Config
 import GHC.CmmToAsm.Types
+import GHC.Utils.Outputable (ftext)
 
 import qualified GHC.CmmToAsm.AArch64.Instr   as AArch64
 import qualified GHC.CmmToAsm.AArch64.Ppr     as AArch64
@@ -28,13 +29,14 @@ ncgAArch64 config
        ,canShortcut               = AArch64.canShortcut
        ,shortcutStatics           = AArch64.shortcutStatics
        ,shortcutJump              = AArch64.shortcutJump
-       ,pprNatCmmDecl             = AArch64.pprNatCmmDecl config
+       ,pprNatCmmDeclS            = AArch64.pprNatCmmDecl config
+       ,pprNatCmmDeclH            = AArch64.pprNatCmmDecl config
        ,maxSpillSlots             = AArch64.maxSpillSlots config
        ,allocatableRegs           = AArch64.allocatableRegs platform
        ,ncgAllocMoreStack         = AArch64.allocMoreStack platform
-       ,ncgMakeFarBranches        = const id
+       ,ncgMakeFarBranches        = AArch64.makeFarBranches
        ,extractUnwindPoints       = const []
-       ,invertCondBranches        = \_ _ -> id
+       ,invertCondBranches        = \_ _ blocks -> blocks
   }
     where
       platform = ncgPlatform config
@@ -45,6 +47,7 @@ instance Instruction AArch64.Instr where
         patchRegsOfInstr        = AArch64.patchRegsOfInstr
         isJumpishInstr          = AArch64.isJumpishInstr
         jumpDestsOfInstr        = AArch64.jumpDestsOfInstr
+        canFallthroughTo        = AArch64.canFallthroughTo
         patchJumpInstr          = AArch64.patchJumpInstr
         mkSpillInstr            = AArch64.mkSpillInstr
         mkLoadInstr             = AArch64.mkLoadInstr
@@ -55,5 +58,5 @@ instance Instruction AArch64.Instr where
         mkJumpInstr             = AArch64.mkJumpInstr
         mkStackAllocInstr       = AArch64.mkStackAllocInstr
         mkStackDeallocInstr     = AArch64.mkStackDeallocInstr
-        mkComment               = pure . AArch64.COMMENT
+        mkComment               = pure . AArch64.COMMENT . ftext
         pprInstr                = AArch64.pprInstr

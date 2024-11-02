@@ -257,7 +257,7 @@ tcLookupGlobal name
     do  { mb_thing <- tcLookupImported_maybe name
         ; case mb_thing of
             Succeeded thing -> return thing
-            Failed msg      -> failWithTc (TcRnUnknownMessage $ mkPlainError noHints msg)
+            Failed msg      -> failWithTc (TcRnInterfaceLookupError name msg)
         }}}
 
 -- Look up only in this module's global env't. Don't look in imports, etc.
@@ -328,17 +328,17 @@ tcLookupInstance cls tys
   = do { instEnv <- tcGetInstEnvs
        ; case lookupUniqueInstEnv instEnv cls tys of
            Left err             ->
-             failWithTc $ TcRnUnknownMessage
+             failWithTc $ mkTcRnUnknownMessage
                         $ mkPlainError noHints (text "Couldn't match instance:" <+> err)
            Right (inst, tys)
              | uniqueTyVars tys -> return inst
-             | otherwise        -> failWithTc (TcRnUnknownMessage $ mkPlainError noHints errNotExact)
+             | otherwise        -> failWithTc (mkTcRnUnknownMessage $ mkPlainError noHints errNotExact)
        }
   where
     errNotExact = text "Not an exact match (i.e., some variables get instantiated)"
 
     uniqueTyVars tys = all isTyVarTy tys
-                    && hasNoDups (map (getTyVar "tcLookupInstance") tys)
+                    && hasNoDups (map getTyVar tys)
 
 tcGetInstEnvs :: TcM InstEnvs
 -- Gets both the external-package inst-env
@@ -553,7 +553,7 @@ tcExtendNameTyVarEnv binds thing_inside
     names = [(name, ATyVar name tv) | (name, tv) <- binds]
 
 isTypeClosedLetBndr :: Id -> Bool
--- See Note [Bindings with closed types] in GHC.Tc.Types
+-- See Note [Bindings with closed types: ClosedTypeId] in GHC.Tc.Types
 isTypeClosedLetBndr = noFreeVarsOfType . idType
 
 tcExtendRecIds :: [(Name, TcId)] -> TcM a -> TcM a
@@ -684,7 +684,7 @@ tcCheckUsage name id_mult thing_inside
            ; traceTc "check_then_add_usage" (ppr id_mult $$ ppr actual_u)
            ; wrapper <- case actual_u of
                Bottom -> return idHsWrapper
-               Zero     -> tcSubMult (UsageEnvironmentOf name) Many id_mult
+               Zero     -> tcSubMult (UsageEnvironmentOf name) ManyTy id_mult
                MUsage m -> do { m <- promote_mult m
                               ; tcSubMult (UsageEnvironmentOf name) m id_mult }
            ; tcEmitBindingUsage (deleteUE uenv name)
@@ -853,7 +853,7 @@ good reasons; a view pattern in the RHS may mention a value binding).
 It is entirely reasonable to reject this, but to do so we need A to be
 in the kind environment when kind-checking the signature for B.
 
-Hence tcAddPatSynPlaceholers adds a binding
+Hence tcAddPatSynPlaceholders adds a binding
     A -> APromotionErr PatSynPE
 to the environment. Then GHC.Tc.Gen.HsType.tcTyVar will find A in the kind
 environment, and will give a 'wrongThingErr' as a result.  But the
@@ -899,7 +899,7 @@ checkWellStaged pp_thing bind_lvl use_lvl
 
   | otherwise                   -- Badly staged
   = failWithTc $                -- E.g.  \x -> $(f x)
-    TcRnUnknownMessage $ mkPlainError noHints $
+    mkTcRnUnknownMessage $ mkPlainError noHints $
     text "Stage error:" <+> pp_thing <+>
         hsep   [text "is bound at stage" <+> ppr bind_lvl,
                 text "but used at stage" <+> ppr use_lvl]
@@ -907,7 +907,7 @@ checkWellStaged pp_thing bind_lvl use_lvl
 stageRestrictionError :: SDoc -> TcM a
 stageRestrictionError pp_thing
   = failWithTc $
-    TcRnUnknownMessage $ mkPlainError noHints $
+    mkTcRnUnknownMessage $ mkPlainError noHints $
     sep [ text "GHC stage restriction:"
         , nest 2 (vcat [ pp_thing <+> text "is used in a top-level splice, quasi-quote, or annotation,"
                        , text "and must be imported, not defined locally"])]
@@ -961,7 +961,7 @@ tcGetDefaultTys
                                 -- User-supplied defaults
            Nothing  -> do
 
-        -- No use-supplied default
+        -- No user-supplied default
         -- Use [Integer, Double], plus modifications
         { integer_ty <- tcMetaTy integerTyConName
         ; list_ty <- tcMetaTy listTyConName
@@ -1125,7 +1125,7 @@ mkWrapperName :: (MonadIO m, HasModule m)
               => IORef (ModuleEnv Int) -> String -> String -> m FastString
 -- ^ @mkWrapperName ref what nameBase@
 --
--- See Note [Generating fresh names for ccall wrapper] for @ref@'s purpose.
+-- See Note [Generating fresh names for FFI wrappers] for @ref@'s purpose.
 mkWrapperName wrapperRef what nameBase
     = do thisMod <- getModule
          let pkg = unitString  (moduleUnit thisMod)
@@ -1139,7 +1139,7 @@ mkWrapperName wrapperRef what nameBase
 
 {-
 Note [Generating fresh names for FFI wrappers]
-
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 We used to use a unique, rather than nextWrapperNum, to distinguish
 between FFI wrapper functions. However, the wrapper names that we
 generate are external names. This means that if a call to them ends up
@@ -1175,7 +1175,7 @@ notFound name
                                             -- don't report it again (#11941)
              | otherwise -> stageRestrictionError (quotes (ppr name))
            _ -> failWithTc $
-                TcRnUnknownMessage $ mkPlainError noHints $
+                mkTcRnUnknownMessage $ mkPlainError noHints $
                 vcat[text "GHC internal error:" <+> quotes (ppr name) <+>
                      text "is not in scope during type checking, but it passed the renamer",
                      text "tcl_env of environment:" <+> ppr (tcl_env lcl_env)]
@@ -1187,11 +1187,8 @@ notFound name
        }
 
 wrongThingErr :: String -> TcTyThing -> Name -> TcM a
--- It's important that this only calls pprTcTyThingCategory, which in
--- turn does not look at the details of the TcTyThing.
--- See Note [Placeholder PatSyn kinds] in GHC.Tc.Gen.Bind
 wrongThingErr expected thing name
-  = let msg = TcRnUnknownMessage $ mkPlainError noHints $
+  = let msg = mkTcRnUnknownMessage $ mkPlainError noHints $
           (pprTcTyThingCategory thing <+> quotes (ppr name) <+>
                      text "used as a" <+> text expected)
   in failWithTc msg

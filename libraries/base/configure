@@ -1818,6 +1818,52 @@ $as_echo "$ac_res" >&6; }
 
 } # ac_fn_c_check_func
 
+# ac_fn_c_check_decl LINENO SYMBOL VAR INCLUDES
+# ---------------------------------------------
+# Tests whether SYMBOL is declared in INCLUDES, setting cache variable VAR
+# accordingly.
+ac_fn_c_check_decl ()
+{
+  as_lineno=${as_lineno-"$1"} as_lineno_stack=as_lineno_stack=$as_lineno_stack
+  as_decl_name=`echo $2|sed 's/ *(.*//'`
+  as_decl_use=`echo $2|sed -e 's/(/((/' -e 's/)/) 0&/' -e 's/,/) 0& (/g'`
+  { $as_echo "$as_me:${as_lineno-$LINENO}: checking whether $as_decl_name is declared" >&5
+$as_echo_n "checking whether $as_decl_name is declared... " >&6; }
+if eval \${$3+:} false; then :
+  $as_echo_n "(cached) " >&6
+else
+  cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+/* end confdefs.h.  */
+$4
+int
+main ()
+{
+#ifndef $as_decl_name
+#ifdef __cplusplus
+  (void) $as_decl_use;
+#else
+  (void) $as_decl_name;
+#endif
+#endif
+
+  ;
+  return 0;
+}
+_ACEOF
+if ac_fn_c_try_compile "$LINENO"; then :
+  eval "$3=yes"
+else
+  eval "$3=no"
+fi
+rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
+fi
+eval ac_res=\$$3
+	       { $as_echo "$as_me:${as_lineno-$LINENO}: result: $ac_res" >&5
+$as_echo "$ac_res" >&6; }
+  eval $as_lineno_stack; ${as_lineno_stack:+:} unset as_lineno
+
+} # ac_fn_c_check_decl
+
 # ac_fn_c_compute_int LINENO EXPR VAR INCLUDES
 # --------------------------------------------
 # Tries to find the compile-time value of EXPR in a program that includes
@@ -2000,52 +2046,6 @@ rm -f conftest.val
   as_fn_set_status $ac_retval
 
 } # ac_fn_c_compute_int
-
-# ac_fn_c_check_decl LINENO SYMBOL VAR INCLUDES
-# ---------------------------------------------
-# Tests whether SYMBOL is declared in INCLUDES, setting cache variable VAR
-# accordingly.
-ac_fn_c_check_decl ()
-{
-  as_lineno=${as_lineno-"$1"} as_lineno_stack=as_lineno_stack=$as_lineno_stack
-  as_decl_name=`echo $2|sed 's/ *(.*//'`
-  as_decl_use=`echo $2|sed -e 's/(/((/' -e 's/)/) 0&/' -e 's/,/) 0& (/g'`
-  { $as_echo "$as_me:${as_lineno-$LINENO}: checking whether $as_decl_name is declared" >&5
-$as_echo_n "checking whether $as_decl_name is declared... " >&6; }
-if eval \${$3+:} false; then :
-  $as_echo_n "(cached) " >&6
-else
-  cat confdefs.h - <<_ACEOF >conftest.$ac_ext
-/* end confdefs.h.  */
-$4
-int
-main ()
-{
-#ifndef $as_decl_name
-#ifdef __cplusplus
-  (void) $as_decl_use;
-#else
-  (void) $as_decl_name;
-#endif
-#endif
-
-  ;
-  return 0;
-}
-_ACEOF
-if ac_fn_c_try_compile "$LINENO"; then :
-  eval "$3=yes"
-else
-  eval "$3=no"
-fi
-rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
-fi
-eval ac_res=\$$3
-	       { $as_echo "$as_me:${as_lineno-$LINENO}: result: $ac_res" >&5
-$as_echo "$ac_res" >&6; }
-  eval $as_lineno_stack; ${as_lineno_stack:+:} unset as_lineno
-
-} # ac_fn_c_check_decl
 cat >config.log <<_ACEOF
 This file contains any messages produced by compilers while
 running configure, to aid debugging if configure makes a mistake.
@@ -3985,6 +3985,18 @@ _ACEOF
 fi
 done
 
+ac_fn_c_check_decl "$LINENO" "CLOCK_PROCESS_CPUTIME_ID" "ac_cv_have_decl_CLOCK_PROCESS_CPUTIME_ID" "#include <time.h>
+"
+if test "x$ac_cv_have_decl_CLOCK_PROCESS_CPUTIME_ID" = xyes; then :
+  ac_have_decl=1
+else
+  ac_have_decl=0
+fi
+
+cat >>confdefs.h <<_ACEOF
+#define HAVE_DECL_CLOCK_PROCESS_CPUTIME_ID $ac_have_decl
+_ACEOF
+
 for ac_func in getclock getrusage times
 do :
   as_ac_var=`$as_echo "ac_cv_func_$ac_func" | $as_tr_sh`
@@ -4165,6 +4177,93 @@ fi
 done
 
 
+for ac_func in chmod
+do :
+  ac_fn_c_check_func "$LINENO" "chmod" "ac_cv_func_chmod"
+if test "x$ac_cv_func_chmod" = xyes; then :
+  cat >>confdefs.h <<_ACEOF
+#define HAVE_CHMOD 1
+_ACEOF
+
+fi
+done
+
+for ac_func in dup
+do :
+  ac_fn_c_check_func "$LINENO" "dup" "ac_cv_func_dup"
+if test "x$ac_cv_func_dup" = xyes; then :
+  cat >>confdefs.h <<_ACEOF
+#define HAVE_DUP 1
+_ACEOF
+
+fi
+done
+
+for ac_func in fork
+do :
+  ac_fn_c_check_func "$LINENO" "fork" "ac_cv_func_fork"
+if test "x$ac_cv_func_fork" = xyes; then :
+  cat >>confdefs.h <<_ACEOF
+#define HAVE_FORK 1
+_ACEOF
+
+fi
+done
+
+for ac_func in getpid
+do :
+  ac_fn_c_check_func "$LINENO" "getpid" "ac_cv_func_getpid"
+if test "x$ac_cv_func_getpid" = xyes; then :
+  cat >>confdefs.h <<_ACEOF
+#define HAVE_GETPID 1
+_ACEOF
+
+fi
+done
+
+for ac_func in mkfifo
+do :
+  ac_fn_c_check_func "$LINENO" "mkfifo" "ac_cv_func_mkfifo"
+if test "x$ac_cv_func_mkfifo" = xyes; then :
+  cat >>confdefs.h <<_ACEOF
+#define HAVE_MKFIFO 1
+_ACEOF
+
+fi
+done
+
+for ac_func in pipe
+do :
+  ac_fn_c_check_func "$LINENO" "pipe" "ac_cv_func_pipe"
+if test "x$ac_cv_func_pipe" = xyes; then :
+  cat >>confdefs.h <<_ACEOF
+#define HAVE_PIPE 1
+_ACEOF
+
+fi
+done
+
+for ac_func in umask
+do :
+  ac_fn_c_check_func "$LINENO" "umask" "ac_cv_func_umask"
+if test "x$ac_cv_func_umask" = xyes; then :
+  cat >>confdefs.h <<_ACEOF
+#define HAVE_UMASK 1
+_ACEOF
+
+fi
+done
+
+
+ac_fn_c_check_type "$LINENO" "struct rlimit" "ac_cv_type_struct_rlimit" "#include <sys/resource.h>
+"
+if test "x$ac_cv_type_struct_rlimit" = xyes; then :
+
+$as_echo "#define HAVE_STRUCT_RLIMIT 1" >>confdefs.h
+
+fi
+
+
 ###  POSIX.1003.1 unsetenv returns 0 or -1 (EINVAL), but older implementations
 ###  in common use return void.
 { $as_echo "$as_me:${as_lineno-$LINENO}: checking return type of unsetenv" >&5
@@ -4259,9 +4358,7 @@ else
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -4332,9 +4429,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -4415,9 +4510,7 @@ rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -4483,9 +4576,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -4551,9 +4642,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -4633,9 +4722,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -4701,9 +4788,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -4814,9 +4899,7 @@ else
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -4887,9 +4970,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -4970,9 +5051,7 @@ rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -5038,9 +5117,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -5106,9 +5183,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -5188,9 +5263,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -5256,9 +5329,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -5369,9 +5440,7 @@ else
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -5442,9 +5511,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -5525,9 +5592,7 @@ rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -5593,9 +5658,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -5661,9 +5724,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -5743,9 +5804,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -5811,9 +5870,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -5924,9 +5981,7 @@ else
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -5997,9 +6052,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -6080,9 +6133,7 @@ rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -6148,9 +6199,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -6216,9 +6265,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -6298,9 +6345,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -6366,9 +6411,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -6479,9 +6522,7 @@ else
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -6552,9 +6593,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -6635,9 +6674,7 @@ rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -6703,9 +6740,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -6771,9 +6806,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -6853,9 +6886,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -6921,9 +6952,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -7034,9 +7063,7 @@ else
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -7107,9 +7134,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -7190,9 +7215,7 @@ rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -7258,9 +7281,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -7326,9 +7347,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -7408,9 +7427,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -7476,9 +7493,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -7589,9 +7604,7 @@ else
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -7662,9 +7675,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -7745,9 +7756,7 @@ rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -7813,9 +7822,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -7881,9 +7888,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -7963,9 +7968,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -8031,9 +8034,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -8144,9 +8145,7 @@ else
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -8217,9 +8216,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -8300,9 +8297,7 @@ rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -8368,9 +8363,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -8436,9 +8429,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -8518,9 +8509,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -8586,9 +8575,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -8699,9 +8686,7 @@ else
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -8772,9 +8757,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -8855,9 +8838,7 @@ rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -8923,9 +8904,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -8991,9 +8970,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -9073,9 +9050,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -9141,9 +9116,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -9255,9 +9228,7 @@ else
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -9328,9 +9299,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -9411,9 +9380,7 @@ rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -9479,9 +9446,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -9547,9 +9512,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -9629,9 +9592,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -9697,9 +9658,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -9810,9 +9769,7 @@ else
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -9883,9 +9840,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -9966,9 +9921,7 @@ rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -10034,9 +9987,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -10102,9 +10053,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -10184,9 +10133,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -10252,9 +10199,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -10366,9 +10311,7 @@ else
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -10439,9 +10382,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -10522,9 +10463,7 @@ rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -10590,9 +10529,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -10658,9 +10595,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -10740,9 +10675,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -10808,9 +10741,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -10921,9 +10852,7 @@ else
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -10994,9 +10923,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -11077,9 +11004,7 @@ rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -11145,9 +11070,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -11213,9 +11136,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -11295,9 +11216,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -11363,9 +11282,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -11476,9 +11393,7 @@ else
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -11549,9 +11464,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -11632,9 +11545,7 @@ rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -11700,9 +11611,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -11768,9 +11677,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -11850,9 +11757,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -11918,9 +11823,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -12031,9 +11934,7 @@ else
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -12104,9 +12005,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -12187,9 +12086,7 @@ rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -12255,9 +12152,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -12323,9 +12218,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -12405,9 +12298,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -12473,9 +12364,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -12586,9 +12475,7 @@ else
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -12659,9 +12546,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -12742,9 +12627,7 @@ rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -12810,9 +12693,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -12878,9 +12759,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -12960,9 +12839,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -13028,9 +12905,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -13141,9 +13016,7 @@ else
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -13214,9 +13087,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -13297,9 +13168,7 @@ rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -13365,9 +13234,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -13433,9 +13300,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -13515,9 +13380,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -13583,9 +13446,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -13696,9 +13557,7 @@ else
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -13769,9 +13628,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -13852,9 +13709,7 @@ rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -13920,9 +13775,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -13988,9 +13841,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -14070,9 +13921,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -14138,9 +13987,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -14251,9 +14098,7 @@ else
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -14324,9 +14169,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -14407,9 +14250,7 @@ rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -14475,9 +14316,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -14543,9 +14382,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -14625,9 +14462,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -14693,9 +14528,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -14806,9 +14639,7 @@ else
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -14879,9 +14710,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -14962,9 +14791,7 @@ rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -15030,9 +14857,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -15098,9 +14923,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -15180,9 +15003,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -15248,9 +15069,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -15361,9 +15180,7 @@ else
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -15434,9 +15251,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -15517,9 +15332,7 @@ rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -15585,9 +15398,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -15653,9 +15464,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -15735,9 +15544,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -15803,9 +15610,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -15915,9 +15720,7 @@ else
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -15988,9 +15791,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -16071,9 +15872,7 @@ rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -16139,9 +15938,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -16207,9 +16004,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -16289,9 +16084,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -16357,9 +16150,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -16471,9 +16262,7 @@ else
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -16544,9 +16333,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -16627,9 +16414,7 @@ rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -16695,9 +16480,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -16763,9 +16546,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -16845,9 +16626,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -16913,9 +16692,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -17026,9 +16803,7 @@ else
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -17099,9 +16874,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -17182,9 +16955,7 @@ rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -17250,9 +17021,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -17318,9 +17087,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -17400,9 +17167,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -17468,9 +17233,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -17581,9 +17344,7 @@ else
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -17654,9 +17415,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -17737,9 +17496,7 @@ rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -17805,9 +17562,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -17873,9 +17628,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -17955,9 +17708,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -18023,9 +17774,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -18136,9 +17885,7 @@ else
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -18209,9 +17956,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -18292,9 +18037,7 @@ rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -18360,9 +18103,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -18428,9 +18169,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -18510,9 +18249,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -18578,9 +18315,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -18691,9 +18426,7 @@ else
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -18764,9 +18497,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -18847,9 +18578,7 @@ rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -18915,9 +18644,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -18983,9 +18710,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -19065,9 +18790,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -19133,9 +18856,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -19246,9 +18967,7 @@ else
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -19319,9 +19038,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -19402,9 +19119,7 @@ rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -19470,9 +19185,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -19538,9 +19251,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -19620,9 +19331,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -19688,9 +19397,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -19801,9 +19508,7 @@ else
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -19874,9 +19579,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -19957,9 +19660,7 @@ rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -20025,9 +19726,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -20093,9 +19792,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -20175,9 +19872,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -20243,9 +19938,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -20356,9 +20049,7 @@ else
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -20429,9 +20120,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -20512,9 +20201,7 @@ rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -20580,9 +20267,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -20648,9 +20333,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -20730,9 +20413,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -20798,9 +20479,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -20911,9 +20590,7 @@ else
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -20984,9 +20661,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -21067,9 +20742,7 @@ rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -21135,9 +20808,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -21203,9 +20874,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -21285,9 +20954,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -21353,9 +21020,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -21466,9 +21131,7 @@ else
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -21539,9 +21202,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -21622,9 +21283,7 @@ rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -21690,9 +21349,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -21758,9 +21415,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -21840,9 +21495,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -21908,9 +21561,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -22021,9 +21672,7 @@ else
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -22094,9 +21743,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -22177,9 +21824,7 @@ rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -22245,9 +21890,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -22313,9 +21956,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -22395,9 +22036,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -22463,9 +22102,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -22576,9 +22213,7 @@ else
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -22649,9 +22284,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -22732,9 +22365,7 @@ rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -22800,9 +22431,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -22868,9 +22497,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -22950,9 +22577,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -23018,9 +22643,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -23131,9 +22754,7 @@ else
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -23204,9 +22825,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -23287,9 +22906,7 @@ rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -23355,9 +22972,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -23423,9 +23038,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -23505,9 +23118,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -23573,9 +23184,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -23686,9 +23295,7 @@ else
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -23759,9 +23366,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -23842,9 +23447,7 @@ rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -23910,9 +23513,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -23978,9 +23579,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -24060,9 +23659,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -24128,9 +23725,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -24241,9 +23836,7 @@ else
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -24314,9 +23907,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -24397,9 +23988,7 @@ rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -24465,9 +24054,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -24533,9 +24120,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -24615,9 +24200,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -24683,9 +24266,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -24796,9 +24377,7 @@ else
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -24869,9 +24448,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -24952,9 +24529,7 @@ rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -25020,9 +24595,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -25088,9 +24661,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -25170,9 +24741,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -25238,9 +24807,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -25351,9 +24918,7 @@ else
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -25424,9 +24989,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -25507,9 +25070,7 @@ rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -25575,9 +25136,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -25643,9 +25202,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -25725,9 +25282,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -25793,9 +25348,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -25906,9 +25459,7 @@ else
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -25979,9 +25530,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -26062,9 +25611,7 @@ rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -26130,9 +25677,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -26198,9 +25743,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -26280,9 +25823,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -26348,9 +25889,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -26461,9 +26000,7 @@ else
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -26534,9 +26071,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -26617,9 +26152,7 @@ rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -26685,9 +26218,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -26753,9 +26284,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -26835,9 +26364,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -26903,9 +26430,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -27016,9 +26541,7 @@ else
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -27089,9 +26612,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -27172,9 +26693,7 @@ rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -27240,9 +26759,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -27308,9 +26825,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -27390,9 +26905,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -27458,9 +26971,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -27571,9 +27082,7 @@ else
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -27644,9 +27153,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -27727,9 +27234,7 @@ rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -27795,9 +27300,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -27863,9 +27366,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -27945,9 +27446,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -28013,9 +27512,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -28126,9 +27623,7 @@ else
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -28199,9 +27694,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -28282,9 +27775,7 @@ rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -28350,9 +27841,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -28418,9 +27907,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -28500,9 +27987,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -28568,9 +28053,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -28681,9 +28164,7 @@ else
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -28754,9 +28235,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -28837,9 +28316,7 @@ rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -28905,9 +28382,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -28973,9 +28448,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -29055,9 +28528,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -29123,9 +28594,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -29237,9 +28706,7 @@ else
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -29310,9 +28777,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -29393,9 +28858,7 @@ rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -29461,9 +28924,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -29529,9 +28990,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -29611,9 +29070,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -29679,9 +29136,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -29792,9 +29247,7 @@ else
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -29865,9 +29318,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -29948,9 +29399,7 @@ rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -30016,9 +29465,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -30084,9 +29531,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -30166,9 +29611,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -30234,9 +29677,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -30347,9 +29788,7 @@ else
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -30420,9 +29859,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -30503,9 +29940,7 @@ rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -30571,9 +30006,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -30639,9 +30072,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -30721,9 +30152,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -30789,9 +30218,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -30902,9 +30329,7 @@ else
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -30975,9 +30400,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -31058,9 +30481,7 @@ rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -31126,9 +30547,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -31194,9 +30613,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -31276,9 +30693,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>
@@ -31344,9 +30759,7 @@ fi
 # include <signal.h>
 #endif
 
-#if HAVE_TIME_H
-# include <time.h>
-#endif
+#include <time.h>
 
 #if HAVE_TERMIOS_H
 # include <termios.h>

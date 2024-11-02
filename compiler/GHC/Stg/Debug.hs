@@ -16,7 +16,7 @@ import GHC.Types.Tickish
 import GHC.Core.DataCon
 import GHC.Types.IPE
 import GHC.Unit.Module
-import GHC.Types.Name   ( getName, getOccName, occNameString, nameSrcSpan)
+import GHC.Types.Name   ( getName, getOccName, occNameString, nameSrcSpan )
 import GHC.Data.FastString
 
 import Control.Monad (when)
@@ -68,21 +68,25 @@ collectStgBind (StgRec pairs) = do
     return (StgRec es)
 
 collectStgRhs :: Id -> StgRhs -> M StgRhs
-collectStgRhs bndr (StgRhsClosure ext cc us bs e)= do
-  let
-    name = idName bndr
-    -- If the name has a span, use that initially as the source position in-case
-    -- we don't get anything better.
-    with_span = case nameSrcSpan name of
-                  RealSrcSpan pos _ -> withSpan (pos, occNameString (getOccName name))
-                  _ -> id
-  e' <- with_span $ collectExpr e
-  recordInfo bndr e'
-  return $ StgRhsClosure ext cc us bs e'
-collectStgRhs _bndr (StgRhsCon cc dc _mn ticks args) = do
-  n' <- numberDataCon dc ticks
-  return (StgRhsCon cc dc n' ticks args)
-
+collectStgRhs bndr rhs =
+    case rhs of
+      StgRhsClosure ext cc us bs e -> do
+        e' <- with_span $ collectExpr e
+        recordInfo bndr e'
+        return $ StgRhsClosure ext cc us bs e'
+      StgRhsCon cc dc _mn ticks args -> do
+        n' <- with_span $ numberDataCon dc ticks
+        return (StgRhsCon cc dc n' ticks args)
+  where
+    -- If the binder name has a span, use that initially as the source position
+    -- in case we don't get anything better
+    with_span :: M a -> M a
+    with_span =
+      let name = idName bndr in
+      case nameSrcSpan name of
+        RealSrcSpan pos _ ->
+          withSpan (pos, occNameString (getOccName name))
+        _ -> id
 
 recordInfo :: Id -> StgExpr -> M ()
 recordInfo bndr new_rhs = do
@@ -210,7 +214,7 @@ is collected in the `InfoTableProvMap` which provides a mapping from:
 1. Data constructors to a list of where they are used.
 2. `Name`s and where they originate from.
 3. Stack represented info tables (return frames) to an approximated source location
-   of the call that pushed a contiunation on the stacks.
+   of the call that pushed a continuation on the stacks.
 
 During the CoreToStg phase, this map is populated whenever something is turned into
 a StgRhsClosure or an StgConApp. The current source position is recorded
@@ -252,8 +256,8 @@ Note [Distinct Info Tables for Constructors]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 In the old times, each usage of a data constructor used the same info table.
-This made it impossible to distinguish which actual usuage of a data constructor was
-contributing primarily to the allocation in a program. Using the `-fdistinct-info-tables` flag you
+This made it impossible to distinguish which actual usage of a data constructor was
+contributing primarily to the allocation in a program. Using the `-fdistinct-constructor-tables` flag you
 can cause code generation to generate a distinct info table for each usage of
 a constructor. Then, when inspecting the heap you can see precisely which usage of a constructor
 was responsible for each allocation.

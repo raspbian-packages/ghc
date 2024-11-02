@@ -27,12 +27,10 @@ import qualified Text.ParserCombinators.ReadP as P
 import GHC.Prelude
 import GHC.Utils.Outputable as Outputable
 import GHC.Driver.Session
-import GHC.Driver.Ppr
 import GHC.Types.CostCentre
 import GHC.Types.CostCentre.State
 import GHC.Types.Name hiding (varName)
 import GHC.Types.Tickish
-import GHC.Unit.Module.Name
 import GHC.Unit.Module.ModGuts
 import GHC.Types.SrcLoc
 import GHC.Types.Var
@@ -44,6 +42,8 @@ import GHC.Utils.Panic
 import qualified GHC.Utils.Binary as B
 import Data.Char
 
+import Language.Haskell.Syntax.Module.Name
+
 addCallerCostCentres :: ModGuts -> CoreM ModGuts
 addCallerCostCentres guts = do
   dflags <- getDynFlags
@@ -52,7 +52,7 @@ addCallerCostCentres guts = do
       env = Env
         { thisModule = mg_module guts
         , ccState = newCostCentreState
-        , dflags = dflags
+        , countEntries = gopt Opt_ProfCountEntries dflags
         , revParents = []
         , filters = filters
         }
@@ -78,13 +78,13 @@ doExpr env e@(Var v)
           hcat (punctuate dot (map ppr (parents env))) <> parens (text "calling:" <> ppr v)
 
         ccName :: CcName
-        ccName = mkFastString $ showSDoc (dflags env) nameDoc
+        ccName = mkFastString $ renderWithContext defaultSDocContext nameDoc
     ccIdx <- getCCIndex' ccName
-    let count = gopt Opt_ProfCountEntries (dflags env)
+    let count = countEntries env
         span = case revParents env of
           top:_ -> nameSrcSpan $ varName top
           _     -> noSrcSpan
-        cc = NormalCC (ExprCC ccIdx) ccName (thisModule env) span
+        cc = NormalCC (mkExprCCFlavour ccIdx) ccName (thisModule env) span
         tick :: CoreTickish
         tick = ProfNote cc count True
     pure $ Tick tick e
@@ -109,7 +109,7 @@ getCCIndex' name = state (getCCIndex name)
 
 data Env = Env
   { thisModule  :: Module
-  , dflags      :: DynFlags
+  , countEntries :: !Bool
   , ccState     :: CostCentreState
   , revParents  :: [Id]
   , filters     :: [CallerCcFilter]

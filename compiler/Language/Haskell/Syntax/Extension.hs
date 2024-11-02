@@ -1,10 +1,10 @@
 {-# LANGUAGE AllowAmbiguousTypes     #-} -- for unXRec, etc.
+{-# LANGUAGE CPP                     #-}
 {-# LANGUAGE ConstraintKinds         #-}
 {-# LANGUAGE DataKinds               #-}
 {-# LANGUAGE DeriveDataTypeable      #-}
 {-# LANGUAGE EmptyCase               #-}
 {-# LANGUAGE EmptyDataDeriving       #-}
-{-# LANGUAGE StandaloneDeriving      #-}
 {-# LANGUAGE FlexibleContexts        #-}
 {-# LANGUAGE FlexibleInstances       #-}
 {-# LANGUAGE GADTs                   #-}
@@ -21,12 +21,15 @@ module Language.Haskell.Syntax.Extension where
 -- This module captures the type families to precisely identify the extension
 -- points for GHC.Hs syntax
 
-import GHC.Prelude
+#if MIN_VERSION_GLASGOW_HASKELL(9,3,0,0)
+import Data.Type.Equality (type (~))
+#endif
 
-import GHC.TypeLits (Symbol, KnownSymbol)
 import Data.Data hiding ( Fixity )
 import Data.Kind (Type)
-import GHC.Utils.Outputable
+
+import Data.Eq
+import Data.Ord
 
 {-
 Note [Trees That Grow]
@@ -73,9 +76,6 @@ See also Note [IsPass] and Note [NoGhcTc] in GHC.Hs.Extension.
 data NoExtField = NoExtField
   deriving (Data,Eq,Ord)
 
-instance Outputable NoExtField where
-  ppr _ = text "NoExtField"
-
 -- | Used when constructing a term with an unused extension point.
 noExtField :: NoExtField
 noExtField = NoExtField
@@ -110,9 +110,6 @@ See also [DataConCantHappen and strict fields].
 -}
 data DataConCantHappen
   deriving (Data,Eq,Ord)
-
-instance Outputable DataConCantHappen where
-  ppr = dataConCantHappen
 
 -- | Eliminate a 'DataConCantHappen'. See Note [Constructor cannot occur].
 dataConCantHappen :: DataConCantHappen -> a
@@ -354,6 +351,10 @@ type family XXDefaultDecl      x
 type family XForeignImport     x
 type family XForeignExport     x
 type family XXForeignDecl      x
+type family XCImport           x
+type family XXForeignImport    x
+type family XCExport           x
+type family XXForeignExport    x
 
 -- -------------------------------------
 -- RuleDecls type families
@@ -397,6 +398,12 @@ type family XCInjectivityAnn  x
 type family XXInjectivityAnn  x
 
 -- =====================================================================
+-- Type families for the HsModule extension points
+
+type family XCModule x
+type family XXModule x
+
+-- =====================================================================
 -- Type families for the HsExpr extension points
 
 type family XVar            x
@@ -431,7 +438,8 @@ type family XExprWithTySig  x
 type family XArithSeq       x
 type family XTypedBracket   x
 type family XUntypedBracket x
-type family XSpliceE        x
+type family XTypedSplice    x
+type family XUntypedSplice  x
 type family XProc           x
 type family XStatic         x
 type family XTick           x
@@ -463,12 +471,10 @@ type family XMissing  x
 type family XXTupArg  x
 
 -- -------------------------------------
--- HsSplice type families
-type family XTypedSplice   x
-type family XUntypedSplice x
-type family XQuasiQuote    x
-type family XSpliced       x
-type family XXSplice       x
+-- HsUntypedSplice type families
+type family XUntypedSpliceExpr x
+type family XQuasiQuote        x
+type family XXUntypedSplice    x
 
 -- -------------------------------------
 -- HsQuoteBracket type families
@@ -653,6 +659,13 @@ type family XWildCardTy      x
 type family XXType           x
 
 -- ---------------------------------------------------------------------
+-- HsTyLit type families
+type family XNumTy           x
+type family XStrTy           x
+type family XCharTy          x
+type family XXTyLit          x
+
+-- ---------------------------------------------------------------------
 -- HsForAllTelescope type families
 type family XHsForAllVis        x
 type family XHsForAllInvis      x
@@ -681,6 +694,7 @@ type family XXFieldOcc x
 -- ImportDecl type families
 type family XCImportDecl       x
 type family XXImportDecl       x
+type family ImportDeclPkgQual  x -- stores the package qualifier in an import statement
 
 -- -------------------------------------
 -- IE type families
@@ -695,6 +709,13 @@ type family XIEDocNamed        x
 type family XXIE               x
 
 -- -------------------------------------
+-- IEWrappedName type families
+type family XIEName p
+type family XIEPattern p
+type family XIEType p
+type family XXIEWrappedName p
+
+
 
 -- =====================================================================
 -- Misc
@@ -707,27 +728,3 @@ type family NoGhcTc (p :: Type)
 -- =====================================================================
 -- End of Type family definitions
 -- =====================================================================
-
-
-
--- =====================================================================
--- Token information
-
-type LHsToken tok p = XRec p (HsToken tok)
-
-data HsToken (tok :: Symbol) = HsTok
-
-deriving instance KnownSymbol tok => Data (HsToken tok)
-
-type LHsUniToken tok utok p = XRec p (HsUniToken tok utok)
-
--- With UnicodeSyntax, there might be multiple ways to write the same token.
--- For example an arrow could be either "->" or "→". This choice must be
--- recorded in order to exactprint such tokens,
--- so instead of HsToken "->" we introduce HsUniToken "->" "→".
---
--- See also IsUnicodeSyntax in GHC.Parser.Annotation; we do not use here to
--- avoid a dependency.
-data HsUniToken (tok :: Symbol) (utok :: Symbol) = HsNormalTok | HsUnicodeTok
-
-deriving instance (KnownSymbol tok, KnownSymbol utok) => Data (HsUniToken tok utok)

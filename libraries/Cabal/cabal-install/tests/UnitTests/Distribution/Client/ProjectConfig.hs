@@ -29,6 +29,7 @@ import Distribution.Version
 import Distribution.Simple.Program.Types
 import Distribution.Simple.Program.Db
 import Distribution.Simple.Utils (toUTF8BS)
+import qualified Distribution.Simple.InstallDirs as InstallDirs
 import Distribution.Types.PackageVersionConstraint
 
 import Distribution.Parsec
@@ -456,6 +457,7 @@ instance Arbitrary ProjectConfigShared where
         projectConfigHcPath               <- arbitraryFlag arbitraryShortToken
         projectConfigHcPkg                <- arbitraryFlag arbitraryShortToken
         projectConfigHaddockIndex         <- arbitrary
+        projectConfigInstallDirs          <- fixInstallDirs <$> arbitrary
         projectConfigPackageDBs           <- shortListOf 2 arbitrary
         projectConfigRemoteRepos          <- arbitrary
         projectConfigLocalNoIndexRepos    <- arbitrary
@@ -479,12 +481,14 @@ instance Arbitrary ProjectConfigShared where
         projectConfigOnlyConstrained      <- arbitrary
         projectConfigPerComponent         <- arbitrary
         projectConfigIndependentGoals     <- arbitrary
+        projectConfigPreferOldest         <- arbitrary
         projectConfigProgPathExtra        <- toNubList <$> listOf arbitraryShortToken
         return ProjectConfigShared {..}
       where
         arbitraryConstraints :: Gen [(UserConstraint, ConstraintSource)]
         arbitraryConstraints =
             fmap (\uc -> (uc, projectConfigConstraintSource)) <$> arbitrary
+        fixInstallDirs x = x {InstallDirs.includedir = mempty, InstallDirs.mandir = mempty, InstallDirs.flibdir = mempty}
 
     shrink ProjectConfigShared {..} = runShrinker $ pure ProjectConfigShared
         <*> shrinker projectConfigDistDir
@@ -495,6 +499,7 @@ instance Arbitrary ProjectConfigShared where
         <*> shrinkerAla (fmap NonEmpty) projectConfigHcPath
         <*> shrinkerAla (fmap NonEmpty) projectConfigHcPkg
         <*> shrinker projectConfigHaddockIndex
+        <*> shrinker projectConfigInstallDirs
         <*> shrinker projectConfigPackageDBs
         <*> shrinker projectConfigRemoteRepos
         <*> shrinker projectConfigLocalNoIndexRepos
@@ -518,6 +523,7 @@ instance Arbitrary ProjectConfigShared where
         <*> shrinker projectConfigOnlyConstrained
         <*> shrinker projectConfigPerComponent
         <*> shrinker projectConfigIndependentGoals
+        <*> shrinker projectConfigPreferOldest
         <*> shrinker projectConfigProgPathExtra
       where
         preShrink_Constraints  = map fst
@@ -570,6 +576,9 @@ instance Arbitrary PackageConfig where
         <*> arbitrary
         <*> arbitraryFlag arbitraryShortToken
         <*> arbitrary
+        <*> arbitrary
+        <*> arbitraryFlag arbitraryShortToken
+        <*> arbitraryFlag arbitraryShortToken
         <*> arbitrary
         <*> arbitrary
         <*> arbitrary
@@ -634,6 +643,9 @@ instance Arbitrary PackageConfig where
                          , packageConfigHaddockHscolourCss = x39
                          , packageConfigHaddockContents = x40
                          , packageConfigHaddockForHackage = x41
+                         , packageConfigHaddockIndex = x54
+                         , packageConfigHaddockBaseUrl = x55
+                         , packageConfigHaddockLib = x56
                          , packageConfigTestHumanLog = x44
                          , packageConfigTestMachineLog = x45
                          , packageConfigTestShowDetails = x46
@@ -691,6 +703,9 @@ instance Arbitrary PackageConfig where
                       , packageConfigHaddockHscolourCss = fmap getNonEmpty x39'
                       , packageConfigHaddockContents = x40'
                       , packageConfigHaddockForHackage = x41'
+                      , packageConfigHaddockIndex = x54'
+                      , packageConfigHaddockBaseUrl = x55'
+                      , packageConfigHaddockLib = x56'
                       , packageConfigTestHumanLog = x44'
                       , packageConfigTestMachineLog = x45'
                       , packageConfigTestShowDetails = x46'
@@ -708,7 +723,8 @@ instance Arbitrary PackageConfig where
           (x30', x31', x32', (x33', x33_1'), x34'),
           (x35', x36', x37', x38', x43', x39'),
           (x40', x41'),
-          (x44', x45', x46', x47', x48', x49', x51', x52')))
+          (x44', x45', x46', x47', x48', x49', x51', x52', x54', x55'),
+          x56'))
           <- shrink
              (((preShrink_Paths x00, preShrink_Args x01, x02, x03, x04),
                 (x05, x42, x06, x50, x07, x08, x09),
@@ -722,7 +738,7 @@ instance Arbitrary PackageConfig where
                  (x30, x31, x32, (x33, x33_1), x34),
                  (x35, x36, fmap NonEmpty x37, x38, x43, fmap NonEmpty x39),
                  (x40, x41),
-                 (x44, x45, x46, x47, x48, x49, x51, x52)))
+                 (x44, x45, x46, x47, x48, x49, x51, x52, x54, x55), x56))
       ]
       where
         preShrink_Paths  = Map.map NonEmpty
@@ -794,6 +810,9 @@ instance Arbitrary MinimizeConflictSet where
 
 instance Arbitrary IndependentGoals where
     arbitrary = IndependentGoals <$> arbitrary
+
+instance Arbitrary PreferOldest where
+    arbitrary = PreferOldest <$> arbitrary
 
 instance Arbitrary StrongFlags where
     arbitrary = StrongFlags <$> arbitrary

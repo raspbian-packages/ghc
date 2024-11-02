@@ -1,4 +1,4 @@
-{-# LANGUAGE TupleSections #-}
+{-# LANGUAGE TupleSections, MultiWayIf #-}
 module Rules.BinaryDist where
 
 import Hadrian.Haskell.Cabal
@@ -254,6 +254,7 @@ bindistRules = do
           -- other machine.
           need $ map (bindistFilesDir -/-)
                     (["configure", "Makefile"] ++ bindistInstallFiles)
+          copyFile ("hadrian" -/- "bindist" -/- "config.mk.in") (bindistFilesDir -/- "config.mk.in")
           forM_ bin_targets $ \(pkg, _) -> do
             needed_wrappers <- pkgToWrappers pkg
             forM_ needed_wrappers $ \wrapper_name -> do
@@ -346,9 +347,10 @@ compressorExtension Bzip2 = "bz2"
 bindistInstallFiles :: [FilePath]
 bindistInstallFiles =
     [ "config.sub", "config.guess", "install-sh"
-    , "mk" -/- "config.mk.in", "mk" -/- "install.mk.in", "mk" -/- "project.mk"
+    , "mk" -/- "project.mk"
     , "mk" -/- "relpath.sh"
     , "mk" -/- "system-cxx-std-lib-1.0.conf.in"
+    , "mk" -/- "hsc2hs.in"
     , "mk" -/- "install_script.sh"
     , "README", "INSTALL" ]
 
@@ -371,19 +373,20 @@ useGhcPrefix pkg
   | pkg == ghciWrapper = False
   | otherwise = True
 
-
 -- | Which wrappers point to a specific package
 pkgToWrappers :: Package -> Action [String]
-pkgToWrappers pkg
-  -- ghc also has the ghci script wrapper
-  | pkg == ghc = pure ["ghc", "ghci"]
-  | pkg == runGhc = pure ["runghc", "runhaskell"]
-  -- These are the packages which we want to expose to the user and hence
-  -- there are wrappers installed in the bindist.
-  | pkg `elem` [hpcBin, haddock, hp2ps, hsc2hs, ghc, ghcPkg]
-    = (:[]) <$> (programName =<< programContext Stage1 pkg)
-  | otherwise = pure []
-
+pkgToWrappers pkg = do
+    prefix <- crossPrefix
+    if  -- ghc also has the ghci script wrapper
+        -- N.B. programName would add the crossPrefix therefore we must do the
+        -- same here.
+      | pkg == ghc    -> pure $ map (prefix++) ["ghc", "ghci"]
+      | pkg == runGhc -> pure $ map (prefix++) ["runghc", "runhaskell"]
+        -- These are the packages which we want to expose to the user and hence
+        -- there are wrappers installed in the bindist.
+      | pkg `elem` [hpcBin, haddock, hp2ps, hsc2hs, ghc, ghcPkg]
+                      -> (:[]) <$> (programName =<< programContext Stage1 pkg)
+      | otherwise     -> pure []
 
 wrapper :: FilePath -> Action String
 wrapper "ghc"         = ghcWrapper
@@ -412,17 +415,8 @@ haddockWrapper = pure $ "exec \"$executablename\" -B\"$libdir\" -l\"$libdir\" ${
 commonWrapper :: Action String
 commonWrapper = pure $ "exec \"$executablename\" ${1+\"$@\"}\n"
 
--- echo 'HSC2HS_EXTRA="$(addprefix --cflag=,$(CONF_CC_OPTS_STAGE1)) $(addprefix --lflag=,$(CONF_GCC_LINKER_OPTS_STAGE1))"' >> "$(WRAPPER)"
 hsc2hsWrapper :: Action String
-hsc2hsWrapper = do
-  ccArgs <- map ("--cflag=" <>) <$> settingList (ConfCcArgs Stage1)
-  ldFlags <- map ("--lflag=" <>) <$> settingList (ConfGccLinkerArgs Stage1)
-  wrapper <- drop 4 . lines <$> liftIO (readFile "utils/hsc2hs/hsc2hs.wrapper")
-  return $ unlines
-    ( "HSC2HS_EXTRA=\"" <> unwords (ccArgs ++ ldFlags) <> "\""
-    : "tflag=\"--template=$libdir/template-hsc.h\""
-    : "Iflag=\"-I$includedir/\""
-    : wrapper )
+hsc2hsWrapper = return "Copied from mk/hsc2hs"
 
 runGhcWrapper :: Action String
 runGhcWrapper = pure $ "exec \"$executablename\" -f \"$exedir/ghc\" ${1+\"$@\"}\n"
@@ -445,7 +439,7 @@ iservBins :: Action [(Package, FilePath)]
 iservBins = do
   rtsways <- interpretInContext (vanillaContext Stage1 ghc) getRtsWays
   traverse (fmap (\p -> (iserv, p)) . programPath)
-      [ Context Stage1 iserv w
+      [ Context Stage1 iserv w Final
       | w <- [vanilla, profiling, dynamic]
       , w `elem` rtsways
       ]

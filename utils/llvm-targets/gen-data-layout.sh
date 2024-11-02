@@ -16,7 +16,7 @@
 # Add missing targets to the list below to have them included in
 # llvm-targets file.
 #
-# See Note [LLVM configuration] in GHC.SysTools for the whole story regarding LLVM
+# See Note [LLVM configuration] in GHC.CmmToLlvm.Config for the whole story regarding LLVM
 # configuration data.
 
 # Target sets for which to generate the llvm-targets file
@@ -55,6 +55,9 @@ TARGETS=(
     "aarch64-unknown-linux-gnu"
     "aarch64-unknown-linux-musl"
     "aarch64-unknown-linux"
+    "aarch64_be-unknown-linux-gnu"
+    "aarch64_be-unknown-linux-musl"
+    "aarch64_be-unknown-linux"
     # Linux x86
     "i386-unknown-linux-gnu"
     "i386-unknown-linux-musl"
@@ -79,6 +82,9 @@ TARGETS=(
     # Linux riscv64
     "riscv64-unknown-linux-gnu"
     "riscv64-unknown-linux"
+    # Linux loongarch64
+    "loongarch64-unknown-linux-gnu"
+    "loongarch64-unknown-linux"
 
     #########################
     # Darwin
@@ -118,7 +124,6 @@ TARGETS=(
     #########################
 
     "x86_64-unknown-openbsd"
-    "i386-unknown-openbsd"
 
     #########################
     # Other

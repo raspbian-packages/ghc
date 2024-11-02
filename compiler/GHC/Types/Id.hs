@@ -86,20 +86,19 @@ module GHC.Types.Id (
         idInlineActivation, setInlineActivation, idRuleMatchInfo,
 
         -- ** One-shot lambdas
-        isOneShotBndr, isProbablyOneShotLambda,
         setOneShotLambda, clearOneShotLambda,
         updOneShotInfo, setIdOneShotInfo,
-        isStateHackType, stateHackOneShot, typeOneShot,
 
         -- ** Reading 'IdInfo' fields
         idArity,
         idCallArity, idFunRepArity,
-        idUnfolding, realIdUnfolding,
         idSpecialisation, idCoreRules, idHasRules,
         idCafInfo, idLFInfo_maybe,
-        idOneShotInfo, idStateHackOneShotInfo,
+        idOneShotInfo,
         idOccInfo,
-        isNeverRepPolyId,
+
+        IdUnfoldingFun, idUnfolding, realIdUnfolding,
+        alwaysActiveUnfoldingFun, whenActiveUnfoldingFun, noUnfoldingFun,
 
         -- ** Writing 'IdInfo' fields
         setIdUnfolding, zapIdUnfolding, setCaseBndrEvald,
@@ -129,8 +128,9 @@ module GHC.Types.Id (
 
 import GHC.Prelude
 
-import GHC.Core ( CoreRule, isStableUnfolding, evaldUnfolding,
-                 isCompulsoryUnfolding, Unfolding( NoUnfolding ), isEvaldUnfolding, hasSomeUnfolding, noUnfolding )
+import GHC.Core ( CoreRule, isStableUnfolding, evaldUnfolding
+                , isCompulsoryUnfolding, Unfolding( NoUnfolding )
+                , IdUnfoldingFun, isEvaldUnfolding, hasSomeUnfolding, noUnfolding )
 
 import GHC.Types.Id.Info
 import GHC.Types.Basic
@@ -146,7 +146,6 @@ import qualified GHC.Types.Var as Var
 
 import GHC.Core.Type
 import GHC.Types.RepType
-import GHC.Builtin.Types.Prim
 import GHC.Core.DataCon
 import GHC.Types.Demand
 import GHC.Types.Cpr
@@ -167,8 +166,6 @@ import GHC.Utils.Misc
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
 import GHC.Utils.Panic.Plain
-import GHC.Utils.GlobalVars
-import GHC.Utils.Trace
 import GHC.Stg.InferTags.TagSig
 
 -- infixl so you can say (id `set` a `set` b)
@@ -315,7 +312,7 @@ mkLocalId name w ty = mkLocalIdWithInfo name w (assert (not (isCoVarType ty)) ty
 mkLocalCoVar :: Name -> Type -> CoVar
 mkLocalCoVar name ty
   = assert (isCoVarType ty) $
-    Var.mkLocalVar CoVarId name Many ty vanillaIdInfo
+    Var.mkLocalVar CoVarId name ManyTy ty vanillaIdInfo
 
 -- | Like 'mkLocalId', but checks the type to see if it should make a covar
 mkLocalIdOrCoVar :: Name -> Mult -> Type -> Id
@@ -383,7 +380,7 @@ instantiated before use.
 -- | Workers get local names. "CoreTidy" will externalise these if necessary
 mkWorkerId :: Unique -> Id -> Type -> Id
 mkWorkerId uniq unwrkr ty
-  = mkLocalId (mkDerivedInternalName mkWorkerOcc uniq (getName unwrkr)) Many ty
+  = mkLocalId (mkDerivedInternalName mkWorkerOcc uniq (getName unwrkr)) ManyTy ty
 
 -- | Create a /template local/: a family of system local 'Id's in bijection with @Int@s, typically used in unfoldings
 mkTemplateLocal :: Int -> Type -> Id
@@ -502,16 +499,16 @@ isClassOpId_maybe id = case Var.idDetails id of
                         _other        -> Nothing
 
 isPrimOpId id = case Var.idDetails id of
-                        PrimOpId _ -> True
-                        _          -> False
+                        PrimOpId {} -> True
+                        _           -> False
 
 isDFunId id = case Var.idDetails id of
                         DFunId {} -> True
                         _         -> False
 
 isPrimOpId_maybe id = case Var.idDetails id of
-                        PrimOpId op -> Just op
-                        _           -> Nothing
+                        PrimOpId op _ -> Just op
+                        _             -> Nothing
 
 isFCallId id = case Var.idDetails id of
                         FCallId _ -> True
@@ -586,7 +583,12 @@ hasNoBinding :: Id -> Bool
 -- exception to this is unboxed tuples and sums datacons, which definitely have
 -- no binding
 hasNoBinding id = case Var.idDetails id of
-                        PrimOpId _       -> True    -- See Note [Eta expanding primops] in GHC.Builtin.PrimOps
+
+-- TEMPORARILY make all primops hasNoBinding, to avoid #20155
+-- The goal is to understand #20155 and revert to the commented out version
+                        PrimOpId _ _ -> True    -- See Note [Eta expanding primops] in GHC.Builtin.PrimOps
+--                        PrimOpId _ lev_poly -> lev_poly    -- TEMPORARILY commented out
+
                         FCallId _        -> True
                         DataConWorkId dc -> isUnboxedTupleDataCon dc || isUnboxedSumDataCon dc
                         _                -> isCompulsoryUnfolding (realIdUnfolding id)
@@ -723,12 +725,14 @@ setIdCprSig id sig = modifyIdInfo (\info -> setCprSigInfo info sig) id
 zapIdDmdSig :: Id -> Id
 zapIdDmdSig id = modifyIdInfo (`setDmdSigInfo` nopSig) id
 
--- | This predicate says whether the 'Id' has a strict demand placed on it or
--- has a type such that it can always be evaluated strictly (i.e an
--- unlifted type, as of GHC 7.6).  We need to
--- check separately whether the 'Id' has a so-called \"strict type\" because if
--- the demand for the given @id@ hasn't been computed yet but @id@ has a strict
--- type, we still want @isStrictId id@ to be @True@.
+-- | `isStrictId` says whether either
+--   (a) the 'Id' has a strict demand placed on it or
+--   (b) definitely has a \"strict type\", such that it can always be
+--       evaluated strictly (i.e an unlifted type)
+-- We need to check (b) as well as (a), because when the demand for the
+-- given `id` hasn't been computed yet but `id` has a strict
+-- type, we still want `isStrictId id` to be `True`.
+-- Returns False if the type is levity polymorphic; False is always safe.
 isStrictId :: Id -> Bool
 isStrictId id
   | assertPpr (isId id) (text "isStrictId: not an id: " <+> ppr id) $
@@ -747,8 +751,27 @@ idTagSig_maybe = tagSig . idInfo
 -- loop breaker. See 'unfoldingInfo'.
 --
 -- If you really want the unfolding of a strong loopbreaker, call 'realIdUnfolding'.
-idUnfolding :: Id -> Unfolding
+idUnfolding :: IdUnfoldingFun
 idUnfolding id = unfoldingInfo (idInfo id)
+
+noUnfoldingFun :: IdUnfoldingFun
+noUnfoldingFun _id = noUnfolding
+
+-- | Returns an unfolding only if
+--   (a) not a strong loop breaker and
+--   (b) always active
+alwaysActiveUnfoldingFun :: IdUnfoldingFun
+alwaysActiveUnfoldingFun id
+  | isAlwaysActive (idInlineActivation id) = idUnfolding id
+  | otherwise                              = noUnfolding
+
+-- | Returns an unfolding only if
+--   (a) not a strong loop breaker and
+--   (b) active in according to is_active
+whenActiveUnfoldingFun :: (Activation -> Bool) -> IdUnfoldingFun
+whenActiveUnfoldingFun is_active id
+  | is_active (idInlineActivation id) = idUnfolding id
+  | otherwise                         = NoUnfolding
 
 realIdUnfolding :: Id -> Unfolding
 -- ^ Expose the unfolding if there is one, including for loop breakers
@@ -922,64 +945,6 @@ isConLikeId id = isConLike (idRuleMatchInfo id)
 idOneShotInfo :: Id -> OneShotInfo
 idOneShotInfo id = oneShotInfo (idInfo id)
 
--- | Like 'idOneShotInfo', but taking the Horrible State Hack in to account
--- See Note [The state-transformer hack] in "GHC.Core.Opt.Arity"
-idStateHackOneShotInfo :: Id -> OneShotInfo
-idStateHackOneShotInfo id
-    | isStateHackType (idType id) = stateHackOneShot
-    | otherwise                   = idOneShotInfo id
-
--- | Returns whether the lambda associated with the 'Id' is certainly applied at most once
--- This one is the "business end", called externally.
--- It works on type variables as well as Ids, returning True
--- Its main purpose is to encapsulate the Horrible State Hack
--- See Note [The state-transformer hack] in "GHC.Core.Opt.Arity"
-isOneShotBndr :: Var -> Bool
-isOneShotBndr var
-  | isTyVar var                              = True
-  | OneShotLam <- idStateHackOneShotInfo var = True
-  | otherwise                                = False
-
--- | Should we apply the state hack to values of this 'Type'?
-stateHackOneShot :: OneShotInfo
-stateHackOneShot = OneShotLam
-
-typeOneShot :: Type -> OneShotInfo
-typeOneShot ty
-   | isStateHackType ty = stateHackOneShot
-   | otherwise          = NoOneShotInfo
-
-isStateHackType :: Type -> Bool
-isStateHackType ty
-  | unsafeHasNoStateHack
-  = False
-  | otherwise
-  = case tyConAppTyCon_maybe ty of
-        Just tycon -> tycon == statePrimTyCon
-        _          -> False
-        -- This is a gross hack.  It claims that
-        -- every function over realWorldStatePrimTy is a one-shot
-        -- function.  This is pretty true in practice, and makes a big
-        -- difference.  For example, consider
-        --      a `thenST` \ r -> ...E...
-        -- The early full laziness pass, if it doesn't know that r is one-shot
-        -- will pull out E (let's say it doesn't mention r) to give
-        --      let lvl = E in a `thenST` \ r -> ...lvl...
-        -- When `thenST` gets inlined, we end up with
-        --      let lvl = E in \s -> case a s of (r, s') -> ...lvl...
-        -- and we don't re-inline E.
-        --
-        -- It would be better to spot that r was one-shot to start with, but
-        -- I don't want to rely on that.
-        --
-        -- Another good example is in fill_in in PrelPack.hs.  We should be able to
-        -- spot that fill_in has arity 2 (and when Keith is done, we will) but we can't yet.
-
-isProbablyOneShotLambda :: Id -> Bool
-isProbablyOneShotLambda id = case idStateHackOneShotInfo id of
-                               OneShotLam    -> True
-                               NoOneShotInfo -> False
-
 setOneShotLambda :: Id -> Id
 setOneShotLambda id = modifyIdInfo (`setOneShotInfo` OneShotLam) id
 
@@ -1105,6 +1070,7 @@ transferPolyIdInfo old_id abstract_wrt new_id
     old_strictness  = dmdSigInfo old_info
     new_strictness  = prependArgsDmdSig arity_increase old_strictness
     old_cpr         = cprSigInfo old_info
+    new_cpr         = prependArgsCprSig arity_increase old_cpr
 
     old_cbv_marks   = fromMaybe (replicate old_arity NotMarkedCbv) (idCbvMarks_maybe old_id)
     abstr_cbv_marks = mapMaybe getMark abstract_wrt
@@ -1118,11 +1084,8 @@ transferPolyIdInfo old_id abstract_wrt new_id
       , mightBeLiftedType (idType v)
       = Just MarkedCbv
       | otherwise = Just NotMarkedCbv
-    transfer new_info = new_info `setArityInfo` new_arity
+    transfer new_info = new_info `setArityInfo`      new_arity
                                  `setInlinePragInfo` old_inline_prag
-                                 `setOccInfo` new_occ_info
-                                 `setDmdSigInfo` new_strictness
-                                 `setCprSigInfo` old_cpr
-
-isNeverRepPolyId :: Id -> Bool
-isNeverRepPolyId = isNeverRepPolyIdInfo . idInfo
+                                 `setOccInfo`        new_occ_info
+                                 `setDmdSigInfo`     new_strictness
+                                 `setCprSigInfo`     new_cpr

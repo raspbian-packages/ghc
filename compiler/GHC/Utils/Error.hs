@@ -2,6 +2,7 @@
 {-# LANGUAGE DeriveFunctor   #-}
 {-# LANGUAGE RankNTypes      #-}
 {-# LANGUAGE ViewPatterns    #-}
+{-# LANGUAGE TypeApplications #-}
 
 {-
 (c) The AQUA Project, Glasgow University, 1994-1998
@@ -25,14 +26,14 @@ module GHC.Utils.Error (
         errorsFound, isEmptyMessages,
 
         -- ** Formatting
-        pprMessageBag, pprMsgEnvelopeBagWithLoc,
+        pprMessageBag, pprMsgEnvelopeBagWithLoc, pprMsgEnvelopeBagWithLocDefault,
         pprMessages,
-        pprLocMsgEnvelope,
+        pprLocMsgEnvelope, pprLocMsgEnvelopeDefault,
         formatBulleted,
 
         -- ** Construction
         DiagOpts (..), diag_wopt, diag_fatal_wopt,
-        emptyMessages, mkDecorated, mkLocMessage, mkLocMessageAnn,
+        emptyMessages, mkDecorated, mkLocMessage,
         mkMsgEnvelope, mkPlainMsgEnvelope, mkPlainErrorMsgEnvelope,
         mkErrorMsgEnvelope,
         mkMCDiagnostic, errorDiagnostic, diagReasonSeverity,
@@ -58,6 +59,7 @@ module GHC.Utils.Error (
         ghcExit,
         prettyPrintGhcErrors,
         traceCmd,
+        traceSystoolCommand,
 
         sortMsgBag
     ) where
@@ -123,13 +125,13 @@ diagReasonSeverity opts reason = case reason of
 
 -- | Make a 'MessageClass' for a given 'DiagnosticReason', consulting the
 -- 'DiagOpts.
-mkMCDiagnostic :: DiagOpts -> DiagnosticReason -> MessageClass
-mkMCDiagnostic opts reason = MCDiagnostic (diagReasonSeverity opts reason) reason
+mkMCDiagnostic :: DiagOpts -> DiagnosticReason -> Maybe DiagnosticCode -> MessageClass
+mkMCDiagnostic opts reason code = MCDiagnostic (diagReasonSeverity opts reason) reason code
 
 -- | Varation of 'mkMCDiagnostic' which can be used when we are /sure/ the
--- input 'DiagnosticReason' /is/ 'ErrorWithoutFlag'.
+-- input 'DiagnosticReason' /is/ 'ErrorWithoutFlag' and there is no diagnostic code.
 errorDiagnostic :: MessageClass
-errorDiagnostic = MCDiagnostic SevError ErrorWithoutFlag
+errorDiagnostic = MCDiagnostic SevError ErrorWithoutFlag Nothing
 
 --
 -- Creating MsgEnvelope(s)
@@ -139,12 +141,12 @@ mk_msg_envelope
   :: Diagnostic e
   => Severity
   -> SrcSpan
-  -> PrintUnqualified
+  -> NamePprCtx
   -> e
   -> MsgEnvelope e
-mk_msg_envelope severity locn print_unqual err
+mk_msg_envelope severity locn name_ppr_ctx err
  = MsgEnvelope { errMsgSpan = locn
-               , errMsgContext = print_unqual
+               , errMsgContext = name_ppr_ctx
                , errMsgDiagnostic = err
                , errMsgSeverity = severity
                }
@@ -156,22 +158,22 @@ mkMsgEnvelope
   :: Diagnostic e
   => DiagOpts
   -> SrcSpan
-  -> PrintUnqualified
+  -> NamePprCtx
   -> e
   -> MsgEnvelope e
-mkMsgEnvelope opts locn print_unqual err
- = mk_msg_envelope (diagReasonSeverity opts (diagnosticReason err)) locn print_unqual err
+mkMsgEnvelope opts locn name_ppr_ctx err
+ = mk_msg_envelope (diagReasonSeverity opts (diagnosticReason err)) locn name_ppr_ctx err
 
 -- | Wrap a 'Diagnostic' in a 'MsgEnvelope', recording its location.
 -- Precondition: the diagnostic is, in fact, an error. That is,
 -- @diagnosticReason msg == ErrorWithoutFlag@.
 mkErrorMsgEnvelope :: Diagnostic e
                    => SrcSpan
-                   -> PrintUnqualified
+                   -> NamePprCtx
                    -> e
                    -> MsgEnvelope e
-mkErrorMsgEnvelope locn unqual msg =
- assert (diagnosticReason msg == ErrorWithoutFlag) $ mk_msg_envelope SevError locn unqual msg
+mkErrorMsgEnvelope locn name_ppr_ctx msg =
+ assert (diagnosticReason msg == ErrorWithoutFlag) $ mk_msg_envelope SevError locn name_ppr_ctx msg
 
 -- | Variant that doesn't care about qualified/unqualified names.
 mkPlainMsgEnvelope :: Diagnostic e
@@ -227,20 +229,31 @@ formatBulleted ctx (unDecorated -> docs)
     msgs    = filter (not . Outputable.isEmpty ctx) docs
     starred = (bullet<+>)
 
-pprMessages :: Diagnostic e => Messages e -> SDoc
-pprMessages = vcat . pprMsgEnvelopeBagWithLoc . getMessages
+pprMessages :: Diagnostic e => DiagnosticOpts e -> Messages e -> SDoc
+pprMessages e = vcat . pprMsgEnvelopeBagWithLoc e . getMessages
 
-pprMsgEnvelopeBagWithLoc :: Diagnostic e => Bag (MsgEnvelope e) -> [SDoc]
-pprMsgEnvelopeBagWithLoc bag = [ pprLocMsgEnvelope item | item <- sortMsgBag Nothing bag ]
+pprMsgEnvelopeBagWithLoc :: Diagnostic e => DiagnosticOpts e -> Bag (MsgEnvelope e) -> [SDoc]
+pprMsgEnvelopeBagWithLoc e bag = [ pprLocMsgEnvelope e item | item <- sortMsgBag Nothing bag ]
 
-pprLocMsgEnvelope :: Diagnostic e => MsgEnvelope e -> SDoc
-pprLocMsgEnvelope (MsgEnvelope { errMsgSpan      = s
+-- | Print the messages with the suitable default configuration, usually not what you want but sometimes you don't really
+-- care about what the configuration is (for example, if the message is in a panic).
+pprMsgEnvelopeBagWithLocDefault :: forall e . Diagnostic e => Bag (MsgEnvelope e) -> [SDoc]
+pprMsgEnvelopeBagWithLocDefault bag = [ pprLocMsgEnvelopeDefault item | item <- sortMsgBag Nothing bag ]
+
+pprLocMsgEnvelopeDefault :: forall e . Diagnostic e => MsgEnvelope e -> SDoc
+pprLocMsgEnvelopeDefault = pprLocMsgEnvelope (defaultDiagnosticOpts @e)
+
+pprLocMsgEnvelope :: Diagnostic e => DiagnosticOpts e -> MsgEnvelope e -> SDoc
+pprLocMsgEnvelope opts (MsgEnvelope { errMsgSpan      = s
                                , errMsgDiagnostic = e
                                , errMsgSeverity  = sev
-                               , errMsgContext   = unqual })
+                               , errMsgContext   = name_ppr_ctx })
   = sdocWithContext $ \ctx ->
-    withErrStyle unqual $
-      mkLocMessage (MCDiagnostic sev (diagnosticReason e)) s (formatBulleted ctx $ diagnosticMessage e)
+    withErrStyle name_ppr_ctx $
+      mkLocMessage
+        (MCDiagnostic sev (diagnosticReason e) (diagnosticCode e))
+        s
+        (formatBulleted ctx $ diagnosticMessage opts e)
 
 sortMsgBag :: Maybe DiagOpts -> Bag (MsgEnvelope e) -> [MsgEnvelope e]
 sortMsgBag mopts = maybeLimit . sortBy (cmp `on` errMsgSpan) . bagToList
@@ -417,13 +430,13 @@ debugTraceMsg logger val msg =
 putMsg :: Logger -> SDoc -> IO ()
 putMsg logger msg = logInfo logger (withPprStyle defaultUserStyle msg)
 
-printInfoForUser :: Logger -> PrintUnqualified -> SDoc -> IO ()
-printInfoForUser logger print_unqual msg
-  = logInfo logger (withUserStyle print_unqual AllTheWay msg)
+printInfoForUser :: Logger -> NamePprCtx -> SDoc -> IO ()
+printInfoForUser logger name_ppr_ctx msg
+  = logInfo logger (withUserStyle name_ppr_ctx AllTheWay msg)
 
-printOutputForUser :: Logger -> PrintUnqualified -> SDoc -> IO ()
-printOutputForUser logger print_unqual msg
-  = logOutput logger (withUserStyle print_unqual AllTheWay msg)
+printOutputForUser :: Logger -> NamePprCtx -> SDoc -> IO ()
+printOutputForUser logger name_ppr_ctx msg
+  = logOutput logger (withUserStyle name_ppr_ctx AllTheWay msg)
 
 logInfo :: Logger -> SDoc -> IO ()
 logInfo logger msg = logMsg logger MCInfo noSrcSpan msg
@@ -459,6 +472,20 @@ traceCmd logger phase_name cmd_line action = do
   loggerTraceFlush logger
    -- And run it!
   action `catchIO` handle_exn
+
+
+-- * Tracing utility
+
+-- | Record in the eventlog when the given tool command starts
+--   and finishes, prepending the given 'String' with
+--   \"systool:\", to easily be able to collect and process
+--   all the systool events.
+--
+--   For those events to show up in the eventlog, you need
+--   to run GHC with @-v2@ or @-ddump-timings@.
+traceSystoolCommand :: Logger -> String -> IO a -> IO a
+traceSystoolCommand logger tool = withTiming logger (text "systool:" <> text tool) (const ())
+
 
 {- Note [withTiming]
 ~~~~~~~~~~~~~~~~~~~~

@@ -38,6 +38,8 @@ import GHC.Utils.Misc
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
 
+import Language.Haskell.Syntax.Basic (FieldLabelString(..))
+
 import qualified Data.Data as Data
 import Data.Function
 import Data.List (find)
@@ -376,7 +378,7 @@ instance Data.Data PatSyn where
 -- | Build a new pattern synonym
 mkPatSyn :: Name
          -> Bool                 -- ^ Is the pattern synonym declared infix?
-         -> ([InvisTVBinder], ThetaType) -- ^ Universially-quantified type
+         -> ([InvisTVBinder], ThetaType) -- ^ Universally-quantified type
                                          -- variables and required dicts
          -> ([InvisTVBinder], ThetaType) -- ^ Existentially-quantified type
                                          -- variables and provided dicts
@@ -387,7 +389,7 @@ mkPatSyn :: Name
          -> [FieldLabel]         -- ^ Names of fields for
                                  --   a record pattern synonym
          -> PatSyn
- -- NB: The univ and ex vars are both in TyBinder form and TyVar form for
+ -- NB: The univ and ex vars are both in PiTyVarBinder form and TyVar form for
  -- convenience. All the TyBinders should be Named!
 mkPatSyn name declared_infix
          (univ_tvs, req_theta)
@@ -506,6 +508,6 @@ pprPatSynType (MkPatSyn { psUnivTyVars = univ_tvs,  psReqTheta  = req_theta
         , pprType sigma_ty ]
   where
     sigma_ty = mkInvisForAllTys ex_tvs $
-               mkInvisFunTysMany prov_theta $
+               mkInvisFunTys prov_theta $
                mkVisFunTysMany orig_args orig_res_ty
     insert_empty_ctxt = null req_theta && not (null prov_theta && null ex_tvs)

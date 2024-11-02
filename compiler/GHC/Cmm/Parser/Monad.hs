@@ -11,19 +11,22 @@ module GHC.Cmm.Parser.Monad (
     PD(..)
   , liftP
   , failMsgPD
+  , getPDConfig
   , getProfile
   , getPlatform
   , getHomeUnitId
+  , PDConfig(..)
   ) where
 
 import GHC.Prelude
+
+import GHC.Cmm.Parser.Config
 
 import GHC.Platform
 import GHC.Platform.Profile
 
 import Control.Monad
 
-import GHC.Driver.Session
 import GHC.Parser.Lexer
 import GHC.Parser.Errors.Types
 import GHC.Types.Error ( MsgEnvelope )
@@ -31,7 +34,7 @@ import GHC.Types.SrcLoc
 import GHC.Unit.Types
 import GHC.Unit.Home
 
-newtype PD a = PD { unPD :: DynFlags -> HomeUnit -> PState -> ParseResult a }
+newtype PD a = PD { unPD :: PDConfig -> HomeUnit -> PState -> ParseResult a }
 
 instance Functor PD where
   fmap = liftM
@@ -58,11 +61,11 @@ thenPD :: PD a -> (a -> PD b) -> PD b
                 POk s1 a   -> unPD (k a) d hu s1
                 PFailed s1 -> PFailed s1
 
-instance HasDynFlags PD where
-   getDynFlags = PD $ \d _ s -> POk s d
+getPDConfig :: PD PDConfig
+getPDConfig = PD $ \pdc _ s -> POk s pdc
 
 getProfile :: PD Profile
-getProfile = targetProfile <$> getDynFlags
+getProfile = PD $ \pdc _ s -> POk s (pdProfile pdc)
 
 getPlatform :: PD Platform
 getPlatform = profilePlatform <$> getProfile

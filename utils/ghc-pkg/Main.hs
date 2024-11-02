@@ -10,13 +10,6 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# OPTIONS_GHC -fno-warn-orphans #-}
 
--- We never want to link against terminfo while bootstrapping.
-#if defined(BOOTSTRAPPING)
-#if defined(WITH_TERMINFO)
-#undef WITH_TERMINFO
-#endif
-#endif
-
 -- Fine if this comes from make/Hadrian or the pre-built base.
 #include <ghcplatform.h>
 
@@ -93,15 +86,12 @@ import qualified Data.ByteString as BS
 #if defined(mingw32_HOST_OS)
 import GHC.ConsoleHandler
 #else
+import System.Environment (lookupEnv)
 import System.Posix hiding (fdToHandle)
 #endif
 
 #if defined(GLOB)
 import qualified System.Info(os)
-#endif
-
-#if defined(WITH_TERMINFO)
-import System.Console.Terminfo as Terminfo
 #endif
 
 #if defined(mingw32_HOST_OS)
@@ -390,7 +380,7 @@ runit verbosity cli nonopts = do
 
         splitFields fields = unfoldr splitComma (',':fields)
           where splitComma "" = Nothing
-                splitComma fs = Just $ break (==',') (tail fs)
+                splitComma (_ : fs) = Just $ break (==',') fs
 
         -- | Parses a glob into a predicate which tests if a string matches
         -- the glob.  Returns Nothing if the string in question is not a glob.
@@ -1582,37 +1572,29 @@ listPackages verbosity my_flags mPackageName mModuleName = do
 
   if simple_output then show_simple stack else do
 
-#if !defined(WITH_TERMINFO)
+#if defined(mingw32_HOST_OS)
     mapM_ show_normal stack
 #else
     let
-       show_colour withF db@PackageDB{ packages = pkg_confs } =
-           if null pkg_confs
-           then termText (location db) <#> termText "\n    (no packages)\n"
-           else
-               mconcat $ map (<#> termText "\n") $
-                           (termText (location db)
-                            : map (termText "    " <#>) (map pp_pkg pkg_confs))
-          where
-                   pp_pkg p
-                     | installedUnitId p `elem` broken = withF Red  doc
-                     | exposed p                       = doc
-                     | otherwise                       = withF Blue doc
-                     where doc | verbosity >= Verbose
-                               = termText (printf "%s (%s)" pkg (display (installedUnitId p)))
-                               | otherwise
-                               = termText pkg
-                            where
-                            pkg = display (mungedId p)
+      show_colour PackageDB{ location = db_name, packages = pkg_confs } =
+          do hPutStrLn stdout db_name
+             if null pkg_confs
+                 then hPutStrLn stdout "    (no packages)"
+                 else hPutStrLn stdout $ unlines (map ("    " ++) (map pp_pkg pkg_confs))
+           where
+                 pp_pkg p
+                   | installedUnitId p `elem` broken = printf "\ESC[31m%s\ESC[0m" doc -- red color
+                   | exposed p = doc
+                   | otherwise = printf "\ESC[34m%s\ESC[0m" doc -- blue color
+                   where doc | verbosity >= Verbose = printf "%s (%s)" pkg (display (installedUnitId p))
+                             | otherwise            = pkg
+                          where
+                          pkg = display (mungedId p)
 
     is_tty <- hIsTerminalDevice stdout
-    if not is_tty
-       then mapM_ show_normal stack
-       else do tty <- Terminfo.setupTermFromEnv
-               case Terminfo.getCapability tty withForegroundColor of
-                   Nothing -> mapM_ show_normal stack
-                   Just w  -> runTermOutput tty $ mconcat $
-                                                  map (show_colour w) stack
+    -- Equivalent of https://hackage.haskell.org/package/ansi-terminal/docs/System-Console-ANSI.html#v:hSupportsANSI
+    term <- lookupEnv "TERM"
+    mapM_ (if is_tty && term /= Just "dumb" then show_colour else show_normal) stack
 #endif
 
 simplePackageList :: [Flag] -> [InstalledPackageInfo] -> IO ()
@@ -1964,10 +1946,11 @@ checkUnitId ipi db_stack update = do
 
 checkDuplicates :: PackageDBStack -> InstalledPackageInfo
                 -> Bool -> Bool-> Validate ()
-checkDuplicates db_stack pkg multi_instance update = do
+checkDuplicates [] _ _ _ = pure ()
+checkDuplicates (hd : _) pkg multi_instance update = do
   let
         pkgid = mungedId pkg
-        pkgs  = packages (head db_stack)
+        pkgs  = packages hd
   --
   -- Check whether this package id already exists in this DB
   --

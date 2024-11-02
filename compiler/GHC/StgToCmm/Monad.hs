@@ -42,6 +42,8 @@ module GHC.StgToCmm.Monad (
         Sequel(..), ReturnKind(..),
         withSequel, getSequel,
 
+        SelfLoopInfo(..),
+
         setTickyCtrLabel, getTickyCtrLabel,
         tickScope, getTickScope,
 
@@ -296,9 +298,9 @@ data CgState
 data FCodeState =
   MkFCodeState { fcs_upframeoffset :: UpdFrameOffset     -- ^ Size of current update frame UpdFrameOffset must be kept lazy or
                                                          -- else the RTS will deadlock _and_ also experience a severe
-                                                         -- performance degredation
+                                                         -- performance degradation
               , fcs_sequel        :: !Sequel             -- ^ What to do at end of basic block
-              , fcs_selfloop      :: Maybe SelfLoopInfo  -- ^ Which tail calls can be compiled as local jumps?
+              , fcs_selfloop      :: !(Maybe SelfLoopInfo) -- ^ Which tail calls can be compiled as local jumps?
                                                          --   See Note [Self-recursive tail calls] in GHC.StgToCmm.Expr
               , fcs_ticky         :: !CLabel             -- ^ Destination for ticky counts
               , fcs_tickscope     :: !CmmTickScope       -- ^ Tick scope for new blocks & ticks
@@ -533,7 +535,7 @@ tickScope :: FCode a -> FCode a
 tickScope code = do
         cfg <- getStgToCmmConfig
         fstate <- getFCodeState
-        if stgToCmmDebugLevel cfg == 0 then code else do
+        if not $ stgToCmmEmitDebugInfo cfg then code else do
           u <- newUnique
           let scope' = SubScope u (fcs_tickscope fstate)
           withFCodeState code fstate{ fcs_tickscope = scope' }
@@ -719,8 +721,8 @@ emitTick = emitCgStmt . CgStmt . CmmTick
 
 emitUnwind :: [(GlobalReg, Maybe CmmExpr)] -> FCode ()
 emitUnwind regs = do
-  debug_level <- stgToCmmDebugLevel <$> getStgToCmmConfig
-  when (debug_level > 0) $
+  debug <- stgToCmmEmitDebugInfo <$> getStgToCmmConfig
+  when debug $
      emitCgStmt $ CgStmt $ CmmUnwind regs
 
 emitAssign :: CmmReg  -> CmmExpr -> FCode ()

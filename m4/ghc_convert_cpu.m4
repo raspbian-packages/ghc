@@ -56,6 +56,12 @@ case "$1" in
   riscv|riscv32*)
     $2="riscv32"
     ;;
+  loongarch64*)
+    $2="loongarch64"
+    ;;
+  loongarch32*)
+    $2="loongarch32"
+    ;;
   rs6000)
     $2="rs6000"
     ;;
@@ -79,6 +85,12 @@ case "$1" in
     ;;
   x86_64|amd64)
     $2="x86_64"
+    ;;
+  wasm32)
+    $2="wasm32"
+    ;;
+  javascript)
+    $2="javascript"
     ;;
   *)
     echo "Unknown CPU $1"

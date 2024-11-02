@@ -4,7 +4,6 @@
 {-# LANGUAGE RecordWildCards   #-}
 
 {-# OPTIONS_GHC -fno-warn-orphans #-}
-{-# OPTIONS_GHC -Wno-incomplete-record-updates #-}
 
 {-
 (c) The University of Glasgow 2006
@@ -47,7 +46,7 @@ module GHC.Tc.Utils.Monad(
   -- * Debugging
   traceTc, traceRn, traceOptTcRn, dumpOptTcRn,
   dumpTcRn,
-  getPrintUnqualified,
+  getNamePprCtx,
   printForUserTcRn,
   traceIf, traceOptIf,
   debugTc,
@@ -70,7 +69,7 @@ module GHC.Tc.Utils.Monad(
   addErrAt, addErrs,
   checkErr,
   addMessages,
-  discardWarnings,
+  discardWarnings, mkDetailedMessage,
 
   -- * Usage environment
   tcCollectingUsage, tcScalingUsage, tcEmitBindingUsage,
@@ -848,11 +847,11 @@ dumpOptTcRn flag title fmt doc =
 dumpTcRn :: Bool -> DumpFlag -> String -> DumpFormat -> SDoc -> TcRn ()
 dumpTcRn useUserStyle flag title fmt doc = do
   logger <- getLogger
-  printer <- getPrintUnqualified
+  name_ppr_ctx <- getNamePprCtx
   real_doc <- wrapDocLoc doc
   let sty = if useUserStyle
-              then mkUserStyle printer AllTheWay
-              else mkDumpStyle printer
+              then mkUserStyle name_ppr_ctx AllTheWay
+              else mkDumpStyle name_ppr_ctx
   liftIO $ logDumpFile logger sty flag title fmt real_doc
 
 -- | Add current location if -dppr-debug
@@ -867,18 +866,19 @@ wrapDocLoc doc = do
     else
       return doc
 
-getPrintUnqualified :: TcRn PrintUnqualified
-getPrintUnqualified
-  = do { rdr_env <- getGlobalRdrEnv
+getNamePprCtx :: TcRn NamePprCtx
+getNamePprCtx
+  = do { ptc <- initPromotionTickContext <$> getDynFlags
+       ; rdr_env <- getGlobalRdrEnv
        ; hsc_env <- getTopEnv
-       ; return $ mkPrintUnqualified (hsc_unit_env hsc_env) rdr_env }
+       ; return $ mkNamePprCtx ptc (hsc_unit_env hsc_env) rdr_env }
 
 -- | Like logInfoTcRn, but for user consumption
 printForUserTcRn :: SDoc -> TcRn ()
 printForUserTcRn doc = do
     logger <- getLogger
-    printer <- getPrintUnqualified
-    liftIO (printOutputForUser logger printer doc)
+    name_ppr_ctx <- getNamePprCtx
+    liftIO (printOutputForUser logger name_ppr_ctx doc)
 
 {-
 traceIf works in the TcRnIf monad, where no RdrEnv is
@@ -1068,7 +1068,12 @@ addErrAt :: SrcSpan -> TcRnMessage -> TcRn ()
 addErrAt loc msg = do { ctxt <- getErrCtxt
                       ; tidy_env <- tcInitTidyEnv
                       ; err_info <- mkErrInfo tidy_env ctxt
-                      ; add_long_err_at loc (TcRnMessageDetailed (ErrInfo err_info Outputable.empty) msg) }
+                      ; let detailed_msg = mkDetailedMessage (ErrInfo err_info Outputable.empty) msg
+                      ; add_long_err_at loc detailed_msg }
+
+mkDetailedMessage :: ErrInfo -> TcRnMessage -> TcRnMessageDetailed
+mkDetailedMessage err_info msg =
+  TcRnMessageDetailed err_info msg
 
 addErrs :: [(SrcSpan,TcRnMessage)] -> TcRn ()
 addErrs msgs = mapM_ add msgs
@@ -1113,9 +1118,9 @@ add_long_err_at loc msg = mk_long_err_at loc msg >>= reportDiagnostic
   where
     mk_long_err_at :: SrcSpan -> TcRnMessageDetailed -> TcRn (MsgEnvelope TcRnMessage)
     mk_long_err_at loc msg
-      = do { printer <- getPrintUnqualified ;
+      = do { name_ppr_ctx <- getNamePprCtx ;
              unit_state <- hsc_units <$> getTopEnv ;
-             return $ mkErrorMsgEnvelope loc printer
+             return $ mkErrorMsgEnvelope loc name_ppr_ctx
                     $ TcRnMessageWithInfo unit_state msg
                     }
 
@@ -1123,16 +1128,16 @@ mkTcRnMessage :: SrcSpan
               -> TcRnMessage
               -> TcRn (MsgEnvelope TcRnMessage)
 mkTcRnMessage loc msg
-  = do { printer <- getPrintUnqualified ;
+  = do { name_ppr_ctx <- getNamePprCtx ;
          diag_opts <- initDiagOpts <$> getDynFlags ;
-         return $ mkMsgEnvelope diag_opts loc printer msg }
+         return $ mkMsgEnvelope diag_opts loc name_ppr_ctx msg }
 
 reportDiagnostics :: [MsgEnvelope TcRnMessage] -> TcM ()
 reportDiagnostics = mapM_ reportDiagnostic
 
 reportDiagnostic :: MsgEnvelope TcRnMessage -> TcRn ()
 reportDiagnostic msg
-  = do { traceTc "Adding diagnostic:" (pprLocMsgEnvelope msg) ;
+  = do { traceTc "Adding diagnostic:" (pprLocMsgEnvelopeDefault msg) ;
          errs_var <- getErrsVar ;
          msgs     <- readTcRef errs_var ;
          writeTcRef errs_var (msg `addMessage` msgs) }
@@ -1191,7 +1196,7 @@ is applied to four arguments.  See #18379 for a concrete example.
 
 This reliance on delicate inlining and Called Arity is not good.
 See #18202 for a more general approach.  But meanwhile, these
-ininings seem unobjectional, and they solve the immediate
+inlinings seem unobjectional, and they solve the immediate
 problem.
 
 Note [Error contexts in generated code]
@@ -1601,19 +1606,20 @@ addDiagnosticTcM (env0, msg)
  = do { ctxt <- getErrCtxt
       ; extra <- mkErrInfo env0 ctxt
       ; let err_info = ErrInfo extra Outputable.empty
-      ; add_diagnostic (TcRnMessageDetailed err_info msg) }
+            detailed_msg = mkDetailedMessage err_info msg
+      ; add_diagnostic detailed_msg }
 
 -- | A variation of 'addDiagnostic' that takes a function to produce a 'TcRnDsMessage'
 -- given some additional context about the diagnostic.
 addDetailedDiagnostic :: (ErrInfo -> TcRnMessage) -> TcM ()
 addDetailedDiagnostic mkMsg = do
   loc <- getSrcSpanM
-  printer <- getPrintUnqualified
+  name_ppr_ctx <- getNamePprCtx
   !diag_opts  <- initDiagOpts <$> getDynFlags
   env0 <- tcInitTidyEnv
   ctxt <- getErrCtxt
   err_info <- mkErrInfo env0 ctxt
-  reportDiagnostic (mkMsgEnvelope diag_opts loc printer (mkMsg (ErrInfo err_info empty)))
+  reportDiagnostic (mkMsgEnvelope diag_opts loc name_ppr_ctx (mkMsg (ErrInfo err_info empty)))
 
 addTcRnDiagnostic :: TcRnMessage -> TcM ()
 addTcRnDiagnostic msg = do
@@ -1623,14 +1629,14 @@ addTcRnDiagnostic msg = do
 -- | Display a diagnostic for the current source location, taken from
 -- the 'TcRn' monad.
 addDiagnostic :: TcRnMessage -> TcRn ()
-addDiagnostic msg = add_diagnostic (TcRnMessageDetailed no_err_info msg)
+addDiagnostic msg = add_diagnostic (mkDetailedMessage no_err_info msg)
 
 -- | Display a diagnostic for a given source location.
 addDiagnosticAt :: SrcSpan -> TcRnMessage -> TcRn ()
 addDiagnosticAt loc msg = do
   unit_state <- hsc_units <$> getTopEnv
-  let dia = TcRnMessageDetailed no_err_info msg
-  mkTcRnMessage loc (TcRnMessageWithInfo unit_state dia) >>= reportDiagnostic
+  let detailed_msg = mkDetailedMessage no_err_info msg
+  mkTcRnMessage loc (TcRnMessageWithInfo unit_state detailed_msg) >>= reportDiagnostic
 
 -- | Display a diagnostic, with an optional flag, for the current source
 -- location.
@@ -1652,7 +1658,7 @@ add_err_tcm :: TidyEnv -> TcRnMessage -> SrcSpan
             -> TcM ()
 add_err_tcm tidy_env msg loc ctxt
  = do { err_info <- mkErrInfo tidy_env ctxt ;
-        add_long_err_at loc (TcRnMessageDetailed (ErrInfo err_info Outputable.empty) msg) }
+        add_long_err_at loc (mkDetailedMessage (ErrInfo err_info Outputable.empty) msg) }
 
 mkErrInfo :: TidyEnv -> [ErrCtxt] -> TcM SDoc
 -- Tidy the error info, trimming excessive contexts
@@ -1910,12 +1916,12 @@ emitAnonTypeHole :: IsExtraConstraint
 emitAnonTypeHole extra_constraints tv
   = do { ct_loc <- getCtLocM (TypeHoleOrigin occ) Nothing
        ; let hole = Hole { hole_sort = sort
-                         , hole_occ  = occ
+                         , hole_occ  = mkRdrUnqual occ
                          , hole_ty   = mkTyVarTy tv
                          , hole_loc  = ct_loc }
        ; emitHole hole }
   where
-    occ = mkTyVarOcc "_"
+    occ = mkTyVarOccFS (fsLit "_")
     sort | YesExtraConstraint <- extra_constraints = ConstraintHole
          | otherwise                               = TypeHole
 
@@ -1924,7 +1930,7 @@ emitNamedTypeHole (name, tv)
   = do { ct_loc <- setSrcSpan (nameSrcSpan name) $
                    getCtLocM (TypeHoleOrigin occ) Nothing
        ; let hole = Hole { hole_sort = TypeHole
-                         , hole_occ  = occ
+                         , hole_occ  = nameRdrName name
                          , hole_ty   = mkTyVarTy tv
                          , hole_loc  = ct_loc }
        ; emitHole hole }
@@ -1970,7 +1976,7 @@ We must not discard the out-of-scope error.
 It's distressingly delicate though:
 
 * If we discard too /many/ constraints we may fail to report the error
-  that led us to interrupte the constraint gathering process.
+  that led us to interrupt the constraint gathering process.
 
   One particular example "variable out of scope" Hole constraints. For
   example (#12529):

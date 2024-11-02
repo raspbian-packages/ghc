@@ -158,6 +158,22 @@ typedef SRWLOCK Mutex;
 
 #endif // CMINUSMINUS
 
+# elif defined(wasm32_HOST_ARCH)
+
+#if defined(CMINUSMINUS)
+#else // CMINUSMINUS
+
+#include <errno.h>
+
+typedef void* Condition;
+typedef void* Mutex;
+typedef void* OSThreadId;
+typedef void* ThreadLocalKey;
+
+#define OSThreadProcAttr
+
+#endif // CMINUSMINUS
+
 # elif defined(THREADED_RTS)
 #  error "Threads not supported"
 # endif
@@ -168,13 +184,17 @@ typedef SRWLOCK Mutex;
 // General thread operations
 //
 extern OSThreadId osThreadId      ( void );
-extern void shutdownThread        ( void )   GNUC3_ATTRIBUTE(__noreturn__);
+extern void shutdownThread        ( void )   STG_NORETURN;
 extern void yieldThread           ( void );
 
 typedef void* OSThreadProcAttr OSThreadProc(void *);
 
-extern int  createOSThread        ( OSThreadId* tid, char *name,
+extern int  createOSThread        ( OSThreadId* tid, const char *name,
                                     OSThreadProc *startProc, void *param);
+#if !defined(mingw32_HOST_OS)
+extern int  createAttachedOSThread( OSThreadId *tid, const char *name,
+                                    OSThreadProc *startProc, void *param);
+#endif
 extern bool osThreadIsAlive       ( OSThreadId id );
 extern void interruptOSThread     ( OSThreadId id );
 extern void joinOSThread          ( OSThreadId id );

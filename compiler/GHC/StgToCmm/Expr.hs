@@ -38,7 +38,6 @@ import GHC.Cmm.BlockId
 import GHC.Cmm hiding ( succ )
 import GHC.Cmm.Info
 import GHC.Cmm.Utils ( zeroExpr, cmmTagMask, mkWordCLit, mAX_PTR_TAG )
-import GHC.Cmm.Ppr
 import GHC.Core
 import GHC.Core.DataCon
 import GHC.Types.ForeignCall
@@ -77,6 +76,8 @@ cgExpr (StgOpApp (StgPrimOp SeqOp) [StgVarArg a, _] _res_ty) =
 
 -- dataToTag# :: a -> Int#
 -- See Note [dataToTag# magic] in GHC.Core.Opt.ConstantFold
+-- TODO: There are some more optimization ideas for this code path
+-- in #21710
 cgExpr (StgOpApp (StgPrimOp DataToTagOp) [StgVarArg a] _res_ty) = do
   platform <- getPlatform
   emitComment (mkFastString "dataToTag#")
@@ -93,15 +94,7 @@ cgExpr (StgOpApp (StgPrimOp DataToTagOp) [StgVarArg a] _res_ty) = do
   -- the constructor index is too large to fit in the pointer and therefore
   -- we must look in the info table. See Note [Tagging big families].
 
-  slow_path <- getCode $ do
-      tmp <- newTemp (bWord platform)
-      _ <- withSequel (AssignTo [tmp] False) (cgIdApp a [])
-      profile     <- getProfile
-      align_check <- stgToCmmAlignCheck <$> getStgToCmmConfig
-      emitAssign (CmmLocal result_reg)
-        $ getConstrTag profile align_check (cmmUntag platform (CmmReg (CmmLocal tmp)))
-
-  fast_path <- getCode $ do
+  (fast_path :: CmmAGraph) <- getCode $ do
       -- Return the constructor index from the pointer tag
       return_ptr_tag <- getCode $ do
           emitAssign (CmmLocal result_reg)
@@ -114,8 +107,22 @@ cgExpr (StgOpApp (StgPrimOp DataToTagOp) [StgVarArg a] _res_ty) = do
             $ getConstrTag profile align_check (cmmUntag platform amode)
 
       emit =<< mkCmmIfThenElse' is_too_big_tag return_info_tag return_ptr_tag (Just False)
-
-  emit =<< mkCmmIfThenElse' is_tagged fast_path slow_path (Just True)
+  -- If we know the argument is already tagged there is no need to generate code to evaluate it
+  -- so we skip straight to the fast path. If we don't know if there is a tag we take the slow
+  -- path which evaluates the argument before fetching the tag.
+  case (idTagSig_maybe a) of
+    Just sig
+      | isTaggedSig sig
+      -> emit fast_path
+    _ -> do
+          slow_path <- getCode $ do
+              tmp <- newTemp (bWord platform)
+              _ <- withSequel (AssignTo [tmp] False) (cgIdApp a [])
+              profile     <- getProfile
+              align_check <- stgToCmmAlignCheck <$> getStgToCmmConfig
+              emitAssign (CmmLocal result_reg)
+                $ getConstrTag profile align_check (cmmUntag platform (CmmReg (CmmLocal tmp)))
+          emit =<< mkCmmIfThenElse' is_tagged fast_path slow_path (Just True)
   emitReturn [CmmReg $ CmmLocal result_reg]
 
 
@@ -386,7 +393,7 @@ Hence: Two basic plans for
 
    * If f is recursive, and the hot loop wouldn't allocate, but the exit branch does then we do
    a redundant heap check.
-   * We use one more instruction to de-allocate the unused heap in the branch using less heap. (Neglible)
+   * We use one more instruction to de-allocate the unused heap in the branch using less heap. (Negligible)
    * A small risk of running gc slightly more often than needed especially if one branch allocates a lot.
 
    The upsides are:
@@ -905,7 +912,7 @@ cgAlts _ _ _ _ = panic "cgAlts"
 -- tag from the info table, and switch on that. The only technically
 -- tricky part is that the default case needs (logical) duplication.
 -- To do this we emit an extra label for it and branch to that from
--- the second switch. This avoids duplicated codegen. See Trac #14373.
+-- the second switch. This avoids duplicated codegen. See #14373.
 -- See Note [Double switching for big families] for the mechanics
 -- involved.
 --
@@ -996,8 +1003,7 @@ cgIdApp fun_id args = do
         fun            = idInfoToAmode fun_info
         lf_info        = cg_lf         fun_info
         n_args         = length args
-        v_args         = length $ filter (isZeroBitTy . stgArgType) args
-    case getCallMethod cfg fun_name fun_id lf_info n_args v_args (cg_loc fun_info) self_loop of
+    case getCallMethod cfg fun_name fun_id lf_info n_args (cg_loc fun_info) self_loop of
             -- A value in WHNF, so we can just return it.
         ReturnIt
           | isZeroBitTy (idType fun_id) -> emitReturn []
@@ -1019,7 +1025,7 @@ cgIdApp fun_id args = do
               assertTag = whenCheckTags $ do
                   mod <- getModuleName
                   emitTagAssertion (showPprUnsafe
-                      (text "TagCheck failed on entry in" <+> ppr mod <+> text "- value:" <> ppr fun_id <+> pprExpr platform fun))
+                      (text "TagCheck failed on entry in" <+> ppr mod <+> text "- value:" <> ppr fun_id <+> pdoc platform fun))
                       fun
 
         EnterIt -> assert (null args) $  -- Discarding arguments
@@ -1092,12 +1098,14 @@ cgIdApp fun_id args = do
 --
 -- Implementation is spread across a couple of places in the code:
 --
---   * FCode monad stores additional information in its reader environment
---     (stgToCmmSelfLoop field). This information tells us which function can
---     tail call itself in an optimized way (it is the function currently
---     being compiled), what is the label of a loop header (L1 in example above)
---     and information about local registers in which we should arguments
---     before making a call (this would be a and b in example above).
+--   * FCode monad stores additional information in its reader
+--     environment (stgToCmmSelfLoop field). This `SelfLoopInfo`
+--     record tells us which function can tail call itself in an
+--     optimized way (it is the function currently being compiled),
+--     its RepArity, what is the label of its loop header (L1 in
+--     example above) and information about which local registers
+--     should receive arguments when making a call (this would be a
+--     and b in the example above).
 --
 --   * Whenever we are compiling a function, we set that information to reflect
 --     the fact that function currently being compiled can be jumped to, instead
@@ -1121,36 +1129,13 @@ cgIdApp fun_id args = do
 --     of call will be generated. getCallMethod decides to generate a self
 --     recursive tail call when (a) environment stores information about
 --     possible self tail-call; (b) that tail call is to a function currently
---     being compiled; (c) number of passed non-void arguments is equal to
---     function's arity. (d) loopification is turned on via -floopification
---     command-line option.
+--     being compiled; (c) number of passed arguments is equal to
+--     function's unarised arity. (d) loopification is turned on via
+--     -floopification command-line option.
 --
 --   * Command line option to turn loopification on and off is implemented in
 --     DynFlags, then passed to StgToCmmConfig for this phase.
---
---
--- Note [Void arguments in self-recursive tail calls]
--- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
---
--- State# tokens can get in the way of the loopification optimization as seen in
--- #11372. Consider this:
---
--- foo :: [a]
---     -> (a -> State# s -> (# State s, Bool #))
---     -> State# s
---     -> (# State# s, Maybe a #)
--- foo [] f s = (# s, Nothing #)
--- foo (x:xs) f s = case f x s of
---      (# s', b #) -> case b of
---          True -> (# s', Just x #)
---          False -> foo xs f s'
---
--- We would like to compile the call to foo as a local jump instead of a call
--- (see Note [Self-recursive tail calls]). However, the generated function has
--- an arity of 2 while we apply it to 3 arguments, one of them being of void
--- type. Thus, we mustn't count arguments of void type when checking whether
--- we can turn a call into a self-recursive jump.
---
+
 
 emitEnter :: CmmExpr -> FCode ReturnKind
 emitEnter fun = do

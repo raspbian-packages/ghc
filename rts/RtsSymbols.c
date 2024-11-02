@@ -9,15 +9,17 @@
 #include "ghcplatform.h"
 #include "Rts.h"
 #include "RtsSymbols.h"
+
 #include "TopHandler.h"
 #include "HsFFI.h"
 #include "CloneStack.h"
 
 #include "sm/Storage.h"
 #include "sm/NonMovingMark.h"
+#include "Arena.h"
 #include <stdbool.h>
 
-#if !defined(mingw32_HOST_OS)
+#if !defined(mingw32_HOST_OS) && defined(HAVE_SIGNAL_H)
 #include "posix/Signals.h"
 #endif
 
@@ -63,7 +65,7 @@ extern char **environ;
       SymE_HasProto(libdwPoolRelease)           \
       SymE_HasProto(libdwPoolClear)
 
-#if !defined(mingw32_HOST_OS)
+#if !defined(mingw32_HOST_OS) && !defined(wasm32_HOST_ARCH)
 #define RTS_POSIX_ONLY_SYMBOLS                  \
       SymI_HasProto(__hscore_get_saved_termios) \
       SymI_HasProto(__hscore_set_saved_termios) \
@@ -72,6 +74,10 @@ extern char **environ;
       SymI_HasProto(stg_sig_install)            \
       SymI_HasProto(rtsTimerSignal)             \
       SymI_NeedsDataProto(nocldstop)
+#endif
+
+#if defined(wasm32_HOST_ARCH)
+#define RTS_POSIX_ONLY_SYMBOLS
 #endif
 
 #if defined(mingw32_HOST_OS)
@@ -96,7 +102,7 @@ extern char **environ;
  * if it is declared but not defined, allowing it to be defined by an object
  * which is loaded later. GHC generalizes this notion, allowing symbol
  * definitions to be declared as *strong*. A strong symbol is one which will
- * silently supercede definitions of the same name by later objects.
+ * silently supersede definitions of the same name by later objects.
  *
  * This is currently only used in the case of atexit() to workaround an
  * unfortunate interaction on musl systems (#20350). Specifically,
@@ -324,6 +330,7 @@ extern char **environ;
       SymI_HasProto(ENT_DYN_IND_ctr)                    \
       SymI_HasProto(ENT_PERM_IND_ctr)                   \
       SymI_HasProto(ENT_PAP_ctr)                        \
+      SymI_HasProto(ENT_CONTINUATION_ctr)                  \
       SymI_HasProto(ENT_AP_ctr)                         \
       SymI_HasProto(ENT_AP_STACK_ctr)                   \
       SymI_HasProto(ENT_BH_ctr)                         \
@@ -595,7 +602,7 @@ extern char **environ;
       SymI_HasProto(defaultRtsConfig)                                   \
       SymI_HasProto(initLinker)                                         \
       SymI_HasProto(initLinker_)                                        \
-      SymI_HasDataProto(stg_unpackClosurezh)                                \
+      SymI_HasDataProto(stg_unpackClosurezh)                            \
       SymI_HasDataProto(stg_closureSizzezh)                                 \
       SymI_HasDataProto(stg_whereFromzh)                                 \
       SymI_HasDataProto(stg_getApStackValzh)                                \
@@ -604,6 +611,8 @@ extern char **environ;
       SymI_HasDataProto(stg_isCurrentThreadBoundzh)                         \
       SymI_HasDataProto(stg_isEmptyMVarzh)                                  \
       SymI_HasDataProto(stg_killThreadzh)                                   \
+      SymI_HasDataProto(stg_listThreadszh)                                  \
+      SymI_HasDataProto(stg_threadLabelzh)                                  \
       SymI_HasProto(loadArchive)                                        \
       SymI_HasProto(loadObj)                                            \
       SymI_HasProto(purgeObj)                                           \
@@ -660,6 +669,7 @@ extern char **environ;
       SymI_HasProto(updateRemembSetPushClosure_)                          \
       SymI_HasProto(performGC)                                          \
       SymI_HasProto(performMajorGC)                                     \
+      SymI_HasProto(performBlockingMajorGC)                             \
       SymI_HasProto(prog_argc)                                          \
       SymI_HasProto(prog_argv)                                          \
       SymI_HasDataProto(stg_putMVarzh)                                      \
@@ -856,6 +866,8 @@ extern char **environ;
       SymI_HasDataProto(stg_sel_13_noupd_info)                              \
       SymI_HasDataProto(stg_sel_14_noupd_info)                              \
       SymI_HasDataProto(stg_sel_15_noupd_info)                              \
+      SymI_HasDataProto(stg_unpack_cstring_info)                            \
+      SymI_HasDataProto(stg_unpack_cstring_utf8_info)                       \
       SymI_HasDataProto(stg_upd_frame_info)                                 \
       SymI_HasDataProto(stg_bh_upd_frame_info)                              \
       SymI_HasProto(suspendThread)                                      \
@@ -872,14 +884,14 @@ extern char **environ;
       SymI_HasDataProto(stg_waitWritezh)                                    \
       SymI_HasDataProto(stg_writeTVarzh)                                    \
       SymI_HasDataProto(stg_yieldzh)                                        \
-      SymI_NeedsDataProto(stg_badAlignment_entry)                           \
-      SymI_NeedsDataProto(stg_interp_constr1_entry)                         \
-      SymI_NeedsDataProto(stg_interp_constr2_entry)                         \
-      SymI_NeedsDataProto(stg_interp_constr3_entry)                         \
-      SymI_NeedsDataProto(stg_interp_constr4_entry)                         \
-      SymI_NeedsDataProto(stg_interp_constr5_entry)                         \
-      SymI_NeedsDataProto(stg_interp_constr6_entry)                         \
-      SymI_NeedsDataProto(stg_interp_constr7_entry)                         \
+      SymI_NeedsProto(stg_badAlignment_entry)                           \
+      SymI_NeedsProto(stg_interp_constr1_entry)                         \
+      SymI_NeedsProto(stg_interp_constr2_entry)                         \
+      SymI_NeedsProto(stg_interp_constr3_entry)                         \
+      SymI_NeedsProto(stg_interp_constr4_entry)                         \
+      SymI_NeedsProto(stg_interp_constr5_entry)                         \
+      SymI_NeedsProto(stg_interp_constr6_entry)                         \
+      SymI_NeedsProto(stg_interp_constr7_entry)                         \
       SymI_HasDataProto(stg_arg_bitmaps)                                    \
       SymI_HasProto(large_alloc_lim)                                    \
       SymI_HasProto(g0)                                                 \
@@ -896,7 +908,6 @@ extern char **environ;
       SymI_HasProto(stopTimer)                                          \
       SymI_HasProto(n_capabilities)                                     \
       SymI_HasProto(enabled_capabilities)                               \
-      SymI_HasDataProto(stg_traceCcszh)                                     \
       SymI_HasDataProto(stg_traceEventzh)                                   \
       SymI_HasDataProto(stg_traceMarkerzh)                                  \
       SymI_HasDataProto(stg_traceBinaryEventzh)                             \
@@ -929,7 +940,16 @@ extern char **environ;
       SymI_HasProto(sendCloneStackMessage)                              \
       SymI_HasProto(cloneStack)                                         \
       SymI_HasProto(decodeClonedStack)                                  \
+      SymI_HasProto(stg_newPromptTagzh)                                 \
+      SymI_HasProto(stg_promptzh)                                       \
+      SymI_HasProto(stg_control0zh)                                     \
+      SymI_HasProto(newArena)                                           \
+      SymI_HasProto(arenaAlloc)                                         \
+      SymI_HasProto(arenaFree)                                          \
       SymI_HasProto(setKeepCAFs)                                        \
+      SymI_HasProto(rtsBadAlignmentBarf)                                \
+      SymI_HasProto(rtsOutOfBoundsAccess)                               \
+      SymI_HasProto(rtsMemcpyRangeOverlap)                              \
       RTS_USER_SIGNALS_SYMBOLS                                          \
       RTS_INTCHAR_SYMBOLS
 
@@ -954,9 +974,16 @@ extern char **environ;
 #define RTS_LIBGCC_SYMBOLS
 #endif
 
+// Symbols defined by libgcc/compiler-rt for AArch64's outline atomics.
+#if defined(HAVE_ARM_OUTLINE_ATOMICS)
+#include "ARMOutlineAtomicsSymbols.h"
+#else
+#define RTS_ARM_OUTLINE_ATOMIC_SYMBOLS
+#endif
+
 // Symbols defined by libc
 #define RTS_LIBC_SYMBOLS                               \
-      SymI_HasProto_redirect(atexit, atexit, STRENGTH_STRONG, CODE_TYPE_CODE) /* See Note [Strong symbols] */ \
+      SymI_HasProto_redirect(atexit, atexit, STRENGTH_STRONG, SYM_TYPE_CODE) /* See Note [Strong symbols] */ \
       SymI_HasProto(environ)
 
 #if !defined(DYNAMIC) && defined(linux_HOST_OS)
@@ -1001,6 +1028,7 @@ RTS_LIBC_SYMBOLS
 RTS_LIBGCC_SYMBOLS
 RTS_FINI_ARRAY_SYMBOLS
 RTS_LIBFFI_SYMBOLS
+RTS_ARM_OUTLINE_ATOMIC_SYMBOLS
 
 #undef SymI_NeedsProto
 #undef SymI_NeedsDataProto
@@ -1042,6 +1070,7 @@ RtsSymbolVal rtsSyms[] = {
       RTS_LIBGCC_SYMBOLS
       RTS_FINI_ARRAY_SYMBOLS
       RTS_LIBFFI_SYMBOLS
+      RTS_ARM_OUTLINE_ATOMIC_SYMBOLS
       SymI_HasDataProto(nonmoving_write_barrier_enabled)
 #if defined(darwin_HOST_OS) && defined(i386_HOST_ARCH)
       // dyld stub code contains references to this,

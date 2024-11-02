@@ -31,7 +31,7 @@ module GHC.Tc.Types(
         Env(..),
         TcGblEnv(..), TcLclEnv(..),
         setLclEnvTcLevel, getLclEnvTcLevel,
-        setLclEnvLoc, getLclEnvLoc,
+        setLclEnvLoc, getLclEnvLoc, lclEnvInGeneratedCode,
         IfGblEnv(..), IfLclEnv(..),
         tcVisibleOrphanMods,
         RewriteEnv(..),
@@ -102,6 +102,7 @@ import GHC.Prelude
 import GHC.Platform
 
 import GHC.Driver.Env
+import GHC.Driver.Config.Core.Lint
 import GHC.Driver.Session
 import {-# SOURCE #-} GHC.Driver.Hooks
 
@@ -183,7 +184,7 @@ import GHC.Linker.Types
 -- 'ns_module_name' @A@, defines a mapping from @{A.T}@
 -- (for some 'OccName' @T@) to some arbitrary other 'Name'.
 --
--- The most intruiging thing about a 'NameShape', however, is
+-- The most intriguing thing about a 'NameShape', however, is
 -- how it's constructed.  A 'NameShape' is *implied* by the
 -- exported 'AvailInfo's of the implementor of an interface:
 -- if an implementor of signature @\<H>@ exports @M.T@, you implicitly
@@ -293,6 +294,7 @@ data RewriteEnv
        -- ^ At what role are we rewriting?
        --
        -- See Note [Rewriter EqRels] in GHC.Tc.Solver.Rewrite
+
        , re_rewriters :: !(TcRef RewriterSet)  -- ^ See Note [Wanteds rewrite Wanteds]
        }
 -- RewriteEnv is mostly used in @GHC.Tc.Solver.Rewrite@, but it is defined
@@ -400,7 +402,7 @@ data FrontendResult
 --        signatures (we just generate blank object files for
 --        hsig files.)
 --
---        A corrolary of this is that the following invariant holds at any point
+--        A corollary of this is that the following invariant holds at any point
 --        past desugaring,
 --
 --            if I have a Module, this_mod, in hand representing the module
@@ -861,6 +863,9 @@ setLclEnvLoc env loc = env { tcl_loc = loc }
 getLclEnvLoc :: TcLclEnv -> RealSrcSpan
 getLclEnvLoc = tcl_loc
 
+lclEnvInGeneratedCode :: TcLclEnv -> Bool
+lclEnvInGeneratedCode = tcl_in_gen_code
+
 type ErrCtxt = (Bool, TidyEnv -> TcM (TidyEnv, SDoc))
         -- Monadic so that we have a chance
         -- to deal with bound type variables just before error
@@ -973,7 +978,7 @@ removeBindingShadowing bindings = reverse $ fst $ foldl
 
 
 -- | Get target platform
-getPlatform :: TcM Platform
+getPlatform :: TcRnIf a b Platform
 getPlatform = targetPlatform <$> getDynFlags
 
 ---------------------------
@@ -1134,7 +1139,7 @@ data TcTyThing
   | ATyVar  Name TcTyVar   -- See Note [Type variables in the type environment]
 
   | ATcTyCon TyCon   -- Used temporarily, during kind checking, for the
-                     -- tycons and clases in this recursive group
+                     -- tycons and classes in this recursive group
                      -- The TyCon is always a TcTyCon.  Its kind
                      -- can be a mono-kind or a poly-kind; in TcTyClsDcls see
                      -- Note [Type checking recursive type and class declarations]
@@ -1146,25 +1151,6 @@ tcTyThingTyCon_maybe :: TcTyThing -> Maybe TyCon
 tcTyThingTyCon_maybe (AGlobal (ATyCon tc)) = Just tc
 tcTyThingTyCon_maybe (ATcTyCon tc_tc)      = Just tc_tc
 tcTyThingTyCon_maybe _                     = Nothing
-
-data PromotionErr
-  = TyConPE          -- TyCon used in a kind before we are ready
-                     --     data T :: T -> * where ...
-  | ClassPE          -- Ditto Class
-
-  | FamDataConPE     -- Data constructor for a data family
-                     -- See Note [AFamDataCon: not promoting data family constructors]
-                     -- in GHC.Tc.Utils.Env.
-  | ConstrainedDataConPE PredType
-                     -- Data constructor with a non-equality context
-                     -- See Note [Don't promote data constructors with
-                     --           non-equality contexts] in GHC.Tc.Gen.HsType
-  | PatSynPE         -- Pattern synonyms
-                     -- See Note [Don't promote pattern synonyms] in GHC.Tc.Utils.Env
-
-  | RecDataConPE     -- Data constructor in a recursive loop
-                     -- See Note [Recursion and promoting data constructors] in GHC.Tc.TyCl
-  | NoDataKindsDC    -- -XDataKinds not enabled (for a datacon)
 
 instance Outputable TcTyThing where     -- Debugging only
    ppr (AGlobal g)      = ppr g
@@ -1233,7 +1219,7 @@ ClosedLet means that
    - The fvs::RhsNames contains the free names of the RHS,
      excluding Global and ClosedLet ones.
 
-   - For the ClosedTypeId field see Note [Bindings with closed types]
+   - For the ClosedTypeId field see Note [Bindings with closed types: ClosedTypeId]
 
 For (static e) to be valid, we need for every 'x' free in 'e',
 that x's binding is floatable to the top level.  Specifically:
@@ -1350,16 +1336,6 @@ instance Outputable IdBindingInfo where
   ppr (NonClosedLet fvs closed_type) =
     text "TopLevelLet" <+> ppr fvs <+> ppr closed_type
 
-instance Outputable PromotionErr where
-  ppr ClassPE                     = text "ClassPE"
-  ppr TyConPE                     = text "TyConPE"
-  ppr PatSynPE                    = text "PatSynPE"
-  ppr FamDataConPE                = text "FamDataConPE"
-  ppr (ConstrainedDataConPE pred) = text "ConstrainedDataConPE"
-                                      <+> parens (ppr pred)
-  ppr RecDataConPE                = text "RecDataConPE"
-  ppr NoDataKindsDC               = text "NoDataKindsDC"
-
 --------------
 pprTcTyThingCategory :: TcTyThing -> SDoc
 pprTcTyThingCategory = text . capitalise . tcTyThingCategory
@@ -1370,19 +1346,6 @@ tcTyThingCategory (ATyVar {})        = "type variable"
 tcTyThingCategory (ATcId {})         = "local identifier"
 tcTyThingCategory (ATcTyCon {})      = "local tycon"
 tcTyThingCategory (APromotionErr pe) = peCategory pe
-
---------------
-pprPECategory :: PromotionErr -> SDoc
-pprPECategory = text . capitalise . peCategory
-
-peCategory :: PromotionErr -> String
-peCategory ClassPE                = "class"
-peCategory TyConPE                = "type constructor"
-peCategory PatSynPE               = "pattern synonym"
-peCategory FamDataConPE           = "data constructor"
-peCategory ConstrainedDataConPE{} = "data constructor"
-peCategory RecDataConPE           = "data constructor"
-peCategory NoDataKindsDC          = "data constructor"
 
 {-
 ************************************************************************
@@ -1451,9 +1414,9 @@ plusImportAvails
                    imp_trust_pkgs    = tpkgs1 `S.union` tpkgs2,
                    imp_trust_own_pkg = tself1 || tself2,
                    imp_boot_mods   = srs1 `plusModDeps` srcs2,
-                   imp_sig_mods      = sig_mods1 `unionLists` sig_mods2,
-                   imp_orphs         = orphs1 `unionLists` orphs2,
-                   imp_finsts        = finsts1 `unionLists` finsts2 }
+                   imp_sig_mods      = unionListsOrd sig_mods1 sig_mods2,
+                   imp_orphs         = unionListsOrd orphs1 orphs2,
+                   imp_finsts        = unionListsOrd finsts1 finsts2 }
 
 {-
 ************************************************************************
@@ -1811,7 +1774,12 @@ instance Outputable DefaultingProposal where
           <+> ppr (deProposalCts p)
 
 type DefaultingPluginResult = [DefaultingProposal]
-type FillDefaulting = WantedConstraints -> TcPluginM DefaultingPluginResult
+type FillDefaulting
+  = WantedConstraints
+      -- Zonked constraints containing the unfilled metavariables that
+      -- can be defaulted. See wrinkle (DP1) of Note [Defaulting plugins]
+      -- in GHC.Tc.Solver
+  -> TcPluginM [DefaultingProposal]
 
 -- | A plugin for controlling defaulting.
 data DefaultingPlugin = forall s. DefaultingPlugin
@@ -1860,7 +1828,8 @@ getRoleAnnots bndrs role_env
 -- axioms, but should check other aspects, too.
 lintGblEnv :: Logger -> DynFlags -> TcGblEnv -> TcM ()
 lintGblEnv logger dflags tcg_env =
-  liftIO $ lintAxioms logger dflags (text "TcGblEnv axioms") axioms
+  -- TODO empty list means no extra in scope from GHCi, is this correct?
+  liftIO $ lintAxioms logger (initLintConfig dflags []) (text "TcGblEnv axioms") axioms
   where
     axioms = typeEnvCoAxioms (tcg_type_env tcg_env)
 

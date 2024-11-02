@@ -1,9 +1,8 @@
 {-# LANGUAGE KindSignatures #-}
 module GHC.Unit.Types where
 
-import GHC.Prelude ()
-import {-# SOURCE #-} GHC.Utils.Outputable
-import {-# SOURCE #-} GHC.Unit.Module.Name ( ModuleName )
+-- No Prelude. See Note [Exporting pprTrace from GHC.Prelude]
+import Language.Haskell.Syntax.Module.Name (ModuleName)
 import Data.Kind (Type)
 
 data UnitId
@@ -15,4 +14,3 @@ type Unit        = GenUnit    UnitId
 
 moduleName :: GenModule a -> ModuleName
 moduleUnit :: GenModule a -> a
-pprModule :: Module -> SDoc

@@ -23,7 +23,7 @@ module GHC.Runtime.Heap.Inspect(
      constrClosToName -- exported to use in test T4891
  ) where
 
-import GHC.Prelude
+import GHC.Prelude hiding (head, init, last, tail)
 import GHC.Platform
 
 import GHC.Runtime.Interpreter as GHCi
@@ -36,7 +36,8 @@ import GHC.Core.Type
 import GHC.Types.RepType
 import GHC.Core.Multiplicity
 import qualified GHC.Core.Unify as U
-import GHC.Types.Var
+import GHC.Core.TyCon
+
 import GHC.Tc.Utils.Monad
 import GHC.Tc.Utils.TcType
 import GHC.Tc.Utils.TcMType
@@ -44,7 +45,7 @@ import GHC.Tc.Utils.Zonk ( zonkTcTypeToTypeX, mkEmptyZonkEnv, ZonkFlexi( Runtime
 import GHC.Tc.Utils.Unify
 import GHC.Tc.Utils.Env
 
-import GHC.Core.TyCon
+import GHC.Types.Var
 import GHC.Types.Name
 import GHC.Types.Name.Occurrence as OccName
 import GHC.Unit.Module
@@ -67,6 +68,8 @@ import GHC.IO (throwIO)
 import Control.Monad
 import Data.Maybe
 import Data.List ((\\))
+import Data.List.NonEmpty (NonEmpty (..))
+import qualified Data.List.NonEmpty as NE
 import GHC.Exts
 import qualified Data.Sequence as Seq
 import Data.Sequence (viewl, ViewL(..))
@@ -431,13 +434,14 @@ cPprTermBase y =
    --Note pprinting of list terms is not lazy
    ppr_list :: Precedence -> Term -> m SDoc
    ppr_list p (Term{subTerms=[h,t]}) = do
-       let elems      = h : getListTerms t
-           isConsLast = not (termType (last elems) `eqType` termType h)
+       let elems      = h :| getListTerms t
+           elemList   = toList elems
+           isConsLast = not (termType (NE.last elems) `eqType` termType h)
            is_string  = all (isCharTy . ty) elems
            chars = [ chr (fromIntegral w)
-                   | Term{subTerms=[Prim{valRaw=[w]}]} <- elems ]
+                   | Term{subTerms=[Prim{valRaw=[w]}]} <- elemList ]
 
-       print_elems <- mapM (y cons_prec) elems
+       print_elems <- mapM (y cons_prec) elemList
        if is_string
         then return (Ppr.doubleQuotes (Ppr.text chars))
         else if isConsLast
@@ -637,7 +641,7 @@ as expected.
 -}
 
 
-instTyVars :: [TyVar] -> TR (TCvSubst, [TcTyVar])
+instTyVars :: [TyVar] -> TR (Subst, [TcTyVar])
 -- Instantiate fresh mutable type variables from some TyVars
 -- This function preserves the print-name, which helps error messages
 instTyVars tvs
@@ -672,7 +676,7 @@ applyRevSubst pairs = liftTcM (mapM_ do_pair pairs)
   where
     do_pair (tc_tv, rtti_tv)
       = do { tc_ty <- zonkTcTyVar tc_tv
-           ; case tcGetTyVar_maybe tc_ty of
+           ; case getTyVar_maybe tc_ty of
                Just tv | isMetaTyVar tv -> writeMetaTyVar tv (mkTyVarTy rtti_tv)
                _                        -> return () }
 
@@ -745,10 +749,13 @@ cvObtainTerm hsc_env max_depth force old_ty hval = runTR hsc_env $ do
                       -- we have unsound types. Replace constructor types in
                       -- subterms with tyvars
                       zterm' <- mapTermTypeM
-                                 (\ty -> case tcSplitTyConApp_maybe ty of
-                                           Just (tc, _:_) | tc /= funTyCon
-                                               -> newOpenVar
-                                           _   -> return ty)
+                                 (\ty -> case splitTyConApp_maybe ty of
+                                           -- SPJ: I have no idea why we are
+                                           --      matching on (:) here, nor
+                                           --      what the isFunTy is for
+                                           Just (_tc, _ : _) | not (isFunTy ty)
+                                                             -> newOpenVar
+                                           _ -> return ty)
                                  term
                       zonkTerm zterm'
    traceTR (text "Term reconstruction completed." $$
@@ -781,7 +788,7 @@ cvObtainTerm hsc_env max_depth force old_ty hval = runTR hsc_env $ do
            EvalSuccess _ -> go (pred max_depth) my_ty old_ty a
            EvalException ex -> do
               -- Report the exception to the UI
-              traceTR $ text "Exception occured:" <+> text (show ex)
+              traceTR $ text "Exception occurred:" <+> text (show ex)
               liftIO $ throwIO $ fromSerializableException ex
 -- Blackholes are indirections iff the payload is not TSO or BLOCKING_QUEUE. If
 -- the indirection is a TSO or BLOCKING_QUEUE, we return the BLACKHOLE itself as
@@ -836,7 +843,7 @@ cvObtainTerm hsc_env max_depth force old_ty hval = runTR hsc_env $ do
           Nothing -> do -- This can happen for private constructors compiled -O0
                         -- where the .hi descriptor does not export them
                         -- In such case, we return a best approximation:
-                        --  ignore the unpointed args, and recover the pointeds
+                        --  ignore the unpointed args, and recover the pointed ones
                         -- This preserves laziness, and should be safe.
                        traceTR (text "Not constructor" <+> ppr dcname)
                        let dflags = hsc_dflags hsc_env
@@ -1101,7 +1108,7 @@ findPtrTyss i tys = foldM step (i, []) tys
 -- improveType <base_type> <rtti_type>
 -- The types can contain skolem type variables, which need to be treated as normal vars.
 -- In particular, we want them to unify with things.
-improveRTTIType :: HscEnv -> RttiType -> RttiType -> Maybe TCvSubst
+improveRTTIType :: HscEnv -> RttiType -> RttiType -> Maybe Subst
 improveRTTIType _ base_ty new_ty = U.tcUnifyTyKi base_ty new_ty
 
 getDataConArgTys :: DataCon -> Type -> TR [Type]
@@ -1219,7 +1226,7 @@ The checks:
 ~~~~~~~~~~~
 Consider a function obtainType that takes a value and a type and produces
 the Term representation and a substitution (the improvement).
-Assume an auxiliar rtti' function which does the actual job if recovering
+Assume an auxiliary rtti' function which does the actual job if recovering
 the type, but which may produce a false type.
 
 In pseudocode:
@@ -1343,12 +1350,13 @@ congruenceNewtypes lhs rhs = go lhs rhs >>= \rhs' -> return (lhs,rhs')
                           ppr tv, equals, ppr ty_v]
          go ty_v r
 -- FunTy inductive case
-    | Just (w1,l1,l2) <- splitFunTy_maybe l
-    , Just (w2,r1,r2) <- splitFunTy_maybe r
+    | Just (af1,w1,l1,l2) <- splitFunTy_maybe l
+    , Just (af2,w2,r1,r2) <- splitFunTy_maybe r
+    , af1==af2
     , w1 `eqType` w2
     = do r2' <- go l2 r2
          r1' <- go l1 r1
-         return (mkVisFunTy w1 r1' r2')
+         return (mkFunTy af1 w1 r1' r2')
 -- TyconApp Inductive case; this is the interesting bit.
     | Just (tycon_l, _) <- tcSplitTyConApp_maybe lhs
     , Just (tycon_r, _) <- tcSplitTyConApp_maybe rhs
@@ -1413,7 +1421,7 @@ isMonomorphicOnNonPhantomArgs ty
   , concrete_args <- [ arg | (tyv,arg) <- tyConTyVars tc `zip` all_args
                            , tyv `notElem` phantom_vars]
   = all isMonomorphicOnNonPhantomArgs concrete_args
-  | Just (_, ty1, ty2) <- splitFunTy_maybe ty
+  | Just (_, _, ty1, ty2) <- splitFunTy_maybe ty
   = all isMonomorphicOnNonPhantomArgs [ty1,ty2]
   | otherwise = isMonomorphic ty
 

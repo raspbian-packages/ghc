@@ -125,7 +125,7 @@ are both type constructors into two GRES.
     , T defined at A.hs:4:23 ]
 
 Then, we get  @[C{C;}, C{T;}, T{T;}, T{D;}]@, which eventually gets merged
-into @[C{C, T;}, T{T, D;}]@ (which satsifies the AvailTC invariant).
+into @[C{C, T;}, T{T, D;}]@ (which satisfies the AvailTC invariant).
 -}
 
 data ExportAccum        -- The type of the accumulating parameter of
@@ -190,7 +190,7 @@ rnExports explicit_mod exports
                  | explicit_mod = exports
                  | has_main
                           = Just (noLocA [noLocA (IEVar noExtField
-                                     (noLocA (IEName $ noLocA default_main)))])
+                                     (noLocA (IEName noExtField $ noLocA default_main)))])
                         -- ToDo: the 'noLoc' here is unhelpful if 'main'
                         --       turns out to be out of scope
                  | otherwise = Nothing
@@ -369,8 +369,8 @@ exports_from_avail (Just (L _ rdr_items)) rdr_env imports this_mod
     lookup_ie _ = panic "lookup_ie"    -- Other cases covered earlier
 
 
-    lookup_ie_with :: LIEWrappedName RdrName -> [LIEWrappedName RdrName]
-                   -> RnM (Located Name, [LIEWrappedName Name], [Name],
+    lookup_ie_with :: LIEWrappedName GhcPs -> [LIEWrappedName GhcPs]
+                   -> RnM (Located Name, [LIEWrappedName GhcRn], [Name],
                            [Located FieldLabel])
     lookup_ie_with (L l rdr) sub_rdrs
         = do name <- lookupGlobalOccRn $ ieWrappedName rdr
@@ -381,7 +381,7 @@ exports_from_avail (Just (L _ rdr_items)) rdr_env imports this_mod
                             , map (ieWrappedName . unLoc) non_flds
                             , flds)
 
-    lookup_ie_all :: IE GhcPs -> LIEWrappedName RdrName
+    lookup_ie_all :: IE GhcPs -> LIEWrappedName GhcPs
                   -> RnM (Located Name, [Name], [FieldLabel])
     lookup_ie_all ie (L l rdr) =
           do name <- lookupGlobalOccRn $ ieWrappedName rdr
@@ -421,8 +421,7 @@ classifyGREs = partitionGreNames . map gre_name
 
 {-
 Note [Modules without a module header]
---------------------------------------------------
-
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 The Haskell 2010 report says in section 5.1:
 
 >> An abbreviated form of module, consisting only of the module body, is
@@ -477,8 +476,8 @@ If the module has NO main function:
 
 
 
-lookupChildrenExport :: Name -> [LIEWrappedName RdrName]
-                     -> RnM ([LIEWrappedName Name], [Located FieldLabel])
+lookupChildrenExport :: Name -> [LIEWrappedName GhcPs]
+                     -> RnM ([LIEWrappedName GhcRn], [Located FieldLabel])
 lookupChildrenExport spec_parent rdr_items =
   do
     xs <- mapAndReportM doOne rdr_items
@@ -493,8 +492,8 @@ lookupChildrenExport spec_parent rdr_items =
           | ns == tcName  = [dataName, tcName]
           | otherwise = [ns]
         -- Process an individual child
-        doOne :: LIEWrappedName RdrName
-              -> RnM (Either (LIEWrappedName Name) (Located FieldLabel))
+        doOne :: LIEWrappedName GhcPs
+              -> RnM (Either (LIEWrappedName GhcRn) (Located FieldLabel))
         doOne n = do
 
           let bareName = (ieWrappedName . unLoc) n
@@ -514,7 +513,7 @@ lookupChildrenExport spec_parent rdr_items =
           case name of
             NameNotFound -> do { ub <- reportUnboundName unboundName
                                ; let l = getLoc n
-                               ; return (Left (L l (IEName (L (la2na l) ub))))}
+                               ; return (Left (L l (IEName noExtField (L (la2na l) ub))))}
             FoundChild par child -> do { checkPatSynParent spec_parent par child
                                        ; return $ case child of
                                            FieldGreName fl   -> Right (L (getLocA n) fl)
@@ -523,7 +522,8 @@ lookupChildrenExport spec_parent rdr_items =
             IncorrectParent p c gs -> failWithDcErr p c gs
 
 
--- Note: [Typing Pattern Synonym Exports]
+-- Note [Typing Pattern Synonym Exports]
+-- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 -- It proved quite a challenge to precisely specify which pattern synonyms
 -- should be allowed to be bundled with which type constructors.
 -- In the end it was decided to be quite liberal in what we allow. Below is
@@ -567,8 +567,8 @@ lookupChildrenExport spec_parent rdr_items =
 --    type constructor.
 --
 --
--- Note: [Types of TyCon]
---
+-- Note [Types of TyCon]
+-- ~~~~~~~~~~~~~~~~~~~~~
 -- This check appears to be overly complicated, Richard asked why it
 -- is not simply just `isAlgTyCon`. The answer for this is that
 -- a classTyCon is also an `AlgTyCon` which we explicitly want to disallow.
@@ -758,4 +758,4 @@ exportClashErr global_env child1 child2 ie1 ie2
       case SrcLoc.leftmost_smallest (greSrcSpan gre1) (greSrcSpan gre2) of
         LT -> (child1, gre1, ie1, child2, gre2, ie2)
         GT -> (child2, gre2, ie2, child1, gre1, ie1)
-        EQ -> panic "exportClashErr: clashing exports have idential location"
+        EQ -> panic "exportClashErr: clashing exports have identical location"

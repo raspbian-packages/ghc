@@ -1,5 +1,5 @@
-{-# LANGUAGE CPP #-}
 {-# LANGUAGE DeriveFunctor #-}
+{-# LANGUAGE DerivingVia #-}
 
 {-# OPTIONS_GHC -Wno-incomplete-uni-patterns #-}
 
@@ -14,10 +14,6 @@ module GHC.CmmToLlvm.Base (
         LlvmCmmDecl, LlvmBasicBlock,
         LiveGlobalRegs,
         LlvmUnresData, LlvmData, UnresLabel, UnresStatic,
-
-        LlvmVersion, supportedLlvmVersionLowerBound, supportedLlvmVersionUpperBound,
-        llvmVersionSupported, parseLlvmVersion,
-        llvmVersionStr, llvmVersionList,
 
         LlvmM,
         runLlvm, withClearVars, varLookup, varInsert,
@@ -39,8 +35,6 @@ module GHC.CmmToLlvm.Base (
         aliasify, llvmDefLabel
     ) where
 
-#include "ghc-llvm-version.h"
-
 import GHC.Prelude
 import GHC.Utils.Panic
 
@@ -49,7 +43,6 @@ import GHC.CmmToLlvm.Regs
 import GHC.CmmToLlvm.Config
 
 import GHC.Cmm.CLabel
-import GHC.Cmm.Ppr.Expr ()
 import GHC.Platform.Regs ( activeStgRegs, globalRegMaybe )
 import GHC.Driver.Session
 import GHC.Data.FastString
@@ -65,11 +58,10 @@ import GHC.Types.Unique.Supply
 import GHC.Utils.Logger
 
 import Data.Maybe (fromJust)
-import Control.Monad (ap)
-import Data.Char (isDigit)
-import Data.List (sortBy, groupBy, intercalate, isPrefixOf)
-import Data.Ord (comparing)
+import Control.Monad.Trans.State (StateT (..))
+import Data.List (isPrefixOf)
 import qualified Data.List.NonEmpty as NE
+import Data.Ord (comparing)
 
 -- ----------------------------------------------------------------------------
 -- * Some Data Types
@@ -201,7 +193,7 @@ padLiveArgs platform live =
     -- set of real registers to be passed. E.g. FloatReg, DoubleReg and XmmReg
     -- all use the same real regs on X86-64 (XMM registers).
     --
-    classes         = groupBy sharesClass fprLive
+    classes         = NE.groupBy sharesClass fprLive
     sharesClass a b = regsOverlap platform (norm a) (norm b) -- check if mapped to overlapping registers
     norm x          = CmmGlobal ((fpr_ctor x) 1)             -- get the first register of the family
 
@@ -211,10 +203,10 @@ padLiveArgs platform live =
     -- E.g. sortedRs = [   F2,   XMM4, D5]
     --      output   = [D1,   D3]
     padded      = concatMap padClass classes
-    padClass rs = go sortedRs [1..]
+    padClass rs = go (NE.toList sortedRs) 1
       where
-         sortedRs = sortBy (comparing fpr_num) rs
-         maxr     = last sortedRs
+         sortedRs = NE.sortBy (comparing fpr_num) rs
+         maxr     = NE.last sortedRs
          ctor     = fpr_ctor maxr
 
          go [] _ = []
@@ -225,10 +217,9 @@ padLiveArgs platform live =
                text "Found two different Cmm registers (" <> ppr c1 <> text "," <> ppr c2 <>
                text ") both alive AND mapped to the same real register: " <> ppr real <>
                text ". This isn't currently supported by the LLVM backend."
-         go (c:cs) (f:fs)
-            | fpr_num c == f = go cs fs              -- already covered by a real register
-            | otherwise      = ctor f : go (c:cs) fs -- add padding register
-         go _ _ = undefined -- unreachable
+         go (c:cs) f
+            | fpr_num c == f = go cs f                    -- already covered by a real register
+            | otherwise      = ctor f : go (c:cs) (f + 1) -- add padding register
 
     fpr_ctor :: GlobalReg -> Int -> GlobalReg
     fpr_ctor (FloatReg _)  = FloatReg
@@ -261,42 +252,6 @@ llvmPtrBits :: Platform -> Int
 llvmPtrBits platform = widthInBits $ typeWidth $ gcWord platform
 
 -- ----------------------------------------------------------------------------
--- * Llvm Version
---
-
-parseLlvmVersion :: String -> Maybe LlvmVersion
-parseLlvmVersion =
-    fmap LlvmVersion . NE.nonEmpty . go [] . dropWhile (not . isDigit)
-  where
-    go vs s
-      | null ver_str
-      = reverse vs
-      | '.' : rest' <- rest
-      = go (read ver_str : vs) rest'
-      | otherwise
-      = reverse (read ver_str : vs)
-      where
-        (ver_str, rest) = span isDigit s
-
--- | The (inclusive) lower bound on the LLVM Version that is currently supported.
-supportedLlvmVersionLowerBound :: LlvmVersion
-supportedLlvmVersionLowerBound = LlvmVersion (sUPPORTED_LLVM_VERSION_MIN NE.:| [])
-
--- | The (not-inclusive) upper bound  bound on the LLVM Version that is currently supported.
-supportedLlvmVersionUpperBound :: LlvmVersion
-supportedLlvmVersionUpperBound = LlvmVersion (sUPPORTED_LLVM_VERSION_MAX NE.:| [])
-
-llvmVersionSupported :: LlvmVersion -> Bool
-llvmVersionSupported v =
-  v >= supportedLlvmVersionLowerBound && v < supportedLlvmVersionUpperBound
-
-llvmVersionStr :: LlvmVersion -> String
-llvmVersionStr = intercalate "." . map show . llvmVersionList
-
-llvmVersionList :: LlvmVersion -> [Int]
-llvmVersionList = NE.toList . llvmVersionNE
-
--- ----------------------------------------------------------------------------
 -- * Environment Handling
 --
 
@@ -321,15 +276,8 @@ type LlvmEnvMap = UniqFM Unique LlvmType
 
 -- | The Llvm monad. Wraps @LlvmEnv@ state as well as the @IO@ monad
 newtype LlvmM a = LlvmM { runLlvmM :: LlvmEnv -> IO (a, LlvmEnv) }
-    deriving (Functor)
-
-instance Applicative LlvmM where
-    pure x = LlvmM $ \env -> return (x, env)
-    (<*>) = ap
-
-instance Monad LlvmM where
-    m >>= f  = LlvmM $ \env -> do (x, env') <- runLlvmM m env
-                                  runLlvmM (f x) env'
+    deriving stock (Functor)
+    deriving (Applicative, Monad) via StateT LlvmEnv IO
 
 instance HasLogger LlvmM where
     getLogger = LlvmM $ \env -> return (envLogger env, env)
@@ -492,8 +440,8 @@ strCLabel_llvm :: CLabel -> LlvmM LMString
 strCLabel_llvm lbl = do
     ctx <- llvmCgContext <$> getConfig
     platform <- getPlatform
-    let sdoc = pprCLabel platform CStyle lbl
-        str = Outp.renderWithContext ctx sdoc
+    let sdoc = pprCLabel platform lbl
+        str = Outp.showSDocOneLine ctx sdoc
     return (fsLit str)
 
 -- ----------------------------------------------------------------------------

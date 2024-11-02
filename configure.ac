@@ -13,7 +13,7 @@ dnl
 # see what flags are available. (Better yet, read the documentation!)
 #
 
-AC_INIT([The Glorious Glasgow Haskell Compilation System], [9.4.7], [glasgow-haskell-bugs@haskell.org], [ghc-AC_PACKAGE_VERSION])
+AC_INIT([The Glorious Glasgow Haskell Compilation System], [9.6.6], [glasgow-haskell-bugs@haskell.org], [ghc-AC_PACKAGE_VERSION])
     # Version on master must be X.Y (not X.Y.Z) for ProjectVersionMunged variable
     # to be useful (cf #19058). However, the version must have three components
     # (X.Y.Z) on stable branches (e.g. ghc-9.2) to ensure that pre-releases are
@@ -72,9 +72,6 @@ cat rts/ghcversion.h.bottom                                             >> rts/i
 
 # Hmmm, we fix the RPM release number to 1 here... Is this convenient?
 AC_SUBST([release], [1])
-
-# First off, a distrib sanity check..
-AC_CONFIG_SRCDIR([mk/config.mk.in])
 
 dnl * We require autoconf version 2.69 due to
 dnl   https://bugs.ruby-lang.org/issues/8179. Also see #14910.
@@ -146,7 +143,7 @@ if test "$EnableDistroToolchain" = "YES"; then
 fi
 
 AC_ARG_ENABLE(asserts-all-ways,
-[AC_HELP_STRING([--enable-asserts-all-ways],
+[AS_HELP_STRING([--enable-asserts-all-ways],
                 [Usually ASSERTs are only compiled in the DEBUG way,
                  this will enable them in all ways.])],
   [FP_CAPITALIZE_YES_NO(["$enableval"], [EnableAssertsAllWays])],
@@ -227,14 +224,9 @@ if test "$WithGhc" = ""
 then
     AC_MSG_ERROR([GHC is required.])
 fi
-MinBootGhcVersion="9.0"
+MinBootGhcVersion="9.2"
 FP_COMPARE_VERSIONS([$GhcVersion],[-lt],[$MinBootGhcVersion],
     [AC_MSG_ERROR([GHC version $MinBootGhcVersion or later is required to compile GHC.])])
-
-# See Note [Support for building ghc 9.4 with the make build system]
-MaxBootWithMakeGhcVersion="9.1"
-FP_COMPARE_VERSIONS([$GhcVersion],[-lt],[$MaxBootWithMakeGhcVersion],
-    [AC_SUBST(CanBootWithMake,"YES")])
 
 if test `expr $GhcMinVersion % 2` = "1"
 then
@@ -341,7 +333,7 @@ AC_SUBST(TablesNextToCode)
 dnl ** Does target have runtime linker support?
 dnl --------------------------------------------------------------
 case "$target" in
-    powerpc64-*|powerpc64le-*|powerpc-ibm-aix*|s390x-ibm-linux|riscv64-*)
+    powerpc64-*|powerpc64le-*|powerpc-ibm-aix*|s390x-ibm-linux|riscv64-*|wasm*|javascript-*|loongarch64-*)
         TargetHasRTSLinker=NO
         ;;
     *)
@@ -400,9 +392,6 @@ if test "$HostOS" = "mingw32"
 then
   GMP_FORCE_INTREE="YES"
 fi
-
-XCODE_VERSION()
-
 
 dnl ** Building a cross compiler?
 dnl --------------------------------------------------------------
@@ -479,6 +468,9 @@ dnl detect compiler (prefer gcc over clang) and set $CC (unless CC already set),
 dnl later CC is copied to CC_STAGE{1,2,3}
 AC_PROG_CC([cc gcc clang])
 AC_PROG_CXX([g++ clang++ c++])
+# Work around #24324
+MOVE_TO_FLAGS([CC],[CFLAGS])
+MOVE_TO_FLAGS([CXX],[CXXFLAGS])
 
 MAYBE_OVERRIDE_STAGE0([ar],[AR_STAGE0])
 
@@ -513,6 +505,7 @@ FP_PROG_LD_IS_GNU
 FP_PROG_LD_BUILD_ID
 FP_PROG_LD_NO_COMPACT_UNWIND
 FP_PROG_LD_FILELIST
+FP_PROG_LD_SINGLE_MODULE
 
 dnl ** Which nm to use?
 dnl --------------------------------------------------------------
@@ -546,22 +539,6 @@ AC_CHECK_TARGET_TOOL([STRIP], [strip])
 StripCmd="$STRIP"
 AC_SUBST([StripCmd])
 
-
-dnl ** which libtool to use?
-dnl --------------------------------------------------------------
-# The host normalization on Windows breaks autoconf, it no longer
-# thinks that target == host so it never checks the unqualified
-# tools for Windows. See #14274.
-if test "$HostOS" = "mingw32"
-then
-    AC_PATH_PROG([LIBTOOL],[libtool])
-    LibtoolCmd="$(cygpath -m $LIBTOOL)"
-else
-    AC_CHECK_TARGET_TOOL([LIBTOOL], [libtool])
-    LibtoolCmd="$LIBTOOL"
-fi
-AC_SUBST([LibtoolCmd])
-
 dnl ** Which otool to use on macOS
 dnl --------------------------------------------------------------
 AC_CHECK_TARGET_TOOL([OTOOL], [otool])
@@ -579,7 +556,7 @@ AC_SUBST(InstallNameToolCmd)
 # versions of LLVM simultaneously, but that stopped working around
 # 3.5/3.6 release of LLVM.
 LlvmMinVersion=11  # inclusive
-LlvmMaxVersion=16 # not inclusive
+LlvmMaxVersion=19 # not inclusive
 AC_SUBST([LlvmMinVersion])
 AC_SUBST([LlvmMaxVersion])
 sUPPORTED_LLVM_VERSION_MIN=$(echo \($LlvmMinVersion\) | sed 's/\./,/')
@@ -686,10 +663,16 @@ FPTOOLS_SET_C_LD_FLAGS([target],[CONF_CC_OPTS_STAGE1],[CONF_GCC_LINKER_OPTS_STAG
 FPTOOLS_SET_C_LD_FLAGS([target],[CONF_CC_OPTS_STAGE2],[CONF_GCC_LINKER_OPTS_STAGE2],[CONF_LD_LINKER_OPTS_STAGE2],[CONF_CPP_OPTS_STAGE2])
 # Stage 3 won't be supported by cross-compilation
 
+#-no_fixup_chains
 FP_LD_NO_FIXUP_CHAINS([target], [LDFLAGS])
 FP_LD_NO_FIXUP_CHAINS([build], [CONF_GCC_LINKER_OPTS_STAGE0])
 FP_LD_NO_FIXUP_CHAINS([target], [CONF_GCC_LINKER_OPTS_STAGE1])
 FP_LD_NO_FIXUP_CHAINS([target], [CONF_GCC_LINKER_OPTS_STAGE2])
+
+#-no_warn_duplicate_libraries
+FP_LD_NO_WARN_DUPLICATE_LIBRARIES([build], [CONF_GCC_LINKER_OPTS_STAGE0])
+FP_LD_NO_WARN_DUPLICATE_LIBRARIES([target], [CONF_GCC_LINKER_OPTS_STAGE1])
+FP_LD_NO_WARN_DUPLICATE_LIBRARIES([target], [CONF_GCC_LINKER_OPTS_STAGE2])
 
 GHC_LLVM_TARGET_SET_VAR
 # we intend to pass trough --targets to llvm as is.
@@ -726,8 +709,12 @@ AC_SUBST(CONF_HC_OPTS_STAGE0)
 AC_SUBST(CONF_HC_OPTS_STAGE1)
 AC_SUBST(CONF_HC_OPTS_STAGE2)
 
-dnl Identify C++ standard library flavour and location
-FP_FIND_CXX_STD_LIB
+dnl Identify C++ standard library flavour and location only when _not_ compiling
+dnl the JS backend. The JS backend uses emscripten to wrap c++ utilities which
+dnl fails this check, so we avoid it when compiling to JS.
+if test "$TargetOS" != "ghcjs"; then
+   FP_FIND_CXX_STD_LIB
+fi
 AC_CONFIG_FILES([mk/system-cxx-std-lib-1.0.conf])
 
 dnl ** Set up the variables for the platform in the settings file.
@@ -781,11 +768,6 @@ AC_PATH_PROG(TimeCmd,time)
 dnl ** check for tar
 dnl   if GNU tar is named gtar, look for it first.
 AC_PATH_PROGS(TarCmd,gnutar gtar tar,tar)
-
-dnl ** check for compressors
-AC_PATH_PROGS(Bzip2Cmd,bzip2, bzip2)
-AC_PATH_PROGS(GzipCmd,gzip, gzip)
-AC_PATH_PROGS(XzCmd,pxz xz, xz)
 
 dnl ** check for patch
 dnl if GNU patch is named gpatch, look for it first
@@ -885,7 +867,7 @@ dnl    off_t, because it will affect the result of that test.
 AC_SYS_LARGEFILE
 
 dnl ** check for specific header (.h) files that we are interested in
-AC_CHECK_HEADERS([ctype.h dirent.h dlfcn.h errno.h fcntl.h grp.h limits.h locale.h nlist.h pthread.h pwd.h signal.h sys/param.h sys/mman.h sys/resource.h sys/select.h sys/time.h sys/timeb.h sys/timerfd.h sys/timers.h sys/times.h sys/utsname.h sys/wait.h termios.h time.h utime.h windows.h winsock.h sched.h])
+AC_CHECK_HEADERS([ctype.h dirent.h dlfcn.h errno.h fcntl.h grp.h limits.h locale.h nlist.h pthread.h pwd.h signal.h sys/param.h sys/mman.h sys/resource.h sys/select.h sys/time.h sys/timeb.h sys/timerfd.h sys/timers.h sys/times.h sys/utsname.h sys/wait.h termios.h utime.h windows.h winsock.h sched.h])
 
 dnl sys/cpuset.h needs sys/param.h to be included first on FreeBSD 9.1; #7708
 AC_CHECK_HEADERS([sys/cpuset.h], [], [],
@@ -896,9 +878,6 @@ AC_CHECK_HEADERS([sys/cpuset.h], [], [],
 
 dnl ** check whether a declaration for `environ` is provided by libc.
 FP_CHECK_ENVIRON
-
-dnl ** check if it is safe to include both <time.h> and <sys/time.h>
-AC_HEADER_TIME
 
 dnl ** do we have long longs?
 AC_CHECK_TYPES([long long])
@@ -961,6 +940,11 @@ AC_CHECK_DECLS([ctime_r], , ,
 #define _POSIX_C_SOURCE 199506L
 #include <time.h>])
 
+dnl On Linux we should have program_invocation_short_name
+AC_CHECK_DECLS([program_invocation_short_name], , ,
+[#define _GNU_SOURCE 1
+#include <errno.h>])
+
 dnl ** check for mingwex library
 AC_CHECK_LIB([mingwex],[closedir])
 
@@ -973,9 +957,9 @@ AC_CHECK_LIB(m, atan, HaveLibM=YES, HaveLibM=NO)
 if test $HaveLibM = YES
 then
   AC_DEFINE([HAVE_LIBM], [1], [Define to 1 if you need to link with libm])
-  AC_SUBST([CabalHaveLibm],[True])
+  AC_SUBST([UseLibm],[YES])
 else
-  AC_SUBST([CabalHaveLibm],[False])
+  AC_SUBST([UseLibm],[NO])
 fi
 TargetHasLibm=$HaveLibM
 AC_SUBST(TargetHasLibm)
@@ -988,15 +972,11 @@ dnl ################################################################
 
 FP_FIND_LIBFFI
 AC_SUBST(UseSystemLibFFI)
-AS_IF([test "x$with_system_libffi" = "xyes"],
-  [CabalUseSystemLibFFI="True"],
-  [CabalUseSystemLibFFI="False"]
-)
-AC_SUBST(CabalUseSystemLibFFI)
 
 dnl ** check whether we need -ldl to get dlopen()
 AC_CHECK_LIB([dl], [dlopen])
-AC_CHECK_LIB([dl], [dlopen], [AC_SUBST([CabalHaveLibdl], [True])], [AC_SUBST([CabalHaveLibdl], [False])])
+AC_CHECK_LIB([dl], [dlopen], HaveLibdl=YES, HaveLibdl=NO)
+AC_SUBST([UseLibdl],[$HaveLibdl])
 dnl ** check whether we have dlinfo
 AC_CHECK_FUNCS([dlinfo])
 
@@ -1029,9 +1009,17 @@ fi
 
 FP_VISIBILITY_HIDDEN
 
+FP_MUSTTAIL
+
 dnl ** check for librt
 AC_CHECK_LIB([rt], [clock_gettime])
-AC_CHECK_LIB([rt], [clock_gettime], [AC_SUBST([CabalHaveLibrt], [True])], [AC_SUBST([CabalHaveLibrt], [False])])
+AC_CHECK_LIB([rt], [clock_gettime], HaveLibrt=YES, HaveLibrt=NO)
+if test $HaveLibrt = YES
+then
+  AC_SUBST([UseLibrt],[YES])
+else
+  AC_SUBST([UseLibrt],[NO])
+fi
 AC_CHECK_FUNCS(clock_gettime timer_settime)
 FP_CHECK_TIMER_CREATE
 
@@ -1054,6 +1042,8 @@ FP_CHECK_PTHREADS
 dnl ** check for eventfd which is needed by the I/O manager
 AC_CHECK_HEADERS([sys/eventfd.h])
 AC_CHECK_FUNCS([eventfd])
+
+AC_CHECK_FUNCS([getpid getuid raise])
 
 dnl ** Check for __thread support in the compiler
 AC_MSG_CHECKING(for __thread support)
@@ -1145,11 +1135,10 @@ AC_DEFINE_UNQUOTED([RTS_LINKER_USE_MMAP], [$RtsLinkerUseMmap],
 
 GHC_ADJUSTORS_METHOD([Target])
 AC_SUBST([UseLibffiForAdjustors])
-AS_IF([test x"${UseLibffiForAdjustors}" = x"YES"],
-  [CabalLibffiAdjustors=True],
-  [CabalLibffiAdjustors=False]
-)
-AC_SUBST([CabalLibffiAdjustors])
+
+dnl ** ARM outline atomics
+dnl --------------------------------------------------------------
+FP_ARM_OUTLINE_ATOMICS
 
 dnl ** Other RTS features
 dnl --------------------------------------------------------------
@@ -1199,12 +1188,6 @@ if grep '	' compiler/ghc.cabal.in 2>&1 >/dev/null; then
    AC_MSG_ERROR([compiler/ghc.cabal.in contains tab characters; please remove them])
 fi
 
-# Create the configuration for the Hadrian build system if it is present
-if test -e hadrian/cfg/system.config.in; then
-    AC_CONFIG_FILES([hadrian/cfg/system.config])
-    AC_CONFIG_FILES([hadrian/ghci-cabal hadrian/ghci-stack])
-fi
-
 # We got caught by
 #     http://savannah.gnu.org/bugs/index.php?1516
 #     $(eval ...) inside conditionals causes errors
@@ -1228,35 +1211,18 @@ checkMake380() {
 checkMake380 make
 checkMake380 gmake
 
-dnl Things specific to the make build system
 AC_CONFIG_FILES(
-[ mk/config.mk
-  mk/install.mk
-  mk/project.mk
-])
-
-dnl When adding things to this list be sure to update hadrian's
-dnl Rules.Configure.configureResults list.
-AC_CONFIG_FILES(
-[ rts/rts.cabal
-  compiler/ghc.cabal
-  ghc/ghc-bin.cabal
-  utils/runghc/runghc.cabal
-  driver/ghci/ghci-wrapper.cabal
-  utils/iserv/iserv.cabal
-  utils/ghc-pkg/ghc-pkg.cabal
-  utils/remote-iserv/remote-iserv.cabal
-  utils/gen-dll/gen-dll.cabal
-  libraries/ghc-boot/ghc-boot.cabal
-  libraries/ghc-boot-th/ghc-boot-th.cabal
-  libraries/ghci/ghci.cabal
-  libraries/ghc-heap/ghc-heap.cabal
-  libraries/libiserv/libiserv.cabal
-  libraries/template-haskell/template-haskell.cabal
+[ mk/project.mk
+  hadrian/cfg/system.config
+  hadrian/ghci-cabal
+  hadrian/ghci-multi-cabal
+  hadrian/ghci-stack
   docs/users_guide/ghc_config.py
-  libraries/prologue.txt
   distrib/configure.ac
 ])
+
+dnl Create the VERSION file, satisfying #22322.
+printf "$ProjectVersion" > VERSION
 
 AC_OUTPUT
 [
@@ -1283,7 +1249,6 @@ echo "\
    Bootstrapping using   : $WithGhc
       which is version   : $GhcVersion
       with threaded RTS? : $GhcThreadedRts
-     can boot with make? : $CanBootWithMake
 "
 
 if test "x$CcLlvmBackend" = "xYES"; then
@@ -1306,7 +1271,6 @@ echo "\
    ar           : $ArCmd
    ld           : $LdCmd
    nm           : $NmCmd
-   libtool      : $LibtoolCmd
    objdump      : $ObjdumpCmd
    ranlib       : $RanlibCmd
    otool        : $OtoolCmd

@@ -9,7 +9,7 @@ module GHC.Unit.Module.Env
    , partitionModuleEnv
    , moduleEnvKeys, moduleEnvElts, moduleEnvToList
    , unitModuleEnv, isEmptyModuleEnv
-   , extendModuleEnvWith, filterModuleEnv
+   , extendModuleEnvWith, filterModuleEnv, mapMaybeModuleEnv
 
      -- * ModuleName mappings
    , ModuleNameEnv, DModuleNameEnv
@@ -37,12 +37,10 @@ where
 
 import GHC.Prelude
 
-import GHC.Unit.Module.Name (ModuleName)
 import GHC.Types.Unique
 import GHC.Types.Unique.FM
 import GHC.Types.Unique.DFM
 import GHC.Unit.Types
-import GHC.Utils.Misc
 import Data.List (sortBy, sort)
 import Data.Ord
 
@@ -51,8 +49,11 @@ import Data.Map (Map)
 import Data.Set (Set)
 import qualified Data.Map as Map
 import qualified Data.Set as Set
+import qualified Data.Semigroup as S
 import qualified GHC.Data.FiniteMap as Map
 import GHC.Utils.Outputable
+
+import Language.Haskell.Syntax.Module.Name
 
 -- | A map keyed off of 'Module's
 newtype ModuleEnv elt = ModuleEnv (Map NDModule elt)
@@ -72,7 +73,7 @@ To be on the safe side and not pessimize ModuleEnv uses nondeterministic
 ordering on Module and normalizes by doing the lexicographic sort when
 turning the env to a list.
 See Note [Unique Determinism] for more information about the source of
-nondeterminismand and Note [Deterministic UniqFM] for explanation of why
+nondeterminism and Note [Deterministic UniqFM] for explanation of why
 it matters for maps.
 -}
 
@@ -86,12 +87,16 @@ instance Outputable NDModule where
 
 instance Ord NDModule where
   compare (NDModule (Module p1 n1)) (NDModule (Module p2 n2)) =
-    (getUnique p1 `nonDetCmpUnique` getUnique p2) `thenCmp`
+    (getUnique p1 `nonDetCmpUnique` getUnique p2) S.<>
     (getUnique n1 `nonDetCmpUnique` getUnique n2)
 
 filterModuleEnv :: (Module -> a -> Bool) -> ModuleEnv a -> ModuleEnv a
 filterModuleEnv f (ModuleEnv e) =
   ModuleEnv (Map.filterWithKey (f . unNDModule) e)
+
+mapMaybeModuleEnv :: (Module -> a -> Maybe b) -> ModuleEnv a -> ModuleEnv b
+mapMaybeModuleEnv f (ModuleEnv e) =
+  ModuleEnv (Map.mapMaybeWithKey (f . unNDModule) e)
 
 elemModuleEnv :: Module -> ModuleEnv a -> Bool
 elemModuleEnv m (ModuleEnv e) = Map.member (NDModule m) e

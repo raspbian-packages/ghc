@@ -67,19 +67,17 @@ isLexId  cs = isLexConId  cs || isLexVarId  cs
 isLexSym cs = isLexConSym cs || isLexVarSym cs
 
 -------------
-isLexConId cs                           -- Prefix type or data constructors
-  | nullFS cs          = False          --      e.g. "Foo", "[]", "(,)"
-  | cs == (fsLit "[]") = True
-  | otherwise          = startsConId (headFS cs)
+isLexConId cs = case unpackFS cs of     -- Prefix type or data constructors
+  []  -> False                  --      e.g. "Foo", "[]", "(,)"
+  c:_ -> cs == fsLit "[]" || startsConId c
 
-isLexVarId cs                           -- Ordinary prefix identifiers
-  | nullFS cs         = False           --      e.g. "x", "_x"
-  | otherwise         = startsVarId (headFS cs)
+isLexVarId cs = case unpackFS cs of     -- Ordinary prefix identifiers
+  []  -> False                  --      e.g. "x", "_x"
+  c:_ -> startsVarId c
 
-isLexConSym cs                          -- Infix type or data constructors
-  | nullFS cs          = False          --      e.g. ":-:", ":", "->"
-  | cs == (fsLit "->") = True
-  | otherwise          = startsConSym (headFS cs)
+isLexConSym cs = case unpackFS cs of    -- Infix type or data constructors
+  []  -> False                  --      e.g. ":-:", ":", "->"
+  c:_ -> cs == fsLit "->" || startsConSym c
 
 isLexVarSym fs                          -- Infix identifiers e.g. "+"
   | fs == (fsLit "~R#") = True
@@ -229,10 +227,11 @@ reservedIds = Set.fromList [ "case", "class", "data", "default", "deriving"
                            , "module", "newtype", "of", "then", "type", "where"
                            , "_" ]
 
--- | All reserved operators. Taken from section 2.4 of the 2010 Report.
+-- | All reserved operators. Taken from section 2.4 of the 2010 Report,
+-- excluding @\@@ and @~@ that are allowed by GHC (see GHC Proposal #229).
 reservedOps :: Set.Set String
 reservedOps = Set.fromList [ "..", ":", "::", "=", "\\", "|", "<-", "->"
-                           , "@", "~", "=>" ]
+                           , "=>" ]
 
 -- | Does this string contain only dashes and has at least 2 of them?
 isDashes :: String -> Bool

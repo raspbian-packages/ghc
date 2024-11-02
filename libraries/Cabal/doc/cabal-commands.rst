@@ -33,6 +33,7 @@ legacy sections. We talk in detail about some global and package commands.
 
     freeze            Freeze dependencies.
     haddock           Build Haddock documentation.
+    haddock-project   Build Haddock documentation of local packages.
     exec              Give a command access to the store.
     list-bin          List path to a single executable.
 
@@ -120,7 +121,7 @@ Arguments and flags common to some or all commands are:
         $ cabal install --allow-newer=foo:base,lens --allow-newer=bar:time
 
     Finally, one can enable :option:`--allow-newer` permanently by setting
-    ``allow-newer: True`` in the ``~/.cabal/config`` file. Enabling
+    ``allow-newer: True`` in the :ref:`config file <config-file-discovery>`. Enabling
     'allow-newer' selectively is also supported in the config file
     (``allow-newer: foo, bar, baz:base``).
 
@@ -185,9 +186,558 @@ Arguments and flags common to some or all commands are:
 
     Already generated `build-info.json` files will be removed since they would be stale otherwise.
 
+Target Forms
+------------
+
+A cabal command target can take any of the following forms:
+
+-  A package target: ``[pkg:]package``, which specifies that all enabled
+   components of a package to be built. By default, test suites and
+   benchmarks are *not* enabled, unless they are explicitly requested
+   (e.g., via ``--enable-tests``.)
+
+-  A component target: ``[package:][ctype:]component``, which specifies
+   a specific component (e.g., a library, executable, test suite or
+   benchmark) to be built.
+
+-  All packages: ``all``, which specifies all packages within the project.
+
+-  Components of a particular type: ``package:ctypes``, ``all:ctypes``:
+   which specifies all components of the given type. Where valid
+   ``ctypes`` are:
+
+     - ``libs``, ``libraries``,
+     - ``flibs``, ``foreign-libraries``,
+     - ``exes``, ``executables``,
+     - ``tests``,
+     - ``benches``, ``benchmarks``.
+
+-  A module target: ``[package:][ctype:]module``, which specifies that the
+   component of which the given module is a part of will be built.
+
+-  A filepath target: ``[package:][ctype:]filepath``, which specifies that the
+   component of which the given filepath is a part of will be built.
+
+-  A script target: ``path/to/script``, which specifies the path to a script
+   file. This is supported by ``build``, ``repl``, ``run``, and ``clean``.
+   Script targets are not part of a package.
+
+Global commands
+---------------
+
+cabal user-config
+^^^^^^^^^^^^^^^^^
+
+``cabal user-config [init|diff|update]`` prints and updates user's global
+cabal preferences. It is very useful when you are e.g. first configuring
+``cabal`` on a new machine.
+
+- ``cabal user-config init`` creates a new configuration file.
+
+  .. option:: --config-file=PATH
+
+      Specify config file path. (default: ``~/.cabal/config``).
+
+  .. option:: -f, --force
+
+    Force configuration file overwriting if already exists.
+
+- ``cabal user-config diff`` prints a diff of the user's config file and the
+  default one.
+
+- ``cabal user-config update`` updates the user's config file with additional
+  lines.
+
+  .. option:: -a, --augment=CONFIGLINE
+
+      Pass additional configuration lines to be incorporated in the
+      config file. e.g.
+      ``cabal user-config update --augment "offline: True"``.
+
+      Note how ``--augment`` syntax follows ``cabal user-config diff``
+      output.
+
+
+Package database commands
+-------------------------
+
+cabal update
+^^^^^^^^^^^^
+
+``cabal update`` updates the state of the package index. If the
+project contains multiple remote package repositories it will update
+the index of all of them (e.g. when using overlays).
+
+Some examples:
+
+::
+
+    $ cabal update                  # update all remote repos
+    $ cabal update head.hackage     # update only head.hackage
+
+cabal list
+^^^^^^^^^^
+
+``cabal list [FLAGS] STRINGS`` lists all packages matching a search string.
+
+.. option::  --installed
+
+    Only output installed packages.
+
+.. option::  --simple-output
+
+    Print matching packages in a one-package-one-line format.
+
+.. option::  -i, --ignore-case
+
+.. option::  -I, --strict-case
+
+.. option:: --package-db=DB
+
+    Append the given package database to the list of used package
+    databases. See `cabal info`_ for a thorough explanation.
+
+.. option:: -w, --with-compiler=PATH
+
+    Path to specific compiler.
+
+cabal info
+^^^^^^^^^^
+
+``cabal info [FLAGS] PACKAGES`` displays useful informations about remote
+packages.
+
+.. option:: --package-db=DB
+
+    Append the given package database to the list of package databases
+    used (to satisfy dependencies and register into). May be a specific
+    file, ``global`` or ``user``. The initial list is ``['global'], ['global',
+    'user']``, depending on context. Use ``clear`` to reset the list to empty.
+
+
+Initialization and download
+---------------------------
+
+cabal init
+^^^^^^^^^^
+
+``cabal init [FLAGS]`` initialises a Cabal package, picking
+reasonable defaults. Run it in your project folder.
+
+.. option:: -i, --interactive
+
+    Enable interactive mode.
+
+.. option:: -m, --minimal
+
+    Generate a short .cabal file, without extra empty fields or
+    explanatory comments.
+
+See :ref:`init quickstart` for an overview on the command, and
+``cabal init --help`` for the complete list of options.
+
+cabal fetch
+^^^^^^^^^^^
+
+*☞ N.B.:* ``cabal fetch`` only works for legacy ``v1-`` commands and only
+for single package projects. If you are not maintaining an old project,
+`cabal build`_ with ``--only-download`` has similar effects to ``fetch``
+and benefits from compatibility with newer build methods.
+
+``cabal fetch [FLAGS] PACKAGES`` downloads packages for later installation.
+It fetches the project plus its dependencies, very useful when
+e.g. you plan to work on a project with unreliable or no internet access.
+
+.. option:: --no-dependencies
+
+    Ignore dependencies.
+
+.. option:: --disable-tests
+
+    Disable dependency checking and compilation
+    for test suites listed in the package
+    description file.
+
+.. option::  --disable-benchmarks
+
+    Disable dependency checking and compilation
+    for benchmarks listed in the package
+    description file.
+
+Check ``cabal fetch --help`` for a complete list of options.
+
+cabal get
+^^^^^^^^^
+
+``cabal get [PACKAGES]`` (synonym: ``cabal unpack``) downloads and unpacks
+the source code of ``PACKAGES`` locally. By default the content of the
+packages is unpacked in the current working directory, in named subfolders
+(e.g.  ``./filepath-1.2.0.8/``), use ``--destdir=PATH`` to specify another
+folder. By default the latest version of the package is downloaded, you can
+ask for a spefic one by adding version numbers
+(``cabal get random-1.0.0.1``).
+
+.. option:: -s, --source-repository[=head|this|...]]
+
+    Clone the package's source repository (Darcs, Git, etc.) instead
+    of downloading the tarball. Only works if the package specifies
+    a ``source-repository``.
+
+.. option:: --index-state=STATE
+
+    Pin your request to a specific Hackage index state. Available
+    ``STATE`` formats: Unix timestamps (e.g. ``@1474732068``),
+    ISO8601 UTC timestamps (e.g. ``2016-09-24T17:47:48Z``), or ``HEAD``
+    (default).
+
+.. option:: --pristine
+
+    Unpacks the pristine tarball, i.e. disregarding any Hackage revision.
+
+Project configuration
+---------------------
+
+cabal configure
+^^^^^^^^^^^^^^^
+
+``cabal configure`` takes a set of arguments and writes a
+``cabal.project.local`` file based on the flags passed to this command.
+``cabal configure FLAGS; cabal build`` is roughly equivalent to
+``cabal build FLAGS``, except that with ``configure`` the flags
+are persisted to all subsequent calls to ``build``.
+
+``cabal configure`` is intended to be a convenient way to write out
+a ``cabal.project.local`` for simple configurations; e.g.,
+``cabal configure -w ghc-7.8`` would ensure that all subsequent
+builds with ``cabal build`` are performed with the compiler
+``ghc-7.8``. For more complex configuration, we recommend writing the
+``cabal.project.local`` file directly (or placing it in
+``cabal.project``!)
+
+``cabal configure`` inherits options from ``Cabal``. semantics:
+
+-  Any flag accepted by ``./Setup configure``.
+
+-  Any flag accepted by ``cabal configure`` beyond
+   ``./Setup configure``, namely ``--cabal-lib-version``,
+   ``--constraint``, ``--preference`` and ``--solver.``
+
+-  Any flag accepted by ``cabal install`` beyond ``./Setup configure``.
+
+-  Any flag accepted by ``./Setup haddock``.
+
+The options of all of these flags apply only to *local* packages in a
+project; this behavior is different than that of ``cabal install``,
+which applies flags to every package that would be built. The motivation
+for this is to avoid an innocuous addition to the flags of a package
+resulting in a rebuild of every package in the store (which might need
+to happen if a flag actually applied to every transitive dependency). To
+apply options to an external package, use a ``package`` stanza in a
+``cabal.project`` file.
+
+There are two ways of modifying the ``cabal.project.local`` file through
+``cabal configure``, either by appending new configurations to it, or
+by simply overwriting it all. Overwriting is the default behaviour, as
+such, there's a flag ``--enable-append`` to append the new configurations
+instead. Since overwriting is rather destructive in nature, a backup system
+is in place, which moves the old configuration to a ``cabal.project.local~``
+file, this feature can also be disabled by using the ``--disable-backup``
+flag.
+
+cabal freeze
+^^^^^^^^^^^^
+
+``cabal freeze`` writes out a **freeze file** which records all of
+the versions and flags that are picked by the solver under the
+current index and flags.  Default name of this file is
+``cabal.project.freeze`` but in combination with a
+``--project-file=my.project`` flag (see :ref:`project-file
+<cmdoption-project-file>`)
+the name will be ``my.project.freeze``.
+A freeze file has the same syntax as ``cabal.project`` and looks
+something like this:
+
+.. highlight:: cabal
+
+::
+
+    constraints: HTTP ==4000.3.3,
+                 HTTP +warp-tests -warn-as-error -network23 +network-uri -mtl1 -conduit10,
+                 QuickCheck ==2.9.1,
+                 QuickCheck +templatehaskell,
+                 -- etc...
+
+
+For end-user executables, it is recommended that you distribute the
+``cabal.project.freeze`` file in your source repository so that all
+users see a consistent set of dependencies. For libraries, this is not
+recommended: users often need to build against different versions of
+libraries than what you developed against.
+
+cabal gen-bounds
+^^^^^^^^^^^^^^^^
+
+``cabal gen-bounds [FLAGS]`` generates bounds for all dependencies that do not
+currently have them.  Generated bounds are printed to stdout. You can then
+paste them into your .cabal file.
+
+See `the section on generating dependency version bounds <cabal-package.html#generating-dependency-version-bounds>`__ for more details and examples.
+
+cabal outdated
+^^^^^^^^^^^^^^
+
+``cabal outdated [FLAGS]`` checks for outdated dependencies in the package
+description file or freeze file.
+
+``cabal outdated`` supports the following flags:
+
+.. option:: --v1-freeze-file
+
+    Read dependency version bounds from the freeze file.
+
+    (``cabal.config``) instead of the package description file
+    (``$PACKAGENAME.cabal``).
+
+.. option:: --v2-freeze-file
+
+    :since: 2.4
+
+    Read dependency version bounds from the v2-style freeze file
+    (by default, ``cabal.project.freeze``) instead of the package
+    description file. ``--new-freeze-file`` is an alias for this flag
+    that can be used with pre-2.4 ``cabal``.
+
+.. option:: --project-file PROJECTFILE
+
+    :since: 2.4
+
+    Read dependency version bounds from the v2-style freeze file
+    related to the named project file (i.e., ``$PROJECTFILE.freeze``)
+    instead of the package description file. If multiple ``--project-file``
+    flags are provided, only the final one is considered. This flag
+    must only be passed in when ``--new-freeze-file`` is present.
+
+.. option:: --simple-output
+
+    Print only the names of outdated dependencies, one per line.
+
+.. option:: --exit-code
+
+    Exit with a non-zero exit code when there are outdated dependencies.
+
+.. option:: -q, --quiet
+
+    Don't print any output. Implies ``-v0`` and ``--exit-code``.
+
+.. option:: --ignore PACKAGENAMES
+
+    Don't warn about outdated dependency version bounds for the packages in this list.
+
+.. option:: --minor [PACKAGENAMES]
+
+    Ignore major version bumps for these packages.
+
+    E.g. if there's a version 2.0 of a package ``pkg`` on Hackage and the freeze
+    file specifies the constraint ``pkg == 1.9``, ``cabal outdated --freeze
+    --minor=pkg`` will only consider the ``pkg`` outdated when there's a version
+    of ``pkg`` on Hackage satisfying ``pkg > 1.9 && < 2.0``. ``--minor`` can also
+    be used without arguments, in that case major version bumps are ignored for
+    all packages.
+
+    See `the section on listing outdated dependency version bounds <cabal-package.html#listing-outdated-dependency-version-bounds>`__ for more details and examples.
+
+Project building and installing
+-------------------------------
+
+cabal build
+^^^^^^^^^^^
+
+``cabal build`` takes a set of targets and builds them. It
+automatically handles building and installing any dependencies of these
+targets.
+
+In component targets, ``package:`` and ``ctype:`` (valid component types
+are ``lib``, ``flib``, ``exe``, ``test`` and ``bench``) can be used to
+disambiguate when multiple packages define the same component, or the
+same component name is used in a package (e.g., a package ``foo``
+defines both an executable and library named ``foo``). We always prefer
+interpreting a target as a package name rather than as a component name.
+
+Some example targets:
+
+::
+
+    $ cabal build lib:foo-pkg       # build the library named foo-pkg
+    $ cabal build foo-pkg:foo-tests # build foo-tests in foo-pkg
+    $ cabal build src/Lib.s         # build the library component to
+                                       # which "src/Lib.hs" belongs
+    $ cabal build app/Main.hs       # build the executable component of
+                                       # "app/Main.hs"
+    $ cabal build Lib               # build the library component to
+                                       # which the module "Lib" belongs
+    $ cabal build path/to/script    # build the script as an executable
+
+Beyond a list of targets, ``cabal build`` accepts all the flags that
+``cabal configure`` takes. Most of these flags are only taken into
+consideration when building local packages; however, some flags may
+cause extra store packages to be built (for example,
+``--enable-profiling`` will automatically make sure profiling libraries
+for all transitive dependencies are built and installed.)
+
+When building a script, the executable is cached under the cabal directory.
+See ``cabal run`` for more information on scripts.
+
+In addition ``cabal build`` accepts these flags:
+
+.. option:: --only-configure
+
+    When given we will forego performing a full build and abort after running
+    the configure phase of each target package.
+
+cabal install
+^^^^^^^^^^^^^
+
+``cabal install [FLAGS] [TARGETS]`` builds the specified target packages and
+symlinks/copies their executables in ``installdir`` (usually ``~/.local/bin``).
+
+.. warning::
+
+  If not every package has an executable to install, use ``all:exes`` rather
+  than ``all`` as the target. To overwrite an installation, use
+  ``--overwrite-policy=always`` as the default policy is ``never``.
+
+For example this command will build the latest ``cabal-install`` and symlink
+its ``cabal`` executable:
+
+::
+
+    $ cabal install cabal-install
+
+In addition, it's possible to use ``cabal install`` to install components
+of a local project. For example, with an up-to-date Git clone of the Cabal
+repository, this command will build cabal-install HEAD and symlink the
+``cabal`` executable:
+
+::
+
+    $ cabal install exe:cabal
+
+Where symlinking is not possible (eg. on some Windows versions) the ``copy``
+method is used by default. You can specify the install method
+by using ``--install-method`` flag:
+
+::
+
+    $ cabal install exe:cabal --install-method=copy --installdir=$HOME/bin
+
+Note that copied executables are not self-contained, since they might use
+data-files from the store.
+
+.. _adding-libraries:
+
+Adding libraries to GHC package environments
+""""""""""""""""""""""""""""""""""""""""""""
+
+It is also possible to "install" libraries using the ``--lib`` flag. For
+example, this command will build the latest Cabal library and install it:
+
+::
+
+    $ cabal install --lib Cabal
+
+This works by managing GHC package environment files. By default, it is writing
+to the global environment in ``~/.ghc/$ARCH-$OS-$GHCVER/environments/default``.
+``install`` provides the ``--package-env`` flag to control which of these
+environments is modified.
+
+This command will modify the environment file in the current directory:
+
+::
+
+    $ cabal install --lib Cabal --package-env .
+
+This command will modify the environment file in the ``~/foo`` directory:
+
+::
+
+    $ cabal install --lib Cabal --package-env foo/
+
+Do note that the results of the previous two commands will be overwritten by
+the use of other style commands, so it is not recommended to use them inside
+a project directory.
+
+This command will modify the environment in the ``local.env`` file in the
+current directory:
+
+::
+
+    $ cabal install --lib Cabal --package-env local.env
+
+This command will modify the ``myenv`` named global environment:
+
+::
+
+    $ cabal install --lib Cabal --package-env myenv
+
+If you wish to create a named environment file in the current directory where
+the name does not contain an extension, you must reference it as ``./myenv``.
+
+You can learn more about how to use these environments in `this section of the
+GHC manual <https://downloads.haskell.org/~ghc/latest/docs/html/users_guide/packages.html#package-environments>`_.
+
+cabal haddock
+^^^^^^^^^^^^^
+
+``cabal haddock [FLAGS] [TARGET]`` builds Haddock documentation for
+the specified packages within the project.
+
+If a target is not a library :cfg-field:`haddock-benchmarks`,
+:cfg-field:`haddock-executables`, :cfg-field:`haddock-internal`,
+:cfg-field:`haddock-tests` will be implied as necessary.
+
+cabal haddock-project
+^^^^^^^^^^^^^^^^^^^^^
+
+``cabal haddock-project [FLAGS]`` builds Haddock documentation for all local
+packages specified in the project.
+
+By default the documentation will be put in ``./haddocks`` folder, this can be
+modified with the ``--output`` flag.
+
+This command supports two primary modes: building a self contained directory
+(which is the default mode) or documentation that links to hackage (with
+``--hackage`` flag).
+
+In both cases the html index as well as quickjump index will include all terms
+and types defined in any of the local packages, but not ones that are included
+in any of the dependencies.  But note that if you navigate to a dependency,
+you will have access to its quickjump index.
+
+The generated landing page will contain one tree of all modules per local
+package.
+
+cabal clean
+^^^^^^^^^^^
+
+``cabal clean [FLAGS]`` cleans up the temporary files and build artifacts
+stored in the ``dist-newstyle`` folder.
+
+By default, it removes the entire folder, but it can also spare the configuration
+and caches if the ``--save-config`` option is given, in which case it only removes
+the build artefacts (``.hi``, ``.o`` along with any other temporary files generated
+by the compiler, along with the build output).
+
+``cabal clean [FLAGS] path/to/script`` cleans up the temporary files and build
+artifacts for the script, which are stored under the .cabal/script-builds directory.
+
+In addition when clean is invoked it will remove all script build artifacts for
+which the corresponding script no longer exists.
+
+Running and testing
+-------------------
 
 cabal list-bin
---------------
+^^^^^^^^^^^^^^
 
 ``cabal list-bin`` will either (a) display the path for a single executable or (b)
 complain that the target doesn't resolve to a single binary. In the latter case,
@@ -234,196 +784,78 @@ will not make sure that these executables actually exist (i.e., have
 been successfully built).  In order to determine the correct location,
 it may invoke the configuration step (see ``cabal configure``).
 
-cabal configure
----------------
-
-``cabal configure`` takes a set of arguments and writes a
-``cabal.project.local`` file based on the flags passed to this command.
-``cabal configure FLAGS; cabal build`` is roughly equivalent to
-``cabal build FLAGS``, except that with ``configure`` the flags
-are persisted to all subsequent calls to ``build``.
-
-``cabal configure`` is intended to be a convenient way to write out
-a ``cabal.project.local`` for simple configurations; e.g.,
-``cabal configure -w ghc-7.8`` would ensure that all subsequent
-builds with ``cabal build`` are performed with the compiler
-``ghc-7.8``. For more complex configuration, we recommend writing the
-``cabal.project.local`` file directly (or placing it in
-``cabal.project``!)
-
-``cabal configure`` inherits options from ``Cabal``. semantics:
-
--  Any flag accepted by ``./Setup configure``.
-
--  Any flag accepted by ``cabal configure`` beyond
-   ``./Setup configure``, namely ``--cabal-lib-version``,
-   ``--constraint``, ``--preference`` and ``--solver.``
-
--  Any flag accepted by ``cabal install`` beyond ``./Setup configure``.
-
--  Any flag accepted by ``./Setup haddock``.
-
-The options of all of these flags apply only to *local* packages in a
-project; this behavior is different than that of ``cabal install``,
-which applies flags to every package that would be built. The motivation
-for this is to avoid an innocuous addition to the flags of a package
-resulting in a rebuild of every package in the store (which might need
-to happen if a flag actually applied to every transitive dependency). To
-apply options to an external package, use a ``package`` stanza in a
-``cabal.project`` file.
-
-There are two ways of modifying the ``cabal.project.local`` file through
-``cabal configure``, either by appending new configurations to it, or
-by simply overwriting it all. Overwriting is the default behaviour, as
-such, there's a flag ``--enable-append`` to append the new configurations
-instead. Since overwriting is rather destructive in nature, a backup system
-is in place, which moves the old configuration to a ``cabal.project.local~``
-file, this feature can also be disabled by using the ``--disable-backup``
-flag.
-
-
-cabal update
-------------
-
-``cabal update`` updates the state of the package index. If the
-project contains multiple remote package repositories it will update
-the index of all of them (e.g. when using overlays).
-
-Some examples:
-
-::
-
-    $ cabal update                  # update all remote repos
-    $ cabal update head.hackage     # update only head.hackage
-
-Target Forms
-------------
-
-A cabal command target can take any of the following forms:
-
--  A package target: ``package``, which specifies that all enabled
-   components of a package to be built. By default, test suites and
-   benchmarks are *not* enabled, unless they are explicitly requested
-   (e.g., via ``--enable-tests``.)
-
--  A component target: ``[package:][ctype:]component``, which specifies
-   a specific component (e.g., a library, executable, test suite or
-   benchmark) to be built.
-
--  All packages: ``all``, which specifies all packages within the project.
-
--  Components of a particular type: ``package:ctypes``, ``all:ctypes``:
-   which specifies all components of the given type. Where valid
-   ``ctypes`` are:
-
-     - ``libs``, ``libraries``,
-     - ``flibs``, ``foreign-libraries``,
-     - ``exes``, ``executables``,
-     - ``tests``,
-     - ``benches``, ``benchmarks``.
-
--  A module target: ``[package:][ctype:]module``, which specifies that the
-   component of which the given module is a part of will be built.
-
--  A filepath target: ``[package:][ctype:]filepath``, which specifies that the
-   component of which the given filepath is a part of will be built.
-
--  A script target: ``path/to/script``, which specifies the path to a script
-   file. This is supported by ``build``, ``repl``, ``run``, and ``clean``.
-   Script targets are not part of a package.
-
-cabal build
------------
-
-``cabal build`` takes a set of targets and builds them. It
-automatically handles building and installing any dependencies of these
-targets.
-
-In component targets, ``package:`` and ``ctype:`` (valid component types
-are ``lib``, ``flib``, ``exe``, ``test`` and ``bench``) can be used to
-disambiguate when multiple packages define the same component, or the
-same component name is used in a package (e.g., a package ``foo``
-defines both an executable and library named ``foo``). We always prefer
-interpreting a target as a package name rather than as a component name.
-
-Some example targets:
-
-::
-
-    $ cabal build lib:foo-pkg       # build the library named foo-pkg
-    $ cabal build foo-pkg:foo-tests # build foo-tests in foo-pkg
-    $ cabal build src/Lib.s         # build the library component to
-                                       # which "src/Lib.hs" belongs
-    $ cabal build app/Main.hs       # build the executable component of
-                                       # "app/Main.hs"
-    $ cabal build Lib               # build the library component to
-                                       # which the module "Lib" belongs
-    $ cabal build path/to/script    # build the script as an executable
-
-Beyond a list of targets, ``cabal build`` accepts all the flags that
-``cabal configure`` takes. Most of these flags are only taken into
-consideration when building local packages; however, some flags may
-cause extra store packages to be built (for example,
-``--enable-profiling`` will automatically make sure profiling libraries
-for all transitive dependencies are built and installed.)
-
-When building a script, the executable is cached under the cabal directory.
-See ``cabal run`` for more information on scripts.
-
-In addition ``cabal build`` accepts these flags:
-
-- ``--only-configure``: When given we will forego performing a full build and
-  abort after running the configure phase of each target package.
-
-
 cabal repl
-----------
+^^^^^^^^^^
 
-``cabal repl TARGET`` loads all of the modules of the target into
-GHCi as interpreted bytecode. In addition to ``cabal build``'s flags,
-it additionally takes the ``--repl-options`` and ``--repl-no-load`` flags.
-
-To avoid ``ghci`` specific flags from triggering unneeded global rebuilds these
-flags are now stripped from the internal configuration. As a result
-``--ghc-options`` will no longer (reliably) work to pass flags to ``ghci`` (or
-other repls). Instead, you should use the new ``--repl-options`` flag to
-specify these options to the invoked repl. (This flag also works on ``cabal
-repl`` and ``Setup repl`` on sufficiently new versions of Cabal.)
-
-The ``repl-no-load`` flag disables the loading of target modules at startup.
+``cabal repl TARGET [FLAGS]``
+opens an interactive session for the target component within the project and
+loads all of the modules of the target into GHCi as interpreted bytecode.
+The available targets are the same as for the ``build`` command: individual components
+within packages in the project, including libraries, executables, test-suites
+and benchmarks (see `the build section <#cabal-build>`__ for the target syntax).
+Local packages can also be specified, in which case the library
+component in the package will be used, or the (first listed) executable in the
+package if there is no library. Dependencies are built or rebuilt as necessary.
 
 Currently, it is not supported to pass multiple targets to ``repl``
 (``repl`` will just successively open a separate GHCi session for
 each target.)
 
-It also provides a way to experiment with libraries without needing to download
-them manually or to install them globally.
-
-This command opens a REPL with the current default target loaded, and a version
-of the ``vector`` package matching that specification exposed.
+Examples:
 
 ::
 
-    $ cabal repl --build-depends "vector >= 0.12 && < 0.13"
+    $ cabal repl                # default component in the package in the current directory
+    $ cabal repl pkgname        # default component in the package named 'pkgname'
+    $ cabal repl ./pkgfoo       # default component in the package in the ./pkgfoo directory
+    $ cabal repl cname          # component named 'cname'
+    $ cabal repl pkgname:cname  # component 'cname' in the package 'pkgname'
 
-Both of these commands do the same thing as the above, but only exposes ``base``,
-``vector``, and the ``vector`` package's transitive dependencies even if the user
-is in a project context.
+Configuration flags can be specified on the command line and these extend the project
+configuration from the 'cabal.project', 'cabal.project.local' and other files.
 
-::
+.. option:: --repl-options
 
-    $ cabal repl --ignore-project --build-depends "vector >= 0.12 && < 0.13"
-    $ cabal repl --project='' --build-depends "vector >= 0.12 && < 0.13"
+    To avoid ``ghci``-specific flags from triggering unneeded global rebuilds, these
+    flags are stripped from the internal configuration. As a result,
+    ``--ghc-options`` will no longer (reliably) work to pass flags to ``ghci`` (or
+    other REPLs). Instead, you should use the ``--repl-options`` flag to
+    specify these options to the invoked REPL.
 
-This command would add ``vector``, but not (for example) ``primitive``, because
-it only includes the packages specified on the command line (and ``base``, which
-cannot be excluded for technical reasons).
+.. option:: --repl-no-load
 
-::
+    Disables the loading of target modules at startup.
 
-    $ cabal repl --build-depends vector --no-transitive-deps
+.. option:: -b, --build-depends
 
-``repl`` can open scripts by passing the path to the script as the target.
+    A way to experiment with libraries without needing to download
+    them manually or to install them globally.
+
+    This command opens a REPL with the current default target loaded, and a version
+    of the ``vector`` package matching that specification exposed.
+
+    ::
+
+        $ cabal repl --build-depends "vector >= 0.12 && < 0.13"
+
+    Both of these commands do the same thing as the above, but only expose ``base``,
+    ``vector``, and the ``vector`` package's transitive dependencies even if the user
+    is in a project context.
+
+    ::
+
+        $ cabal repl --ignore-project --build-depends "vector >= 0.12 && < 0.13"
+        $ cabal repl --project='' --build-depends "vector >= 0.12 && < 0.13"
+
+    This command would add ``vector``, but not (for example) ``primitive``, because
+    it only includes the packages specified on the command line (and ``base``, which
+    cannot be excluded for technical reasons).
+
+    ::
+
+        $ cabal repl --build-depends vector --no-transitive-deps
+
+``cabal repl`` can open scripts by passing the path to the script as the target.
 
 ::
 
@@ -433,8 +865,10 @@ The configuration information for the script is cached under the cabal directory
 and can be pre-built with ``cabal build path/to/script``.
 See ``cabal run`` for more information on scripts.
 
+.. _cabal run:
+
 cabal run
----------
+^^^^^^^^^
 
 ``cabal run [TARGET [ARGS]]`` runs the executable specified by the
 target, which can be a component, a package or can be left blank, as
@@ -525,177 +959,48 @@ or the interpreter line
 
 For more information see :cfg-field:`verbose`
 
-cabal freeze
-------------
-
-``cabal freeze`` writes out a **freeze file** which records all of
-the versions and flags that are picked by the solver under the
-current index and flags.  Default name of this file is
-``cabal.project.freeze`` but in combination with a
-``--project-file=my.project`` flag (see :ref:`project-file
-<cmdoption-project-file>`)
-the name will be ``my.project.freeze``.
-A freeze file has the same syntax as ``cabal.project`` and looks
-something like this:
-
-.. highlight:: cabal
-
-::
-
-    constraints: HTTP ==4000.3.3,
-                 HTTP +warp-tests -warn-as-error -network23 +network-uri -mtl1 -conduit10,
-                 QuickCheck ==2.9.1,
-                 QuickCheck +templatehaskell,
-                 -- etc...
-
-
-For end-user executables, it is recommended that you distribute the
-``cabal.project.freeze`` file in your source repository so that all
-users see a consistent set of dependencies. For libraries, this is not
-recommended: users often need to build against different versions of
-libraries than what you developed against.
-
 cabal bench
------------
+^^^^^^^^^^^
 
 ``cabal bench [TARGETS] [OPTIONS]`` runs the specified benchmarks
 (all the benchmarks in the current package by default), first ensuring
 they are up to date.
 
 cabal test
-----------
+^^^^^^^^^^
 
 ``cabal test [TARGETS] [OPTIONS]`` runs the specified test suites
 (all the test suites in the current package by default), first ensuring
 they are up to date.
 
-cabal haddock
--------------
-
-``cabal haddock [FLAGS] [TARGET]`` builds Haddock documentation for
-the specified packages within the project.
-
-If a target is not a library :cfg-field:`haddock-benchmarks`,
-:cfg-field:`haddock-executables`, :cfg-field:`haddock-internal`,
-:cfg-field:`haddock-tests` will be implied as necessary.
-
 cabal exec
-----------
+^^^^^^^^^^
 
 ``cabal exec [FLAGS] [--] COMMAND [--] [ARGS]`` runs the specified command
 using the project's environment. That is, passing the right flags to compiler
 invocations and bringing the project's executables into scope.
 
-cabal install
--------------
+Sanity checks and shipping
+--------------------------
 
-``cabal install [FLAGS] [TARGETS]`` builds the specified target packages and
-symlinks/copies their executables in ``installdir`` (usually ``~/.cabal/bin``).
+cabal check
+^^^^^^^^^^^
 
-.. warning::
+``cabal check [FLAGS]`` checks the package for common mistakes (e.g.: if
+it is missing important fields like ``synopsis``, if it is using
+tricky GHC options, etc.).
 
-  If not every package has an executable to install, use ``all:exes`` rather
-  than ``all`` as the target. To overwrite an installation, use
-  ``--overwrite-policy=always`` as the default policy is ``never``.
+Run ``cabal check`` in the folder where your ``.cabal`` package file is.
 
-For example this command will build the latest ``cabal-install`` and symlink
-its ``cabal`` executable:
+.. option:: -v, --verbose[=n]
 
-::
+    Set verbosity level (0–3, default is 1).
 
-    $ cabal install cabal-install
-
-In addition, it's possible to use ``cabal install`` to install components
-of a local project. For example, with an up-to-date Git clone of the Cabal
-repository, this command will build cabal-install HEAD and symlink the
-``cabal`` executable:
-
-::
-
-    $ cabal install exe:cabal
-
-Where symlinking is not possible (eg. on some Windows versions) the ``copy``
-method is used by default. You can specify the install method
-by using ``--install-method`` flag:
-
-::
-
-    $ cabal install exe:cabal --install-method=copy --installdir=$HOME/bin
-
-Note that copied executables are not self-contained, since they might use
-data-files from the store.
-
-.. _adding-libraries:
-
-Adding libraries to GHC package environments
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-It is also possible to "install" libraries using the ``--lib`` flag. For
-example, this command will build the latest Cabal library and install it:
-
-::
-
-    $ cabal install --lib Cabal
-
-This works by managing GHC package environment files. By default, it is writing
-to the global environment in ``~/.ghc/$ARCH-$OS-$GHCVER/environments/default``.
-``install`` provides the ``--package-env`` flag to control which of these
-environments is modified.
-
-This command will modify the environment file in the current directory:
-
-::
-
-    $ cabal install --lib Cabal --package-env .
-
-This command will modify the environment file in the ``~/foo`` directory:
-
-::
-
-    $ cabal install --lib Cabal --package-env foo/
-
-Do note that the results of the previous two commands will be overwritten by
-the use of other style commands, so it is not recommended to use them inside
-a project directory.
-
-This command will modify the environment in the ``local.env`` file in the
-current directory:
-
-::
-
-    $ cabal install --lib Cabal --package-env local.env
-
-This command will modify the ``myenv`` named global environment:
-
-::
-
-    $ cabal install --lib Cabal --package-env myenv
-
-If you wish to create a named environment file in the current directory where
-the name does not contain an extension, you must reference it as ``./myenv``.
-
-You can learn more about how to use these environments in `this section of the
-GHC manual <https://downloads.haskell.org/~ghc/latest/docs/html/users_guide/packages.html#package-environments>`_.
-
-cabal clean
------------
-
-``cabal clean [FLAGS]`` cleans up the temporary files and build artifacts
-stored in the ``dist-newstyle`` folder.
-
-By default, it removes the entire folder, but it can also spare the configuration
-and caches if the ``--save-config`` option is given, in which case it only removes
-the build artefacts (``.hi``, ``.o`` along with any other temporary files generated
-by the compiler, along with the build output).
-
-``cabal clean [FLAGS] path/to/script`` cleans up the temporary files and build
-artifacts for the script, which are stored under the .cabal/script-builds directory.
-
-In addition when clean is invoked it will remove all script build artifacts for
-which the corresponding script no longer exists.
+``cabal check`` mimics Hackage's requirements: if no error or warning
+is reported, Hackage should accept your package.
 
 cabal sdist
------------
+^^^^^^^^^^^
 
 ``cabal sdist [FLAGS] [TARGETS]`` takes the crucial files needed to build ``TARGETS``
 and puts them into an archive format ready for upload to Hackage. These archives are stable
@@ -703,16 +1008,23 @@ and two archives of the same format built from the same source will hash to the 
 
 ``cabal sdist`` takes the following flags:
 
-- ``-l``, ``--list-only``: Rather than creating an archive, lists files that would be included.
-  Output is to ``stdout`` by default. The file paths are relative to the project's root
-  directory.
+.. option:: -l, --list-only
 
-- ``-o``, ``--output-directory``: Sets the output dir, if a non-default one is desired. The default is
-  ``dist-newstyle/sdist/``. ``--output-directory -`` will send output to ``stdout``
-  unless multiple archives are being created.
+    Rather than creating an archive, lists files that would be included.
 
-- ``--null-sep``: Only used with ``--list-only``. Separates filenames with a NUL
-  byte instead of newlines.
+    Output is to ``stdout`` by default. The file paths are relative to the project's root
+    directory.
+
+.. option:: -o, --output-directory
+
+    Sets the output dir, if a non-default one is desired. The default is
+    ``dist-newstyle/sdist/``. ``--output-directory -`` will send output to ``stdout``
+    unless multiple archives are being created.
+
+.. option:: --null-sep
+
+    Only used with ``--list-only``. Separates filenames with a NUL
+    byte instead of newlines.
 
 ``sdist`` is inherently incompatible with sdist hooks (which were removed in `Cabal-3.0`),
 not due to implementation but due to fundamental core invariants
@@ -721,60 +1033,58 @@ that must be satisfied for it to function correctly in the larger build ecosyste
 ``autogen-modules`` is able to replace uses of the hooks to add generated modules, along with
 the custom publishing of Haddock documentation to Hackage.
 
-cabal gen-bounds
-----------------
+cabal upload
+^^^^^^^^^^^^
 
-``cabal gen-bounds [FLAGS]`` generates bounds for all dependencies that do not
-currently have them.  Generated bounds are printed to stdout. You can then
-paste them into your .cabal file.
+``cabal upload [FLAGS] TARFILES`` uploads source packages or documentation
+to Hackage.
 
-See `the section on generating dependency version bounds <cabal-package.html#generating-dependency-version-bounds>`__ for more details and examples.
+.. option:: --publish
 
-cabal outdated
---------------
+    Publish the package immediately instead of uploading it as a
+    `package candidate <https://hackage.haskell.org/upload#candidates>`__
+    (make sure everything is fine, you cannot delete published packages
+    on Hackage!).
 
-``cabal outdated [FLAGS]`` checks for outdated dependencies in the package
-description file or freeze file.
+.. option:: -d, --documentation
 
-``cabal outdated`` supports the following flags:
+    Upload documentation instead of a source package. To upload
+    documentation for a published package (and not a candidate), add
+    ``--publish``.
 
-- ``--v1-freeze-file``: Read dependency version bounds from the freeze file
-  (``cabal.config``) instead of the package description file
-  (``$PACKAGENAME.cabal``).
+.. option:: -u, --username
 
-- ``--v2-freeze-file``:
+    Your Hackage username.
 
-  :since: 2.4
+.. option:: -p, --password
 
-  Read dependency version bounds from the v2-style freeze file
-  (by default, ``cabal.project.freeze``) instead of the package
-  description file. ``--new-freeze-file`` is an alias for this flag
-  that can be used with pre-2.4 ``cabal``.
+    Your Hackage password.
 
-- ``--project-file PROJECTFILE``:
+.. option:: -P, --password-command
 
-  :since: 2.4
+    Command to get your Hackage password.  Arguments with whitespace
+    must be quoted (double-quotes only).  For example:
 
-  Read dependendency version bounds from the v2-style freeze file
-  related to the named project file (i.e., ``$PROJECTFILE.freeze``)
-  instead of the package desctription file. If multiple ``--project-file``
-  flags are provided, only the final one is considered. This flag
-  must only be passed in when ``--new-freeze-file`` is present.
+    ::
 
-- ``--simple-output``: Print only the names of outdated dependencies, one per line.
+        --password-command 'sh -c "grep hackage ~/secrets | cut -d : -f 2"'
 
-- ``--exit-code``: Exit with a non-zero exit code when there are outdated dependencies.
+    Or in the config file:
 
-- ``-q, --quiet``: Don't print any output. Implies ``-v0`` and ``--exit-code``.
+    ::
 
-- ``--ignore PACKAGENAMES``: Don't warn about outdated dependency version bounds for the packages in this list.
+        password-command: sh -c "grep hackage ~/secrets | cut -d : -f 2"
 
-- ``--minor [PACKAGENAMES]``: Ignore major version bumps for these packages.
-  E.g. if there's a version 2.0 of a package ``pkg`` on Hackage and the freeze
-  file specifies the constraint ``pkg == 1.9``, ``cabal outdated --freeze
-  --minor=pkg`` will only consider the ``pkg`` outdated when there's a version
-  of ``pkg`` on Hackage satisfying ``pkg > 1.9 && < 2.0``. ``--minor`` can also
-  be used without arguments, in that case major version bumps are ignored for
-  all packages.
 
-  See `the section on listing outdated dependency version bounds <cabal-package.html#listing-outdated-dependency-version-bounds>`__ for more details and examples.
+cabal report
+^^^^^^^^^^^^
+
+``cabal report [FLAGS]`` uploads build reports to Hackage.
+
+.. option:: -u, --username
+
+    Your Hackage username.
+
+.. option:: -p, --password
+
+    Your Hackage password.

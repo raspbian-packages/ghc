@@ -153,7 +153,7 @@ stdcall:        Caller allocates parameters, callee deallocates.
 See: http://www.programmersheaven.com/2/Calling-conventions
 -}
 
--- any changes here should be replicated in the CallConv type in template haskell
+-- any changes here should be replicated in the Callconv type in template haskell
 data CCallConv
   = CCallConv
   | CApiConv
@@ -219,8 +219,8 @@ instance Outputable CCallSpec where
              | otherwise       = text "_unsafe"
 
       ppr_fun (StaticTarget st lbl mPkgId isFun)
-        = text (if isFun then "__ffi_static_ccall"
-                         else "__ffi_static_ccall_value")
+        = (if isFun then text "__ffi_static_ccall"
+                    else text "__ffi_static_ccall_value")
        <> gc_suf
        <+> (case mPkgId of
             Nothing -> empty

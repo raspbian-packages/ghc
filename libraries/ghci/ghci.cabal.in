@@ -70,8 +70,8 @@ library
     Build-Depends:
         rts,
         array            == 0.5.*,
-        base             >= 4.8 && < 4.18,
-        ghc-prim         >= 0.5.0 && < 0.10,
+        base             >= 4.8 && < 4.19,
+        ghc-prim         >= 0.5.0 && < 0.11,
         binary           == 0.8.*,
         bytestring       >= 0.10 && < 0.12,
         containers       >= 0.5 && < 0.7,
@@ -79,8 +79,8 @@ library
         filepath         == 1.4.*,
         ghc-boot         == @ProjectVersionMunged@,
         ghc-heap         == @ProjectVersionMunged@,
-        template-haskell == 2.19.*,
-        transformers     == 0.5.*
+        template-haskell == 2.20.*,
+        transformers     >= 0.5 && < 0.7
 
     if !os(windows)
         Build-Depends: unix >= 2.7 && < 2.9

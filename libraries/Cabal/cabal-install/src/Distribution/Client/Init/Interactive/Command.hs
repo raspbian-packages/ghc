@@ -297,7 +297,7 @@ cabalVersionPrompt flags = getCabalVersion flags $ do
 packageNamePrompt :: Interactive m => SourcePackageDb -> InitFlags -> m PackageName
 packageNamePrompt srcDb flags = getPackageName flags $ do
     defName <- case packageDir flags of
-        Flag b -> return $ filePathToPkgName b
+        Flag b -> filePathToPkgName b
         NoFlag -> currentDirPkgName
 
     go $ DefaultPrompt defName
@@ -356,14 +356,10 @@ licensePrompt flags = getLicense flags $ do
       else fmap prettyShow knownLicenses
 
 authorPrompt :: Interactive m => InitFlags -> m String
-authorPrompt flags = getAuthor flags $ do
-    name <- guessAuthorName
-    promptStr "Author name" (DefaultPrompt name)
+authorPrompt flags = getAuthor flags $ guessAuthorName >>= promptOrDefault "Author name"
 
 emailPrompt :: Interactive m => InitFlags -> m String
-emailPrompt flags = getEmail flags $ do
-    email' <- guessAuthorEmail
-    promptStr "Maintainer email" (DefaultPrompt email')
+emailPrompt flags = getEmail flags $ guessAuthorEmail >>= promptOrDefault "Maintainer email"
 
 homepagePrompt :: Interactive m => InitFlags -> m String
 homepagePrompt flags = getHomepage flags $
@@ -416,7 +412,7 @@ languagePrompt flags pkgType = getLanguage flags $ do
     let h2010   = "Haskell2010"
         h98     = "Haskell98"
         ghc2021 = "GHC2021 (requires at least GHC 9.2)"
-          
+
     l <- promptList ("Choose a language for your " ++ pkgType)
       [h2010, h98, ghc2021]
       (DefaultPrompt h2010)
@@ -427,13 +423,7 @@ languagePrompt flags pkgType = getLanguage flags $ do
       | l == h2010       -> return Haskell2010
       | l == h98         -> return Haskell98
       | l == ghc2021     -> return GHC2021
-      | all isAlphaNum l -> return $ UnknownLanguage l
-      | otherwise        -> do
-        putStrLn
-          $ "\nThe language must be alphanumeric. "
-          ++ "Please enter a different language."
-
-        languagePrompt flags pkgType
+      | otherwise        -> return $ UnknownLanguage l
 
 noCommentsPrompt :: Interactive m => InitFlags -> m Bool
 noCommentsPrompt flags = getNoComments flags $ do
@@ -474,3 +464,6 @@ srcDirsPrompt flags = getSrcDirs flags $ do
       True
 
     return [dir]
+
+promptOrDefault :: Interactive m => String -> Maybe String -> m String
+promptOrDefault s = maybe (promptStr s MandatoryPrompt)  (promptStr s . DefaultPrompt)

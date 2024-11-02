@@ -31,11 +31,13 @@ import Data.Typeable
 import GHC.Unit.Module (ModuleName, Module)
 import GHC.Hs.Extension (GhcTc)
 import GHC.Core.Coercion
+import GHC.Core.Type (PredType)
 import GHC.Types.Fixity (LexicalFixity(..))
 import GHC.Types.Name (Name, NameSpace, OccName (occNameFS), isSymOcc, nameOccName)
 import GHC.Types.Name.Reader (RdrName (Unqual), ImpDeclSpec)
 import GHC.Types.SrcLoc (SrcSpan)
 import GHC.Types.Basic (Activation, RuleName)
+import {-# SOURCE #-} GHC.Tc.Types.Origin ( ClsInstOrQC(..) )
 import GHC.Parser.Errors.Basic
 import {-# SOURCE #-} Language.Haskell.Syntax.Expr
 import GHC.Unit.Module.Imported (ImportedModsVal)
@@ -63,7 +65,7 @@ data LanguageExtensionHint
     -- it's totally irrelevant/redundant for IDEs and other tools.
      SuggestSingleExtension !SDoc !LangExt.Extension
     -- | Suggest to enable the input extensions. The list
-    -- is to be intended as /disjuctive/ i.e. the user is
+    -- is to be intended as /disjunctive/ i.e. the user is
     -- suggested to enable /any/ of the extensions listed. If
     -- the input 'SDoc' is not empty, it will contain some extra
     -- information about the why the extensions are required, but
@@ -136,6 +138,14 @@ data GhcHint
 
     -}
   | SuggestExtension !LanguageExtensionHint
+    {-| Suggests possible corrections of a misspelled pragma. Its argument
+        represents all applicable suggestions.
+
+        Example: {-# LNGUAGE BangPatterns #-}
+
+        Test case(s): parser/should_compile/T21589
+    -}
+  | SuggestCorrectPragmaName ![String]
     {-| Suggests that a monadic code block is probably missing a \"do\" keyword.
 
         Example:
@@ -393,11 +403,27 @@ data GhcHint
         Test cases: ccfail004
     -}
   | SuggestImportingDataCon
-
   {- Found a pragma in the body of a module, suggest
      placing it in the header
   -}
   | SuggestPlacePragmaInHeader
+    {-| Suggest using pattern matching syntax for a non-bidirectional pattern synonym
+
+        Test cases: patsyn/should_fail/record-exquant
+                    typecheck/should_fail/T3176
+    -}
+  | SuggestPatternMatchingSyntax
+    {-| Suggest tips for making a definition visible for the purpose of writing
+        a SPECIALISE pragma for it in a different module.
+
+        Test cases: none
+    -}
+  | SuggestSpecialiseVisibilityHints Name
+
+  | LoopySuperclassSolveHint PredType ClsInstOrQC
+
+  {-| Suggest binding explicitly; e.g   data T @k (a :: F k) = .... -}
+  | SuggestBindTyVarExplicitly Name
 
 -- | An 'InstantiationSuggestion' for a '.hsig' file. This is generated
 -- by GHC in case of a 'DriverUnexpectedSignature' and suggests a way

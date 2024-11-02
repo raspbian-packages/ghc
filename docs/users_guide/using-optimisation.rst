@@ -250,7 +250,7 @@ by saying ``-fno-wombat``.
     generator, merging basic blocks and avoiding jumps right after jumps.
 
 .. ghc-flag:: -fasm-shortcutting
-    :shortdesc: Enable shortcutting on assembly. Implied by :ghc-flag:`-O2`.
+    :shortdesc: Enable shortcutting on assembly.
     :type: dynamic
     :reverse: -fno-asm-shortcutting
     :category:
@@ -266,6 +266,9 @@ by saying ``-fno-wombat``.
     So at ``-O2`` this flag runs the pass again at the assembly stage to catch
     these. Note that due to platform limitations (:ghc-ticket:`21972`) this flag
     does nothing on macOS.
+
+    This flag is known to result in unsoundness in this version of GHC
+    (:ghc-ticket:`24507`).
 
 .. ghc-flag:: -fblock-layout-cfg
     :shortdesc: Use the new cfg based block layout algorithm.
@@ -337,7 +340,7 @@ by saying ``-fno-wombat``.
 
     CPR analysis will see that each code path produces a *constructed product*
     such as ``I# 0#`` in the first branch (where ``GHC.Exts.I#`` is the data
-    constructor of ``Int``, boxing up the the primitive integer literal ``0#``
+    constructor of ``Int``, boxing up the primitive integer literal ``0#``
     of type ``Int#``) and optimise to ::
 
          sum xs = I# ($wsum xs)
@@ -745,6 +748,54 @@ by saying ``-fno-wombat``.
 
     Sets the maximal number of iterations for the simplifier.
 
+.. ghc-flag:: -flocal-float-out
+    :shortdesc: Enable local floating definitions out of let-binds.
+    :type: dynamic
+    :reverse: -fno-local-float-out
+    :category:
+
+    :default: on
+
+    Enable local floating of bindings from the RHS of a let(rec) in the
+    simplifier. For example ::
+
+        let x = let y = rhs_y in rhs_x in blah
+        ==>
+        let y = rhs_y in let x = rhs_x in blah
+
+    See the paper "Let-floating: moving bindings to give faster programs", Partain, Santos, and Peyton Jones; ICFP 1996.
+    https://www.microsoft.com/en-us/research/publication/let-floating-moving-bindings-to-give-faster-programs/
+
+    .. note::
+      This is distinct from the global floating pass which can be disabled with
+      :ghc-flag:`-fno-full-laziness`.
+
+.. ghc-flag:: -flocal-float-out-top-level
+    :shortdesc: Enable local floating to float top-level bindings
+    :type: dynamic
+    :reverse: -fno-local-float-out-top-level
+    :category:
+
+    :default: on
+
+    Enable local floating of top-level bindings from the RHS of a let(rec) in
+    the simplifier. For example
+
+      x = let y = e in (a,b)
+      ===>
+      y = e; x = (a,b)
+
+
+    See the paper "Let-floating: moving bindings to give faster programs", Partain, Santos, and Peyton Jones; ICFP 1996.
+    https://www.microsoft.com/en-us/research/publication/let-floating-moving-bindings-to-give-faster-programs/
+
+    Note that if :ghc-flag:`-fno-local-float-out` is set, that will take
+    precedence.
+
+    .. note::
+      This is distinct from the global floating pass which can be disabled with
+      :ghc-flag:`-fno-full-laziness`.
+
 .. ghc-flag:: -fmax-worker-args=⟨n⟩
     :shortdesc: *default: 10.* Maximum number of value arguments for a worker.
     :type: dynamic
@@ -1065,6 +1116,21 @@ by saying ``-fno-wombat``.
     which they are called in this module. Note that specialisation must be
     enabled (by ``-fspecialise``) for this to have any effect.
 
+.. ghc-flag:: -fpolymorphic-specialisation
+    :shortdesc: Allow specialisation to abstract over free type variables
+    :type: dynamic
+    :reverse: -fno-polymorphic-specialisation
+    :category:
+
+    :default: off
+
+    Warning, this feature is highly experimental and may lead to incorrect runtime
+    results. Use at your own risk (:ghc-ticket:`23469`, :ghc-ticket:`23109`, :ghc-ticket:`21229`, :ghc-ticket:`23445`).
+
+    Enable specialisation of function calls to known dictionaries with free type variables.
+    The created specialisation will abstract over the type variables free in the dictionary.
+
+
 .. ghc-flag:: -flate-specialise
     :shortdesc: Run a late specialisation pass
     :type: dynamic
@@ -1308,7 +1374,7 @@ by saying ``-fno-wombat``.
 
         sd   ::= card                     polymorphic sub-demand, card at every level
               |  P(d,d,..)                product sub-demand
-              |  Ccard(sd)                call sub-demand
+              |  C(card,sd)               call sub-demand
 
     For example, ``fst`` is strict in its argument, and also in the first
     component of the argument.  It will not evaluate the argument's second
@@ -1368,14 +1434,14 @@ by saying ``-fno-wombat``.
         maybe n _ Nothing  = n
         maybe _ s (Just a) = s a
 
-    We give it demand signature ``<L><MCM(L)><1L>``.  The ``CM(L)`` is a *call
+    We give it demand signature ``<L><MC(M,L)><1L>``.  The ``C(M,L)`` is a *call
     sub-demand* that says "Called at most once, where the result is used
     according to ``L``". The expression ``f `seq` f 1`` puts ``f`` under
-    demand ``SC1(L)`` and serves as an example where the upper bound on
+    demand ``SC(1,L)`` and serves as an example where the upper bound on
     evaluation cardinality doesn't coincide with that of the call cardinality.
 
     Cardinality is always relative to the enclosing call cardinality, so
-    ``g 1 2 + g 3 4`` puts ``g`` under demand ``SCS(C1(L))``, which says
+    ``g 1 2 + g 3 4`` puts ``g`` under demand ``SC(S,C(1,L))``, which says
     "called multiple times (``S``), but every time it is called with one
     argument, it is applied exactly once to another argument (``1``)".
 

@@ -6,7 +6,7 @@ module Builder (
     TarMode (..), GitMode (..), Builder (..), Win32TarballsMode(..),
 
     -- * Builder properties
-    builderProvenance, systemBuilderPath, builderPath, isSpecified, needBuilder,
+    builderProvenance, systemBuilderPath, builderPath, isSpecified, needBuilders,
     runBuilder, runBuilderWith, runBuilderWithCmdOptions, getBuilderPath,
     builderEnvironment,
 
@@ -102,7 +102,7 @@ instance NFData   ConfigurationInfo
 -- TODO: Do we really need all these modes? Why do we need 'Dependencies'? We
 -- can extract dependencies using the Cabal library.
 -- | 'GhcPkg' can initialise a package database and register packages in it.
-data GhcPkgMode = Init         -- ^ Initialise an empty package database
+data GhcPkgMode = Recache      -- ^ Recache a package database
                 | Copy         -- ^ Copy a package from one database to another.
                 | Dependencies -- ^ Compute package dependencies.
                 | Unregister   -- ^ Unregister a package.
@@ -266,7 +266,7 @@ instance H.Builder Builder where
         GhcPkg Dependencies _ -> do
             let input  = fromSingleton msgIn buildInputs
                 msgIn  = "[askBuilder] Exactly one input file expected."
-            needBuilder builder
+            needBuilders [builder]
             path <- H.builderPath builder
             -- we do not depend on bare builders. E.g. we won't depend on `clang`
             -- or `ld` or `ar`.  Unless they are provided with fully qualified paths
@@ -309,7 +309,8 @@ instance H.Builder Builder where
                 -- Capture stdout and write it to the output file.
                 captureStdout = do
                     Stdout stdout <- cmd' [path] buildArgs
-                    writeFileChanged output stdout
+                    -- see Note [Capture stdout as a ByteString]
+                    writeFileChangedBS output stdout
             case builder of
                 Ar Pack stg -> do
                     useTempFile <- arSupportsAtFile stg
@@ -333,8 +334,10 @@ instance H.Builder Builder where
 
                 GenPrimopCode -> do
                     stdin <- readFile' input
+                    need [input]
                     Stdout stdout <- cmd' (Stdin stdin) [path] buildArgs
-                    writeFileChanged output stdout
+                    -- see Note [Capture stdout as a ByteString]
+                    writeFileChangedBS output stdout
 
                 GhcPkg Copy _ -> do
                     Stdout pkgDesc <- cmd' [path]
@@ -482,7 +485,7 @@ isSpecified = fmap (not . null) . systemBuilderPath
 applyPatch :: FilePath -> FilePath -> Action ()
 applyPatch dir patch = do
     let file = dir -/- patch
-    needBuilder Patch
+    needBuilders [Patch]
     path <- builderPath Patch
     putBuild $ "| Apply patch " ++ file
     quietly $ cmd' [Cwd dir, FileStdin file] [path, "-p0"]
@@ -515,6 +518,19 @@ applyPatch dir patch = do
 --  tell if an Exit or ExitCode value is returned in `r`. So we use our own
 --  HasExit type class to provide the `hasExit` predicate that tells us if we
 --  should throw an exception as `cmd` would do in case of failure or not.
+--
+-- Note [Capture stdout as a ByteString]
+-- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+-- As of shake-0.19.6, capturing a process stdout as a `String` using `Stdout`
+-- mangles the encoding if it some other use of `Stdout` also captures it as a
+-- `ByteString`; see <https://github.com/ndmitchell/shake/issues/828>. This
+-- can cause us real problems, since `cmd'` (see Note [cmd wrapper]) *always*
+-- captures stdout as a `ByteString`.
+--
+-- Fortunately, a simple workaround is to avoid capturing stdout as a `String`
+-- in the first place. It’s usually unnecessary (and is in fact pointless work),
+-- as most of the time the captured output is immediately written to a file, so
+-- we can just treat it as an opaque binary stream.
 
 
 -- | Wrapper for Shake's 'cmd'

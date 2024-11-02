@@ -4,16 +4,19 @@ Building Cabal for hacking
 --------------------------
 
 The current recommended way of developing Cabal is to use the
-`v2-build` feature which [shipped in cabal-install-1.24](http://blog.ezyang.com/2016/05/announcing-cabal-new-build-nix-style-local-builds/).  Assuming
-that you have a sufficiently recent cabal-install (see above),
-it is sufficient to run:
+`v2-build` feature which [shipped in cabal-install-1.24](http://blog.ezyang.com/2016/05/announcing-cabal-new-build-nix-style-local-builds/).  If you use the latest version of cabal published on Hackage, it is sufficient to run:
 
 ```
 cabal v2-build cabal
 ```
 
-To build a local, development copy of cabal-install.  The location
-of your build products will vary depending on which version of
+If not, you aren't able to build the testsuite, so you need to disable the default `cabal.project` that implies configuring the testsuite, e.g., with:
+
+```
+cabal v2-build --project-file=cabal.project.release cabal
+```
+
+The location of your build products will vary depending on which version of
 cabal-install you use to build; see the documentation section
 [Where are my build products?](http://cabal.readthedocs.io/en/latest/nix-local-build.html#where-are-my-build-products)
 to find the binary (or just run `find -type f -executable -name cabal`).
@@ -113,10 +116,34 @@ names. When running `cabal-install` test suites, one need only use `cabal test` 
 `cabal run <test-target>` in order to test locally.
 
 
-Conventions
------------
+Whitespace Conventions
+----------------------
 
-* Spaces, not tabs.
+* No tab characters allowed.
+* No trailing whitespace allowed.
+* File needs to be terminated by a newline character.
+
+These conventions are enforced by the
+[fix-whitespace](https://hackage.haskell.org/package/fix-whitespace)
+tool.  Install it from hackage as usual (`cabal install fix-whitespace`)
+and run it in the project root to fix whitespace violations.
+
+The files included in the automatic whitespace check are specified in
+`fix-whitespace.yaml`.  Please add to this file if you add textfiles
+to this repository that are not included by the rules given there.
+Note that files that make essential use of tab characters (like `Makefile`)
+should _not_ be included in the automatic check.
+
+Whitespace conventions are enforced by
+[CI](https://github.com/haskell/cabal/actions/workflows/whitespace.yml).
+If you push a fix of a whitespace violation, please do so in a
+_separate commit_.
+
+
+
+
+Other Conventions
+-----------------
 
 * Try to follow style conventions of a file you are modifying, and
   avoid gratuitous reformatting (it makes merges harder!)
@@ -183,6 +210,40 @@ We like [this style guide][guide].
 
 [guide]: https://github.com/tibbe/haskell-style-guide/blob/master/haskell-style.md
 
+GitHub Ticket Conventions
+-------------------
+
+Each major `Cabal`/`cabal-install` release (e.g. 3.4, 3.6, etc.) has a
+corresponding GitHub Project and milestone. A ticket is included in a release's
+project if the release managers are tenatively planning on including a fix for
+the ticket in the release, i.e. if they are actively seeking someone to work on
+the ticket.
+
+By contrast, a ticket is milestoned to a given release if we are open to
+accepting a fix in that release, i.e. we would very much appreciate someone
+working on it, but are not committing to actively sourcing someone to work on
+it.
+
+GitHub Pull Request Conventions
+-------------------
+
+Every (non-backport) pull request has to go through a review and get 2
+approvals. After this is done, the author of the pull request is expected to add
+any final touches they deem important and put the `merge me` label on the pull
+request. If the author lacks permissions to apply labels, they are welcome to
+explicitly signal the merge intent on the discussion thread of the pull request,
+at which point others (e.g., reviewers) apply the label. Merge buttons are
+reserved for exceptional situations, e.g., CI fixes being iterated on or
+backports/patches that need to be expedited for a release.
+
+Currently there is a 2 day buffer for potential extra feedback between the last
+update of a pull request (e.g. a commit, a rebase, an addition of the `merge me`
+label) and the moment the Mergify bot picks up the pull request for a merge.
+
+If your pull request consists of several commits, consider using `squash+merge
+me` instead of `merge me`: the Mergify bot will squash all the commits into one
+and concatenate the commit messages of the commits before merging.
+
 Changelog
 ---------
 
@@ -224,7 +285,7 @@ You can find a large number of real-world examples of changelog files
 [here](https://github.com/haskell/cabal/tree/bc83de27569fda22dbe1e10be1a921bebf4d3430/changelog.d).
 
 At release time, the entries will be merged with
-[this tool](https://github.com/phadej/changelog-d).
+[this tool](https://github.com/fgaz/changelog-d).
 
 In addition, if you're changing the .cabal file format specification you should
 add an entry in `doc/file-format-changelog.rst`.

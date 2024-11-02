@@ -18,7 +18,9 @@
 -----------------------------------------------------------------------------
 
 module GHC.List (
-   -- [] (..),          -- built-in syntax; can't be used in export list
+
+   -- The list data type
+   List,
 
    -- List-monomorphic Foldable methods and misc functions
    foldr, foldr', foldr1,
@@ -515,19 +517,15 @@ scanl' = scanlGo'
 -- See Note [scanl rewrite rules]
 {-# RULES
 "scanl'"  [~1] forall f a bs . scanl' f a bs =
-  build (\c n -> a `c` foldr (scanlFB' f c) (flipSeqScanl' n) bs a)
+  build (\c n -> a `c` foldr (scanlFB' f c) (flipSeq n) bs a)
 "scanlList'" [1] forall f a bs .
-    foldr (scanlFB' f (:)) (flipSeqScanl' []) bs a = tail (scanl' f a bs)
+    foldr (scanlFB' f (:)) (flipSeq []) bs a = tail (scanl' f a bs)
  #-}
 
 {-# INLINE [0] scanlFB' #-} -- See Note [Inline FB functions]
 scanlFB' :: (b -> a -> b) -> (b -> c -> c) -> a -> (b -> c) -> b -> c
 scanlFB' f c = \b g -> oneShot (\x -> let !b' = f x b in b' `c` g b')
   -- See Note [Left folds via right fold]
-
-{-# INLINE [0] flipSeqScanl' #-}
-flipSeqScanl' :: a -> b -> a
-flipSeqScanl' a !_b = a
 
 {-
 Note [scanl rewrite rules]
@@ -718,7 +716,7 @@ maximum []              =  errorEmptyList "maximum"
 maximum xs              =  foldl1' max xs
 
 -- We want this to be specialized so that with a strict max function, GHC
--- produces good code. Note that to see if this is happending, one has to
+-- produces good code. Note that to see if this is happening, one has to
 -- look at -ddump-prep, not -ddump-core!
 {-# SPECIALIZE  maximum :: [Int] -> Int #-}
 {-# SPECIALIZE  maximum :: [Integer] -> Integer #-}
@@ -799,8 +797,8 @@ iterate'FB c f x0 = go x0
 
 -- | 'repeat' @x@ is an infinite list, with @x@ the value of every element.
 --
--- >>> take 20 $ repeat 17
---[17,17,17,17,17,17,17,17,17...
+-- >>> repeat 17
+-- [17,17,17,17,17,17,17,17,17...
 repeat :: a -> [a]
 {-# INLINE [0] repeat #-}
 -- The pragma just gives the rules more chance to fire
@@ -837,9 +835,9 @@ replicate n x           =  take n (repeat x)
 --
 -- >>> cycle []
 -- *** Exception: Prelude.cycle: empty list
--- >>> take 20 $ cycle [42]
+-- >>> cycle [42]
 -- [42,42,42,42,42,42,42,42,42,42...
--- >>> take 20 $ cycle [2, 5, 7]
+-- >>> cycle [2, 5, 7]
 -- [2,5,7,2,5,7,2,5,7,2,5,7...
 cycle                   :: HasCallStack => [a] -> [a]
 cycle []                = errorEmptyList "cycle"
@@ -930,7 +928,7 @@ take n xs | 0 < n     = unsafeTake n xs
 
 -- A version of take that takes the whole list if it's given an argument less
 -- than 1.
-{-# NOINLINE [1] unsafeTake #-}
+{-# NOINLINE [0] unsafeTake #-} -- See Note [Inline FB functions]
 unsafeTake :: Int -> [a] -> [a]
 unsafeTake !_  []     = []
 unsafeTake 1   (x: _) = [x]
@@ -939,20 +937,18 @@ unsafeTake m   (x:xs) = x : unsafeTake (m - 1) xs
 {-# RULES
 "take"     [~1] forall n xs . take n xs =
   build (\c nil -> if 0 < n
-                   then foldr (takeFB c nil) (flipSeqTake nil) xs n
+                   then foldr (takeFB c nil) (flipSeq nil) xs n
                    else nil)
-"unsafeTakeList"  [1] forall n xs . foldr (takeFB (:) []) (flipSeqTake []) xs n
+"unsafeTakeList"  [1] forall n xs . foldr (takeFB (:) []) (flipSeq []) xs n
                                         = unsafeTake n xs
  #-}
 
-{-# INLINE [0] flipSeqTake #-}
--- Just flip seq, specialized to Int, but not inlined too early.
--- It's important to force the numeric argument here, even though
--- it's not used. Otherwise, take n [] doesn't force n. This is
--- bad for strictness analysis and unboxing, and leads to increased
--- allocation in T7257.
-flipSeqTake :: a -> Int -> a
-flipSeqTake x !_n = x
+{-# INLINE [0] flipSeq #-}
+-- Just flip seq, but not inlined too early.
+-- It's important to force the argument here, even though it's not used.
+-- Otherwise, take n [] can't unbox n, leading to increased allocation in T7257.
+flipSeq :: a -> b -> a
+flipSeq x !_n = x
 
 {-# INLINE [0] takeFB #-} -- See Note [Inline FB functions]
 takeFB :: (a -> b -> b) -> b -> a -> (Int -> b) -> Int -> b
@@ -1282,6 +1278,7 @@ notElem x (y:ys)=  x /= y && notElem x ys
 
 -- | \(\mathcal{O}(n)\). 'lookup' @key assocs@ looks up a key in an association
 -- list.
+-- For the result to be 'Nothing', the list must be finite.
 --
 -- >>> lookup 2 []
 -- Nothing
@@ -1289,6 +1286,7 @@ notElem x (y:ys)=  x /= y && notElem x ys
 -- Nothing
 -- >>> lookup 2 [(1, "first"), (2, "second"), (3, "third")]
 -- Just "second"
+--
 lookup                  :: (Eq a) => a -> [(a,b)] -> Maybe b
 lookup _key []          =  Nothing
 lookup  key ((x,y):xys)
@@ -1347,8 +1345,8 @@ concat = foldr (++) []
 -- >>> ['a', 'b', 'c'] !! (-1)
 -- *** Exception: Prelude.!!: negative index
 --
--- WARNING: This function is partial. You can use <'atMay'
--- https://hackage.haskell.org/package/safe-0.3.19/docs/Safe.html#v:atMay>
+-- WARNING: This function is partial. You can use
+-- <https://hackage.haskell.org/package/safe/docs/Safe.html#v:atMay atMay>
 -- instead.
 #if defined(USE_REPORT_PRELUDE)
 (!!)                    :: [a] -> Int -> a

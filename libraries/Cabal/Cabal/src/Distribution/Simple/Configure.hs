@@ -54,7 +54,7 @@ module Distribution.Simple.Configure
   , platformDefines,
   ) where
 
-import qualified Prelude as Unsafe (tail)
+import Prelude ()
 import Distribution.Compat.Prelude
 
 import Distribution.Compiler
@@ -76,12 +76,13 @@ import Distribution.Simple.Program
 import Distribution.Simple.Setup as Setup
 import Distribution.Simple.BuildTarget
 import Distribution.Simple.LocalBuildInfo
+import Distribution.Simple.Program.Db (appendProgramSearchPath, modifyProgramSearchPath, lookupProgramByName)
+import Distribution.Simple.Utils
+import Distribution.System
 import Distribution.Types.PackageVersionConstraint
 import Distribution.Types.LocalBuildInfo
 import Distribution.Types.ComponentRequestedSpec
 import Distribution.Types.GivenComponent
-import Distribution.Simple.Utils
-import Distribution.System
 import Distribution.Version
 import Distribution.Verbosity
 import qualified Distribution.Compat.Graph as Graph
@@ -101,20 +102,20 @@ import qualified Distribution.Simple.HaskellSuite as HaskellSuite
 import Control.Exception
     ( try )
 import Distribution.Utils.Structured ( structuredDecodeOrFailIO, structuredEncode )
-import Distribution.Compat.Directory ( listDirectory )
+import Distribution.Compat.Directory
+    ( listDirectory, doesPathExist )
 import Data.ByteString.Lazy          ( ByteString )
 import qualified Data.ByteString            as BS
 import qualified Data.ByteString.Lazy.Char8 as BLC8
 import Data.List
-    ( (\\), inits, stripPrefix, intersect)
+    ( (\\), stripPrefix, intersect)
+import qualified Data.List.NonEmpty as NEL
 import qualified Data.Map as Map
 import System.Directory
     ( canonicalizePath, createDirectoryIfMissing, doesFileExist
     , getTemporaryDirectory, removeFile)
 import System.FilePath
     ( (</>), isAbsolute, takeDirectory )
-import Distribution.Compat.Directory
-    ( doesPathExist )
 import qualified System.Info
     ( compilerName, compilerVersion )
 import System.IO
@@ -128,6 +129,7 @@ import Text.PrettyPrint
     , punctuate, quotes, render, renderStyle, sep, text )
 import Distribution.Compat.Environment ( lookupEnv )
 
+import qualified Data.Maybe as M
 import qualified Data.Set as Set
 import qualified Distribution.Compat.NonEmptySet as NES
 
@@ -365,18 +367,19 @@ configure (pkg_descr0, pbi) cfg = do
             (fromFlag (configUserInstall cfg))
             (configPackageDBs cfg)
 
+    programDbPre <- mkProgramDb cfg (configPrograms cfg)
     -- comp:            the compiler we're building with
     -- compPlatform:    the platform we're building for
     -- programDb:  location and args of all programs we're
     --                  building with
-    (comp         :: Compiler,
+    (comp :: Compiler,
      compPlatform :: Platform,
-     programDb    :: ProgramDb)
+     programDb :: ProgramDb)
         <- configCompilerEx
             (flagToMaybe (configHcFlavor cfg))
             (flagToMaybe (configHcPath cfg))
             (flagToMaybe (configHcPkg cfg))
-            (mkProgramDb cfg (configPrograms cfg))
+            programDbPre
             (lessVerbose verbosity)
 
     -- The InstalledPackageIndex of all installed packages
@@ -635,21 +638,16 @@ configure (pkg_descr0, pbi) cfg = do
                                       "--enable-split-objs; ignoring")
                                 return False
 
-    let compilerSupportsGhciLibs :: Bool
-        compilerSupportsGhciLibs =
-          case compilerId comp of
-            CompilerId GHC version
-              | version > mkVersion [9,3] && windows ->
-                False
-            CompilerId GHC _ ->
-                True
-            CompilerId GHCJS _ ->
-                True
-            _ -> False
-          where
-            windows = case compPlatform of
-              Platform _ Windows -> True
-              Platform _ _ -> False
+    -- Basically yes/no/unknown.
+    let linkerSupportsRelocations :: Maybe Bool
+        linkerSupportsRelocations =
+          case lookupProgramByName "ld" programDb'' of
+            Nothing -> Nothing
+            Just ld ->
+              case Map.lookup "Supports relocatable output" $ programProperties ld of
+                Just "YES" -> Just True
+                Just "NO" -> Just False
+                _other -> Nothing
 
     let ghciLibByDefault =
           case compilerId comp of
@@ -669,10 +667,12 @@ configure (pkg_descr0, pbi) cfg = do
 
     withGHCiLib_ <-
       case fromFlagOrDefault ghciLibByDefault (configGHCiLib cfg) of
-        True | not compilerSupportsGhciLibs -> do
+        -- NOTE: If linkerSupportsRelocations is Nothing this may still fail if the
+        -- linker does not support -r.
+        True | not (fromMaybe True linkerSupportsRelocations) -> do
           warn verbosity $
-                "--enable-library-for-ghci is no longer supported on Windows with"
-              ++ " GHC 9.4 and later; ignoring..."
+            "--enable-library-for-ghci is not supported with the current"
+            ++ "  linker; ignoring..."
           return False
         v -> return v
 
@@ -841,16 +841,27 @@ configure (pkg_descr0, pbi) cfg = do
     where
       verbosity = fromFlag (configVerbosity cfg)
 
-mkProgramDb :: ConfigFlags -> ProgramDb -> ProgramDb
-mkProgramDb cfg initialProgramDb = programDb
+-- | Adds the extra program paths from the flags provided to @configure@ as
+-- well as specified locations for certain known programs and their default
+-- arguments.
+mkProgramDb :: ConfigFlags -> ProgramDb -> IO ProgramDb
+mkProgramDb cfg initialProgramDb = do
+  programDb <-
+    modifyProgramSearchPath (getProgramSearchPath initialProgramDb ++)
+      <$> appendProgramSearchPath (fromFlagOrDefault normal (configVerbosity cfg)) searchpath initialProgramDb
+  pure
+    . userSpecifyArgss (configProgramArgs cfg)
+    . userSpecifyPaths (configProgramPaths cfg)
+    $ programDb
   where
-    programDb  = userSpecifyArgss (configProgramArgs cfg)
-                 . userSpecifyPaths (configProgramPaths cfg)
-                 . setProgramSearchPath searchpath
-                 $ initialProgramDb
-    searchpath = getProgramSearchPath initialProgramDb
-                 ++ map ProgramSearchPathDir
-                 (fromNubList $ configProgramPathExtra cfg)
+    searchpath = fromNubList $ configProgramPathExtra cfg
+
+-- Note. We try as much as possible to _prepend_ rather than postpend the extra-prog-path
+-- so that we can override the system path. However, in a v2-build, at this point, the "system" path
+-- has already been extended by both the built-tools-depends paths, as well as the program-path-extra
+-- so for v2 builds adding it again is entirely unnecessary. However, it needs to get added again _anyway_
+-- so as to take effect for v1 builds or standalone calls to Setup.hs
+-- In this instance, the lesser evil is to not allow it to override the system path.
 
 -- -----------------------------------------------------------------------------
 -- Helper functions for configure
@@ -936,11 +947,11 @@ dependencySatisfiable
         then internalDepSatisfiable
         else
           -- Backward compatibility for the old sublibrary syntax
-          (sublibs == mainLibSet
+          sublibs == mainLibSet
             && Map.member
                  (pn, CLibName $ LSubLibName $
                       packageNameToUnqualComponentName depName)
-                 requiredDepsMap)
+                 requiredDepsMap
 
           || all visible sublibs
 
@@ -967,7 +978,7 @@ dependencySatisfiable
     internalDepSatisfiable =
         Set.isSubsetOf (NES.toSet sublibs) packageLibraries
     internalDepSatisfiableExternally =
-        all (\ln -> not $ null $ PackageIndex.lookupInternalDependency installedPackageSet pn vr ln) sublibs
+        all (not . null . PackageIndex.lookupInternalDependency installedPackageSet pn vr) sublibs
 
     -- Check whether a library exists and is visible.
     -- We don't disambiguate between dependency on non-existent or private
@@ -1436,8 +1447,7 @@ getInstalledPackagesMonitorFiles verbosity comp packageDBs progdb platform =
 -- flag into a single package db stack.
 --
 interpretPackageDbFlags :: Bool -> [Maybe PackageDB] -> PackageDBStack
-interpretPackageDbFlags userInstall specificDBs =
-    extra initialStack specificDBs
+interpretPackageDbFlags userInstall = extra initialStack
   where
     initialStack | userInstall = [GlobalPackageDB, UserPackageDB]
                  | otherwise   = [GlobalPackageDB]
@@ -1683,8 +1693,8 @@ ccLdOptionsBuildInfo cflags ldflags ldflags_static =
   let (includeDirs',  cflags')   = partition ("-I" `isPrefixOf`) cflags
       (extraLibs',    ldflags')  = partition ("-l" `isPrefixOf`) ldflags
       (extraLibDirs', ldflags'') = partition ("-L" `isPrefixOf`) ldflags'
-      (extraLibsStatic')         = filter ("-l" `isPrefixOf`) ldflags_static
-      (extraLibDirsStatic')      = filter ("-L" `isPrefixOf`) ldflags_static
+      extraLibsStatic'         = filter ("-l" `isPrefixOf`) ldflags_static
+      extraLibDirsStatic'      = filter ("-L" `isPrefixOf`) ldflags_static
   in mempty {
        includeDirs  = map (drop 2) includeDirs',
        extraLibs    = map (drop 2) extraLibs',
@@ -1700,13 +1710,13 @@ ccLdOptionsBuildInfo cflags ldflags ldflags_static =
 
 configCompilerAuxEx :: ConfigFlags
                     -> IO (Compiler, Platform, ProgramDb)
-configCompilerAuxEx cfg = configCompilerEx (flagToMaybe $ configHcFlavor cfg)
+configCompilerAuxEx cfg = do
+  programDb <- mkProgramDb cfg defaultProgramDb
+  configCompilerEx (flagToMaybe $ configHcFlavor cfg)
                                            (flagToMaybe $ configHcPath cfg)
                                            (flagToMaybe $ configHcPkg cfg)
                                            programDb
                                            (fromFlag (configVerbosity cfg))
-  where
-    programDb = mkProgramDb cfg defaultProgramDb
 
 configCompilerEx :: Maybe CompilerFlavor -> Maybe FilePath -> Maybe FilePath
                  -> ProgramDb -> Verbosity
@@ -1783,7 +1793,7 @@ checkForeignDeps pkg lbi verbosity =
         findOffendingHdr =
             ifBuildsWith allHeaders ccArgs
                          (return Nothing)
-                         (go . Unsafe.tail . inits $ allHeaders) -- inits always contains at least []
+                         (go . tail . NEL.inits $ allHeaders)
             where
               go [] = return Nothing       -- cannot happen
               go (hdrs:hdrsInits) =
@@ -1961,11 +1971,19 @@ checkPackageProblems :: Verbosity
 checkPackageProblems verbosity dir gpkg pkg = do
   ioChecks      <- checkPackageFiles verbosity pkg dir
   let pureChecks = checkPackage gpkg (Just pkg)
-      errors   = [ e | PackageBuildImpossible e <- pureChecks ++ ioChecks ]
-      warnings = [ w | PackageBuildWarning    w <- pureChecks ++ ioChecks ]
+      (errors, warnings) =
+        partitionEithers (M.mapMaybe classEW $ pureChecks ++ ioChecks)
   if null errors
-    then traverse_ (warn verbosity) warnings
-    else die' verbosity (intercalate "\n\n" errors)
+    then traverse_ (warn verbosity) (map ppPackageCheck warnings)
+    else die' verbosity (intercalate "\n\n" $ map ppPackageCheck errors)
+  where
+    -- Classify error/warnings. Left: error, Right: warning.
+    classEW :: PackageCheck -> Maybe (Either PackageCheck PackageCheck)
+    classEW e@(PackageBuildImpossible _) = Just (Left e)
+    classEW w@(PackageBuildWarning _) = Just (Right w)
+    classEW (PackageDistSuspicious _) = Nothing
+    classEW (PackageDistSuspiciousWarn _) = Nothing
+    classEW (PackageDistInexcusable _) = Nothing
 
 -- | Preform checks if a relocatable build is allowed
 checkRelocatable :: Verbosity
@@ -2057,7 +2075,7 @@ checkForeignLibSupported comp platform flib = go (compilerFlavor comp)
     go :: CompilerFlavor -> Maybe String
     go GHC
       | compilerVersion comp < mkVersion [7,8] = unsupported [
-        "Building foreign libraires is only supported with GHC >= 7.8"
+        "Building foreign libraries is only supported with GHC >= 7.8"
       ]
       | otherwise = goGhcPlatform platform
     go _   = unsupported [

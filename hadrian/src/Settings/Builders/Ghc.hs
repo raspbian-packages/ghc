@@ -11,23 +11,14 @@ import Settings.Builders.Common
 import Settings.Warnings
 import qualified Context as Context
 import Rules.Libffi (libffiName)
+import qualified Data.Set as Set
 import System.Directory
+import Data.Version.Extra
 
 ghcBuilderArgs :: Args
 ghcBuilderArgs = mconcat
-  [ package genapply ? do
-      -- TODO: this is here because this -I needs to come before the others.
-      -- Otherwise this would go in Settings.Packages.
-      --
-      -- genapply bakes in the next stage's headers to bake in the target
-      -- config at build time.
-      -- See Note [Genapply target as host for RTS macros].
-      stage <- getStage
-      nextStageRtsBuildDir <- expr $ rtsBuildPath $ succStage stage
-      let nextStageRtsBuildIncludeDir = nextStageRtsBuildDir </> "include"
-      builder Ghc ? arg ("-I" ++ nextStageRtsBuildIncludeDir)
-  , compileAndLinkHs, compileC, compileCxx, findHsDependencies
-  , toolArgs]
+  [ compileAndLinkHs, compileC, compileCxx, findHsDependencies
+  , toolArgs ]
 
 toolArgs :: Args
 toolArgs = do
@@ -114,7 +105,7 @@ ghcLinkArgs = builder (Ghc LinkHs) ? do
     useSystemFfi <- expr (flag UseSystemFfi)
     buildPath <- getBuildPath
     libffiName' <- libffiName
-    debugged <- ghcDebugged <$> expr flavour
+    debugged <- ghcDebugged <$> expr flavour <*> getStage
 
     osxTarget <- expr isOsxTarget
     winTarget <- expr isWinTarget
@@ -168,15 +159,14 @@ ghcLinkArgs = builder (Ghc LinkHs) ? do
                       ]
                 ]
             , arg "-no-auto-link-packages"
-            ,      nonHsMainPackage pkg  ? arg "-no-hs-main"
-            , not (nonHsMainPackage pkg) ? arg "-rtsopts"
+            ,       nonHsMainPackage pkg  ? arg "-no-hs-main"
+            , (not (nonHsMainPackage pkg) && not (isLibrary pkg)) ? arg "-rtsopts"
             , pure [ "-l" ++ lib    | lib    <- libs    ]
             , pure [ "-L" ++ libDir | libDir <- libDirs ]
             , rtsFfiArg
             , osxTarget ? pure (concat [ ["-framework", fmwk] | fmwk <- fmwks ])
             , debugged ? packageOneOf [ghc, iservProxy, iserv, remoteIserv] ?
               arg "-debug"
-
             ]
 
 findHsDependencies :: Args
@@ -188,7 +178,7 @@ findHsDependencies = builder (Ghc FindHsDependencies) ? do
             , defaultGhcWarningsArgs
             , arg "-include-pkg-deps"
             , arg "-dep-makefile", arg =<< getOutput
-            , pure $ concat [ ["-dep-suffix", wayPrefix w] | w <- ways ]
+            , pure $ concat [ ["-dep-suffix", wayPrefix w] | w <- Set.toList ways ]
             , getInputs ]
 
 haddockGhcArgs :: Args
@@ -248,12 +238,15 @@ wayGhcArgs = do
 packageGhcArgs :: Args
 packageGhcArgs = do
     package <- getPackage
+    ghc_ver <- readVersion <$> (expr . ghcVersionStage =<< getStage)
     pkgId   <- expr $ pkgIdentifier package
     mconcat [ arg "-hide-all-packages"
             , arg "-no-user-package-db"
             , arg "-package-env -"
             , packageDatabaseArgs
-            , libraryPackage ? arg ("-this-unit-id " ++ pkgId)
+            -- We want to pass -this-unit-id for executables as well for multi-repl to
+            -- work with executable packages but this is buggy on GHC-9.0.2
+            , (isLibrary package || (ghc_ver >= makeVersion [9,2,1])) ?  arg ("-this-unit-id " ++ pkgId)
             , map ("-package-id " ++) <$> getContextData depIds ]
 
 includeGhcArgs :: Args

@@ -7,7 +7,7 @@ AC_CONFIG_HEADERS([include/HsProcessConfig.h])
 
 AC_PROG_CC
 
-dnl ** Working vfork?
+dnl ** Working fork?
 AC_FUNC_FORK
 
 # check for specific header (.h) files that we are interested in
@@ -15,10 +15,15 @@ AC_CHECK_HEADERS([signal.h sys/wait.h fcntl.h])
 
 AC_CHECK_FUNCS([setitimer sysconf])
 AC_CHECK_FUNCS([execvpe])
+AC_CHECK_FUNCS([pipe2],[],[],[
+  #define _GNU_SOURCE
+  #include <unistd.h>
+  #include <fcntl.h>
+])
 
 # posix_spawn checks
 AC_CHECK_HEADERS([spawn.h])
-AC_CHECK_FUNCS([posix_spawnp posix_spawn_file_actions_addchdir],[],[],[
+AC_CHECK_FUNCS([posix_spawnp posix_spawn_file_actions_addchdir_np posix_spawn_file_actions_addchdir],[],[],[
   #define _GNU_SOURCE
   #include <spawn.h>
 ])

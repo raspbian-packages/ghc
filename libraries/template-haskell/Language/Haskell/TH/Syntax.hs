@@ -2,7 +2,7 @@
              DeriveGeneric, FlexibleInstances, DefaultSignatures,
              RankNTypes, RoleAnnotations, ScopedTypeVariables,
              MagicHash, KindSignatures, PolyKinds, TypeApplications, DataKinds,
-             GADTs, UnboxedTuples, UnboxedSums, TypeInType, TypeOperators,
+             GADTs, UnboxedTuples, UnboxedSums, TypeOperators,
              Trustworthy, DeriveFunctor, BangPatterns, RecordWildCards, ImplicitParams #-}
 
 {-# OPTIONS_GHC -fno-warn-inline-rule-shadowing #-}
@@ -26,6 +26,9 @@ module Language.Haskell.TH.Syntax
       -- * Language extensions
     , module Language.Haskell.TH.LanguageExtensions
     , ForeignSrcLang(..)
+    -- * Notes
+    -- ** Unresolved Infix
+    -- $infix
     ) where
 
 import Data.Data hiding (Fixity(..))
@@ -36,7 +39,7 @@ import GHC.IO.Unsafe    ( unsafeDupableInterleaveIO )
 import Control.Monad (liftM)
 import Control.Monad.IO.Class (MonadIO (..))
 import Control.Monad.Fix (MonadFix (..))
-import Control.Applicative (liftA2)
+import Control.Applicative (Applicative(..))
 import Control.Exception (BlockedIndefinitelyOnMVar (..), catch, throwIO)
 import Control.Exception.Base (FixIOException (..))
 import Control.Concurrent.MVar (newEmptyMVar, readMVar, putMVar)
@@ -57,7 +60,7 @@ import GHC.Lexeme       ( startsVarSym, startsVarId )
 import GHC.ForeignSrcLang.Type
 import Language.Haskell.TH.LanguageExtensions
 import Numeric.Natural
-import Prelude
+import Prelude hiding (Applicative(..))
 import Foreign.ForeignPtr
 import Foreign.C.String
 import Foreign.C.Types
@@ -639,7 +642,8 @@ $(do
 newDeclarationGroup :: Q [Dec]
 newDeclarationGroup = pure []
 
-{- | @reifyInstances nm tys@ returns a list of visible instances of @nm tys@. That is,
+{- | @reifyInstances nm tys@ returns a list of all visible instances (see below for "visible")
+of @nm tys@. That is,
 if @nm@ is the name of a type class, then all instances of this class at the types @tys@
 are returned. Alternatively, if @nm@ is the name of a data family or type family,
 all instances of this family at the types @tys@ are returned.
@@ -657,8 +661,20 @@ instance heads which unify with @nm tys@, they need not actually be satisfiable.
 There is one edge case: @reifyInstances ''Typeable tys@ currently always
 produces an empty list (no matter what @tys@ are given).
 
-An instance is visible if it is imported or defined in a prior top-level
-declaration group. See the documentation for 'newDeclarationGroup' for more details.
+In principle, the *visible* instances are
+* all instances defined in a prior top-level declaration group
+  (see docs on @newDeclarationGroup@), or
+* all instances defined in any module transitively imported by the
+  module being compiled
+
+However, actually searching all modules transitively below the one being
+compiled is unreasonably expensive, so @reifyInstances@ will report only the
+instance for modules that GHC has had some cause to visit during this
+compilation.  This is a shortcoming: @reifyInstances@ might fail to report
+instances for a type that is otherwise unusued, or instances defined in a
+different component.  You can work around this shortcoming by explicitly importing the modules
+whose instances you want to be visible. GHC issue <https://gitlab.haskell.org/ghc/ghc/-/issues/20529#note_388980 #20529>
+has some discussion around this.
 
 -}
 reifyInstances :: Name -> [Type] -> Q [InstanceDec]
@@ -811,6 +827,7 @@ addForeignSource lang src = do
                  LangObjc   -> "m"
                  LangObjcxx -> "mm"
                  LangAsm    -> "s"
+                 LangJs     -> "js"
                  RawObject  -> "a"
   path <- addTempFile suffix
   runIO $ writeFile path src
@@ -1117,8 +1134,9 @@ addrToByteArrayName = helper
   where
     helper :: HasCallStack => Name
     helper =
-      case head (getCallStack ?callStack) of
-        (_, SrcLoc{..}) -> mkNameG_v srcLocPackage srcLocModule "addrToByteArray"
+      case getCallStack ?callStack of
+        [] -> error "addrToByteArrayName: empty call stack"
+        (_, SrcLoc{..}) : _ -> mkNameG_v srcLocPackage srcLocModule "addrToByteArray"
 
 
 addrToByteArray :: Int -> Addr# -> ByteArray
@@ -1398,7 +1416,7 @@ dataToQa mkCon mkLit appCon antiQ t =
                       con@('(':_) -> Name (mkOccName con)
                                           (NameG DataName
                                                 (mkPkgName "ghc-prim")
-                                                (mkModName "GHC.Tuple"))
+                                                (mkModName "GHC.Tuple.Prim"))
 
                       -- Tricky case: see Note [Data for non-algebraic types]
                       fun@(x:_)   | startsVarSym x || startsVarId x
@@ -1789,6 +1807,10 @@ mkNameU s u = Name (mkOccName s) (NameU u)
 mkNameL :: String -> Uniq -> Name
 mkNameL s u = Name (mkOccName s) (NameL u)
 
+-- | Only used internally
+mkNameQ :: String -> String -> Name
+mkNameQ mn occ = Name (mkOccName occ) (NameQ (mkModName mn))
+
 -- | Used for 'x etc, but not available to the programmer
 mkNameG :: NameSpace -> String -> String -> String -> Name
 mkNameG ns pkg modu occ
@@ -1870,10 +1892,13 @@ mk_tup_name n space boxed
     withParens thing
       | boxed     = "("  ++ thing ++ ")"
       | otherwise = "(#" ++ thing ++ "#)"
-    tup_occ | n == 1    = if boxed then "Solo" else "Solo#"
+    tup_occ | n == 1    = if boxed then solo else "Solo#"
             | otherwise = withParens (replicate n_commas ',')
     n_commas = n - 1
-    tup_mod  = mkModName "GHC.Tuple"
+    tup_mod  = mkModName "GHC.Tuple.Prim"
+    solo
+      | space == DataName = "MkSolo"
+      | otherwise = "Solo"
 
 -- Unboxed sum data and type constructors
 -- | Unboxed sum data constructor
@@ -2070,6 +2095,7 @@ Note [Unresolved infix]
 ~~~~~~~~~~~~~~~~~~~~~~~
 -}
 {- $infix #infix#
+
 When implementing antiquotation for quasiquoters, one often wants
 to parse strings into expressions:
 
@@ -2377,6 +2403,9 @@ data Dec
              Con [DerivClause]    -- ^ @{ newtype Cxt x => T x = A (B x)
                                   --       deriving (Z,W Q)
                                   --       deriving stock Eq }@
+  | TypeDataD Name [TyVarBndr ()]
+          (Maybe Kind)            -- Kind signature (allowed only for GADTs)
+          [Con]                   -- ^ @{ type data T x = A x | B (T x) }@
   | TySynD Name [TyVarBndr ()] Type -- ^ @{ type T x = (x,x) }@
   | ClassD Cxt Name [TyVarBndr ()]
          [FunDep] [Dec]           -- ^ @{ class Eq a => Ord a where ds }@
@@ -2597,24 +2626,36 @@ type Cxt = [Pred]                 -- ^ @(Eq a, Ord b)@
 -- be tuples of other constraints.
 type Pred = Type
 
+-- | 'SourceUnpackedness' corresponds to unpack annotations found in the source code.
+--
+-- This may not agree with the annotations returned by 'reifyConStrictness'.
+-- See 'reifyConStrictness' for more information.
 data SourceUnpackedness
   = NoSourceUnpackedness -- ^ @C a@
   | SourceNoUnpack       -- ^ @C { {\-\# NOUNPACK \#-\} } a@
   | SourceUnpack         -- ^ @C { {\-\# UNPACK \#-\} } a@
         deriving (Show, Eq, Ord, Data, Generic)
 
+-- | 'SourceStrictness' corresponds to strictness annotations found in the source code.
+--
+-- This may not agree with the annotations returned by 'reifyConStrictness'.
+-- See 'reifyConStrictness' for more information.
 data SourceStrictness = NoSourceStrictness    -- ^ @C a@
                       | SourceLazy            -- ^ @C {~}a@
                       | SourceStrict          -- ^ @C {!}a@
         deriving (Show, Eq, Ord, Data, Generic)
 
 -- | Unlike 'SourceStrictness' and 'SourceUnpackedness', 'DecidedStrictness'
--- refers to the strictness that the compiler chooses for a data constructor
--- field, which may be different from what is written in source code. See
--- 'reifyConStrictness' for more information.
-data DecidedStrictness = DecidedLazy
-                       | DecidedStrict
-                       | DecidedUnpack
+-- refers to the strictness annotations that the compiler chooses for a data constructor
+-- field, which may be different from what is written in source code.
+--
+-- Note that non-unpacked strict fields are assigned 'DecidedLazy' when a bang would be inappropriate,
+-- such as the field of a newtype constructor and fields that have an unlifted type.
+--
+-- See 'reifyConStrictness' for more information.
+data DecidedStrictness = DecidedLazy -- ^ Field inferred to not have a bang.
+                       | DecidedStrict -- ^ Field inferred to have a bang.
+                       | DecidedUnpack -- ^ Field inferred to be unpacked.
         deriving (Show, Eq, Ord, Data, Generic)
 
 -- | A single data constructor.
@@ -2740,21 +2781,21 @@ data Type = ForallT [TyVarBndr Specificity] Cxt Type -- ^ @forall \<vars\>. \<ct
           | ParensT Type                   -- ^ @(T)@
 
           -- See Note [Representing concrete syntax in types]
-          | TupleT Int                     -- ^ @(,), (,,), etc.@
-          | UnboxedTupleT Int              -- ^ @(\#,\#), (\#,,\#), etc.@
-          | UnboxedSumT SumArity           -- ^ @(\#|\#), (\#||\#), etc.@
+          | TupleT Int                     -- ^ @(,)@, @(,,)@, etc.
+          | UnboxedTupleT Int              -- ^ @(\#,\#)@, @(\#,,\#)@, etc.
+          | UnboxedSumT SumArity           -- ^ @(\#|\#)@, @(\#||\#)@, etc.
           | ArrowT                         -- ^ @->@
           | MulArrowT                      -- ^ @%n ->@
                                            --
                                            -- Generalised arrow type with multiplicity argument
           | EqualityT                      -- ^ @~@
           | ListT                          -- ^ @[]@
-          | PromotedTupleT Int             -- ^ @'(), '(,), '(,,), etc.@
+          | PromotedTupleT Int             -- ^ @'()@, @'(,)@, @'(,,)@, etc.
           | PromotedNilT                   -- ^ @'[]@
-          | PromotedConsT                  -- ^ @(':)@
+          | PromotedConsT                  -- ^ @'(:)@
           | StarT                          -- ^ @*@
           | ConstraintT                    -- ^ @Constraint@
-          | LitT TyLit                     -- ^ @0,1,2, etc.@
+          | LitT TyLit                     -- ^ @0@, @1@, @2@, etc.
           | WildCardT                      -- ^ @_@
           | ImplicitParamT String Type     -- ^ @?x :: t@
       deriving( Show, Eq, Ord, Data, Generic )

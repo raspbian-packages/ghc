@@ -56,7 +56,7 @@ data Extension
    | BangPatterns
    | TypeFamilies
    | TypeFamilyDependencies
-   | TypeInType
+   | TypeInType               -- Deprecated
    | OverloadedStrings
    | OverloadedLists
    | NumDecimals
@@ -73,6 +73,7 @@ data Extension
    | ConstraintKinds
    | PolyKinds                -- Kind polymorphism
    | DataKinds                -- Datatype promotion
+   | TypeData                 -- allow @type data@ definitions
    | InstanceSigs
    | ApplicativeDo
    | LinearTypes

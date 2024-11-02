@@ -2,8 +2,6 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE TypeFamilies #-}
 
-{-# OPTIONS_GHC -Wno-incomplete-uni-patterns #-}
-
 {-
 (c) The University of Glasgow 2006
 (c) The GRASP/AQUA Project, Glasgow University, 1992-1998
@@ -18,14 +16,14 @@ lower levels it is preserved with @let@/@letrec@s).
 
 module GHC.HsToCore.Binds
    ( dsTopLHsBinds, dsLHsBinds, decomposeRuleLhs, dsSpec
-   , dsHsWrapper, dsEvTerm, dsTcEvBinds, dsTcEvBinds_s, dsEvBinds, dsMkUserRule
+   , dsHsWrapper, dsEvTerm, dsTcEvBinds, dsTcEvBinds_s, dsEvBinds
+   , dsWarnOrphanRule
    )
 where
 
 import GHC.Prelude
 
 import GHC.Driver.Session
-import GHC.Driver.Ppr
 import GHC.Driver.Config
 import qualified GHC.LanguageExtensions as LangExt
 import GHC.Unit.Module
@@ -54,6 +52,7 @@ import GHC.Core.Type
 import GHC.Core.Coercion
 import GHC.Core.Multiplicity
 import GHC.Core.Rules
+import GHC.Core.TyCo.Compare( eqType )
 
 import GHC.Builtin.Names
 import GHC.Builtin.Types ( naturalTy, typeSymbolKind, charTy )
@@ -73,7 +72,6 @@ import GHC.Data.Maybe
 import GHC.Data.OrdList
 import GHC.Data.Graph.Directed
 import GHC.Data.Bag
-import GHC.Data.FastString
 
 import GHC.Utils.Constants (debugIsOn)
 import GHC.Utils.Misc
@@ -81,7 +79,6 @@ import GHC.Utils.Monad
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
 import GHC.Utils.Panic.Plain
-import GHC.Utils.Trace
 
 import Control.Monad
 
@@ -154,8 +151,8 @@ dsHsBind dflags (VarBind { var_id = var
 
 dsHsBind dflags b@(FunBind { fun_id = L loc fun
                            , fun_matches = matches
-                           , fun_ext = co_fn
-                           , fun_tick = tick })
+                           , fun_ext = (co_fn, tick)
+                           })
  = do   { (args, body) <- addTyCs FromSource (hsWrapDictBinders co_fn) $
                           -- FromSource might not be accurate (we don't have any
                           -- origin annotations for things in this module), but at
@@ -185,8 +182,8 @@ dsHsBind dflags b@(FunBind { fun_id = L loc fun
           return (force_var, [core_binds]) }
 
 dsHsBind dflags (PatBind { pat_lhs = pat, pat_rhs = grhss
-                         , pat_ext = ty
-                         , pat_ticks = (rhs_tick, var_ticks) })
+                         , pat_ext = (ty, (rhs_tick, var_ticks))
+                         })
   = do  { rhss_nablas <- pmcGRHSs PatBindGuards grhss
         ; body_expr <- dsGuarded grhss ty rhss_nablas
         ; let body' = mkOptTickBox rhs_tick body_expr
@@ -300,7 +297,7 @@ dsAbsBinds dflags tyvars dicts exports
                             mkLet aux_binds $
                             tup_expr
 
-       ; poly_tup_id <- newSysLocalDs Many (exprType poly_tup_rhs)
+       ; poly_tup_id <- newSysLocalDs ManyTy (exprType poly_tup_rhs)
 
         -- Find corresponding global or make up a new one: sometimes
         -- we need to make new export to desugar strict binds, see
@@ -311,10 +308,10 @@ dsAbsBinds dflags tyvars dicts exports
                           , abe_poly = global
                           , abe_mono = local, abe_prags = spec_prags })
                           -- See Note [AbsBinds wrappers] in "GHC.Hs.Binds"
-                = do { tup_id  <- newSysLocalDs Many tup_ty
+                = do { tup_id  <- newSysLocalDs ManyTy tup_ty
                      ; core_wrap <- dsHsWrapper wrap
                      ; let rhs = core_wrap $ mkLams tyvars $ mkLams dicts $
-                                 mkTupleSelector all_locals local tup_id $
+                                 mkBigTupleSelector all_locals local tup_id $
                                  mkVarApps (Var poly_tup_id) (tyvars ++ dicts)
                            rhs_for_spec = Let (NonRec poly_tup_id poly_tup_rhs) rhs
                      ; (spec_binds, rules) <- dsSpecs rhs_for_spec spec_prags
@@ -371,7 +368,7 @@ dsAbsBinds dflags tyvars dicts exports
             ([],[]) lcls
 
     mk_export local =
-      do global <- newSysLocalDs Many
+      do global <- newSysLocalDs ManyTy
                      (exprType (mkLams tyvars (mkLams dicts (Var local))))
          return (ABE { abe_poly  = global
                      , abe_mono  = local
@@ -391,7 +388,7 @@ makeCorePair :: DynFlags -> Id -> Bool -> Arity -> CoreExpr
 makeCorePair dflags gbl_id is_default_method dict_arity rhs
   | is_default_method    -- Default methods are *always* inlined
                          -- See Note [INLINE and default methods] in GHC.Tc.TyCl.Instance
-  = (gbl_id `setIdUnfolding` mkCompulsoryUnfolding simpl_opts rhs, rhs)
+  = (gbl_id `setIdUnfolding` mkCompulsoryUnfolding' simpl_opts rhs, rhs)
 
   | otherwise
   = case inlinePragmaSpec inline_prag of
@@ -403,19 +400,20 @@ makeCorePair dflags gbl_id is_default_method dict_arity rhs
   where
     simpl_opts    = initSimpleOpts dflags
     inline_prag   = idInlinePragma gbl_id
-    inlinable_unf = mkInlinableUnfolding simpl_opts rhs
+    inlinable_unf = mkInlinableUnfolding simpl_opts StableUserSrc rhs
     inline_pair
        | Just arity <- inlinePragmaSat inline_prag
         -- Add an Unfolding for an INLINE (but not for NOINLINE)
         -- And eta-expand the RHS; see Note [Eta-expanding INLINE things]
        , let real_arity = dict_arity + arity
-        -- NB: The arity in the InlineRule takes account of the dictionaries
-       = ( gbl_id `setIdUnfolding` mkInlineUnfoldingWithArity real_arity simpl_opts rhs
+        -- NB: The arity passed to mkInlineUnfoldingWithArity
+        --     must take account of the dictionaries
+       = ( gbl_id `setIdUnfolding` mkInlineUnfoldingWithArity simpl_opts StableUserSrc real_arity rhs
          , etaExpand real_arity rhs)
 
        | otherwise
        = pprTrace "makeCorePair: arity missing" (ppr gbl_id) $
-         (gbl_id `setIdUnfolding` mkInlineUnfolding simpl_opts rhs, rhs)
+         (gbl_id `setIdUnfolding` mkInlineUnfoldingNoArity simpl_opts StableUserSrc rhs, rhs)
 
 dictArity :: [Var] -> Arity
 -- Don't count coercion variables in arity
@@ -527,7 +525,7 @@ happen as a result of method sharing), there's a danger that we never
 get to do the inlining, which is a Terribly Bad thing given that the
 user said "inline"!
 
-To avoid this we pre-emptively eta-expand the definition, so that foo
+To avoid this we preemptively eta-expand the definition, so that foo
 has the arity with which it is declared in the source code.  In this
 example it has arity 2 (one for the Eq and one for x). Doing this
 should mean that (foo d) is a PAP and we don't share it.
@@ -543,7 +541,7 @@ this:
         fromT :: T Bool -> Bool
         { fromT_1 ((TBool b)) = not b } } }
 
-Note the nested AbsBind.  The arity for the InlineRule on $cfromT should be
+Note the nested AbsBind.  The arity for the unfolding on $cfromT should be
 gotten from the binding for fromT_1.
 
 It might be better to have just one level of AbsBinds, but that requires more
@@ -708,7 +706,7 @@ dsSpec mb_poly_rhs (L loc (SpecPrag poly_id spec_co spec_inl))
          --                         , text "spec_co:" <+> ppr spec_co
          --                         , text "ds_rhs:" <+> ppr ds_lhs ]) $
          dflags <- getDynFlags
-       ; case decomposeRuleLhs dflags spec_bndrs ds_lhs of {
+       ; case decomposeRuleLhs dflags spec_bndrs ds_lhs (mkVarSet spec_bndrs) of {
            Left msg -> do { diagnosticDs msg; return Nothing } ;
            Right (rule_bndrs, _fn, rule_lhs_args) -> do
 
@@ -716,22 +714,16 @@ dsSpec mb_poly_rhs (L loc (SpecPrag poly_id spec_co spec_inl))
        ; let fn_unf    = realIdUnfolding poly_id
              simpl_opts = initSimpleOpts dflags
              spec_unf   = specUnfolding simpl_opts spec_bndrs core_app rule_lhs_args fn_unf
-             spec_id    = mkLocalId spec_name Many spec_ty -- Specialised binding is toplevel, hence Many.
+             spec_id    = mkLocalId spec_name ManyTy spec_ty -- Specialised binding is toplevel, hence Many.
                             `setInlinePragma` inl_prag
                             `setIdUnfolding`  spec_unf
 
-       ; rule <- dsMkUserRule this_mod is_local_id
-                        (mkFastString ("SPEC " ++ showPpr dflags poly_name))
-                        rule_act poly_name
-                        rule_bndrs rule_lhs_args
-                        (mkVarApps (Var spec_id) spec_bndrs)
+             rule = mkSpecRule dflags this_mod False rule_act (text "USPEC")
+                               poly_id rule_bndrs rule_lhs_args
+                               (mkVarApps (Var spec_id) spec_bndrs)
+             spec_rhs = mkLams spec_bndrs (core_app poly_rhs)
 
-       ; let spec_rhs = mkLams spec_bndrs (core_app poly_rhs)
-
--- Commented out: see Note [SPECIALISE on INLINE functions]
---       ; when (isInlinePragma id_inl)
---              (diagnosticDs $ text "SPECIALISE pragma on INLINE function probably won't fire:"
---                        <+> quotes (ppr poly_name))
+       ; dsWarnOrphanRule rule
 
        ; return (Just (unitOL (spec_id, spec_rhs), rule))
             -- NB: do *not* use makeCorePair on (spec_id,spec_rhs), because
@@ -774,13 +766,10 @@ dsSpec mb_poly_rhs (L loc (SpecPrag poly_id spec_co spec_inl))
              | otherwise   = spec_prag_act                   -- Specified by user
 
 
-dsMkUserRule :: Module -> Bool -> RuleName -> Activation
-       -> Name -> [CoreBndr] -> [CoreExpr] -> CoreExpr -> DsM CoreRule
-dsMkUserRule this_mod is_local name act fn bndrs args rhs = do
-    let rule = mkRule this_mod False is_local name act fn bndrs args rhs
-    when (isOrphan (ru_orphan rule)) $
-        diagnosticDs (DsOrphanRule rule)
-    return rule
+dsWarnOrphanRule :: CoreRule -> DsM ()
+dsWarnOrphanRule rule
+  = when (isOrphan (ru_orphan rule)) $
+    diagnosticDs (DsOrphanRule rule)
 
 {- Note [SPECIALISE on INLINE functions]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -844,56 +833,82 @@ SPEC f :: ty                [n]   INLINE [k]
 -}
 
 decomposeRuleLhs :: DynFlags -> [Var] -> CoreExpr
+                 -> VarSet   -- Free vars of the RHS
                  -> Either DsMessage ([Var], Id, [CoreExpr])
 -- (decomposeRuleLhs bndrs lhs) takes apart the LHS of a RULE,
 -- The 'bndrs' are the quantified binders of the rules, but decomposeRuleLhs
--- may add some extra dictionary binders (see Note [Free dictionaries])
+-- may add some extra dictionary binders (see Note [Free dictionaries on rule LHS])
 --
 -- Returns an error message if the LHS isn't of the expected shape
 -- Note [Decomposing the left-hand side of a RULE]
-decomposeRuleLhs dflags orig_bndrs orig_lhs
-  | not (null unbound)    -- Check for things unbound on LHS
-                          -- See Note [Unused spec binders]
-  = Left (DsRuleBindersNotBound unbound orig_bndrs orig_lhs lhs2)
+decomposeRuleLhs dflags orig_bndrs orig_lhs rhs_fvs
   | Var funId <- fun2
   , Just con <- isDataConId_maybe funId
   = Left (DsRuleIgnoredDueToConstructor con) -- See Note [No RULES on datacons]
-  | Just (fn_id, args) <- decompose fun2 args2
-  , let extra_bndrs = mk_extra_bndrs fn_id args
-  = -- pprTrace "decomposeRuleLhs" (vcat [ text "orig_bndrs:" <+> ppr orig_bndrs
-    --                                  , text "orig_lhs:" <+> ppr orig_lhs
-    --                                  , text "lhs1:"     <+> ppr lhs1
-    --                                  , text "extra_bndrs:" <+> ppr extra_bndrs
-    --                                  , text "fn_id:" <+> ppr fn_id
-    --                                  , text "args:"   <+> ppr args]) $
-    Right (orig_bndrs ++ extra_bndrs, fn_id, args)
 
-  | otherwise
-  = Left (DsRuleLhsTooComplicated orig_lhs lhs2)
+  | otherwise = case decompose fun2 args2 of
+        Nothing -> -- pprTrace "decomposeRuleLhs 3" (vcat [ text "orig_bndrs:" <+> ppr orig_bndrs
+                   --                                    , text "orig_lhs:" <+> ppr orig_lhs
+                   --                                    , text "rhs_fvs:" <+> ppr rhs_fvs
+                   --                                    , text "orig_lhs:" <+> ppr orig_lhs
+                   --                                    , text "lhs1:" <+> ppr lhs1
+                   --                                    , text "lhs2:" <+> ppr lhs2
+                   --                                    , text "fun2:" <+> ppr fun2
+                   --                                    , text "args2:" <+> ppr args2
+                   --                                    ]) $
+                   Left (DsRuleLhsTooComplicated orig_lhs lhs2)
+        Just (fn_id, args)
+          | not (null unbound) ->
+            -- Check for things unbound on LHS
+            -- See Note [Unused spec binders]
+            -- pprTrace "decomposeRuleLhs 1" (vcat [ text "orig_bndrs:" <+> ppr orig_bndrs
+            --                                     , text "orig_lhs:" <+> ppr orig_lhs
+            --                                     , text "lhs_fvs:" <+> ppr lhs_fvs
+            --                                     , text "rhs_fvs:" <+> ppr rhs_fvs
+            --                                     , text "unbound:" <+> ppr unbound
+            --                                     ]) $
+            Left (DsRuleBindersNotBound unbound orig_bndrs orig_lhs lhs2)
+          | otherwise ->
+            -- pprTrace "decomposeRuleLhs 2" (vcat [ text "orig_bndrs:" <+> ppr orig_bndrs
+            --                                    , text "orig_lhs:" <+> ppr orig_lhs
+            --                                    , text "lhs1:"     <+> ppr lhs1
+            --                                    , text "extra_bndrs:" <+> ppr extra_bndrs
+            --                                    , text "fn_id:" <+> ppr fn_id
+            --                                    , text "args:"   <+> ppr args
+            --                                    , text "args fvs:" <+> ppr (exprsFreeVarsList args)
+            --                                    ]) $
+            Right (trimmed_bndrs ++ extra_bndrs, fn_id, args)
+
+          where -- See Note [Variables unbound on the LHS]
+                lhs_fvs = exprsFreeVars args
+                all_fvs       = lhs_fvs `unionVarSet` rhs_fvs
+                trimmed_bndrs = filter (`elemVarSet` all_fvs) orig_bndrs
+                unbound       = filterOut (`elemVarSet` lhs_fvs) trimmed_bndrs
+                    -- Needed on RHS but not bound on LHS
+
+                -- Add extra tyvar binders: Note [Free tyvars on rule LHS]
+                -- and extra dict binders: Note [Free dictionaries on rule LHS]
+                extra_bndrs = scopedSort extra_tvs ++ extra_dicts
+                  where
+                    extra_tvs   = [ v | v <- extra_vars, isTyVar v ]
+                extra_dicts =
+                  [ mkLocalId (localiseName (idName d)) ManyTy (idType d)
+                  | d <- extra_vars, isDictId d ]
+                extra_vars  =
+                  [ v
+                  | v <- exprsFreeVarsList args
+                  , not (v `elemVarSet` orig_bndr_set)
+                  , not (v == fn_id) ]
+                    -- fn_id: do not quantify over the function itself, which may
+                    -- itself be a dictionary (in pathological cases, #10251)
+
  where
-   simpl_opts   = initSimpleOpts dflags
+   simpl_opts    = initSimpleOpts dflags
+   orig_bndr_set = mkVarSet orig_bndrs
+
    lhs1         = drop_dicts orig_lhs
    lhs2         = simpleOptExpr simpl_opts lhs1  -- See Note [Simplify rule LHS]
    (fun2,args2) = collectArgs lhs2
-
-   lhs_fvs    = exprFreeVars lhs2
-   unbound    = filterOut (`elemVarSet` lhs_fvs) orig_bndrs
-
-   orig_bndr_set = mkVarSet orig_bndrs
-
-        -- Add extra tyvar binders: Note [Free tyvars in rule LHS]
-        -- and extra dict binders: Note [Free dictionaries in rule LHS]
-   mk_extra_bndrs fn_id args
-     = scopedSort unbound_tvs ++ unbound_dicts
-     where
-       unbound_tvs   = [ v | v <- unbound_vars, isTyVar v ]
-       unbound_dicts = [ mkLocalId (localiseName (idName d)) Many (idType d)
-                       | d <- unbound_vars, isDictId d ]
-       unbound_vars  = [ v | v <- exprsFreeVarsList args
-                           , not (v `elemVarSet` orig_bndr_set)
-                           , not (v == fn_id) ]
-         -- fn_id: do not quantify over the function itself, which may
-         -- itself be a dictionary (in pathological cases, #10251)
 
    decompose (Var fn_id) args
       | not (fn_id `elemVarSet` orig_bndr_set)
@@ -913,7 +928,9 @@ decomposeRuleLhs dflags orig_bndrs orig_lhs
 
    split_lets :: CoreExpr -> ([(DictId,CoreExpr)], CoreExpr)
    split_lets (Let (NonRec d r) body)
-     | isDictId d
+     | isDictId d  -- Catches dictionaries, yes, but also catches dictionary
+                   -- /functions/ arising from solving a
+                   -- quantified contraint (#24370)
      = ((d,r):bs, body')
      where (bs, body') = split_lets body
 
@@ -935,12 +952,33 @@ decomposeRuleLhs dflags orig_bndrs orig_lhs
        needed' = (needed `minusVarSet` rhs_fvs) `extendVarSet` d
 
 {-
+Note [Variables unbound on the LHS]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+We obviously want to complain about
+   RULE   forall x. f True = not x
+because the forall'd variable `x` is not bound on the LHS.
+
+It can be a bit delicate when dictionaries are involved.
+Consider #22471
+  {-# RULES "foo" forall (f :: forall a. [a] -> Int).
+                  foo (\xs. 1 + f xs) = 2 + foo f #-}
+
+We get two dicts on the LHS, one from `1` and one from `+`.
+For reasons described in Note [The SimplifyRule Plan] in
+GHC.Tc.Gen.Rule, we quantify separately over those dictionaries:
+   forall f (d1::Num Int) (d2 :: Num Int).
+   foo (\xs. (+) d1 (fromInteger d2 1) xs) = ...
+
+Now the desugarer shortcircuits (fromInteger d2 1) to (I# 1); so d2 is
+not mentioned at all (on LHS or RHS)! We don't want to complain about
+and unbound d2.  Hence the trimmed_bndrs.
+
 Note [Decomposing the left-hand side of a RULE]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 There are several things going on here.
 * drop_dicts: see Note [Drop dictionary bindings on rule LHS]
 * simpleOptExpr: see Note [Simplify rule LHS]
-* extra_dict_bndrs: see Note [Free dictionaries]
+* extra_dict_bndrs: see Note [Free dictionaries on rule LHS]
 
 Note [Free tyvars on rule LHS]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -965,6 +1003,9 @@ Moreover, we have to do something rather similar for dictionaries;
 see Note [Free dictionaries on rule LHS].   So that's why we look for
 type variables free on the LHS, and quantify over them.
 
+This relies on there not being any in-scope tyvars, which is true for
+user-defined RULEs, which are always top-level.
+
 Note [Free dictionaries on rule LHS]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 When the LHS of a specialisation rule, (/\as\ds. f es) has a free dict,
@@ -986,7 +1027,7 @@ And from that we want the rule
 
 But be careful!  That dInt might be GHC.Base.$fOrdInt, which is an External
 Name, and you can't bind them in a lambda or forall without getting things
-confused.   Likewise it might have an InlineRule or something, which would be
+confused.   Likewise it might have a stable unfolding or something, which would be
 utterly bogus. So we really make a fresh Id, with the same unique and type
 as the old one, but with an Internal name and no IdInfo.
 
@@ -997,7 +1038,7 @@ drop_dicts drops dictionary bindings on the LHS where possible.
      --> f d
    Reasoning here is that there is only one d:Eq [Int], and so we can
    quantify over it. That makes 'd' free in the LHS, but that is later
-   picked up by extra_dict_bndrs (Note [Dead spec binders]).
+   picked up by extra_dict_bndrs (see Note [Unused spec binders]).
 
    NB 1: We can only drop the binding if the RHS doesn't bind
          one of the orig_bndrs, which we assume occur on RHS.
@@ -1105,6 +1146,21 @@ So for now, we ban them altogether as requested by #13290. See also #7398.
 *                                                                      *
 ************************************************************************
 
+Note [Desugaring WpFun]
+~~~~~~~~~~~~~~~~~~~~~~~
+See comments on WpFun in GHC.Tc.Types.Evidence for what WpFun means.
+Roughly:
+
+  (WpFun w_arg w_res)[ e ] = \x. w_res[ e w_arg[x] ]
+
+This eta-expansion risk duplicating work, if `e` is not in HNF.
+At one stage I thought we could avoid that by desugaring to
+      let f = e in \x. w_res[ f w_arg[x] ]
+But that /fundamentally/ doesn't work, because `w_res` may bind
+evidence that is used in `e`.
+
+This question arose when thinking about deep subsumption; see
+https://github.com/ghc-proposals/ghc-proposals/pull/287#issuecomment-1125419649).
 -}
 
 dsHsWrapper :: HsWrapper -> DsM (CoreExpr -> CoreExpr)
@@ -1117,9 +1173,7 @@ dsHsWrapper (WpLet ev_binds)  = do { bs <- dsTcEvBinds ev_binds
 dsHsWrapper (WpCompose c1 c2) = do { w1 <- dsHsWrapper c1
                                    ; w2 <- dsHsWrapper c2
                                    ; return (w1 . w2) }
- -- See comments on WpFun in GHC.Tc.Types.Evidence for an explanation of what
- -- the specification of this clause is
-dsHsWrapper (WpFun c1 c2 (Scaled w t1))
+dsHsWrapper (WpFun c1 c2 (Scaled w t1))  -- See Note [Desugaring WpFun]
                               = do { x <- newSysLocalDs w t1
                                    ; w1 <- dsHsWrapper c1
                                    ; w2 <- dsHsWrapper c2
@@ -1208,8 +1262,7 @@ dsEvTypeable :: Type -> EvTypeable -> DsM CoreExpr
 dsEvTypeable ty ev
   = do { tyCl <- dsLookupTyCon typeableClassName    -- Typeable
        ; let kind = typeKind ty
-             Just typeable_data_con
-                 = tyConSingleDataCon_maybe tyCl    -- "Data constructor"
+             typeable_data_con = tyConSingleDataCon tyCl  -- "Data constructor"
                                                     -- for Typeable
 
        ; rep_expr <- ds_ev_typeable ty ev           -- :: TypeRep a
@@ -1266,7 +1319,7 @@ ds_ev_typeable ty (EvTypeableTyApp ev1 ev2)
        }
 
 ds_ev_typeable ty (EvTypeableTrFun evm ev1 ev2)
-  | Just (m,t1,t2) <- splitFunTy_maybe ty
+  | Just (_af,m,t1,t2) <- splitFunTy_maybe ty
   = do { e1 <- getRep ev1 t1
        ; e2 <- getRep ev2 t2
        ; em <- getRep evm m

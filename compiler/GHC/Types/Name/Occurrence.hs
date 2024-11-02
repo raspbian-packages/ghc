@@ -6,7 +6,6 @@
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE LambdaCase #-}
 
 -- |
 -- #name_types#
@@ -115,6 +114,7 @@ import GHC.Utils.Binary
 import Control.DeepSeq
 import Data.Char
 import Data.Data
+import qualified Data.Semigroup as S
 
 {-
 ************************************************************************
@@ -200,7 +200,7 @@ pprNonVarNameSpace :: NameSpace -> SDoc
 pprNonVarNameSpace VarName = empty
 pprNonVarNameSpace ns = pprNameSpace ns
 
-pprNameSpaceBrief :: NameSpace -> SDoc
+pprNameSpaceBrief :: IsLine doc => NameSpace -> doc
 pprNameSpaceBrief DataName  = char 'd'
 pprNameSpaceBrief VarName   = char 'v'
 pprNameSpaceBrief TvName    = text "tv"
@@ -246,8 +246,7 @@ instance Eq OccName where
 
 instance Ord OccName where
         -- Compares lexicographically, *not* by Unique of the string
-    compare (OccName sp1 s1) (OccName sp2 s2)
-        = (s1  `lexicalCompareFS` s2) `thenCmp` (sp1 `compare` sp2)
+    compare (OccName sp1 s1) (OccName sp2 s2) = lexicalCompareFS s1 s2 S.<> compare sp1 sp2
 
 instance Data OccName where
   -- don't traverse?
@@ -277,29 +276,14 @@ instance OutputableBndr OccName where
     pprInfixOcc n = pprInfixVar (isSymOcc n) (ppr n)
     pprPrefixOcc n = pprPrefixVar (isSymOcc n) (ppr n)
 
-pprOccName :: OccName -> SDoc
+pprOccName :: IsLine doc => OccName -> doc
 pprOccName (OccName sp occ)
-  = getPprStyle $ \ sty ->
-    if codeStyle sty
+  = docWithContext $ \ sty ->
+    if codeStyle (sdocStyle sty)
     then ztext (zEncodeFS occ)
-    else pp_occ <> whenPprDebug (braces (pprNameSpaceBrief sp))
-  where
-    pp_occ = sdocOption sdocSuppressUniques $ \case
-               True  -> text (strip_th_unique (unpackFS occ))
-               False -> ftext occ
-
-        -- See Note [Suppressing uniques in OccNames]
-    strip_th_unique ('[' : c : _) | isAlphaNum c = []
-    strip_th_unique (c : cs) = c : strip_th_unique cs
-    strip_th_unique []       = []
+    else ftext occ <> whenPprDebug (braces (pprNameSpaceBrief sp))
 
 {-
-Note [Suppressing uniques in OccNames]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-This is a hack to de-wobblify the OccNames that contain uniques from
-Template Haskell that have been turned into a string in the OccName.
-See Note [Unique OccNames from Template Haskell] in "GHC.ThToHs"
-
 ************************************************************************
 *                                                                      *
 \subsection{Construction}
@@ -445,6 +429,13 @@ instance Outputable a => Outputable (OccEnv a) where
 pprOccEnv :: (a -> SDoc) -> OccEnv a -> SDoc
 pprOccEnv ppr_elt (A env) = pprUniqFM ppr_elt env
 
+instance NFData a => NFData (OccEnv a) where
+  rnf = forceOccEnv rnf
+
+-- | Force an 'OccEnv' with the provided function.
+forceOccEnv :: (a -> ()) -> OccEnv a -> ()
+forceOccEnv nf (A fs) = seqEltsUFM nf fs
+
 type OccSet = UniqSet OccName
 
 emptyOccSet       :: OccSet
@@ -535,7 +526,9 @@ parenSymOcc occ doc | isSymOcc occ = parens doc
 startsWithUnderscore :: OccName -> Bool
 -- ^ Haskell 98 encourages compilers to suppress warnings about unused
 -- names in a pattern if they start with @_@: this implements that test
-startsWithUnderscore occ = headFS (occNameFS occ) == '_'
+startsWithUnderscore occ = case unpackFS (occNameFS occ) of
+  '_':_ -> True
+  _     -> False
 
 {-
 ************************************************************************
@@ -660,8 +653,8 @@ mkGenR   = mk_simple_deriv tcName "Rep_"
 mkGen1R  = mk_simple_deriv tcName "Rep1_"
 
 -- Overloaded record field selectors
-mkRecFldSelOcc :: String -> OccName
-mkRecFldSelOcc s = mk_deriv varName "$sel" [fsLit s]
+mkRecFldSelOcc :: FastString -> OccName
+mkRecFldSelOcc s = mk_deriv varName "$sel" [s]
 
 mk_simple_deriv :: NameSpace -> FastString -> OccName -> OccName
 mk_simple_deriv sp px occ = mk_deriv sp px [occNameFS occ]
@@ -807,7 +800,6 @@ after we allocate a new one.
 
 Note [Tidying multiple names at once]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
 Consider
 
     > :t (id,id,id)
@@ -875,13 +867,13 @@ tidyOccName env occ@(OccName occ_sp fs)
     base1 = mkFastString (base ++ "1")
 
     find !k !n
-      = case lookupUFM env new_fs of
-          Just {} -> find (k+1 :: Int) (n+k)
+      = case elemUFM new_fs env of
+          True -> find (k+1 :: Int) (n+k)
                        -- By using n+k, the n argument to find goes
                        --    1, add 1, add 2, add 3, etc which
                        -- moves at quadratic speed through a dense patch
 
-          Nothing -> (new_env, OccName occ_sp new_fs)
+          False -> (new_env, OccName occ_sp new_fs)
        where
          new_fs = mkFastString (base ++ show n)
          new_env = addToUFM (addToUFM env new_fs 1) base1 (n+1)

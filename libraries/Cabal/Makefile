@@ -71,14 +71,26 @@ ghcid-lib :
 ghcid-cli :
 	ghcid -c 'cabal v2-repl cabal-install'
 
-# doctests (relies on .ghc.environment files)
-
+# Artem, 2023-02-03, https://github.com/haskell/cabal/issues/8504
+# The new and prefered way to call the doctest tool (as of now) is based on cabal repl --with-ghc=doctest.
+# The call below reflects the current documentation of the doctest tool except one caveat,
+# which is https://github.com/haskell/cabal/issues/6859, i.e. we have to hide allow-newer in our project
+# file from cabal/doctest. This is easy: we just select a project file with no allow-newer (e.g. cabal.project.libonly).
+#
+# TODO: Cabal-described should be added here but its doctests currently broken, see:
+#       https://github.com/haskell/cabal/issues/8734
+#       Just as well, cabal-install(-solver) doctests (the target below) bitrotted and need some care.
 doctest :
-	doctest --fast Cabal-syntax/src Cabal/src
+	cabal repl --with-ghc=doctest --build-depends=QuickCheck --build-depends=template-haskell --repl-options="-w" --project-file="cabal.project.doctest" Cabal-syntax
+	cabal repl --with-ghc=doctest --build-depends=QuickCheck --build-depends=template-haskell --repl-options="-w" --project-file="cabal.project.doctest" Cabal
+
 
 # This is not run as part of validate.sh (we need hackage-security, which is tricky to get).
 doctest-cli :
 	doctest -D__DOCTEST__ --fast cabal-install/src cabal-install-solver/src cabal-install-solver/src-assertion
+
+doctest-install:
+	cabal install doctest --overwrite-policy=always --ignore-project
 
 # tests
 
@@ -126,7 +138,6 @@ cabal-install-test-accept:
 #
 #   make validate-via-docker-all -j4 -O
 #
-validate-via-docker-all : validate-via-docker-8.0.2
 validate-via-docker-all : validate-via-docker-8.2.2
 validate-via-docker-all : validate-via-docker-8.4.4
 validate-via-docker-all : validate-via-docker-8.6.5
@@ -138,7 +149,6 @@ validate-dockerfiles : .docker/validate-8.8.4.dockerfile
 validate-dockerfiles : .docker/validate-8.6.5.dockerfile
 validate-dockerfiles : .docker/validate-8.4.4.dockerfile
 validate-dockerfiles : .docker/validate-8.2.2.dockerfile
-validate-dockerfiles : .docker/validate-8.6.5.dockerfile
 
 .docker/validate-%.dockerfile : .docker/validate.dockerfile.zinza cabal-dev-scripts/src/GenValidateDockerfile.hs
 	cabal v2-run --builddir=dist-newstyle-meta --project-file=cabal.project.meta gen-validate-dockerfile -- $* $< $@
@@ -146,9 +156,6 @@ validate-dockerfiles : .docker/validate-8.6.5.dockerfile
 # This is good idea anyway
 # and we have a test relying on this limit being sufficiently small
 DOCKERARGS:=--ulimit nofile=1024:1024
-
-validate-via-docker-8.0.2:
-	docker build $(DOCKERARGS) -t cabal-validate:8.0.2 -f .docker/validate-8.0.2.dockerfile .
 
 validate-via-docker-8.2.2:
 	docker build $(DOCKERARGS) -t cabal-validate:8.2.2 -f .docker/validate-8.2.2.dockerfile .
@@ -182,13 +189,13 @@ tags :
 ##############################################################################
 
 bootstrap-json-%: phony
-	cabal v2-build --project=cabal.project.release --with-compiler=ghc-$* --dry-run cabal-install:exe:cabal
+	cabal v2-build --project-file=cabal.project.release --with-compiler=ghc-$* --dry-run cabal-install:exe:cabal
 	cp dist-newstyle/cache/plan.json bootstrap/linux-$*.plan.json
 	@# -v0 to avoid build output on stdout
 	cd bootstrap && cabal v2-run -v0 cabal-bootstrap-gen -- linux-$*.plan.json \
 		| python3 -m json.tool > linux-$*.json
 
-BOOTSTRAP_GHC_VERSIONS := 8.6.5 8.8.4 8.10.7 9.0.2 9.2.3
+BOOTSTRAP_GHC_VERSIONS := 8.10.7 9.0.2 9.2.8 9.4.8
 
 bootstrap-jsons: $(BOOTSTRAP_GHC_VERSIONS:%=bootstrap-json-%)
 

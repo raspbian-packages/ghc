@@ -12,7 +12,8 @@ import GHC.Prelude
 
 import GHC.Hs
 import GHC.Core.Class
-import GHC.Core.Type ( typeKind )
+import GHC.Core.Type( typeKind )
+
 import GHC.Types.Var( tyVarKind )
 import GHC.Tc.Errors.Types
 import GHC.Tc.Utils.Monad
@@ -26,8 +27,9 @@ import GHC.Builtin.Names
 import GHC.Types.Error
 import GHC.Types.SrcLoc
 import GHC.Utils.Outputable
-import GHC.Utils.Panic
 import qualified GHC.LanguageExtensions as LangExt
+
+import Data.List.NonEmpty ( NonEmpty (..) )
 
 tcDefaults :: [LDefaultDecl GhcRn]
            -> TcM (Maybe [Type])    -- Defaulting types to heave
@@ -67,9 +69,9 @@ tcDefaults [L locn (DefaultDecl _ mono_tys)]
 
         ; return (Just tau_tys) }
 
-tcDefaults decls@(L locn (DefaultDecl _ _) : _)
+tcDefaults (decl@(L locn (DefaultDecl _ _)) : decls)
   = setSrcSpan (locA locn) $
-    failWithTc (dupDefaultDeclErr decls)
+    failWithTc (dupDefaultDeclErr (decl:|decls))
 
 
 tc_default_ty :: [Class] -> LHsType GhcRn -> TcM Type
@@ -103,7 +105,6 @@ check_instance ty cls
 defaultDeclCtxt :: SDoc
 defaultDeclCtxt = text "When checking the types in a default declaration"
 
-dupDefaultDeclErr :: [LDefaultDecl GhcRn] -> TcRnMessage
-dupDefaultDeclErr (L _ (DefaultDecl _ _) : dup_things)
+dupDefaultDeclErr :: NonEmpty (LDefaultDecl GhcRn) -> TcRnMessage
+dupDefaultDeclErr (L _ (DefaultDecl _ _) :| dup_things)
   = TcRnMultipleDefaultDeclarations dup_things
-dupDefaultDeclErr [] = panic "dupDefaultDeclErr []"

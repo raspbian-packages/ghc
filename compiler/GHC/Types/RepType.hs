@@ -13,7 +13,7 @@ module GHC.Types.RepType
     -- * Type representation for the code generator
     typePrimRep, typePrimRep1,
     runtimeRepPrimRep, typePrimRepArgs,
-    PrimRep(..), primRepToType, primRepToRuntimeRep,
+    PrimRep(..), primRepToRuntimeRep, primRepToType,
     countFunRepArgs, countConRepArgs, dataConRuntimeRepStrictness,
     tyConPrimRep, tyConPrimRep1,
     runtimeRepPrimRep_maybe, kindPrimRep_maybe, typePrimRep_maybe,
@@ -31,7 +31,6 @@ import GHC.Prelude
 
 import GHC.Types.Basic (Arity, RepArity)
 import GHC.Core.DataCon
-import GHC.Builtin.Names
 import GHC.Core.Coercion
 import GHC.Core.TyCon
 import GHC.Core.TyCon.RecWalk
@@ -56,8 +55,8 @@ import {-# SOURCE #-} GHC.Builtin.Types ( anyTypeOfKind
 import GHC.Utils.Misc
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
-import GHC.Utils.Panic.Plain
 
+import Data.List.NonEmpty (NonEmpty (..))
 import Data.List (sort)
 import qualified Data.IntSet as IS
 
@@ -205,14 +204,14 @@ type SortedSlotTys = [SlotTy]
 --
 -- INVARIANT: Result slots are sorted (via Ord SlotTy), except that at the head
 -- of the list we have the slot for the tag.
-ubxSumRepType :: [[PrimRep]] -> [SlotTy]
+ubxSumRepType :: [[PrimRep]] -> NonEmpty SlotTy
 ubxSumRepType constrs0
   -- These first two cases never classify an actual unboxed sum, which always
   -- has at least two disjuncts. But it could happen if a user writes, e.g.,
   -- forall (a :: TYPE (SumRep [IntRep])). ...
   -- which could never be instantiated. We still don't want to panic.
   | constrs0 `lengthLessThan` 2
-  = [WordSlot]
+  = WordSlot :| []
 
   | otherwise
   = let
@@ -240,7 +239,7 @@ ubxSumRepType constrs0
       rep :: [PrimRep] -> SortedSlotTys
       rep ty = sort (map primRepSlot ty)
 
-      sumRep = WordSlot : combine_alts (map rep constrs0)
+      sumRep = WordSlot :| combine_alts (map rep constrs0)
                -- WordSlot: for the tag of the sum
     in
       sumRep
@@ -306,11 +305,10 @@ instance Outputable SlotTy where
   ppr (VecSlot n e)   = text "VecSlot" <+> ppr n <+> ppr e
 
 typeSlotTy :: UnaryType -> Maybe SlotTy
-typeSlotTy ty
-  | isZeroBitTy ty
-  = Nothing
-  | otherwise
-  = Just (primRepSlot (typePrimRep1 ty))
+typeSlotTy ty = case typePrimRep ty of
+                  [] -> Nothing
+                  [rep] -> Just (primRepSlot rep)
+                  reps -> pprPanic "typeSlotTy" (ppr ty $$ ppr reps)
 
 primRepSlot :: PrimRep -> SlotTy
 primRepSlot VoidRep     = pprPanic "primRepSlot" (text "No slot for VoidRep")
@@ -528,7 +526,7 @@ GHC.Builtin.Types and its helper function mk_runtime_rep_dc.) Example 2 passes t
 list as the one argument to the extracted function. The extracted function is defined
 as prim_rep_fun within tupleRepDataCon in GHC.Builtin.Types. It takes one argument, decomposes
 the promoted list (with extractPromotedList), and then recurs back to runtimeRepPrimRep
-to process the LiftedRep and WordRep, concatentating the results.
+to process the LiftedRep and WordRep, concatenating the results.
 
 -}
 
@@ -584,60 +582,58 @@ tyConPrimRep1 tc = case tyConPrimRep tc of
 -- See also Note [Getting from RuntimeRep to PrimRep]
 kindPrimRep :: HasDebugCallStack => SDoc -> Kind -> [PrimRep]
 kindPrimRep doc ki
-  | Just ki' <- coreView ki
-  = kindPrimRep doc ki'
-kindPrimRep doc (TyConApp typ [runtime_rep])
-  = assert (typ `hasKey` tYPETyConKey) $
-    runtimeRepPrimRep doc runtime_rep
+  | Just runtime_rep <- kindRep_maybe ki
+  = runtimeRepPrimRep doc runtime_rep
 kindPrimRep doc ki
   = pprPanic "kindPrimRep" (ppr ki $$ doc)
 
 -- NB: We could implement the partial methods by calling into the maybe
 -- variants here. But then both would need to pass around the doc argument.
 
--- | Take a kind (of shape @TYPE rr@) and produce the 'PrimRep's
+-- | Take a kind (of shape `TYPE rr` or `CONSTRAINT rr`) and produce the 'PrimRep's
 -- of values of types of this kind.
 -- See also Note [Getting from RuntimeRep to PrimRep]
 -- Returns Nothing if rep can't be determined. Eg. levity polymorphic types.
 kindPrimRep_maybe :: HasDebugCallStack => Kind -> Maybe [PrimRep]
 kindPrimRep_maybe ki
-  | Just ki' <- coreView ki
-  = kindPrimRep_maybe ki'
-kindPrimRep_maybe (TyConApp typ [runtime_rep])
-  = assert (typ `hasKey` tYPETyConKey) $
-    runtimeRepPrimRep_maybe runtime_rep
-kindPrimRep_maybe _ki
-  = Nothing
+  | Just (_torc, rep) <- sORTKind_maybe ki
+  = runtimeRepPrimRep_maybe rep
+  | otherwise
+  = pprPanic "kindPrimRep" (ppr ki)
 
 -- | Take a type of kind RuntimeRep and extract the list of 'PrimRep' that
--- it encodes. See also Note [Getting from RuntimeRep to PrimRep]
--- The [PrimRep] is the final runtime representation /after/ unarisation
-runtimeRepPrimRep :: HasDebugCallStack => SDoc -> Type -> [PrimRep]
+-- it encodes. See also Note [Getting from RuntimeRep to PrimRep].
+-- The @[PrimRep]@ is the final runtime representation /after/ unarisation.
+--
+-- The result does not contain any VoidRep.
+runtimeRepPrimRep :: HasDebugCallStack => SDoc -> RuntimeRepType -> [PrimRep]
 runtimeRepPrimRep doc rr_ty
   | Just rr_ty' <- coreView rr_ty
   = runtimeRepPrimRep doc rr_ty'
   | TyConApp rr_dc args <- rr_ty
-  , RuntimeRep fun <- tyConRuntimeRepInfo rr_dc
+  , RuntimeRep fun <- tyConPromDataConInfo rr_dc
   = fun args
   | otherwise
   = pprPanic "runtimeRepPrimRep" (doc $$ ppr rr_ty)
 
 -- | Take a type of kind RuntimeRep and extract the list of 'PrimRep' that
--- it encodes. See also Note [Getting from RuntimeRep to PrimRep]
--- The [PrimRep] is the final runtime representation /after/ unarisation
--- Returns Nothing if rep can't be determined. Eg. levity polymorphic types.
+-- it encodes. See also Note [Getting from RuntimeRep to PrimRep].
+-- The @[PrimRep]@ is the final runtime representation /after/ unarisation
+-- and does not contain VoidRep.
+--
+-- Returns @Nothing@ if rep can't be determined. Eg. levity polymorphic types.
 runtimeRepPrimRep_maybe :: Type -> Maybe [PrimRep]
 runtimeRepPrimRep_maybe rr_ty
   | Just rr_ty' <- coreView rr_ty
   = runtimeRepPrimRep_maybe rr_ty'
   | TyConApp rr_dc args <- rr_ty
-  , RuntimeRep fun <- tyConRuntimeRepInfo rr_dc
+  , RuntimeRep fun <- tyConPromDataConInfo rr_dc
   = Just $! fun args
   | otherwise
   = Nothing
 
 -- | Convert a 'PrimRep' to a 'Type' of kind RuntimeRep
-primRepToRuntimeRep :: PrimRep -> Type
+primRepToRuntimeRep :: PrimRep -> RuntimeRepType
 primRepToRuntimeRep rep = case rep of
   VoidRep       -> zeroBitRepTy
   LiftedRep     -> liftedRepTy

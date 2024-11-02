@@ -9,6 +9,7 @@ Kind polymorphism
 
     :implies: :extension:`PolyKinds`, :extension:`DataKinds`, :extension:`KindSignatures`
     :since: 8.0.1
+    :status: Deprecated
 
     The extension :extension:`TypeInType` is now deprecated: its sole effect is
     to switch on :extension:`PolyKinds`
@@ -20,6 +21,8 @@ Kind polymorphism
 
     :implies: :extension:`KindSignatures`
     :since: 7.4.1
+
+    :status: Included in :extension:`GHC2021`
 
     Allow kind polymorphic types.
 
@@ -251,6 +254,7 @@ Complete user-supplied kind signatures and polymorphic recursion
     :shortdesc: Enable detection of complete user-supplied kind signatures.
 
     :since: 8.10.1
+    :status: Included in :extension:`Haskell98`, :extension:`Haskell2010`
 
 NB! This is a legacy feature, see :extension:`StandaloneKindSignatures` for the
 modern replacement.
@@ -384,6 +388,7 @@ Standalone kind signatures and polymorphic recursion
 
     :implies: :extension:`NoCUSKs`
     :since: 8.10.1
+    :status: Included in :extension:`GHC2021`
 
 Just as in type inference, kind inference for recursive types can only
 use *monomorphic* recursion. Consider this (contrived) example: ::
@@ -472,7 +477,7 @@ Standalone kind signatures and declaration headers
 --------------------------------------------------
 
 GHC requires that in the presence of a standalone kind signature, data
-declarations must bind all their inputs. For example: ::
+declarations must bind all their parameters For example: ::
 
     type Prox1 :: k -> Type
     data Prox1 a = MkProx1
@@ -485,7 +490,7 @@ declarations must bind all their inputs. For example: ::
       --   • In the data type declaration for ‘Prox2’
 
 
-GADT-style data declarations may either bind their inputs or use an inline
+GADT-style data declarations may either bind their parameters or use an inline
 signature in addition to the standalone kind signature: ::
 
     type GProx1 :: k -> Type
@@ -502,9 +507,19 @@ signature in addition to the standalone kind signature: ::
     data GProx3 :: k -> Type where MkGProx3 :: GProx3 a
       -- OK.
 
-    type GProx4 :: k -> Type
-    data GProx4 :: w where MkGProx4 :: GProx4 a
-      -- OK, w ~ (k -> Type)
+    type GProx4 :: k1 -> Type
+    data GProx4 :: k2 -> Type where MkGProx4 :: GProx4 a
+      -- OK.
+
+Note that variables in a kind signature must stand for variables, not
+arbitrary types. For example, the following is rejected: ::
+
+    type GProx5 :: k -> Type
+    data GProx5 :: w where MkGProx5 :: GProx5 a
+      -- Error:
+      --   • Couldn't match expected kind ‘w’ with actual kind ‘k -> Type’
+      --   • In the data type declaration for ‘GProx5’
+
 
 Classes are subject to the same rules: ::
 
@@ -519,10 +534,29 @@ Classes are subject to the same rules: ::
       --                 with actual kind ‘Type -> Constraint’
       --   • In the class declaration for ‘C2’
 
-On the other hand, type families are exempt from this rule: ::
+For type families, the number of parameters in the kind signature takes on
+additional meaning: it specifies the arity of the type family, i.e. how many
+arguments the type family requires before reducing.
+Any type family instances must then provide the same number of arguments.
+For example: ::
 
-    type F :: Type -> Type
-    type family F
+    type F1 :: Type -> Type
+    type family F1 where
+      F1 = Maybe
+      -- OK.
+
+    type F2 :: Type -> Type
+    type family F2 where
+      F2 () = Bool
+      F2 a  = Maybe a
+      -- Error:
+      --   • Number of parameters must match family declaration; expected 0
+      --   • In the type family declaration for `F2'
+
+    type F3 :: Type -> Type
+    type family F3 a where
+      F3 () = Bool
+      F3 a  = Maybe a
       -- OK.
 
 Data families are tricky territory. Their headers are exempt from this rule,
@@ -875,6 +909,7 @@ The kind ``Type``
     :shortdesc: Treat ``*`` as ``Data.Kind.Type``.
 
     :since: 8.6.1
+    :status: Included in :extension:`Haskell98`, :extension:`Haskell2010`, :extension:`GHC2021`
 
     Treat the unqualified uses of the ``*`` type operator as nullary and desugar
     to ``Data.Kind.Type``.
@@ -1056,5 +1091,3 @@ Examples::
    single: TYPE
    single: levity polymorphism
    single: representation polymorphism
-
-

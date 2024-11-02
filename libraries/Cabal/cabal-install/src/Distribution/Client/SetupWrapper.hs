@@ -29,6 +29,7 @@ import Distribution.Client.Compat.Prelude
 import Distribution.CabalSpecVersion (cabalSpecMinimumLibraryVersion)
 import qualified Distribution.Make as Make
 import qualified Distribution.Simple as Simple
+
 import Distribution.Version
          ( Version, mkVersion, versionNumbers, VersionRange, anyVersion
          , intersectVersionRanges, orLaterVersion
@@ -59,9 +60,10 @@ import Distribution.Simple.Program
          ( ProgramDb, emptyProgramDb
          , getProgramSearchPath, getDbProgramOutput, runDbProgram, ghcProgram
          , ghcjsProgram )
+import Distribution.Simple.Program.Db
+         ( appendProgramSearchPath )
 import Distribution.Simple.Program.Find
-         ( programSearchPathAsPATHVar
-         , ProgramSearchPathEntry(ProgramSearchPathDir) )
+         ( programSearchPathAsPATHVar )
 import Distribution.Simple.Program.Run
          ( getEffectiveEnvironment )
 import qualified Distribution.Simple.Program.Strip as Strip
@@ -77,7 +79,7 @@ import Distribution.Simple.PackageIndex (InstalledPackageIndex)
 import qualified Distribution.InstalledPackageInfo as IPI
 import Distribution.Client.Types
 import Distribution.Client.Config
-         ( getCabalDir )
+         ( defaultCacheDir )
 import Distribution.Client.IndexUtils
          ( getInstalledPackages )
 import Distribution.Client.JobControl
@@ -87,8 +89,8 @@ import Distribution.Simple.Setup
 import Distribution.Utils.Generic
          ( safeHead )
 import Distribution.Simple.Utils
-         ( die', debug, info, infoNoWrap
-         , cabalVersion, tryFindPackageDesc
+         ( die', debug, info, infoNoWrap, maybeExit
+         , cabalVersion, tryFindPackageDesc, rawSystemProc
          , createDirectoryIfMissingVerbose, installExecutableFile
          , copyFileVerbose, rewriteFileEx, rewriteFileLBS )
 import Distribution.Client.Utils
@@ -109,9 +111,8 @@ import Distribution.Compat.Stack
 import System.Directory    ( doesFileExist )
 import System.FilePath     ( (</>), (<.>) )
 import System.IO           ( Handle, hPutStr )
-import Distribution.Compat.Process (createProcess)
-import System.Process      ( StdStream(..), proc, waitForProcess
-                           , ProcessHandle )
+import Distribution.Compat.Process (proc)
+import System.Process      ( StdStream(..) )
 import qualified System.Process as Process
 import Data.List           ( foldl1' )
 import Distribution.Client.Compat.ExecutablePath  ( getExecutablePath )
@@ -241,7 +242,7 @@ data SetupScriptOptions = SetupScriptOptions {
     -- When we are installing in parallel, we always use the external setup
     -- method. Since compiling the setup script each time adds noticeable
     -- overhead, we use a shared setup script cache
-    -- ('~/.cabal/setup-exe-cache'). For each (compiler, platform, Cabal
+    -- ('$XDG_CACHE_HOME/cabal/setup-exe-cache'). For each (compiler, platform, Cabal
     -- version) combination the cache holds a compiled setup script
     -- executable. This only affects the Simple build type; for the Custom,
     -- Configure and Make build types we always compile the setup script anew.
@@ -437,34 +438,31 @@ buildTypeAction Configure = Simple.defaultMainWithHooksArgs
 buildTypeAction Make      = Make.defaultMainArgs
 buildTypeAction Custom               = error "buildTypeAction Custom"
 
+invoke :: Verbosity -> FilePath -> [String] -> SetupScriptOptions -> IO ()
+invoke verbosity path args options = do
+  info verbosity $ unwords (path : args)
+  case useLoggingHandle options of
+    Nothing        -> return ()
+    Just logHandle -> info verbosity $ "Redirecting build log to " ++ show logHandle
 
--- | @runProcess'@ is a version of @runProcess@ where we have
--- the additional option to decide whether or not we should
--- delegate CTRL+C to the spawned process.
-runProcess' :: FilePath                 -- ^ Filename of the executable
-            -> [String]                 -- ^ Arguments to pass to executable
-            -> Maybe FilePath           -- ^ Optional path to working directory
-            -> Maybe [(String, String)] -- ^ Optional environment
-            -> Maybe Handle             -- ^ Handle for @stdin@
-            -> Maybe Handle             -- ^ Handle for @stdout@
-            -> Maybe Handle             -- ^ Handle for @stderr@
-            -> Bool                     -- ^ Delegate Ctrl+C ?
-            -> IO ProcessHandle
-runProcess' cmd args mb_cwd mb_env mb_stdin mb_stdout mb_stderr _delegate = do
-  (_,_,_,ph) <-
-    createProcess
-      (proc cmd args){ Process.cwd = mb_cwd
-                     , Process.env = mb_env
-                     , Process.std_in  = mbToStd mb_stdin
-                     , Process.std_out = mbToStd mb_stdout
-                     , Process.std_err = mbToStd mb_stderr
-                     , Process.delegate_ctlc = _delegate
-                     }
-  return ph
-  where
-    mbToStd :: Maybe Handle -> StdStream
-    mbToStd Nothing = Inherit
-    mbToStd (Just hdl) = UseHandle hdl
+  progDb <- appendProgramSearchPath verbosity (useExtraPathEnv options) (useProgramDb options)
+
+  searchpath <- programSearchPathAsPATHVar $ getProgramSearchPath progDb
+  env       <- getEffectiveEnvironment $
+                 [ ("PATH", Just searchpath)
+                 , ("HASKELL_DIST_DIR", Just (useDistPref options))
+                 ] ++ useExtraEnvOverrides options
+
+  let loggingHandle = case useLoggingHandle options of
+                        Nothing -> Inherit
+                        Just hdl -> UseHandle hdl
+      cp = (proc path args) { Process.cwd = useWorkingDir options
+                            , Process.env = env
+                            , Process.std_out = loggingHandle
+                            , Process.std_err = loggingHandle
+                            , Process.delegate_ctlc = isInteractive options
+                            }
+  maybeExit $ rawSystemProc verbosity cp
 
 -- ------------------------------------------------------------
 -- * Self-Exec SetupMethod
@@ -478,83 +476,43 @@ selfExecSetupMethod verbosity options bt args0 = do
   info verbosity $ "Using self-exec internal setup method with build-type "
                  ++ show bt ++ " and args:\n  " ++ show args
   path <- getExecutablePath
-  info verbosity $ unwords (path : args)
-  case useLoggingHandle options of
-    Nothing        -> return ()
-    Just logHandle -> info verbosity $ "Redirecting build log to "
-                                    ++ show logHandle
-
-  searchpath <- programSearchPathAsPATHVar
-                (map ProgramSearchPathDir (useExtraPathEnv options) ++
-                 getProgramSearchPath (useProgramDb options))
-  env       <- getEffectiveEnvironment $
-                 [ ("PATH", Just searchpath)
-                 , ("HASKELL_DIST_DIR", Just (useDistPref options))
-                 ] ++ useExtraEnvOverrides options
-  process <- runProcess' path args
-             (useWorkingDir options) env Nothing
-             (useLoggingHandle options) (useLoggingHandle options)
-             (isInteractive options)
-  exitCode <- waitForProcess process
-  unless (exitCode == ExitSuccess) $ exitWith exitCode
+  invoke verbosity path args options
 
 -- ------------------------------------------------------------
 -- * External SetupMethod
 -- ------------------------------------------------------------
 
 externalSetupMethod :: WithCallStack (FilePath -> SetupRunner)
-externalSetupMethod path verbosity options _ args = do
-  info verbosity $ unwords (path : args)
-  case useLoggingHandle options of
-    Nothing        -> return ()
-    Just logHandle -> info verbosity $ "Redirecting build log to "
-                                    ++ show logHandle
-
-  -- See 'Note: win32 clean hack' above.
-#ifdef mingw32_HOST_OS
-  if useWin32CleanHack options then doWin32CleanHack path else doInvoke path
+externalSetupMethod path verbosity options _ args =
+#ifndef mingw32_HOST_OS
+  invoke verbosity path args options
 #else
-  doInvoke path
-#endif
-
+  -- See 'Note: win32 clean hack' above.
+  if useWin32CleanHack options
+    then invokeWithWin32CleanHack path
+    else invoke' path
   where
-    doInvoke path' = do
-      searchpath <- programSearchPathAsPATHVar
-                    (map ProgramSearchPathDir (useExtraPathEnv options) ++
-                      getProgramSearchPath (useProgramDb options))
-      env        <- getEffectiveEnvironment $
-                      [ ("PATH", Just searchpath)
-                      , ("HASKELL_DIST_DIR", Just (useDistPref options))
-                      ] ++ useExtraEnvOverrides options
+    invoke' p = invoke verbosity p args options
 
-      debug verbosity $ "Setup arguments: "++unwords args
-      process <- runProcess' path' args
-                  (useWorkingDir options) env Nothing
-                  (useLoggingHandle options) (useLoggingHandle options)
-                  (isInteractive options)
-      exitCode <- waitForProcess process
-      unless (exitCode == ExitSuccess) $ exitWith exitCode
-
-#ifdef mingw32_HOST_OS
-    doWin32CleanHack path' = do
+    invokeWithWin32CleanHack origPath = do
       info verbosity $ "Using the Win32 clean hack."
       -- Recursively removes the temp dir on exit.
       withTempDirectory verbosity (workingDir options) "cabal-tmp" $ \tmpDir ->
-          bracket (moveOutOfTheWay tmpDir path')
-                  (maybeRestore path')
-                  doInvoke
+          bracket (moveOutOfTheWay tmpDir origPath)
+                  (\tmpPath -> maybeRestore origPath tmpPath)
+                  (\tmpPath -> invoke' tmpPath)
 
-    moveOutOfTheWay tmpDir path' = do
-      let newPath = tmpDir </> "setup" <.> exeExtension buildPlatform
-      Win32.moveFile path' newPath
-      return newPath
+    moveOutOfTheWay tmpDir origPath = do
+      let tmpPath = tmpDir </> "setup" <.> exeExtension buildPlatform
+      Win32.moveFile origPath tmpPath
+      return tmpPath
 
-    maybeRestore oldPath path' = do
-      let oldPathDir = takeDirectory oldPath
-      oldPathDirExists <- doesDirectoryExist oldPathDir
+    maybeRestore origPath tmpPath = do
+      let origPathDir = takeDirectory origPath
+      origPathDirExists <- doesDirectoryExist origPathDir
       -- 'setup clean' didn't complete, 'dist/setup' still exists.
-      when oldPathDirExists $
-        Win32.moveFile path' oldPath
+      when origPathDirExists $
+        Win32.moveFile tmpPath origPath
 #endif
 
 getExternalSetupMethod
@@ -784,8 +742,8 @@ getExternalSetupMethod verbosity options pkg bt = do
   cachedSetupDirAndProg :: SetupScriptOptions -> Version
                         -> IO (FilePath, FilePath)
   cachedSetupDirAndProg options' cabalLibVersion = do
-    cabalDir <- getCabalDir
-    let setupCacheDir       = cabalDir </> "setup-exe-cache"
+    cacheDir <- defaultCacheDir
+    let setupCacheDir       = cacheDir </> "setup-exe-cache"
         cachedSetupProgFile = setupCacheDir
                               </> ("setup-" ++ buildTypeString ++ "-"
                                    ++ cabalVersionString ++ "-"

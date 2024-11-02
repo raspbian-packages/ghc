@@ -27,7 +27,8 @@ needing to run the program, by inspecting the object file using 'nm'.
 
 import Control.Monad (when, unless)
 import Data.Bits (shiftL)
-import Data.List (stripPrefix, intercalate)
+import Data.Char (toLower)
+import Data.List (elemIndex, stripPrefix, intercalate)
 import Data.Map (Map)
 import qualified Data.Map as Map
 import Data.Maybe (catMaybes, mapMaybe, fromMaybe)
@@ -50,17 +51,26 @@ main = do opts <- parseArgs
           case mode of
               Gen_Haskell_Type ->
                   writeHaskellType fn
-                      [ what | (wh, what) <- wanteds "OS must not matter"
+                      [ what | (wh, what) <- wanteds Nothing -- OS must not matter
                              , wh `elem` [Haskell, Both] ]
               Gen_Computed cm ->
-                  do os <- getOption "target os"   o_targetOS
+                  do os_str  <- getOption "target os"   o_targetOS
                      tmpdir  <- getOption "tmpdir"      o_tmpdir
                      gccProg <- getOption "gcc program" o_gccProg
                      nmProg  <- getOption "nm program"  o_nmProg
-                     let verbose = o_verbose opts
+                     let os = case os_str of
+                                "ghcjs"   -> JS
+                                "aix"     -> AIX
+                                "wasi"    -> WASI
+                                "openbsd" -> OpenBSD
+                                "mingw32" -> Windows
+                                _         -> DefaultOS
+                         verbose = o_verbose opts
                          gccFlags = o_gccFlags opts
-                     rs <- getWanted verbose os tmpdir gccProg gccFlags nmProg
-                                     (o_objdumpProg opts)
+                     rs <- case os of
+                             JS -> getWantedJS
+                             _  -> getWanted verbose os tmpdir gccProg gccFlags nmProg
+                                        (o_objdumpProg opts)
                      let haskellRs = [ what
                                      | (wh, what) <- rs
                                      , wh `elem` [Haskell, Both] ]
@@ -79,6 +89,15 @@ data Options = Options {
                    o_objdumpProg :: Maybe FilePath,
                    o_targetOS :: Maybe String
                }
+
+data OS
+   = DefaultOS
+   | JS
+   | AIX
+   | WASI
+   | OpenBSD
+   | Windows
+   deriving (Show, Eq)
 
 -- | Write a file atomically
 --
@@ -289,7 +308,7 @@ defSize w nameBase cExpr = [(w, GetWord ("SIZEOF_" ++ nameBase) (Fst cExpr))]
 defClosureSize :: Where -> Name -> CExpr -> Wanteds
 defClosureSize w nameBase cExpr = [(w, GetClosureSize ("SIZEOF_" ++ nameBase) (Fst cExpr))]
 
-wanteds :: String -> Wanteds
+wanteds :: Maybe OS -> Wanteds
 wanteds os = concat
           [-- Control group constant for integrity check; this
            -- round-tripped constant is used for testing that
@@ -418,9 +437,11 @@ wanteds os = concat
           ,structField  Both "StgEntCounter" "link"
           ,structField  Both "StgEntCounter" "entry_count"
 
-          ,closureSize Both "StgUpdateFrame"
-          ,closureSize C    "StgCatchFrame"
-          ,closureSize C    "StgStopFrame"
+          ,closureSize  Both "StgUpdateFrame"
+          ,closureSize  C    "StgCatchFrame"
+          ,closureSize  C    "StgStopFrame"
+          ,closureSize  C    "StgDeadThreadFrame"
+          ,closureField C    "StgDeadThreadFrame" "result"
 
           ,closureSize  Both "StgMutArrPtrs"
           ,closureField Both "StgMutArrPtrs" "ptrs"
@@ -446,6 +467,7 @@ wanteds os = concat
           ,closureField  C    "StgTSO"      "flags"
           ,closureField  C    "StgTSO"      "dirty"
           ,closureField  C    "StgTSO"      "bq"
+          ,closureField  C    "StgTSO"      "label"
           ,closureField  Both "StgTSO"      "alloc_limit"
           ,closureField_ Both "StgTSO_cccs" "StgTSO" "prof.cccs"
           ,closureField  Both "StgTSO"      "stackobj"
@@ -460,7 +482,6 @@ wanteds os = concat
           ,closureField Both "StgUpdateFrame" "updatee"
 
           ,closureField C "StgCatchFrame" "handler"
-          ,closureField C "StgCatchFrame" "exceptions_blocked"
 
           ,closureSize       C "StgPAP"
           ,closureField      C "StgPAP" "n_args"
@@ -477,6 +498,12 @@ wanteds os = concat
           ,closureField      C "StgAP_STACK" "size"
           ,closureFieldGcptr C "StgAP_STACK" "fun"
           ,closurePayload    C "StgAP_STACK" "payload"
+
+          ,closureSize       C "StgContinuation"
+          ,closureField      C "StgContinuation" "apply_mask_frame"
+          ,closureField      C "StgContinuation" "mask_frame_offset"
+          ,closureField      C "StgContinuation" "stack_size"
+          ,closurePayload    C "StgContinuation" "stack"
 
           ,thunkSize C "StgSelector"
 
@@ -610,7 +637,7 @@ wanteds os = concat
            -- Note that this conditional part only affects the C headers.
            -- That's important, as it means we get the same PlatformConstants
            -- type on all platforms.
-          ,if os == "mingw32"
+          ,if os == Just Windows
            then concat [structSize  C "StgAsyncIOResult"
                        ,structField C "StgAsyncIOResult" "reqID"
                        ,structField C "StgAsyncIOResult" "len"
@@ -676,22 +703,33 @@ wanteds os = concat
           ,constantBool    Haskell "USE_INLINE_SRT_FIELD" "defined(USE_INLINE_SRT_FIELD)"
           ]
 
-getWanted :: Bool -> String -> FilePath -> FilePath -> [String] -> FilePath -> Maybe FilePath
+getWanted :: Bool -> OS -> FilePath -> FilePath -> [String] -> FilePath -> Maybe FilePath
              -> IO Results
 getWanted verbose os tmpdir gccProgram gccFlags nmProgram mobjdumpProgram
-    = do let cStuff = unlines (headers ++ concatMap (doWanted . snd) (wanteds os))
+    = do let cStuff = unlines (headers ++ concatMap (doWanted . snd) (wanteds (Just os)))
              cFile = tmpdir </> "tmp.c"
              oFile = tmpdir </> "tmp.o"
          atomicWriteFile cFile cStuff
-         execute verbose gccProgram (gccFlags ++ ["-c", cFile, "-o", oFile])
+         -- On wasm32-wasi, llvm-nm incorrectly reports length of
+         -- buffers defined in wasm object files as 0, see llvm ticket
+         -- #58839. Therefore we have to emit .ll file instead, and
+         -- use a very crude parser which is just enough to extract
+         -- the buffer length info we're interested in.
+         execute verbose gccProgram (gccFlags ++ (
+             case os of
+                 WASI -> ["-emit-llvm", "-S"]
+                 _ -> ["-c"]
+             ) ++ [cFile, "-o", oFile])
          xs <- case os of
-                 "openbsd" -> readProcess objdumpProgam ["--syms", oFile] ""
-                 "aix"     -> readProcess objdumpProgam ["--syms", oFile] ""
-                 _         -> readProcess nmProgram ["-P", oFile] ""
+                 OpenBSD -> readProcess objdumpProgam ["--syms", oFile] ""
+                 AIX     -> readProcess objdumpProgam ["--syms", oFile] ""
+                 WASI    -> readFile oFile
+                 _       -> readProcess nmProgram ["-P", oFile] ""
 
          let ls = lines xs
              m = Map.fromList $ case os of
-                 "aix" -> parseAixObjdump ls
+                 AIX   -> parseAixObjdump ls
+                 WASI  -> mapMaybe parseLLLine ls
                  _     -> mapMaybe parseNmLine ls
 
          case Map.lookup "CONTROL_GROUP_CONST_291" m of
@@ -704,7 +742,7 @@ getWanted verbose os tmpdir gccProgram gccFlags nmProgram mobjdumpProgram
                               ++ "to 'configure'.\n"
              Just x     -> die ("unexpected value round-tripped for CONTROL_GROUP_CONST_291: " ++ show x)
 
-         mapM (lookupResult m) (wanteds os)
+         mapM (lookupResult m) (wanteds (Just os))
     where headers = ["#define IN_STG_CODE 0",
                      "",
                      "/*",
@@ -721,7 +759,7 @@ getWanted verbose os tmpdir gccProgram gccFlags nmProgram mobjdumpProgram
                      -- FIXME: rts/PosixSource.h should include ghcplatform.h
                      -- which should set this. There is a mismatch host/target
                      -- again...
-                     if os == "mingw32" then "#define mingw32_HOST_OS 1" else "",
+                     if os == Windows then "#define mingw32_HOST_OS 1" else "",
                      "",
                      "#include \"rts/PosixSource.h\"",
                      "#include \"Rts.h\"",
@@ -776,6 +814,13 @@ getWanted verbose os tmpdir gccProgram gccFlags nmProgram mobjdumpProgram
           doWanted (ClosureFieldMacro {}) = []
           doWanted (ClosurePayloadMacro {}) = []
           doWanted (FieldTypeGcptrMacro {}) = []
+
+          parseLLLine line = case words line of
+            ('@' : prefix_sym) : ts -> do
+                sym <- stripPrefix prefix prefix_sym
+                i <- elemIndex "x" ts
+                pure (sym, read (tail (ts !! (i - 1))))
+            _ -> Nothing
 
           -- parseNmLine parses "nm -P" output that looks like
           -- "derivedConstantMAX_Vanilla_REG C 0000000b 0000000b" (GNU nm)
@@ -873,6 +918,36 @@ getWanted verbose os tmpdir gccProgram gccFlags nmProgram mobjdumpProgram
           lookupResult _ (w, FieldTypeGcptrMacro name)
               = return (w, FieldTypeGcptrMacro name)
 
+-- The JavaScript backend doesn't require the native-RTS constants, so we filter those here,
+-- and provide reasonable presets for any remaining constants. This way, `deriveConstants`
+-- can still produce a valid constants file (required by GHC), without the side-effect of
+-- producing a c file.
+getWantedJS :: IO Results
+getWantedJS = mapM lookupResult (wanteds (Just JS))
+  where
+    jsHardCoded :: Map String Integer
+    jsHardCoded = Map.fromList [ ("WORD_SIZE", 4)
+                               , ("DOUBLE_SIZE", 8)
+                               , ("CINT_SIZE", 4)
+                               , ("CLONG_SIZE", 4)
+                               , ("CLONG_LONG_SIZE", 8)
+                               ]
+
+    lookupResult :: (Where, What Fst) -> IO (Where, What Snd)
+    lookupResult (w, GetWord name _) | Just res <- Map.lookup name jsHardCoded
+                 = return (w, GetWord name (Snd res))
+    lookupResult (w, what) = return $ case what of
+      GetWord             name _ -> (w, GetWord             name (Snd 0))
+      GetInt              name _ -> (w, GetWord             name (Snd 0))
+      GetNatural          name _ -> (w, GetWord             name (Snd 0))
+      GetBool             name _ -> (w, GetBool             name (Snd False))
+      GetFieldType        name _ -> (w, GetFieldType        name (Snd 1))
+      GetClosureSize      name _ -> (w, GetClosureSize      name (Snd 1))
+      StructFieldMacro    name   -> (w, StructFieldMacro    name)
+      ClosureFieldMacro   name   -> (w, ClosureFieldMacro   name)
+      ClosurePayloadMacro name   -> (w, ClosurePayloadMacro name)
+      FieldTypeGcptrMacro name   -> (w, FieldTypeGcptrMacro name)
+
 writeHaskellType :: FilePath -> [What Fst] -> IO ()
 writeHaskellType fn ws = atomicWriteFile fn xs
     where xs = unlines [header, body, footer, parser]
@@ -958,8 +1033,15 @@ writeHaskellValue fn rs = atomicWriteFile fn xs
 
 writeHeader :: FilePath -> [(Where, What Snd)] -> IO ()
 writeHeader fn rs = atomicWriteFile fn xs
-    where xs = headers ++ hs ++ unlines body
+    where xs = headers ++ genapplyBits ++ hs ++ unlines body
           headers = "/* This file is created automatically.  Do not edit by hand.*/\n\n"
+          -- See Note [How genapply gets target info] for details
+          genapplyBits = mconcat ["// " ++ _name ++ " " ++ show v ++ "\n" | (_name, v) <- genapplyData]
+          genapplyData = [(_name, v) | (_, GetWord _name (Snd v)) <- rs, _name `elem` genapplyFields ]
+          genapplyFields = [
+            "MAX_Real_Vanilla_REG", "MAX_Real_Float_REG", "MAX_Real_Double_REG", "MAX_Real_Long_REG",
+            "WORD_SIZE", "TAG_BITS", "BITMAP_BITS_SHIFT"
+            ]
           haskellRs = fmap snd $ filter (\r -> fst r `elem` [Haskell,Both]) rs
           cRs       = fmap snd $ filter (\r -> fst r `elem` [C,Both]) rs
           hs = concat
@@ -1002,4 +1084,3 @@ execute verbose prog args
       ec <- rawSystem prog args
       unless (ec == ExitSuccess) $
           die ("Executing " ++ show prog ++ " failed")
-

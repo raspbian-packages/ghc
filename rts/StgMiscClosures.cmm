@@ -23,6 +23,28 @@ import whitehole_lockClosure_spin;
 import whitehole_lockClosure_yield;
 #endif
 
+#if !defined(UnregisterisedCompiler)
+import CLOSURE CCS_SYSTEM;
+import CLOSURE ENT_DYN_IND_ctr;
+import CLOSURE ENT_STATIC_IND_ctr;
+import CLOSURE ENT_VIA_NODE_ctr;
+import CLOSURE RtsFlags;
+import CLOSURE stg_BLOCKING_QUEUE_CLEAN_info;
+import CLOSURE stg_BLOCKING_QUEUE_DIRTY_info;
+import CLOSURE stg_IND_info;
+import CLOSURE stg_MSG_BLACKHOLE_info;
+import CLOSURE stg_TSO_info;
+import CLOSURE stg_apply_interp_info;
+import CLOSURE stg_enter_info;
+import CLOSURE stg_ret_d_info;
+import CLOSURE stg_ret_f_info;
+import CLOSURE stg_ret_l_info;
+import CLOSURE stg_ret_n_info;
+import CLOSURE stg_ret_p_info;
+import CLOSURE stg_ret_t_info;
+import CLOSURE stg_ret_v_info;
+#endif
+
 /* ----------------------------------------------------------------------------
    Stack underflow
    ------------------------------------------------------------------------- */
@@ -54,6 +76,8 @@ INFO_TABLE_RET (stg_stack_underflow_frame, UNDERFLOW_FRAME,
 
 INFO_TABLE_RET (stg_restore_cccs, RET_SMALL, W_ info_ptr, W_ cccs)
 {
+    W_ _unused;
+
     unwind Sp = Sp + WDS(2);
 #if defined(PROFILING)
     CCCS = Sp(1);
@@ -61,7 +85,7 @@ INFO_TABLE_RET (stg_restore_cccs, RET_SMALL, W_ info_ptr, W_ cccs)
     Sp_adj(2);
 
     IF_DEBUG(sanity,
-      ccall checkStackFrame(Sp "ptr"));
+      (_unused) = ccall checkStackFrame(Sp "ptr"));
 
     jump %ENTRY_CODE(Sp(0)) [*]; // NB. all registers live!
 }
@@ -440,11 +464,21 @@ INFO_TABLE_RET( stg_apply_interp, RET_BCO )
     jump stg_yield_to_interpreter [];
 }
 
+/*
+ * Dummy info table pushed on the top of the stack when the stack's
+ * owning thread has finished.
+ */
+INFO_TABLE_RET( stg_dead_thread, RET_SMALL,
+                W_ info_ptr,
+                PROF_HDR_FIELDS(W_,p1,p2)
+                P_ result )
+{ foreign "C" barf("stg_dead_thread entered!", NULL) never returns; }
+
 /* ----------------------------------------------------------------------------
    Entry code for a BCO
    ------------------------------------------------------------------------- */
 
-INFO_TABLE_FUN( stg_BCO, 3, 0, BCO, "BCO", "BCO", ARG_BCO )
+INFO_TABLE_FUN( stg_BCO, 3, 0, BCO, "BCO", "BCO", 0, ARG_BCO )
     /* explicit stack */
 {
   /* entering a BCO means "apply it", same as a function */
@@ -475,7 +509,9 @@ INFO_TABLE(stg_IND,1,0,IND,"IND","IND")
     (P_ node)
 {
     TICK_ENT_DYN_IND(); /* tick */
-    node = UNTAG(StgInd_indirectee(node));
+    ACQUIRE_FENCE;
+    node = %acquire StgInd_indirectee(node);
+    node = UNTAG(node);
     TICK_ENT_VIA_NODE();
     jump %GET_ENTRY(node) (node);
 }
@@ -483,7 +519,10 @@ INFO_TABLE(stg_IND,1,0,IND,"IND","IND")
     /* explicit stack */
 {
     TICK_ENT_DYN_IND(); /* tick */
-    R1 = UNTAG(StgInd_indirectee(R1));
+    ACQUIRE_FENCE;
+    P_ p;
+    p = %acquire StgInd_indirectee(R1);
+    R1 = UNTAG(p);
     TICK_ENT_VIA_NODE();
     jump %GET_ENTRY(R1) [R1];
 }
@@ -493,7 +532,10 @@ INFO_TABLE(stg_IND_STATIC,1,0,IND_STATIC,"IND_STATIC","IND_STATIC")
     /* explicit stack */
 {
     TICK_ENT_STATIC_IND(); /* tick */
-    R1 = UNTAG(StgInd_indirectee(R1));
+    ACQUIRE_FENCE;
+    P_ p;
+    p = %acquire StgInd_indirectee(R1);
+    R1 = UNTAG(p);
     TICK_ENT_VIA_NODE();
     jump %GET_ENTRY(R1) [R1];
 }
@@ -516,14 +558,20 @@ INFO_TABLE(stg_BLACKHOLE,1,0,BLACKHOLE,"BLACKHOLE","BLACKHOLE")
     TICK_ENT_DYN_IND(); /* tick */
 
 retry:
-    prim_read_barrier;
-    p = StgInd_indirectee(node);
+#if defined(TSAN_ENABLED)
+    // See Note [ThreadSanitizer and fences]
+    W_ unused; unused = %acquire GET_INFO(node);
+#endif
+    // Synchronizes with the release-store in updateWithIndirection.
+    // See Note [Heap memory barriers] in SMP.h.
+    ACQUIRE_FENCE;
+    p = %relaxed StgInd_indirectee(node);
     if (GETTAG(p) != 0) {
         return (p);
     }
 
-    info = StgHeader_info(p);
-    prim_read_barrier;
+    // May race with OVERWRITE_INFO in wakeBlockingQueue()
+    info = %relaxed GET_INFO(p);
     if (info == stg_IND_info) {
         // This could happen, if e.g. we got a BLOCKING_QUEUE that has
         // just been replaced with an IND by another thread in
@@ -621,6 +669,7 @@ loop:
         // defined in CMM.
         goto loop;
     }
+    ACQUIRE_FENCE;
     jump %ENTRY_CODE(info) (node);
 #else
     ccall barf("WHITEHOLE object (%p) entered!", R1) never returns;

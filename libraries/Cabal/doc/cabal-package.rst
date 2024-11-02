@@ -763,7 +763,8 @@ describe the package as a whole:
     behaviour, put the files that wildcards will match against in
     their own folder.
 
-    ``**`` wildcards are available starting in Cabal 2.4.
+    ``**`` wildcards are available starting in Cabal 2.4
+    and `bug-free since Cabal 3.0 <https://github.com/haskell/cabal/issues/6125#issuecomment-1379878419>`_.
 
 .. pkg-field:: data-dir: directory
 
@@ -773,9 +774,9 @@ describe the package as a whole:
 
 .. pkg-field:: extra-source-files: filename list
 
-    A list of additional files to be included in source distributions
-    built with :ref:`setup-sdist`. As with :pkg-field:`data-files` it can use
-    a limited form of ``*`` wildcards in file names.
+    A list of additional files to be included in source distributions built with :ref:`setup-sdist`.
+    As with :pkg-field:`data-files` it can use a limited form of ``*`` wildcards in file names.
+    Files listed here are tracked by ``cabal build``; changes in these files cause (partial) rebuilds.
 
 .. pkg-field:: extra-doc-files: filename list
     :since: 1.18
@@ -849,11 +850,18 @@ The library section should contain the following fields:
 
     :since: 3.0
 
-    :default: ``private`` for internal libraries. Cannot be set for public library.
+    :default:
+        ``private`` for internal libraries. Cannot be set for main
+        (unnamed) library, which is always public.
 
-    Cabal recognizes ``public`` and ``private`` here...
+    Can be ``public`` or ``private``.
+    Makes it possible to have multiple public libraries in a single package.
+    If set to ``public``, depending on this library from another package is
+    allowed. If set to ``private``, depending on this library is allowed only
+    from the same package.
 
-    Multiple public libraries...
+    See section on :ref:`Internal Libraries <sublibs>` for examples and more
+    information.
 
 .. pkg-field:: reexported-modules: exportlist
     :since: 1.22
@@ -926,6 +934,7 @@ look something like this:
         default-language: Haskell2010
 
     test-suite test-foo
+        type:             exitcode-stdio-1.0
         main-is:          test-foo.hs
         -- NOTE: no constraints on 'foo-internal' as same-package
         --       dependencies implicitly refer to the same package instance
@@ -990,6 +999,23 @@ a real-world use case:
       ghc-options: -funbox-strict-fields -Wall -fwarn-tabs -O2
 
       default-language: Haskell2010
+
+.. note::
+    For packages using ``cabal-version: 3.4`` or higher, the syntax to
+    specify an internal library in a ``build-depends:`` section is
+    ``package-name:internal-library-name``.
+
+**Multiple public libraries**
+
+Cabal 3.0 and later support exposing multiple libraries from a single package
+through the field :pkg-field:`library:visibility`.
+Having multiple public libraries is useful for separating the unit of
+distribution (package) from the unit of buildable code (library).
+For more information about the rationale and some examples, see
+`this blog post <https://fgaz.me/posts/2019-11-14-cabal-multiple-libraries/>`__.
+
+..
+    TODO inline the blog post
 
 
 Opening an interpreter session
@@ -1187,14 +1213,14 @@ Test suites
 The test suite may be described using the following fields, as well as
 build information fields (see the section on `build information`_).
 
-.. pkg-field:: type: interface
+.. pkg-field:: type: interface (required until ``cabal-version`` 3.8)
 
     The interface type and version of the test suite. Cabal supports two
-    test suite interfaces, called ``exitcode-stdio-1.0`` (default) and
+    test suite interfaces, called ``exitcode-stdio-1.0`` (default since ``cabal-version`` 3.8) and
     ``detailed-0.9``. Each of these types may require or disallow other
     fields as described below.
 
-Test suites using the ``exitcode-stdio-1.0`` (default) interface are executables
+Test suites using the ``exitcode-stdio-1.0`` (default since ``cabal-version`` 3.8) interface are executables
 that indicate test failure with a non-zero exit code when run; they may
 provide human-readable log information through the standard output and
 error channels. The ``exitcode-stdio-1.0`` type requires the ``main-is``
@@ -1203,6 +1229,7 @@ field.
 .. pkg-field:: main-is: filename
     :synopsis: Module containing tests main function.
 
+    :required: ``exitcode-stdio-1.0``
     :disallowed: ``detailed-0.9``
 
     The name of the ``.hs`` or ``.lhs`` file containing the ``Main``
@@ -1224,9 +1251,29 @@ the :pkg-field:`test-module` field.
 
 .. pkg-field:: test-module: identifier
 
+    :required: ``detailed-0.9``
     :disallowed: ``exitcode-stdio-1.0``
 
     The module exporting the ``tests`` symbol.
+
+.. pkg-field:: code-generators
+
+    An optional list of preprocessors which can generate new modules
+    for use in the test-suite.
+
+ A list of executabes (possibly brought into scope by
+ :pkg-field:`build-tool-depends`) that are run after all other
+ preprocessors. These executables are invoked as so: ``exe-name
+ TARGETDIR [SOURCEDIRS] -- [GHCOPTIONS]``. The arguments are, in order a target dir for
+ output, a sequence of all source directories with source files of
+ local lib components that the given test stanza dependens on, and
+ following a double dash, all options cabal would pass to ghc for a
+ build. They are expected to output a newline-seperated list of
+ generated modules which have been written to the targetdir
+ (excepting, if written, the main module). This can
+ be used for driving doctests and other discover-style tests generated
+ from source code.
+
 
 Example: Package using ``exitcode-stdio-1.0`` interface
 """""""""""""""""""""""""""""""""""""""""""""""""""""""
@@ -1244,6 +1291,7 @@ demonstrate the use of the ``exitcode-stdio-1.0`` interface.
     Build-Type:     Simple
 
     Test-Suite test-foo
+        type:             exitcode-stdio-1.0
         main-is:          test-foo.hs
         build-depends:    base >= 4 && < 5
         default-language: Haskell2010
@@ -1278,6 +1326,7 @@ be provided by the library that provides the testing facility.
     Build-Type:     Simple
 
     Test-Suite test-bar
+        type:             detailed-0.9
         test-module:      Bar
         build-depends:    base >= 4 && < 5, Cabal >= 1.9.2 && < 2
         default-language: Haskell2010
@@ -1340,6 +1389,16 @@ Benchmarks
 The benchmark may be described using the following fields, as well as
 build information fields (see the section on `build information`_).
 
+.. pkg-field:: type: interface (required until ``cabal-version`` 3.8)
+
+    The interface type and version of the benchmark. At the moment Cabal
+    only support one benchmark interface, called ``exitcode-stdio-1.0``.
+
+Benchmarks using the ``exitcode-stdio-1.0`` (default since ``cabal-version`` 3.8) interface are executables
+that indicate failure to run the benchmark with a non-zero exit code
+when run; they may provide human-readable information through the
+standard output and error channels.
+
 .. pkg-field:: main-is: filename
 
     The name of the ``.hs`` or ``.lhs`` file containing the ``Main``
@@ -1364,6 +1423,7 @@ Example:
     Build-Type:     Simple
 
     Benchmark bench-foo
+        type:             exitcode-stdio-1.0
         main-is:          bench-foo.hs
         build-depends:    base >= 4 && < 5, time >= 1.1 && < 1.7
         default-language: Haskell2010
@@ -1539,7 +1599,7 @@ in ghc's package DB and so we can figure out what the location of the library
 is. Foreign libraries however don't get registered, which means that we'd have
 to have a way of finding out where a platform library got installed (other than by
 searching the ``lib/`` directory). Instead, we install foreign libraries in
-``~/.cabal/lib``, much like we install executables in ``~/.cabal/bin``.
+``~/.local/lib``.
 
 Build information
 ^^^^^^^^^^^^^^^^^
@@ -1561,16 +1621,16 @@ system-dependent values for these fields.
     **Library Names**
 
     External libraries are identified by the package's name they're
-    provided by (currently a package can only publicly expose its
-    main library component; in future, packages with multiple exposed
-    public library components will be supported and a syntax for
-    referring to public sub-libraries will be provided).
+    provided by, optionally followed by a colon and the library name
+    (available from ``cabal-version: 3.0``).
+    If the library name is absent, the main (unnamed) library will be used.
+    To refer to the main (unnamed) library explicitly, use the name of the
+    package (``foo:foo``).
+    Multiple libraries from the same package can be specified with the shorthand
+    syntax ``pkg:{lib1,lib2}```.
 
-    In order to specify an intra-package dependency on an internal
-    library component you can use the unqualified name of the
-    library component. Note that locally defined sub-library
-    names shadow external package names of the same name. See section on
-    :ref:`Internal Libraries <sublibs>` for examples and more information.
+    See section on :ref:`Internal Libraries <sublibs>` for examples and more
+    information.
 
     **Version Constraints**
 
@@ -2698,6 +2758,7 @@ Starting with Cabal-2.2 it's possible to use common build info stanzas.
 
       test-suite tests
         import:           deps, test-deps
+        type:             exitcode-stdio-1.0
         main-is:          Tests.hs
         build-depends:    foo
         default-language: Haskell2010
@@ -2865,6 +2926,9 @@ The ``get`` command supports the following options:
     ``2016-09-24T17:47:48Z``), or ``HEAD`` (default).
     This determines which package versions are available as well as which
     ``.cabal`` file revision is selected (unless ``--pristine`` is used).
+``--only-package-description``
+    Unpack only the package description file. A synonym,
+    ``--package-description-only``, is provided for convenience.
 ``--pristine``
     Unpack the original pristine tarball, rather than updating the
     ``.cabal`` file with the latest revision from the package archive.
@@ -3113,11 +3177,28 @@ the configured data directory for ``pretty-show`` is controlled with the
 Accessing the package version
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-The aforementioned auto generated :file:`Paths_{pkgname}` module also
-exports the constant ``version ::``
-`Version <http://hackage.haskell.org/package/base/docs/Data-Version.html>`__
+The auto generated :file:`PackageInfo_{pkgname}` module exports the constant
+``version ::`` `Version <http://hackage.haskell.org/package/base/docs/Data-Version.html>`__
 which is defined as the version of your package as specified in the
 ``version`` field.
+
+Accessing package-related informations
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The auto generated :file:`PackageInfo_{pkgname}` module exports the following
+package-related constants:
+
+.. code-block:: haskell
+
+    name :: String
+    version :: Version
+    synopsis :: String
+    copyright :: String
+    homepage :: String
+
+Unlike :file:`Paths_{pkgname}` (see <#accessing-data-files-from-package-code>),
+:file:`PackageInfo_{pkgname}` is system- and path-independent. It aims to be
+easier to work with for hash-based tools such as Nix.
 
 .. _system-dependent parameters:
 
@@ -3156,6 +3237,20 @@ The :pkg-field:`build-type` ``Configure`` differs from ``Simple`` in two ways:
    given in the ``.cabal`` file. In particular, this file may be
    generated by the ``configure`` script mentioned above, allowing these
    settings to vary depending on the build environment.
+
+Note that the package's ``extra-source-files`` are available to the
+``configure`` script when it is executed. In typical ``autoconf`` fashion,
+``--host`` flag will be passed to the ``configure`` script to indicate the host
+platform when cross-compiling. Moreover, various bits of build configuration
+will be passed via environment variables:
+
+ - ``CC`` will reflect the path to the C compiler
+ - ``CFLAGS`` will reflect the path to the C compiler
+ - ``CABAL_FLAGS`` will contain the Cabal flag assignment of the current
+   package using traditional Cabal flag syntax (e.g. ``+flagA -flagB``)
+ - ``CABAL_FLAG_<flag>`` will be set to either ``0`` or ``1`` depending upon
+   whether flag ``<flag>`` is enabled. Note that any any non-alpha-numeric
+   characters in the flag name are replaced with ``_``.
 
 The build information file should have the following structure:
 

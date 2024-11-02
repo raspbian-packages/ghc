@@ -9,12 +9,15 @@ where
 import GHC.Prelude
 import GHC.Platform
 
+import GHC.Linker.Config
+
 import GHC.Driver.Session
 
 import GHC.Unit.Types
 import GHC.Unit.State
 import GHC.Unit.Env
 
+import GHC.Settings
 import GHC.SysTools.Tasks
 
 import GHC.Runtime.Interpreter
@@ -36,7 +39,7 @@ import Text.ParserCombinators.ReadP as Parser
 -- macOS Sierra (10.14).
 --
 -- @-dead_strip_dylibs@ does not dead strip @-rpath@ entries, as such passing
--- @-l@ and @-rpath@ to the linker will result in the unnecesasry libraries not
+-- @-l@ and @-rpath@ to the linker will result in the unnecessary libraries not
 -- being included in the load commands, however the @-rpath@ entries are all
 -- forced to be included.  This can lead to 100s of @-rpath@ entries being
 -- included when only a handful of libraries end up being truly linked.
@@ -46,15 +49,13 @@ import Text.ParserCombinators.ReadP as Parser
 -- dynamic library through @-add_rpath@.
 --
 -- See Note [Dynamic linking on macOS]
-runInjectRPaths :: Logger -> DynFlags -> [FilePath] -> FilePath -> IO ()
--- Make sure to honour -fno-use-rpaths if set on darwin as well see #20004
-runInjectRPaths _ dflags _ _ | not (gopt Opt_RPath dflags) = return ()
-runInjectRPaths logger dflags lib_paths dylib = do
-  info <- lines <$> askOtool logger dflags Nothing [Option "-L", Option dylib]
+runInjectRPaths :: Logger -> ToolSettings -> [FilePath] -> FilePath -> IO ()
+runInjectRPaths logger toolSettings lib_paths dylib = do
+  info <- lines <$> askOtool logger toolSettings Nothing [Option "-L", Option dylib]
   -- filter the output for only the libraries. And then drop the @rpath prefix.
   let libs = fmap (drop 7) $ filter (isPrefixOf "@rpath") $ fmap (head.words) $ info
   -- find any pre-existing LC_PATH items
-  info <- lines <$> askOtool logger dflags Nothing [Option "-l", Option dylib]
+  info <- lines <$> askOtool logger toolSettings Nothing [Option "-l", Option dylib]
   let paths = mapMaybe get_rpath info
       lib_paths' = [ p | p <- lib_paths, not (p `elem` paths) ]
   -- only find those rpaths, that aren't already in the library.
@@ -62,7 +63,7 @@ runInjectRPaths logger dflags lib_paths dylib = do
   -- inject the rpaths
   case rpaths of
     [] -> return ()
-    _  -> runInstallNameTool logger dflags $ map Option $ "-add_rpath":(intersperse "-add_rpath" rpaths) ++ [dylib]
+    _  -> runInstallNameTool logger toolSettings $ map Option $ "-add_rpath":(intersperse "-add_rpath" rpaths) ++ [dylib]
 
 get_rpath :: String -> Maybe FilePath
 get_rpath l = case readP_to_S rpath_parser l of
@@ -96,15 +97,15 @@ getUnitFrameworkOpts unit_env dep_packages
 
   | otherwise = return []
 
-getFrameworkOpts :: DynFlags -> Platform -> [String]
-getFrameworkOpts dflags platform
+getFrameworkOpts :: FrameworkOpts -> Platform -> [String]
+getFrameworkOpts fwOpts platform
   | platformUsesFrameworks platform = framework_path_opts ++ framework_opts
   | otherwise = []
   where
-    framework_paths     = frameworkPaths dflags
+    framework_paths     = foFrameworkPaths fwOpts
     framework_path_opts = map ("-F" ++) framework_paths
 
-    frameworks     = cmdlineFrameworks dflags
+    frameworks     = foCmdlineFrameworks fwOpts
     -- reverse because they're added in reverse order from the cmd line:
     framework_opts = concat [ ["-framework", fw]
                             | fw <- reverse frameworks ]

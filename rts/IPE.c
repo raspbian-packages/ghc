@@ -63,9 +63,19 @@ static HashTable *ipeMap = NULL;
 // Accessed atomically
 static IpeBufferListNode *ipeBufferList = NULL;
 
+#if defined(THREADED_RTS)
+
 void initIpe(void) { initMutex(&ipeMapLock); }
 
 void exitIpe(void) { closeMutex(&ipeMapLock); }
+
+#else
+
+void initIpe(void) { }
+
+void exitIpe(void) { }
+
+#endif // THREADED_RTS
 
 static InfoProvEnt ipeBufferEntryToIpe(const IpeBufferListNode *node, const IpeBufferEntry *ent)
 {
@@ -78,7 +88,8 @@ static InfoProvEnt ipeBufferEntryToIpe(const IpeBufferListNode *node, const IpeB
                 .ty_desc = &strings[ent->ty_desc],
                 .label = &strings[ent->label],
                 .module = &strings[ent->module_name],
-                .srcloc = &strings[ent->srcloc]
+                .src_file = &strings[ent->src_file],
+                .src_span = &strings[ent->src_span]
             }
     };
 }

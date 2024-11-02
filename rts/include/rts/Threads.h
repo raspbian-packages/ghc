@@ -53,11 +53,15 @@ StgThreadID rts_getThreadId                  (StgPtr tso);
 void        rts_enableThreadAllocationLimit  (StgPtr tso);
 void        rts_disableThreadAllocationLimit (StgPtr tso);
 
+// Forward declarations, defined in Closures.h
+struct _StgMutArrPtrs;
+struct _StgMutArrPtrs *listThreads               (Capability *cap);
+
 #if !defined(mingw32_HOST_OS)
 pid_t  forkProcess     (HsStablePtr *entry);
 #else
 pid_t  forkProcess     (HsStablePtr *entry)
-    GNU_ATTRIBUTE(__noreturn__);
+    STG_NORETURN;
 #endif
 
 HsBool rtsSupportsBoundThreads (void);

@@ -1,4 +1,4 @@
-name: Changelogs
+name: Assorted
 
 on:
   push:
@@ -21,6 +21,7 @@ defaults:
 
 jobs:
   build:
+    name: Changelogs
     runs-on: ubuntu-latest
 
     steps:
@@ -28,10 +29,18 @@ jobs:
         # https://docs.github.com/en/free-pro-team@latest/actions/reference/workflow-commands-for-github-actions#adding-a-system-path
         run: |
           echo "$HOME/.cabal/bin" >> $GITHUB_PATH
-      - uses: actions/cache@v1
+      - uses: actions/cache@v3
         with:
           path: ~/.cabal/store
           key: linux-store-changelogs
+      # See https://github.com/haskell/cabal/pull/8739
+      - name: Sudo chmod to permit ghcup to update its cache
+        run: |
+          if [[ "${{ runner.os }}" == "Linux" ]]; then
+            sudo mkdir -p /usr/local/.ghcup/cache
+            sudo chown -R $USER /usr/local/.ghcup
+            sudo chmod -R 777 /usr/local/.ghcup
+          fi
       - name: ghcup
         run: |
           ghcup config set cache true
@@ -43,7 +52,7 @@ jobs:
       # https://github.com/haskell/cabal/issues/7360
       - uses: actions/checkout@v3
         with:
-          repository: "phadej/changelog-d"
+          repository: "fgaz/changelog-d"
           path: "changelog-d"
       - name: Install changelog-d
         run: |

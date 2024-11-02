@@ -1,7 +1,7 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE TypeFamilies     #-}
+{-# LANGUAGE GADTs            #-}
 
-{-# OPTIONS_GHC -Wno-incomplete-uni-patterns #-}
 {-
 
 This module contains miscellaneous functions related to renaming.
@@ -20,7 +20,9 @@ module GHC.Rename.Utils (
         mkFieldEnv,
         badQualBndrErr, typeAppErr, badFieldConErr,
         wrapGenSpan, genHsVar, genLHsVar, genHsApp, genHsApps, genAppType,
-        genHsIntegralLit, genHsTyLit,
+        genHsIntegralLit, genHsTyLit, genSimpleConPat,
+        genVarPat, genWildPat,
+        genSimpleFunBind, genFunBind,
 
         newLocalBndrRn, newLocalBndrsRn,
 
@@ -35,13 +37,12 @@ module GHC.Rename.Utils (
 where
 
 
-import GHC.Prelude
+import GHC.Prelude hiding (unzip)
 
 import GHC.Core.Type
 import GHC.Hs
 import GHC.Types.Name.Reader
 import GHC.Tc.Errors.Types
-import GHC.Tc.Errors.Ppr (withHsDocContext)
 import GHC.Tc.Utils.Env
 import GHC.Tc.Utils.Monad
 import GHC.Types.Error
@@ -55,7 +56,7 @@ import GHC.Types.SourceText ( SourceText(..), IntegralLit )
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
 import GHC.Utils.Misc
-import GHC.Types.Basic  ( TopLevelFlag(..) )
+import GHC.Types.Basic  ( TopLevelFlag(..), Origin(Generated) )
 import GHC.Data.List.SetOps ( removeDups )
 import GHC.Data.Maybe ( whenIsJust )
 import GHC.Driver.Session
@@ -66,6 +67,7 @@ import GHC.Settings.Constants ( mAX_TUPLE_SIZE, mAX_CTUPLE_SIZE )
 import qualified Data.List.NonEmpty as NE
 import qualified GHC.LanguageExtensions as LangExt
 import GHC.Data.Bag
+import qualified Data.List as List
 
 {-
 *********************************************************
@@ -201,7 +203,9 @@ checkInferredVars ctxt (Just msg) ty =
   let bndrs = sig_ty_bndrs ty
   in case find ((==) InferredSpec . hsTyVarBndrFlag) bndrs of
     Nothing -> return ()
-    Just _  -> addErr $ TcRnUnknownMessage $ mkPlainError noHints (withHsDocContext ctxt msg)
+    Just _  -> addErr $
+      TcRnWithHsDocContext ctxt $
+      mkTcRnUnknownMessage $ mkPlainError noHints msg
   where
     sig_ty_bndrs :: LHsSigType GhcPs -> [HsTyVarBndr Specificity GhcPs]
     sig_ty_bndrs (L _ (HsSig{sig_bndrs = outer_bndrs}))
@@ -284,7 +288,7 @@ Note [No nested foralls or contexts in instance types] in GHC.Hs.Type).
 --   "GHC.Rename.Module" and 'renameSig' in "GHC.Rename.Bind").
 --   See @Note [No nested foralls or contexts in instance types]@ in
 --   "GHC.Hs.Type".
-noNestedForallsContextsErr :: SDoc -> LHsType GhcRn -> Maybe (SrcSpan, SDoc)
+noNestedForallsContextsErr :: SDoc -> LHsType GhcRn -> Maybe (SrcSpan, TcRnMessage)
 noNestedForallsContextsErr what lty =
   case ignoreParens lty of
     L l (HsForAllTy { hst_tele = tele })
@@ -293,9 +297,7 @@ noNestedForallsContextsErr what lty =
          -- types of terms, so we give a slightly more descriptive error
          -- message in the event that they contain visible dependent
          -- quantification (currently only allowed in kinds).
-      -> Just (locA l, vcat [ text "Illegal visible, dependent quantification" <+>
-                              text "in the type of a term"
-                            , text "(GHC does not yet support this)" ])
+      -> Just (locA l, TcRnVDQInTermType Nothing)
       |  HsForAllInvis{} <- tele
       -> Just (locA l, nested_foralls_contexts_err)
     L l (HsQualTy {})
@@ -303,6 +305,7 @@ noNestedForallsContextsErr what lty =
     _ -> Nothing
   where
     nested_foralls_contexts_err =
+      mkTcRnUnknownMessage $ mkPlainError noHints $
       what <+> text "cannot contain nested"
       <+> quotes forAllLit <> text "s or contexts"
 
@@ -310,7 +313,7 @@ noNestedForallsContextsErr what lty =
 addNoNestedForallsContextsErr :: HsDocContext -> SDoc -> LHsType GhcRn -> RnM ()
 addNoNestedForallsContextsErr ctxt what lty =
   whenIsJust (noNestedForallsContextsErr what lty) $ \(l, err_msg) ->
-    addErrAt l $ TcRnUnknownMessage $ mkPlainError noHints (withHsDocContext ctxt err_msg)
+    addErrAt l $ TcRnWithHsDocContext ctxt err_msg
 
 {-
 ************************************************************************
@@ -325,10 +328,17 @@ addFvRn :: FreeVars -> RnM (thing, FreeVars) -> RnM (thing, FreeVars)
 addFvRn fvs1 thing_inside = do { (res, fvs2) <- thing_inside
                                ; return (res, fvs1 `plusFV` fvs2) }
 
-mapFvRn :: (a -> RnM (b, FreeVars)) -> [a] -> RnM ([b], FreeVars)
-mapFvRn f xs = do stuff <- mapM f xs
-                  case unzip stuff of
-                      (ys, fvs_s) -> return (ys, plusFVs fvs_s)
+mapFvRn :: Traversable f => (a -> RnM (b, FreeVars)) -> f a -> RnM (f b, FreeVars)
+mapFvRn f xs = do
+    stuff <- mapM f xs
+    case unzip stuff of
+        (ys, fvs_s) -> return (ys, foldl' (flip plusFV) emptyFVs fvs_s)
+{-# SPECIALIZE mapFvRn :: (a -> RnM (b, FreeVars)) -> [a] -> RnM ([b], FreeVars) #-}
+
+unzip :: Functor f => f (a, b) -> (f a, f b)
+unzip = \ xs -> (fmap fst xs, fmap snd xs)
+{-# NOINLINE [1] unzip #-}
+{-# RULES "unzip/List" unzip = List.unzip #-}
 
 mapMaybeFvRn :: (a -> RnM (b, FreeVars)) -> Maybe a -> RnM (Maybe b, FreeVars)
 mapMaybeFvRn _ Nothing = return (Nothing, emptyFVs)
@@ -388,7 +398,7 @@ checkUnusedRecordWildcard loc fvs (Just dotdot_names) =
 warnRedundantRecordWildcard :: RnM ()
 warnRedundantRecordWildcard =
   whenWOptM Opt_WarnRedundantRecordWildcards $
-    let msg = TcRnUnknownMessage $
+    let msg = mkTcRnUnknownMessage $
                 mkPlainDiagnostic (WarningWithFlag Opt_WarnRedundantRecordWildcards)
                                   noHints
                                   redundantWildcardWarning
@@ -487,7 +497,7 @@ reportable child
 
 addUnusedWarning :: WarningFlag -> OccName -> SrcSpan -> SDoc -> RnM ()
 addUnusedWarning flag occ span msg = do
-  let diag = TcRnUnknownMessage $ mkPlainDiagnostic (WarningWithFlag flag) noHints $
+  let diag = mkTcRnUnknownMessage $ mkPlainDiagnostic (WarningWithFlag flag) noHints $
         sep [msg <> colon,
              nest 2 $ pprNonVarNameSpace (occNameSpace occ)
                             <+> quotes (ppr occ)]
@@ -495,7 +505,7 @@ addUnusedWarning flag occ span msg = do
 
 unusedRecordWildcardWarning :: TcRnMessage
 unusedRecordWildcardWarning =
-  TcRnUnknownMessage $ mkPlainDiagnostic (WarningWithFlag Opt_WarnUnusedRecordWildcards) noHints $
+  mkTcRnUnknownMessage $ mkPlainDiagnostic (WarningWithFlag Opt_WarnUnusedRecordWildcards) noHints $
     wildcardDoc $ text "No variables bound in the record wildcard match are used"
 
 redundantWildcardWarning :: SDoc
@@ -545,7 +555,7 @@ addNameClashErrRn rdr_name gres
   -- already, and we don't want an error cascade.
   = return ()
   | otherwise
-  = addErr $ TcRnUnknownMessage $ mkPlainError noHints $
+  = addErr $ mkTcRnUnknownMessage $ mkPlainError noHints $
     (vcat [ text "Ambiguous occurrence" <+> quotes (ppr rdr_name)
                  , text "It could refer to"
                  , nest 3 (vcat (msg1 : msgs)) ])
@@ -598,7 +608,7 @@ addNameClashErrRn rdr_name gres
 
 dupNamesErr :: Outputable n => (n -> SrcSpan) -> NE.NonEmpty n -> RnM ()
 dupNamesErr get_loc names
-  = addErrAt big_loc $ TcRnUnknownMessage $ mkPlainError noHints $
+  = addErrAt big_loc $ mkTcRnUnknownMessage $ mkPlainError noHints $
     vcat [text "Conflicting definitions for" <+> quotes (ppr (NE.head names)),
           locations]
   where
@@ -608,19 +618,19 @@ dupNamesErr get_loc names
 
 badQualBndrErr :: RdrName -> TcRnMessage
 badQualBndrErr rdr_name
-  = TcRnUnknownMessage $ mkPlainError noHints $
+  = mkTcRnUnknownMessage $ mkPlainError noHints $
   text "Qualified name in binding position:" <+> ppr rdr_name
 
 typeAppErr :: String -> LHsType GhcPs -> TcRnMessage
 typeAppErr what (L _ k)
-  = TcRnUnknownMessage $ mkPlainError noHints $
+  = mkTcRnUnknownMessage $ mkPlainError noHints $
     hang (text "Illegal visible" <+> text what <+> text "application"
             <+> quotes (char '@' <> ppr k))
        2 (text "Perhaps you intended to use TypeApplications")
 
 badFieldConErr :: Name -> FieldLabelString -> TcRnMessage
 badFieldConErr con field
-  = TcRnUnknownMessage $ mkPlainError noHints $
+  = mkTcRnUnknownMessage $ mkPlainError noHints $
     hsep [text "Constructor" <+> quotes (ppr con),
           text "does not have field", quotes (ppr field)]
 
@@ -631,7 +641,7 @@ checkTupSize tup_size
   | tup_size <= mAX_TUPLE_SIZE
   = return ()
   | otherwise
-  = addErr $ TcRnUnknownMessage $ mkPlainError noHints $
+  = addErr $ mkTcRnUnknownMessage $ mkPlainError noHints $
     sep [text "A" <+> int tup_size <> text "-tuple is too large for GHC",
                  nest 2 (parens (text "max size is" <+> int mAX_TUPLE_SIZE)),
                  nest 2 (text "Workaround: use nested tuples or define a data type")]
@@ -642,7 +652,7 @@ checkCTupSize tup_size
   | tup_size <= mAX_CTUPLE_SIZE
   = return ()
   | otherwise
-  = addErr $ TcRnUnknownMessage $ mkPlainError noHints $
+  = addErr $ mkTcRnUnknownMessage $ mkPlainError noHints $
     hang (text "Constraint tuple arity too large:" <+> int tup_size
                   <+> parens (text "max arity =" <+> int mAX_CTUPLE_SIZE))
                2 (text "Instead, use a nested tuple")
@@ -672,10 +682,40 @@ genHsVar :: Name -> HsExpr GhcRn
 genHsVar nm = HsVar noExtField $ wrapGenSpan nm
 
 genAppType :: HsExpr GhcRn -> HsType (NoGhcTc GhcRn) -> HsExpr GhcRn
-genAppType expr = HsAppType noExtField (wrapGenSpan expr) . mkEmptyWildCardBndrs . wrapGenSpan
+genAppType expr ty = HsAppType noExtField (wrapGenSpan expr) noHsTok (mkEmptyWildCardBndrs (wrapGenSpan ty))
 
 genHsIntegralLit :: IntegralLit -> LocatedAn an (HsExpr GhcRn)
 genHsIntegralLit lit = wrapGenSpan $ HsLit noAnn (HsInt noExtField lit)
 
 genHsTyLit :: FastString -> HsType GhcRn
 genHsTyLit = HsTyLit noExtField . HsStrTy NoSourceText
+
+genSimpleConPat :: Name -> [LPat GhcRn] -> LPat GhcRn
+-- The pattern (C p1 .. pn)
+genSimpleConPat con pats
+  = wrapGenSpan $ ConPat { pat_con_ext = noExtField
+                         , pat_con     = wrapGenSpan con
+                         , pat_args    = PrefixCon [] pats }
+
+genVarPat :: Name -> LPat GhcRn
+genVarPat n = wrapGenSpan $ VarPat noExtField (wrapGenSpan n)
+
+genWildPat :: LPat GhcRn
+genWildPat = wrapGenSpan $ WildPat noExtField
+
+genSimpleFunBind :: Name -> [LPat GhcRn]
+                 -> LHsExpr GhcRn -> LHsBind GhcRn
+genSimpleFunBind fun pats expr
+  = L gen $ genFunBind (L gen fun)
+        [mkMatch (mkPrefixFunRhs (L gen fun)) pats expr
+                 emptyLocalBinds]
+  where
+    gen = noAnnSrcSpan generatedSrcSpan
+
+genFunBind :: LocatedN Name -> [LMatch GhcRn (LHsExpr GhcRn)]
+           -> HsBind GhcRn
+genFunBind fn ms
+  = FunBind { fun_id = fn
+            , fun_matches = mkMatchGroup Generated (wrapGenSpan ms)
+            , fun_ext = emptyNameSet
+            }

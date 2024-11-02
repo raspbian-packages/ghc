@@ -28,14 +28,17 @@ import GHC.Builtin.Types
 import GHC.Builtin.Types.Prim
 import GHC.Builtin.Names
 
+import GHC.Types.FieldLabel
 import GHC.Types.Name.Reader( lookupGRE_FieldLabel, greMangledName )
 import GHC.Types.SafeHaskell
 import GHC.Types.Name   ( Name, pprDefinedAt )
 import GHC.Types.Var.Env ( VarEnv )
 import GHC.Types.Id
+import GHC.Types.Id.Make ( nospecId )
 import GHC.Types.Var
 
 import GHC.Core.Predicate
+import GHC.Core.Coercion
 import GHC.Core.InstEnv
 import GHC.Core.Type
 import GHC.Core.Make ( mkCharExpr, mkNaturalExpr, mkStringExprFS, mkCoreLams )
@@ -43,15 +46,14 @@ import GHC.Core.DataCon
 import GHC.Core.TyCon
 import GHC.Core.Class
 
-import GHC.Core ( Expr(Var, App, Cast, Let), Bind (NonRec) )
-import GHC.Types.Basic
+import GHC.Core ( Expr(Var, App, Cast, Type) )
 
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
 import GHC.Utils.Misc( splitAtList, fstOf3 )
 import GHC.Data.FastString
 
-import Data.Maybe
+import Language.Haskell.Syntax.Basic (FieldLabelString(..))
 
 {- *******************************************************************
 *                                                                    *
@@ -151,20 +153,17 @@ matchGlobalInst :: DynFlags
                              -- See Note [Shortcut solving: overlap]
                 -> Class -> [Type] -> TcM ClsInstResult
 matchGlobalInst dflags short_cut clas tys
-  | cls_name == knownNatClassName
-  = matchKnownNat    dflags short_cut clas tys
-  | cls_name == knownSymbolClassName
-  = matchKnownSymbol dflags short_cut clas tys
-  | cls_name == knownCharClassName
-  = matchKnownChar dflags short_cut clas tys
-  | isCTupleClass clas                = matchCTuple          clas tys
-  | cls_name == typeableClassName     = matchTypeable        clas tys
-  | cls_name == withDictClassName     = matchWithDict             tys
-  | clas `hasKey` heqTyConKey         = matchHeteroEquality       tys
-  | clas `hasKey` eqTyConKey          = matchHomoEquality         tys
-  | clas `hasKey` coercibleTyConKey   = matchCoercible            tys
-  | cls_name == hasFieldClassName     = matchHasField dflags short_cut clas tys
-  | otherwise                         = matchInstEnv dflags short_cut clas tys
+  | cls_name == knownNatClassName     = matchKnownNat    dflags short_cut clas tys
+  | cls_name == knownSymbolClassName  = matchKnownSymbol dflags short_cut clas tys
+  | cls_name == knownCharClassName    = matchKnownChar   dflags short_cut clas tys
+  | isCTupleClass clas                = matchCTuple                       clas tys
+  | cls_name == typeableClassName     = matchTypeable                     clas tys
+  | cls_name == withDictClassName     = matchWithDict                          tys
+  | clas `hasKey` heqTyConKey         = matchHeteroEquality                    tys
+  | clas `hasKey` eqTyConKey          = matchHomoEquality                      tys
+  | clas `hasKey` coercibleTyConKey   = matchCoercible                         tys
+  | cls_name == hasFieldClassName     = matchHasField    dflags short_cut clas tys
+  | otherwise                         = matchInstEnv     dflags short_cut clas tys
   where
     cls_name = className clas
 
@@ -190,7 +189,7 @@ matchInstEnv dflags short_cut_solver clas tys
 
             -- Nothing matches
             ([], NoUnifiers, _)
-                -> do { traceTc "matchClass not matching" (ppr pred)
+                -> do { traceTc "matchClass not matching" (ppr pred $$ ppr (ie_local instEnvs))
                       ; return NoInstance }
 
             -- A single match (& no safe haskell failure)
@@ -424,7 +423,7 @@ makeLitDict clas ty et
                     -- then tcRep is SNat
     , Just (_, co_rep) <- tcInstNewTyCon_maybe tcRep [ty]
           -- SNat n ~ Integer
-    , let ev_tm = mkEvCast et (mkTcSymCo (mkTcTransCo co_dict co_rep))
+    , let ev_tm = mkEvCast et (mkSymCo (mkTransCo co_dict co_rep))
     = return $ OneInst { cir_new_theta = []
                        , cir_mk_ev     = \_ -> ev_tm
                        , cir_what      = BuiltinInstance }
@@ -451,25 +450,29 @@ matchWithDict [cls, mty]
     -- and in that case let
     -- co :: C t1 ..tn ~R# inst_meth_ty
   , Just (inst_meth_ty, co) <- tcInstNewTyCon_maybe dict_tc dict_args
-  = do { sv <- mkSysLocalM (fsLit "withDict_s") Many mty
-       ; k  <- mkSysLocalM (fsLit "withDict_k") Many (mkInvisFunTyMany cls openAlphaTy)
-
-       ; let evWithDict_type = mkSpecForAllTys [runtimeRep1TyVar, openAlphaTyVar] $
-                               mkVisFunTysMany [mty, mkInvisFunTyMany cls openAlphaTy] openAlphaTy
-
-       ; wd_id <- mkSysLocalM (fsLit "withDict_wd") Many evWithDict_type
-       ; let wd_id' = wd_id `setInlinePragma` neverInlinePragma
-               -- Inlining withDict can cause the specialiser to incorrectly common up
-               -- distinct evidence terms. See (WD6) in Note [withDict].
+  = do { sv <- mkSysLocalM (fsLit "withDict_s") ManyTy mty
+       ; k  <- mkSysLocalM (fsLit "withDict_k") ManyTy (mkInvisFunTy cls openAlphaTy)
 
        -- Given co2 : mty ~N# inst_meth_ty, construct the method of
        -- the WithDict dictionary:
-       -- \@(r : RuntimeRep) @(a :: TYPE r) (sv : mty) (k :: cls => a) -> k (sv |> (sub co; sym co2))
+       --
+       --   \@(r :: RuntimeRep) @(a :: TYPE r) (sv :: mty) (k :: cls => a) ->
+       --     nospec @(cls => a) k (sv |> (sub co ; sym co2))
+       --
+       -- where  nospec :: forall a. a -> a  ensures that the typeclass specialiser
+       -- doesn't attempt to common up this evidence term with other evidence terms
+       -- of the same type.
+       --
+       -- See (WD6) in Note [withDict], and Note [nospecId magic] in GHC.Types.Id.Make.
        ; let evWithDict co2 =
-               let wd_rhs = mkCoreLams [ runtimeRep1TyVar, openAlphaTyVar, sv, k ] $
-                            Var k `App` Cast (Var sv) (mkTcTransCo (mkTcSubCo co2) (mkTcSymCo co))
-               in Let (NonRec wd_id' wd_rhs) (Var wd_id')
-         -- Why a Let?  See (WD6) in Note [withDict]
+               mkCoreLams [ runtimeRep1TyVar, openAlphaTyVar, sv, k ] $
+                 Var nospecId
+                   `App`
+                 (Type $ mkInvisFunTy cls openAlphaTy)
+                   `App`
+                 Var k
+                   `App`
+                 (Var sv `Cast` mkTransCo (mkSubCo co2) (mkSymCo co))
 
        ; tc <- tcLookupTyCon withDictClassName
        ; let Just withdict_data_con
@@ -531,7 +534,7 @@ as if the following instance declaration existed:
 
 instance (mty ~# inst_meth_ty) => WithDict (C t1..tn) mty where
   withDict = \@{rr} @(r :: TYPE rr) (sv :: mty) (k :: C t1..tn => r) ->
-    k (sv |> (sub co2; sym co))
+    k (sv |> (sub co2 ; sym co))
 
 That is, it matches on the first (constraint) argument of C; if C is
 a single-method class, the instance "fires" and emits an equality
@@ -564,49 +567,68 @@ Some further observations about `withDict`:
 (WD3) As an alternative to `withDict`, one could define functions like `withT`
       above in terms of `unsafeCoerce`. This is more error-prone, however.
 
-(WD4) In order to define things like `reifySymbol` below:
+(WD4) In order to define things like `withKnownNat` below:
 
-        reifySymbol :: forall r. String -> (forall (n :: Symbol). KnownSymbol n => r) -> r
+        withKnownNat :: SNat n -> (KnownNat n => r) -> r
 
       `withDict` needs to be instantiated with `Any`, like so:
 
-        reifySymbol n k = withDict @(KnownSymbol Any) @String @r n (k @Any)
+        withKnownNat = withDict @(KnownNat Any) @(SNat Any) @r
 
-      The use of `Any` is explained in Note [NOINLINE someNatVal] in
+      The use of `Any` is explained in Note [NOINLINE withSomeSNat] in
       base:GHC.TypeNats.
 
 (WD5) In earlier implementations, `withDict` was implemented as an identifier
       with special handling during either constant-folding or desugaring.
-      The current approach is more robust, previously the type of `withDict`
+      The current approach is more robust: previously, the type of `withDict`
       did not have a type-class constraint and was overly polymorphic.
       See #19915.
 
-(WD6) In fact we desugar `withDict @(C t_1 ... t_n) @mty @{rr} @r` to
+(WD6) In fact, we desugar `withDict @cls @mty @{rr} @r` to
 
-         let wd = \sv k -> k (sv |> co)
-             {-# NOINLINE wd #-}
-         in wd
+         \@(r :: RuntimeRep) @(a :: TYPE r) (sv :: mty) (k :: cls => a) ->
+           nospec @(cls => a) k (sv |> (sub co2 ; sym co)))
 
-      The local `let` and NOINLINE pragma ensure that the type-class specialiser
-      doesn't wrongly common up distinct evidence terms. This is super important!
-      Suppose we have calls
+      That is, we cast the method using a coercion, and apply k to it.
+      However, we use the 'nospec' magicId (see Note [nospecId magic] in GHC.Types.Id.Make)
+      to ensure that the typeclass specialiser doesn't incorrectly common-up distinct
+      evidence terms. This is super important! Suppose we have calls
+
           withDict A k
           withDict B k
-      where k1, k2 :: C T -> blah.  If we inline those withDict calls we'll get
+
+      where k1, k2 :: C T -> blah.  If we desugared withDict naively, we'd get
+
           k (A |> co1)
           k (B |> co2)
-      and the Specialiser will assume that those arguments (of type `C T`) are
-      the same, will specialise `k` for that type, and will call the same,
+
+      and the Specialiser would assume that those arguments (of type `C T`) are
+      the same. It would then specialise `k` for that type, and then call the same,
       specialised function from both call sites.  #21575 is a concrete case in point.
 
-      Solution: never inline `withDict`. Note that it is not sufficient to delay
-      inlining until after the specialiser (that is, until Phase 2), because if
-      we inline withDict in module A but import it in module B, the specialiser
-      will try to common up the two distinct evidence terms.
-      See test case T21575b.
+      To avoid this, we need to stop the typeclass specialiser from seeing this
+      structure, by using nospec. This function is inlined only in CorePrep; crucially
+      this means that it still appears in interface files, so that the desugaring of
+      withDict remains opaque to the typeclass specialiser across modules.
+      This means the specialiser will always see instead:
 
-      This solution is unsatisfactory, as it imposes a performance overhead
-      on uses of withDict.
+          nospec @(cls => a) k (A |> co1)
+          nospec @(cls => a) k (B |> co2)
+
+      Why does this work? Recall that nospec is not an overloaded function;
+      it has the type
+
+        nospec :: forall a. a -> a
+
+      This means that there is nothing for the specialiser to do with function calls
+      such as
+
+        nospec @(cls => a) k (A |> co)
+
+      as the specialiser only looks at calls of the form `f dict` for an
+      overloaded function `f` (e.g. with a type such as `f :: Eq a => ...`).
+
+      See test-case T21575b.
 
 -}
 
@@ -620,18 +642,29 @@ Some further observations about `withDict`:
 -- and it was applied to the correct argument.
 matchTypeable :: Class -> [Type] -> TcM ClsInstResult
 matchTypeable clas [k,t]  -- clas = Typeable
-  -- For the first two cases, See Note [No Typeable for polytypes or qualified types]
-  | isForAllTy k                      = return NoInstance   -- Polytype
-  | isJust (tcSplitPredFunTy_maybe t) = return NoInstance   -- Qualified type
+  -- Forall types: see Note [No Typeable for polytypes or qualified types]
+  | isForAllTy k = return NoInstance
+
+  -- Functions; but only with a visible argment
+  | Just (af,mult,arg,ret) <- splitFunTy_maybe t
+  = if isVisibleFunArg af
+    then doFunTy clas t mult arg ret
+    else return NoInstance
+      -- 'else' case: qualified types like (Num a => blah) are not typeable
+      -- see Note [No Typeable for polytypes or qualified types]
 
   -- Now cases that do work
-  | k `eqType` naturalTy                   = doTyLit knownNatClassName         t
-  | k `eqType` typeSymbolKind              = doTyLit knownSymbolClassName      t
-  | k `eqType` charTy                      = doTyLit knownCharClassName        t
-  | tcIsConstraintKind t                   = doTyConApp clas t constraintKindTyCon []
-  | Just (mult,arg,ret) <- splitFunTy_maybe t   = doFunTy    clas t mult arg ret
+  | k `eqType` naturalTy      = doTyLit knownNatClassName         t
+  | k `eqType` typeSymbolKind = doTyLit knownSymbolClassName      t
+  | k `eqType` charTy         = doTyLit knownCharClassName        t
+
+  -- TyCon applied to its kind args
+  -- No special treatment of Type and Constraint; they get distinct TypeReps
+  -- see wrinkle (W4) of Note [Type and Constraint are not apart]
+  --     in GHC.Builtin.Types.Prim.
   | Just (tc, ks) <- splitTyConApp_maybe t -- See Note [Typeable (T a b c)]
   , onlyNamedBndrsApplied tc ks            = doTyConApp clas t tc ks
+
   | Just (f,kt)   <- splitAppTy_maybe t    = doTyApp    clas t f kt
 
 matchTypeable _ _ = return NoInstance
@@ -655,10 +688,9 @@ doFunTy clas ty mult arg_ty ret_ty
 doTyConApp :: Class -> Type -> TyCon -> [Kind] -> TcM ClsInstResult
 doTyConApp clas ty tc kind_args
   | tyConIsTypeable tc
-  = do
-     return $ OneInst { cir_new_theta = (map (mk_typeable_pred clas) kind_args)
-                      , cir_mk_ev     = mk_ev
-                      , cir_what      = BuiltinTypeableInstance tc }
+  = return $ OneInst { cir_new_theta = map (mk_typeable_pred clas) kind_args
+                     , cir_mk_ev     = mk_ev
+                     , cir_what      = BuiltinTypeableInstance tc }
   | otherwise
   = return NoInstance
   where
@@ -684,7 +716,7 @@ doTyApp :: Class -> Type -> Type -> KindOrType -> TcM ClsInstResult
 --    (Typeable f, Typeable Int, Typeable Char)  --> (after some simp. steps)
 --    Typeable f
 doTyApp clas ty f tk
-  | isForAllTy (tcTypeKind f)
+  | isForAllTy (typeKind f)
   = return NoInstance -- We can't solve until we know the ctr.
   | otherwise
   = return $ OneInst { cir_new_theta = map (mk_typeable_pred clas) [f, tk]
@@ -697,7 +729,7 @@ doTyApp clas ty f tk
 
 -- Emit a `Typeable` constraint for the given type.
 mk_typeable_pred :: Class -> Type -> PredType
-mk_typeable_pred clas ty = mkClassPred clas [ tcTypeKind ty, ty ]
+mk_typeable_pred clas ty = mkClassPred clas [ typeKind ty, ty ]
 
   -- Typeable is implied by KnownNat/KnownSymbol. In the case of a type literal
   -- we generate a sub-goal for the appropriate class.
@@ -713,14 +745,31 @@ doTyLit kc t = do { kc_clas <- tcLookupClass kc
 
 {- Note [Typeable (T a b c)]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-For type applications we always decompose using binary application,
-via doTyApp, until we get to a *kind* instantiation.  Example
-   Proxy :: forall k. k -> *
 
-To solve Typeable (Proxy (* -> *) Maybe) we
-  - First decompose with doTyApp,
-    to get (Typeable (Proxy (* -> *))) and Typeable Maybe
-  - Then solve (Typeable (Proxy (* -> *))) with doTyConApp
+For type applications we always decompose using binary application,
+via doTyApp (building a TrApp), until we get to a *kind* instantiation
+(building a TrTyCon).  We detect a pure kind instantiation using
+`onlyNamedBndrsApplied`.
+
+Example: Proxy :: forall k. k -> *
+
+  To solve Typeable (Proxy @(* -> *) Maybe) we
+
+  - First decompose with doTyApp (onlyNamedBndrsApplied is False)
+    to get (Typeable (Proxy @(* -> *))) and Typeable Maybe.
+    This step returns a TrApp.
+
+  - Then solve (Typeable (Proxy @(* -> *))) with doTyConApp
+    (onlyNamedBndrsApplied is True).
+    This step returns a TrTyCon
+
+  So the TypeRep we build is
+    TrApp (TrTyCon ("Proxy" @(*->*))) (TrTyCon "Maybe")
+
+Notice also that TYPE and CONSTRAINT are distinct so, in effect, we
+allow (Typeable TYPE) and (Typeable CONSTRAINT), giving disinct TypeReps.
+This is very important: we may want to get a TypeRep for a kind like
+   Type -> Constraint
 
 If we attempt to short-cut by solving it all at once, via
 doTyConApp
@@ -894,7 +943,7 @@ matchHasField dflags short_cut clas tys
                -- use representation tycon (if data family); it has the fields
              , let r_tc = fstOf3 (tcLookupDataFamInst fam_inst_envs tc args)
                -- x should be a field of r
-             , Just fl <- lookupTyConFieldLabel x r_tc
+             , Just fl <- lookupTyConFieldLabel (FieldLabelString x) r_tc
                -- the field selector should be in scope
              , Just gre <- lookupGRE_FieldLabel rdr_env fl
 
@@ -913,8 +962,8 @@ matchHasField dflags short_cut clas tys
                          -- it to a HasField dictionary.
                          mk_ev (ev1:evs) = evSelector sel_id tvs evs `evCast` co
                            where
-                             co = mkTcSubCo (evTermCoercion (EvExpr ev1))
-                                      `mkTcTransCo` mkTcSymCo co2
+                             co = mkSubCo (evTermCoercion (EvExpr ev1))
+                                      `mkTransCo` mkSymCo co2
                          mk_ev [] = panic "matchHasField.mk_ev"
 
                          Just (_, co2) = tcInstNewTyCon_maybe (classTyCon clas)

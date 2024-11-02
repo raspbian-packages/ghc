@@ -285,7 +285,7 @@ The available mode flags are:
        single: run mode
        single: GHCi
 
-    Run a script's ``main`` entry-point. Similar to ``runghc`` this will by
+    Run a script's ``main`` entry-point. Similar to ``runghc``/``runhaskell`` this will by
     default use the bytecode interpreter. If the command-line contains a ``--``
     argument then all arguments that follow will be passed to the script. All
     arguments that precede ``--`` are interpreted as GHC arguments.
@@ -784,7 +784,7 @@ pass to ``--make`` mode.
 
 Then when the compiler starts in ``--make`` mode it will compile both units ``a`` and ``b``.
 
-There is also very basic support for multple home units in GHCi, at the moment you can start
+There is also very basic support for multiple home units in GHCi, at the moment you can start
 a GHCi session with multiple units but only the `:reload`:ghci-cmd: is supported.
 
 .. ghc-flag:: -unit @⟨filename⟩
@@ -809,7 +809,7 @@ units easier.
     to this directory. When there are multiple home units the compiler is often
     not operating in the standard directory and instead where the cabal.project
     file is located. In this case the `-working-dir` option can be passed which specifies
-    the path from the current directory to the directory the unit assumes to be it's root,
+    the path from the current directory to the directory the unit assumes to be its root,
     normally the directory which contains the cabal file.
 
     When the flag is passed, any relative paths used by the compiler are offset
@@ -868,7 +868,7 @@ multiple home units.
   Any external unit must not depend on any home unit.
 
 This closure property is checked by the compiler but it's up to the tool invoking
-GHC to ensure that the supplied list of home units obey this invariant.
+GHC to ensure that the supplied list of home units obeys this invariant.
 
 For example, if we have three units, ``p``, ``q`` and ``r``, where ``p`` depends on ``q`` and
 ``q`` depends on ``r``, then the closure property states that if we load ``p`` and ``r`` as
@@ -1051,7 +1051,7 @@ See also the ``--help``, ``--version``, ``--numeric-version``, and
     :category: verbosity
 
     When GHC can't find an instance for a class, it displays a short
-    list of some in the instances it knows about. With this flag it
+    list of some of the instances it knows about. With this flag it
     prints *all* the instances it knows about.
 
 .. ghc-flag:: -fhide-source-paths
@@ -1252,6 +1252,53 @@ messages and in GHCi:
         Expected type: ST s Int
           Actual type: ST s Bool
 
+.. ghc-flag:: -fprint-redundant-promotion-ticks
+    :shortdesc: Print redundant :extension:`DataKinds` promotion ticks
+    :type: dynamic
+    :reverse: -fno-print-redundant-promotion-ticks
+    :category: verbosity
+
+    The :extension:`DataKinds` extension allows us to use data constructors at
+    the type level::
+
+        type B = True     -- refers to the data constructor True (of type Bool)
+
+    When there is a type constructor of the same name, it takes precedence
+    during name resolution::
+
+        data True = MkT
+        type B = True     -- now refers to the type constructor (of kind Type)
+
+    We can tell GHC to prefer the data constructor over the type constructor
+    using special namespace disambiguation syntax that we call a *promotion
+    tick*::
+
+        data True = MkT
+        type B = 'True
+            -- refers to the data constructor True (of type Bool)
+            -- even in the presence of a type constructor of the same name
+
+    Note that the promotion tick is not a promotion operator. Its only purpose
+    is to instruct GHC to prefer the promoted data constructor over a type
+    constructor in case of a name conflict. Therefore, GHC will not print the
+    tick when the name conflict is absent:
+
+    .. code-block:: none
+
+        ghci> type B = False
+        ghci> :kind! B
+        B :: Bool
+        = False          -- no promotion tick here
+
+        ghci> data False -- introduce a name conflict
+
+        ghci> :kind! B
+        B :: Bool
+        = 'False         -- promotion tick resolves the name conflict
+
+    The :ghc-flag:`-fprint-redundant-promotion-ticks` instructs GHC to print the
+    promotion tick unconditionally.
+
 .. ghc-flag:: -fprint-typechecker-elaboration
     :shortdesc: Print extra information from typechecker.
     :type: dynamic
@@ -1359,6 +1406,18 @@ messages and in GHCi:
     Controls whether GHC displays a line of the original source code where the
     error was detected.  This also affects the associated caret symbol that
     points at the region of code at fault.
+
+.. ghc-flag:: -fshow-error-context
+    :shortdesc: Whether to show textual information about error context
+    :type: dynamic
+    :reverse: -fno-show-error-context
+    :category: verbosity
+
+    :default: on
+
+    Controls whether GHC displays information about the context in which an
+    error occurred. This controls whether the part of the error message which
+    says "In the equation..", "In the pattern.." etc is displayed or not.
 
 .. ghc-flag:: -ferror-spans
     :shortdesc: Output full span in error messages
@@ -1680,9 +1739,9 @@ GHC can also be configured using various environment variables.
 
 .. envvar:: GHC_NO_UNICODE
 
-    When non-empty, disables Unicode diagnostics output will be disabled of locale settings.
+    When non-empty, disables Unicode diagnostics output regardless of locale settings.
 
 .. envvar:: GHC_CHARENC
 
     When set to ``UTF-8`` the compiler will always print UTF-8-encoded output, regardless
-    the current locale.
+    of the current locale.

@@ -135,6 +135,13 @@ denominator (_ :% y)    =  y
 -- Standard numeric classes
 --------------------------------------------------------------
 
+-- | Real numbers.
+--
+-- The Haskell report defines no laws for 'Real', however 'Real' instances
+-- are customarily expected to adhere to the following law:
+--
+-- [__Coherence with 'fromRational'__]: if the type also implements 'Fractional',
+-- then 'fromRational' is a left inverse for 'toRational', i.e. @fromRational (toRational i) = i@
 class  (Num a, Ord a) => Real a  where
     -- | the rational equivalent of its real argument with full precision
     toRational          ::  a -> Rational
@@ -153,6 +160,9 @@ class  (Num a, Ord a) => Real a  where
 --
 -- An example of a suitable Euclidean function, for 'Integer'\'s instance, is
 -- 'abs'.
+--
+-- In addition, 'toInteger` should be total, and 'fromInteger' should be a left
+-- inverse for it, i.e. @fromInteger (toInteger i) = i@.
 class  (Real a, Enum a) => Integral a  where
     -- | integer division truncated toward zero
     --
@@ -211,6 +221,9 @@ class  (Real a, Enum a) => Integral a  where
 --
 -- [__'recip' gives the multiplicative inverse__]:
 -- @x * recip x@ = @recip x * x@ = @fromInteger 1@
+-- [__Totality of 'toRational'__]: 'toRational' is total
+-- [__Coherence with 'toRational'__]: if the type also implements 'Real',
+-- then 'fromRational' is a left inverse for 'toRational', i.e. @fromRational (toRational i) = i@
 --
 -- Note that it /isn't/ customarily expected that a type instance of
 -- 'Fractional' implement a field. However, all instances in @base@ do.
@@ -275,6 +288,7 @@ class  (Real a, Fractional a) => RealFrac a  where
 -- These 'numeric' enumerations come straight from the Report
 
 numericEnumFrom         :: (Fractional a) => a -> [a]
+{-# INLINE numericEnumFrom #-}  -- See Note [Inline Enum method helpers] in GHC.Enum
 numericEnumFrom n       = go 0
   where
     -- See Note [Numeric Stability of Enumerating Floating Numbers]
@@ -282,6 +296,7 @@ numericEnumFrom n       = go 0
              in n' : go (k + 1)
 
 numericEnumFromThen     :: (Fractional a) => a -> a -> [a]
+{-# INLINE numericEnumFromThen #-}  -- See Note [Inline Enum method helpers] in GHC.Enum
 numericEnumFromThen n m = go 0
   where
     step = m - n
@@ -290,9 +305,11 @@ numericEnumFromThen n m = go 0
              in n' : go (k + 1)
 
 numericEnumFromTo       :: (Ord a, Fractional a) => a -> a -> [a]
+{-# INLINE numericEnumFromTo #-}  -- See Note [Inline Enum method helpers] in GHC.Enum
 numericEnumFromTo n m   = takeWhile (<= m + 1/2) (numericEnumFrom n)
 
 numericEnumFromThenTo   :: (Ord a, Fractional a) => a -> a -> a -> [a]
+{-# INLINE numericEnumFromThenTo #-}  -- See Note [Inline Enum method helpers] in GHC.Enum
 numericEnumFromThenTo e1 e2 e3
     = takeWhile predicate (numericEnumFromThen e1 e2)
                                 where
@@ -654,27 +671,37 @@ odd             =  not . even
 
 -------------------------------------------------------
 -- | raise a number to a non-negative integral power
-{-# SPECIALISE [1] (^) ::
-        Integer -> Integer -> Integer,
-        Integer -> Int -> Integer,
-        Int -> Int -> Int #-}
-{-# INLINABLE [1] (^) #-}    -- See Note [Inlining (^)]
+{-# INLINE [1] (^) #-}    -- See Note [Inlining (^)]
 (^) :: (Num a, Integral b) => a -> b -> a
 x0 ^ y0 | y0 < 0    = errorWithoutStackTrace "Negative exponent"
         | y0 == 0   = 1
-        | otherwise = f x0 y0
-    where -- f : x0 ^ y0 = x ^ y
-          f x y | even y    = f (x * x) (y `quot` 2)
-                | y == 1    = x
-                | otherwise = g (x * x) (y `quot` 2) x         -- See Note [Half of y - 1]
-          -- g : x0 ^ y0 = (x ^ y) * z
-          g x y z | even y = g (x * x) (y `quot` 2) z
-                  | y == 1 = x * z
-                  | otherwise = g (x * x) (y `quot` 2) (x * z) -- See Note [Half of y - 1]
+        | otherwise = powImpl x0 y0
+
+{-# SPECIALISE powImpl ::
+        Integer -> Integer -> Integer,
+        Integer -> Int -> Integer,
+        Int -> Int -> Int #-}
+{-# INLINABLE powImpl #-}    -- See Note [Inlining (^)]
+powImpl :: (Num a, Integral b) => a -> b -> a
+-- powImpl : x0 ^ y0 = (x ^ y)
+powImpl x y | even y    = powImpl (x * x) (y `quot` 2)
+            | y == 1    = x
+            | otherwise = powImplAcc (x * x) (y `quot` 2) x -- See Note [Half of y - 1]
+
+{-# SPECIALISE powImplAcc ::
+        Integer -> Integer -> Integer -> Integer,
+        Integer -> Int -> Integer -> Integer,
+        Int -> Int -> Int -> Int #-}
+{-# INLINABLE powImplAcc #-}    -- See Note [Inlining (^)]
+powImplAcc :: (Num a, Integral b) => a -> b -> a -> a
+-- powImplAcc : x0 ^ y0 = (x ^ y) * z
+powImplAcc x y z | even y    = powImplAcc (x * x) (y `quot` 2) z
+                 | y == 1    = x * z
+                 | otherwise = powImplAcc (x * x) (y `quot` 2) (x * z) -- See Note [Half of y - 1]
 
 -- | raise a number to an integral power
 (^^)            :: (Fractional a, Integral b) => a -> b -> a
-{-# INLINABLE [1] (^^) #-}         -- See Note [Inlining (^)
+{-# INLINE [1] (^^) #-}         -- See Note [Inlining (^)
 x ^^ n          =  if n >= 0 then x^n else recip (x^(negate n))
 
 {- Note [Half of y - 1]
@@ -682,14 +709,40 @@ x ^^ n          =  if n >= 0 then x^n else recip (x^(negate n))
 Since y is guaranteed to be odd and positive here,
 half of y - 1 can be computed as y `quot` 2, optimising subtraction away.
 
-Note [Inlining (^)
-~~~~~~~~~~~~~~~~~~
-The INLINABLE pragma allows (^) to be specialised at its call sites.
-If it is called repeatedly at the same type, that can make a huge
-difference, because of those constants which can be repeatedly
-calculated.
+Note [Inlining (^)]
+~~~~~~~~~~~~~~~~~~~
+We want to achieve the following:
+* Noting that (^) is lazy in its first argument, we'd still like to avoid allocating a box for
+  the first argument.   Example: nofib/imaginary/x2n1, which makes many calls to (^) with
+  different first arguments each time.
 
-Currently the fromInteger calls are not floated because we get
+  Solution: split (^) into a small INLINE wrapper that tests the second arg, which then calls the
+  strict (and recursive) auxiliary function `powImpl`.
+
+* Don't inline (^) too early because we want rewrite rules to optimise calls to (^) with
+  small exponents.  See Note [Powers with small exponent].
+
+  Solution: use INLINE[1] to delay inlining to phase 1, giving the rewrite rules time to fire.
+
+* (^) is overloaded on two different type parameters.  We want to specialise.
+
+  Solution: make `powImpl` (and its friend `powImplAcc`) INLINEABLE, so they can be specialised
+  at call sites.  Also give them some common specialisations right here, to avoid duplicating
+  that specialisation in clients.
+
+Specialisation can make a huge difference for repeated calls, because of
+constants which would otherwise be calculated repeatedly and unboxing of
+arguments.
+
+Why not make (^) strict in `x0` with a bang and make it INLINABLE? Well, because
+it is futile: Being strict in the `Complex Double` pair won't be enough to unbox
+the `Double`s anyway. Even after deep specisalisation, we will only unbox the
+`Double`s when we inline (^), because (^) remains lazy in the `Double` fields.
+Given that (^) must always inline to yield good code, we can just as well mark
+it as such.
+
+A small note on perf: Currently the fromInteger calls from the desugaring of
+literals are not floated because we get
           \d1 d2 x y -> blah
 after the gentle round of simplification.
 
@@ -713,22 +766,21 @@ floated out before the rule has a chance to fire.
 Also desirable would be rules for (^^), but I haven't managed
 to get those to fire.
 
-Note: Trying to save multiplications by sharing the square for
-exponents 4 and 5 does not save time, indeed, for Double, it is
-up to twice slower, so the rules contain flat sequences of
-multiplications.
+Note: Since (*) is not associative for some types (e.g. Double), it is
+important that the RHS of these rules produce the same bracketing as
+would the actual implementation of (^). A mismatch here led to #19569.
 -}
 
 -- See Note [Powers with small exponent]
 {-# RULES
-"^2/Int"        forall x. x ^ (2 :: Int) = let u = x in u*u
-"^3/Int"        forall x. x ^ (3 :: Int) = let u = x in u*u*u
-"^4/Int"        forall x. x ^ (4 :: Int) = let u = x in u*u*u*u
-"^5/Int"        forall x. x ^ (5 :: Int) = let u = x in u*u*u*u*u
-"^2/Integer"    forall x. x ^ (2 :: Integer) = let u = x in u*u
-"^3/Integer"    forall x. x ^ (3 :: Integer) = let u = x in u*u*u
-"^4/Integer"    forall x. x ^ (4 :: Integer) = let u = x in u*u*u*u
-"^5/Integer"    forall x. x ^ (5 :: Integer) = let u = x in u*u*u*u*u
+"^2/Int"        forall x. x ^ (2 :: Int) = x*x
+"^3/Int"        forall x. x ^ (3 :: Int) = x*x*x
+"^4/Int"        forall x. x ^ (4 :: Int) = let u = x*x in u*u
+"^5/Int"        forall x. x ^ (5 :: Int) = let u = x*x in u*u*x
+"^2/Integer"    forall x. x ^ (2 :: Integer) = x*x
+"^3/Integer"    forall x. x ^ (3 :: Integer) = x*x*x
+"^4/Integer"    forall x. x ^ (4 :: Integer) = let u = x*x in u*u
+"^5/Integer"    forall x. x ^ (5 :: Integer) = let u = x*x in u*u*x
   #-}
 
 -------------------------------------------------------
@@ -829,13 +881,13 @@ lcm x y         =  abs ((x `quot` (gcd x y)) * y)
 "gcd/Word->Word->Word"          gcd = gcdWord
  #-}
 
--- See Note [Stable Unfolding for list producers] in GHC.Enum
-{-# INLINABLE integralEnumFrom #-}
+-- INLINE pragma: see Note [Inline Enum method helpers] in GHC.Enum
+{-# INLINE integralEnumFrom #-}
 integralEnumFrom :: (Integral a, Bounded a) => a -> [a]
 integralEnumFrom n = map fromInteger [toInteger n .. toInteger (maxBound `asTypeOf` n)]
 
--- See Note [Stable Unfolding for list producers] in GHC.Enum
-{-# INLINABLE integralEnumFromThen #-}
+-- INLINE pragma: see Note [Inline Enum method helpers] in GHC.Enum
+{-# INLINE integralEnumFromThen #-}
 integralEnumFromThen :: (Integral a, Bounded a) => a -> a -> [a]
 integralEnumFromThen n1 n2
   | i_n2 >= i_n1  = map fromInteger [i_n1, i_n2 .. toInteger (maxBound `asTypeOf` n1)]
@@ -844,13 +896,13 @@ integralEnumFromThen n1 n2
     i_n1 = toInteger n1
     i_n2 = toInteger n2
 
--- See Note [Stable Unfolding for list producers] in GHC.Enum
-{-# INLINABLE integralEnumFromTo #-}
+-- INLINE pragma: see Note [Inline Enum method helpers] in GHC.Enum
+{-# INLINE integralEnumFromTo #-}
 integralEnumFromTo :: Integral a => a -> a -> [a]
 integralEnumFromTo n m = map fromInteger [toInteger n .. toInteger m]
 
--- See Note [Stable Unfolding for list producers] in GHC.Enum
-{-# INLINABLE integralEnumFromThenTo #-}
+-- INLINE pragma: see Note [Inline Enum method helpers] in GHC.Enum
+{-# INLINE integralEnumFromThenTo #-}
 integralEnumFromThenTo :: Integral a => a -> a -> a -> [a]
 integralEnumFromThenTo n1 n2 m
   = map fromInteger [toInteger n1, toInteger n2 .. toInteger m]

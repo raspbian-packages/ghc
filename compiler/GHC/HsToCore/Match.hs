@@ -6,7 +6,6 @@
 {-# LANGUAGE ViewPatterns #-}
 
 {-# OPTIONS_GHC -Wno-incomplete-uni-patterns   #-}
-{-# OPTIONS_GHC -Wno-incomplete-record-updates #-}
 
 {-
 (c) The University of Glasgow 2006
@@ -25,9 +24,11 @@ where
 import GHC.Prelude
 import GHC.Platform
 
+import Language.Haskell.Syntax.Basic (Boxity(..))
+
 import {-#SOURCE#-} GHC.HsToCore.Expr (dsExpr)
 
-import GHC.Types.Basic ( Origin(..), isGenerated, Boxity(..) )
+import GHC.Types.Basic ( Origin(..), isGenerated )
 import GHC.Types.SourceText
 import GHC.Driver.Session
 import GHC.Hs
@@ -35,28 +36,32 @@ import GHC.Hs.Syn.Type
 import GHC.Tc.Types.Evidence
 import GHC.Tc.Utils.Monad
 import GHC.HsToCore.Pmc
-import GHC.HsToCore.Pmc.Types ( Nablas, initNablas )
-import GHC.Core
-import GHC.Types.Literal
-import GHC.Core.Utils
-import GHC.Core.Make
+import GHC.HsToCore.Pmc.Types ( Nablas )
 import GHC.HsToCore.Monad
 import GHC.HsToCore.Binds
 import GHC.HsToCore.GuardedRHSs
 import GHC.HsToCore.Utils
-import GHC.Types.Id
-import GHC.Core.ConLike
-import GHC.Core.DataCon
-import GHC.Core.PatSyn
 import GHC.HsToCore.Errors.Types
 import GHC.HsToCore.Match.Constructor
 import GHC.HsToCore.Match.Literal
+
+import GHC.Core
+import GHC.Core.Utils
+import GHC.Core.Make
+import GHC.Core.ConLike
+import GHC.Core.DataCon
+import GHC.Core.PatSyn
 import GHC.Core.Type
+import GHC.Core.TyCo.Compare( eqType, eqTypes )
 import GHC.Core.Coercion ( eqCoercion )
 import GHC.Core.TyCon    ( isNewTyCon )
 import GHC.Core.Multiplicity
 import GHC.Builtin.Types
+
+import GHC.Types.Id
+import GHC.Types.Literal
 import GHC.Types.SrcLoc
+
 import GHC.Data.Maybe
 import GHC.Utils.Misc
 import GHC.Types.Name
@@ -430,7 +435,7 @@ tidy1 v _ (VarPat _ (L _ var))
 
         -- case v of { x@p -> mr[] }
         -- = case v of { p -> let x=v in mr[] }
-tidy1 v o (AsPat _ (L _ var) pat)
+tidy1 v o (AsPat _ (L _ var) _ pat)
   = do  { (wrap, pat') <- tidy1 v o (unLoc pat)
         ; return (wrapBind var v . wrap, pat') }
 
@@ -517,8 +522,8 @@ tidy_bang_pat v o _ (SigPat _ (L l p) _) = tidy_bang_pat v o l p
 
 -- Push the bang-pattern inwards, in the hope that
 -- it may disappear next time
-tidy_bang_pat v o l (AsPat x v' p)
-  = tidy1 v o (AsPat x v' (L l (BangPat noExtField p)))
+tidy_bang_pat v o l (AsPat x v' at p)
+  = tidy1 v o (AsPat x v' at (L l (BangPat noExtField p)))
 tidy_bang_pat v o l (XPat (CoPat w p t))
   = tidy1 v o (XPat $ CoPat w (BangPat noExtField (L l p)) t)
 
@@ -751,7 +756,7 @@ matchWrapper
       it creates another equation if the match can fail
       (see @GHC.HsToCore.Expr.doDo@ function)
 \item @let@ patterns, are treated by @matchSimply@
-   List Comprension Patterns, are treated by @matchSimply@ also
+   List Comprehension Patterns, are treated by @matchSimply@ also
 \end{itemize}
 
 We can't call @matchSimply@ with Lambda patterns,
@@ -762,8 +767,8 @@ JJQC 30-Nov-1997
 -}
 
 matchWrapper ctxt scrs (MG { mg_alts = L _ matches
-                             , mg_ext = MatchGroupTc arg_tys rhs_ty
-                             , mg_origin = origin })
+                           , mg_ext = MatchGroupTc arg_tys rhs_ty origin
+                           })
   = do  { dflags <- getDynFlags
         ; locn   <- getSrcSpanDs
 
@@ -778,16 +783,24 @@ matchWrapper ctxt scrs (MG { mg_alts = L _ matches
         -- Pattern match check warnings for /this match-group/.
         -- @rhss_nablas@ is a flat list of covered Nablas for each RHS.
         -- Each Match will split off one Nablas for its RHSs from this.
-        ; matches_nablas <- if isMatchContextPmChecked dflags origin ctxt
+        ; matches_nablas <-
+            if isMatchContextPmChecked dflags origin ctxt
+
+            -- See Note [Long-distance information] in GHC.HsToCore.Pmc
             then addHsScrutTmCs (concat scrs) new_vars $
-                 -- See Note [Long-distance information]
                  pmcMatches (DsMatchContext ctxt locn) new_vars matches
-            else pure (initNablasMatches matches)
+
+            -- When we're not doing PM checks on the match group,
+            -- we still need to propagate long-distance information.
+            -- See Note [Long-distance information in matchWrapper]
+            else do { ldi_nablas <- getLdiNablas
+                    ; pure $ initNablasMatches ldi_nablas matches }
 
         ; eqns_info   <- zipWithM mk_eqn_info matches matches_nablas
 
-        ; result_expr <- handleWarnings $
+        ; result_expr <- discard_warnings_if_generated origin $
                          matchEquations ctxt new_vars eqns_info rhs_ty
+
         ; return (new_vars, result_expr) }
   where
     -- Called once per equation in the match, or alternative in the case
@@ -805,19 +818,67 @@ matchWrapper ctxt scrs (MG { mg_alts = L _ matches
                             , eqn_orig = FromSource
                             , eqn_rhs  = match_result } }
 
-    handleWarnings = if isGenerated origin
-                     then discardWarningsDs
-                     else id
+    discard_warnings_if_generated orig =
+      if isGenerated orig
+      then discardWarningsDs
+      else id
 
-    initNablasMatches :: [LMatch GhcTc b] -> [(Nablas, NonEmpty Nablas)]
-    initNablasMatches ms
-      = map (\(L _ m) -> (initNablas, initNablasGRHSs (m_grhss m))) ms
+    initNablasMatches :: Nablas -> [LMatch GhcTc b] -> [(Nablas, NonEmpty Nablas)]
+    initNablasMatches ldi_nablas ms
+      = map (\(L _ m) -> (ldi_nablas, initNablasGRHSs ldi_nablas (m_grhss m))) ms
 
-    initNablasGRHSs :: GRHSs GhcTc b -> NonEmpty Nablas
-    initNablasGRHSs m = expectJust "GRHSs non-empty"
-                      $ NEL.nonEmpty
-                      $ replicate (length (grhssGRHSs m)) initNablas
+    initNablasGRHSs :: Nablas -> GRHSs GhcTc b -> NonEmpty Nablas
+    initNablasGRHSs ldi_nablas m
+      = expectJust "GRHSs non-empty"
+      $ NEL.nonEmpty
+      $ replicate (length (grhssGRHSs m)) ldi_nablas
 
+{- Note [Long-distance information in matchWrapper]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The pattern match checking in matchWrapper is done conditionally, depending
+on isMatchContextPmChecked. This means that we don't perform pattern match
+checking on e.g. generated pattern matches.
+
+However, when we skip pattern match checking, we still need to keep track
+of long-distance information in case we need it in a nested context.
+
+This came up in #23445. For example:
+
+  data GADT a where
+    IsUnit :: GADT ()
+
+  data Foo b where
+    FooUnit :: Foo ()
+    FooInt  :: Foo Int
+
+  data SomeRec = SomeRec { fld :: () }
+
+  bug :: GADT a -> Foo a -> SomeRec -> SomeRec
+  bug IsUnit foo r =
+    let gen_fld :: ()
+        gen_fld = case foo of { FooUnit -> () }
+    in case r of { SomeRec _ -> SomeRec gen_fld }
+
+Here the body of 'bug' was generated by 'desugarRecordUpd' from the user-written
+record update
+
+  cd { fld = case foo of { FooUnit -> () } }
+
+As a result, we have a generated FunBind gen_fld whose RHS
+
+  case foo of { FooUnit -> () }
+
+is user-written. This all happens after the GADT pattern match on IsUnit,
+which brings into scope the Given equality [G] a ~ (). We need to make sure
+that this long distance information is visible when pattern match checking the
+user-written case statement.
+
+To propagate this long-distance information in 'matchWrapper', when we skip
+pattern match checks, we make sure to manually pass the long-distance
+information to 'mk_eqn_info', which is responsible for recurring further into
+the expression (in this case, it will end up recursively calling 'matchWrapper'
+on the user-written case statement).
+-}
 
 matchEquations  :: HsMatchContext GhcRn
                 -> [MatchId] -> [EquationInfo] -> Type
@@ -869,7 +930,7 @@ matchSinglePat (Var var) ctx pat ty match_result
   = matchSinglePatVar var Nothing ctx pat ty match_result
 
 matchSinglePat scrut hs_ctx pat ty match_result
-  = do { var           <- selectSimpleMatchVarL Many pat
+  = do { var           <- selectSimpleMatchVarL ManyTy pat
                             -- matchSinglePat is only used in matchSimply, which
                             -- is used in list comprehension, arrow notation,
                             -- and to create field selectors. All of which only

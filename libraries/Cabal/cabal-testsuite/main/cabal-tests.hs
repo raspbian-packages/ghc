@@ -82,8 +82,8 @@ main = do
     -- https://github.com/appveyor/ci/issues/1364
     hSetBuffering stderr LineBuffering
 
-    -- Parse arguments
-    args <- execParser (info mainArgParser mempty)
+    -- Parse arguments.  N.B. 'helper' adds the option `--help`.
+    args <- execParser $ info (mainArgParser <**> helper) mempty
     let verbosity = if mainArgVerbose args then verbose else normal
 
     -- To run our test scripts, we need to be able to run Haskell code
@@ -214,10 +214,15 @@ main = do
             unexpected_passes <- takeMVar unexpected_passes_var
             skipped           <- takeMVar skipped_var
 
-            -- print skipped
-            logAll $ "SKIPPED " ++ show (length skipped) ++ " tests"
+            -- print summary
+            let sl = show . length
+                testSummary =
+                  sl all_tests ++ " tests, " ++ sl skipped ++ " skipped, "
+                    ++ sl unexpected_passes ++ " unexpected passes, "
+                    ++ sl unexpected_fails ++ " unexpected fails."
+            logAll testSummary
 
-            -- print failed or ook
+            -- print failed or unexpected ok
             if null (unexpected_fails ++ unexpected_passes)
             then logAll "OK"
             else do

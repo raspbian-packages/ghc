@@ -15,6 +15,8 @@ import qualified GHC.Platform.S390X      as S390X
 import qualified GHC.Platform.X86        as X86
 import qualified GHC.Platform.X86_64     as X86_64
 import qualified GHC.Platform.RISCV64    as RISCV64
+import qualified GHC.Platform.Wasm32     as Wasm32
+import qualified GHC.Platform.LoongArch64 as LoongArch64
 import qualified GHC.Platform.NoRegs     as NoRegs
 
 -- | Returns 'True' if this global register is stored in a caller-saves
@@ -31,6 +33,8 @@ callerSaves platform
    ArchARM {}  -> ARM.callerSaves
    ArchAArch64 -> AArch64.callerSaves
    ArchRISCV64 -> RISCV64.callerSaves
+   ArchWasm32  -> Wasm32.callerSaves
+   ArchLoongArch64 -> LoongArch64.callerSaves
    arch
     | arch `elem` [ArchPPC, ArchPPC_64 ELF_V1, ArchPPC_64 ELF_V2] ->
         PPC.callerSaves
@@ -53,6 +57,8 @@ activeStgRegs platform
    ArchARM {}  -> ARM.activeStgRegs
    ArchAArch64 -> AArch64.activeStgRegs
    ArchRISCV64 -> RISCV64.activeStgRegs
+   ArchWasm32  -> Wasm32.activeStgRegs
+   ArchLoongArch64 -> LoongArch64.activeStgRegs
    arch
     | arch `elem` [ArchPPC, ArchPPC_64 ELF_V1, ArchPPC_64 ELF_V2] ->
         PPC.activeStgRegs
@@ -70,6 +76,8 @@ haveRegBase platform
    ArchARM {}  -> ARM.haveRegBase
    ArchAArch64 -> AArch64.haveRegBase
    ArchRISCV64 -> RISCV64.haveRegBase
+   ArchWasm32  -> Wasm32.haveRegBase
+   ArchLoongArch64 -> LoongArch64.haveRegBase
    arch
     | arch `elem` [ArchPPC, ArchPPC_64 ELF_V1, ArchPPC_64 ELF_V2] ->
         PPC.haveRegBase
@@ -87,6 +95,8 @@ globalRegMaybe platform
    ArchARM {}  -> ARM.globalRegMaybe
    ArchAArch64 -> AArch64.globalRegMaybe
    ArchRISCV64 -> RISCV64.globalRegMaybe
+   ArchWasm32  -> Wasm32.globalRegMaybe
+   ArchLoongArch64 -> LoongArch64.globalRegMaybe
    arch
     | arch `elem` [ArchPPC, ArchPPC_64 ELF_V1, ArchPPC_64 ELF_V2] ->
         PPC.globalRegMaybe
@@ -104,6 +114,8 @@ freeReg platform
    ArchARM {}  -> ARM.freeReg
    ArchAArch64 -> AArch64.freeReg
    ArchRISCV64 -> RISCV64.freeReg
+   ArchWasm32  -> Wasm32.freeReg
+   ArchLoongArch64 -> LoongArch64.freeReg
    arch
     | arch `elem` [ArchPPC, ArchPPC_64 ELF_V1, ArchPPC_64 ELF_V2] ->
         PPC.freeReg

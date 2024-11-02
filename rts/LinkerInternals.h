@@ -29,6 +29,8 @@ void printLoadedObjects(void);
 #  define OBJFORMAT_PEi386
 #elif defined(darwin_HOST_OS) || defined(ios_HOST_OS)
 #  define OBJFORMAT_MACHO
+#elif defined(wasm32_HOST_ARCH)
+#  define OBJFORMAT_WASM32
 #endif
 
 typedef void SymbolAddr;
@@ -71,6 +73,8 @@ typedef enum _SymType {
 #  include "linker/PEi386Types.h"
 #elif defined(OBJFORMAT_MACHO)
 #  include "linker/MachOTypes.h"
+#elif defined(OBJFORMAT_WASM32)
+#  include "linker/Wasm32Types.h"
 #else
 #  error "Unknown OBJECT_FORMAT for HOST_OS"
 #endif
@@ -356,6 +360,15 @@ struct _ObjectCode {
     m32_allocator *rw_m32, *rx_m32;
 #endif
 
+#if defined(OBJFORMAT_ELF) && defined(SHN_XINDEX)
+    /* Cached address of ELF's shndx table, or SHNDX_TABLE_UNINIT if not
+     * initialized yet. It would be better to put it info ELF-specific
+     * ObjectCodeFormatInfo, but unfortunately shndx table is needed in
+     * ocVerifyImage_ELF which runs before ObjectCodeFormatInfo is
+     * initialized by ocInit_ELF. */
+    Elf_Word *shndx_table;
+#endif
+
     /*
      * The following are only valid if .type == DYNAMIC_OBJECT
      */
@@ -366,6 +379,15 @@ struct _ObjectCode {
     /* virtual memory ranges of loaded code */
     NativeCodeRange *nc_ranges;
 };
+
+#if defined(OBJFORMAT_ELF) && defined(SHN_XINDEX)
+/* We cannot simply use NULL to signal uninitialised shndx_table because NULL
+ * is valid return value of get_shndx_table. Thus SHNDX_TABLE_UNINIT is defined
+ * as the address of global variable shndx_table_uninit_label, defined in
+ * rts/linker/Elf.c, which is definitely unequal to any heap-allocated address */
+extern Elf_Word shndx_table_uninit_label;
+#define SHNDX_TABLE_UNINIT (&shndx_table_uninit_label)
+#endif
 
 #define OC_INFORMATIVE_FILENAME(OC)             \
     ( (OC)->archiveMemberName ?                 \

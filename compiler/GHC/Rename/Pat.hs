@@ -1,4 +1,4 @@
-{-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE TypeApplications    #-}
 {-# LANGUAGE DeriveFunctor       #-}
 {-# LANGUAGE FlexibleContexts    #-}
 {-# LANGUAGE RankNTypes          #-}
@@ -6,9 +6,6 @@
 {-# LANGUAGE TypeFamilies        #-}
 {-# LANGUAGE ViewPatterns        #-}
 {-# LANGUAGE DisambiguateRecordFields #-}
-
-{-# OPTIONS_GHC -Wno-incomplete-uni-patterns   #-}
-{-# OPTIONS_GHC -Wno-incomplete-record-updates #-}
 
 {-
 (c) The GRASP/AQUA Project, Glasgow University, 1992-1998
@@ -22,7 +19,7 @@ general, all of these functions return a renamed thing, and a set of
 free variables.
 -}
 module GHC.Rename.Pat (-- main entry points
-              rnPat, rnPats, rnBindPat, rnPatAndThen,
+              rnPat, rnPats, rnBindPat,
 
               NameMaker, applyNameMaker,     -- a utility for making names:
               localRecNameMaker, topRecNameMaker,  --   sometimes we want to make local names,
@@ -77,11 +74,14 @@ import GHC.Core.DataCon
 import GHC.Driver.Session ( getDynFlags, xopt_DuplicateRecordFields )
 import qualified GHC.LanguageExtensions as LangExt
 
-import Control.Monad       ( when, ap, guard, forM, unless )
+import Control.Monad       ( when, ap, guard, unless )
+import Data.Foldable
+import Data.Functor.Identity ( Identity (..) )
 import qualified Data.List.NonEmpty as NE
 import Data.Maybe
 import Data.Ratio
 import GHC.Types.FieldLabel (DuplicateRecordFields(..))
+import Language.Haskell.Syntax.Basic (FieldLabelString(..))
 
 {-
 *********************************************************
@@ -404,9 +404,10 @@ There are various entry points to renaming patterns, depending on
 --   * local namemaker
 --   * unused and duplicate checking
 --   * no fixities
-rnPats :: HsMatchContext GhcRn -- for error messages
-       -> [LPat GhcPs]
-       -> ([LPat GhcRn] -> RnM (a, FreeVars))
+rnPats :: Traversable f
+       => HsMatchContext GhcRn -- for error messages
+       -> f (LPat GhcPs)
+       -> (f (LPat GhcRn) -> RnM (a, FreeVars))
        -> RnM (a, FreeVars)
 rnPats ctxt pats thing_inside
   = do  { envs_before <- getRdrEnvs
@@ -423,7 +424,7 @@ rnPats ctxt pats thing_inside
           --    complain *twice* about duplicates e.g. f (x,x) = ...
           --
           -- See Note [Don't report shadowing for pattern synonyms]
-        ; let bndrs = collectPatsBinders CollNoDictBinders pats'
+        ; let bndrs = collectPatsBinders CollNoDictBinders (toList pats')
         ; addErrCtxt doc_pat $
           if isPatSynCtxt ctxt
              then checkDupNames bndrs
@@ -431,6 +432,8 @@ rnPats ctxt pats thing_inside
         ; thing_inside pats' } }
   where
     doc_pat = text "In" <+> pprMatchContext ctxt
+{-# SPECIALIZE rnPats :: HsMatchContext GhcRn -> [LPat GhcPs] -> ([LPat GhcRn] -> RnM (a, FreeVars)) -> RnM (a, FreeVars) #-}
+{-# SPECIALIZE rnPats :: HsMatchContext GhcRn -> Identity (LPat GhcPs) -> (Identity (LPat GhcRn) -> RnM (a, FreeVars)) -> RnM (a, FreeVars) #-}
 
 rnPat :: HsMatchContext GhcRn -- for error messages
       -> LPat GhcPs
@@ -438,7 +441,7 @@ rnPat :: HsMatchContext GhcRn -- for error messages
       -> RnM (a, FreeVars)     -- Variables bound by pattern do not
                                -- appear in the result FreeVars
 rnPat ctxt pat thing_inside
-  = rnPats ctxt [pat] (\pats' -> let [pat'] = pats' in thing_inside pat')
+  = rnPats ctxt (Identity pat) (thing_inside . runIdentity)
 
 applyNameMaker :: NameMaker -> LocatedN RdrName -> RnM (LocatedN Name)
 applyNameMaker mk rdr = do { (n, _fvs) <- runCps (newPatLName mk rdr)
@@ -468,9 +471,9 @@ rnBindPat name_maker pat = runCps (rnLPatAndThen name_maker pat)
 -}
 
 -- ----------- Entry point 3: rnLPatAndThen -------------------
--- General version: parametrized by how you make new names
+-- General version: parameterized by how you make new names
 
-rnLPatsAndThen :: NameMaker -> [LPat GhcPs] -> CpsRn [LPat GhcRn]
+rnLPatsAndThen :: Traversable f => NameMaker -> f (LPat GhcPs) -> CpsRn (f (LPat GhcRn))
 rnLPatsAndThen mk = mapM (rnLPatAndThen mk)
   -- Despite the map, the monad ensures that each pattern binds
   -- variables that may be mentioned in subsequent patterns in the list
@@ -551,10 +554,10 @@ rnPatAndThen mk (NPlusKPat _ rdr (L l lit) _ _ _ )
                                       (L l lit') lit' ge minus) }
                 -- The Report says that n+k patterns must be in Integral
 
-rnPatAndThen mk (AsPat _ rdr pat)
+rnPatAndThen mk (AsPat _ rdr at pat)
   = do { new_name <- newPatLName mk rdr
        ; pat' <- rnLPatAndThen mk pat
-       ; return (AsPat noExtField new_name pat') }
+       ; return (AsPat noExtField new_name at pat') }
 
 rnPatAndThen mk p@(ViewPat _ expr pat)
   = do { liftCps $ do { vp_flag <- xoptM LangExt.ViewPatterns
@@ -609,15 +612,13 @@ rnPatAndThen mk (SumPat _ pat alt arity)
        ; return (SumPat noExtField pat alt arity)
        }
 
--- If a splice has been run already, just rename the result.
-rnPatAndThen mk (SplicePat x (HsSpliced x2 mfs (HsSplicedPat pat)))
-  = SplicePat x . HsSpliced x2 mfs . HsSplicedPat <$> rnPatAndThen mk pat
-
 rnPatAndThen mk (SplicePat _ splice)
   = do { eith <- liftCpsFV $ rnSplicePat splice
        ; case eith of   -- See Note [rnSplicePat] in GHC.Rename.Splice
-           Left  not_yet_renamed -> rnPatAndThen mk not_yet_renamed
-           Right already_renamed -> return already_renamed }
+           (rn_splice, HsUntypedSpliceTop mfs pat) -> -- Splice was top-level and thus run, creating Pat GhcPs
+               gParPat . (fmap (flip SplicePat rn_splice . HsUntypedSpliceTop mfs)) <$> rnLPatAndThen mk pat
+           (rn_splice, HsUntypedSpliceNested splice_name) -> return (SplicePat (HsUntypedSpliceNested splice_name) rn_splice) -- Splice was nested and thus already renamed
+       }
 
 --------------------
 rnConPatAndThen :: NameMaker
@@ -628,8 +629,7 @@ rnConPatAndThen :: NameMaker
 rnConPatAndThen mk con (PrefixCon tyargs pats)
   = do  { con' <- lookupConCps con
         ; liftCps check_lang_exts
-        ; tyargs' <- forM tyargs $ \t ->
-            liftCpsWithCont $ rnHsPatSigTypeBindingVars HsTypeCtx t
+        ; tyargs' <- mapM rnConPatTyArg tyargs
         ; pats' <- rnLPatsAndThen mk pats
         ; return $ ConPat
             { pat_con_ext = noExtField
@@ -644,12 +644,15 @@ rnConPatAndThen mk con (PrefixCon tyargs pats)
       type_app      <- xoptM LangExt.TypeApplications
       unless (scoped_tyvars && type_app) $
         case listToMaybe tyargs of
-          Nothing    -> pure ()
-          Just tyarg -> addErr $ TcRnUnknownMessage $ mkPlainError noHints $
+          Nothing -> pure ()
+          Just tyarg -> addErr $ mkTcRnUnknownMessage $ mkPlainError noHints $
             hang (text "Illegal visible type application in a pattern:"
-                    <+> quotes (char '@' <> ppr tyarg))
+                    <+> quotes (ppr tyarg))
                2 (text "Both ScopedTypeVariables and TypeApplications are"
                     <+> text "required to use this feature")
+    rnConPatTyArg (HsConPatTyArg at t) = do
+      t' <- liftCpsWithCont $ rnHsPatSigTypeBindingVars HsTypeCtx t
+      return (HsConPatTyArg at t')
 
 rnConPatAndThen mk con (InfixCon pat1 pat2)
   = do  { con' <- lookupConCps con
@@ -689,13 +692,13 @@ rnHsRecPatsAndThen mk (L _ con)
   where
     mkVarPat l n = VarPat noExtField (L (noAnnSrcSpan l) n)
     rn_field (L l fld, n') =
-      do { arg' <- rnLPatAndThen (nested_mk dd mk n') (hfbRHS fld)
+      do { arg' <- rnLPatAndThen (nested_mk dd mk (RecFieldsDotDot n')) (hfbRHS fld)
          ; return (L l (fld { hfbRHS = arg' })) }
 
     loc = maybe noSrcSpan getLoc dd
 
     -- Get the arguments of the implicit binders
-    implicit_binders fs (unLoc -> n) = collectPatsBinders CollNoDictBinders implicit_pats
+    implicit_binders fs (unLoc -> RecFieldsDotDot n) = collectPatsBinders CollNoDictBinders implicit_pats
       where
         implicit_pats = map (hfbRHS . unLoc) (drop n fs)
 
@@ -794,12 +797,12 @@ rnHsRecFields ctxt mk_arg (HsRecFields { rec_flds = flds, rec_dotdot = dotdot })
                              , hfbPun      = pun })) }
 
 
-    rn_dotdot :: Maybe (Located Int)      -- See Note [DotDot fields] in GHC.Hs.Pat
+    rn_dotdot :: Maybe (Located RecFieldsDotDot)      -- See Note [DotDot fields] in GHC.Hs.Pat
               -> Maybe Name -- The constructor (Nothing for an
                                 --    out of scope constructor)
               -> [LHsRecField GhcRn (LocatedA arg)] -- Explicit fields
               -> RnM ([LHsRecField GhcRn (LocatedA arg)])   -- Field Labels we need to fill in
-    rn_dotdot (Just (L loc n)) (Just con) flds -- ".." on record construction / pat match
+    rn_dotdot (Just (L loc (RecFieldsDotDot n))) (Just con) flds -- ".." on record construction / pat match
       | not (isUnboundName con) -- This test is because if the constructor
                                 -- isn't in scope the constructor lookup will add
                                 -- an error but still return an unbound name. We
@@ -822,7 +825,7 @@ rnHsRecFields ctxt mk_arg (HsRecFields { rec_flds = flds, rec_dotdot = dotdot })
                  (dot_dot_fields, dot_dot_gres)
                         = unzip [ (fl, gre)
                                 | fl <- con_fields
-                                , let lbl = mkVarOccFS (flLabel fl)
+                                , let lbl = mkVarOccFS (field_label $ flLabel fl)
                                 , not (lbl `elemOccSet` present_flds)
                                 , Just gre <- [lookupGRE_FieldLabel rdr_env fl]
                                               -- Check selector is in scope
@@ -840,7 +843,7 @@ rnHsRecFields ctxt mk_arg (HsRecFields { rec_flds = flds, rec_dotdot = dotdot })
                         , hfbPun      = False })
                     | fl <- dot_dot_fields
                     , let sel     = flSelector fl
-                    , let arg_rdr = mkVarUnqual (flLabel fl) ] }
+                    , let arg_rdr = mkVarUnqual (field_label $ flLabel fl) ] }
 
     rn_dotdot _dotdot _mb_con _flds
       = return []
@@ -962,7 +965,7 @@ generalizeOverLitVal (HsFractional fl@(FL {fl_text=src,fl_neg=neg,fl_exp=e}))
     , denominator val == 1 = HsIntegral (IL {il_text=src,il_neg=neg,il_value=numerator val})
 generalizeOverLitVal lit = lit
 
-isNegativeZeroOverLit :: HsOverLit t -> Bool
+isNegativeZeroOverLit :: (XXOverLit t ~ DataConCantHappen) => HsOverLit t -> Bool
 isNegativeZeroOverLit lit
  = case ol_val lit of
         HsIntegral i    -> 0 == il_value i && il_neg i
@@ -984,7 +987,7 @@ in this case return not only literal itself but also negateName so that users
 can apply it explicitly. In this case it stays negative zero.  #13211
 -}
 
-rnOverLit :: HsOverLit t ->
+rnOverLit :: (XXOverLit t ~ DataConCantHappen) => HsOverLit t ->
              RnM ((HsOverLit GhcRn, Maybe (HsExpr GhcRn)), FreeVars)
 rnOverLit origLit
   = do  { opt_NumDecimals <- xoptM LangExt.NumDecimals

@@ -361,8 +361,10 @@ filterAutogenModules pkg_descr0 = mapLib filterAutogenModuleLib $
       otherModules   = filter (filterFunction bi) (otherModules bi)
     }
     pathsModule = autogenPathsModuleName pkg_descr0
+    packageInfoModule = autogenPackageInfoModuleName pkg_descr0
     filterFunction bi = \mn ->
                                    mn /= pathsModule
+                                && mn /= packageInfoModule
                                 && not (mn `elem` autogenModules bi)
 
 -- | Prepare a directory tree of source files for a snapshot version.
@@ -504,10 +506,10 @@ printPackageProblems verbosity pkg_descr = do
       (errors, warnings) = partition isDistError (pureChecks ++ ioChecks)
   unless (null errors) $
       notice verbosity $ "Distribution quality errors:\n"
-                      ++ unlines (map explanation errors)
+                      ++ unlines (map ppPackageCheck errors)
   unless (null warnings) $
       notice verbosity $ "Distribution quality warnings:\n"
-                      ++ unlines (map explanation warnings)
+                      ++ unlines (map ppPackageCheck warnings)
   unless (null errors) $
       notice verbosity
         "Note: the public hackage server would reject this package."

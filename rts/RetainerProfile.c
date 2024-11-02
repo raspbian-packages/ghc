@@ -177,6 +177,7 @@ isRetainer( const StgClosure *c )
     case FUN_0_2:
         // partial applications
     case PAP:
+    case CONTINUATION:
         // indirection
     // IND_STATIC used to be an error, but at the moment it can happen
     // as isAlive doesn't look through IND_STATIC as it ignores static
@@ -413,7 +414,7 @@ computeRetainerSet( traverseState *ts )
 
 /* -----------------------------------------------------------------------------
  * Perform retainer profiling.
- * N is the oldest generation being profilied, where the generations are
+ * N is the oldest generation being profiled, where the generations are
  * numbered starting at 0.
  * Invariants:
  * Note:

@@ -3,7 +3,6 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TupleSections       #-}
 
-{-# OPTIONS_GHC -Wno-incomplete-record-updates #-}
 -- (c) The University of Glasgow 2006
 --
 -- FamInstEnv: Type checked family instance declarations
@@ -11,7 +10,7 @@
 module GHC.Core.FamInstEnv (
         FamInst(..), FamFlavor(..), famInstAxiom, famInstTyCon, famInstRHS,
         famInstsRepTyCons, famInstRepTyCon_maybe, dataFamInstRepTyCon,
-        pprFamInst, pprFamInsts,
+        pprFamInst, pprFamInsts, orphNamesOfFamInst,
         mkImportedFamInst,
 
         FamInstEnvs, FamInstEnv, emptyFamInstEnv, emptyFamInstEnvs,
@@ -42,14 +41,17 @@ import GHC.Prelude
 import GHC.Core.Unify
 import GHC.Core.Type as Type
 import GHC.Core.TyCo.Rep
+import GHC.Core.TyCo.Compare( eqType, eqTypes )
 import GHC.Core.TyCon
 import GHC.Core.Coercion
 import GHC.Core.Coercion.Axiom
 import GHC.Core.Reduction
 import GHC.Core.RoughMap
+import GHC.Core.FVs( orphNamesOfAxiomLHS )
 import GHC.Types.Var.Set
 import GHC.Types.Var.Env
 import GHC.Types.Name
+import GHC.Data.FastString
 import GHC.Data.Maybe
 import GHC.Types.Var
 import GHC.Types.SrcLoc
@@ -61,7 +63,11 @@ import GHC.Utils.Misc
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
 import GHC.Utils.Panic.Plain
+
+import GHC.Types.Name.Set
 import GHC.Data.Bag
+import GHC.Data.List.Infinite (Infinite (..))
+import qualified GHC.Data.List.Infinite as Inf
 
 {-
 ************************************************************************
@@ -203,6 +209,10 @@ dataFamInstRepTyCon fi
   = case fi_flavor fi of
        DataFamilyInst tycon -> tycon
        SynFamilyInst        -> pprPanic "dataFamInstRepTyCon" (ppr fi)
+
+orphNamesOfFamInst :: FamInst -> NameSet
+orphNamesOfFamInst (FamInst { fi_axiom = ax }) = orphNamesOfAxiomLHS ax
+
 
 {-
 ************************************************************************
@@ -366,7 +376,7 @@ type FamInstEnvs = (FamInstEnv, FamInstEnv)
 
 data FamInstEnv
   = FamIE !Int -- The number of instances, used to choose the smaller environment
-               -- when checking type family consistnecy of home modules.
+               -- when checking type family consistency of home modules.
           !(RoughMap FamInst)
      -- See Note [FamInstEnv]
      -- See Note [FamInstEnv determinism]
@@ -550,37 +560,41 @@ data InjectivityCheckResult
    | InjectivityUnified CoAxBranch CoAxBranch
     -- ^ RHSs unify but LHSs don't unify under that substitution.  Relevant for
     -- closed type families where equation after unification might be
-    -- overlpapped (in which case it is OK if they don't unify).  Constructor
+    -- overlapped (in which case it is OK if they don't unify).  Constructor
     -- stores axioms after unification.
 
 -- | Check whether two type family axioms don't violate injectivity annotation.
 injectiveBranches :: [Bool] -> CoAxBranch -> CoAxBranch
                   -> InjectivityCheckResult
 injectiveBranches injectivity
-                  ax1@(CoAxBranch { cab_lhs = lhs1, cab_rhs = rhs1 })
-                  ax2@(CoAxBranch { cab_lhs = lhs2, cab_rhs = rhs2 })
+                  ax1@(CoAxBranch { cab_tvs = tvs1, cab_lhs = lhs1, cab_rhs = rhs1 })
+                  ax2@(CoAxBranch { cab_tvs = tvs2, cab_lhs = lhs2, cab_rhs = rhs2 })
   -- See Note [Verifying injectivity annotation], case 1.
   = let getInjArgs  = filterByList injectivity
-    in case tcUnifyTyWithTFs True rhs1 rhs2 of -- True = two-way pre-unification
+        in_scope    = mkInScopeSetList (tvs1 ++ tvs2)
+    in case tcUnifyTyWithTFs True in_scope rhs1 rhs2 of -- True = two-way pre-unification
        Nothing -> InjectivityAccepted
          -- RHS are different, so equations are injective.
          -- This is case 1A from Note [Verifying injectivity annotation]
-       Just subst -> -- RHS unify under a substitution
-        let lhs1Subst = Type.substTys subst (getInjArgs lhs1)
-            lhs2Subst = Type.substTys subst (getInjArgs lhs2)
-        -- If LHSs are equal under the substitution used for RHSs then this pair
-        -- of equations does not violate injectivity annotation. If LHSs are not
-        -- equal under that substitution then this pair of equations violates
-        -- injectivity annotation, but for closed type families it still might
-        -- be the case that one LHS after substitution is unreachable.
-        in if eqTypes lhs1Subst lhs2Subst  -- check case 1B1 from Note.
-           then InjectivityAccepted
-           else InjectivityUnified ( ax1 { cab_lhs = Type.substTys subst lhs1
-                                         , cab_rhs = Type.substTy  subst rhs1 })
-                                   ( ax2 { cab_lhs = Type.substTys subst lhs2
-                                         , cab_rhs = Type.substTy  subst rhs2 })
-                -- payload of InjectivityUnified used only for check 1B2, only
-                -- for closed type families
+
+       Just subst -- RHS unify under a substitution
+          -- If LHSs are equal under the substitution used for RHSs then this pair
+          -- of equations does not violate injectivity annotation. If LHSs are not
+          -- equal under that substitution then this pair of equations violates
+          -- injectivity annotation, but for closed type families it still might
+          -- be the case that one LHS after substitution is unreachable.
+          | eqTypes lhs1Subst lhs2Subst  -- check case 1B1 from Note.
+          -> InjectivityAccepted
+          | otherwise
+          -> InjectivityUnified ( ax1 { cab_lhs = Type.substTys subst lhs1
+                                      , cab_rhs = Type.substTy  subst rhs1 })
+                                ( ax2 { cab_lhs = Type.substTys subst lhs2
+                                      , cab_rhs = Type.substTy  subst rhs2 })
+                  -- Payload of InjectivityUnified used only for check 1B2, only
+                  -- for closed type families
+        where
+          lhs1Subst = Type.substTys subst (getInjArgs lhs1)
+          lhs2Subst = Type.substTys subst (getInjArgs lhs2)
 
 -- takes a CoAxiom with unknown branch incompatibilities and computes
 -- the compatibilities
@@ -683,7 +697,7 @@ mkCoAxBranch tvs eta_tvs cvs lhs rhs roles loc
     -- See Note [Tidy axioms when we build them]
     -- See also Note [CoAxBranch type variables] in GHC.Core.Coercion.Axiom
 
-    init_occ_env = initTidyOccEnv [mkTyVarOcc "_"]
+    init_occ_env = initTidyOccEnv [mkTyVarOccFS (fsLit "_")]
     init_tidy_env = mkEmptyTidyEnv init_occ_env
     -- See Note [Always number wildcard types in CoAxBranch]
 
@@ -917,7 +931,7 @@ See also Note [Injective type families] in GHC.Core.TyCon
 lookupFamInstEnvInjectivityConflicts
     :: [Bool]         -- injectivity annotation for this type family instance
                       -- INVARIANT: list contains at least one True value
-    ->  FamInstEnvs   -- all type instances seens so far
+    ->  FamInstEnvs   -- all type instances seen so far
     ->  FamInst       -- new type instance that we're checking
     -> [CoAxBranch]   -- conflicting instance declarations
 lookupFamInstEnvInjectivityConflicts injList fam_inst_envs
@@ -1312,7 +1326,7 @@ topNormaliseType_maybe env ty
 
     unwrapNewTypeStepper' :: NormaliseStepper (Coercion, MCoercionN)
     unwrapNewTypeStepper' rec_nts tc tys
-      = mapStepResult (, MRefl) $ unwrapNewTypeStepper rec_nts tc tys
+      = (, MRefl) <$> unwrapNewTypeStepper rec_nts tc tys
 
       -- second coercion below is the kind coercion relating the original type's kind
       -- to the normalised type's kind
@@ -1324,16 +1338,50 @@ topNormaliseType_maybe env ty
           _ -> NS_Done
 
 ---------------
+-- | Try to simplify a type-family application, by *one* step
+-- If topReduceTyFamApp_maybe env r F tys = Just (HetReduction (Reduction co rhs) res_co)
+-- then    co     :: F tys ~R# rhs
+--         res_co :: typeKind(F tys) ~ typeKind(rhs)
+-- Type families and data families; always Representational role
+topReduceTyFamApp_maybe :: FamInstEnvs -> TyCon -> [Type]
+                        -> Maybe HetReduction
+topReduceTyFamApp_maybe envs fam_tc arg_tys
+  | isFamilyTyCon fam_tc   -- type families and data families
+  , Just redn <- reduceTyFamApp_maybe envs role fam_tc ntys
+  = Just $
+      mkHetReduction
+        (mkTyConAppCo role fam_tc args_cos `mkTransRedn` redn)
+        res_co
+  | otherwise
+  = Nothing
+  where
+    role = Representational
+    ArgsReductions (Reductions args_cos ntys) res_co
+      = initNormM envs role (tyCoVarsOfTypes arg_tys)
+      $ normalise_tc_args fam_tc arg_tys
+
+---------------
+normaliseType :: FamInstEnvs
+              -> Role  -- desired role of coercion
+              -> Type -> Reduction
+normaliseType env role ty
+  = initNormM env role (tyCoVarsOfType ty) $ normalise_type ty
+
+---------------
 normaliseTcApp :: FamInstEnvs -> Role -> TyCon -> [Type] -> Reduction
 -- See comments on normaliseType for the arguments of this function
 normaliseTcApp env role tc tys
   = initNormM env role (tyCoVarsOfTypes tys) $
     normalise_tc_app tc tys
 
+-------------------------------------------------------
+--        Functions that work in the NormM monad
+-------------------------------------------------------
+
 -- See Note [Normalising types] about the LiftingContext
 normalise_tc_app :: TyCon -> [Type] -> NormM Reduction
 normalise_tc_app tc tys
-  | Just (tenv, rhs, tys') <- expandSynTyCon_maybe tc tys
+  | ExpandsSyn tenv rhs tys' <- expandSynTyCon_maybe tc tys
   , not (isFamFreeTyCon tc)  -- Expand and try again
   = -- A synonym with type families in the RHS
     -- Expand and try again
@@ -1372,40 +1420,10 @@ normalise_tc_app tc tys
     assemble_result r redn kind_co
       = mkCoherenceRightMRedn r redn (mkSymMCo kind_co)
 
----------------
--- | Try to simplify a type-family application, by *one* step
--- If topReduceTyFamApp_maybe env r F tys = Just (HetReduction (Reduction co rhs) res_co)
--- then    co     :: F tys ~R# rhs
---         res_co :: typeKind(F tys) ~ typeKind(rhs)
--- Type families and data families; always Representational role
-topReduceTyFamApp_maybe :: FamInstEnvs -> TyCon -> [Type]
-                        -> Maybe HetReduction
-topReduceTyFamApp_maybe envs fam_tc arg_tys
-  | isFamilyTyCon fam_tc   -- type families and data families
-  , Just redn <- reduceTyFamApp_maybe envs role fam_tc ntys
-  = Just $
-      mkHetReduction
-        (mkTyConAppCo role fam_tc args_cos `mkTransRedn` redn)
-        res_co
-  | otherwise
-  = Nothing
-  where
-    role = Representational
-    ArgsReductions (Reductions args_cos ntys) res_co
-      = initNormM envs role (tyCoVarsOfTypes arg_tys)
-      $ normalise_tc_args fam_tc arg_tys
-
 normalise_tc_args :: TyCon -> [Type] -> NormM ArgsReductions
 normalise_tc_args tc tys
   = do { role <- getRole
        ; normalise_args (tyConKind tc) (tyConRolesX role tc) tys }
-
----------------
-normaliseType :: FamInstEnvs
-              -> Role  -- desired role of coercion
-              -> Type -> Reduction
-normaliseType env role ty
-  = initNormM env role (tyCoVarsOfType ty) $ normalise_type ty
 
 normalise_type :: Type -> NormM Reduction
 -- Normalise the input type, by eliminating *all* type-function redexes
@@ -1469,7 +1487,7 @@ normalise_type ty
                Nothing ->
                  do { ArgsReductions redns res_co
                         <- normalise_args (typeKind nfun)
-                                          (repeat Nominal)
+                                          (Inf.repeat Nominal)
                                           arg_tys
                     ; role <- getRole
                     ; return $
@@ -1478,7 +1496,7 @@ normalise_type ty
                           (mkSymMCo res_co) } }
 
 normalise_args :: Kind    -- of the function
-               -> [Role]  -- roles at which to normalise args
+               -> Infinite Role  -- roles at which to normalise args
                -> [Type]  -- args
                -> NormM ArgsReductions
 -- returns ArgsReductions (Reductions cos xis) res_co,
@@ -1488,7 +1506,7 @@ normalise_args :: Kind    -- of the function
 -- but the resulting application *will* be well-kinded
 -- cf. GHC.Tc.Solver.Rewrite.rewrite_args_slow
 normalise_args fun_ki roles args
-  = do { normed_args <- zipWithM normalise1 roles args
+  = do { normed_args <- zipWithM normalise1 (Inf.toList roles) args
        ; return $ simplifyArgsWorker ki_binders inner_ki fvs roles normed_args }
   where
     (ki_binders, inner_ki) = splitPiTys fun_ki

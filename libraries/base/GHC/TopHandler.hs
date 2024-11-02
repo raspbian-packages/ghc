@@ -28,6 +28,7 @@ module GHC.TopHandler (
         flushStdHandles
     ) where
 
+#include <ghcplatform.h>
 #include "HsBaseConfig.h"
 
 import Control.Exception
@@ -46,6 +47,7 @@ import GHC.Weak
 
 #if defined(mingw32_HOST_OS)
 import GHC.ConsoleHandler
+#elif defined(javascript_HOST_ARCH)
 #else
 import Data.Dynamic (toDyn)
 #endif
@@ -81,6 +83,11 @@ runMainIO main =
     do
       main_thread_id <- myThreadId
       weak_tid <- mkWeakThreadId main_thread_id
+
+    --setFinalizerExceptionHandler printToStderrFinalizerExceptionHandler
+      -- For the time being, we don't install any exception handler for
+      -- Handle finalization. Instead, the user should set one manually.
+
       case weak_tid of (Weak w) -> setMainThread w
       install_interrupt_handler $ do
            m <- deRefWeak weak_tid
@@ -92,7 +99,9 @@ runMainIO main =
       topHandler
 
 install_interrupt_handler :: IO () -> IO ()
-#if defined(mingw32_HOST_OS)
+#if defined(javascript_HOST_ARCH)
+install_interrupt_handler _ = return ()
+#elif defined(mingw32_HOST_OS)
 install_interrupt_handler handler = do
   _ <- GHC.ConsoleHandler.installHandler $
      Catch $ \event ->
@@ -102,6 +111,8 @@ install_interrupt_handler handler = do
            Close    -> handler
            _ -> return ()
   return ()
+#elif !defined(HAVE_SIGNAL_H)
+install_interrupt_handler _ = pure ()
 #else
 #include "rts/Signals.h"
 -- specialised version of System.Posix.Signals.installHandler, which
@@ -226,13 +237,26 @@ calling the RTS, without iconv at all.
 -}
 
 
--- try to flush stdout/stderr, but don't worry if we fail
--- (these handles might have errors, and we don't want to go into
--- an infinite loop).
+-- try to flush stdout/stderr.
 flushStdHandles :: IO ()
 flushStdHandles = do
-  hFlush stdout `catchAny` \_ -> return ()
-  hFlush stderr `catchAny` \_ -> return ()
+  hFlush stdout `catchException` handleExc
+  -- In the event that we fail to flush stderr the default finalizer exception
+  -- handler (which prints to stderr) will also likely fail. However, we call it
+  -- anyways since the user may have set their own handler.
+  hFlush stderr `catchException` handleExc
+  where
+    -- We dispatch exceptions thrown by hFlush to the same action used to
+    -- handle Weak finalizers since this is where "normal" Handles (e.g. not
+    -- stderr/stdout) would be flushed.
+    --
+    -- See Note [Handling exceptions during Handle finalization] in
+    -- GHC.IO.Handle.Internals
+    handleExc se = do
+      handleFinalizerExc <- getFinalizerExceptionHandler
+      -- Swallow any exceptions thrown by the finalizer exception handler
+      handleFinalizerExc se `catchException` (\(SomeException _) -> return ())
+
 
 safeExit, fastExit :: Int -> IO a
 safeExit = exitHelper useSafeExit
@@ -242,7 +266,7 @@ unreachable :: IO a
 unreachable = failIO "If you can read this, shutdownHaskellAndExit did not exit."
 
 exitHelper :: CInt -> Int -> IO a
-#if defined(mingw32_HOST_OS)
+#if defined(mingw32_HOST_OS) || defined(javascript_HOST_ARCH)
 exitHelper exitKind r =
   shutdownHaskellAndExit (fromIntegral r) exitKind >> unreachable
 #else
@@ -258,14 +282,22 @@ exitHelper exitKind r
   | otherwise
   = shutdownHaskellAndExit   0xff                exitKind >> unreachable
 
+-- See Note [Lack of signals on wasm32-wasi].
+#if !defined(HAVE_SIGNAL_H)
+shutdownHaskellAndSignal :: CInt -> CInt -> IO ()
+shutdownHaskellAndSignal = shutdownHaskellAndExit
+#else
 foreign import ccall "shutdownHaskellAndSignal"
   shutdownHaskellAndSignal :: CInt -> CInt -> IO ()
+#endif
 #endif
 
 exitInterrupted :: IO a
 exitInterrupted =
-#if defined(mingw32_HOST_OS)
+#if defined(mingw32_HOST_OS) || defined(javascript_HOST_ARCH)
   safeExit 252
+#elif !defined(HAVE_SIGNAL_H)
+  safeExit 1
 #else
   -- we must exit via the default action for SIGINT, so that the
   -- parent of this process can take appropriate action (see #2301)

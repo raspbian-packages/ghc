@@ -1,7 +1,3 @@
-
-
-{-# OPTIONS_GHC -Wno-incomplete-record-updates #-}
-
 -- | This module implements interface renaming, which is
 -- used to rewrite interface files on the fly when we
 -- are doing indefinite typechecking and need instantiations
@@ -543,8 +539,8 @@ rnIfaceTyConParent (IfDataInstance n tc args)
 rnIfaceTyConParent IfNoParent = pure IfNoParent
 
 rnIfaceConDecls :: Rename IfaceConDecls
-rnIfaceConDecls (IfDataTyCon ds)
-    = IfDataTyCon <$> mapM rnIfaceConDecl ds
+rnIfaceConDecls (IfDataTyCon type_data ds)
+    = IfDataTyCon type_data <$> mapM rnIfaceConDecl ds
 rnIfaceConDecls (IfNewTyCon d) = IfNewTyCon <$> rnIfaceConDecl d
 rnIfaceConDecls IfAbstractTyCon = pure IfAbstractTyCon
 
@@ -600,12 +596,8 @@ rnIfaceInfoItem i
     = pure i
 
 rnIfaceUnfolding :: Rename IfaceUnfolding
-rnIfaceUnfolding (IfCoreUnfold stable cache if_expr)
-    = IfCoreUnfold stable cache <$> rnIfaceExpr if_expr
-rnIfaceUnfolding (IfCompulsory if_expr)
-    = IfCompulsory <$> rnIfaceExpr if_expr
-rnIfaceUnfolding (IfInlineRule arity unsat_ok boring_ok if_expr)
-    = IfInlineRule arity unsat_ok boring_ok <$> rnIfaceExpr if_expr
+rnIfaceUnfolding (IfCoreUnfold src cache guide if_expr)
+    = IfCoreUnfold src cache guide <$> rnIfaceExpr if_expr
 rnIfaceUnfolding (IfDFunUnfold bs ops)
     = IfDFunUnfold <$> rnIfaceBndrs bs <*> mapM rnIfaceExpr ops
 
@@ -636,7 +628,7 @@ rnIfaceExpr (IfaceLet (IfaceRec pairs) body)
 rnIfaceExpr (IfaceCast expr co)
     = IfaceCast <$> rnIfaceExpr expr <*> rnIfaceCo co
 rnIfaceExpr (IfaceLit lit)           = pure (IfaceLit lit)
-rnIfaceExpr (IfaceLitRubbish rep)    = IfaceLitRubbish <$> rnIfaceType rep
+rnIfaceExpr (IfaceLitRubbish tc rep) = IfaceLitRubbish tc <$> rnIfaceType rep
 rnIfaceExpr (IfaceFCall cc ty)       = IfaceFCall cc <$> rnIfaceType ty
 rnIfaceExpr (IfaceTick tickish expr) = IfaceTick tickish <$> rnIfaceExpr expr
 
@@ -697,7 +689,7 @@ rnIfaceCo (IfaceTransCo c1 c2)
     = IfaceTransCo <$> rnIfaceCo c1 <*> rnIfaceCo c2
 rnIfaceCo (IfaceInstCo c1 c2)
     = IfaceInstCo <$> rnIfaceCo c1 <*> rnIfaceCo c2
-rnIfaceCo (IfaceNthCo d c) = IfaceNthCo d <$> rnIfaceCo c
+rnIfaceCo (IfaceSelCo d c) = IfaceSelCo d <$> rnIfaceCo c
 rnIfaceCo (IfaceLRCo lr c) = IfaceLRCo lr <$> rnIfaceCo c
 rnIfaceCo (IfaceSubCo c) = IfaceSubCo <$> rnIfaceCo c
 rnIfaceCo (IfaceAxiomRuleCo ax cos)

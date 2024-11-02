@@ -1,5 +1,21 @@
 # Changelog for [`process` package](http://hackage.haskell.org/package/process)
 
+## 1.6.19.0 *April 2024*
+
+* Adjust command-line escaping logic on Windows to ensure that occurrences of
+  characters with special significance to the Windows batch interpreter are
+  properly escaped in arguments passed to `.bat` and `.cmd` processes.
+  This addresses
+  [HSEC-2024-0003](https://github.com/haskell/security-advisories/tree/main/advisories/hackage/process/HSEC-2024-0003.md).
+
+## 1.6.18.0 *September 2023*
+
+* Fix deadlock when waiting for process completion and process jobs [#273](https://github.com/haskell/process/issues/273)
+* Support `delegate_ctlc` on Windows. [#278](https://github.com/haskell/process/pull/278)
+* Drop support for `vfork` [#261](https://github.com/haskell/process/pull/261)
+* Javascript backend support
+* Fix potential segmentation fault on macOS [#295](https://github.com/haskell/process/pull/295)
+
 ## 1.6.17.0 *February 2023*
 
 * Improved documentation for the `OpenExtHandle` constructor.

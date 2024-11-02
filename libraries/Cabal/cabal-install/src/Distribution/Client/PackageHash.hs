@@ -196,6 +196,7 @@ data PackageHashConfigInputs = PackageHashConfigInputs {
        pkgHashDebugInfo           :: DebugInfoLevel,
        pkgHashProgramArgs         :: Map String [String],
        pkgHashExtraLibDirs        :: [FilePath],
+       pkgHashExtraLibDirsStatic  :: [FilePath],
        pkgHashExtraFrameworkDirs  :: [FilePath],
        pkgHashExtraIncludeDirs    :: [FilePath],
        pkgHashProgPrefix          :: Maybe PathTemplate,
@@ -215,7 +216,10 @@ data PackageHashConfigInputs = PackageHashConfigInputs {
        pkgHashHaddockCss          :: Maybe FilePath,
        pkgHashHaddockLinkedSource :: Bool,
        pkgHashHaddockQuickJump    :: Bool,
-       pkgHashHaddockContents     :: Maybe PathTemplate
+       pkgHashHaddockContents     :: Maybe PathTemplate,
+       pkgHashHaddockIndex        :: Maybe PathTemplate,
+       pkgHashHaddockBaseUrl      :: Maybe String,
+       pkgHashHaddockLib          :: Maybe String
 
 --     TODO: [required eventually] pkgHashToolsVersions     ?
 --     TODO: [required eventually] pkgHashToolsExtraOptions ?
@@ -290,6 +294,7 @@ renderPackageHashInputs PackageHashInputs{
       , opt   "stripped-exe" True  prettyShow pkgHashStripExes
       , opt   "debug-info"   NormalDebugInfo (show . fromEnum) pkgHashDebugInfo
       , opt   "extra-lib-dirs"     [] unwords pkgHashExtraLibDirs
+      , opt   "extra-lib-dirs-static" [] unwords pkgHashExtraLibDirsStatic
       , opt   "extra-framework-dirs" [] unwords pkgHashExtraFrameworkDirs
       , opt   "extra-include-dirs" [] unwords pkgHashExtraIncludeDirs
       , opt   "prog-prefix" Nothing (maybe "" fromPathTemplate) pkgHashProgPrefix
@@ -309,6 +314,9 @@ renderPackageHashInputs PackageHashInputs{
       , opt   "haddock-hyperlink-source" False prettyShow pkgHashHaddockLinkedSource
       , opt   "haddock-quickjump" False prettyShow pkgHashHaddockQuickJump
       , opt   "haddock-contents-location" Nothing (maybe "" fromPathTemplate) pkgHashHaddockContents
+      , opt   "haddock-index-location" Nothing (maybe "" fromPathTemplate) pkgHashHaddockIndex
+      , opt   "haddock-base-url" Nothing (fromMaybe "") pkgHashHaddockBaseUrl
+      , opt   "haddock-lib" Nothing (fromMaybe "") pkgHashHaddockLib
 
       ] ++ Map.foldrWithKey (\prog args acc -> opt (prog ++ "-options") [] unwords args : acc) [] pkgHashProgramArgs
   where

@@ -1,8 +1,13 @@
+{-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE GADTs #-}
+{-# LANGUAGE StandaloneDeriving #-}
 
 module GHC.Driver.Errors.Types (
     GhcMessage(..)
-  , DriverMessage(..), DriverMessages, PsMessage(PsHeaderMessage)
+  , GhcMessageOpts(..)
+  , DriverMessage(..)
+  , DriverMessageOpts(..)
+  , DriverMessages, PsMessage(PsHeaderMessage)
   , BuildingCabalPackage(..)
   , WarningMessages
   , ErrorMessages
@@ -31,6 +36,8 @@ import GHC.HsToCore.Errors.Types ( DsMessage )
 import GHC.Hs.Extension          (GhcTc)
 
 import Language.Haskell.Syntax.Decls (RuleDecl)
+
+import GHC.Generics ( Generic )
 
 -- | A collection of warning messages.
 -- /INVARIANT/: Each 'GhcMessage' in the collection should have 'SevWarning' severity.
@@ -83,7 +90,16 @@ data GhcMessage where
   -- 'Diagnostic' constraint ensures that worst case scenario we can still
   -- render this into something which can be eventually converted into a
   -- 'DecoratedSDoc'.
-  GhcUnknownMessage :: forall a. (Diagnostic a, Typeable a) => a -> GhcMessage
+  GhcUnknownMessage :: UnknownDiagnostic -> GhcMessage
+
+  deriving Generic
+
+
+data GhcMessageOpts = GhcMessageOpts { psMessageOpts :: DiagnosticOpts PsMessage
+                                     , tcMessageOpts :: DiagnosticOpts TcRnMessage
+                                     , dsMessageOpts :: DiagnosticOpts DsMessage
+                                     , driverMessageOpts :: DiagnosticOpts DriverMessage
+                                     }
 
 -- | Creates a new 'GhcMessage' out of any diagnostic. This function is also
 -- provided to ease the integration of #18516 by allowing diagnostics to be
@@ -91,8 +107,8 @@ data GhcMessage where
 -- conversion can happen gradually. This function should not be needed within
 -- GHC, as it would typically be used by plugin or library authors (see
 -- comment for the 'GhcUnknownMessage' type constructor)
-ghcUnknownMessage :: (Diagnostic a, Typeable a) => a -> GhcMessage
-ghcUnknownMessage = GhcUnknownMessage
+ghcUnknownMessage :: (DiagnosticOpts a ~ NoDiagnosticOpts, Diagnostic a, Typeable a) => a -> GhcMessage
+ghcUnknownMessage = GhcUnknownMessage . UnknownDiagnostic
 
 -- | Abstracts away the frequent pattern where we are calling 'ioMsgMaybe' on
 -- the result of 'IO (Messages TcRnMessage, a)'.
@@ -110,7 +126,8 @@ type DriverMessages = Messages DriverMessage
 -- | A message from the driver.
 data DriverMessage where
   -- | Simply wraps a generic 'Diagnostic' message @a@.
-  DriverUnknownMessage :: (Diagnostic a, Typeable a) => a -> DriverMessage
+  DriverUnknownMessage :: UnknownDiagnostic -> DriverMessage
+
   -- | A parse error in parsing a Haskell file header during dependency
   -- analysis
   DriverPsHeaderMessage :: !PsMessage -> DriverMessage
@@ -350,6 +367,11 @@ data DriverMessage where
   DriverRedirectedNoMain :: !ModuleName -> DriverMessage
 
   DriverHomePackagesNotClosed :: ![UnitId] -> DriverMessage
+
+deriving instance Generic DriverMessage
+
+data DriverMessageOpts =
+  DriverMessageOpts { psDiagnosticOpts :: DiagnosticOpts PsMessage }
 
 -- | Pass to a 'DriverMessage' the information whether or not the
 -- '-fbuilding-cabal-package' flag is set.

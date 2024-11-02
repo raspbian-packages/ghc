@@ -87,6 +87,9 @@
    significant byte first */
 #undef FLOAT_WORDS_BIGENDIAN
 
+/* Has musttail */
+#undef HAS_MUSTTAIL
+
 /* Has visibility hidden */
 #undef HAS_VISIBILITY_HIDDEN
 
@@ -96,6 +99,9 @@
 /* Define to 1 if you have <alloca.h> and it should be used (not on Ultrix).
    */
 #undef HAVE_ALLOCA_H
+
+/* Does the toolchain use ARMv8 outline atomics */
+#undef HAVE_ARM_OUTLINE_ATOMICS
 
 /* Define to 1 if you have the <bfd.h> header file. */
 #undef HAVE_BFD_H
@@ -132,6 +138,10 @@
    don't. */
 #undef HAVE_DECL_MAP_NORESERVE
 
+/* Define to 1 if you have the declaration of `program_invocation_short_name',
+   and to 0 if you don't. */
+#undef HAVE_DECL_PROGRAM_INVOCATION_SHORT_NAME
+
 /* Define to 1 if you have the <dirent.h> header file. */
 #undef HAVE_DIRENT_H
 
@@ -165,11 +175,17 @@
 /* Define to 1 if you have the `GetModuleFileName' function. */
 #undef HAVE_GETMODULEFILENAME
 
+/* Define to 1 if you have the `getpid' function. */
+#undef HAVE_GETPID
+
 /* Define to 1 if you have the `getrusage' function. */
 #undef HAVE_GETRUSAGE
 
 /* Define to 1 if you have the `gettimeofday' function. */
 #undef HAVE_GETTIMEOFDAY
+
+/* Define to 1 if you have the `getuid' function. */
+#undef HAVE_GETUID
 
 /* Define to 1 if you have the <grp.h> header file. */
 #undef HAVE_GRP_H
@@ -248,6 +264,9 @@
 
 /* Define to 1 if you have the <pwd.h> header file. */
 #undef HAVE_PWD_H
+
+/* Define to 1 if you have the `raise' function. */
+#undef HAVE_RAISE
 
 /* Define to 1 if you have the `sched_getaffinity' function. */
 #undef HAVE_SCHED_GETAFFINITY
@@ -344,9 +363,6 @@
 
 /* Define to 1 if you have the `times' function. */
 #undef HAVE_TIMES
-
-/* Define to 1 if you have the <time.h> header file. */
-#undef HAVE_TIME_H
 
 /* Define to 1 if you have the <unistd.h> header file. */
 #undef HAVE_UNISTD_H
@@ -485,9 +501,6 @@
 
 /* Define to 1 if info tables are laid out next to code */
 #undef TABLES_NEXT_TO_CODE
-
-/* Define to 1 if you can safely include both <sys/time.h> and <time.h>. */
-#undef TIME_WITH_SYS_TIME
 
 /* Compile-in ASSERTs in all ways. */
 #undef USE_ASSERTS_ALL_WAYS

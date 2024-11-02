@@ -12,7 +12,7 @@ packages: ./compiler
           -- ./libraries/deepseq/
           ./libraries/directory/
           ./libraries/exceptions/
-          -- ./libraries/filepath/
+          ./libraries/filepath/
           -- ./libraries/ghc-bignum/
            ./libraries/ghc-boot/
           -- ./libraries/ghc-boot-th/
@@ -48,14 +48,13 @@ packages: ./compiler
           ./utils/iserv
           ./linters/**/*.cabal
 
-constraints: ghc +internal-interpreter +dynamic-system-linke +terminfo,
+constraints: ghc +internal-interpreter +dynamic-system-linke,
              ghc-bin +internal-interpreter +threaded,
              ghci +internal-interpreter,
              haddock +in-ghc-tree,
              any.array installed,
              any.base installed,
              any.deepseq installed,
-             any.filepath installed,
              any.ghc-bignum installed,
              any.ghc-boot-th installed,
              any.integer-gmp installed,

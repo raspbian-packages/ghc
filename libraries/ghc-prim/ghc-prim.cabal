@@ -1,6 +1,6 @@
 cabal-version:  2.2
 name:           ghc-prim
-version:        0.9.1
+version:        0.10.0
 -- NOTE: Don't forget to update ./changelog.md
 license:        BSD-3-Clause
 license-file:   LICENSE
@@ -11,6 +11,11 @@ synopsis:       GHC primitives
 build-type:     Custom
 description:
     This package contains the primitive types and operations supplied by GHC.
+
+    It is an internal package, only for the use of GHC developers.
+    GHC users should not use it!  If you do use it then expect
+    breaking changes at any time without warning.  You should prefer
+    to import @GHC.Exts@ from the @base@ package instead.
 
 extra-source-files: changelog.md
 
@@ -51,6 +56,7 @@ Library
         GHC.Prim.PtrEq
         GHC.PrimopWrappers
         GHC.Tuple
+        GHC.Tuple.Prim
         GHC.Types
 
     virtual-modules:
@@ -75,18 +81,20 @@ Library
         -- is just an empty shell.
         extra-libraries: c, m
 
-    c-sources:
-        cbits/atomic.c
-        cbits/bswap.c
-        cbits/bitrev.c
-        cbits/clz.c
-        cbits/ctz.c
-        cbits/debug.c
-        cbits/longlong.c
-        cbits/pdep.c
-        cbits/pext.c
-        cbits/popcnt.c
-        cbits/word2float.c
+    if !os(ghcjs)
+      c-sources:
+          cbits/atomic.c
+          cbits/bswap.c
+          cbits/bitrev.c
+          cbits/clz.c
+          cbits/ctz.c
+          cbits/debug.c
+          cbits/longlong.c
+          cbits/mulIntMayOflo.c
+          cbits/pdep.c
+          cbits/pext.c
+          cbits/popcnt.c
+          cbits/word2float.c
 
     -- We need to set the unit ID to ghc-prim (without a version number)
     -- as it's magic.

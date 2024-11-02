@@ -6,7 +6,7 @@ A lint pass to check basic STG invariants:
 - Variables should be defined before used.
 
 - Let bindings should not have unboxed types (unboxed bindings should only
-  appear in case), except when they're join points (see Note [Core let/app
+  appear in case), except when they're join points (see Note [Core let-can-float
   invariant] and #14117).
 
 - If linting after unarisation, invariants listed in Note [Post-unarisation
@@ -77,8 +77,8 @@ is much coarser. In particular, STG programs must be /well-kinded/.
 More precisely, if f :: ty1 -> ty2, then in the application (f e)
 where e :: ty1', we must have kind(ty1) = kind(ty1').
 
-So the STG type system does not distinguish beteen Int and Bool,
-but it /does/ distinguish beteen Int and Int#, because they have
+So the STG type system does not distinguish between Int and Bool,
+but it /does/ distinguish between Int and Int#, because they have
 different kinds.  Actually, since all terms have kind (TYPE rep),
 we might say that the STG language is well-runtime-rep'd.
 
@@ -101,7 +101,6 @@ import GHC.Prelude
 import GHC.Stg.Syntax
 import GHC.Stg.Utils
 
-import GHC.Core.Lint        ( interactiveInScope )
 import GHC.Core.DataCon
 import GHC.Core             ( AltCon(..) )
 import GHC.Core.Type
@@ -121,11 +120,9 @@ import GHC.Utils.Error      ( mkLocMessage, DiagOpts )
 import qualified GHC.Utils.Error as Err
 
 import GHC.Unit.Module            ( Module )
-import GHC.Runtime.Context        ( InteractiveContext )
 
 import GHC.Data.Bag         ( Bag, emptyBag, isEmptyBag, snocBag, bagToList )
 
-import Control.Applicative ((<|>))
 import Control.Monad
 import Data.Maybe
 import GHC.Utils.Misc
@@ -139,14 +136,14 @@ lintStgTopBindings :: forall a . (OutputablePass a, BinderP a ~ Id)
                    -> Logger
                    -> DiagOpts
                    -> StgPprOpts
-                   -> InteractiveContext
+                   -> [Var]  -- ^ extra vars in scope from GHCi
                    -> Module -- ^ module being compiled
                    -> Bool   -- ^ have we run Unarise yet?
                    -> String -- ^ who produced the STG?
                    -> [GenStgTopBinding a]
                    -> IO ()
 
-lintStgTopBindings platform logger diag_opts opts ictxt this_mod unarised whodunnit binds
+lintStgTopBindings platform logger diag_opts opts extra_vars this_mod unarised whodunit binds
   = {-# SCC "StgLint" #-}
     case initL platform diag_opts this_mod unarised opts top_level_binds (lint_binds binds) of
       Nothing  ->
@@ -155,7 +152,7 @@ lintStgTopBindings platform logger diag_opts opts ictxt this_mod unarised whodun
         logMsg logger Err.MCDump noSrcSpan
           $ withPprStyle defaultDumpStyle
           (vcat [ text "*** Stg Lint ErrMsgs: in" <+>
-                        text whodunnit <+> text "***",
+                        text whodunit <+> text "***",
                   msg,
                   text "*** Offending Program ***",
                   pprGenStgTopBindings opts binds,
@@ -165,7 +162,7 @@ lintStgTopBindings platform logger diag_opts opts ictxt this_mod unarised whodun
     -- Bring all top-level binds into scope because CoreToStg does not generate
     -- bindings in dependency order (so we may see a use before its definition).
     top_level_binds = extendVarSetList (mkVarSet (bindersOfTopBinds binds))
-                                       (interactiveInScope ictxt)
+                                       extra_vars
 
     lint_binds :: [GenStgTopBinding a] -> LintM ()
 
@@ -178,9 +175,34 @@ lintStgTopBindings platform logger diag_opts opts ictxt this_mod unarised whodun
     lint_bind (StgTopLifted bind) = lintStgBinds TopLevel bind
     lint_bind (StgTopStringLit v _) = return [v]
 
-lintStgArg :: StgArg -> LintM ()
-lintStgArg (StgLitArg _) = return ()
-lintStgArg (StgVarArg v) = lintStgVar v
+lintStgConArg :: StgArg -> LintM ()
+lintStgConArg arg = do
+  unarised <- lf_unarised <$> getLintFlags
+  when unarised $ case typePrimRep_maybe (stgArgType arg) of
+    -- Note [Post-unarisation invariants], invariant 4
+    Just [_] -> pure ()
+    badRep   -> addErrL $
+      text "Non-unary constructor arg: " <> ppr arg $$
+      text "Its PrimReps are: " <> ppr badRep
+
+  case arg of
+    StgLitArg _ -> pure ()
+    StgVarArg v -> lintStgVar v
+
+lintStgFunArg :: StgArg -> LintM ()
+lintStgFunArg arg = do
+  unarised <- lf_unarised <$> getLintFlags
+  when unarised $ case typePrimRep_maybe (stgArgType arg) of
+    -- Note [Post-unarisation invariants], invariant 3
+    Just []  -> pure ()
+    Just [_] -> pure ()
+    badRep   -> addErrL $
+      text "Function arg is not unary or void: " <> ppr arg $$
+      text "Its PrimReps are: " <> ppr badRep
+
+  case arg of
+    StgLitArg _ -> pure ()
+    StgVarArg v -> lintStgVar v
 
 lintStgVar :: Id -> LintM ()
 lintStgVar id = checkInScope id
@@ -251,35 +273,32 @@ lintStgRhs rhs@(StgRhsCon _ con _ _ args) = do
 
     lintConApp con args (pprStgRhs opts rhs)
 
-    mapM_ lintStgArg args
-    mapM_ checkPostUnariseConArg args
-
 lintStgExpr :: (OutputablePass a, BinderP a ~ Id) => GenStgExpr a -> LintM ()
 
 lintStgExpr (StgLit _) = return ()
 
 lintStgExpr e@(StgApp fun args) = do
   lintStgVar fun
-  mapM_ lintStgArg args
-
+  mapM_ lintStgFunArg args
   lintAppCbvMarks e
   lintStgAppReps fun args
+
+
 
 lintStgExpr app@(StgConApp con _n args _arg_tys) = do
     -- unboxed sums should vanish during unarise
     lf <- getLintFlags
-    opts <- getStgPprOpts
-    when (lf_unarised lf && isUnboxedSumDataCon con) $ do
+    let !unarised = lf_unarised lf
+    when (unarised && isUnboxedSumDataCon con) $ do
+      opts <- getStgPprOpts
       addErrL (text "Unboxed sum after unarise:" $$
                pprStgExpr opts app)
 
+    opts <- getStgPprOpts
     lintConApp con args (pprStgExpr opts app)
 
-    mapM_ lintStgArg args
-    mapM_ checkPostUnariseConArg args
-
 lintStgExpr (StgOpApp _ args _) =
-    mapM_ lintStgArg args
+    mapM_ lintStgFunArg args
 
 lintStgExpr (StgLet _ binds body) = do
     binders <- lintStgBinds NotTopLevel binds
@@ -322,12 +341,14 @@ lintAlt GenStgAlt{ alt_con   = DataAlt _
     mapM_ checkPostUnariseBndr bndrs
     addInScopeVars bndrs (lintStgExpr rhs)
 
--- Post unarise check we apply constructors to the right number of args.
--- This can be violated by invalid use of unsafeCoerce as showcased by test
--- T9208
-lintConApp :: Foldable t => DataCon -> t a -> SDoc -> LintM ()
+lintConApp :: DataCon -> [StgArg] -> SDoc -> LintM ()
 lintConApp con args app = do
+    mapM_ lintStgConArg args
     unarised <- lf_unarised <$> getLintFlags
+
+    -- Post unarise check we apply constructors to the right number of args.
+    -- This can be violated by invalid use of unsafeCoerce as showcased by test
+    -- T9208; see also #23865
     when (unarised &&
           not (isUnboxedTupleDataCon con) &&
           length (dataConRuntimeRepStrictness con) /= length args) $ do
@@ -361,6 +382,8 @@ lintStgAppReps fun args = do
         = match_args actual_reps_left expected_reps_left
 
         -- Check for void rep which can be either an empty list *or* [VoidRep]
+           -- No, typePrimRep_maybe will never return a result containing VoidRep.
+           -- We should refactor to make this obvious from the types.
         | isVoidRep actual_rep && isVoidRep expected_rep
         = match_args actual_reps_left expected_reps_left
 
@@ -507,32 +530,16 @@ checkPostUnariseBndr bndr = do
           ppr bndr <> text " has " <> text unexpected <> text " type " <>
           ppr (idType bndr)
 
--- Arguments shouldn't have sum, tuple, or void types.
-checkPostUnariseConArg :: StgArg -> LintM ()
-checkPostUnariseConArg arg = case arg of
-    StgLitArg _ ->
-      return ()
-    StgVarArg id -> do
-      lf <- getLintFlags
-      when (lf_unarised lf) $
-        forM_ (checkPostUnariseId id) $ \unexpected ->
-          addErrL $
-            text "After unarisation, arg " <>
-            ppr id <> text " has " <> text unexpected <> text " type " <>
-            ppr (idType id)
-
 -- Post-unarisation args and case alt binders should not have unboxed tuple,
 -- unboxed sum, or void types. Return what the binder is if it is one of these.
 checkPostUnariseId :: Id -> Maybe String
-checkPostUnariseId id =
-    let
-      id_ty = idType id
-      is_sum, is_tuple, is_void :: Maybe String
-      is_sum = guard (isUnboxedSumType id_ty) >> return "unboxed sum"
-      is_tuple = guard (isUnboxedTupleType id_ty) >> return "unboxed tuple"
-      is_void = guard (isZeroBitTy id_ty) >> return "void"
-    in
-      is_sum <|> is_tuple <|> is_void
+checkPostUnariseId id
+  | isUnboxedSumType id_ty   = Just "unboxed sum"
+  | isUnboxedTupleType id_ty = Just "unboxed tuple"
+  | isZeroBitTy id_ty        = Just "void"
+  | otherwise                = Nothing
+  where
+    id_ty = idType id
 
 addErrL :: SDoc -> LintM ()
 addErrL msg = LintM $ \_mod _lf df _opts loc _scope errs -> ((), addErr df errs msg loc)
@@ -542,7 +549,7 @@ addErr diag_opts errs_so_far msg locs
   = errs_so_far `snocBag` mk_msg locs
   where
     mk_msg (loc:_) = let (l,hdr) = dumpLoc loc
-                     in  mkLocMessage (Err.mkMCDiagnostic diag_opts WarningWithoutFlag)
+                     in  mkLocMessage (Err.mkMCDiagnostic diag_opts WarningWithoutFlag Nothing)
                                       l (hdr $$ msg)
     mk_msg []      = msg
 

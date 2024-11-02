@@ -77,7 +77,7 @@ import GHC.Types.Hint
 import GHC.Types.Error
 import GHC.Unit.Module
 import GHC.Unit.Module.ModIface
-import GHC.Unit.Module.Warnings  ( WarningTxt, pprWarningTxtForMsg )
+import GHC.Unit.Module.Warnings  ( WarningTxt )
 import GHC.Core.ConLike
 import GHC.Core.DataCon
 import GHC.Core.TyCon
@@ -104,6 +104,7 @@ import Control.Arrow    ( first )
 import GHC.Types.FieldLabel
 import GHC.Data.Bag
 import GHC.Types.PkgQual
+import Language.Haskell.Syntax.Basic (FieldLabelString(..))
 
 {-
 *********************************************************
@@ -206,6 +207,11 @@ newTopSrcBinder (L loc rdr_name)
         -- the nice Exact name for the TyCon gets swizzled to an Orig name.
         -- Hence the badOrigBinding error message.
         --
+
+        -- MP 2022: I suspect this code path is never called for `rOOT_MAIN` anymore
+        -- because External Core has been removed but we instead have some similar logic for
+        -- serialising whole programs into interface files in GHC.IfaceToCore.mk_top_id.
+
         -- Except for the ":Main.main = ..." definition inserted into
         -- the Main module; ugh!
 
@@ -275,7 +281,7 @@ lookupTopBndrRn which_suggest rdr_name =
           let occ = rdrNameOcc rdr_name
         ; when (isTcOcc occ && isSymOcc occ)
                (do { op_ok <- xoptM LangExt.TypeOperators
-                   ; unless op_ok (addErr (opDeclErr rdr_name)) })
+                   ; unless op_ok (addErr (TcRnIllegalTypeOperatorDecl rdr_name)) })
 
         ; env <- getGlobalRdrEnv
         ; case filter isLocalGRE (lookupGRE_RdrName rdr_name env) of
@@ -498,7 +504,7 @@ lookupRecFieldOcc mb_con rdr_name
   = lookupExactOrOrig rdr_name id $  -- See Note [Record field names and Template Haskell]
     do { flds <- lookupConstructorFields con
        ; env <- getGlobalRdrEnv
-       ; let lbl      = occNameFS (rdrNameOcc rdr_name)
+       ; let lbl      = FieldLabelString $ occNameFS (rdrNameOcc rdr_name)
              mb_field = do fl <- find ((== lbl) . flLabel) flds
                            -- We have the label, now check it is in scope.  If
                            -- there is a qualifier, use pickGREs to check that
@@ -761,7 +767,7 @@ data DisambigInfo
           -- monoid will combine them to this failing case.
 
 instance Outputable DisambigInfo where
-  ppr NoOccurrence = text "NoOccurence"
+  ppr NoOccurrence = text "NoOccurrence"
   ppr (UniqueOccurrence gre) = text "UniqueOccurrence:" <+> ppr gre
   ppr (DisambiguatedOccurrence gre) = text "DiambiguatedOccurrence:" <+> ppr gre
   ppr (AmbiguousOccurrence gres)    = text "Ambiguous:" <+> ppr gres
@@ -865,7 +871,7 @@ of 'G' in the 'instance C S' decl is unambiguous, because C has only
 one associated type called G. This is exactly what happens for methods,
 and it is only consistent to do the same thing for types. That's the
 role of the function lookupTcdName; the (Maybe Name) give the class of
-the encloseing instance decl, if any.
+the enclosing instance decl, if any.
 
 Note [Looking up Exact RdrNames]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1111,10 +1117,10 @@ lookup_promoted rdr_name
 
 badVarInType :: RdrName -> RnM Name
 badVarInType rdr_name
-  = do { addErr (TcRnUnknownMessage $ mkPlainError noHints
-           (text "Illegal promoted term variable in a type:"
-                 <+> ppr rdr_name))
-       ; return (mkUnboundNameRdr rdr_name) }
+  = do { addErr (TcRnUnpromotableThing name TermVariablePE)
+       ; return name }
+      where
+        name = mkUnboundNameRdr rdr_name
 
 {- Note [Promoted variables in types]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1553,33 +1559,21 @@ warnIfDeprecated gre@(GRE { gre_imp = iss })
                    -- See Note [Handling of deprecations]
          do { iface <- loadInterfaceForName doc name
             ; case lookupImpDeprec iface gre of
-                Just txt -> do
-                  let msg = TcRnUnknownMessage $
-                              mkPlainDiagnostic (WarningWithFlag Opt_WarnWarningsDeprecations)
-                                                noHints
-                                                (mk_msg imp_spec txt)
-
-                  addDiagnostic msg
+                Just deprText -> addDiagnostic $
+                  TcRnPragmaWarning {
+                    pragma_warning_occ = occ,
+                    pragma_warning_msg = deprText,
+                    pragma_warning_import_mod = importSpecModule imp_spec,
+                    pragma_warning_defined_mod = definedMod
+                  }
                 Nothing  -> return () } }
   | otherwise
   = return ()
   where
     occ = greOccName gre
     name = greMangledName gre
-    name_mod = assertPpr (isExternalName name) (ppr name) (nameModule name)
+    definedMod = moduleName $ assertPpr (isExternalName name) (ppr name) (nameModule name)
     doc = text "The name" <+> quotes (ppr occ) <+> text "is mentioned explicitly"
-
-    mk_msg imp_spec txt
-      = sep [ sep [ text "In the use of"
-                    <+> pprNonVarNameSpace (occNameSpace occ)
-                    <+> quotes (ppr occ)
-                  , parens imp_msg <> colon ]
-            , pprWarningTxtForMsg txt ]
-      where
-        imp_mod  = importSpecModule imp_spec
-        imp_msg  = text "imported from" <+> ppr imp_mod <> extra
-        extra | imp_mod == moduleName name_mod = Outputable.empty
-              | otherwise = text ", but defined in" <+> ppr name_mod
 
 lookupImpDeprec :: ModIface -> GlobalRdrElt -> Maybe (WarningTxt GhcRn)
 lookupImpDeprec iface gre
@@ -2093,25 +2087,9 @@ lookupQualifiedDoName ctxt std_name
 
 -- Error messages
 
-opDeclErr :: RdrName -> TcRnMessage
-opDeclErr n
-  = TcRnUnknownMessage $ mkPlainError noHints $
-    hang (text "Illegal declaration of a type or class operator" <+> quotes (ppr n))
-       2 (text "Use TypeOperators to declare operators in type and declarations")
-
 badOrigBinding :: RdrName -> TcRnMessage
 badOrigBinding name
-  | Just _ <- isBuiltInOcc_maybe occ
-  = TcRnUnknownMessage $ mkPlainError noHints $ text "Illegal binding of built-in syntax:" <+> ppr occ
-    -- Use an OccName here because we don't want to print Prelude.(,)
-  | otherwise
-  = TcRnUnknownMessage $ mkPlainError noHints $
-    text "Cannot redefine a Name retrieved by a Template Haskell quote:" <+> ppr name
-    -- This can happen when one tries to use a Template Haskell splice to
-    -- define a top-level identifier with an already existing name, e.g.,
-    --
-    --   $(pure [ValD (VarP 'succ) (NormalB (ConE 'True)) []])
-    --
-    -- (See #13968.)
+  | Just _ <- isBuiltInOcc_maybe occ = TcRnIllegalBindingOfBuiltIn occ
+  | otherwise = TcRnNameByTemplateHaskellQuote name
   where
     occ = rdrNameOcc $ filterCTuple name

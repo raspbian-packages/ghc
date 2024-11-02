@@ -326,7 +326,7 @@ stmtToInstrs bid stmt = do
        -> genForeignCall target result_regs args bid
 
     _ -> (,Nothing) <$> case stmt of
-      CmmComment s   -> return (unitOL (COMMENT $ ftext s))
+      CmmComment s   -> return (unitOL (COMMENT s))
       CmmTick {}     -> return nilOL
 
       CmmUnwind regs -> do
@@ -969,16 +969,38 @@ getRegister' _ is32Bit (CmmMachOp mop [x, y]) = -- dyadic MachOps
 
         return (Fixed format eax code)
 
-
     imulMayOflo :: Width -> CmmExpr -> CmmExpr -> NatM Register
+    imulMayOflo W8 a b = do
+         -- The general case (W16, W32, W64) doesn't work for W8 as its
+         -- multiplication doesn't use two registers.
+         --
+         -- The plan is:
+         -- 1. truncate and sign-extend a and b to 8bit width
+         -- 2. multiply a' = a * b in 32bit width
+         -- 3. copy and sign-extend 8bit from a' to c
+         -- 4. compare a' and c: they are equal if there was no overflow
+         (a_reg, a_code) <- getNonClobberedReg a
+         (b_reg, b_code) <- getNonClobberedReg b
+         let
+             code = a_code `appOL` b_code `appOL`
+                        toOL [
+                           MOVSxL II8 (OpReg a_reg) (OpReg a_reg),
+                           MOVSxL II8 (OpReg b_reg) (OpReg b_reg),
+                           IMUL II32 (OpReg b_reg) (OpReg a_reg),
+                           MOVSxL II8 (OpReg a_reg) (OpReg eax),
+                           CMP II16 (OpReg a_reg) (OpReg eax),
+                           SETCC NE (OpReg eax)
+                        ]
+         return (Fixed II8 eax code)
     imulMayOflo rep a b = do
          (a_reg, a_code) <- getNonClobberedReg a
          b_code <- getAnyReg b
          let
              shift_amt  = case rep of
+                           W16 -> 15
                            W32 -> 31
                            W64 -> 63
-                           _ -> panic "shift_amt"
+                           w -> panic ("shift_amt: " ++ show w)
 
              format = intFormat rep
              code = a_code `appOL` b_code eax `appOL`
@@ -1979,10 +2001,10 @@ genCondBranch' _ bid id false bool = do
                   -- Use ASSERT so we don't break releases if
                   -- LTT/LE creep in somehow.
                   LTT ->
-                    assertPpr False (ppr "Should have been turned into >")
+                    assertPpr False (text "Should have been turned into >")
                     and_ordered
                   LE  ->
-                    assertPpr False (ppr "Should have been turned into >=")
+                    assertPpr False (text "Should have been turned into >=")
                     and_ordered
                   _   -> and_ordered
 
@@ -2892,24 +2914,9 @@ genSwitch expr targets = do
         let op = OpAddr (AddrBaseIndex (EABaseReg tableReg)
                                        (EAIndex reg (platformWordSizeInBytes platform)) (ImmInt 0))
 
-        offsetReg <- getNewRegNat (intFormat (platformWordWidth platform))
-        return $ if is32bit || os == OSDarwin
-                 then e_code `appOL` t_code `appOL` toOL [
+        return $ e_code `appOL` t_code `appOL` toOL [
                                 ADD (intFormat (platformWordWidth platform)) op (OpReg tableReg),
                                 JMP_TBL (OpReg tableReg) ids rosection lbl
-                       ]
-                 else -- HACK: On x86_64 binutils<2.17 is only able to generate
-                      -- PC32 relocations, hence we only get 32-bit offsets in
-                      -- the jump table. As these offsets are always negative
-                      -- we need to properly sign extend them to 64-bit. This
-                      -- hack should be removed in conjunction with the hack in
-                      -- PprMach.hs/pprDataItem once binutils 2.17 is standard.
-                      e_code `appOL` t_code `appOL` toOL [
-                               MOVSxL II32 op (OpReg offsetReg),
-                               ADD (intFormat (platformWordWidth platform))
-                                   (OpReg offsetReg)
-                                   (OpReg tableReg),
-                               JMP_TBL (OpReg tableReg) ids rosection lbl
                        ]
   else do
         (reg,e_code) <- getSomeReg indexExpr
@@ -3032,7 +3039,7 @@ condIntReg cond x y = do
 --  ja _c2g2
 --  jmp _c2g1
 --
--- Removing the jump reduces the pressure on the branch predidiction system
+-- Removing the jump reduces the pressure on the branch prediction system
 -- and plays better with the uOP cache.
 
 condFltReg :: Bool -> Cond -> CmmExpr -> CmmExpr -> NatM Register
@@ -3052,9 +3059,9 @@ condFltReg is32Bit cond x y = condFltReg_sse2
                 GU  -> plain_test   dst
                 GEU -> plain_test   dst
                 -- Use ASSERT so we don't break releases if these creep in.
-                LTT -> assertPpr False (ppr "Should have been turned into >") $
+                LTT -> assertPpr False (text "Should have been turned into >") $
                        and_ordered  dst
-                LE  -> assertPpr False (ppr "Should have been turned into >=") $
+                LE  -> assertPpr False (text "Should have been turned into >=") $
                        and_ordered  dst
                 _   -> and_ordered  dst)
 
@@ -3317,9 +3324,9 @@ invertCondBranches (Just cfg) keep bs =
     invert bs
   where
     invert :: [NatBasicBlock Instr] -> [NatBasicBlock Instr]
-    invert ((BasicBlock lbl1 ins@(_:_:_xs)):b2@(BasicBlock lbl2 _):bs)
+    invert (BasicBlock lbl1 ins:b2@(BasicBlock lbl2 _):bs)
       | --pprTrace "Block" (ppr lbl1) True,
-        (jmp1,jmp2) <- last2 ins
+        Just (jmp1,jmp2) <- last2 ins
       , JXX cond1 target1 <- jmp1
       , target1 == lbl2
       --, pprTrace "CutChance" (ppr b1) True

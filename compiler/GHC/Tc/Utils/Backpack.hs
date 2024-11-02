@@ -27,7 +27,6 @@ import GHC.Types.Fixity (defaultFixity)
 import GHC.Types.Fixity.Env
 import GHC.Types.TypeEnv
 import GHC.Types.Name.Reader
-import GHC.Types.Id
 import GHC.Types.Name
 import GHC.Types.Name.Env
 import GHC.Types.Name.Set
@@ -35,6 +34,7 @@ import GHC.Types.Avail
 import GHC.Types.SrcLoc
 import GHC.Types.SourceFile
 import GHC.Types.Var
+import GHC.Types.Id( idType )
 import GHC.Types.Unique.DSet
 import GHC.Types.Name.Shape
 import GHC.Types.PkgQual
@@ -62,8 +62,6 @@ import GHC.Hs
 
 import GHC.Core.InstEnv
 import GHC.Core.FamInstEnv
-import GHC.Core.Type
-import GHC.Core.Multiplicity
 
 import GHC.IfaceToCore
 import GHC.Iface.Load
@@ -90,9 +88,10 @@ import Data.List (find)
 
 import {-# SOURCE #-} GHC.Tc.Module
 
+
 fixityMisMatch :: TyThing -> Fixity -> Fixity -> TcRnMessage
 fixityMisMatch real_thing real_fixity sig_fixity =
-  TcRnUnknownMessage $ mkPlainError noHints $
+  mkTcRnUnknownMessage $ mkPlainError noHints $
     vcat [ppr real_thing <+> text "has conflicting fixities in the module",
           text "and its hsig file",
           text "Main module:" <+> ppr_fix real_fixity,
@@ -169,7 +168,7 @@ checkHsigIface tcg_env gr sig_iface
         -- tcg_env (TODO: but maybe this isn't relevant anymore).
         r <- tcLookupImported_maybe name
         case r of
-          Failed err -> addErr (TcRnUnknownMessage $ mkPlainError noHints err)
+          Failed err -> addErr (TcRnInterfaceLookupError name err)
           Succeeded real_thing -> checkHsigDeclM sig_iface sig_thing real_thing
 
       -- The hsig did NOT define this function; that means it must
@@ -220,32 +219,23 @@ checkHsigIface tcg_env gr sig_iface
 -- (we might conclude the module exports an instance when it doesn't, see
 -- #9422), but we will never refuse to compile something.
 check_inst :: ClsInst -> TcM ()
-check_inst sig_inst = do
+check_inst sig_inst@(ClsInst { is_dfun = dfun_id }) = do
     -- TODO: This could be very well generalized to support instance
     -- declarations in boot files.
     tcg_env <- getGblEnv
     -- NB: Have to tug on the interface, not necessarily
     -- tugged... but it didn't work?
     mapM_ tcLookupImported_maybe (nameSetElemsStable (orphNamesOfClsInst sig_inst))
+
     -- Based off of 'simplifyDeriv'
-    let ty = idType (instanceDFunId sig_inst)
-        -- Based off of tcSplitDFunTy
-        (tvs, theta, pred) =
-           case tcSplitForAllInvisTyVars ty of { (tvs, rho)    ->
-           case splitFunTys rho             of { (theta, pred) ->
-           (tvs, theta, pred) }}
-        origin = InstProvidedOrigin (tcg_semantic_mod tcg_env) sig_inst
-    skol_info <- mkSkolemInfo InstSkol
-    (skol_subst, tvs_skols) <- tcInstSkolTyVars skol_info tvs -- Skolemize
+    let origin = InstProvidedOrigin (tcg_semantic_mod tcg_env) sig_inst
+    (skol_info, tvs_skols, inst_theta, cls, inst_tys) <- tcSkolDFunType (idType dfun_id)
     (tclvl,cts) <- pushTcLevelM $ do
-       wanted <- newWanted origin
-                           (Just TypeLevel)
-                           (substTy skol_subst pred)
-       givens <- forM theta $ \given -> do
+       wanted <- newWanted origin (Just TypeLevel) (mkClassPred cls inst_tys)
+       givens <- forM inst_theta $ \given -> do
            loc <- getCtLocM origin (Just TypeLevel)
-           let given_pred = substTy skol_subst (scaledThing given)
-           new_ev <- newEvVar given_pred
-           return CtGiven { ctev_pred = given_pred
+           new_ev <- newEvVar given
+           return CtGiven { ctev_pred = given
                           -- Doesn't matter, make something up
                           , ctev_evar = new_ev
                           , ctev_loc = loc
@@ -253,7 +243,7 @@ check_inst sig_inst = do
        return $ wanted : givens
     unsolved <- simplifyWantedsTcM cts
 
-    (implic, _) <- buildImplicationFor tclvl (getSkolemInfo skol_info) tvs_skols [] unsolved
+    (implic, _) <- buildImplicationFor tclvl skol_info tvs_skols [] unsolved
     reportAllUnsolved (mkImplicWC implic)
 
 -- | For a module @modname@ of type 'HscSource', determine the list
@@ -687,7 +677,7 @@ mergeSignatures
             -- 3(d). Extend the name substitution (performing shaping)
             mb_r <- extend_ns nsubst as2
             case mb_r of
-                Left err -> failWithTc (TcRnUnknownMessage $ mkPlainError noHints err)
+                Left err -> failWithTc (mkTcRnUnknownMessage $ mkPlainError noHints err)
                 Right nsubst' -> return (nsubst',oks',(imod, thinned_iface):ifaces)
         nsubst0 = mkNameShape (moduleName inner_mod) (mi_exports lcl_iface0)
         ok_to_use0 = mkOccSet (exportOccs (mi_exports lcl_iface0))
@@ -855,7 +845,6 @@ mergeSignatures
         -- we hope that we get lucky / the overlapping instances never
         -- get used, but it is not a very good situation to be in.
         --
-        hsc_env <- getTopEnv
         let merge_inst (insts, inst_env) inst
                 | memberInstEnv inst_env inst -- test DFun Type equality
                 = (insts, inst_env)
@@ -866,18 +855,17 @@ mergeSignatures
             (insts, inst_env) = foldl' merge_inst
                                     (tcg_insts tcg_env, tcg_inst_env tcg_env)
                                     (instEnvElts $ md_insts details)
-            -- This is a HACK to prevent calculateAvails from including imp_mod
-            -- in the listing.  We don't want it because a module is NOT
+            -- Use mi_deps directly rather than calculateAvails.
+            -- because a module is NOT
             -- supposed to include itself in its dep_orphs/dep_finsts.  See #13214
-            iface' = iface { mi_final_exts = (mi_final_exts iface){ mi_orphan = False, mi_finsts = False } }
-            home_unit = hsc_home_unit hsc_env
-            other_home_units = hsc_all_home_unit_ids hsc_env
-            avails = plusImportAvails (tcg_imports tcg_env) $
-                        calculateAvails home_unit other_home_units iface' False NotBoot ImportedBySystem
+            avails = tcg_imports tcg_env
+            deps = mi_deps iface
+            avails_with_trans = addTransitiveDepInfo avails deps
+
         return tcg_env {
             tcg_inst_env = inst_env,
             tcg_insts    = insts,
-            tcg_imports  = avails,
+            tcg_imports  = avails_with_trans,
             tcg_merged   =
                 if outer_mod == mi_module iface
                     -- Don't add ourselves!
@@ -910,6 +898,20 @@ mergeSignatures
     addDependentFiles src_files
 
     return tcg_env
+
+-- | Add on the necessary transitive information from the merged signature to
+-- the 'ImportAvails' of the result of merging. This propagates the orphan instances
+-- which were in the transitive closure of the signature through the merge.
+addTransitiveDepInfo :: ImportAvails -- ^ From the signature resulting from the merge
+                     -> Dependencies -- ^ From the original signature
+                     -> ImportAvails
+addTransitiveDepInfo avails deps =
+  -- Avails for the merged in signature
+  -- Add on transitive information from the signature but nothing else..
+  -- because we do not "import" the signature.
+  avails { imp_orphs = imp_orphs avails ++ dep_orphs deps
+         , imp_finsts = imp_finsts avails ++ dep_finsts deps
+         , imp_sig_mods = imp_sig_mods avails ++ dep_sig_mods deps }
 
 -- | Top-level driver for signature instantiation (run when compiling
 -- an @hsig@ file.)
@@ -994,7 +996,7 @@ checkImplements impl_mod req_mod@(Module uid mod_name) = do
                                                isig_mod sig_mod NotBoot
     isig_iface <- case mb_isig_iface of
         Succeeded (iface, _) -> return iface
-        Failed err -> failWithTc $ TcRnUnknownMessage $ mkPlainError noHints $
+        Failed err -> failWithTc $ mkTcRnUnknownMessage $ mkPlainError noHints $
             hang (text "Could not find hi interface for signature" <+>
                   quotes (ppr isig_mod) <> colon) 4 err
 
@@ -1002,7 +1004,7 @@ checkImplements impl_mod req_mod@(Module uid mod_name) = do
     -- we need.  (Notice we IGNORE the Modules in the AvailInfos.)
     forM_ (exportOccs (mi_exports isig_iface)) $ \occ ->
         case lookupGlobalRdrEnv impl_gr occ of
-            [] -> addErr $ TcRnUnknownMessage $ mkPlainError noHints $
+            [] -> addErr $ mkTcRnUnknownMessage $ mkPlainError noHints $
                         quotes (ppr occ)
                     <+> text "is exported by the hsig file, but not exported by the implementing module"
                     <+> quotes (pprWithUnitState unit_state $ ppr impl_mod)

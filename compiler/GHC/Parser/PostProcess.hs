@@ -1,5 +1,6 @@
 
 {-# LANGUAGE ConstraintKinds #-}
+{-# LANGUAGE DeriveTraversable #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE GADTs #-}
@@ -8,8 +9,6 @@
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE ViewPatterns #-}
 {-# LANGUAGE DataKinds #-}
-
-{-# OPTIONS_GHC -Wno-incomplete-record-updates #-}
 
 --
 --  (c) The University of Glasgow 2002-2006
@@ -39,6 +38,7 @@ module GHC.Parser.PostProcess (
         fromSpecTyVarBndr, fromSpecTyVarBndrs,
         annBinds,
         fixValbindsAnn,
+        stmtsAnchor, stmtsLoc,
 
         cvBindGroup,
         cvBindsAndSigs,
@@ -94,8 +94,8 @@ module GHC.Parser.PostProcess (
         warnStarIsType,
         warnPrepositiveQualifiedModule,
         failOpFewArgs,
-        failOpNotEnabledImportQualifiedPost,
-        failOpImportQualifiedTwice,
+        failNotEnabledImportQualifiedPost,
+        failImportQualifiedTwice,
 
         SumOrTuple (..),
 
@@ -124,7 +124,6 @@ import GHC.Core.ConLike        ( ConLike(..) )
 import GHC.Core.Coercion.Axiom ( Role, fsFromRole )
 import GHC.Types.Name.Reader
 import GHC.Types.Name
-import GHC.Unit.Module (ModuleName)
 import GHC.Types.Basic
 import GHC.Types.Error
 import GHC.Types.Fixity
@@ -136,10 +135,11 @@ import GHC.Parser.Errors.Types
 import GHC.Parser.Errors.Ppr ()
 import GHC.Utils.Lexeme ( okConOcc )
 import GHC.Types.TyThing
-import GHC.Core.Type    ( unrestrictedFunTyCon, Specificity(..) )
+import GHC.Core.Type    ( Specificity(..) )
 import GHC.Builtin.Types( cTupleTyConName, tupleTyCon, tupleDataCon,
                           nilDataConName, nilDataConKey,
-                          listTyConName, listTyConKey )
+                          listTyConName, listTyConKey,
+                          unrestrictedFunTyCon )
 import GHC.Types.ForeignCall
 import GHC.Types.SrcLoc
 import GHC.Types.Unique ( hasKey )
@@ -156,6 +156,8 @@ import qualified Data.Semigroup as Semi
 import GHC.Utils.Panic
 import GHC.Utils.Panic.Plain
 import qualified GHC.Data.Strict as Strict
+
+import Language.Haskell.Syntax.Basic (FieldLabelString(..))
 
 import Control.Monad
 import Text.ParserCombinators.ReadP as ReadP
@@ -190,7 +192,7 @@ mkClassDecl :: SrcSpan
             -> Located (Maybe (LHsContext GhcPs), LHsType GhcPs)
             -> Located (a,[LHsFunDep GhcPs])
             -> OrdList (LHsDecl GhcPs)
-            -> LayoutInfo
+            -> LayoutInfo GhcPs
             -> [AddEpAnn]
             -> P (LTyClDecl GhcPs)
 
@@ -201,7 +203,8 @@ mkClassDecl loc' (L _ (mcxt, tycl_hdr)) fds where_cls layoutInfo annsIn
        ; tyvars <- checkTyVars (text "class") whereDots cls tparams
        ; cs <- getCommentsFor (locA loc) -- Get any remaining comments
        ; let anns' = addAnns (EpAnn (spanAsAnchor $ locA loc) annsIn emptyComments) ann cs
-       ; return (L loc (ClassDecl { tcdCExt = (anns', NoAnnSortKey, layoutInfo)
+       ; return (L loc (ClassDecl { tcdCExt = (anns', NoAnnSortKey)
+                                  , tcdLayout = layoutInfo
                                   , tcdCtxt = mcxt
                                   , tcdLName = cls, tcdTyVars = tyvars
                                   , tcdFixity = fixity
@@ -212,6 +215,7 @@ mkClassDecl loc' (L _ (mcxt, tycl_hdr)) fds where_cls layoutInfo annsIn
                                   , tcdDocs  = docs })) }
 
 mkTyData :: SrcSpan
+         -> Bool
          -> NewOrData
          -> Maybe (LocatedP CType)
          -> Located (Maybe (LHsContext GhcPs), LHsType GhcPs)
@@ -220,35 +224,34 @@ mkTyData :: SrcSpan
          -> Located (HsDeriving GhcPs)
          -> [AddEpAnn]
          -> P (LTyClDecl GhcPs)
-mkTyData loc' new_or_data cType (L _ (mcxt, tycl_hdr))
+mkTyData loc' is_type_data new_or_data cType (L _ (mcxt, tycl_hdr))
          ksig data_cons (L _ maybe_deriv) annsIn
   = do { let loc = noAnnSrcSpan loc'
        ; (tc, tparams, fixity, ann) <- checkTyClHdr False tycl_hdr
        ; tyvars <- checkTyVars (ppr new_or_data) equalsDots tc tparams
        ; cs <- getCommentsFor (locA loc) -- Get any remaining comments
        ; let anns' = addAnns (EpAnn (spanAsAnchor $ locA loc) annsIn emptyComments) ann cs
-       ; defn <- mkDataDefn new_or_data cType mcxt ksig data_cons maybe_deriv
+       ; data_cons <- checkNewOrData (locA loc) (unLoc tc) is_type_data new_or_data data_cons
+       ; defn <- mkDataDefn cType mcxt ksig data_cons maybe_deriv
        ; return (L loc (DataDecl { tcdDExt = anns',
                                    tcdLName = tc, tcdTyVars = tyvars,
                                    tcdFixity = fixity,
                                    tcdDataDefn = defn })) }
 
-mkDataDefn :: NewOrData
-           -> Maybe (LocatedP CType)
+mkDataDefn :: Maybe (LocatedP CType)
            -> Maybe (LHsContext GhcPs)
            -> Maybe (LHsKind GhcPs)
-           -> [LConDecl GhcPs]
+           -> DataDefnCons (LConDecl GhcPs)
            -> HsDeriving GhcPs
            -> P (HsDataDefn GhcPs)
-mkDataDefn new_or_data cType mcxt ksig data_cons maybe_deriv
+mkDataDefn cType mcxt ksig data_cons maybe_deriv
   = do { checkDatatypeContext mcxt
        ; return (HsDataDefn { dd_ext = noExtField
-                            , dd_ND = new_or_data, dd_cType = cType
+                            , dd_cType = cType
                             , dd_ctxt = mcxt
                             , dd_cons = data_cons
                             , dd_kindSig = ksig
                             , dd_derivs = maybe_deriv }) }
-
 
 mkTySynonym :: SrcSpan
             -> LHsType GhcPs  -- LHS
@@ -324,7 +327,8 @@ mkDataFamInst loc new_or_data cType (mcxt, bndrs, tycl_hdr)
   = do { (tc, tparams, fixity, ann) <- checkTyClHdr False tycl_hdr
        ; cs <- getCommentsFor loc -- Add any API Annotations to the top SrcSpan
        ; let fam_eqn_ans = addAnns (EpAnn (spanAsAnchor loc) ann cs) anns emptyComments
-       ; defn <- mkDataDefn new_or_data cType mcxt ksig data_cons maybe_deriv
+       ; data_cons <- checkNewOrData loc (unLoc tc) False new_or_data data_cons
+       ; defn <- mkDataDefn cType mcxt ksig data_cons maybe_deriv
        ; return (L (noAnnSrcSpan loc) (DataFamInstD noExtField (DataFamInstDecl
                   (FamEqn { feqn_ext    = fam_eqn_ans
                           , feqn_tycon  = tc
@@ -398,19 +402,19 @@ mkSpliceDecl :: LHsExpr GhcPs -> P (LHsDecl GhcPs)
 -- Typed splices are not allowed at the top level, thus we do not represent them
 -- as spliced declaration.  See #10945
 mkSpliceDecl lexpr@(L loc expr)
-  | HsSpliceE _ splice@(HsUntypedSplice {}) <- expr = do
+  | HsUntypedSplice _ splice@(HsUntypedSpliceExpr {}) <- expr = do
     cs <- getCommentsFor (locA loc)
-    return $ L (addCommentsToSrcAnn loc cs) $ SpliceD noExtField (SpliceDecl noExtField (L loc splice) ExplicitSplice)
+    return $ L (addCommentsToSrcAnn loc cs) $ SpliceD noExtField (SpliceDecl noExtField (L loc splice) DollarSplice)
 
-  | HsSpliceE _ splice@(HsQuasiQuote {}) <- expr = do
+  | HsUntypedSplice _ splice@(HsQuasiQuote {}) <- expr = do
     cs <- getCommentsFor (locA loc)
-    return $ L (addCommentsToSrcAnn loc cs) $ SpliceD noExtField (SpliceDecl noExtField (L loc splice) ExplicitSplice)
+    return $ L (addCommentsToSrcAnn loc cs) $ SpliceD noExtField (SpliceDecl noExtField (L loc splice) DollarSplice)
 
   | otherwise = do
     cs <- getCommentsFor (locA loc)
     return $ L (addCommentsToSrcAnn loc cs) $ SpliceD noExtField (SpliceDecl noExtField
-                                 (L loc (mkUntypedSplice noAnn BareSplice lexpr))
-                                       ImplicitSplice)
+                                 (L loc (HsUntypedSpliceExpr noAnn lexpr))
+                                       BareSplice)
 
 mkRoleAnnotDecl :: SrcSpan
                 -> LocatedN RdrName                -- type being annotated
@@ -467,13 +471,13 @@ annBinds a cs (HsIPBinds an bs)   = (HsIPBinds (add_where a an cs) bs, Nothing)
 annBinds _ cs  (EmptyLocalBinds x) = (EmptyLocalBinds x, Just cs)
 
 add_where :: AddEpAnn -> EpAnn AnnList -> EpAnnComments -> EpAnn AnnList
-add_where an@(AddEpAnn _ (EpaSpan rs)) (EpAnn a (AnnList anc o c r t) cs) cs2
+add_where an@(AddEpAnn _ (EpaSpan rs _)) (EpAnn a (AnnList anc o c r t) cs) cs2
   | valid_anchor (anchor a)
   = EpAnn (widenAnchor a [an]) (AnnList anc o c (an:r) t) (cs Semi.<> cs2)
   | otherwise
   = EpAnn (patch_anchor rs a)
           (AnnList (fmap (patch_anchor rs) anc) o c (an:r) t) (cs Semi.<> cs2)
-add_where an@(AddEpAnn _ (EpaSpan rs)) EpAnnNotUsed cs
+add_where an@(AddEpAnn _ (EpaSpan rs _)) EpAnnNotUsed cs
   = EpAnn (Anchor rs UnchangedAnchor)
            (AnnList (Just $ Anchor rs UnchangedAnchor) Nothing Nothing [an] []) cs
 add_where (AddEpAnn _ (EpaDelta _ _)) _ _ = panic "add_where"
@@ -493,6 +497,18 @@ fixValbindsAnn :: EpAnn AnnList -> EpAnn AnnList
 fixValbindsAnn EpAnnNotUsed = EpAnnNotUsed
 fixValbindsAnn (EpAnn anchor (AnnList ma o c r t) cs)
   = (EpAnn (widenAnchor anchor (map trailingAnnToAddEpAnn t)) (AnnList ma o c r t) cs)
+
+-- | The 'Anchor' for a stmtlist is based on either the location or
+-- the first semicolon annotion.
+stmtsAnchor :: Located (OrdList AddEpAnn,a) -> Anchor
+stmtsAnchor (L l ((ConsOL (AddEpAnn _ (EpaSpan r _)) _), _))
+  = widenAnchorR (Anchor (realSrcSpan l) UnchangedAnchor) r
+stmtsAnchor (L l _) = Anchor (realSrcSpan l) UnchangedAnchor
+
+stmtsLoc :: Located (OrdList AddEpAnn,a) -> SrcSpan
+stmtsLoc (L l ((ConsOL aa _), _))
+  = widenSpan l [aa]
+stmtsLoc (L l _) = l
 
 {- **********************************************************************
 
@@ -674,7 +690,7 @@ mkPatSynMatchGroup (L loc patsyn_name) (L ld decls) =
     fromDecl (L loc decl@(ValD _ (PatBind _
                                  -- AZ: where should these anns come from?
                          pat@(L _ (ConPat noAnn ln@(L _ name) details))
-                               rhs _))) =
+                               rhs))) =
         do { unless (name == patsyn_name) $
                wrongNameBindingErr (locA loc) decl
            ; match <- case details of
@@ -737,11 +753,11 @@ mkConDeclH98 ann name mb_forall mb_cxt args
 --   records whether this is a prefix or record GADT constructor. See
 --   Note [GADT abstract syntax] in "GHC.Hs.Decls" for more details.
 mkGadtDecl :: SrcSpan
-           -> [LocatedN RdrName]
+           -> NonEmpty (LocatedN RdrName)
+           -> LHsUniToken "::" "∷" GhcPs
            -> LHsSigType GhcPs
-           -> [AddEpAnn]
            -> P (LConDecl GhcPs)
-mkGadtDecl loc names ty annsIn = do
+mkGadtDecl loc names dcol ty = do
   cs <- getCommentsFor loc
   let l = noAnnSrcSpan loc
 
@@ -761,11 +777,12 @@ mkGadtDecl loc names ty annsIn = do
        let (anns, cs, arg_types, res_type) = splitHsFunType body_ty
        return (PrefixConGADT arg_types, res_type, anns, cs)
 
-  let an = EpAnn (spanAsAnchor loc) (annsIn ++ annsa) (cs Semi.<> csa)
+  let an = EpAnn (spanAsAnchor loc) annsa (cs Semi.<> csa)
 
   pure $ L l ConDeclGADT
                      { con_g_ext  = an
                      , con_names  = names
+                     , con_dcolon = dcol
                      , con_bndrs  = L (getLoc ty) outer_bndrs
                      , con_mb_cxt = mcxt
                      , con_g_args = args
@@ -947,8 +964,7 @@ mkRuleTyVarBndrs = fmap cvt_one
 checkRuleTyVarBndrNames :: [LHsTyVarBndr flag GhcPs] -> P ()
 checkRuleTyVarBndrNames = mapM_ (check . fmap hsTyVarName)
   where check (L loc (Unqual occ)) =
-          -- TODO: don't use string here, OccName has a Unique/FastString
-          when ((occNameString occ ==) `any` ["forall","family","role"])
+          when (occNameFS occ `elem` [fsLit "forall",fsLit "family",fsLit "role"])
             (addFatalError $ mkPlainErrorMsgEnvelope (locA loc) $
                (PsErrParseErrorOnInput occ))
         check _ = panic "checkRuleTyVarBndrNames"
@@ -991,7 +1007,7 @@ checkTyClHdr is_cls ty
     -- workaround to define '*' despite StarIsType
     go _ (HsParTy an (L l (HsStarTy _ isUni))) acc ops' cps' fix
       = do { addPsMessage (locA l) PsWarnStarBinder
-           ; let name = mkOccName tcClsName (starSym isUni)
+           ; let name = mkOccNameFS tcClsName (starSym isUni)
            ; let a' = newAnns l an
            ; return (L a' (Unqual name), acc, fix
                     , (reverse ops') ++ cps') }
@@ -1023,13 +1039,13 @@ checkTyClHdr is_cls ty
     newAnns (SrcSpanAnn EpAnnNotUsed l) (EpAnn as (AnnParen _ o c) cs) =
       let
         lr = combineRealSrcSpans (realSrcSpan l) (anchor as)
-        an = (EpAnn (Anchor lr UnchangedAnchor) (NameAnn NameParens o (EpaSpan $ realSrcSpan l) c []) cs)
+        an = (EpAnn (Anchor lr UnchangedAnchor) (NameAnn NameParens o (srcSpan2e l) c []) cs)
       in SrcSpanAnn an (RealSrcSpan lr Strict.Nothing)
     newAnns _ EpAnnNotUsed = panic "missing AnnParen"
     newAnns (SrcSpanAnn (EpAnn ap (AnnListItem ta) csp) l) (EpAnn as (AnnParen _ o c) cs) =
       let
         lr = combineRealSrcSpans (anchor ap) (anchor as)
-        an = (EpAnn (Anchor lr UnchangedAnchor) (NameAnn NameParens o (EpaSpan $ realSrcSpan l) c ta) (csp Semi.<> cs))
+        an = (EpAnn (Anchor lr UnchangedAnchor) (NameAnn NameParens o (srcSpan2e l) c ta) (csp Semi.<> cs))
       in SrcSpanAnn an (RealSrcSpan lr Strict.Nothing)
 
 -- | Yield a parse error if we have a function applied directly to a do block
@@ -1116,13 +1132,13 @@ checkImportDecl mPre mPost = do
   -- 'ImportQualifiedPost' is not in effect.
   whenJust mPost $ \post ->
     when (not importQualifiedPostEnabled) $
-      failOpNotEnabledImportQualifiedPost (RealSrcSpan (epaLocationRealSrcSpan post) Strict.Nothing)
+      failNotEnabledImportQualifiedPost (RealSrcSpan (epaLocationRealSrcSpan post) Strict.Nothing)
 
   -- Error if 'qualified' occurs in both pre and postpositive
   -- positions.
   whenJust mPost $ \post ->
     when (isJust mPre) $
-      failOpImportQualifiedTwice (RealSrcSpan (epaLocationRealSrcSpan post) Strict.Nothing)
+      failImportQualifiedTwice (RealSrcSpan (epaLocationRealSrcSpan post) Strict.Nothing)
 
   -- Warn if 'qualified' found in prepositive position and
   -- 'Opt_WarnPrepositiveQualifiedModule' is enabled.
@@ -1144,7 +1160,7 @@ checkPattern_details extraDetails pp = runPV_details extraDetails (pp >>= checkL
 checkLPat :: LocatedA (PatBuilder GhcPs) -> PV (LPat GhcPs)
 checkLPat e@(L l _) = checkPat l e [] []
 
-checkPat :: SrcSpanAnnA -> LocatedA (PatBuilder GhcPs) -> [HsPatSigType GhcPs] -> [LPat GhcPs]
+checkPat :: SrcSpanAnnA -> LocatedA (PatBuilder GhcPs) -> [HsConPatTyArg GhcPs] -> [LPat GhcPs]
          -> PV (LPat GhcPs)
 checkPat loc (L l e@(PatBuilderVar (L ln c))) tyargs args
   | isRdrDataCon c = return . L loc $ ConPat
@@ -1157,8 +1173,8 @@ checkPat loc (L l e@(PatBuilderVar (L ln c))) tyargs args
   | (not (null args) && patIsRec c) = do
       ctx <- askParseContext
       patFail (locA l) . PsErrInPat e $ PEIP_RecPattern args YesPatIsRecursive ctx
-checkPat loc (L _ (PatBuilderAppType f t)) tyargs args =
-  checkPat loc f (t : tyargs) args
+checkPat loc (L _ (PatBuilderAppType f at t)) tyargs args =
+  checkPat loc f (HsConPatTyArg at t : tyargs) args
 checkPat loc (L _ (PatBuilderApp f e)) [] args = do
   p <- checkLPat e
   checkPat loc f [] (p : args)
@@ -1293,8 +1309,7 @@ makeFunBind :: LocatedN RdrName -> LocatedL [LMatch GhcPs (LHsExpr GhcPs)]
 makeFunBind fn ms
   = FunBind { fun_ext = noExtField,
               fun_id = fn,
-              fun_matches = mkMatchGroup FromSource ms,
-              fun_tick = [] }
+              fun_matches = mkMatchGroup FromSource ms }
 
 -- See Note [FunBind vs PatBind]
 checkPatBind :: SrcSpan
@@ -1316,7 +1331,7 @@ checkPatBind loc annsIn (L _ (BangPat (EpAnn _ ans cs) (L _ (VarPat _ v))))
 
 checkPatBind loc annsIn lhs (L _ grhss) = do
   cs <- getCommentsFor loc
-  return (PatBind (EpAnn (spanAsAnchor loc) annsIn cs) lhs grhss ([],[]))
+  return (PatBind (EpAnn (spanAsAnchor loc) annsIn cs) lhs grhss)
 
 checkValSigLhs :: LHsExpr GhcPs -> P (LocatedN RdrName)
 checkValSigLhs (L _ (HsVar _ lrdr@(L _ v)))
@@ -1516,7 +1531,7 @@ class (b ~ (Body b) GhcPs, AnnoBody b) => DisambECP b where
   -- | Disambiguate "f x" (function application)
   mkHsAppPV :: SrcSpanAnnA -> LocatedA b -> LocatedA (FunArg b) -> PV (LocatedA b)
   -- | Disambiguate "f @t" (visible type application)
-  mkHsAppTypePV :: SrcSpanAnnA -> LocatedA b -> SrcSpan -> LHsType GhcPs -> PV (LocatedA b)
+  mkHsAppTypePV :: SrcSpanAnnA -> LocatedA b -> LHsToken "@" GhcPs -> LHsType GhcPs -> PV (LocatedA b)
   -- | Disambiguate "if ... then ... else ..."
   mkHsIfPV :: SrcSpan
          -> LHsExpr GhcPs
@@ -1549,7 +1564,7 @@ class (b ~ (Body b) GhcPs, AnnoBody b) => DisambECP b where
   -- | Disambiguate "[a,b,c]" (list syntax)
   mkHsExplicitListPV :: SrcSpan -> [LocatedA b] -> AnnList -> PV (LocatedA b)
   -- | Disambiguate "$(...)" and "[quasi|...|]" (TH splices)
-  mkHsSplicePV :: Located (HsSplice GhcPs) -> PV (Located b)
+  mkHsSplicePV :: Located (HsUntypedSplice GhcPs) -> PV (Located b)
   -- | Disambiguate "f { a = b, ... }" syntax (record construction and record updates)
   mkHsRecordPV ::
     Bool -> -- Is OverloadedRecordUpdate in effect?
@@ -1569,7 +1584,7 @@ class (b ~ (Body b) GhcPs, AnnoBody b) => DisambECP b where
     :: SrcSpan -> LHsExpr GhcPs -> LocatedA b -> [AddEpAnn] -> PV (LocatedA b)
   -- | Disambiguate "a@b" (as-pattern)
   mkHsAsPatPV
-    :: SrcSpan -> LocatedN RdrName -> LocatedA b -> [AddEpAnn] -> PV (LocatedA b)
+    :: SrcSpan -> LocatedN RdrName -> LHsToken "@" GhcPs -> LocatedA b -> PV (LocatedA b)
   -- | Disambiguate "~a" (lazy pattern)
   mkHsLazyPatPV :: SrcSpan -> LocatedA b -> [AddEpAnn] -> PV (LocatedA b)
   -- | Disambiguate "!a" (bang pattern)
@@ -1675,8 +1690,8 @@ instance DisambECP (HsCmd GhcPs) where
   mkHsWildCardPV l = cmdFail l (text "_")
   mkHsTySigPV l a sig _ = cmdFail (locA l) (ppr a <+> text "::" <+> ppr sig)
   mkHsExplicitListPV l xs _ = cmdFail l $
-    brackets (fsep (punctuate comma (map ppr xs)))
-  mkHsSplicePV (L l sp) = cmdFail l (ppr sp)
+    brackets (pprWithCommas ppr xs)
+  mkHsSplicePV (L l sp) = cmdFail l (pprUntypedSplice True Nothing sp)
   mkHsRecordPV _ l _ a (fbinds, ddLoc) _ = do
     let (fs, ps) = partitionEithers fbinds
     if not (null ps)
@@ -1689,7 +1704,7 @@ instance DisambECP (HsCmd GhcPs) where
     in pp_op <> ppr c
   mkHsViewPatPV l a b _ = cmdFail l $
     ppr a <+> text "->" <+> ppr b
-  mkHsAsPatPV l v c _ = cmdFail l $
+  mkHsAsPatPV l v _ c = cmdFail l $
     pprPrefixOcc (unLoc v) <> text "@" <> ppr c
   mkHsLazyPatPV l c _ = cmdFail l $
     text "~" <> ppr c
@@ -1743,9 +1758,9 @@ instance DisambECP (HsExpr GhcPs) where
     checkExpBlockArguments e1
     checkExpBlockArguments e2
     return $ L l (HsApp (comment (realSrcSpan $ locA l) cs) e1 e2)
-  mkHsAppTypePV l e la t = do
+  mkHsAppTypePV l e at t = do
     checkExpBlockArguments e
-    return $ L l (HsAppType la e (mkHsWildCardBndrs t))
+    return $ L l (HsAppType noExtField e at (mkHsWildCardBndrs t))
   mkHsIfPV l c semi1 a semi2 b anns = do
     checkDoAndIfThenElse PsErrSemiColonsInCondExpr c semi1 a semi2 b
     cs <- getCommentsFor l
@@ -1772,7 +1787,7 @@ instance DisambECP (HsExpr GhcPs) where
     return $ L (noAnnSrcSpan l) (ExplicitList (EpAnn (spanAsAnchor l) anns cs) xs)
   mkHsSplicePV sp@(L l _) = do
     cs <- getCommentsFor l
-    return $ mapLoc (HsSpliceE (EpAnn (spanAsAnchor l) NoEpAnns cs)) sp
+    return $ fmap (HsUntypedSplice (EpAnn (spanAsAnchor l) NoEpAnns cs)) sp
   mkHsRecordPV opts l lrec a (fbinds, ddLoc) anns = do
     cs <- getCommentsFor l
     r <- mkRecConstrOrUpdate opts a lrec (fbinds, ddLoc) (EpAnn (spanAsAnchor l) anns cs)
@@ -1785,7 +1800,7 @@ instance DisambECP (HsExpr GhcPs) where
     return $ L l (SectionR (comment (realSrcSpan l) cs) op e)
   mkHsViewPatPV l a b _ = addError (mkPlainErrorMsgEnvelope l $ PsErrViewPatInExpr a b)
                           >> return (L (noAnnSrcSpan l) (hsHoleExpr noAnn))
-  mkHsAsPatPV l v e   _ = addError (mkPlainErrorMsgEnvelope l $ PsErrTypeAppWithoutSpace (unLoc v) e)
+  mkHsAsPatPV l v _ e   = addError (mkPlainErrorMsgEnvelope l $ PsErrTypeAppWithoutSpace (unLoc v) e)
                           >> return (L (noAnnSrcSpan l) (hsHoleExpr noAnn))
   mkHsLazyPatPV l e   _ = addError (mkPlainErrorMsgEnvelope l $ PsErrLazyPatWithoutSpace e)
                           >> return (L (noAnnSrcSpan l) (hsHoleExpr noAnn))
@@ -1800,7 +1815,7 @@ instance DisambECP (HsExpr GhcPs) where
   rejectPragmaPV _                        = return ()
 
 hsHoleExpr :: EpAnn EpAnnUnboundVar -> HsExpr GhcPs
-hsHoleExpr anns = HsUnboundVar anns (mkVarOcc "_")
+hsHoleExpr anns = HsUnboundVar anns (mkRdrUnqual (mkVarOccFS (fsLit "_")))
 
 type instance Anno (GRHS GhcPs (LocatedA (PatBuilder GhcPs))) = SrcAnn NoEpAnns
 type instance Anno [LocatedA (Match GhcPs (LocatedA (PatBuilder GhcPs)))] = SrcSpanAnnL
@@ -1825,10 +1840,10 @@ instance DisambECP (PatBuilder GhcPs) where
   type FunArg (PatBuilder GhcPs) = PatBuilder GhcPs
   superFunArg m = m
   mkHsAppPV l p1 p2      = return $ L l (PatBuilderApp p1 p2)
-  mkHsAppTypePV l p la t = do
+  mkHsAppTypePV l p at t = do
     cs <- getCommentsFor (locA l)
-    let anns = EpAnn (spanAsAnchor (combineSrcSpans la (getLocA t))) (EpaSpan (realSrcSpan la)) cs
-    return $ L l (PatBuilderAppType p (mkHsPatSigType anns t))
+    let anns = EpAnn (spanAsAnchor (getLocA t)) NoEpAnns cs
+    return $ L l (PatBuilderAppType p at (mkHsPatSigType anns t))
   mkHsIfPV l _ _ _ _ _ _ = addFatalError $ mkPlainErrorMsgEnvelope l PsErrIfThenElseInPat
   mkHsDoPV l _ _ _       = addFatalError $ mkPlainErrorMsgEnvelope l PsErrDoNotationInPat
   mkHsParPV l lpar p rpar   = return $ L (noAnnSrcSpan l) (PatBuilderPar lpar p rpar)
@@ -1867,10 +1882,10 @@ instance DisambECP (PatBuilder GhcPs) where
     p <- checkLPat b
     cs <- getCommentsFor l
     return $ L (noAnnSrcSpan l) (PatBuilderPat (ViewPat (EpAnn (spanAsAnchor l) anns cs) a p))
-  mkHsAsPatPV l v e a = do
+  mkHsAsPatPV l v at e = do
     p <- checkLPat e
     cs <- getCommentsFor l
-    return $ L (noAnnSrcSpan l) (PatBuilderPat (AsPat (EpAnn (spanAsAnchor l) a cs) v p))
+    return $ L (noAnnSrcSpan l) (PatBuilderPat (AsPat (EpAnn (spanAsAnchor l) NoEpAnns cs) v at p))
   mkHsLazyPatPV l e a = do
     p <- checkLPat e
     cs <- getCommentsFor l
@@ -2497,10 +2512,10 @@ mkRecConstrOrUpdate _ (L _ (HsVar _ (L l c))) _lrec (fbinds,dd) anns
   | isRdrDataCon c
   = do
       let (fs, ps) = partitionEithers fbinds
-      if not (null ps)
-        then addFatalError $ mkPlainErrorMsgEnvelope (getLocA (head ps)) $
-                               PsErrOverloadedRecordDotInvalid
-        else return (mkRdrRecordCon (L l c) (mk_rec_fields fs dd) anns)
+      case ps of
+          p:_ -> addFatalError $ mkPlainErrorMsgEnvelope (getLocA p) $
+              PsErrOverloadedRecordDotInvalid
+          _ -> return (mkRdrRecordCon (L l c) (mk_rec_fields fs dd) anns)
 mkRecConstrOrUpdate overloaded_update exp _ (fs,dd) anns
   | Just dd_loc <- dd = addFatalError $ mkPlainErrorMsgEnvelope dd_loc $
                                           PsErrDotsInRecordUpdate
@@ -2530,15 +2545,13 @@ mkRdrRecordUpd overloaded_on exp@(L loc _) fbinds anns = do
             [ L l lbl | L _ (HsFieldBind _ (L l lbl) _ _) <- fs'
                       , isQual . rdrNameAmbiguousFieldOcc $ lbl
             ]
-      if not $ null qualifiedFields
-        then
-          addFatalError $ mkPlainErrorMsgEnvelope (getLocA (head qualifiedFields)) $
+      case qualifiedFields of
+          qf:_ -> addFatalError $ mkPlainErrorMsgEnvelope (getLocA qf) $
             PsErrOverloadedRecordUpdateNoQualifiedFields
-        else -- This is a RecordDotSyntax update.
-          return RecordUpd {
-            rupd_ext = anns
-           , rupd_expr = exp
-           , rupd_flds = Right (toProjUpdates fbinds) }
+          _ -> return RecordUpd -- This is a RecordDotSyntax update.
+             { rupd_ext = anns
+             , rupd_expr = exp
+             , rupd_flds = Right (toProjUpdates fbinds) }
   where
     toProjUpdates :: [Fbind (HsExpr GhcPs)] -> [LHsRecUpdProj GhcPs]
     toProjUpdates = map (\case { Right p -> p; Left f -> recFieldToProjUpdate f })
@@ -2549,7 +2562,7 @@ mkRdrRecordUpd overloaded_on exp@(L loc _) fbinds anns = do
     recFieldToProjUpdate (L l (HsFieldBind anns (L _ (FieldOcc _ (L loc rdr))) arg pun)) =
         -- The idea here is to convert the label to a singleton [FastString].
         let f = occNameFS . rdrNameOcc $ rdr
-            fl = DotFieldOcc noAnn (L loc f)
+            fl = DotFieldOcc noAnn (L loc (FieldLabelString f))
             lf = locA loc
         in mkRdrProjUpdate l (L lf [L (l2l loc) fl]) (punnedVar f) pun anns
         where
@@ -2568,7 +2581,7 @@ mkRdrRecordCon con flds anns
 mk_rec_fields :: [LocatedA (HsRecField (GhcPass p) arg)] -> Maybe SrcSpan -> HsRecFields (GhcPass p) arg
 mk_rec_fields fs Nothing = HsRecFields { rec_flds = fs, rec_dotdot = Nothing }
 mk_rec_fields fs (Just s)  = HsRecFields { rec_flds = fs
-                                     , rec_dotdot = Just (L s (length fs)) }
+                                     , rec_dotdot = Just (L s (RecFieldsDotDot $ length fs)) }
 
 mk_rec_upd_field :: HsRecField GhcPs (LHsExpr GhcPs) -> HsRecUpdField GhcPs
 mk_rec_upd_field (HsFieldBind noAnn (L loc (FieldOcc _ rdr)) arg pun)
@@ -2606,6 +2619,28 @@ mkOpaquePragma src
                  , inl_rule   = FunLike
                  }
 
+checkNewOrData :: SrcSpan -> RdrName -> Bool -> NewOrData -> [LConDecl GhcPs]
+               -> P (DataDefnCons (LConDecl GhcPs))
+checkNewOrData span name is_type_data = curry $ \ case
+    (NewType, [a]) -> pure $ NewTypeCon a
+    (DataType, as) -> pure $ DataTypeCons is_type_data (handle_type_data as)
+    (NewType, as) -> addFatalError $ mkPlainErrorMsgEnvelope span $ PsErrMultipleConForNewtype name (length as)
+  where
+    -- In a "type data" declaration, the constructors are in the type/class
+    -- namespace rather than the data constructor namespace.
+    -- See Note [Type data declarations] in GHC.Rename.Module.
+    handle_type_data
+      | is_type_data = map (fmap promote_constructor)
+      | otherwise = id
+
+    promote_constructor (dc@ConDeclGADT { con_names = cons })
+      = dc { con_names = fmap (fmap promote_name) cons }
+    promote_constructor (dc@ConDeclH98 { con_name = con })
+      = dc { con_name = fmap promote_name con }
+    promote_constructor dc = dc
+
+    promote_name name = fromMaybe name (promoteRdrName name)
+
 -----------------------------------------------------------------------------
 -- utilities for foreign declarations
 
@@ -2638,7 +2673,7 @@ mkImport cconv safety (L loc (StringLiteral esrc entity _), v, ty) =
                              PsErrMalformedEntityString
         Just importSpec -> return importSpec
 
-    isCWrapperImport (CImport _ _ _ CWrapper _) = True
+    isCWrapperImport (CImport _ _ _ _ CWrapper) = True
     isCWrapperImport _ = False
 
     -- currently, all the other import conventions only support a symbol name in
@@ -2649,7 +2684,7 @@ mkImport cconv safety (L loc (StringLiteral esrc entity _), v, ty) =
                         then mkExtName (unLoc v)
                         else entity
         funcTarget = CFunction (StaticTarget esrc entity' Nothing True)
-        importSpec = CImport cconv safety Nothing funcTarget (L loc esrc)
+        importSpec = CImport (L loc esrc) cconv safety Nothing funcTarget
 
     returnSpec spec = return $ \ann -> ForD noExtField $ ForeignImport
           { fd_i_ext  = ann
@@ -2665,7 +2700,7 @@ mkImport cconv safety (L loc (StringLiteral esrc entity _), v, ty) =
 -- that one.
 parseCImport :: Located CCallConv -> Located Safety -> FastString -> String
              -> Located SourceText
-             -> Maybe ForeignImport
+             -> Maybe (ForeignImport (GhcPass p))
 parseCImport cconv safety nm str sourceText =
  listToMaybe $ map fst $ filter (null.snd) $
      readP_to_S parse str
@@ -2692,7 +2727,7 @@ parseCImport cconv safety nm str sourceText =
                        | id_char c -> pfail
                       _            -> return ()
 
-   mk h n = CImport cconv safety h n sourceText
+   mk h n = CImport sourceText cconv safety h n
 
    hdr_char c = not (isSpace c)
    -- header files are filenames, which can contain
@@ -2727,8 +2762,7 @@ mkExport :: Located CCallConv
 mkExport (L lc cconv) (L le (StringLiteral esrc entity _), v, ty)
  = return $ \ann -> ForD noExtField $
    ForeignExport { fd_e_ext = ann, fd_name = v, fd_sig_ty = ty
-                 , fd_fe = CExport (L lc (CExportStatic esrc entity' cconv))
-                                   (L le esrc) }
+                 , fd_fe = CExport (L le esrc) (L lc (CExportStatic esrc entity' cconv)) }
   where
     entity' | nullFS entity = mkExtName (unLoc v)
             | otherwise     = entity
@@ -2740,7 +2774,7 @@ mkExport (L lc cconv) (L le (StringLiteral esrc entity _), v, ty)
 -- want z-encoding (e.g. names with z's in them shouldn't be doubled)
 --
 mkExtName :: RdrName -> CLabelString
-mkExtName rdrNm = mkFastString (occNameString (rdrNameOcc rdrNm))
+mkExtName rdrNm = occNameFS (rdrNameOcc rdrNm)
 
 --------------------------------------------------------------------------------
 -- Help with module system imports/exports
@@ -2774,7 +2808,7 @@ mkModuleImpExp anns (L l specname) subs = do
             let withs = map unLoc xs
                 pos   = maybe NoIEWildcard IEWildcard
                           (findIndex isImpExpQcWildcard withs)
-                ies :: [LocatedA (IEWrappedName RdrName)]
+                ies :: [LocatedA (IEWrappedName GhcPs)]
                 ies   = wrapped $ filter (not . isImpExpQcWildcard . unLoc) xs
             in (\newName
                         -> IEThingWith ann (L l newName) pos ies)
@@ -2793,11 +2827,12 @@ mkModuleImpExp anns (L l specname) subs = do
     ieNameVal (ImpExpQcType _ ln) = unLoc ln
     ieNameVal (ImpExpQcWildcard)  = panic "ieNameVal got wildcard"
 
-    ieNameFromSpec (ImpExpQcName   ln) = IEName   ln
-    ieNameFromSpec (ImpExpQcType r ln) = IEType r ln
+    ieNameFromSpec :: ImpExpQcSpec -> IEWrappedName GhcPs
+    ieNameFromSpec (ImpExpQcName   (L l n)) = IEName noExtField (L l n)
+    ieNameFromSpec (ImpExpQcType r (L l n)) = IEType r (L l n)
     ieNameFromSpec (ImpExpQcWildcard)  = panic "ieName got wildcard"
 
-    wrapped = map (mapLoc ieNameFromSpec)
+    wrapped = map (fmap ieNameFromSpec)
 
 mkTypeImpExp :: LocatedN RdrName   -- TcCls or Var name space
              -> P (LocatedN RdrName)
@@ -2820,7 +2855,7 @@ checkImportSpec ie@(L _ specs) =
 mkImpExpSubSpec :: [LocatedA ImpExpQcSpec] -> P ([AddEpAnn], ImpExpSubSpec)
 mkImpExpSubSpec [] = return ([], ImpExpList [])
 mkImpExpSubSpec [L la ImpExpQcWildcard] =
-  return ([AddEpAnn AnnDotdot (EpaSpan $ la2r la)], ImpExpAll)
+  return ([AddEpAnn AnnDotdot (la2e la)], ImpExpAll)
 mkImpExpSubSpec xs =
   if (any (isImpExpQcWildcard . unLoc) xs)
     then return $ ([], ImpExpAllWith xs)
@@ -2837,12 +2872,12 @@ warnPrepositiveQualifiedModule :: SrcSpan -> P ()
 warnPrepositiveQualifiedModule span =
   addPsMessage span PsWarnImportPreQualified
 
-failOpNotEnabledImportQualifiedPost :: SrcSpan -> P ()
-failOpNotEnabledImportQualifiedPost loc =
+failNotEnabledImportQualifiedPost :: SrcSpan -> P ()
+failNotEnabledImportQualifiedPost loc =
   addError $ mkPlainErrorMsgEnvelope loc $ PsErrImportPostQualified
 
-failOpImportQualifiedTwice :: SrcSpan -> P ()
-failOpImportQualifiedTwice loc =
+failImportQualifiedTwice :: SrcSpan -> P ()
+failImportQualifiedTwice loc =
   addError $ mkPlainErrorMsgEnvelope loc $ PsErrImportQualifiedTwice
 
 warnStarIsType :: SrcSpan -> P ()
@@ -2873,6 +2908,7 @@ data PV_Accum =
     }
 
 data PV_Result a = PV_Ok PV_Accum a | PV_Failed PV_Accum
+  deriving (Foldable, Functor, Traversable)
 
 -- During parsing, we make use of several monadic effects: reporting parse errors,
 -- accumulating warnings, adding API annotations, and checking for extensions. These
@@ -2894,9 +2930,7 @@ data PV_Result a = PV_Ok PV_Accum a | PV_Failed PV_Accum
 --   abParser :: forall x. DisambAB x => P (PV x)
 --
 newtype PV a = PV { unPV :: PV_Context -> PV_Accum -> PV_Result a }
-
-instance Functor PV where
-  fmap = liftM
+  deriving (Functor)
 
 instance Applicative PV where
   pure a = a `seq` PV (\_ acc -> PV_Ok acc a)
@@ -2971,7 +3005,7 @@ instance MonadP PV where
 
 {- Note [Parser-Validator Details]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-A PV computation is parametrized by some 'ParseContext' for diagnostic messages, which can be set
+A PV computation is parameterized by some 'ParseContext' for diagnostic messages, which can be set
 depending on validation context. We use this in checkPattern to fix #984.
 
 Consider this example, where the user has forgotten a 'do':
@@ -3090,14 +3124,14 @@ mkMultTy pct t arr = HsExplicitMult pct t arr
 
 mkTokenLocation :: SrcSpan -> TokenLocation
 mkTokenLocation (UnhelpfulSpan _) = NoTokenLoc
-mkTokenLocation (RealSrcSpan r _)  = TokenLoc (EpaSpan r)
+mkTokenLocation (RealSrcSpan r mb) = TokenLoc (EpaSpan r mb)
 
 -- Precondition: the TokenLocation has EpaSpan, never EpaDelta.
 token_location_widenR :: TokenLocation -> SrcSpan -> TokenLocation
 token_location_widenR NoTokenLoc _ = NoTokenLoc
 token_location_widenR tl (UnhelpfulSpan _) = tl
-token_location_widenR (TokenLoc (EpaSpan r1)) (RealSrcSpan r2 _) =
-                      (TokenLoc (EpaSpan (combineRealSrcSpans r1 r2)))
+token_location_widenR (TokenLoc (EpaSpan r1 mb1)) (RealSrcSpan r2 mb2) =
+                      (TokenLoc (EpaSpan (combineRealSrcSpans r1 r2) (liftA2 combineBufSpans mb1 mb2)))
 token_location_widenR (TokenLoc (EpaDelta _ _)) _ =
   -- Never happens because the parser does not produce EpaDelta.
   panic "token_location_widenR: EpaDelta"
@@ -3106,9 +3140,9 @@ token_location_widenR (TokenLoc (EpaDelta _ _)) _ =
 -----------------------------------------------------------------------------
 -- Token symbols
 
-starSym :: Bool -> String
-starSym True = "★"
-starSym False = "*"
+starSym :: Bool -> FastString
+starSym True = fsLit "★"
+starSym False = fsLit "*"
 
 -----------------------------------------
 -- Bits and pieces for RecordDotSyntax.

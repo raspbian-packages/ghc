@@ -18,16 +18,17 @@ import GHC.Cmm.Dataflow.Block
 import GHC.Cmm.Dataflow.Graph
 import GHC.Cmm.Dataflow.Label
 import GHC.Cmm.Dataflow.Collections
+import Data.Functor.Classes (liftEq)
 import Data.Maybe (mapMaybe)
 import qualified Data.List as List
 import Data.Word
 import qualified Data.Map as M
-import GHC.Utils.Outputable
-import GHC.Utils.Panic
 import qualified GHC.Data.TrieMap as TM
 import GHC.Types.Unique.FM
 import GHC.Types.Unique
 import Control.Arrow (first, second)
+import Data.List.NonEmpty (NonEmpty (..))
+import qualified Data.List.NonEmpty as NE
 
 -- -----------------------------------------------------------------------------
 -- Eliminate common blocks
@@ -81,7 +82,7 @@ iterate subst blocks
     | mapNull new_substs = subst
     | otherwise = iterate subst' updated_blocks
   where
-    grouped_blocks :: [[(Key, [DistinctBlocks])]]
+    grouped_blocks :: [[(Key, NonEmpty DistinctBlocks)]]
     grouped_blocks = map groupByLabel blocks
 
     merged_blocks :: [[(Key, DistinctBlocks)]]
@@ -106,9 +107,8 @@ mergeBlocks subst existing new = go new
         -- This block is not a duplicate, keep it.
         Nothing -> second (b:) $ go bs
 
-mergeBlockList :: Subst -> [DistinctBlocks] -> (Subst, DistinctBlocks)
-mergeBlockList _ [] = pprPanic "mergeBlockList" empty
-mergeBlockList subst (b:bs) = go mapEmpty b bs
+mergeBlockList :: Subst -> NonEmpty DistinctBlocks -> (Subst, DistinctBlocks)
+mergeBlockList subst (b:|bs) = go mapEmpty b bs
   where
     go !new_subst1 b [] = (new_subst1, b)
     go !new_subst1 b1 (b2:bs) = go new_subst b bs
@@ -214,7 +214,7 @@ eqMiddleWith eqBid (CmmStore l1 r1 _) (CmmStore l2 r2 _)
   = eqExprWith eqBid l1 l2 && eqExprWith eqBid r1 r2
 eqMiddleWith eqBid (CmmUnsafeForeignCall t1 r1 a1)
                    (CmmUnsafeForeignCall t2 r2 a2)
-  = t1 == t2 && r1 == r2 && eqListWith (eqExprWith eqBid) a1 a2
+  = t1 == t2 && r1 == r2 && liftEq (eqExprWith eqBid) a1 a2
 eqMiddleWith _ _ _ = False
 
 eqExprWith :: (BlockId -> BlockId -> Bool)
@@ -225,11 +225,9 @@ eqExprWith eqBid = eq
   CmmLoad e1 t1 a1   `eq` CmmLoad e2 t2 a2   = t1 `cmmEqType` t2 && e1 `eq` e2 && a1==a2
   CmmReg r1          `eq` CmmReg r2          = r1==r2
   CmmRegOff r1 i1    `eq` CmmRegOff r2 i2    = r1==r2 && i1==i2
-  CmmMachOp op1 es1  `eq` CmmMachOp op2 es2  = op1==op2 && es1 `eqs` es2
+  CmmMachOp op1 es1  `eq` CmmMachOp op2 es2  = op1==op2 && liftEq eq es1 es2
   CmmStackSlot a1 i1 `eq` CmmStackSlot a2 i2 = eqArea a1 a2 && i1==i2
   _e1                `eq` _e2                = False
-
-  xs `eqs` ys = eqListWith eq xs ys
 
   eqLit (CmmBlock id1) (CmmBlock id2) = eqBid id1 id2
   eqLit l1 l2 = l1 == l2
@@ -252,7 +250,7 @@ eqBlockBodyWith eqBid block block'
         (_,m',l') = blockSplit block'
         nodes'    = filter (not . dont_care) (blockToList m')
 
-        equal = eqListWith (eqMiddleWith eqBid) nodes nodes' &&
+        equal = liftEq (eqMiddleWith eqBid) nodes nodes' &&
                 eqLastWith eqBid l l'
 
 
@@ -261,20 +259,10 @@ eqLastWith eqBid (CmmBranch bid1) (CmmBranch bid2) = eqBid bid1 bid2
 eqLastWith eqBid (CmmCondBranch c1 t1 f1 l1) (CmmCondBranch c2 t2 f2 l2) =
   c1 == c2 && l1 == l2 && eqBid t1 t2 && eqBid f1 f2
 eqLastWith eqBid (CmmCall t1 c1 g1 a1 r1 u1) (CmmCall t2 c2 g2 a2 r2 u2) =
-  t1 == t2 && eqMaybeWith eqBid c1 c2 && a1 == a2 && r1 == r2 && u1 == u2 && g1 == g2
+  t1 == t2 && liftEq eqBid c1 c2 && a1 == a2 && r1 == r2 && u1 == u2 && g1 == g2
 eqLastWith eqBid (CmmSwitch e1 ids1) (CmmSwitch e2 ids2) =
   e1 == e2 && eqSwitchTargetWith eqBid ids1 ids2
 eqLastWith _ _ _ = False
-
-eqMaybeWith :: (a -> b -> Bool) -> Maybe a -> Maybe b -> Bool
-eqMaybeWith eltEq (Just e) (Just e') = eltEq e e'
-eqMaybeWith _ Nothing Nothing = True
-eqMaybeWith _ _ _ = False
-
-eqListWith :: (a -> b -> Bool) -> [a] -> [b] -> Bool
-eqListWith f (a : as) (b : bs) = f a b && eqListWith f as bs
-eqListWith _ []       []       = True
-eqListWith _ _        _        = False
 
 -- | Given a block map, ensure that all "target" blocks are covered by
 -- the same ticks as the respective "source" blocks. This not only
@@ -301,15 +289,15 @@ copyTicks env g
 
 -- Group by [Label]
 -- See Note [Compressed TrieMap] in GHC.Core.Map.Expr about the usage of GenMap.
-groupByLabel :: [(Key, DistinctBlocks)] -> [(Key, [DistinctBlocks])]
+groupByLabel :: [(Key, DistinctBlocks)] -> [(Key, NonEmpty DistinctBlocks)]
 groupByLabel =
-  go (TM.emptyTM :: TM.ListMap (TM.GenMap LabelMap) (Key, [DistinctBlocks]))
+  go (TM.emptyTM :: TM.ListMap (TM.GenMap LabelMap) (Key, NonEmpty DistinctBlocks))
     where
       go !m [] = TM.foldTM (:) m []
       go !m ((k,v) : entries) = go (TM.alterTM k adjust m) entries
         where --k' = map (getKey . getUnique) k
-              adjust Nothing       = Just (k,[v])
-              adjust (Just (_,vs)) = Just (k,v:vs)
+              adjust Nothing       = Just (k, pure v)
+              adjust (Just (_,vs)) = Just (k, v NE.<| vs)
 
 groupByInt :: (a -> Int) -> [a] -> [[a]]
 groupByInt f xs = nonDetEltsUFM $ List.foldl' go emptyUFM xs

@@ -17,7 +17,7 @@ GHC.Prim        Has no implementation.  It defines built-in things, and
                 copied to make GHC.Prim.hi
 
 GHC.Base        Classes: Eq, Ord, Functor, Monad
-                Types:   list, (), Int, Bool, Ordering, Char, String
+                Types:   List, (), Int, Bool, Ordering, Char, String
 
 Data.Tuple      Types: tuples, plus instances for GHC.Base classes
 
@@ -65,6 +65,8 @@ Other Prelude modules are much easier with fewer complex dependencies.
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE DataKinds #-}
+{-# LANGUAGE EmptyCase #-}
+{-# LANGUAGE EmptyDataDeriving #-}
 {-# LANGUAGE ExistentialQuantification #-}
 {-# LANGUAGE MagicHash #-}
 {-# LANGUAGE NoImplicitPrelude #-}
@@ -122,7 +124,7 @@ import GHC.Err
 import GHC.Maybe
 import {-# SOURCE #-} GHC.IO (mkUserError, mplusIO)
 
-import GHC.Tuple (Solo (..))     -- Note [Depend on GHC.Tuple]
+import GHC.Tuple (Solo (MkSolo)) -- Note [Depend on GHC.Tuple]
 import GHC.Num.Integer ()        -- Note [Depend on GHC.Num.Integer]
 
 -- for 'class Semigroup'
@@ -162,10 +164,6 @@ resulting in:
   Failed to load interface for ‘GHC.Num.Integer’
     There are files missing in the ‘ghc-bignum’ package,
 
-Note that this is only a problem with the make-based build system. Hadrian
-doesn't interleave compilation of modules from separate packages and respects
-the dependency between `base` and `ghc-bignum`.
-
 To ensure that GHC.Num.Integer is there, we must ensure that there is a visible
 dependency on GHC.Num.Integer from every module in base.  We make GHC.Base
 depend on GHC.Num.Integer; and everything else either depends on GHC.Base,
@@ -203,6 +201,37 @@ build = errorWithoutStackTrace "urk"
 foldr = errorWithoutStackTrace "urk"
 #endif
 
+-- | Uninhabited data type
+--
+-- @since 4.8.0.0
+data Void deriving
+  ( Eq      -- ^ @since 4.8.0.0
+  , Ord     -- ^ @since 4.8.0.0
+  )
+
+-- | Since 'Void' values logically don't exist, this witnesses the
+-- logical reasoning tool of \"ex falso quodlibet\".
+--
+-- >>> let x :: Either Void Int; x = Right 5
+-- >>> :{
+-- case x of
+--     Right r -> r
+--     Left l  -> absurd l
+-- :}
+-- 5
+--
+-- @since 4.8.0.0
+absurd :: Void -> a
+absurd a = case a of {}
+
+-- | If 'Void' is uninhabited then any 'Functor' that holds only
+-- values of type 'Void' is holding no values.
+-- It is implemented in terms of @fmap absurd@.
+--
+-- @since 4.8.0.0
+vacuous :: Functor f => f Void -> f a
+vacuous = fmap absurd
+
 infixr 6 <>
 
 -- | The class of semigroups (types with an associative binary operation).
@@ -211,22 +240,48 @@ infixr 6 <>
 --
 -- [Associativity] @x '<>' (y '<>' z) = (x '<>' y) '<>' z@
 --
+-- You can alternatively define `sconcat` instead of (`<>`), in which case the
+-- laws are:
+--
+-- [Unit]: @'sconcat' ('pure' x) = x@
+-- [Multiplication]: @'sconcat' ('join' xss) = 'sconcat' ('fmap' 'sconcat' xss)@
+--
 -- @since 4.9.0.0
 class Semigroup a where
         -- | An associative operation.
         --
+        -- ==== __Examples__
+        --
         -- >>> [1,2,3] <> [4,5,6]
         -- [1,2,3,4,5,6]
+        --
+        -- >>> Just [1, 2, 3] <> Just [4, 5, 6]
+        -- Just [1,2,3,4,5,6]
+        --
+        -- >>> putStr "Hello, " <> putStrLn "World!"
+        -- Hello, World!
         (<>) :: a -> a -> a
+        a <> b = sconcat (a :| [ b ])
 
         -- | Reduce a non-empty list with '<>'
         --
         -- The default definition should be sufficient, but this can be
         -- overridden for efficiency.
         --
+        -- ==== __Examples__
+        --
+        -- For the following examples, we will assume that we have:
+        --
         -- >>> import Data.List.NonEmpty (NonEmpty (..))
+        --
         -- >>> sconcat $ "Hello" :| [" ", "Haskell", "!"]
         -- "Hello Haskell!"
+        --
+        -- >>> sconcat $ Just [1, 2, 3] :| [Nothing, Just [4, 5, 6]]
+        -- Just [1,2,3,4,5,6]
+        --
+        -- >>> sconcat $ Left 1 :| [Right 2, Left 3, Right 4]
+        -- Right 2
         sconcat :: NonEmpty a -> a
         sconcat (a :| as) = go a as where
           go b (c:cs) = b <> go c cs
@@ -234,19 +289,29 @@ class Semigroup a where
 
         -- | Repeat a value @n@ times.
         --
-        -- Given that this works on a 'Semigroup' it is allowed to fail if
-        -- you request 0 or fewer repetitions, and the default definition
-        -- will do so.
+        -- The default definition will raise an exception for a multiplier that is @<= 0@.
+        -- This may be overridden with an implementation that is total. For monoids
+        -- it is preferred to use 'stimesMonoid'.
         --
         -- By making this a member of the class, idempotent semigroups
         -- and monoids can upgrade this to execute in \(\mathcal{O}(1)\) by
         -- picking @stimes = 'Data.Semigroup.stimesIdempotent'@ or @stimes =
-        -- 'stimesIdempotentMonoid'@ respectively.
+        -- 'Data.Semigroup.stimesIdempotentMonoid'@ respectively.
+        --
+        -- ==== __Examples__
         --
         -- >>> stimes 4 [1]
         -- [1,1,1,1]
+        --
+        -- >>> stimes 5 (putStr "hi!")
+        -- hi!hi!hi!hi!hi!
+        --
+        -- >>> stimes 3 (Right ":)")
+        -- Right ":)"
         stimes :: Integral b => b -> a -> a
         stimes = stimesDefault
+
+        {-# MINIMAL (<>) | sconcat #-}
 
 
 -- | The class of monoids (types with an associative binary operation that
@@ -256,6 +321,13 @@ class Semigroup a where
 -- [Left identity]  @'mempty' '<>' x = x@
 -- [Associativity]  @x '<>' (y '<>' z) = (x '<>' y) '<>' z@ ('Semigroup' law)
 -- [Concatenation]  @'mconcat' = 'foldr' ('<>') 'mempty'@
+--
+-- You can alternatively define `mconcat` instead of `mempty`, in which case the
+-- laws are:
+--
+-- [Unit]: @'mconcat' ('pure' x) = x@
+-- [Multiplication]: @'mconcat' ('join' xss) = 'mconcat' ('fmap' 'mconcat' xss)@
+-- [Subclass]: @'mconcat' ('toList' xs) = 'sconcat' xs@
 --
 -- The method names refer to the monoid of lists under concatenation,
 -- but there are many other instances.
@@ -269,9 +341,15 @@ class Semigroup a where
 class Semigroup a => Monoid a where
         -- | Identity of 'mappend'
         --
+        -- ==== __Examples__
         -- >>> "Hello world" <> mempty
         -- "Hello world"
-        mempty  :: a
+        --
+        -- >>> mempty <> [1, 2, 3]
+        -- [1,2,3]
+        mempty :: a
+        mempty = mconcat []
+        {-# INLINE mempty #-}
 
         -- | An associative operation
         --
@@ -297,6 +375,8 @@ class Semigroup a => Monoid a where
         {-# INLINE mconcat #-}
         -- INLINE in the hope of fusion with mconcat's argument (see !4890)
 
+        {-# MINIMAL mempty | mconcat #-}
+
 -- | @since 4.9.0.0
 instance Semigroup [a] where
         (<>) = (++)
@@ -311,6 +391,11 @@ instance Monoid [a] where
         {-# INLINE mconcat #-}
         mconcat xss = [x | xs <- xss, x <- xs]
 -- See Note: [List comprehensions and inlining]
+
+-- | @since 4.9.0.0
+instance Semigroup Void where
+    a <> _ = a
+    stimes _ a = a
 
 {-
 Note: [List comprehensions and inlining]
@@ -363,12 +448,12 @@ instance Monoid () where
 
 -- | @since 4.15
 instance Semigroup a => Semigroup (Solo a) where
-  Solo a <> Solo b = Solo (a <> b)
-  stimes n (Solo a) = Solo (stimes n a)
+  MkSolo a <> MkSolo b = MkSolo (a <> b)
+  stimes n (MkSolo a) = MkSolo (stimes n a)
 
 -- | @since 4.15
 instance Monoid a => Monoid (Solo a) where
-  mempty = Solo mempty
+  mempty = MkSolo mempty
 
 -- | @since 4.9.0.0
 instance (Semigroup a, Semigroup b) => Semigroup (a, b) where
@@ -446,17 +531,17 @@ instance Semigroup a => Monoid (Maybe a) where
 
 -- | @since 4.15
 instance Applicative Solo where
-  pure = Solo
+  pure = MkSolo
 
   -- Note: we really want to match strictly here. This lets us write,
   -- for example,
   --
   -- forceSpine :: Foldable f => f a -> ()
   -- forceSpine xs
-  --   | Solo r <- traverse_ Solo xs
+  --   | MkSolo r <- traverse_ MkSolo xs
   --   = r
-  Solo f <*> Solo x = Solo (f x)
-  liftA2 f (Solo x) (Solo y) = Solo (f x y)
+  MkSolo f <*> MkSolo x = MkSolo (f x)
+  liftA2 f (MkSolo x) (MkSolo y) = MkSolo (f x y)
 
 -- | For tuples, the 'Monoid' constraint on @a@ determines
 -- how the first values merge.
@@ -473,7 +558,7 @@ instance Monoid a => Applicative ((,) a) where
 
 -- | @since 4.15
 instance Monad Solo where
-  Solo x >>= f = f x
+  MkSolo x >>= f = f x
 
 -- | @since 4.9.0.0
 instance Monoid a => Monad ((,) a) where
@@ -504,6 +589,18 @@ instance (Monoid a, Monoid b, Monoid c) => Applicative ((,,,) a b c) where
 -- | @since 4.14.0.0
 instance (Monoid a, Monoid b, Monoid c) => Monad ((,,,) a b c) where
     (u, v, w, a) >>= k = case k a of (u', v', w', b) -> (u <> u', v <> v', w <> w', b)
+
+-- | @since 4.18.0.0
+instance Functor ((,,,,) a b c d) where
+    fmap f (a, b, c, d, e) = (a, b, c, d, f e)
+
+-- | @since 4.18.0.0
+instance Functor ((,,,,,) a b c d e) where
+    fmap fun (a, b, c, d, e, f) = (a, b, c, d, e, fun f)
+
+-- | @since 4.18.0.0
+instance Functor ((,,,,,,) a b c d e f) where
+    fmap fun (a, b, c, d, e, f, g) = (a, b, c, d, e, f, fun g)
 
 -- | @since 4.10.0.0
 instance Semigroup a => Semigroup (IO a) where
@@ -583,6 +680,15 @@ class Functor f where
     -- The default definition is @'fmap' . 'const'@, but this may be
     -- overridden with a more efficient version.
     --
+    -- ==== __Examples__
+    --
+    -- Perform a computation with 'Maybe' and replace the result with a
+    -- constant value if it is 'Just':
+    --
+    -- >>> 'a' <$ Just 2
+    -- Just 'a'
+    -- >>> 'a' <$ Nothing
+    -- Nothing
     (<$)        :: a -> f b -> f a
     (<$)        =  fmap . const
 
@@ -739,10 +845,9 @@ class Functor f => Applicative f where
 
 -- | Lift a function to actions.
 -- Equivalent to Functor's `fmap` but implemented using only `Applicative`'s methods:
--- `liftA f a = pure f <*> a`
+-- @'liftA' f a = 'pure' f '<*>' a@
 --
 -- As such this function may be used to implement a `Functor` instance from an `Applicative` one.
-
 --
 -- ==== __Examples__
 -- Using the Applicative instance for Lists:
@@ -1026,12 +1131,12 @@ instance Monad ((->) r) where
 
 -- | @since 4.15
 instance Functor Solo where
-  fmap f (Solo a) = Solo (f a)
+  fmap f (MkSolo a) = MkSolo (f a)
 
   -- Being strict in the `Solo` argument here seems most consistent
   -- with the concept behind `Solo`: always strict in the wrapper and lazy
   -- in the contents.
-  x <$ Solo _ = Solo x
+  x <$ MkSolo _ = MkSolo x
 
 -- | @since 2.01
 instance Functor ((,) a) where
@@ -1096,7 +1201,9 @@ class Applicative f => Alternative f where
         some_v = liftA2 (:) v many_v
 
 
--- | @since 2.01
+-- | Picks the leftmost 'Just' value, or, alternatively, 'Nothing'.
+--
+-- @since 2.01
 instance Alternative Maybe where
     empty = Nothing
     Nothing <|> r = r
@@ -1128,7 +1235,9 @@ class (Alternative m, Monad m) => MonadPlus m where
    mplus :: m a -> m a -> m a
    mplus = (<|>)
 
--- | @since 2.01
+-- | Picks the leftmost 'Just' value, or, alternatively, 'Nothing'.
+--
+-- @since 2.01
 instance MonadPlus Maybe
 
 ---------------------------------------------
@@ -1190,12 +1299,16 @@ instance Monad []  where
     {-# INLINE (>>) #-}
     (>>) = (*>)
 
--- | @since 2.01
+-- | Combines lists by concatenation, starting from the empty list.
+--
+-- @since 2.01
 instance Alternative [] where
     empty = []
     (<|>) = (++)
 
--- | @since 2.01
+-- | Combines lists by concatenation, starting from the empty list.
+--
+-- @since 2.01
 instance MonadPlus []
 
 {-
@@ -1271,7 +1384,7 @@ augment g xs = g (:) xs
         -- when we disable the rule that expands (++) into foldr
 
 -- The foldr/cons rule looks nice, but it can give disastrously
--- bloated code when commpiling
+-- bloated code when compiling
 --      array (a,b) [(1,2), (2,2), (3,2), ...very long list... ]
 -- i.e. when there are very very long literal lists
 -- So I've disabled it for now. We could have special cases
@@ -1411,10 +1524,42 @@ otherwise               =  True
 -- Type Char and String
 ----------------------------------------------
 
--- | A 'String' is a list of characters.  String constants in Haskell are values
--- of type 'String'.
+-- | 'String' is an alias for a list of characters.
 --
--- See "Data.List" for operations on lists.
+-- String constants in Haskell are values of type 'String'.
+-- That means if you write a string literal like @"hello world"@,
+-- it will have the type @[Char]@, which is the same as @String@.
+--
+-- __Note:__ You can ask the compiler to automatically infer different types
+-- with the @-XOverloadedStrings@ language extension, for example
+--  @"hello world" :: Text@. See t'Data.String.IsString' for more information.
+--
+-- Because @String@ is just a list of characters, you can use normal list functions
+-- to do basic string manipulation. See "Data.List" for operations on lists.
+--
+-- === __Performance considerations__
+--
+-- @[Char]@ is a relatively memory-inefficient type.
+-- It is a linked list of boxed word-size characters, internally it looks something like:
+--
+-- > ╭─────┬───┬──╮  ╭─────┬───┬──╮  ╭─────┬───┬──╮  ╭────╮
+-- > │ (:) │   │ ─┼─>│ (:) │   │ ─┼─>│ (:) │   │ ─┼─>│ [] │
+-- > ╰─────┴─┼─┴──╯  ╰─────┴─┼─┴──╯  ╰─────┴─┼─┴──╯  ╰────╯
+-- >         v               v               v
+-- >        'a'             'b'             'c'
+--
+-- The @String@ "abc" will use @5*3+1 = 16@ (in general @5n+1@)
+-- words of space in memory.
+--
+-- Furthermore, operations like '(++)' (string concatenation) are @O(n)@
+-- (in the left argument).
+--
+-- For historical reasons, the @base@ library uses @String@ in a lot of places
+-- for the conceptual simplicity, but library code dealing with user-data
+-- should use the [text](https://hackage.haskell.org/package/text)
+-- package for Unicode text, or the the
+-- [bytestring](https://hackage.haskell.org/package/bytestring) package
+-- for binary data.
 type String = [Char]
 
 unsafeChr :: Int -> Char
@@ -1578,12 +1723,18 @@ instance  Monad IO  where
     (>>)      = (*>)
     (>>=)     = bindIO
 
--- | @since 4.9.0.0
+-- | Takes the first non-throwing 'IO' action\'s result.
+-- 'empty' throws an exception.
+--
+-- @since 4.9.0.0
 instance Alternative IO where
     empty = failIO "mzero"
     (<|>) = mplusIO
 
--- | @since 4.9.0.0
+-- | Takes the first non-throwing 'IO' action\'s result.
+-- 'mzero' throws an exception.
+--
+-- @since 4.9.0.0
 instance MonadPlus IO
 
 returnIO :: a -> IO a

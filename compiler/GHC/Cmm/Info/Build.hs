@@ -1,6 +1,6 @@
 {-# LANGUAGE GADTs, BangPatterns, RecordWildCards,
     GeneralizedNewtypeDeriving, NondecreasingIndentation, TupleSections,
-    ScopedTypeVariables, OverloadedStrings, LambdaCase #-}
+    ScopedTypeVariables, OverloadedStrings, LambdaCase, EmptyCase #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE StandaloneDeriving #-}
@@ -113,55 +113,70 @@ The following things have SRTs:
 - Static thunks (THUNK), ie. CAFs
 - Continuations (RET_SMALL, etc.)
 
-In each case, the info table points to the SRT.  There are three ways which we
-may encode the location of the SRT in the info table, described below.
+In each case, the info table points to the SRT, if there is one.
+
+- info->srt is 0 if there's no SRT
+- otherwise, there are three ways which we may encode the location of the SRT in
+  the info table, described below.
+
+USE_SRT_POINTER
+---------------
+Most general implementation. Can always be used, but other ways are more efficient.
+
+- info->srt is a pointer
+
+We encode an **absolute pointer** to the SRT in info->srt. e.g. for a FUN
+with an SRT:
+
+StgInfoTable          +------+
+  info->layout.ptrs   | ...  |
+  info->layout.nptrs  | ...  |
+  info->srt           |  ------------> pointer to SRT object
+  info->type          | ...  |
+                      |------|
 
 USE_SRT_OFFSET
 --------------
-In this case we use the info->srt to encode whether or not there is an
-SRT and if so encode the offset to its location in info->f.srt_offset:
+Requires:
+  - tables-next-to-code enabled
 
+In this case we use the info->srt to encode whether or not there is an SRT and
+if so encode the offset to its location in info->f.srt_offset:
+
+- info->srt is a half-word
+- info->f.srt_offset is a 32-bit int
 - info->srt is 0 if there's no SRT, otherwise,
-- info->srt == 1 and info->f.srt_offset points to the SRT
+- info->srt == 1 and info->f.srt_offset is a offset to the SRT, relative to the
+field address itself
 
 e.g. for a FUN with an SRT:
 
 StgFunInfoTable       +------+
   info->f.srt_offset  |  ------------> offset to SRT object
-StgStdInfoTable       +------+
+StgInfoTable          +------+
   info->layout.ptrs   | ...  |
   info->layout.nptrs  | ...  |
   info->srt           |  1   |
   info->type          | ...  |
                       |------|
 
-USE_SRT_POINTER
----------------
-When tables-next-to-code isn't in use we rather encode an absolute pointer to
-the SRT in info->srt. e.g. for a FUN with an SRT:
-
-StgFunInfoTable       +------+
-  info->f.srt_offset  |  ------------> pointer to SRT object
-StgStdInfoTable       +------+
-  info->layout.ptrs   | ...  |
-  info->layout.nptrs  | ...  |
-  info->srt           |  1   |
-  info->type          | ...  |
-                      |------|
 USE_INLINE_SRT_FIELD
 --------------------
-When using TNTC on x86_64 (and other platforms using the small memory model),
-we optimise the info table representation further.  The offset to the SRT can
+Requires:
+  - tables-next-to-code enabled
+  - 64-bit architecture
+  - small memory model
+
+We optimise the info table representation further.  The offset to the SRT can
 be stored in 32 bits (all code lives within a 2GB region in x86_64's small
 memory model), so we can save a word in the info table by storing the
 srt_offset in the srt field, which is half a word.
 
-On x86_64 with TABLES_NEXT_TO_CODE (except on MachO, due to #15169):
-
-- info->srt is zero if there's no SRT, otherwise:
+- info->srt is a half-word
+- info->srt is 0 if there's no SRT, otherwise:
 - info->srt is an offset from the info pointer to the SRT object
 
-StgStdInfoTable       +------+
+StgInfoTable          +------+
   info->layout.ptrs   |      |
   info->layout.nptrs  |      |
   info->srt           |  ------------> offset to SRT object
@@ -561,7 +576,7 @@ cafAnalData
   -> CAFSet
 cafAnalData platform st = case st of
    CmmStaticsRaw _lbl _data           -> Set.empty
-   CmmStatics _lbl _itbl _ccs payload ->
+   CmmStatics _lbl _itbl _ccs payload _extras ->
        foldl' analyzeStatic Set.empty payload
      where
        analyzeStatic s lit =
@@ -726,7 +741,9 @@ getBlockLabels = mapMaybe getBlockLabel
 getLabelledBlocks :: Platform -> CmmDecl -> [(SomeLabel, CAFfyLabel)]
 getLabelledBlocks platform decl = case decl of
    CmmData _ (CmmStaticsRaw _ _)    -> []
-   CmmData _ (CmmStatics lbl _ _ _) -> [ (DeclLabel lbl, mkCAFfyLabel platform lbl) ]
+   CmmData _ (CmmStatics lbl info _ _ _) -> [ (DeclLabel lbl, mkCAFfyLabel platform lbl)
+                                            | not (isThunkRep (cit_rep info))
+                                            ]
    CmmProc top_info _ _ _           -> [ (BlockLabel blockId, caf_lbl)
                                        | (blockId, info) <- mapToList (info_tbls top_info)
                                        , let rep = cit_rep info
@@ -771,28 +788,48 @@ depAnalSRTs platform cafEnv cafEnv_static decls =
   graph :: [SCC (SomeLabel, CAFfyLabel, Set CAFfyLabel)]
   graph = stronglyConnCompFromEdgedVerticesOrd nodes
 
--- | Get @(Label, CAFfyLabel, Set CAFfyLabel)@ for each CAF block.
--- The @Set CafLabel@ represents the set of CAFfy things which this CAF's code
+-- | Get @(Maybe Label, CAFfyLabel, Set CAFfyLabel)@ for each CAF block.
+-- The @Set CAFfyLabel@ represents the set of CAFfy things which this CAF's code
 -- depends upon.
 --
--- CAFs are treated differently from other labelled blocks:
+--  - The 'Label' represents the entry code of the closure. This may be
+--    'Nothing' if it is a standard closure type (e.g. @stg_unpack_cstring@; see
+--    Note [unpack_cstring closures] in StgStdThunks.cmm).
+--  - The 'CAFLabel' is the label of the CAF closure.
+--  - The @Set CAFLabel@ is the set of CAFfy closures which should be included
+--    in the closure's SRT.
+--
+-- Note that CAFs are treated differently from other labelled blocks:
 --
 --  - we never shortcut a reference to a CAF to the contents of its
 --    SRT, since the point of SRTs is to keep CAFs alive.
 --
 --  - CAFs therefore don't take part in the dependency analysis in depAnalSRTs.
 --    instead we generate their SRTs after everything else.
---
-getCAFs :: Platform -> CAFEnv -> [CmmDecl] -> [(Label, CAFfyLabel, Set CAFfyLabel)]
-getCAFs platform cafEnv decls =
-  [ (g_entry g, mkCAFfyLabel platform topLbl, cafs)
-  | CmmProc top_info topLbl _ g <- decls
-  , Just info <- [mapLookup (g_entry g) (info_tbls top_info)]
-  , let rep = cit_rep info
-  , isStaticRep rep && isThunkRep rep
-  , Just cafs <- [mapLookup (g_entry g) cafEnv]
-  ]
+getCAFs :: Platform -> CAFEnv -> [CmmDecl] -> [(Maybe Label, CAFfyLabel, Set CAFfyLabel)]
+getCAFs platform cafEnv = mapMaybe getCAFLabel
+  where
+    getCAFLabel :: CmmDecl -> Maybe (Maybe Label, CAFfyLabel, Set CAFfyLabel)
 
+    getCAFLabel (CmmProc top_info top_lbl _ g)
+      | Just info <- mapLookup (g_entry g) (info_tbls top_info)
+      , let rep = cit_rep info
+      , isStaticRep rep && isThunkRep rep
+      , Just cafs <- mapLookup (g_entry g) cafEnv
+      = Just (Just (g_entry g), mkCAFfyLabel platform top_lbl, cafs)
+
+      | otherwise
+      = Nothing
+
+    getCAFLabel (CmmData _ (CmmStatics top_lbl info _ccs _payload _extras))
+      | isThunkRep (cit_rep info)
+      = Just (Nothing, mkCAFfyLabel platform top_lbl, Set.empty)
+
+      | otherwise
+      = Nothing
+
+    getCAFLabel (CmmData _ (CmmStaticsRaw _lbl _payload))
+      = Nothing
 
 -- | Get the list of blocks that correspond to the entry points for
 -- @FUN_STATIC@ closures.  These are the blocks for which if we have an
@@ -847,7 +884,7 @@ doSRTs
   :: CmmConfig
   -> ModuleSRTInfo
   -> [(CAFEnv, [CmmDecl])]   -- ^ 'CAFEnv's and 'CmmDecl's for code blocks
-  -> [(CAFSet, CmmDecl)]     -- ^ static data decls and their 'CAFSet's
+  -> [(CAFSet, CmmDataDecl)]     -- ^ static data decls and their 'CAFSet's
   -> IO (ModuleSRTInfo, [CmmDeclSRTs])
 
 doSRTs cfg moduleSRTInfo procs data_ = do
@@ -863,16 +900,15 @@ doSRTs cfg moduleSRTInfo procs data_ = do
         flip map data_ $
         \(set, decl) ->
           case decl of
-            CmmProc{} ->
-              pprPanic "doSRTs" (text "Proc in static data list:" <+> pdoc platform decl)
+            CmmProc void _ _ _ -> case void of
             CmmData _ static ->
               case static of
-                CmmStatics lbl _ _ _ -> (lbl, set)
+                CmmStatics lbl _ _ _ _ -> (lbl, set)
                 CmmStaticsRaw lbl _ -> (lbl, set)
 
       (proc_envs, procss) = unzip procs
       cafEnv = mapUnions proc_envs
-      decls = map snd data_ ++ concat procss
+      decls = map (cmmDataDeclCmmDecl . snd) data_ ++ concat procss
       staticFuns = mapFromList (getStaticFuns decls)
 
       platform = cmmPlatform cfg
@@ -887,7 +923,7 @@ doSRTs cfg moduleSRTInfo procs data_ = do
     sccs :: [SCC (SomeLabel, CAFfyLabel, Set CAFfyLabel)]
     sccs = {-# SCC depAnalSRTs #-} depAnalSRTs platform cafEnv static_data_env decls
 
-    cafsWithSRTs :: [(Label, CAFfyLabel, Set CAFfyLabel)]
+    cafsWithSRTs :: [(Maybe Label, CAFfyLabel, Set CAFfyLabel)]
     cafsWithSRTs = getCAFs platform cafEnv decls
 
   srtTraceM "doSRTs" (text "data:"            <+> pdoc platform data_ $$
@@ -910,7 +946,7 @@ doSRTs cfg moduleSRTInfo procs data_ = do
         flip runStateT moduleSRTInfo $ do
           nonCAFs <- mapM (doSCC cfg staticFuns static_data_env) sccs
           cAFs <- forM cafsWithSRTs $ \(l, cafLbl, cafs) ->
-            oneSRT cfg staticFuns [BlockLabel l] [cafLbl]
+            oneSRT cfg staticFuns (map BlockLabel (maybeToList l)) [cafLbl]
                    True{-is a CAF-} cafs static_data_env
           return (nonCAFs ++ cAFs)
 
@@ -943,8 +979,7 @@ doSRTs cfg moduleSRTInfo procs data_ = do
                       | otherwise ->
                           -- Not an IdLabel, ignore
                           srtMap
-                    CmmProc{} ->
-                      pprPanic "doSRTs" (text "Found Proc in static data list:" <+> pdoc platform decl))
+                    CmmProc void _ _ _ -> case void of)
                (moduleSRTMap moduleSRTInfo') data_
 
   return (moduleSRTInfo'{ moduleSRTMap = srtMap_w_raws }, srt_decls ++ decls')
@@ -1137,7 +1172,8 @@ oneSRT cfg staticFuns lbls caf_lbls isCAF cafs static_data_env = do
           not (labelDynamic this_mod platform (cmmExternalDynamicRefs cfg) lbl)
 
           -- MachO relocations can't express offsets between compilation units at
-          -- all, so we are always forced to build a singleton SRT in this case.
+          -- all, so we are always forced to build a singleton SRT in this case
+          -- (cf #15169)
             && (not (osMachOTarget $ platformOS $ profilePlatform profile)
                || isLocalCLabel this_mod lbl) -> do
 
@@ -1205,15 +1241,15 @@ buildSRTChain
         ( [CmmDeclSRTs] -- The SRT object(s)
         , SRTEntry      -- label to use in the info table
         )
-buildSRTChain _ [] = panic "buildSRT: empty"
 buildSRTChain profile cafSet =
   case splitAt mAX_SRT_SIZE cafSet of
+    ([], _) -> panic "buildSRT: empty"
     (these, []) -> do
       (decl,lbl) <- buildSRT profile these
       return ([decl], lbl)
-    (these,those) -> do
-      (rest, rest_lbl) <- buildSRTChain profile (head these : those)
-      (decl,lbl) <- buildSRT profile (rest_lbl : tail these)
+    (this:these,those) -> do
+      (rest, rest_lbl) <- buildSRTChain profile (this : those)
+      (decl,lbl) <- buildSRT profile (rest_lbl : these)
       return (decl:rest, lbl)
   where
     mAX_SRT_SIZE = 16
@@ -1232,6 +1268,7 @@ buildSRT profile refs = do
         [] -- no padding
         [mkIntCLit platform 0] -- link field
         [] -- no saved info
+        [] -- no extras
   return (mkDataLits (Section Data lbl) lbl fields, SRTEntry lbl)
 
 -- | Update info tables with references to their SRTs. Also generate
@@ -1247,10 +1284,10 @@ updInfoSRTs
 updInfoSRTs _ _ _ _ (CmmData s (CmmStaticsRaw lbl statics))
   = [CmmData s (CmmStaticsRaw lbl statics)]
 
-updInfoSRTs profile _ _ caffy (CmmData s (CmmStatics lbl itbl ccs payload))
+updInfoSRTs profile _ _ caffy (CmmData s (CmmStatics lbl itbl ccs payload extras))
   = [CmmData s (CmmStaticsRaw lbl (map CmmStaticLit field_lits))]
   where
-    field_lits = mkStaticClosureFields profile itbl ccs caffy payload
+    field_lits = mkStaticClosureFields profile itbl ccs caffy payload extras
 
 updInfoSRTs profile srt_env funSRTEnv caffy (CmmProc top_info top_l live g)
   | Just (_,closure) <- maybeStaticClosure = [ proc, closure ]
@@ -1280,7 +1317,7 @@ updInfoSRTs profile srt_env funSRTEnv caffy (CmmProc top_info top_l live g)
             Just srtEntries -> srtTrace "maybeStaticFun" (pdoc (profilePlatform profile) res)
               (info_tbl { cit_rep = new_rep }, res)
               where res = [ CmmLabel lbl | SRTEntry lbl <- srtEntries ]
-          fields = mkStaticClosureFields profile info_tbl ccs caffy srtEntries
+          fields = mkStaticClosureFields profile info_tbl ccs caffy srtEntries []
           new_rep = case cit_rep of
              HeapRep sta ptrs nptrs ty ->
                HeapRep sta (ptrs + length srtEntries) nptrs ty

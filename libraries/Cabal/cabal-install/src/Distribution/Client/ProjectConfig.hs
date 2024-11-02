@@ -31,6 +31,7 @@ module Distribution.Client.ProjectConfig (
     readProjectLocalFreezeConfig,
     reportParseResult,
     showProjectConfig,
+    withGlobalConfig,
     withProjectOrGlobalConfig,
     writeProjectLocalExtraConfig,
     writeProjectLocalFreezeConfig,
@@ -119,7 +120,7 @@ import Distribution.Simple.InstallDirs
          ( PathTemplate, fromPathTemplate
          , toPathTemplate, substPathTemplate, initialPathTemplateEnv )
 import Distribution.Simple.Utils
-         ( die', warn, notice, info, createDirectoryIfMissingVerbose, rawSystemIOWithEnv )
+         ( die', warn, notice, info, createDirectoryIfMissingVerbose, maybeExit, rawSystemIOWithEnv )
 import Distribution.Client.Utils
          ( determineNumJobs )
 import Distribution.Utils.NubList
@@ -254,6 +255,7 @@ resolveSolverSettings ProjectConfig{
     solverSettingIndexState        = flagToMaybe projectConfigIndexState
     solverSettingActiveRepos       = flagToMaybe projectConfigActiveRepos
     solverSettingIndependentGoals  = fromFlag projectConfigIndependentGoals
+    solverSettingPreferOldest      = fromFlag projectConfigPreferOldest
   --solverSettingShadowPkgs        = fromFlag projectConfigShadowPkgs
   --solverSettingReinstall         = fromFlag projectConfigReinstall
   --solverSettingAvoidReinstalls   = fromFlag projectConfigAvoidReinstalls
@@ -274,7 +276,8 @@ resolveSolverSettings ProjectConfig{
        projectConfigStrongFlags       = Flag (StrongFlags False),
        projectConfigAllowBootLibInstalls = Flag (AllowBootLibInstalls False),
        projectConfigOnlyConstrained   = Flag OnlyConstrainedNone,
-       projectConfigIndependentGoals  = Flag (IndependentGoals False)
+       projectConfigIndependentGoals  = Flag (IndependentGoals False),
+       projectConfigPreferOldest      = Flag (PreferOldest False)
      --projectConfigShadowPkgs        = Flag False,
      --projectConfigReinstall         = Flag False,
      --projectConfigAvoidReinstalls   = Flag False,
@@ -460,12 +463,21 @@ renderBadProjectRoot :: BadProjectRoot -> String
 renderBadProjectRoot (BadProjectRootExplicitFile projectFile) =
     "The given project file '" ++ projectFile ++ "' does not exist."
 
+withGlobalConfig
+    :: Verbosity                  -- ^ verbosity
+    -> Flag FilePath              -- ^ @--cabal-config@
+    -> (ProjectConfig -> IO a)    -- ^ with global
+    -> IO a
+withGlobalConfig verbosity gcf with = do
+    globalConfig <- runRebuild "" $ readGlobalConfig verbosity gcf
+    with globalConfig
+
 withProjectOrGlobalConfig
     :: Verbosity                  -- ^ verbosity
     -> Flag Bool                  -- ^ whether to ignore local project (--ignore-project flag)
     -> Flag FilePath              -- ^ @--cabal-config@
     -> IO a                       -- ^ with project
-    -> (ProjectConfig -> IO a)    -- ^ without projet
+    -> (ProjectConfig -> IO a)    -- ^ without project
     -> IO a
 withProjectOrGlobalConfig verbosity (Flag True) gcf _with without = do
     globalConfig <- runRebuild "" $ readGlobalConfig verbosity gcf
@@ -620,7 +632,7 @@ writeProjectConfigFile file =
     writeFile file . showProjectConfig
 
 
--- | Read the user's @~/.cabal/config@ file.
+-- | Read the user's cabal-install config file.
 --
 readGlobalConfig :: Verbosity -> Flag FilePath -> Rebuild ProjectConfig
 readGlobalConfig verbosity configFileFlag = do
@@ -1137,11 +1149,10 @@ syncAndReadSourcePackagesRemoteRepos verbosity
                             [ ((rtype, rloc), [(repo, vcsRepoType vcs)])
                             | (repo, rloc, rtype, vcs) <- repos' ]
 
-    --TODO: pass progPathExtra on to 'configureVCS'
-    let _progPathExtra = fromNubList projectConfigProgPathExtra
+    let progPathExtra = fromNubList projectConfigProgPathExtra
     getConfiguredVCS <- delayInitSharedResources $ \repoType ->
                           let vcs = Map.findWithDefault (error $ "Unknown VCS: " ++ prettyShow repoType) repoType knownVCSs in
-                          configureVCS verbosity {-progPathExtra-} vcs
+                          configureVCS verbosity progPathExtra vcs
 
     concat <$> sequenceA
       [ rerunIfChanged verbosity monitor repoGroup' $ do
@@ -1175,8 +1186,7 @@ syncAndReadSourcePackagesRemoteRepos verbosity
         -- Run post-checkout-command if it is specified
         for_ repoGroupWithPaths $ \(repo, _, repoPath) ->
             for_ (nonEmpty (srpCommand repo)) $ \(cmd :| args) -> liftIO $ do
-                exitCode <- rawSystemIOWithEnv verbosity cmd args (Just repoPath) Nothing Nothing Nothing Nothing
-                unless (exitCode == ExitSuccess) $ exitWith exitCode
+                maybeExit $ rawSystemIOWithEnv verbosity cmd args (Just repoPath) Nothing Nothing Nothing Nothing
 
         -- But for reading we go through each 'SourceRepo' including its subdir
         -- value and have to know which path each one ended up in.

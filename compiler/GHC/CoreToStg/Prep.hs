@@ -1,4 +1,3 @@
-
 {-# LANGUAGE BangPatterns #-}
 
 {-# OPTIONS_GHC -Wno-incomplete-uni-patterns #-}
@@ -11,7 +10,9 @@ Core pass to saturate constructors and PrimOps
 -}
 
 module GHC.CoreToStg.Prep
-   ( corePrepPgm
+   ( CorePrepConfig (..)
+   , CorePrepPgmConfig (..)
+   , corePrepPgm
    , corePrepExpr
    , mkConvertNumLiteral
    )
@@ -21,9 +22,7 @@ import GHC.Prelude
 
 import GHC.Platform
 
-import GHC.Driver.Session
-import GHC.Driver.Env
-import GHC.Driver.Ppr
+import GHC.Driver.Flags
 
 import GHC.Tc.Utils.Env
 import GHC.Unit
@@ -33,9 +32,7 @@ import GHC.Builtin.Types
 
 import GHC.Core.Utils
 import GHC.Core.Opt.Arity
-import GHC.Core.FVs
-import GHC.Core.Opt.Monad ( CoreToDo(..) )
-import GHC.Core.Lint    ( endPassIO )
+import GHC.Core.Lint    ( EndPassConfig(..), endPassIO )
 import GHC.Core
 import GHC.Core.Make hiding( FloatBind(..) )   -- We use our own FloatBind here
 import GHC.Core.Type
@@ -58,17 +55,15 @@ import GHC.Utils.Panic.Plain
 import GHC.Utils.Outputable
 import GHC.Utils.Monad  ( mapAccumLM )
 import GHC.Utils.Logger
-import GHC.Utils.Trace
 
 import GHC.Types.Demand
 import GHC.Types.Var
-import GHC.Types.Var.Set
 import GHC.Types.Var.Env
 import GHC.Types.Id
 import GHC.Types.Id.Info
 import GHC.Types.Id.Make ( realWorldPrimId )
 import GHC.Types.Basic
-import GHC.Types.Name   ( NamedThing(..), nameSrcSpan, isInternalName )
+import GHC.Types.Name   ( Name, NamedThing(..), nameSrcSpan, isInternalName )
 import GHC.Types.SrcLoc ( SrcSpan(..), realSrcLocSpan, mkRealSrcLoc )
 import GHC.Types.Literal
 import GHC.Types.Tickish
@@ -117,6 +112,17 @@ The goal of this pass is to prepare for code generation.
     and doing so would be tiresome because then we'd need
     to substitute in types and coercions.
 
+    We need to clone ids for two reasons:
+    + Things associated with labels in the final code must be truly unique in
+      order to avoid labels being shadowed in the final output.
+    + Even binders without info tables like function arguments or alternative
+      bound binders must be unique at least in their type/unique combination.
+      We only emit a single declaration for each binder when compiling to C
+      so if binders are not unique we would either get duplicate declarations
+      or misstyped variables. The later happend in #22402.
+    + We heavily use unique-keyed maps in the backend which can go wrong when
+      ids with the same unique are meant to represent the same variable.
+
 7.  Give each dynamic CCall occurrence a fresh unique; this is
     rather like the cloning step above.
 
@@ -126,26 +132,24 @@ The goal of this pass is to prepare for code generation.
     We want curried definitions for all of these in case they
     aren't inlined by some caller.
 
-9.  Replace (lazy e) by e.  See Note [lazyId magic] in GHC.Types.Id.Make
-    Also replace (noinline e) by e.
+ 9. Convert bignum literals into their core representation.
 
-10. Convert bignum literals into their core representation.
-
-11. Uphold tick consistency while doing this: We move ticks out of
+10. Uphold tick consistency while doing this: We move ticks out of
     (non-type) applications where we can, and make sure that we
     annotate according to scoping rules when floating.
 
-12. Collect cost centres (including cost centres in unfoldings) if we're in
-    profiling mode. We have to do this here beucase we won't have unfoldings
+11. Collect cost centres (including cost centres in unfoldings) if we're in
+    profiling mode. We have to do this here because we won't have unfoldings
     after this pass (see `trimUnfolding` and Note [Drop unfoldings and rules].
 
-13. Eliminate case clutter in favour of unsafe coercions.
+12. Eliminate case clutter in favour of unsafe coercions.
     See Note [Unsafe coercions]
 
-14. Eliminate some magic Ids, specifically
+13. Eliminate some magic Ids, specifically
      runRW# (\s. e)  ==>  e[readWorldId/s]
-             lazy e  ==>  e
+             lazy e  ==>  e (see Note [lazyId magic] in GHC.Types.Id.Make)
          noinline e  ==>  e
+           nospec e  ==>  e
      ToDo:  keepAlive# ...
     This is done in cpeApp
 
@@ -185,7 +189,7 @@ CorePrep does these two transformations:
    Tiresome, but not difficult.
 
 These transformations get rid of "case clutter", leaving only casts.
-We are doing no further significant tranformations, so the reasons
+We are doing no further significant transformations, so the reasons
 for the case forms have disappeared. And it is extremely helpful for
 the ANF-ery, CoreToStg, and backends, if trivial expressions really do
 look trivial. #19700 was an example.
@@ -234,17 +238,28 @@ type CpeRhs  = CoreExpr    -- Non-terminal 'rhs'
 ************************************************************************
 -}
 
-corePrepPgm :: HscEnv -> Module -> ModLocation -> CoreProgram -> [TyCon]
+data CorePrepPgmConfig = CorePrepPgmConfig
+  { cpPgm_endPassConfig     :: !EndPassConfig
+  , cpPgm_generateDebugInfo :: !Bool
+  }
+
+corePrepPgm :: Logger
+            -> CorePrepConfig
+            -> CorePrepPgmConfig
+            -> Module -> ModLocation -> CoreProgram -> [TyCon]
             -> IO CoreProgram
-corePrepPgm hsc_env this_mod mod_loc binds data_tycons =
+corePrepPgm logger cp_cfg pgm_cfg
+            this_mod mod_loc binds data_tycons =
     withTiming logger
                (text "CorePrep"<+>brackets (ppr this_mod))
                (\a -> a `seqList` ()) $ do
     us <- mkSplitUniqSupply 's'
-    initialCorePrepEnv <- mkInitialCorePrepEnv hsc_env
+    let initialCorePrepEnv = mkInitialCorePrepEnv cp_cfg
 
     let
-        implicit_binds = mkDataConWorkers dflags mod_loc data_tycons
+        implicit_binds = mkDataConWorkers
+          (cpPgm_generateDebugInfo pgm_cfg)
+          mod_loc data_tycons
             -- NB: we must feed mkImplicitBinds through corePrep too
             -- so that they are suitably cloned and eta-expanded
 
@@ -253,18 +268,15 @@ corePrepPgm hsc_env this_mod mod_loc binds data_tycons =
                       floats2 <- corePrepTopBinds initialCorePrepEnv implicit_binds
                       return (deFloatTop (floats1 `appendFloats` floats2))
 
-    endPassIO hsc_env alwaysQualify CorePrep binds_out []
+    endPassIO logger (cpPgm_endPassConfig pgm_cfg)
+              binds_out []
     return binds_out
-  where
-    dflags = hsc_dflags hsc_env
-    logger = hsc_logger hsc_env
 
-corePrepExpr :: HscEnv -> CoreExpr -> IO CoreExpr
-corePrepExpr hsc_env expr = do
-    let logger = hsc_logger hsc_env
+corePrepExpr :: Logger -> CorePrepConfig -> CoreExpr -> IO CoreExpr
+corePrepExpr logger config expr = do
     withTiming logger (text "CorePrep [expr]") (\e -> e `seq` ()) $ do
       us <- mkSplitUniqSupply 's'
-      initialCorePrepEnv <- mkInitialCorePrepEnv hsc_env
+      let initialCorePrepEnv = mkInitialCorePrepEnv config
       let new_expr = initUs_ us (cpeBodyNF initialCorePrepEnv expr)
       putDumpFileMaybe logger Opt_D_dump_prep "CorePrep" FormatCore (ppr new_expr)
       return new_expr
@@ -283,10 +295,10 @@ corePrepTopBinds initialCorePrepEnv binds
                                floatss <- go env' binds
                                return (floats `appendFloats` floatss)
 
-mkDataConWorkers :: DynFlags -> ModLocation -> [TyCon] -> [CoreBind]
+mkDataConWorkers :: Bool -> ModLocation -> [TyCon] -> [CoreBind]
 -- See Note [Data constructor workers]
 -- c.f. Note [Injecting implicit bindings] in GHC.Iface.Tidy
-mkDataConWorkers dflags mod_loc data_tycons
+mkDataConWorkers generate_debug_info mod_loc data_tycons
   = [ NonRec id (tick_it (getName data_con) (Var id))
                                 -- The ice is thin here, but it works
     | tycon <- data_tycons,     -- CorePrep will eta-expand it
@@ -297,11 +309,12 @@ mkDataConWorkers dflags mod_loc data_tycons
    -- If we want to generate debug info, we put a source note on the
    -- worker. This is useful, especially for heap profiling.
    tick_it name
-     | not (needSourceNotes dflags)           = id
+     | not generate_debug_info               = id
      | RealSrcSpan span _ <- nameSrcSpan name = tick span
      | Just file <- ml_hs_file mod_loc       = tick (span1 file)
      | otherwise                             = tick (span1 "???")
-     where tick span  = Tick (SourceNote span $ showSDoc dflags (ppr name))
+     where tick span  = Tick $ SourceNote span $
+             renderWithContext defaultSDocContext $ ppr name
            span1 file = realSrcLocSpan $ mkRealSrcLoc (mkFastString file) 1 1
 
 {-
@@ -777,12 +790,12 @@ cpeRhsE env (Type ty)
 cpeRhsE env (Coercion co)
   = return (emptyFloats, Coercion (cpSubstCo env co))
 cpeRhsE env expr@(Lit (LitNumber nt i))
-   = case cpe_convertNumLit env nt i of
+   = case cp_convertNumLit (cpe_config env) nt i of
       Nothing -> return (emptyFloats, expr)
       Just e  -> cpeRhsE env e
 cpeRhsE _env expr@(Lit {}) = return (emptyFloats, expr)
 cpeRhsE env expr@(Var {})  = cpeApp env expr
-cpeRhsE env expr@(App {}) = cpeApp env expr
+cpeRhsE env expr@(App {})  = cpeApp env expr
 
 cpeRhsE env (Let bind body)
   = do { (env', bind_floats, maybe_bind') <- cpeBind NotTopLevel env bind
@@ -793,7 +806,7 @@ cpeRhsE env (Let bind body)
 
 cpeRhsE env (Tick tickish expr)
   -- Pull out ticks if they are allowed to be floated.
-  | floatableTick tickish
+  | tickishFloatable tickish
   = do { (floats, body) <- cpeRhsE env expr
          -- See [Floating Ticks in CorePrep]
        ; return (unitFloat (FloatTick tickish) `appendFloats` floats, body) }
@@ -851,18 +864,11 @@ cpeRhsE env (Case scrut bndr ty alts)
   = do { (floats, scrut') <- cpeBody env scrut
        ; (env', bndr2) <- cpCloneBndr env bndr
        ; let alts'
-                 -- This flag is intended to aid in debugging strictness
-                 -- analysis bugs. These are particularly nasty to chase down as
-                 -- they may manifest as segmentation faults. When this flag is
-                 -- enabled we instead produce an 'error' expression to catch
-                 -- the case where a function we think should bottom
-                 -- unexpectedly returns.
-               | gopt Opt_CatchNonexhaustiveCases (cpe_dynFlags env)
+               | cp_catchNonexhaustiveCases $ cpe_config env
                , not (altsAreExhaustive alts)
                = addDefault alts (Just err)
                | otherwise = alts
-               where err = mkRuntimeErrorApp rUNTIME_ERROR_ID ty
-                                             "Bottoming expression returned"
+               where err = mkImpossibleExpr ty "cpeRhsE: missing case alternative"
        ; alts'' <- mapM (sat_alt env') alts'
 
        ; return (floats, Case scrut' bndr2 ty alts'') }
@@ -917,9 +923,7 @@ rhsToBody (Cast e co)
   = do { (floats, e') <- rhsToBody e
        ; return (floats, Cast e' co) }
 
-rhsToBody expr@(Lam {})
-  | Just no_lam_result <- tryEtaReducePrep bndrs body
-  = return (emptyFloats, no_lam_result)
+rhsToBody expr@(Lam {})   -- See Note [No eta reduction needed in rhsToBody]
   | all isTyVar bndrs           -- Type lambdas are ok
   = return (emptyFloats, expr)
   | otherwise                   -- Some value lambdas
@@ -928,11 +932,29 @@ rhsToBody expr@(Lam {})
        ; let float = FloatLet (NonRec fn rhs)
        ; return (unitFloat float, Var fn) }
   where
-    (bndrs,body) = collectBinders expr
+    (bndrs,_) = collectBinders expr
 
 rhsToBody expr = return (emptyFloats, expr)
 
 
+{- Note [No eta reduction needed in rhsToBody]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Historical note.  In the olden days we used to have a Prep-specific
+eta-reduction step in rhsToBody:
+  rhsToBody expr@(Lam {})
+    | Just no_lam_result <- tryEtaReducePrep bndrs body
+    = return (emptyFloats, no_lam_result)
+
+The goal was to reduce
+        case x of { p -> \xs. map f xs }
+    ==> case x of { p -> map f }
+
+to avoid allocating a lambda.  Of course, we'd allocate a PAP
+instead, which is hardly better, but that's the way it was.
+
+Now we simply don't bother with this. It doesn't seem to be a win,
+and it's extra work.
+-}
 
 -- ---------------------------------------------------------------------------
 --              CpeApp: produces a result satisfying CpeApp
@@ -1013,10 +1035,12 @@ cpeApp top_env expr
             -- Profiling ticks are slightly less strict so we expand their scope
             -- if they cover partial applications of things like primOps.
             -- See Note [Ticks and mandatory eta expansion]
-            | floatableTick tickish || isProfTick tickish
-            , Var vh <- head
+            -- Here we look inside `fun` before we make the final decision about
+            -- floating the tick which isn't optimal for perf. But this only makes
+            -- a difference if we have a non-floatable tick which is somewhat rare.
+            | Var vh <- head
             , Var head' <- lookupCorePrepEnv top_env vh
-            , hasNoBinding head'
+            , etaExpansionTick head' tickish
             = (head,as')
             where
               (head,as') = go fun (CpeTick tickish : as)
@@ -1032,8 +1056,11 @@ cpeApp top_env expr
     cpe_app env (Var f) (CpeApp Type{} : CpeApp arg : args)
         | f `hasKey` lazyIdKey          -- Replace (lazy a) with a, and
             -- See Note [lazyId magic] in GHC.Types.Id.Make
-       || f `hasKey` noinlineIdKey      -- Replace (noinline a) with a
+       || f `hasKey` noinlineIdKey || f `hasKey` noinlineConstraintIdKey
+            -- Replace (noinline a) with a
             -- See Note [noinlineId magic] in GHC.Types.Id.Make
+       || f `hasKey` nospecIdKey        -- Replace (nospec a) with a
+            -- See Note [nospecId magic] in GHC.Types.Id.Make
 
         -- Consider the code:
         --
@@ -1118,7 +1145,7 @@ cpeApp top_env expr
           case info of
             CpeCast {} -> go infos n
             CpeTick tickish
-              | floatableTick tickish                 -> go infos n
+              | tickishFloatable tickish                 -> go infos n
               -- If we can't guarantee a tick will be floated out of the application
               -- we can't guarantee the value args following it will be applied.
               | otherwise                             -> n
@@ -1183,12 +1210,9 @@ cpeApp top_env expr
           arg_ty' = cpSubstTy env arg_ty
 
       CpeApp (Coercion co)
-        -> rebuild_app' env as (App fun' (Coercion co')) floats ss' rt_ticks req_depth
+        -> rebuild_app' env as (App fun' (Coercion co')) floats (drop 1 ss) rt_ticks req_depth
         where
             co' = cpSubstCo env co
-            ss'
-              | null ss = []
-              | otherwise = tail ss
 
       CpeApp arg -> do
         let (ss1, ss_rest)  -- See Note [lazyId magic] in GHC.Types.Id.Make
@@ -1564,7 +1588,7 @@ the simplifier only when there at least one lambda already.
 
 NB1:we could refrain when the RHS is trivial (which can happen
     for exported things).  This would reduce the amount of code
-    generated (a little) and make things a little words for
+    generated (a little) and make things a little worse for
     code compiled without -O.  The case in point is data constructor
     wrappers.
 
@@ -1596,56 +1620,6 @@ cpeEtaExpand :: Arity -> CpeRhs -> CpeRhs
 cpeEtaExpand arity expr
   | arity == 0 = expr
   | otherwise  = etaExpand arity expr
-
-{-
--- -----------------------------------------------------------------------------
---      Eta reduction
--- -----------------------------------------------------------------------------
-
-Why try eta reduction?  Hasn't the simplifier already done eta?
-But the simplifier only eta reduces if that leaves something
-trivial (like f, or f Int).  But for deLam it would be enough to
-get to a partial application:
-        case x of { p -> \xs. map f xs }
-    ==> case x of { p -> map f }
--}
-
--- When updating this function, make sure it lines up with
--- GHC.Core.Utils.tryEtaReduce!
-tryEtaReducePrep :: [CoreBndr] -> CoreExpr -> Maybe CoreExpr
-tryEtaReducePrep bndrs expr@(App _ _)
-  | ok_to_eta_reduce f
-  , n_remaining >= 0
-  , and (zipWith ok bndrs last_args)
-  , not (any (`elemVarSet` fvs_remaining) bndrs)
-  , exprIsHNF remaining_expr   -- Don't turn value into a non-value
-                               -- else the behaviour with 'seq' changes
-  =
-    -- pprTrace "prep-reduce" (
-    --   text "reduced:" <> ppr remaining_expr $$
-    --   ppr (remaining_args)
-    --   ) $
-    Just remaining_expr
-  where
-    (f, args) = collectArgs expr
-    remaining_expr = mkApps f remaining_args
-    fvs_remaining = exprFreeVars remaining_expr
-    (remaining_args, last_args) = splitAt n_remaining args
-    n_remaining = length args - length bndrs
-    n_remaining_vals = length $ filter isRuntimeArg remaining_args
-
-    ok bndr (Var arg) = bndr == arg
-    ok _    _         = False
-
-    ok_to_eta_reduce (Var f) = canEtaReduceToArity f n_remaining n_remaining_vals
-    ok_to_eta_reduce _       = False -- Safe. ToDo: generalise
-
-
-tryEtaReducePrep bndrs (Tick tickish e)
-  | tickishFloatable tickish
-  = fmap (mkTick tickish) $ tryEtaReducePrep bndrs e
-
-tryEtaReducePrep _ _ = Nothing
 
 {-
 ************************************************************************
@@ -1990,8 +1964,25 @@ map to CoreExprs, not Ids.
 
 -}
 
+data CorePrepConfig = CorePrepConfig
+  { cp_catchNonexhaustiveCases :: !Bool
+  -- ^ Whether to generate a default alternative with ``error`` in these
+  -- cases. This is helpful when debugging demand analysis or type
+  -- checker bugs which can sometimes manifest as segmentation faults.
+
+  , cp_convertNumLit           :: !(LitNumType -> Integer -> Maybe CoreExpr)
+  -- ^ Convert some numeric literals (Integer, Natural) into their final
+  -- Core form.
+  }
+
 data CorePrepEnv
-  = CPE { cpe_dynFlags        :: DynFlags
+  = CPE { cpe_config          :: !CorePrepConfig
+        -- ^ This flag is intended to aid in debugging strictness
+        -- analysis bugs. These are particularly nasty to chase down as
+        -- they may manifest as segmentation faults. When this flag is
+        -- enabled we instead produce an 'error' expression to catch
+        -- the case where a function we think should bottom
+        -- unexpectedly returns.
         , cpe_env             :: IdEnv CoreExpr   -- Clone local Ids
         -- ^ This environment is used for three operations:
         --
@@ -2007,20 +1998,14 @@ data CorePrepEnv
 
         , cpe_tyco_env :: Maybe CpeTyCoEnv -- See Note [CpeTyCoEnv]
 
-        , cpe_convertNumLit   :: LitNumType -> Integer -> Maybe CoreExpr
-        -- ^ Convert some numeric literals (Integer, Natural) into their
-        -- final Core form
         , cpe_rec_ids         :: UnVarSet -- Faster OutIdSet; See Note [Speculative evaluation]
     }
 
-mkInitialCorePrepEnv :: HscEnv -> IO CorePrepEnv
-mkInitialCorePrepEnv hsc_env = do
-   convertNumLit <- mkConvertNumLiteral hsc_env
-   return $ CPE
-      { cpe_dynFlags      = hsc_dflags hsc_env
+mkInitialCorePrepEnv :: CorePrepConfig -> CorePrepEnv
+mkInitialCorePrepEnv cfg = CPE
+      { cpe_config        = cfg
       , cpe_env           = emptyVarEnv
       , cpe_tyco_env      = Nothing
-      , cpe_convertNumLit = convertNumLit
       , cpe_rec_ids       = emptyUnVarSet
       }
 
@@ -2054,7 +2039,7 @@ enterRecGroupRHSs env grp
 {- Note [CpeTyCoEnv]
 ~~~~~~~~~~~~~~~~~~~~
 The cpe_tyco_env :: Maybe CpeTyCoEnv field carries a substitution
-for type and coercion varibles
+for type and coercion variables
 
 * We need the coercion substitution to support the elimination of
   unsafeEqualityProof (see Note [Unsafe coercions])
@@ -2179,7 +2164,9 @@ cpCloneBndr env bndr
        -- Drop (now-useless) rules/unfoldings
        -- See Note [Drop unfoldings and rules]
        -- and Note [Preserve evaluatedness] in GHC.Core.Tidy
-       ; let unfolding' = trimUnfolding (realIdUnfolding bndr)
+       -- And force it.. otherwise the old unfolding is just retained.
+       -- See #22071
+       ; let !unfolding' = trimUnfolding (realIdUnfolding bndr)
                           -- Simplifier will set the Id's unfolding
 
              bndr'' = bndr' `setIdUnfolding`      unfolding'
@@ -2232,9 +2219,7 @@ fiddleCCall id
 
 newVar :: Type -> UniqSM Id
 newVar ty
- = seqType ty `seq` do
-     uniq <- getUniqueM
-     return (mkSysLocalOrCoVar (fsLit "sat") uniq Many ty)
+ = seqType ty `seq` mkSysLocalOrCoVarM (fsLit "sat") ManyTy ty
 
 
 ------------------------------------------------------------------------------
@@ -2292,24 +2277,18 @@ wrapTicks (Floats flag floats0) expr =
         wrapBind t (NonRec binder rhs) = NonRec binder (mkTick t rhs)
         wrapBind t (Rec pairs)         = Rec (mapSnd (mkTick t) pairs)
 
-floatableTick :: GenTickish pass -> Bool
-floatableTick tickish =
-    tickishPlace tickish == PlaceNonLam &&
-    tickish `tickishScopesLike` SoftScope
-
 ------------------------------------------------------------------------------
 -- Numeric literals
 -- ---------------------------------------------------------------------------
 
 -- | Create a function that converts Bignum literals into their final CoreExpr
 mkConvertNumLiteral
-   :: HscEnv
+   :: Platform
+   -> HomeUnit
+   -> (Name -> IO TyThing)
    -> IO (LitNumType -> Integer -> Maybe CoreExpr)
-mkConvertNumLiteral hsc_env = do
+mkConvertNumLiteral platform home_unit lookup_global = do
    let
-      dflags   = hsc_dflags hsc_env
-      platform = targetPlatform dflags
-      home_unit = hsc_home_unit hsc_env
       guardBignum act
          | isHomeUnitInstanceOf home_unit primUnitId
          = return $ panic "Bignum literals are not supported in ghc-prim"
@@ -2317,7 +2296,7 @@ mkConvertNumLiteral hsc_env = do
          = return $ panic "Bignum literals are not supported in ghc-bignum"
          | otherwise = act
 
-      lookupBignumId n      = guardBignum (tyThingId <$> lookupGlobal hsc_env n)
+      lookupBignumId n      = guardBignum (tyThingId <$> lookup_global n)
 
    -- The lookup is done here but the failure (panic) is reported lazily when we
    -- try to access the `bigNatFromWordList` function.
@@ -2334,8 +2313,6 @@ mkConvertNumLiteral hsc_env = do
 
       convertBignatPrim i =
          let
-            target    = targetPlatform dflags
-
             -- ByteArray# literals aren't supported (yet). Were they supported,
             -- we would use them directly. We would need to handle
             -- wordSize/endianness conversion between host and target
@@ -2351,11 +2328,10 @@ mkConvertNumLiteral hsc_env = do
                   f x = let low  = x .&. mask
                             high = x `shiftR` bits
                         in Just (mkConApp wordDataCon [Lit (mkLitWord platform low)], high)
-                  bits = platformWordSizeInBits target
+                  bits = platformWordSizeInBits platform
                   mask = 2 ^ bits - 1
 
          in mkApps (Var bignatFromWordListId) [words]
 
 
    return convertNumLit
-

@@ -9,7 +9,7 @@
 -- hooks. The compiler itself uses hooks in multithreaded code (--make) and it
 -- is also probably used by ghc-api users (IDEs, etc.).
 --
--- In addition to hooks, the Logger suppors LogFlags: basically a subset of the
+-- In addition to hooks, the Logger supports LogFlags: basically a subset of the
 -- command-line flags that control the logger behaviour at a higher level than
 -- hooks.
 --
@@ -88,19 +88,18 @@ import GHC.Utils.Panic
 import GHC.Data.EnumSet (EnumSet)
 import qualified GHC.Data.EnumSet as EnumSet
 
-import Data.IORef
 import System.Directory
 import System.FilePath  ( takeDirectory, (</>) )
-import qualified Data.Set as Set
-import Data.Set (Set)
-import Data.List (intercalate, stripPrefix)
-import qualified Data.List.NonEmpty as NE
+import qualified Data.Map.Strict as Map
+import Data.Map.Strict (Map)
+import Data.List (stripPrefix)
 import Data.Time
 import System.IO
 import Control.Monad
 import Control.Concurrent.MVar
 import System.IO.Unsafe
 import Debug.Trace (trace)
+import GHC.Platform.Ways
 
 ---------------------------------------------------------------
 -- Log flags
@@ -118,8 +117,10 @@ data LogFlags = LogFlags
   , log_dump_dir             :: !(Maybe FilePath)   -- ^ Dump directory
   , log_dump_prefix          :: !FilePath           -- ^ Normal dump path ("basename.")
   , log_dump_prefix_override :: !(Maybe FilePath)   -- ^ Overriden dump path
+  , log_with_ways            :: !Bool               -- ^ Use different dump files names for different ways
   , log_enable_debug         :: !Bool               -- ^ Enable debug output
   , log_verbosity            :: !Int                -- ^ Verbosity level
+  , log_ways                 :: !(Maybe Ways)         -- ^ Current ways (to name dump files)
   }
 
 -- | Default LogFlags
@@ -135,13 +136,15 @@ defaultLogFlags = LogFlags
   , log_dump_dir             = Nothing
   , log_dump_prefix          = ""
   , log_dump_prefix_override = Nothing
+  , log_with_ways           = True
   , log_enable_debug         = False
   , log_verbosity            = 0
+  , log_ways                 = Nothing
   }
 
 -- | Test if a DumpFlag is enabled
 log_dopt :: DumpFlag -> LogFlags -> Bool
-log_dopt f logflags = f `EnumSet.member` log_dump_flags logflags
+log_dopt = getDumpFlagFrom log_verbosity log_dump_flags
 
 -- | Enable a DumpFlag
 log_set_dopt :: DumpFlag -> LogFlags -> LogFlags
@@ -198,10 +201,14 @@ data DumpFormat
    | FormatASM       -- ^ Assembly code
    | FormatC         -- ^ C code/header
    | FormatLLVM      -- ^ LLVM bytecode
+   | FormatJS        -- ^ JavaScript code
    | FormatText      -- ^ Unstructured dump
    deriving (Show,Eq)
 
-type DumpCache = IORef (Set FilePath)
+-- | A set of the dump files to which we have written thusfar. Each dump file
+-- has a corresponding MVar to ensure that a dump file has at most one active
+-- writer at a time, avoiding interleaved output.
+type DumpCache = MVar (Map FilePath (MVar ()))
 
 data Logger = Logger
     { log_hook   :: [LogAction -> LogAction]
@@ -239,7 +246,7 @@ defaultTraceFlush = hFlush stderr
 
 initLogger :: IO Logger
 initLogger = do
-    dumps <- newIORef Set.empty
+    dumps <- newMVar Map.empty
     return $ Logger
         { log_hook        = []
         , dump_hook       = []
@@ -323,11 +330,11 @@ makeThreadSafe logger = do
 -- See Note [JSON Error Messages]
 --
 jsonLogAction :: LogAction
-jsonLogAction _ (MCDiagnostic SevIgnore _) _ _ = return () -- suppress the message
+jsonLogAction _ (MCDiagnostic SevIgnore _ _) _ _ = return () -- suppress the message
 jsonLogAction logflags msg_class srcSpan msg
   =
     defaultLogActionHPutStrDoc logflags True stdout
-      (withPprStyle (PprCode CStyle) (doc $$ text ""))
+      (withPprStyle PprCode (doc $$ text ""))
     where
       str = renderWithContext (log_default_user_context logflags) msg
       doc = renderJSON $
@@ -340,21 +347,21 @@ defaultLogAction :: LogAction
 defaultLogAction logflags msg_class srcSpan msg
   | log_dopt Opt_D_dump_json logflags = jsonLogAction logflags msg_class srcSpan msg
   | otherwise = case msg_class of
-      MCOutput                 -> printOut msg
-      MCDump                   -> printOut (msg $$ blankLine)
-      MCInteractive            -> putStrSDoc msg
-      MCInfo                   -> printErrs msg
-      MCFatal                  -> printErrs msg
-      MCDiagnostic SevIgnore _ -> pure () -- suppress the message
-      MCDiagnostic sev rea     -> printDiagnostics sev rea
+      MCOutput                     -> printOut msg
+      MCDump                       -> printOut (msg $$ blankLine)
+      MCInteractive                -> putStrSDoc msg
+      MCInfo                       -> printErrs msg
+      MCFatal                      -> printErrs msg
+      MCDiagnostic SevIgnore _ _   -> pure () -- suppress the message
+      MCDiagnostic _sev _rea _code -> printDiagnostics
     where
       printOut   = defaultLogActionHPrintDoc  logflags False stdout
       printErrs  = defaultLogActionHPrintDoc  logflags False stderr
       putStrSDoc = defaultLogActionHPutStrDoc logflags False stdout
       -- Pretty print the warning flag, if any (#10752)
-      message sev rea = mkLocMessageAnn (flagMsg sev rea) msg_class srcSpan msg
+      message = mkLocMessageWarningGroups (log_show_warn_groups logflags) msg_class srcSpan msg
 
-      printDiagnostics severity reason = do
+      printDiagnostics = do
         hPutChar stderr '\n'
         caretDiagnostic <-
             if log_show_caret logflags
@@ -362,34 +369,11 @@ defaultLogAction logflags msg_class srcSpan msg
             else pure empty
         printErrs $ getPprStyle $ \style ->
           withPprStyle (setStyleColoured True style)
-            (message severity reason $+$ caretDiagnostic)
+            (message $+$ caretDiagnostic)
         -- careful (#2302): printErrs prints in UTF-8,
         -- whereas converting to string first and using
         -- hPutStr would just emit the low 8 bits of
         -- each unicode char.
-
-      flagMsg :: Severity -> DiagnosticReason -> Maybe String
-      flagMsg SevIgnore _                 =  panic "Called flagMsg with SevIgnore"
-      flagMsg SevError WarningWithoutFlag =  Just "-Werror"
-      flagMsg SevError (WarningWithFlag wflag) = do
-        let name = NE.head (warnFlagNames wflag)
-        return $
-          "-W" ++ name ++ warnFlagGrp wflag ++
-          ", -Werror=" ++ name
-      flagMsg SevError ErrorWithoutFlag = Nothing
-      flagMsg SevWarning WarningWithoutFlag = Nothing
-      flagMsg SevWarning (WarningWithFlag wflag) = do
-        let name = NE.head (warnFlagNames wflag)
-        return ("-W" ++ name ++ warnFlagGrp wflag)
-      flagMsg SevWarning ErrorWithoutFlag =
-        panic "SevWarning with ErrorWithoutFlag"
-
-      warnFlagGrp flag
-          | log_show_warn_groups logflags =
-                case smallestWarningGroups flag of
-                    [] -> ""
-                    groups -> " (in " ++ intercalate ", " (map ("-W"++) groups) ++ ")"
-          | otherwise = ""
 
 -- | Like 'defaultLogActionHPutStrDoc' but appends an extra newline.
 defaultLogActionHPrintDoc :: LogFlags -> Bool -> Handle -> SDoc -> IO ()
@@ -428,7 +412,7 @@ defaultDumpAction dumps log_action logflags sty flag title _fmt doc =
 -- | Write out a dump.
 --
 -- If --dump-to-file is set then this goes to a file.
--- otherwise emit to stdout (via the the LogAction parameter).
+-- otherwise emit to stdout (via the LogAction parameter).
 --
 -- When @hdr@ is empty, we print in a more compact format (no separators and
 -- blank lines)
@@ -462,16 +446,24 @@ dumpSDocWithStyle dumps log_action sty logflags flag hdr doc =
 -- file, otherwise 'Nothing'.
 withDumpFileHandle :: DumpCache -> LogFlags -> DumpFlag -> (Maybe Handle -> IO ()) -> IO ()
 withDumpFileHandle dumps logflags flag action = do
-    let mFile = chooseDumpFile logflags flag
+    let dump_ways = log_ways logflags
+    let mFile = chooseDumpFile logflags dump_ways flag
     case mFile of
       Just fileName -> do
-        gd <- readIORef dumps
-        let append = Set.member fileName gd
-            mode = if append then AppendMode else WriteMode
-        unless append $
-            writeIORef dumps (Set.insert fileName gd)
-        createDirectoryIfMissing True (takeDirectory fileName)
-        withFile fileName mode $ \handle -> do
+        lock <- modifyMVar dumps $ \gd ->
+            case Map.lookup fileName gd of
+              Nothing -> do
+                  lock <- newMVar ()
+                  let gd' = Map.insert fileName lock gd
+                  -- ensure that file exists so we can append to it
+                  createDirectoryIfMissing True (takeDirectory fileName)
+                  writeFile fileName ""
+                  return (gd', lock)
+              Just lock -> do
+                  return (gd, lock)
+
+        let withLock k = withMVar lock $ \() -> k >> return ()
+        withLock $ withFile fileName AppendMode $ \handle -> do
             -- We do not want the dump file to be affected by
             -- environment variables, but instead to always use
             -- UTF8. See:
@@ -482,14 +474,20 @@ withDumpFileHandle dumps logflags flag action = do
       Nothing -> action Nothing
 
 -- | Choose where to put a dump file based on LogFlags and DumpFlag
-chooseDumpFile :: LogFlags -> DumpFlag -> Maybe FilePath
-chooseDumpFile logflags flag
+chooseDumpFile :: LogFlags -> Maybe Ways -> DumpFlag -> Maybe FilePath
+chooseDumpFile logflags ways flag
     | log_dump_to_file logflags || forced_to_file
-    = Just $ setDir (getPrefix ++ dump_suffix)
+    = Just $ setDir (getPrefix ++ way_infix ++ dump_suffix)
 
     | otherwise
     = Nothing
   where
+    way_infix = case ways of
+      _ | not (log_with_ways logflags) -> ""
+      Nothing -> ""
+      Just ws
+        | null ws || null (waysTag ws) -> ""
+        | otherwise -> waysTag ws ++ "."
     (forced_to_file, dump_suffix) = case flag of
         -- -dth-dec-file dumps expansions of TH
         -- splices into MODULE.th.hs even when
@@ -565,29 +563,29 @@ putDumpFileMaybe logger = putDumpFileMaybe' logger alwaysQualify
 
 -- | Dump if the given DumpFlag is set
 --
--- Unlike 'putDumpFileMaybe', has a PrintUnqualified argument
+-- Unlike 'putDumpFileMaybe', has a NamePprCtx argument
 putDumpFileMaybe'
     :: Logger
-    -> PrintUnqualified
+    -> NamePprCtx
     -> DumpFlag
     -> String
     -> DumpFormat
     -> SDoc
     -> IO ()
-putDumpFileMaybe' logger printer flag hdr fmt doc
+putDumpFileMaybe' logger name_ppr_ctx flag hdr fmt doc
   = when (logHasDumpFlag logger flag) $
-    logDumpFile' logger printer flag hdr fmt doc
+    logDumpFile' logger name_ppr_ctx flag hdr fmt doc
 {-# INLINE putDumpFileMaybe' #-}  -- see Note [INLINE conditional tracing utilities]
 
 
-logDumpFile' :: Logger -> PrintUnqualified -> DumpFlag
+logDumpFile' :: Logger -> NamePprCtx -> DumpFlag
              -> String -> DumpFormat -> SDoc -> IO ()
 {-# NOINLINE logDumpFile' #-}
 -- NOINLINE: Now we are past the conditional, into the "cold" path,
 --           don't inline, to reduce code size at the call site
 -- See Note [INLINE conditional tracing utilities]
-logDumpFile' logger printer flag hdr fmt doc
-  = logDumpFile logger (mkDumpStyle printer) flag hdr fmt doc
+logDumpFile' logger name_ppr_ctx flag hdr fmt doc
+  = logDumpFile logger (mkDumpStyle name_ppr_ctx) flag hdr fmt doc
 
 -- | Ensure that a dump file is created even if it stays empty
 touchDumpFile :: Logger -> DumpFlag -> IO ()

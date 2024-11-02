@@ -27,7 +27,6 @@ module Distribution.Client.Init.NonInteractive.Heuristics
   ) where
 
 import Distribution.Client.Compat.Prelude hiding (readFile, (<|>), many)
-import Distribution.Utils.Generic (safeLast)
 
 import Distribution.Simple.Setup (fromFlagOrDefault)
 
@@ -40,7 +39,7 @@ import System.FilePath
 import Distribution.CabalSpecVersion
 import Language.Haskell.Extension
 import Distribution.Version
-import Distribution.Types.PackageName (PackageName, mkPackageName)
+import Distribution.Types.PackageName (PackageName)
 import Distribution.Simple.Compiler
 import qualified Data.Set as Set
 import Distribution.FieldGrammar.Newtypes
@@ -82,24 +81,7 @@ guessLanguage _ = return defaultLanguage
 
 -- | Guess the package name based on the given root directory.
 guessPackageName :: Interactive m => FilePath -> m PackageName
-guessPackageName = fmap (mkPackageName . repair . fromMaybe "" . safeLast . splitDirectories)
-                 . canonicalizePathNoThrow
-  where
-    -- Treat each span of non-alphanumeric characters as a hyphen. Each
-    -- hyphenated component of a package name must contain at least one
-    -- alphabetic character. An arbitrary character ('x') will be prepended if
-    -- this is not the case for the first component, and subsequent components
-    -- will simply be run together. For example, "1+2_foo-3" will become
-    -- "x12-foo3".
-    repair = repair' ('x' :) id
-    repair' invalid valid x = case dropWhile (not . isAlphaNum) x of
-        "" -> repairComponent ""
-        x' -> let (c, r) = first repairComponent $ span isAlphaNum x'
-              in c ++ repairRest r
-      where
-        repairComponent c | all isDigit c = invalid c
-                          | otherwise     = valid c
-    repairRest = repair' id ('-' :)
+guessPackageName = filePathToPkgName
 
 -- | Try to guess the license from an already existing @LICENSE@ file in
 --   the package directory, comparing the file contents with the ones
@@ -125,7 +107,7 @@ guessPackageType :: Interactive m => InitFlags -> m PackageType
 guessPackageType flags = do
   if fromFlagOrDefault False (initializeTestSuite flags)
     then
-      return TestSuite 
+      return TestSuite
     else do
       let lastDir dirs   = L.last . splitDirectories $ dirs
           srcCandidates  = [defaultSourceDir, "src", "source"]
@@ -169,18 +151,23 @@ guessSourceDirectories flags = do
     True  -> ["src"]
 
 -- | Guess author and email using git configuration options.
-guessAuthorName :: Interactive m => m String
+guessAuthorName :: Interactive m => m (Maybe String)
 guessAuthorName = guessGitInfo "user.name"
 
-guessAuthorEmail :: Interactive m => m String
+guessAuthorEmail :: Interactive m => m (Maybe String)
 guessAuthorEmail = guessGitInfo "user.email"
 
-guessGitInfo :: Interactive m => String -> m String
+guessGitInfo :: Interactive m => String -> m (Maybe String)
 guessGitInfo target = do
-  info <- readProcessWithExitCode "git" ["config", "--local", target] ""
-  if null $ snd' info
-    then trim . snd' <$> readProcessWithExitCode "git" ["config", "--global", target] ""
-    else return . trim $ snd' info
+  localInfo <- readProcessWithExitCode "git" ["config", "--local", target] ""
+  if null $ snd' localInfo
+    then do
+      globalInfo <- readProcessWithExitCode "git" ["config", "--global", target] ""
+      case fst' globalInfo of
+        ExitSuccess -> return $  Just (trim $ snd' globalInfo)
+        _           -> return Nothing
+    else return $  Just (trim $ snd' localInfo)
 
   where
+    fst' (x, _, _) = x
     snd' (_, x, _) = x

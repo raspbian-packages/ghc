@@ -13,39 +13,9 @@ packages: cabal-benchmarks/
 
 optional-packages: ./vendored/*/*.cabal
 
-allow-newer:
-  hackage-security:Cabal
-
 -- avoiding extra dependencies
 constraints: rere -rere-cfg
 constraints: these -assoc
 
--- So us hackers get all the assertion failures early:
---
--- NOTE: currently commented out, see
--- https://github.com/haskell/cabal/issues/3911
--- as a workaround we specify it for each package individually:
---
--- program-options
---   ghc-options: -fno-ignore-asserts
---
-package Cabal
-  ghc-options: -fno-ignore-asserts
-
-package cabal-testsuite
-  ghc-options: -fno-ignore-asserts
-
-package Cabal-QuickCheck
-  ghc-options: -fno-ignore-asserts
-
-package Cabal-tree-diff
-  ghc-options: -fno-ignore-asserts
-
-package Cabal-described
-  ghc-options: -fno-ignore-asserts
-
-package cabal-install-solver
-  ghc-options: -fno-ignore-asserts
-
-package cabal-install
+program-options
   ghc-options: -fno-ignore-asserts

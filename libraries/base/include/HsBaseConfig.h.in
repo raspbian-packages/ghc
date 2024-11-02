@@ -306,15 +306,25 @@
 /* The value of SIGINT. */
 #undef CONST_SIGINT
 
+/* Define to 1 if you have the `chmod' function. */
+#undef HAVE_CHMOD
+
 /* Define to 1 if you have the `clock_gettime' function. */
 #undef HAVE_CLOCK_GETTIME
 
 /* Define to 1 if you have the <ctype.h> header file. */
 #undef HAVE_CTYPE_H
 
+/* Define to 1 if you have the declaration of `CLOCK_PROCESS_CPUTIME_ID', and
+   to 0 if you don't. */
+#undef HAVE_DECL_CLOCK_PROCESS_CPUTIME_ID
+
 /* Define to 1 if you have the declaration of `environ', and to 0 if you
    don't. */
 #undef HAVE_DECL_ENVIRON
+
+/* Define to 1 if you have the `dup' function. */
+#undef HAVE_DUP
 
 /* Define if you have epoll support. */
 #undef HAVE_EPOLL
@@ -334,11 +344,17 @@
 /* Define if you have flock support. */
 #undef HAVE_FLOCK
 
+/* Define to 1 if you have the `fork' function. */
+#undef HAVE_FORK
+
 /* Define to 1 if you have the `ftruncate' function. */
 #undef HAVE_FTRUNCATE
 
 /* Define to 1 if you have the `getclock' function. */
 #undef HAVE_GETCLOCK
+
+/* Define to 1 if you have the `getpid' function. */
+#undef HAVE_GETPID
 
 /* Define to 1 if you have the `getrusage' function. */
 #undef HAVE_GETRUSAGE
@@ -379,8 +395,14 @@
 /* Define to 1 if you have the <memory.h> header file. */
 #undef HAVE_MEMORY_H
 
+/* Define to 1 if you have the `mkfifo' function. */
+#undef HAVE_MKFIFO
+
 /* Define if you have open file descriptor lock support. */
 #undef HAVE_OFD_LOCKING
+
+/* Define to 1 if you have the `pipe' function. */
+#undef HAVE_PIPE
 
 /* Define if you have poll support. */
 #undef HAVE_POLL
@@ -402,6 +424,9 @@
 
 /* Define to 1 if you have the <string.h> header file. */
 #undef HAVE_STRING_H
+
+/* HAVE_STRUCT_RLIMIT */
+#undef HAVE_STRUCT_RLIMIT
 
 /* Define to 1 if you have the <sys/epoll.h> header file. */
 #undef HAVE_SYS_EPOLL_H
@@ -459,6 +484,9 @@
 
 /* Define to 1 if you have the <time.h> header file. */
 #undef HAVE_TIME_H
+
+/* Define to 1 if you have the `umask' function. */
+#undef HAVE_UMASK
 
 /* Define to 1 if you have the <unistd.h> header file. */
 #undef HAVE_UNISTD_H

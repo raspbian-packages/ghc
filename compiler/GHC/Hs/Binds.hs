@@ -28,12 +28,13 @@ module GHC.Hs.Binds
 
 import GHC.Prelude
 
+import Language.Haskell.Syntax.Extension
 import Language.Haskell.Syntax.Binds
 
 import {-# SOURCE #-} GHC.Hs.Expr ( pprExpr, pprFunBind, pprPatBind )
 import {-# SOURCE #-} GHC.Hs.Pat  (pprLPat )
 
-import Language.Haskell.Syntax.Extension
+import GHC.Types.Tickish
 import GHC.Hs.Extension
 import GHC.Parser.Annotation
 import GHC.Hs.Type
@@ -66,7 +67,7 @@ import Data.Data (Data)
 Global bindings (where clauses)
 -}
 
--- the ...LR datatypes are parametrized by two id types,
+-- the ...LR datatypes are parameterized by two id types,
 -- one for the left and one for the right.
 
 type instance XHsValBinds      (GhcPass pL) (GhcPass pR) = EpAnn AnnList
@@ -95,9 +96,10 @@ type instance XFunBind    (GhcPass pL) GhcRn = NameSet
 -- extension field contains the locally-bound free variables of this
 -- defn. See Note [Bind free vars]
 
-type instance XFunBind    (GhcPass pL) GhcTc = HsWrapper
--- ^ After the type-checker, the FunBind extension field contains a
--- coercion from the type of the MatchGroup to the type of the Id.
+type instance XFunBind    (GhcPass pL) GhcTc = (HsWrapper, [CoreTickish])
+-- ^ After the type-checker, the FunBind extension field contains
+-- the ticks to put on the rhs, if any, and a coercion from the
+-- type of the MatchGroup to the type of the Id.
 -- Example:
 --
 -- @
@@ -113,7 +115,10 @@ type instance XFunBind    (GhcPass pL) GhcTc = HsWrapper
 
 type instance XPatBind    GhcPs (GhcPass pR) = EpAnn [AddEpAnn]
 type instance XPatBind    GhcRn (GhcPass pR) = NameSet -- See Note [Bind free vars]
-type instance XPatBind    GhcTc (GhcPass pR) = Type    -- Type of the GRHSs
+type instance XPatBind    GhcTc (GhcPass pR) =
+    ( Type                  -- Type of the GRHSs
+    , ( [CoreTickish]       -- Ticks to put on the rhs, if any
+      , [[CoreTickish]] ) ) -- and ticks to put on the bound variables.
 
 type instance XVarBind    (GhcPass pL) (GhcPass pR) = NoExtField
 type instance XPatSynBind (GhcPass pL) (GhcPass pR) = NoExtField
@@ -512,13 +517,26 @@ ppr_monobind (VarBind { var_id = var, var_rhs = rhs })
   = sep [pprBndr CasePatBind var, nest 2 $ equals <+> pprExpr (unLoc rhs)]
 ppr_monobind (FunBind { fun_id = fun,
                         fun_matches = matches,
-                        fun_tick = ticks,
-                        fun_ext = wrap })
-  = pprTicks empty (if null ticks then empty
-                    else text "-- ticks = " <> ppr ticks)
+                        fun_ext = ext })
+  = pprTicks empty ticksDoc
     $$  whenPprDebug (pprBndr LetBind (unLoc fun))
     $$  pprFunBind  matches
-    $$  whenPprDebug (pprIfTc @idR $ ppr wrap)
+    $$  whenPprDebug (pprIfTc @idR $ wrapDoc)
+        where
+            ticksDoc :: SDoc
+            ticksDoc = case ghcPass @idR of
+                         GhcPs -> empty
+                         GhcRn -> empty
+                         GhcTc | (_, ticks) <- ext ->
+                             if null ticks
+                                then empty
+                                else text "-- ticks = " <> ppr ticks
+            wrapDoc :: SDoc
+            wrapDoc = case ghcPass @idR of
+                        GhcPs -> empty
+                        GhcRn -> empty
+                        GhcTc | (wrap, _) <- ext -> ppr wrap
+
 
 ppr_monobind (PatSynBind _ psb) = ppr psb
 ppr_monobind (XHsBindsLR b) = case ghcPass @idL of
@@ -600,6 +618,10 @@ pprTicks pp_no_debug pp_when_debug
          then pp_when_debug
          else pp_no_debug
 
+instance Outputable (XRec a RdrName) => Outputable (RecordPatSynField a) where
+    ppr (RecordPatSynField { recordPatSynField = v }) = ppr v
+
+
 {-
 ************************************************************************
 *                                                                      *
@@ -651,19 +673,27 @@ instance OutputableBndrId p => Outputable (IPBind (GhcPass p)) where
 type instance XTypeSig          (GhcPass p) = EpAnn AnnSig
 type instance XPatSynSig        (GhcPass p) = EpAnn AnnSig
 type instance XClassOpSig       (GhcPass p) = EpAnn AnnSig
-type instance XIdSig            (GhcPass p) = NoExtField -- No anns, generated
 type instance XFixSig           (GhcPass p) = EpAnn [AddEpAnn]
 type instance XInlineSig        (GhcPass p) = EpAnn [AddEpAnn]
 type instance XSpecSig          (GhcPass p) = EpAnn [AddEpAnn]
-type instance XSpecInstSig      (GhcPass p) = EpAnn [AddEpAnn]
-type instance XMinimalSig       (GhcPass p) = EpAnn [AddEpAnn]
-type instance XSCCFunSig        (GhcPass p) = EpAnn [AddEpAnn]
-type instance XCompleteMatchSig (GhcPass p) = EpAnn [AddEpAnn]
-
-type instance XXSig             (GhcPass p) = DataConCantHappen
+type instance XSpecInstSig      (GhcPass p) = (EpAnn [AddEpAnn], SourceText)
+type instance XMinimalSig       (GhcPass p) = (EpAnn [AddEpAnn], SourceText)
+type instance XSCCFunSig        (GhcPass p) = (EpAnn [AddEpAnn], SourceText)
+type instance XCompleteMatchSig (GhcPass p) = (EpAnn [AddEpAnn], SourceText)
+    -- SourceText: Note [Pragma source text] in GHC.Types.SourceText
+type instance XXSig             GhcPs = DataConCantHappen
+type instance XXSig             GhcRn = IdSig
+type instance XXSig             GhcTc = IdSig
 
 type instance XFixitySig  (GhcPass p) = NoExtField
 type instance XXFixitySig (GhcPass p) = DataConCantHappen
+
+-- | A type signature in generated code, notably the code
+-- generated for record selectors. We simply record the desired Id
+-- itself, replete with its name, type and IdDetails. Otherwise it's
+-- just like a type signature: there should be an accompanying binding
+newtype IdSig = IdSig { unIdSig :: Id }
+    deriving Data
 
 data AnnSig
   = AnnSig {
@@ -714,7 +744,6 @@ ppr_sig (TypeSig _ vars ty)  = pprVarSig (map unLoc vars) (ppr ty)
 ppr_sig (ClassOpSig _ is_deflt vars ty)
   | is_deflt                 = text "default" <+> pprVarSig (map unLoc vars) (ppr ty)
   | otherwise                = pprVarSig (map unLoc vars) (ppr ty)
-ppr_sig (IdSig _ id)         = pprVarSig [id] (ppr (varType id))
 ppr_sig (FixSig _ fix_sig)   = ppr fix_sig
 ppr_sig (SpecSig _ var ty inl@(InlinePragma { inl_inline = spec }))
   = pragSrcBrackets (inlinePragmaSource inl) pragmaSrc (pprSpec (unLoc var)
@@ -724,22 +753,25 @@ ppr_sig (SpecSig _ var ty inl@(InlinePragma { inl_inline = spec }))
         NoUserInlinePrag -> "{-# " ++ extractSpecPragName (inl_src inl)
         _                -> "{-# " ++ extractSpecPragName (inl_src inl)  ++ "_INLINE"
 ppr_sig (InlineSig _ var inl)
-  = pragSrcBrackets (inlinePragmaSource inl) "{-# INLINE"  (pprInline inl
-                                   <+> pprPrefixOcc (unLoc var))
-ppr_sig (SpecInstSig _ src ty)
+  = ppr_pfx <+> pprInline inl <+> pprPrefixOcc (unLoc var) <+> text "#-}"
+    where
+      ppr_pfx = case inlinePragmaSource inl of
+        SourceText src -> text src
+        NoSourceText   -> text "{-#" <+> inlinePragmaName (inl_inline inl)
+ppr_sig (SpecInstSig (_, src) ty)
   = pragSrcBrackets src "{-# pragma" (text "instance" <+> ppr ty)
-ppr_sig (MinimalSig _ src bf)
+ppr_sig (MinimalSig (_, src) bf)
   = pragSrcBrackets src "{-# MINIMAL" (pprMinimalSig bf)
 ppr_sig (PatSynSig _ names sig_ty)
   = text "pattern" <+> pprVarSig (map unLoc names) (ppr sig_ty)
-ppr_sig (SCCFunSig _ src fn mlabel)
+ppr_sig (SCCFunSig (_, src) fn mlabel)
   = pragSrcBrackets src "{-# SCC" (ppr_fn <+> maybe empty ppr mlabel )
       where
         ppr_fn = case ghcPass @p of
           GhcPs -> ppr fn
           GhcRn -> ppr fn
           GhcTc -> ppr fn
-ppr_sig (CompleteMatchSig _ src cs mty)
+ppr_sig (CompleteMatchSig (_, src) cs mty)
   = pragSrcBrackets src "{-# COMPLETE"
       ((hsep (punctuate comma (map ppr_n (unLoc cs))))
         <+> opt_sig)
@@ -749,6 +781,40 @@ ppr_sig (CompleteMatchSig _ src cs mty)
         GhcPs -> ppr n
         GhcRn -> ppr n
         GhcTc -> ppr n
+ppr_sig (XSig x) = case ghcPass @p of
+                      GhcRn | IdSig id <- x -> pprVarSig [id] (ppr (varType id))
+                      GhcTc | IdSig id <- x -> pprVarSig [id] (ppr (varType id))
+
+hsSigDoc :: forall p. IsPass p => Sig (GhcPass p) -> SDoc
+hsSigDoc (TypeSig {})           = text "type signature"
+hsSigDoc (PatSynSig {})         = text "pattern synonym signature"
+hsSigDoc (ClassOpSig _ is_deflt _ _)
+ | is_deflt                     = text "default type signature"
+ | otherwise                    = text "class method signature"
+hsSigDoc (SpecSig _ _ _ inl)    = (inlinePragmaName . inl_inline $ inl) <+> text "pragma"
+hsSigDoc (InlineSig _ _ prag)   = (inlinePragmaName . inl_inline $ prag) <+> text "pragma"
+-- Using the 'inlinePragmaName' function ensures that the pragma name for any
+-- one of the INLINE/INLINABLE/NOINLINE pragmas are printed after being extracted
+-- from the InlineSpec field of the pragma.
+hsSigDoc (SpecInstSig (_, src) _)  = text (extractSpecPragName src) <+> text "instance pragma"
+hsSigDoc (FixSig {})            = text "fixity declaration"
+hsSigDoc (MinimalSig {})        = text "MINIMAL pragma"
+hsSigDoc (SCCFunSig {})         = text "SCC pragma"
+hsSigDoc (CompleteMatchSig {})  = text "COMPLETE pragma"
+hsSigDoc (XSig _)               = case ghcPass @p of
+                                    GhcRn -> text "id signature"
+                                    GhcTc -> text "id signature"
+
+-- | Extracts the name for a SPECIALIZE instance pragma. In 'hsSigDoc', the src
+-- field of 'SpecInstSig' signature contains the SourceText for a SPECIALIZE
+-- instance pragma of the form: "SourceText {-# SPECIALIZE"
+--
+-- Extraction ensures that all variants of the pragma name (with a 'Z' or an
+-- 'S') are output exactly as used in the pragma.
+extractSpecPragName :: SourceText -> String
+extractSpecPragName srcTxt =  case (words $ show srcTxt) of
+     (_:_:pragName:_) -> filter (/= '\"') pragName
+     _                -> pprPanic "hsSigDoc: Misformed SPECIALISE instance pragma:" (ppr srcTxt)
 
 instance OutputableBndrId p
        => Outputable (FixitySig (GhcPass p)) where
@@ -782,7 +848,7 @@ pprTcSpecPrags (SpecPrags ps)  = vcat (map (ppr . unLoc) ps)
 
 instance Outputable TcSpecPrag where
   ppr (SpecPrag var _ inl)
-    = ppr (extractSpecPragName $ inl_src inl) <+> pprSpec var (text "<type>") inl
+    = text (extractSpecPragName $ inl_src inl) <+> pprSpec var (text "<type>") inl
 
 pprMinimalSig :: (OutputableBndr name)
               => LBooleanFormula (GenLocated l name) -> SDoc

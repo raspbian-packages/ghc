@@ -64,6 +64,7 @@ RTS_RET(stg_stack_underflow_frame);
 RTS_RET(stg_keepAlive_frame);
 RTS_RET(stg_restore_cccs);
 RTS_RET(stg_restore_cccs_eval);
+RTS_RET(stg_prompt_frame);
 
 // RTS_FUN(stg_interp_constr1_entry);
 // RTS_FUN(stg_interp_constr2_entry);
@@ -160,6 +161,7 @@ RTS_RET(stg_ctoi_t62);
 
 RTS_RET(stg_primcall);
 RTS_RET(stg_apply_interp);
+RTS_RET(stg_dead_thread);
 
 RTS_ENTRY(stg_IND);
 RTS_ENTRY(stg_IND_STATIC);
@@ -210,6 +212,8 @@ RTS_ENTRY(stg_AP);
 RTS_ENTRY(stg_AP_NOUPD);
 RTS_ENTRY(stg_AP_STACK);
 RTS_ENTRY(stg_AP_STACK_NOUPD);
+RTS_ENTRY(stg_CONTINUATION);
+RTS_ENTRY(stg_PROMPT_TAG);
 RTS_ENTRY(stg_dummy_ret);
 RTS_ENTRY(stg_raise);
 RTS_ENTRY(stg_raise_ret);
@@ -314,6 +318,10 @@ RTS_THUNK(stg_ap_5_upd);
 RTS_THUNK(stg_ap_6_upd);
 RTS_THUNK(stg_ap_7_upd);
 
+// Standard entry for `unpackCString# str` thunks
+RTS_ENTRY(stg_unpack_cstring);
+RTS_ENTRY(stg_unpack_cstring_utf8);
+
 /* standard application routines (see also utils/genapply,
  * and GHC.StgToCmm.ArgRep).
  */
@@ -354,6 +362,7 @@ RTS_FUN_DECL(stg_ap_pppp_fast);
 RTS_FUN_DECL(stg_ap_ppppp_fast);
 RTS_FUN_DECL(stg_ap_pppppp_fast);
 RTS_FUN_DECL(stg_PAP_apply);
+RTS_FUN_DECL(stg_CONTINUATION_apply);
 
 /* standard GC & stack check entry points, all defined in HeapStackCheck.cmm */
 
@@ -373,7 +382,9 @@ RTS_FUN_DECL(stg_gc_prim_pp);
 RTS_FUN_DECL(stg_gc_prim_n);
 
 RTS_RET(stg_gc_prim_p_ll_ret);
+RTS_RET(stg_gc_prim_pp_ll_ret);
 RTS_FUN_DECL(stg_gc_prim_p_ll);
+RTS_FUN_DECL(stg_gc_prim_pp_ll);
 
 RTS_RET(stg_enter);
 RTS_FUN_DECL(__stg_gc_enter_1);
@@ -501,6 +512,11 @@ RTS_FUN_DECL(stg_paniczh);
 RTS_FUN_DECL(stg_keepAlivezh);
 RTS_FUN_DECL(stg_absentErrorzh);
 
+RTS_FUN_DECL(stg_newPromptTagzh);
+RTS_FUN_DECL(stg_promptzh);
+RTS_FUN_DECL(stg_control0zh);
+RTS_FUN_DECL(stg_control0zh_ll);
+
 RTS_FUN_DECL(stg_makeStableNamezh);
 RTS_FUN_DECL(stg_makeStablePtrzh);
 RTS_FUN_DECL(stg_deRefStablePtrzh);
@@ -531,7 +547,9 @@ RTS_FUN_DECL(stg_unmaskAsyncExceptionszh);
 RTS_FUN_DECL(stg_myThreadIdzh);
 RTS_FUN_DECL(stg_labelThreadzh);
 RTS_FUN_DECL(stg_isCurrentThreadBoundzh);
+RTS_FUN_DECL(stg_threadLabelzh);
 RTS_FUN_DECL(stg_threadStatuszh);
+RTS_FUN_DECL(stg_listThreadszh);
 
 RTS_FUN_DECL(stg_mkWeakzh);
 RTS_FUN_DECL(stg_mkWeakNoFinalizzerzh);
@@ -564,7 +582,6 @@ RTS_FUN_DECL(stg_numSparkszh);
 RTS_FUN_DECL(stg_noDuplicatezh);
 RTS_FUN(stg_noDuplicate);
 
-RTS_FUN_DECL(stg_traceCcszh);
 RTS_FUN_DECL(stg_clearCCSzh);
 RTS_FUN_DECL(stg_traceEventzh);
 RTS_FUN_DECL(stg_traceBinaryEventzh);

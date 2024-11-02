@@ -1,5 +1,7 @@
 -- | An exactprintable structure for docstrings
 {-# LANGUAGE DeriveDataTypeable #-}
+{-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
 
 module GHC.Hs.DocString
   ( LHsDocString
@@ -27,6 +29,7 @@ import GHC.Utils.Binary
 import GHC.Utils.Encoding
 import GHC.Utils.Outputable as Outputable hiding ((<>))
 import GHC.Types.SrcLoc
+import Control.DeepSeq
 
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
@@ -59,6 +62,11 @@ data HsDocString
 instance Outputable HsDocString where
   ppr = text . renderHsDocString
 
+instance NFData HsDocString where
+  rnf (MultiLineDocString a b) = rnf a `seq` rnf b
+  rnf (NestedDocString a b) = rnf a `seq` rnf b
+  rnf (GeneratedDocString a) = rnf a
+
 -- | Annotate a pretty printed thing with its doc
 -- The docstring comes after if is 'HsDocStringPrevious'
 -- Otherwise it comes before.
@@ -75,19 +83,19 @@ instance Binary HsDocString where
     MultiLineDocString dec xs -> do
       putByte bh 0
       put_ bh dec
-      put_ bh xs
+      put_ bh $ BinLocated <$> xs
     NestedDocString dec x -> do
       putByte bh 1
       put_ bh dec
-      put_ bh x
+      put_ bh $ BinLocated x
     GeneratedDocString x -> do
       putByte bh 2
       put_ bh x
   get bh = do
     tag <- getByte bh
     case tag of
-      0 -> MultiLineDocString <$> get bh <*> get bh
-      1 -> NestedDocString <$> get bh <*> get bh
+      0 -> MultiLineDocString <$> get bh <*> (fmap unBinLocated <$> get bh)
+      1 -> NestedDocString <$> get bh <*> (unBinLocated <$> get bh)
       2 -> GeneratedDocString <$> get bh
       t -> fail $ "HsDocString: invalid tag " ++ show t
 
@@ -100,6 +108,12 @@ data HsDocStringDecorator
 
 instance Outputable HsDocStringDecorator where
   ppr = text . printDecorator
+
+instance NFData HsDocStringDecorator where
+  rnf HsDocStringNext = ()
+  rnf HsDocStringPrevious = ()
+  rnf (HsDocStringNamed x) = rnf x
+  rnf (HsDocStringGroup x) = rnf x
 
 printDecorator :: HsDocStringDecorator -> String
 printDecorator HsDocStringNext = "|"
@@ -124,9 +138,10 @@ instance Binary HsDocStringDecorator where
 
 type LHsDocStringChunk = Located HsDocStringChunk
 
--- | A continguous chunk of documentation
+-- | A contiguous chunk of documentation
 newtype HsDocStringChunk = HsDocStringChunk ByteString
-  deriving (Eq,Ord,Data, Show)
+  deriving stock (Eq,Ord,Data, Show)
+  deriving newtype (NFData)
 
 instance Binary HsDocStringChunk where
   put_ bh (HsDocStringChunk bs) = put_ bh bs
@@ -135,9 +150,8 @@ instance Binary HsDocStringChunk where
 instance Outputable HsDocStringChunk where
   ppr = text . unpackHDSC
 
-
 mkHsDocStringChunk :: String -> HsDocStringChunk
-mkHsDocStringChunk s = HsDocStringChunk (utf8EncodeString s)
+mkHsDocStringChunk s = HsDocStringChunk (utf8EncodeByteString s)
 
 -- | Create a 'HsDocString' from a UTF8-encoded 'ByteString'.
 mkHsDocStringChunkUtf8ByteString :: ByteString -> HsDocStringChunk
@@ -192,6 +206,6 @@ unlines' :: [String] -> String
 unlines' = intercalate "\n"
 
 -- | Just get the docstring, without any decorators
--- Seperates docstrings using "\n\n", which is how haddock likes to render them
+-- Separates docstrings using "\n\n", which is how haddock likes to render them
 renderHsDocStrings :: [HsDocString] -> String
 renderHsDocStrings = intercalate "\n\n" . map renderHsDocString

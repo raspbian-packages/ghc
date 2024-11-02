@@ -7,9 +7,7 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE StandaloneDeriving #-}
 {-# LANGUAGE UndecidableInstances #-}
-
-{-# OPTIONS_GHC -Wno-incomplete-record-updates #-}
-{-# OPTIONS_GHC -Wno-incomplete-uni-patterns   #-}
+{-# LANGUAGE LambdaCase #-}
 
 -- CmmNode type for representation using Hoopl graphs.
 
@@ -28,23 +26,29 @@ module GHC.Cmm.Node (
 import GHC.Prelude hiding (succ)
 
 import GHC.Platform.Regs
+import GHC.Cmm.CLabel
 import GHC.Cmm.Expr
 import GHC.Cmm.Switch
 import GHC.Data.FastString
+import GHC.Data.Pair
 import GHC.Types.ForeignCall
 import GHC.Utils.Outputable
 import GHC.Runtime.Heap.Layout
 import GHC.Types.Tickish (CmmTickish)
 import qualified GHC.Types.Unique as U
+import GHC.Types.Basic (FunctionOrData(..))
 
+import GHC.Platform
 import GHC.Cmm.Dataflow.Block
 import GHC.Cmm.Dataflow.Graph
 import GHC.Cmm.Dataflow.Collections
 import GHC.Cmm.Dataflow.Label
+import Data.Foldable (toList)
+import Data.Functor.Classes (liftCompare)
 import Data.Maybe
 import Data.List (tails,sortBy)
 import GHC.Types.Unique (nonDetCmpUnique)
-import GHC.Utils.Misc
+import GHC.Utils.Constants (debugIsOn)
 
 
 ------------------------
@@ -164,6 +168,177 @@ data CmmNode e x where
       ret_off :: ByteOff,       -- same as cml_ret_off
       intrbl:: Bool             -- whether or not the call is interruptible
   } -> CmmNode O C
+
+instance OutputableP Platform (CmmNode e x) where
+    pdoc = pprNode
+
+pprNode :: Platform -> CmmNode e x -> SDoc
+pprNode platform node = pp_node <+> pp_debug
+  where
+    pp_node :: SDoc
+    pp_node = case node of
+      -- label:
+      CmmEntry id tscope ->
+         (sdocOption sdocSuppressUniques $ \case
+            True  -> text "_lbl_"
+            False -> ppr id
+         )
+         <> colon
+         <+> ppUnlessOption sdocSuppressTicks (text "//" <+> ppr tscope)
+
+      -- // text
+      CmmComment s -> text "//" <+> ftext s
+
+      -- //tick bla<...>
+      CmmTick t -> ppUnlessOption sdocSuppressTicks
+                     (text "//tick" <+> ppr t)
+
+      -- unwind reg = expr;
+      CmmUnwind regs ->
+          text "unwind "
+          <> commafy (map (\(r,e) -> ppr r <+> char '=' <+> pdoc platform e) regs) <> semi
+
+      -- reg = expr;
+      CmmAssign reg expr -> ppr reg <+> equals <+> pdoc platform expr <> semi
+
+      -- rep[lv] = expr;
+      CmmStore lv expr align -> rep <> align_mark <> brackets (pdoc platform lv) <+> equals <+> pdoc platform expr <> semi
+          where
+            align_mark = case align of
+                           Unaligned -> text "^"
+                           NaturallyAligned -> empty
+            rep = ppr ( cmmExprType platform expr )
+
+      -- call "ccall" foo(x, y)[r1, r2];
+      -- ToDo ppr volatile
+      CmmUnsafeForeignCall target results args ->
+          hsep [ ppUnless (null results) $
+                    parens (commafy $ map ppr results) <+> equals,
+                 text "call",
+                 pdoc platform target <> parens (commafy $ map (pdoc platform) args) <> semi]
+
+      -- goto label;
+      CmmBranch ident -> text "goto" <+> ppr ident <> semi
+
+      -- if (expr) goto t; else goto f;
+      CmmCondBranch expr t f l ->
+          hsep [ text "if"
+               , parens (pdoc platform expr)
+               , case l of
+                   Nothing -> empty
+                   Just b -> parens (text "likely:" <+> ppr b)
+               , text "goto"
+               , ppr t <> semi
+               , text "else goto"
+               , ppr f <> semi
+               ]
+
+      CmmSwitch expr ids ->
+          hang (hsep [ text "switch"
+                     , range
+                     , if isTrivialCmmExpr expr
+                       then pdoc platform expr
+                       else parens (pdoc platform expr)
+                     , text "{"
+                     ])
+             4 (vcat (map ppCase cases) $$ def) $$ rbrace
+          where
+            (cases, mbdef) = switchTargetsFallThrough ids
+            ppCase (is,l) = hsep
+                            [ text "case"
+                            , commafy $ toList $ fmap integer is
+                            , text ": goto"
+                            , ppr l <> semi
+                            ]
+            def | Just l <- mbdef = hsep
+                            [ text "default:"
+                            , braces (text "goto" <+> ppr l <> semi)
+                            ]
+                | otherwise = empty
+
+            range = brackets $ hsep [integer lo, text "..", integer hi]
+              where (lo,hi) = switchTargetsRange ids
+
+      CmmCall tgt k regs out res updfr_off ->
+          hcat [ text "call", space
+               , pprFun tgt, parens (interpp'SP regs), space
+               , returns <+>
+                 text "args: " <> ppr out <> comma <+>
+                 text "res: " <> ppr res <> comma <+>
+                 text "upd: " <> ppr updfr_off
+               , semi ]
+          where pprFun f@(CmmLit _) = pdoc platform f
+                pprFun f = parens (pdoc platform f)
+
+                returns
+                  | Just r <- k = text "returns to" <+> ppr r <> comma
+                  | otherwise   = empty
+
+      CmmForeignCall {tgt=t, res=rs, args=as, succ=s, ret_args=a, ret_off=u, intrbl=i} ->
+          hcat $ if i then [text "interruptible", space] else [] ++
+               [ text "foreign call", space
+               , pdoc platform t, text "(...)", space
+               , text "returns to" <+> ppr s
+                    <+> text "args:" <+> parens (pdoc platform as)
+                    <+> text "ress:" <+> parens (ppr rs)
+               , text "ret_args:" <+> ppr a
+               , text "ret_off:" <+> ppr u
+               , semi ]
+
+    pp_debug :: SDoc
+    pp_debug =
+      if not debugIsOn then empty
+      else case node of
+             CmmEntry {}             -> empty -- Looks terrible with text "  // CmmEntry"
+             CmmComment {}           -> empty -- Looks also terrible with text "  // CmmComment"
+             CmmTick {}              -> empty
+             CmmUnwind {}            -> text "  // CmmUnwind"
+             CmmAssign {}            -> text "  // CmmAssign"
+             CmmStore {}             -> text "  // CmmStore"
+             CmmUnsafeForeignCall {} -> text "  // CmmUnsafeForeignCall"
+             CmmBranch {}            -> text "  // CmmBranch"
+             CmmCondBranch {}        -> text "  // CmmCondBranch"
+             CmmSwitch {}            -> text "  // CmmSwitch"
+             CmmCall {}              -> text "  // CmmCall"
+             CmmForeignCall {}       -> text "  // CmmForeignCall"
+
+    commafy :: [SDoc] -> SDoc
+    commafy xs = hsep $ punctuate comma xs
+
+instance OutputableP Platform (Block CmmNode C C) where
+    pdoc = pprBlock
+instance OutputableP Platform (Block CmmNode C O) where
+    pdoc = pprBlock
+instance OutputableP Platform (Block CmmNode O C) where
+    pdoc = pprBlock
+instance OutputableP Platform (Block CmmNode O O) where
+    pdoc = pprBlock
+
+instance OutputableP Platform (Graph CmmNode e x) where
+    pdoc = pprGraph
+
+pprBlock :: IndexedCO x SDoc SDoc ~ SDoc
+         => Platform -> Block CmmNode e x -> IndexedCO e SDoc SDoc
+pprBlock platform block
+    = foldBlockNodesB3 ( ($$) . pdoc platform
+                       , ($$) . (nest 4) . pdoc platform
+                       , ($$) . (nest 4) . pdoc platform
+                       )
+                       block
+                       empty
+
+pprGraph :: Platform -> Graph CmmNode e x -> SDoc
+pprGraph platform = \case
+   GNil                  -> empty
+   GUnit block           -> pdoc platform block
+   GMany entry body exit ->
+         text "{"
+      $$ nest 2 (pprMaybeO entry $$ (vcat $ map (pdoc platform) $ bodyToBlockList body) $$ pprMaybeO exit)
+      $$ text "}"
+      where pprMaybeO :: OutputableP Platform (Block CmmNode e x)
+                      => MaybeO ex (Block CmmNode e x) -> SDoc
+            pprMaybeO NothingO = empty
+            pprMaybeO (JustO block) = pdoc platform block
 
 {- Note [Foreign calls]
 ~~~~~~~~~~~~~~~~~~~~~~~
@@ -291,10 +466,24 @@ data ForeignConvention
         CmmReturnInfo
   deriving Eq
 
+instance Outputable ForeignConvention where
+    ppr = pprForeignConvention
+
+pprForeignConvention :: ForeignConvention -> SDoc
+pprForeignConvention (ForeignConvention c args res ret) =
+    doubleQuotes (ppr c) <+> text "arg hints: " <+> ppr args <+> text " result hints: " <+> ppr res <+> ppr ret
+
 data CmmReturnInfo
   = CmmMayReturn
   | CmmNeverReturns
   deriving ( Eq )
+
+instance Outputable CmmReturnInfo where
+    ppr = pprReturnInfo
+
+pprReturnInfo :: CmmReturnInfo -> SDoc
+pprReturnInfo CmmMayReturn = empty
+pprReturnInfo CmmNeverReturns = text "never returns"
 
 data ForeignTarget        -- The target of a foreign call
   = ForeignTarget                -- A foreign procedure
@@ -303,6 +492,35 @@ data ForeignTarget        -- The target of a foreign call
   | PrimTarget            -- A possibly-side-effecting machine operation
         CallishMachOp            -- Which one
   deriving Eq
+
+instance OutputableP Platform ForeignTarget where
+    pdoc = pprForeignTarget
+
+pprForeignTarget :: Platform -> ForeignTarget -> SDoc
+pprForeignTarget platform (ForeignTarget fn c) =
+    ppr c <+> ppr_target fn
+  where
+    ppr_target :: CmmExpr -> SDoc
+    ppr_target t@(CmmLit _) = pdoc platform t
+    ppr_target fn'          = parens (pdoc platform fn')
+pprForeignTarget platform (PrimTarget op)
+ -- HACK: We're just using a ForeignLabel to get this printed, the label
+ --       might not really be foreign.
+ = pdoc platform
+               (mkForeignLabel
+                          (mkFastString (show op))
+                          Nothing ForeignLabelInThisPackage IsFunction)
+
+instance Outputable Convention where
+  ppr = pprConvention
+
+pprConvention :: Convention -> SDoc
+pprConvention (NativeNodeCall   {}) = text "<native-node-call-convention>"
+pprConvention (NativeDirectCall {}) = text "<native-direct-call-convention>"
+pprConvention (NativeReturn {})     = text "<native-ret-convention>"
+pprConvention  Slow                 = text "<slow-convention>"
+pprConvention  GC                   = text "<gc-convention>"
+
 
 foreignTargetHints :: ForeignTarget -> ([ForeignHint], [ForeignHint])
 foreignTargetHints target
@@ -505,7 +723,7 @@ mapExpM _ (CmmComment _)            = Nothing
 mapExpM _ (CmmTick _)               = Nothing
 mapExpM f (CmmUnwind regs)          = CmmUnwind `fmap` mapM (\(r,e) -> mapM f e >>= \e' -> pure (r,e')) regs
 mapExpM f (CmmAssign r e)           = CmmAssign r `fmap` f e
-mapExpM f (CmmStore addr e align)   = (\[addr', e'] -> CmmStore addr' e' align) `fmap` mapListM f [addr, e]
+mapExpM f (CmmStore addr e align)   = (\ (Pair addr' e') -> CmmStore addr' e' align) `fmap` traverse f (Pair addr e)
 mapExpM _ (CmmBranch _)             = Nothing
 mapExpM f (CmmCondBranch e ti fi l) = (\x -> CmmCondBranch x ti fi l) `fmap` f e
 mapExpM f (CmmSwitch e tbl)         = (\x -> CmmSwitch x tbl)       `fmap` f e
@@ -693,7 +911,7 @@ instance Ord CmmTickScope where
   compare GlobalScope    _               = LT
   compare _              GlobalScope     = GT
   compare (SubScope u _) (SubScope u' _) = nonDetCmpUnique u u'
-  compare scope scope'                   = cmpList nonDetCmpUnique
+  compare scope scope'                   = liftCompare nonDetCmpUnique
      (sortBy nonDetCmpUnique $ scopeUniques scope)
      (sortBy nonDetCmpUnique $ scopeUniques scope')
 

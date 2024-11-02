@@ -27,6 +27,7 @@ import GHC.Data.Graph.Directed ( SCC(..) )
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
 import GHC.Utils.Panic.Plain
+import GHC.Types.Error (UnknownDiagnostic(..))
 import GHC.Types.SourceError
 import GHC.Types.SrcLoc
 import GHC.Types.PkgQual
@@ -260,7 +261,7 @@ processDeps dflags hsc_env excl_mods root hdl (AcyclicSCC (ModuleNode _ node))
 
                 -- Emit a dependency for each CPP import
         ; when (depIncludeCppDeps dflags) $ do
-            -- CPP deps are descovered in the module parsing phase by parsing
+            -- CPP deps are discovered in the module parsing phase by parsing
             -- comment lines left by the preprocessor.
             -- Note that GHC.parseModule may throw an exception if the module
             -- fails to parse, which may not be desirable (see #16616).
@@ -306,7 +307,8 @@ findDependency hsc_env srcloc pkg imp is_boot include_pkg_deps = do
     fail ->
         throwOneError $
           mkPlainErrorMsgEnvelope srcloc $
-          GhcDriverMessage $ DriverUnknownMessage $ mkPlainError noHints $
+          GhcDriverMessage $ DriverUnknownMessage $
+             UnknownDiagnostic $ mkPlainError noHints $
              cannotFindModule hsc_env imp fail
 
 -----------------------------

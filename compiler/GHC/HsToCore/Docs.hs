@@ -28,6 +28,7 @@ import GHC.Parser.Annotation
 import Control.Applicative
 import Control.Monad.IO.Class
 import Data.Bifunctor (first)
+import Data.Foldable (toList)
 import Data.IntMap (IntMap)
 import qualified Data.IntMap as IM
 import Data.Map.Strict (Map)
@@ -273,8 +274,8 @@ mkMaps env instances decls =
     names _ decl = getMainDeclBinder env decl
 
 {-
-Note [1]:
----------
+Note [1]
+~~~~~~~~
 We relate ClsInsts to InstDecls and DerivDecls using the SrcSpans buried
 inside them. That should work for normal user-written instances (from
 looking at GHC sources). We can assume that commented instances are
@@ -366,13 +367,13 @@ subordinates env instMap decl = case decl of
              -> [(Name, [HsDoc GhcRn], IntMap (HsDoc GhcRn))]
     dataSubs dd = constrs ++ fields  ++ derivs
       where
-        cons = map unLoc $ (dd_cons dd)
+        cons = unLoc <$> dd_cons dd
         constrs = [ ( unLoc cname
                     , maybeToList $ fmap unLoc $ con_doc c
                     , conArgDocs c)
-                  | c <- cons, cname <- getConNames c ]
+                  | c <- toList cons, cname <- getConNames c ]
         fields  = [ (foExt n, maybeToList $ fmap unLoc doc, IM.empty)
-                  | Just flds <- map getRecConArgs_maybe cons
+                  | Just flds <- toList $ fmap getRecConArgs_maybe cons
                   , (L _ (ConDeclField _ ns _ doc)) <- (unLoc flds)
                   , (L _ n) <- ns ]
         derivs  = [ (instName, [unLoc doc], IM.empty)
@@ -534,7 +535,7 @@ filterDecls = filter (isHandled . unXRec @p . fst)
 
 -- | Go through all class declarations and filter their sub-declarations
 filterClasses :: forall p doc. (IsPass p) => [(LHsDecl (GhcPass p), doc)] -> [(LHsDecl (GhcPass p), doc)]
-filterClasses = map (first (mapLoc filterClass))
+filterClasses = map (first (fmap filterClass))
   where
     filterClass (TyClD x c@(ClassDecl {})) =
       TyClD x $ c { tcdSigs =
@@ -554,7 +555,7 @@ mkDecls :: (struct -> [GenLocated l decl])
         -> (decl -> hsDecl)
         -> struct
         -> [GenLocated l hsDecl]
-mkDecls field con = map (mapLoc con) . field
+mkDecls field con = map (fmap con) . field
 
 -- | Extracts out individual maps of documentation added via Template Haskell's
 -- @putDoc@.

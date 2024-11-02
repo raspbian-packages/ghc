@@ -1,5 +1,3 @@
-
-{-# OPTIONS_GHC -Wno-incomplete-record-updates #-}
 {-# OPTIONS_GHC -Wno-incomplete-uni-patterns   #-}
 
 module GHC.Tc.Solver.Interact (
@@ -8,26 +6,17 @@ module GHC.Tc.Solver.Interact (
   ) where
 
 import GHC.Prelude
-import GHC.Types.Basic ( SwapFlag(..),
-                         infinity, IntWithInf, intGtLimit )
+import GHC.Types.Basic ( SwapFlag(..), IntWithInf, intGtLimit )
 import GHC.Tc.Solver.Canonical
 import GHC.Types.Var.Set
-import GHC.Core.Type as Type
-import GHC.Core.InstEnv         ( DFunInstType )
 
 import GHC.Types.Var
 import GHC.Tc.Errors.Types
 import GHC.Tc.Utils.TcType
 import GHC.Builtin.Names ( coercibleTyConKey, heqTyConKey, eqTyConKey, ipClassKey )
-import GHC.Core.Coercion.Axiom ( CoAxBranch (..), CoAxiom (..), TypeEqn, fromBranches, sfInteractInert, sfInteractTop )
-import GHC.Core.Class
-import GHC.Core.TyCon
-import GHC.Core.Reduction
 import GHC.Tc.Instance.FunDeps
 import GHC.Tc.Instance.Family
 import GHC.Tc.Instance.Class ( InstanceWhat(..), safeOverlap )
-import GHC.Core.FamInstEnv
-import GHC.Core.Unify ( tcUnifyTyWithTFs, ruleMatchTyKiX )
 
 import GHC.Tc.Types.Evidence
 import GHC.Utils.Outputable
@@ -35,31 +24,47 @@ import GHC.Utils.Panic
 
 import GHC.Tc.Types
 import GHC.Tc.Types.Constraint
-import GHC.Core.Predicate
 import GHC.Tc.Types.Origin
 import GHC.Tc.Utils.TcMType( promoteMetaTyVarTo )
 import GHC.Tc.Solver.Types
 import GHC.Tc.Solver.InertSet
 import GHC.Tc.Solver.Monad
-import GHC.Data.Bag
-import GHC.Utils.Monad ( concatMapM, foldlM )
 
 import GHC.Core
-import Data.List( deleteFirstsBy )
-import Data.Function ( on )
+import GHC.Core.Type as Type
+import GHC.Core.InstEnv     ( DFunInstType )
+import GHC.Core.Class
+import GHC.Core.TyCon
+import GHC.Core.Reduction
+import GHC.Core.Predicate
+import GHC.Core.Coercion
+import GHC.Core.FamInstEnv
+import GHC.Core.Unify ( tcUnifyTyWithTFs, ruleMatchTyKiX )
+import GHC.Core.Coercion.Axiom ( CoAxBranch (..), CoAxiom (..), TypeEqn, fromBranches
+                               , sfInteractInert, sfInteractTop )
+
 import GHC.Types.SrcLoc
 import GHC.Types.Var.Env
-
-import qualified Data.Semigroup as S
-import Control.Monad
-import GHC.Data.Pair (Pair(..))
 import GHC.Types.Unique( hasKey )
-import GHC.Driver.Session
+
+import GHC.Data.Bag
+import GHC.Data.Pair (Pair(..))
+
+import GHC.Utils.Monad ( concatMapM, foldlM )
 import GHC.Utils.Misc
+
+import GHC.Driver.Session
+
 import qualified GHC.LanguageExtensions as LangExt
+
+import Data.List( deleteFirstsBy )
+import Data.Maybe ( listToMaybe, mapMaybe )
+import Data.Function ( on )
+import qualified Data.Semigroup as S
 
 import Control.Monad.Trans.Class
 import Control.Monad.Trans.Maybe
+import Control.Monad
 
 {-
 **********************************************************************
@@ -78,7 +83,7 @@ Note [Basic Simplifier Plan]
       - inert reactions
       - spontaneous reactions
       - top-level interactions
-   Each stage returns a StopOrContinue and may have sideffected
+   Each stage returns a StopOrContinue and may have sideeffected
    the inerts or worklist.
 
    The threading of the stages is as follows:
@@ -445,7 +450,7 @@ instance Outputable InteractResult where
 
 solveOneFromTheOther :: Ct  -- Inert    (Dict or Irred)
                      -> Ct  -- WorkItem (same predicate as inert)
-                     -> TcS InteractResult
+                     -> InteractResult
 -- Precondition:
 -- * inert and work item represent evidence for the /same/ predicate
 -- * Both are CDictCan or CIrredCan
@@ -457,28 +462,28 @@ solveOneFromTheOther :: Ct  -- Inert    (Dict or Irred)
 solveOneFromTheOther ct_i ct_w
   | CtWanted { ctev_loc = loc_w } <- ev_w
   , prohibitedSuperClassSolve loc_i loc_w
+  -- See Note [Solving superclass constraints] in GHC.Tc.TyCl.Instance
   = -- Inert must be Given
-    do { traceTcS "prohibitedClassSolve1" (ppr ev_i $$ ppr ev_w)
-       ; return KeepWork }
+    KeepWork
 
   | CtWanted {} <- ev_w
   = -- Inert is Given or Wanted
     case ev_i of
-      CtGiven {} -> return KeepInert
+      CtGiven {} -> KeepInert
         -- work is Wanted; inert is Given: easy choice.
 
       CtWanted {} -- Both are Wanted
         -- If only one has no pending superclasses, use it
         -- Otherwise we can get infinite superclass expansion (#22516)
         -- in silly cases like   class C T b => C a b where ...
-        | not is_psc_i, is_psc_w     -> return KeepInert
-        | is_psc_i,     not is_psc_w -> return KeepWork
+        | not is_psc_i, is_psc_w     -> KeepInert
+        | is_psc_i,     not is_psc_w -> KeepWork
 
         -- If only one is a WantedSuperclassOrigin (arising from expanding
         -- a Wanted class constraint), keep the other: wanted superclasses
         -- may be unexpected by users
-        | not is_wsc_orig_i, is_wsc_orig_w     -> return KeepInert
-        | is_wsc_orig_i,     not is_wsc_orig_w -> return KeepWork
+        | not is_wsc_orig_i, is_wsc_orig_w     -> KeepInert
+        | is_wsc_orig_i,     not is_wsc_orig_w -> KeepWork
 
         -- otherwise, just choose the lower span
         -- reason: if we have something like (abs 1) (where the
@@ -486,46 +491,46 @@ solveOneFromTheOther ct_i ct_w
         -- get an error about abs than about 1.
         -- This test might become more elaborate if we see an
         -- opportunity to improve the error messages
-        | ((<) `on` ctLocSpan) loc_i loc_w -> return KeepInert
-        | otherwise                        -> return KeepWork
+        | ((<) `on` ctLocSpan) loc_i loc_w -> KeepInert
+        | otherwise                        -> KeepWork
 
   -- From here on the work-item is Given
 
   | CtWanted { ctev_loc = loc_i } <- ev_i
   , prohibitedSuperClassSolve loc_w loc_i
-  = do { traceTcS "prohibitedClassSolve2" (ppr ev_i $$ ppr ev_w)
-       ; return KeepInert }      -- Just discard the un-usable Given
-                                 -- This never actually happens because
-                                 -- Givens get processed first
+  = KeepInert   -- Just discard the un-usable Given
+                -- This never actually happens because
+                -- Givens get processed first
 
   | CtWanted {} <- ev_i
-  = return KeepWork
+  = KeepWork
 
   -- From here on both are Given
   -- See Note [Replacement vs keeping]
 
   | lvl_i == lvl_w
-  = return same_level_strategy
+  = same_level_strategy
 
   | otherwise   -- Both are Given, levels differ
-  = return different_level_strategy
+  = different_level_strategy
   where
      ev_i  = ctEvidence ct_i
      ev_w  = ctEvidence ct_w
 
      pred  = ctEvPred ev_i
 
-     loc_i = ctEvLoc ev_i
-     loc_w = ctEvLoc ev_w
-     lvl_i = ctLocLevel loc_i
-     lvl_w = ctLocLevel loc_w
+     loc_i  = ctEvLoc ev_i
+     loc_w  = ctEvLoc ev_w
+     orig_i = ctLocOrigin loc_i
+     orig_w = ctLocOrigin loc_w
+     lvl_i  = ctLocLevel loc_i
+     lvl_w  = ctLocLevel loc_w
 
      is_psc_w = isPendingScDict ct_w
      is_psc_i = isPendingScDict ct_i
 
-     is_wsc_orig_i = is_wanted_superclass_loc loc_i
-     is_wsc_orig_w = is_wanted_superclass_loc loc_w
-     is_wanted_superclass_loc = isWantedSuperclassOrigin . ctLocOrigin
+     is_wsc_orig_i = isWantedSuperclassOrigin orig_i
+     is_wsc_orig_w = isWantedSuperclassOrigin orig_w
 
      different_level_strategy  -- Both Given
        | isIPLikePred pred = if lvl_w > lvl_i then KeepWork  else KeepInert
@@ -534,27 +539,20 @@ solveOneFromTheOther ct_i ct_w
        -- For the isIPLikePred case see Note [Shadowing of Implicit Parameters]
 
      same_level_strategy -- Both Given
-       = case (ctLocOrigin loc_i, ctLocOrigin loc_w) of
-              -- case 2(a) from Note [Replacement vs keeping]
-           (InstSCOrigin _depth_i size_i, InstSCOrigin _depth_w size_w)
-             | size_w < size_i -> KeepWork
-             | otherwise       -> KeepInert
+       = case (orig_i, orig_w) of
 
-              -- case 2(c) from Note [Replacement vs keeping]
-           (InstSCOrigin depth_i _, OtherSCOrigin depth_w _)  -> choose_shallower depth_i depth_w
-           (OtherSCOrigin depth_i _, InstSCOrigin depth_w _)  -> choose_shallower depth_i depth_w
-           (OtherSCOrigin depth_i _, OtherSCOrigin depth_w _) -> choose_shallower depth_i depth_w
+           (GivenSCOrigin _ depth_i blocked_i, GivenSCOrigin _ depth_w blocked_w)
+             | blocked_i, not blocked_w -> KeepWork  -- Case 2(a) from
+             | not blocked_i, blocked_w -> KeepInert -- Note [Replacement vs keeping]
 
-              -- case 2(b) from Note [Replacement vs keeping]
-           (InstSCOrigin {}, _)                         -> KeepWork
-           (OtherSCOrigin {}, _)                        -> KeepWork
+             -- Both blocked or both not blocked
 
-             -- case 2(d) from Note [Replacement vs keeping]
-           _                                      -> KeepInert
+             | depth_w < depth_i -> KeepWork   -- Case 2(c) from
+             | otherwise         -> KeepInert  -- Note [Replacement vs keeping]
 
-     choose_shallower depth_i depth_w | depth_w < depth_i = KeepWork
-                                      | otherwise         = KeepInert
-       -- favor KeepInert in the equals case, according to 2(d) from the Note
+           (GivenSCOrigin {}, _) -> KeepWork  -- Case 2(b) from Note [Replacement vs keeping]
+
+           _ -> KeepInert  -- Case 2(d) from Note [Replacement vs keeping]
 
 {-
 Note [Replacement vs keeping]
@@ -580,7 +578,7 @@ solveOneFromTheOther.
 
   2) Constraints coming from the same level (i.e. same implication)
 
-       (a) If both are InstSCOrigin, choose the one with the smallest TypeSize,
+       (a) If both are GivenSCOrigin, choose the one that is unblocked if possible
            according to Note [Solving superclass constraints] in GHC.Tc.TyCl.Instance.
 
        (b) Prefer constraints that are not superclass selections. Example:
@@ -596,11 +594,12 @@ solveOneFromTheOther.
            Getting this wrong was #20602. See also
            Note [Tracking redundant constraints] in GHC.Tc.Solver.
 
-       (c) If both are superclass selections (but not both InstSCOrigin), choose the one
-           with the shallower superclass-selection depth, in the hope of identifying
-           more correct redundant constraints. This is really a generalization of
-           point (b), because the superclass depth of a non-superclass
-           constraint is 0.
+       (c) If both are GivenSCOrigin, chooose the one with the shallower
+           superclass-selection depth, in the hope of identifying more correct
+           redundant constraints. This is really a generalization of point (b),
+           because the superclass depth of a non-superclass constraint is 0.
+
+           (If the levels differ, we definitely won't have both with GivenSCOrigin.)
 
        (d) Finally, when there is still a choice, use KeepInert rather than
            KeepWork, for two reasons:
@@ -663,11 +662,12 @@ interactIrred inerts ct_w@(CIrredCan { cc_ev = ev_w, cc_reason = reason })
   , ((ct_i, swap) : _rest) <- bagToList matching_irreds
         -- See Note [Multiple matching irreds]
   , let ev_i = ctEvidence ct_i
-  = do { what_next <- solveOneFromTheOther ct_i ct_w
-       ; traceTcS "iteractIrred" (ppr ct_w $$ ppr what_next $$ ppr ct_i)
-       ; case what_next of
+  = do { traceTcS "iteractIrred" $
+         vcat [ text "wanted:" <+> (ppr ct_w $$ ppr (ctOrigin ct_w))
+              , text "inert: " <+> (ppr ct_i $$ ppr (ctOrigin ct_i)) ]
+       ; case solveOneFromTheOther ct_i ct_w of
             KeepInert -> do { setEvBindIfWanted ev_w (swap_me swap ev_i)
-                            ; return (Stop ev_w (text "Irred equal" <+> parens (ppr what_next))) }
+                            ; return (Stop ev_w (text "Irred equal:KeepInert" <+> ppr ct_w)) }
             KeepWork ->  do { setEvBindIfWanted ev_i (swap_me swap ev_w)
                             ; updInertIrreds (\_ -> others)
                             ; continueWith ct_w } }
@@ -680,7 +680,7 @@ interactIrred inerts ct_w@(CIrredCan { cc_ev = ev_w, cc_reason = reason })
     swap_me swap ev
       = case swap of
            NotSwapped -> ctEvTerm ev
-           IsSwapped  -> evCoercion (mkTcSymCo (evTermCoercion (ctEvTerm ev)))
+           IsSwapped  -> evCoercion (mkSymCo (evTermCoercion (ctEvTerm ev)))
 
 interactIrred _ wi = pprPanic "interactIrred" (ppr wi)
 
@@ -921,7 +921,7 @@ Note that:
   cannot be solved from instances.
 
 * The (EvBindMap, DictMap CtEvidence) is an accumulating purely-functional
-  state that allows try_solve_from_instance to augmennt the evidence
+  state that allows try_solve_from_instance to augment the evidence
   bindings and inert_solved_dicts as it goes.
 
   If it succeeds, we commit all these bindings and solved dicts to the
@@ -994,7 +994,7 @@ We ingore such fundeps for several reasons:
       [W] iss ~ is2 : beta
 
    Again we can't prove that equality; and worse we'll rewrite iss to
-   (is2:beta) in deeply nested contraints inside this implication,
+   (is2:beta) in deeply nested constraints inside this implication,
    where beta is untouchable (under other equality constraints), leading
    to other insoluble constraints.
 
@@ -1005,7 +1005,9 @@ and Given/instance fundeps entirely.
 interactDict :: InertCans -> Ct -> TcS (StopOrContinue Ct)
 interactDict inerts ct_w@(CDictCan { cc_ev = ev_w, cc_class = cls, cc_tyargs = tys })
   | Just ct_i <- lookupInertDict inerts (ctEvLoc ev_w) cls tys
-  , let ev_i = ctEvidence ct_i
+  , let ev_i  = ctEvidence ct_i
+        loc_i = ctEvLoc ev_i
+        loc_w = ctEvLoc ev_w
   = -- There is a matching dictionary in the inert set
     do { -- First to try to solve it /completely/ from top level instances
          -- See Note [Shortcut solving]
@@ -1013,16 +1015,24 @@ interactDict inerts ct_w@(CDictCan { cc_ev = ev_w, cc_class = cls, cc_tyargs = t
        ; short_cut_worked <- shortCutSolver dflags ev_w ev_i
        ; if short_cut_worked
          then stopWith ev_w "interactDict/solved from instance"
-         else
 
-    do { -- Ths short-cut solver didn't fire, so we
-         -- solve ev_w from the matching inert ev_i we found
-         what_next <- solveOneFromTheOther ct_i ct_w
-       ; traceTcS "lookupInertDict" (ppr what_next)
-       ; case what_next of
-           KeepInert -> do { setEvBindIfWanted ev_w (ctEvTerm ev_i)
-                           ; return $ Stop ev_w (text "Dict equal" <+> parens (ppr what_next)) }
-           KeepWork  -> do { setEvBindIfWanted ev_i (ctEvTerm ev_w)
+         -- Next see if we are in "loopy-superclass" land.  If so,
+         -- we don't want to replace the (Given) inert with the
+         -- (Wanted) work-item, or vice versa; we want to hang on
+         -- to both, and try to solve the work-item via an instance.
+         -- See Note [Solving superclass constraints] in GHC.Tc.TyCl.Instance
+         else if prohibitedSuperClassSolve loc_i loc_w
+         then continueWith ct_w
+         else
+    do { -- The short-cut solver didn't fire, and loopy superclasses
+         -- are dealt with, so we can either solve
+         -- the inert from the work-item or vice-versa.
+       ; case solveOneFromTheOther ct_i ct_w of
+           KeepInert -> do { traceTcS "lookupInertDict:KeepInert" (ppr ct_w)
+                           ; setEvBindIfWanted ev_w (ctEvTerm ev_i)
+                           ; return $ Stop ev_w (text "Dict equal" <+> ppr ct_w) }
+           KeepWork  -> do { traceTcS "lookupInertDict:KeepWork" (ppr ct_w)
+                           ; setEvBindIfWanted ev_i (ctEvTerm ev_w)
                            ; updInertDicts $ \ ds -> delDict ds cls tys
                            ; continueWith ct_w } } }
 
@@ -1393,7 +1403,7 @@ We generate these Wanteds in three places, depending on how we notice the
 injectivity.
 
 1. When we have a [W] F tys1 ~ F tys2. This is handled in canEqCanLHS2, and
-described in Note [Decomposing equality] in GHC.Tc.Solver.Canonical.
+described in Note [Decomposing type family applications] in GHC.Tc.Solver.Canonical.
 
 2. When we have [W] F tys1 ~ T and [W] F tys2 ~ T. Note that neither of these
 constraints rewrites the other, as they have different LHSs. This is done
@@ -1469,7 +1479,7 @@ But it's not so simple:
 
   That first argument is invisible in the source program (aside from
   visible type application), so we'd much prefer to get the error from
-  the second. We track visiblity in the uo_visible field of a TypeEqOrigin.
+  the second. We track visibility in the uo_visible field of a TypeEqOrigin.
   We use this to prioritise visible errors (see GHC.Tc.Errors.tryReporters,
   the partition on isVisibleOrigin).
 
@@ -1531,10 +1541,10 @@ interactEq inerts workItem@(CEqCan { cc_lhs = lhs
                                    , cc_eq_rel = eq_rel })
   | Just (ev_i, swapped) <- inertsCanDischarge inerts workItem
   = do { setEvBindIfWanted ev $
-         evCoercion (maybeTcSymCo swapped $
-                     tcDowngradeRole (eqRelRole eq_rel)
-                                     (ctEvRole ev_i)
-                                     (ctEvCoercion ev_i))
+         evCoercion (maybeSymCo swapped $
+                     downgradeRole (eqRelRole eq_rel)
+                                   (ctEvRole ev_i)
+                                   (ctEvCoercion ev_i))
 
        ; stopWith ev "Solved from inert" }
 
@@ -1596,10 +1606,10 @@ solveByUnification wd tv xi
        ; traceTcS "Sneaky unification:" $
                        vcat [text "Unifies:" <+> ppr tv <+> text ":=" <+> ppr xi,
                              text "Coercion:" <+> pprEq tv_ty xi,
-                             text "Left Kind is:" <+> ppr (tcTypeKind tv_ty),
-                             text "Right Kind is:" <+> ppr (tcTypeKind xi) ]
+                             text "Left Kind is:" <+> ppr (typeKind tv_ty),
+                             text "Right Kind is:" <+> ppr (typeKind xi) ]
        ; unifyTyVar tv xi
-       ; setEvBindIfWanted wd (evCoercion (mkTcNomReflCo xi))
+       ; setEvBindIfWanted wd (evCoercion (mkNomReflCo xi))
        ; n_kicked <- kickOutAfterUnification tv
        ; return (Stop wd (text "Solved by unification" <+> pprKicked n_kicked)) }
 
@@ -1734,8 +1744,12 @@ Then it is solvable, but its very hard to detect this on the spot.
 It's exactly the same with implicit parameters, except that the
 "aggressive" approach would be much easier to implement.
 
-Note [Fundeps with instances]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Note [Fundeps with instances, and equality orientation]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+This Note describes a delicate interaction that constrains the orientation of
+equalities. This one is about fundeps, but the /exact/ same thing arises for
+type-family injectivity constraints: see Note [Improvement orientation].
+
 doTopFundepImprovement compares the constraint with all the instance
 declarations, to see if we can produce any equalities. E.g
    class C2 a b | a -> b
@@ -1749,52 +1763,122 @@ There is a nasty corner in #19415 which led to the typechecker looping:
 
    work_item: dwrk :: C (T @ka (a::ka)) (T @kb0 (b0::kb0)) Char
       where kb0, b0 are unification vars
-   ==> {fundeps against instance; k0, y0 fresh unification vars}
-       [W] T kb0 (b0::kb0) ~ T k0 (y0::k0)
-       Add dwrk to inert set
-   ==> {solve that equality kb0 := k0, b0 := y0
+
+   ==> {doTopFundepImprovement: compare work_item with instance,
+        generate /fresh/ unification variables kfresh0, yfresh0,
+        emit a new Wanted, and add dwrk to inert set}
+
+   Suppose we emit this new Wanted from the fundep:
+       [W] T kb0 (b0::kb0) ~ T kfresh0 (yfresh0::kfresh0)
+
+   ==> {solve that equality kb0 := kfresh0, b0 := yfresh0}
    Now kick out dwrk, since it mentions kb0
    But now we are back to the start!  Loop!
 
-NB1: this example relies on an instance that does not satisfy
-the coverage condition (although it may satisfy the weak coverage
-condition), which is known to lead to termination trouble
+NB1: This example relies on an instance that does not satisfy the
+     coverage condition (although it may satisfy the weak coverage
+     condition), and hence whose fundeps generate fresh unification
+     variables.  Not satisfying the coverage condition is known to
+     lead to termination trouble, but in this case it's plain silly.
 
-NB2: if the unification was the other way round, k0:=kb0, all would be
-well.  It's a very delicate problem.
+NB2: In this example, the third parameter to C ensures that the
+     instance doesn't actually match the Wanted, so we can't use it to
+     solve the Wanted
 
-The ticket #19415 discusses various solutions, but the one we adopted
-is very simple:
+We solve the problem by (#21703):
 
-* There is a flag in CDictCan (cc_fundeps :: Bool)
+    carefully orienting the new Wanted so that all the
+    freshly-generated unification variables are on the LHS.
 
-* cc_fundeps = True means
-    a) The class has fundeps
-    b) We have not had a successful hit against instances yet
+    Thus we emit
+       [W] T kfresh0 (yfresh0::kfresh0) ~ T kb0 (b0::kb0)
+    and /NOT/
+       [W] T kb0 (b0::kb0) ~ T kfresh0 (yfresh0::kfresh0)
 
-* In doTopFundepImprovement, if we emit some constraints we flip the flag
-  to False, so that we won't try again with the same CDictCan.  In our
-  example, dwrk will have its flag set to False.
+Now we'll unify kfresh0:=kb0, yfresh0:=b0, and all is well.  The general idea
+is that we want to preferentially eliminate those freshly-generated
+unification variables, rather than unifying older variables, which causes
+kick-out etc.
 
-* Not that if we have no "hits" we must /not/ flip the flag. We might have
-      dwrk :: C alpha beta Char
-  which does not yet trigger fundeps from the instance, but later we
-  get alpha := T ka a.  We could be cleverer, and spot that the constraint
-  is such that we will /never/ get any hits (no unifiers) but we don't do
-  that yet.
+Keeping younger variables on the left also gives very minor improvement in
+the compiler performance by having less kick-outs and allocations (-0.1% on
+average).  Indeed Historical Note [Eliminate younger unification variables]
+in GHC.Tc.Utils.Unify describes an earlier attempt to do so systematically,
+apparently now in abeyance.
 
-Easy!  What could go wrong?
-* Maybe the class has multiple fundeps, and we get hit with one but not
-  the other.  Per-fundep flags?
-* Maybe we get a hit against one instance with one fundep but, after
-  the work-item is instantiated a bit more, we get a second hit
-  against a second instance.  (This is a pretty strange and
-  undesirable thing anyway, and can only happen with overlapping
-  instances; one example is in Note [Weird fundeps].)
+But this is is a delicate solution. We must take care to /preserve/
+orientation during solving. Wrinkles:
 
-But both of these seem extremely exotic, and ignoring them threatens
-completeness (fixable with some type signature), but not termination
-(not fixable).  So for now we are just doing the simplest thing.
+(W1) We start with
+       [W] T kfresh0 (yfresh0::kfresh0) ~ T kb0 (b0::kb0)
+     Decompose to
+       [W] kfresh0 ~ kb0
+       [W] (yfresh0::kfresh0) ~ (b0::kb0)
+     Preserve orientiation when decomposing!!
+
+(W2) Suppose we happen to tackle the second Wanted from (W1)
+     first. Then in canEqCanLHSHetero we emit a /kind/ equality, as
+     well as a now-homogeneous type equality
+       [W] kco : kfresh0 ~ kb0
+       [W] (yfresh0::kfresh0) ~ (b0::kb0) |> (sym kco)
+     Preserve orientation in canEqCanLHSHetero!!  (Failing to
+     preserve orientation here was the immediate cause of #21703.)
+
+(W3) There is a potential interaction with the swapping done by
+     GHC.Tc.Utils.Unify.swapOverTyVars.  We think it's fine, but it's
+     a slight worry.  See especially Note [TyVar/TyVar orientation] in
+     that module.
+
+The trouble is that "preserving orientation" is a rather global invariant,
+and sometimes we definitely do want to swap (e.g. Int ~ alpha), so we don't
+even have a precise statement of what the invariant is.  The advantage
+of the preserve-orientation plan is that it is extremely cheap to implement,
+and apparently works beautifully.
+
+--- Alternative plan (1) ---
+Rather than have an ill-defined invariant, another possiblity is to
+elminate those fresh unification variables at birth, when generating
+the new fundep-inspired equalities.
+
+The key idea is to call `instFlexiX` in `emitFunDepWanteds` on only those
+type variables that are guaranteed to give us some progress. This means we
+have to locally (without calling emitWanteds) identify the type variables
+that do not give us any progress.  In the above example, we _know_ that
+emitting the two wanteds `kco` and `co` is fruitless.
+
+  Q: How do we identify such no-ops?
+
+  1. Generate a matching substitution from LHS to RHS
+        ɸ = [kb0 :-> k0, b0 :->  y0]
+  2. Call `instFlexiX` on only those type variables that do not appear in the domain of ɸ
+        ɸ' = instFlexiX ɸ (tvs - domain ɸ)
+  3. Apply ɸ' on LHS and then call emitWanteds
+        unifyWanteds ... (subst ɸ' LHS) RHS
+
+Why will this work?  The matching substitution ɸ will be a best effort
+substitution that gives us all the easy solutions. It can be generated with
+modified version of `Core/Unify.unify_tys` where we run it in a matching mode
+and never generate `SurelyApart` and always return a `MaybeApart Subst`
+instead.
+
+The same alternative plan would work for type-family injectivity constraints:
+see Note [Improvement orientation].
+--- End of Alternative plan (1) ---
+
+--- Alternative plan (2) ---
+We could have a new flavour of TcTyVar (like `TauTv`, `TyVarTv` etc; see GHC.Tc.Utils.TcType.MetaInfo)
+for the fresh unification variables introduced by functional dependencies.  Say `FunDepTv`.  Then in
+GHC.Tc.Utils.Unify.swapOverTyVars we could arrange to keep a `FunDepTv` on the left if possible.
+Looks possible, but it's one more complication.
+--- End of Alternative plan (2) ---
+
+
+--- Historical note: Failed Alternative Plan (3) ---
+Previously we used a flag `cc_fundeps` in `CDictCan`. It would flip to False
+once we used a fun dep to hint the solver to break and to stop emitting more
+wanteds.  This solution was not complete, and caused a failures while trying
+to solve for transitive functional dependencies (test case: T21703)
+-- End of Historical note: Failed Alternative Plan (3) --
 
 Note [Weird fundeps]
 ~~~~~~~~~~~~~~~~~~~~
@@ -1818,25 +1902,17 @@ as the fundeps.
 #7875 is a case in point.
 -}
 
-doTopFundepImprovement :: Ct -> TcS (StopOrContinue Ct)
--- Try to functional-dependency improvement betweeen the constraint
+doTopFundepImprovement :: Ct -> TcS ()
+-- Try to functional-dependency improvement between the constraint
 -- and the top-level instance declarations
--- See Note [Fundeps with instances]
+-- See Note [Fundeps with instances, and equality orientation]
 -- See also Note [Weird fundeps]
 doTopFundepImprovement work_item@(CDictCan { cc_ev = ev, cc_class = cls
-                                           , cc_tyargs = xis
-                                           , cc_fundeps = has_fds })
-  | has_fds
+                                           , cc_tyargs = xis })
   = do { traceTcS "try_fundeps" (ppr work_item)
        ; instEnvs <- getInstEnvs
        ; let fundep_eqns = improveFromInstEnv instEnvs mk_ct_loc cls xis
-       ; case fundep_eqns of
-           [] -> continueWith work_item  -- No improvement
-           _  -> do { emitFunDepWanteds (ctEvRewriters ev) fundep_eqns
-                    ; continueWith (work_item { cc_fundeps = False }) } }
-  | otherwise
-  = continueWith work_item
-
+       ; emitFunDepWanteds (ctEvRewriters ev) fundep_eqns }
   where
      dict_pred   = mkClassPred cls xis
      dict_loc    = ctEvLoc ev
@@ -1853,8 +1929,11 @@ doTopFundepImprovement work_item@(CDictCan { cc_ev = ev, cc_class = cls
 doTopFundepImprovement work_item = pprPanic "doTopFundepImprovement" (ppr work_item)
 
 emitFunDepWanteds :: RewriterSet  -- from the work item
-                   -> [FunDepEqn (CtLoc, RewriterSet)] -> TcS ()
+                  -> [FunDepEqn (CtLoc, RewriterSet)] -> TcS ()
+
+emitFunDepWanteds _ [] = return () -- common case noop
 -- See Note [FunDep and implicit parameter reactions]
+
 emitFunDepWanteds work_rewriters fd_eqns
   = mapM_ do_one_FDEqn fd_eqns
   where
@@ -1867,15 +1946,24 @@ emitFunDepWanteds work_rewriters fd_eqns
 
      | otherwise
      = do { traceTcS "emitFunDepWanteds 2" (ppr (ctl_depth loc) $$ ppr tvs $$ ppr eqs)
-          ; subst <- instFlexi tvs  -- Takes account of kind substitution
+          ; subst <- instFlexiX emptySubst tvs  -- Takes account of kind substitution
           ; mapM_ (do_one_eq loc all_rewriters subst) (reverse eqs) }
                -- See Note [Reverse order of fundep equations]
      where
        all_rewriters = work_rewriters S.<> rewriters
 
     do_one_eq loc rewriters subst (Pair ty1 ty2)
-       = unifyWanted rewriters loc Nominal
-                     (Type.substTyUnchecked subst ty1) (Type.substTyUnchecked subst ty2)
+       = unifyWanted rewriters loc Nominal (substTyUnchecked subst' ty1) ty2
+         -- ty2 does not mention fd_qtvs, so no need to subst it.
+         -- See GHC.Tc.Instance.Fundeps Note [Improving against instances]
+         --     Wrinkle (1)
+      where
+         subst' = extendSubstInScopeSet subst (tyCoVarsOfType ty1)
+         -- The free vars of ty1 aren't just fd_qtvs: ty1 is the result
+         -- of matching with the [W] constraint. So we add its free
+         -- vars to InScopeSet, to satisfy substTy's invariants, even
+         -- though ty1 will never (currently) be a poytype, so this
+         -- InScopeSet will never be looked at.
 
 {-
 **********************************************************************
@@ -1938,7 +2026,7 @@ doTopReactOther work_item
 ********************************************************************-}
 
 doTopReactEqPred :: Ct -> EqRel -> TcType -> TcType -> TcS (StopOrContinue Ct)
-doTopReactEqPred work_item eq_rel t1 t2
+doTopReactEqPred work_item eq_rel lhs rhs
   -- See Note [Looking up primitive equalities in quantified constraints]
   = do { ev_binds_var <- getTcEvBindsVar
        ; ics <- getInertCans
@@ -1946,15 +2034,14 @@ doTopReactEqPred work_item eq_rel t1 t2
          && not (null (inert_insts ics))      -- Shortcut common case
          && not (isCoEvBindsVar ev_binds_var) -- See Note [Instances in no-evidence implications]
          then try_for_qci
-         else continueWith work_item}
+         else continueWith work_item }
   where
     ev   = ctEvidence work_item
     loc = ctEvLoc ev
 
     role = eqRelRole eq_rel
-
     try_for_qci  -- First try looking for (lhs ~ rhs)
-       | Just (cls, tys) <- boxEqPred eq_rel t1 t2
+       | Just (cls, tys) <- boxEqPred eq_rel lhs rhs
        = do { res <- matchLocalInst (mkClassPred cls tys) loc
             ; traceTcS "final_qci_check:1" (ppr (mkClassPred cls tys))
             ; case res of
@@ -1965,13 +2052,13 @@ doTopReactEqPred work_item eq_rel t1 t2
        = continueWith work_item
 
     try_swapping  -- Now try looking for (rhs ~ lhs)  (see #23333)
-       | Just (cls, tys) <- boxEqPred eq_rel t2 t1
+       | Just (cls, tys) <- boxEqPred eq_rel rhs lhs
        = do { res <- matchLocalInst (mkClassPred cls tys) loc
             ; traceTcS "final_qci_check:2" (ppr (mkClassPred cls tys))
             ; case res of
                 OneInst { cir_mk_ev = mk_ev }
                   -> do { ev' <- rewriteEqEvidence emptyRewriterSet ev IsSwapped
-                                      (mkReflRedn role t2) (mkReflRedn role t1)
+                                      (mkReflRedn role rhs) (mkReflRedn role lhs)
                         ; chooseInstance ev' (res { cir_mk_ev = mk_eq_ev cls tys mk_ev }) }
                 _ -> do { traceTcS "final_qci_check:3" (ppr work_item)
                         ; continueWith work_item }}
@@ -2097,13 +2184,15 @@ improve_top_fun_eqs fam_envs fam_tc args rhs_ty
   = return []
 
   where
+      in_scope = mkInScopeSet (tyCoVarsOfType rhs_ty)
+
       buildImprovementData
           :: [a]                     -- axioms for a TF (FamInst or CoAxBranch)
           -> (a -> [TyVar])          -- get bound tyvars of an axiom
           -> (a -> [Type])           -- get LHS of an axiom
           -> (a -> Type)             -- get RHS of an axiom
           -> (a -> Maybe CoAxBranch) -- Just => apartness check required
-          -> [( [Type], TCvSubst, [TyVar], Maybe CoAxBranch )]
+          -> [( [Type], Subst, [TyVar], Maybe CoAxBranch )]
              -- Result:
              -- ( [arguments of a matching axiom]
              -- , RHS-unifying substitution
@@ -2115,14 +2204,15 @@ improve_top_fun_eqs fam_envs fam_tc args rhs_ty
           , let ax_args = axiomLHS axiom
                 ax_rhs  = axiomRHS axiom
                 ax_tvs  = axiomTVs axiom
-          , Just subst <- [tcUnifyTyWithTFs False ax_rhs rhs_ty]
+                in_scope1 = in_scope `extendInScopeSetList` ax_tvs
+          , Just subst <- [tcUnifyTyWithTFs False in_scope1 ax_rhs rhs_ty]
           , let notInSubst tv = not (tv `elemVarEnv` getTvSubstEnv subst)
                 unsubstTvs    = filter (notInSubst <&&> isTyVar) ax_tvs ]
                    -- The order of unsubstTvs is important; it must be
                    -- in telescope order e.g. (k:*) (a:k)
 
       injImproveEqns :: [Bool]
-                     -> ([Type], TCvSubst, [TyCoVar], Maybe CoAxBranch)
+                     -> ([Type], Subst, [TyCoVar], Maybe CoAxBranch)
                      -> TcS [TypeEqn]
       injImproveEqns inj_args (ax_args, subst, unsubstTvs, cabr)
         = do { subst <- instFlexiX subst unsubstTvs
@@ -2131,7 +2221,7 @@ improve_top_fun_eqs fam_envs fam_tc args rhs_ty
                   -- be sure to apply the current substitution to a's kind.
                   -- Hence instFlexiX.   #13135 was an example.
 
-             ; return [ Pair (substTyUnchecked subst ax_arg) arg
+             ; return [ Pair (substTy subst ax_arg) arg
                         -- NB: the ax_arg part is on the left
                         -- see Note [Improvement orientation]
                       | case cabr of
@@ -2148,6 +2238,9 @@ we do *not* need to expand type synonyms because the matcher will do that for us
 
 Note [Improvement orientation]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+See also Note [Fundeps with instances, and equality orientation], which describes
+the Exact Same Prolem, with the same solution, but for functional dependencies.
+
 A very delicate point is the orientation of equalities
 arising from injectivity improvement (#12522).  Suppose we have
   type family F x = t | t -> x
@@ -2213,14 +2306,35 @@ doTopReactDict inerts work_item@(CDictCan { cc_ev = ev, cc_class = cls
                         ; chooseInstance ev lkup_res }
                _  -> -- NoInstance or NotSure
                      -- We didn't solve it; so try functional dependencies with
-                     -- the instance environment, and return
-                     doTopFundepImprovement work_item }
+                     -- the instance environment
+                     do { doTopFundepImprovement work_item
+                        ; tryLastResortProhibitedSuperclass inerts work_item } }
    where
      dict_loc = ctEvLoc ev
 
 
 doTopReactDict _ w = pprPanic "doTopReactDict" (ppr w)
 
+-- | As a last resort, we TEMPORARILY allow a prohibited superclass solve,
+-- emitting a loud warning when doing so: we might be creating non-terminating
+-- evidence (as we are in T22912 for example).
+--
+-- See Note [Migrating away from loopy superclass solving] in GHC.Tc.TyCl.Instance.
+tryLastResortProhibitedSuperclass :: InertSet -> Ct -> TcS (StopOrContinue Ct)
+tryLastResortProhibitedSuperclass inerts
+    work_item@(CDictCan { cc_ev = ev_w, cc_class = cls, cc_tyargs = xis })
+  | let loc_w  = ctEvLoc ev_w
+        orig_w = ctLocOrigin loc_w
+  , ScOrigin _ NakedSc <- orig_w   -- work_item is definitely Wanted
+  , Just ct_i <- lookupInertDict (inert_cans inerts) loc_w cls xis
+  , let ev_i = ctEvidence ct_i
+  , isGiven ev_i
+  = do { setEvBindIfWanted ev_w (ctEvTerm ev_i)
+       ; ctLocWarnTcS loc_w $
+         TcRnLoopySuperclassSolve loc_w (ctPred work_item)
+       ; return $ Stop ev_w (text "Loopy superclass") }
+tryLastResortProhibitedSuperclass _ work_item
+  = continueWith work_item
 
 chooseInstance :: CtEvidence -> ClsInstResult -> TcS (StopOrContinue Ct)
 chooseInstance work_item
@@ -2237,8 +2351,8 @@ chooseInstance work_item
        ; emitWorkNC (freshGoals evc_vars)
        ; stopWith work_item "Dict/Top (solved wanted)" }
   where
-     pred = ctEvPred work_item
-     loc  = ctEvLoc work_item
+     pred       = ctEvPred work_item
+     loc        = ctEvLoc work_item
 
 chooseInstance work_item lookup_res
   = pprPanic "chooseInstance" (ppr work_item $$ ppr lookup_res)
@@ -2256,11 +2370,33 @@ checkInstanceOK loc what pred
      origin     = ctLocOrigin loc
 
      zap_origin loc  -- After applying an instance we can set ScOrigin to
-                     -- infinity, so that prohibitedSuperClassSolve never fires
-       | ScOrigin {} <- origin
-       = setCtLocOrigin loc (ScOrigin infinity)
+                     -- NotNakedSc, so that prohibitedSuperClassSolve never fires
+                     -- See Note [Solving superclass constraints] in
+                     -- GHC.Tc.TyCl.Instance, (sc1).
+       | ScOrigin what _ <- origin
+       = setCtLocOrigin loc (ScOrigin what NotNakedSc)
        | otherwise
        = loc
+
+{- Note [Instances in no-evidence implications]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In #15290 we had
+  [G] forall p q. Coercible p q => Coercible (m p) (m q))
+  [W] forall <no-ev> a. m (Int, IntStateT m a)
+                          ~R#
+                        m (Int, StateT Int m a)
+
+The Given is an ordinary quantified constraint; the Wanted is an implication
+equality that arises from
+  [W] (forall a. t1) ~R# (forall a. t2)
+
+But because the (t1 ~R# t2) is solved "inside a type" (under that forall a)
+we can't generate any term evidence.  So we can't actually use that
+lovely quantified constraint.  Alas!
+
+This test arranges to ignore the instance-based solution under these
+(rare) circumstances.   It's sad, but I  really don't see what else we can do.
+-}
 
 
 matchClassInst :: DynFlags -> InertSet
@@ -2273,11 +2409,9 @@ matchClassInst dflags inerts clas tys loc
 -- See Note [Instance and Given overlap]
   | not (xopt LangExt.IncoherentInstances dflags)
   , not (naturallyCoherentClass clas)
-  , let matchable_givens = matchableGivens loc pred inerts
-  , not (isEmptyBag matchable_givens)
+  , not (noMatchableGivenDicts inerts loc clas tys)
   = do { traceTcS "Delaying instance application" $
-           vcat [ text "Work item=" <+> pprClassPred clas tys
-                , text "Potential matching givens:" <+> ppr matchable_givens ]
+           vcat [ text "Work item=" <+> pprClassPred clas tys ]
        ; return NotSure }
 
   | otherwise
@@ -2303,7 +2437,7 @@ matchClassInst dflags inerts clas tys loc
 -- | If a class is "naturally coherent", then we needn't worry at all, in any
 -- way, about overlapping/incoherent instances. Just solve the thing!
 -- See Note [Naturally coherent classes]
--- See also Note [The equality class story] in "GHC.Builtin.Types.Prim".
+-- See also Note [The equality types story] in GHC.Builtin.Types.Prim.
 naturallyCoherentClass :: Class -> Bool
 naturallyCoherentClass cls
   = isCTupleClass cls
@@ -2429,7 +2563,7 @@ And less obviously to:
       instance (c1, c2) => (% c1, c2 %)
   Example in #14218
 
-Exammples: T5853, T10432, T5315, T9222, T2627b, T3028b
+Examples: T5853, T10432, T5315, T9222, T2627b, T3028b
 
 PS: the term "naturally coherent" doesn't really seem helpful.
 Perhaps "invertible" or something?  I left it for now though.
@@ -2454,7 +2588,7 @@ will be constructed by GHC at a call site... from the very instances
 that unify with it here.  It is not like an incoherent user-written
 instance which might have utterly different behaviour.
 
-Consdider  f :: Eq a => blah.  If we have [W] Eq a, we certainly
+Consider  f :: Eq a => blah.  If we have [W] Eq a, we certainly
 get it from the Eq a context, without worrying that there are
 lots of top-level instances that unify with [W] Eq a!  We'll use
 those instances to build evidence to pass to f. That's just the
@@ -2467,110 +2601,236 @@ matchLocalInst :: TcPredType -> CtLoc -> TcS ClsInstResult
 matchLocalInst pred loc
   = do { inerts@(IS { inert_cans = ics }) <- getTcSInerts
        ; case match_local_inst inerts (inert_insts ics) of
-           ([], Nothing) -> do { traceTcS "No local instance for" (ppr pred)
-                               ; return NoInstance }
+          { ([], []) -> do { traceTcS "No local instance for" (ppr pred)
+                           ; return NoInstance }
+          ; (matches, unifs) ->
+    do { matches <- mapM mk_instDFun matches
+       ; unifs   <- mapM mk_instDFun unifs
+         -- See Note [Use only the best matching quantified constraint]
+       ; case dominatingMatch matches of
+          { Just (dfun_id, tys, theta)
+            | all ((theta `impliedBySCs`) . thdOf3) unifs
+            ->
+            do { let result = OneInst { cir_new_theta = theta
+                                      , cir_mk_ev     = evDFunApp dfun_id tys
+                                      , cir_what      = LocalInstance }
+               ; traceTcS "Best local instance found:" $
+                  vcat [ text "pred:" <+> ppr pred
+                       , text "result:" <+> ppr result
+                       , text "matches:" <+> ppr matches
+                       , text "unifs:" <+> ppr unifs ]
+               ; return result }
 
-             -- See Note [Use only the best local instance] about
-             -- superclass depths
-           (matches, unifs)
-             | [(dfun_ev, inst_tys)] <- best_matches
-             , maybe True (> min_sc_depth) unifs
-             -> do { let dfun_id = ctEvEvId dfun_ev
-                   ; (tys, theta) <- instDFunType dfun_id inst_tys
-                   ; let result = OneInst { cir_new_theta = theta
-                                          , cir_mk_ev     = evDFunApp dfun_id tys
-                                          , cir_what      = LocalInstance }
-                   ; traceTcS "Best local inst found:" (ppr result)
-                   ; traceTcS "All local insts:" (ppr matches)
-                   ; return result }
-
-             | otherwise
-             -> do { traceTcS "Multiple local instances for" (ppr pred)
-                   ; return NotSure }
-
-             where
-               extract_depth = sc_depth . ctEvLoc . fst
-               min_sc_depth = minimum (map extract_depth matches)
-               best_matches = filter ((== min_sc_depth) . extract_depth) matches }
+          ; mb_best ->
+            do { traceTcS "Multiple local instances; not committing to any"
+                  $ vcat [ text "pred:" <+> ppr pred
+                         , text "matches:" <+> ppr matches
+                         , text "unifs:" <+> ppr unifs
+                         , text "best_match:" <+> ppr mb_best ]
+               ; return NotSure }}}}}
   where
     pred_tv_set = tyCoVarsOfType pred
 
-    sc_depth :: CtLoc -> Int
-    sc_depth ctloc = case ctLocOrigin ctloc of
-      InstSCOrigin depth _  -> depth
-      OtherSCOrigin depth _ -> depth
-      _                     -> 0
+    mk_instDFun :: (CtEvidence, [DFunInstType]) -> TcS InstDFun
+    mk_instDFun (ev, tys) =
+      let dfun_id = ctEvEvId ev
+      in do { (tys, theta) <- instDFunType (ctEvEvId ev) tys
+            ; return (dfun_id, tys, theta) }
 
-    -- See Note [Use only the best local instance] about superclass depths
+    -- Compute matching and unifying local instances
     match_local_inst :: InertSet
                      -> [QCInst]
                      -> ( [(CtEvidence, [DFunInstType])]
-                        , Maybe Int )   -- Nothing ==> no unifying local insts
-                                        -- Just n ==> unifying local insts, with
-                                        --            minimum superclass depth
-                                        --            of n
+                        , [(CtEvidence, [DFunInstType])] )
     match_local_inst _inerts []
-      = ([], Nothing)
-    match_local_inst inerts (qci@(QCI { qci_tvs = qtvs, qci_pred = qpred
-                               , qci_ev = qev })
-                             : qcis)
+      = ([], [])
+    match_local_inst inerts (qci@(QCI { qci_tvs  = qtvs
+                                      , qci_pred = qpred
+                                      , qci_ev   = qev })
+                            :qcis)
       | let in_scope = mkInScopeSet (qtv_set `unionVarSet` pred_tv_set)
       , Just tv_subst <- ruleMatchTyKiX qtv_set (mkRnEnv2 in_scope)
                                         emptyTvSubstEnv qpred pred
       , let match = (qev, map (lookupVarEnv tv_subst) qtvs)
-      = (match:matches, unif)
+      = (match:matches, unifs)
 
       | otherwise
       = assertPpr (disjointVarSet qtv_set (tyCoVarsOfType pred))
                   (ppr qci $$ ppr pred)
             -- ASSERT: unification relies on the
             -- quantified variables being fresh
-        (matches, unif `combine` this_unif)
+        (matches, this_unif `combine` unifs)
       where
         qloc = ctEvLoc qev
         qtv_set = mkVarSet qtvs
+        (matches, unifs) = match_local_inst inerts qcis
         this_unif
-          | mightEqualLater inerts qpred qloc pred loc = Just (sc_depth qloc)
-          | otherwise = Nothing
-        (matches, unif) = match_local_inst inerts qcis
+          | Just subst <- mightEqualLater inerts qpred qloc pred loc
+          = Just (qev, map  (lookupTyVar subst) qtvs)
+          | otherwise
+          = Nothing
 
-        combine Nothing  Nothing    = Nothing
-        combine (Just n) Nothing    = Just n
-        combine Nothing  (Just n)   = Just n
-        combine (Just n1) (Just n2) = Just (n1 `min` n2)
+        combine Nothing  us = us
+        combine (Just u) us = u : us
 
-{- Note [Use only the best local instance]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+-- | Instance dictionary function and type.
+type InstDFun = (DFunId, [TcType], TcThetaType)
+
+-- | Try to find a local quantified instance that dominates all others,
+-- i.e. which has a weaker instance context than all the others.
+--
+-- See Note [Use only the best matching quantified constraint].
+dominatingMatch :: [InstDFun] -> Maybe InstDFun
+dominatingMatch matches =
+  listToMaybe $ mapMaybe (uncurry go) (holes matches)
+  -- listToMaybe: arbitrarily pick any one context that is weaker than
+  -- all others, e.g. so that we can handle [Eq a, Num a] vs [Num a, Eq a]
+  -- (see test case T22223).
+
+  where
+    go :: InstDFun -> [InstDFun] -> Maybe InstDFun
+    go this [] = Just this
+    go this@(_,_,this_theta) ((_,_,other_theta):others)
+      | this_theta `impliedBySCs` other_theta
+      = go this others
+      | otherwise
+      = Nothing
+
+-- | Whether a collection of constraints is implied by another collection,
+-- according to a simple superclass check.
+--
+-- See Note [When does a quantified instance dominate another?].
+impliedBySCs :: TcThetaType -> TcThetaType -> Bool
+impliedBySCs c1 c2 = all in_c2 c1
+  where
+    in_c2 :: TcPredType -> Bool
+    in_c2 pred = any (pred `tcEqType`) c2_expanded
+
+    c2_expanded :: [TcPredType]  -- Includes all superclasses
+    c2_expanded = [ q | p <- c2, q <- p : transSuperClasses p ]
+
+
+{- Note [When does a quantified instance dominate another?]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+When matching local quantified instances, it's useful to be able to pick
+the one with the weakest precondition, e.g. if one has both
+
+  [G] d1: forall a b. ( Eq a, Num b, C a b  ) => D a b
+  [G] d2: forall a  .                C a Int  => D a Int
+  [W] {w}: D a Int
+
+Then it makes sense to use d2 to solve w, as doing so we end up with a strictly
+weaker proof obligation of `C a Int`, compared to `(Eq a, Num Int, C a Int)`
+were we to use d1.
+
+In theory, to compute whether one context implies another, we would need to
+recursively invoke the constraint solver. This is expensive, so we instead do
+a simple check using superclasses, implemented in impliedBySCs.
+
+Examples:
+
+ - [Eq a] is implied by [Ord a]
+ - [Ord a] is not implied by [Eq a],
+ - any context is implied by itself,
+ - the empty context is implied by any context.
+
+Note [Use only the best matching quantified constraint]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Consider (#20582) the ambiguity check for
   (forall a. Ord (m a), forall a. Semigroup a => Eq (m a)) => m Int
 
 Because of eager expansion of given superclasses, we get
-  [G] forall a. Ord (m a)
-  [G] forall a. Eq (m a)
-  [G] forall a. Semigroup a => Eq (m a)
+  [G] d1: forall a. Ord (m a)
+  [G] d2: forall a. Eq (m a)
+  [G] d3: forall a. Semigroup a => Eq (m a)
 
-  [W] forall a. Ord (m a)
-  [W] forall a. Semigroup a => Eq (m a)
+  [W] {w1}: forall a. Ord (m a)
+  [W] {w2}: forall a. Semigroup a => Eq (m a)
 
 The first wanted is solved straightforwardly. But the second wanted
-matches *two* local instances. Our general rule around multiple local
+matches *two* local instances: d2 and d3. Our general rule around multiple local
 instances is that we refuse to commit to any of them. However, that
 means that our type fails the ambiguity check. That's bad: the type
 is perfectly fine. (This actually came up in the wild, in the streamly
 library.)
 
-The solution is to prefer local instances with fewer superclass selections.
-So, matchLocalInst is careful to whittle down the matches only to the
-ones with the shallowest superclass depth, and also to worry about unifying
-local instances that are at that depth (or less).
+The solution is to prefer local instances which are easier to prove, meaning
+that they have a weaker precondition. In this case, the empty context
+of d2 is a weaker constraint than the "Semigroup a" context of d3, so we prefer
+using it when proving w2. This allows us to pass the ambiguity check here.
 
-By preferring these shallower local instances, we can use the last given
-listed above and pass the ambiguity check.
+Our criterion for solving a Wanted by matching local quantified instances is
+thus as follows:
 
-The instance-depth mechanism uses the same superclass depth
-information as described in Note [Replacement vs keeping], 2a.
+  - There is a matching local quantified instance that dominates all others
+    matches, in the sense of [When does a quantified instance dominate another?].
+    Any such match do, we pick it arbitrarily (the T22223 example below says why).
+  - This local quantified instance also dominates all the unifiers, as we
+    wouldn't want to commit to a single match when we might have multiple,
+    genuinely different matches after further unification takes place.
 
-Test case: typecheck/should_compile/T20582.
+Some other examples:
 
+
+  #15244:
+
+    f :: (C g, D g) => ....
+    class S g => C g where ...
+    class S g => D g where ...
+    class (forall a. Eq a => Eq (g a)) => S g where ...
+
+  Here, in f's RHS, there are two identical quantified constraints
+  available, one via the superclasses of C and one via the superclasses
+  of D. Given that each implies the other, we pick one arbitrarily.
+
+
+  #22216:
+
+    class Eq a
+    class Eq a => Ord a
+    class (forall b. Eq b => Eq (f b)) => Eq1 f
+    class (Eq1 f, forall b. Ord b => Ord (f b)) => Ord1 f
+
+  Suppose we have
+
+    [G] d1: Ord1 f
+    [G] d2: Eq a
+    [W] {w}: Eq (f a)
+
+  Superclass expansion of d1 gives us:
+
+    [G] d3 : Eq1 f
+    [G] d4 : forall b. Ord b => Ord (f b)
+
+  expanding d4 and d5 gives us, respectively:
+
+    [G] d5 : forall b. Eq  b => Eq (f b)
+    [G] d6 : forall b. Ord b => Eq (f b)
+
+  Now we have two matching local instances that we could use when solving the
+  Wanted. However, it's obviously silly to use d6, given that d5 provides us with
+  as much information, with a strictly weaker precondition. So we pick d5 to solve
+  w. If we chose d6, we would get [W] Ord a, which in this case we can't solve.
+
+
+  #22223:
+
+    [G] forall a b. (Eq a, Ord b) => C a b
+    [G] forall a b. (Ord b, Eq a) => C a b
+    [W] C x y
+
+  Here we should be free to pick either quantified constraint, as they are
+  equivalent up to re-ordering of the constraints in the context.
+  See also Note [Do not add duplicate quantified instances]
+  in GHC.Tc.Solver.Monad.
+
+Test cases:
+  typecheck/should_compile/T20582
+  quantified-constraints/T15244
+  quantified-constraints/T22216{a,b,c,d,e}
+  quantified-constraints/T22223
+
+Historical note: a previous solution was to instead pick the local instance
+with the least superclass depth (see Note [Replacement vs keeping]),
+but that doesn't work for the example from #22216.
 -}
-

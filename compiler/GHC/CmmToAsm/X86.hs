@@ -33,11 +33,12 @@ ncgX86_64 config = NcgImpl
    , canShortcut               = X86.canShortcut
    , shortcutStatics           = X86.shortcutStatics
    , shortcutJump              = X86.shortcutJump
-   , pprNatCmmDecl             = X86.pprNatCmmDecl config
+   , pprNatCmmDeclS            = X86.pprNatCmmDecl config
+   , pprNatCmmDeclH            = X86.pprNatCmmDecl config
    , maxSpillSlots             = X86.maxSpillSlots config
    , allocatableRegs           = X86.allocatableRegs platform
    , ncgAllocMoreStack         = X86.allocMoreStack platform
-   , ncgMakeFarBranches        = const id
+   , ncgMakeFarBranches        = \_p _i bs -> pure bs
    , extractUnwindPoints       = X86.extractUnwindPoints
    , invertCondBranches        = X86.invertCondBranches
    }
@@ -50,6 +51,7 @@ instance Instruction X86.Instr where
    patchRegsOfInstr        = X86.patchRegsOfInstr
    isJumpishInstr          = X86.isJumpishInstr
    jumpDestsOfInstr        = X86.jumpDestsOfInstr
+   canFallthroughTo        = X86.canFallthroughTo
    patchJumpInstr          = X86.patchJumpInstr
    mkSpillInstr            = X86.mkSpillInstr
    mkLoadInstr             = X86.mkLoadInstr

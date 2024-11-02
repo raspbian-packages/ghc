@@ -22,7 +22,6 @@
 void initScheduler (void);
 void exitScheduler (bool wait_foreign);
 void freeScheduler (void);
-void markScheduler (evac_fn evac, void *user);
 
 // Place a new thread on the run queue of the current Capability
 void scheduleThread (Capability *cap, StgTSO *tso);
@@ -135,14 +134,6 @@ getRecentActivity(void)
     return RELAXED_LOAD_ALWAYS(&recent_activity);
 }
 
-/* Thread queues.
- * Locks required  : sched_mutex
- */
-#if !defined(THREADED_RTS)
-extern  StgTSO *blocked_queue_hd, *blocked_queue_tl;
-extern  StgTSO *sleeping_queue;
-#endif
-
 extern bool heap_overflow;
 
 #if defined(THREADED_RTS)
@@ -166,67 +157,16 @@ void resurrectThreads (StgTSO *);
  * NOTE: tso->link should be END_TSO_QUEUE before calling this macro.
  * ASSUMES: cap->running_task is the current task.
  */
-EXTERN_INLINE void
-appendToRunQueue (Capability *cap, StgTSO *tso);
-
-EXTERN_INLINE void
-appendToRunQueue (Capability *cap, StgTSO *tso)
-{
-    ASSERT(tso->_link == END_TSO_QUEUE);
-    if (cap->run_queue_hd == END_TSO_QUEUE) {
-        cap->run_queue_hd = tso;
-        tso->block_info.prev = END_TSO_QUEUE;
-    } else {
-        setTSOLink(cap, cap->run_queue_tl, tso);
-        setTSOPrev(cap, tso, cap->run_queue_tl);
-    }
-    cap->run_queue_tl = tso;
-    cap->n_run_queue++;
-}
+void appendToRunQueue (Capability *cap, StgTSO *tso);
 
 /* Push a thread on the beginning of the run queue.
  * ASSUMES: cap->running_task is the current task.
  */
-EXTERN_INLINE void
-pushOnRunQueue (Capability *cap, StgTSO *tso);
-
-EXTERN_INLINE void
-pushOnRunQueue (Capability *cap, StgTSO *tso)
-{
-    setTSOLink(cap, tso, cap->run_queue_hd);
-    tso->block_info.prev = END_TSO_QUEUE;
-    if (cap->run_queue_hd != END_TSO_QUEUE) {
-        setTSOPrev(cap, cap->run_queue_hd, tso);
-    }
-    cap->run_queue_hd = tso;
-    if (cap->run_queue_tl == END_TSO_QUEUE) {
-        cap->run_queue_tl = tso;
-    }
-    cap->n_run_queue++;
-}
+void pushOnRunQueue (Capability *cap, StgTSO *tso);
 
 /* Pop the first thread off the runnable queue.
  */
-INLINE_HEADER StgTSO *
-popRunQueue (Capability *cap)
-{
-    ASSERT(cap->n_run_queue > 0);
-    StgTSO *t = cap->run_queue_hd;
-    ASSERT(t != END_TSO_QUEUE);
-    cap->run_queue_hd = t->_link;
-
-    StgTSO *link = RELAXED_LOAD(&t->_link);
-    if (link != END_TSO_QUEUE) {
-        link->block_info.prev = END_TSO_QUEUE;
-    }
-    RELAXED_STORE(&t->_link, END_TSO_QUEUE); // no write barrier req'd
-
-    if (cap->run_queue_hd == END_TSO_QUEUE) {
-        cap->run_queue_tl = END_TSO_QUEUE;
-    }
-    cap->n_run_queue--;
-    return t;
-}
+StgTSO *popRunQueue (Capability *cap);
 
 INLINE_HEADER StgTSO *
 peekRunQueue (Capability *cap)
@@ -235,30 +175,6 @@ peekRunQueue (Capability *cap)
 }
 
 void promoteInRunQueue (Capability *cap, StgTSO *tso);
-
-/* Add a thread to the end of the blocked queue.
- */
-#if !defined(THREADED_RTS)
-INLINE_HEADER void
-appendToBlockedQueue(StgTSO *tso)
-{
-    ASSERT(tso->_link == END_TSO_QUEUE);
-    if (blocked_queue_hd == END_TSO_QUEUE) {
-        blocked_queue_hd = tso;
-    } else {
-        setTSOLink(&MainCapability, blocked_queue_tl, tso);
-    }
-    blocked_queue_tl = tso;
-}
-#endif
-
-/* Check whether various thread queues are empty
- */
-INLINE_HEADER bool
-emptyQueue (StgTSO *q)
-{
-    return (q == END_TSO_QUEUE);
-}
 
 INLINE_HEADER bool
 emptyRunQueue(Capability *cap)
@@ -278,21 +194,6 @@ truncateRunQueue(Capability *cap)
     cap->run_queue_hd = END_TSO_QUEUE;
     cap->run_queue_tl = END_TSO_QUEUE;
     cap->n_run_queue = 0;
-}
-
-#if !defined(THREADED_RTS)
-#define EMPTY_BLOCKED_QUEUE()  (emptyQueue(blocked_queue_hd))
-#define EMPTY_SLEEPING_QUEUE() (emptyQueue(sleeping_queue))
-#endif
-
-INLINE_HEADER bool
-emptyThreadQueues(Capability *cap)
-{
-    return emptyRunQueue(cap)
-#if !defined(THREADED_RTS)
-        && EMPTY_BLOCKED_QUEUE() && EMPTY_SLEEPING_QUEUE()
-#endif
-    ;
 }
 
 #endif /* !IN_STG_CODE */

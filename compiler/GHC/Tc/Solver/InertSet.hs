@@ -20,7 +20,8 @@ module GHC.Tc.Solver.InertSet (
     emptyInert,
     addInertItem,
 
-    matchableGivens,
+    noMatchableGivenDicts,
+    noGivenNewtypeReprEqs,
     mightEqualLater,
     prohibitedSuperClassSolve,
 
@@ -41,11 +42,11 @@ module GHC.Tc.Solver.InertSet (
 
 import GHC.Prelude
 
-import GHC.Tc.Solver.Types
-
 import GHC.Tc.Types.Constraint
 import GHC.Tc.Types.Origin
+import GHC.Tc.Solver.Types
 import GHC.Tc.Utils.TcType
+
 import GHC.Types.Var
 import GHC.Types.Var.Env
 
@@ -53,6 +54,7 @@ import GHC.Core.Reduction
 import GHC.Core.Predicate
 import GHC.Core.TyCo.FVs
 import qualified GHC.Core.TyCo.Rep as Rep
+import GHC.Core.Class( Class )
 import GHC.Core.TyCon
 import GHC.Core.Unify
 
@@ -338,7 +340,7 @@ VERY IMPORTANT INVARIANT:
      in the above sense
 
    - Exception 1: local quantified constraints have no such guarantee;
-     indeed, adding a "solved dictionary" when appling a quantified
+     indeed, adding a "solved dictionary" when applying a quantified
      constraint led to the ability to define unsafeCoerce
      in #17267.
 
@@ -883,7 +885,7 @@ The idea is that
     (this is Lemma (L0)), and hence this triple never plays a role in application S(f,t).
     It is always safe to extend S with such a triple.
 
-    (NB: we could strengten K1) in this way too, but see K3.
+    (NB: we could strengthen K1) in this way too, but see K3.
 
   - (K2b): if lhs not in s, we have no further opportunity to apply the
     work item
@@ -1535,46 +1537,59 @@ isOuterTyVar tclvl tv
     -- becomes "outer" even though its level numbers says it isn't.
   | otherwise  = False  -- Coercion variables; doesn't much matter
 
--- | Returns Given constraints that might,
--- potentially, match the given pred. This is used when checking to see if a
+noGivenNewtypeReprEqs :: TyCon -> InertSet -> Bool
+-- True <=> there is no Irred looking like (N tys1 ~ N tys2)
+-- See Note [Decomposing newtype equalities] (EX2) in GHC.Tc.Solver.Canonical
+--     This is the only call site.
+noGivenNewtypeReprEqs tc inerts
+  = not (anyBag might_help (inert_irreds (inert_cans inerts)))
+  where
+    might_help ct
+      = case classifyPredType (ctPred ct) of
+          EqPred ReprEq t1 t2
+             | Just (tc1,_) <- tcSplitTyConApp_maybe t1
+             , tc == tc1
+             , Just (tc2,_) <- tcSplitTyConApp_maybe t2
+             , tc == tc2
+             -> True
+          _  -> False
+
+-- | Returns True iff there are no Given constraints that might,
+-- potentially, match the given class consraint. This is used when checking to see if a
 -- Given might overlap with an instance. See Note [Instance and Given overlap]
 -- in "GHC.Tc.Solver.Interact"
-matchableGivens :: CtLoc -> PredType -> InertSet -> Cts
-matchableGivens loc_w pred_w inerts@(IS { inert_cans = inert_cans })
-  = filterBag matchable_given all_relevant_givens
+noMatchableGivenDicts :: InertSet -> CtLoc -> Class -> [TcType] -> Bool
+noMatchableGivenDicts inerts@(IS { inert_cans = inert_cans }) loc_w clas tys
+  = not $ anyBag matchable_given $
+    findDictsByClass (inert_dicts inert_cans) clas
   where
-    -- just look in class constraints and irreds. matchableGivens does get called
-    -- for ~R constraints, but we don't need to look through equalities, because
-    -- canonical equalities are used for rewriting. We'll only get caught by
-    -- non-canonical -- that is, irreducible -- equalities.
-    all_relevant_givens :: Cts
-    all_relevant_givens
-      | Just (clas, _) <- getClassPredTys_maybe pred_w
-      = findDictsByClass (inert_dicts inert_cans) clas
-        `unionBags` inert_irreds inert_cans
-      | otherwise
-      = inert_irreds inert_cans
+    pred_w = mkClassPred clas tys
 
     matchable_given :: Ct -> Bool
     matchable_given ct
       | CtGiven { ctev_loc = loc_g, ctev_pred = pred_g } <- ctEvidence ct
-      = mightEqualLater inerts pred_g loc_g pred_w loc_w
+      = isJust $ mightEqualLater inerts pred_g loc_g pred_w loc_w
 
       | otherwise
       = False
 
-mightEqualLater :: InertSet -> TcPredType -> CtLoc -> TcPredType -> CtLoc -> Bool
+mightEqualLater :: InertSet -> TcPredType -> CtLoc -> TcPredType -> CtLoc -> Maybe Subst
 -- See Note [What might equal later?]
 -- Used to implement logic in Note [Instance and Given overlap] in GHC.Tc.Solver.Interact
 mightEqualLater inert_set given_pred given_loc wanted_pred wanted_loc
   | prohibitedSuperClassSolve given_loc wanted_loc
-  = False
+  = Nothing
 
   | otherwise
   = case tcUnifyTysFG bind_fun [flattened_given] [flattened_wanted] of
-      SurelyApart              -> False  -- types that are surely apart do not equal later
-      MaybeApart MARInfinite _ -> False  -- see Example 7 in the Note.
-      _                        -> True
+      Unifiable subst
+        -> Just subst
+      MaybeApart reason subst
+        | MARInfinite <- reason -- see Example 7 in the Note.
+        -> Nothing
+        | otherwise
+        -> Just subst
+      SurelyApart -> Nothing
 
   where
     in_scope  = mkInScopeSet $ tyCoVarsOfTypes [given_pred, wanted_pred]
@@ -1621,7 +1636,7 @@ mightEqualLater inert_set given_pred given_loc wanted_pred wanted_loc
     -- like startSolvingByUnification, but allows cbv variables to unify
     can_unify :: TcTyVar -> MetaInfo -> Type -> Bool
     can_unify _lhs_tv TyVarTv rhs_ty  -- see Example 3 from the Note
-      | Just rhs_tv <- tcGetTyVar_maybe rhs_ty
+      | Just rhs_tv <- getTyVar_maybe rhs_ty
       = case tcTyVarDetails rhs_tv of
           MetaTv { mtv_info = TyVarTv } -> True
           MetaTv {}                     -> False  -- could unify with anything
@@ -1631,12 +1646,24 @@ mightEqualLater inert_set given_pred given_loc wanted_pred wanted_loc
       = False
     can_unify lhs_tv _other _rhs_ty = mentions_meta_ty_var lhs_tv
 
-prohibitedSuperClassSolve :: CtLoc -> CtLoc -> Bool
--- See Note [Solving superclass constraints] in GHC.Tc.TyCl.Instance
-prohibitedSuperClassSolve from_loc solve_loc
-  | InstSCOrigin _ given_size <- ctLocOrigin from_loc
-  , ScOrigin wanted_size <- ctLocOrigin solve_loc
-  = given_size >= wanted_size
+-- | Is it (potentially) loopy to use the first @ct1@ to solve @ct2@?
+--
+-- Necessary (but not sufficient) conditions for this function to return @True@:
+--
+--   - @ct1@ and @ct2@ both arise from superclass expansion,
+--   - @ct1@ is a Given and @ct2@ is a Wanted.
+--
+-- See Note [Solving superclass constraints] in GHC.Tc.TyCl.Instance, (sc2).
+prohibitedSuperClassSolve :: CtLoc -- ^ is it loopy to use this one ...
+                          -> CtLoc -- ^ ... to solve this one?
+                          -> Bool  -- ^ True ==> don't solve it
+prohibitedSuperClassSolve given_loc wanted_loc
+  | GivenSCOrigin _ _ blocked <- ctLocOrigin given_loc
+  , blocked
+  , ScOrigin _ NakedSc <- ctLocOrigin wanted_loc
+  = True    -- Prohibited if the Wanted is a superclass
+            -- and the Given has come via a superclass selection from
+            -- a predicate bigger than the head
   | otherwise
   = False
 

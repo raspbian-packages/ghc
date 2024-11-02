@@ -1,7 +1,8 @@
 MAKEFLAGS += --no-builtin-rules
 .SUFFIXES:
 
-include mk/config.mk
+include ./mk/project.mk
+include ./config.mk
 
 .PHONY: default
 default:
@@ -68,7 +69,7 @@ install: install_bin install_lib
 install: install_man install_docs update_package_db
 
 ActualBinsDir=${ghclibdir}/bin
-ifeq "$(TargetOS_CPP)" "mingw32"
+ifeq "$(RelocatableBuild)" "YES"
 ActualLibsDir=${ghclibdir}
 else
 ActualLibsDir=${ghclibdir}/lib
@@ -76,7 +77,7 @@ endif
 WrapperBinsDir=${bindir}
 
 # N.B. this is duplicated from includes/ghc.mk.
-lib/settings :
+lib/settings : config.mk
 	@rm -f $@
 	@echo '[("GCC extra via C opts", "$(GccExtraViaCOpts)")' >> $@
 	@echo ',("C compiler command", "$(SettingsCCompilerCommand)")' >> $@
@@ -90,8 +91,8 @@ lib/settings :
 	@echo ',("ld command", "$(SettingsLdCommand)")' >> $@
 	@echo ',("ld flags", "$(SettingsLdFlags)")' >> $@
 	@echo ',("ld supports compact unwind", "$(LdHasNoCompactUnwind)")' >> $@
-	@echo ',("ld supports build-id", "$(LdHasBuildId)")' >> $@
 	@echo ',("ld supports filelist", "$(LdHasFilelist)")' >> $@
+	@echo ',("ld supports single module", "$(LdHasSingleModule)")' >> $@
 	@echo ',("ld is GNU ld", "$(LdIsGNULd)")' >> $@
 	@echo ',("Merge objects command", "$(SettingsMergeObjectsCommand)")' >> $@
 	@echo ',("Merge objects flags", "$(SettingsMergeObjectsFlags)")' >> $@
@@ -105,7 +106,6 @@ lib/settings :
 	@echo ',("touch command", "$(SettingsTouchCommand)")' >> $@
 	@echo ',("dllwrap command", "$(SettingsDllWrapCommand)")' >> $@
 	@echo ',("windres command", "$(SettingsWindresCommand)")' >> $@
-	@echo ',("libtool command", "$(SettingsLibtoolCommand)")' >> $@
 	@echo ',("unlit command", "$$topdir/bin/unlit")' >> $@
 	@echo ',("cross compiling", "$(CrossCompiling)")' >> $@
 	@echo ',("target platform string", "$(TARGETPLATFORM)")' >> $@
@@ -180,9 +180,6 @@ install_lib: lib/settings
 		esac; \
 	done; \
 	chmod ugo+rx "$$dest"/bin/*
-	for i in $(DOCS); do \
-		cp -R $$i "$(DESTDIR)$(docdir)/"; \
-	done
 	# Work around #17418 on Darwin
 	if [ -e "${XATTR}" ]; then \
 		"${XATTR}" -c -r "$(DESTDIR)$(ActualLibsDir)"; \
@@ -216,12 +213,18 @@ install_man:
 	fi
 
 export SHELL
-install_wrappers: install_bin_libdir
+.PHONY: install_wrappers
+install_wrappers: install_bin_libdir install_hsc2hs_wrapper
 	@echo "Installing wrapper scripts"
 	$(INSTALL_DIR) "$(DESTDIR)$(WrapperBinsDir)"
 	for p in `cd wrappers; $(FIND) . ! -type d`; do \
 	    mk/install_script.sh "$$p" "$(DESTDIR)/$(WrapperBinsDir)/$$p" "$(WrapperBinsDir)" "$(ActualBinsDir)" "$(ActualBinsDir)/$$p" "$(ActualLibsDir)" "$(docdir)" "$(includedir)"; \
 	done
+
+.PHONY: install_hsc2hs_wrapper
+install_hsc2hs_wrapper:
+	@echo Copying hsc2hs wrapper
+	cp mk/hsc2hs wrappers/hsc2hs-ghc-$(ProjectVersion)
 
 PKG_CONFS = $(shell find "$(DESTDIR)$(ActualLibsDir)/package.conf.d" -name '*.conf' | sed "s:   :\0xxx\0:g")
 update_package_db: install_bin install_lib

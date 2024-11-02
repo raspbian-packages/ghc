@@ -17,7 +17,6 @@ import GHC.Tc.Utils.Monad
 import GHC.Tc.Solver
 import GHC.Tc.Solver.Monad ( runTcS )
 import GHC.Tc.Types.Constraint
-import GHC.Core.Predicate
 import GHC.Tc.Types.Origin
 import GHC.Tc.Utils.TcMType
 import GHC.Tc.Utils.TcType
@@ -25,9 +24,12 @@ import GHC.Tc.Gen.HsType
 import GHC.Tc.Gen.Expr
 import GHC.Tc.Utils.Env
 import GHC.Tc.Utils.Unify( buildImplicationFor )
-import GHC.Tc.Types.Evidence( mkTcCoVarCo )
+
 import GHC.Core.Type
+import GHC.Core.Coercion( mkCoVarCo )
 import GHC.Core.TyCon( isTypeFamilyTyCon )
+import GHC.Core.Predicate
+
 import GHC.Types.Id
 import GHC.Types.Var( EvVar, tyVarName )
 import GHC.Types.Var.Set
@@ -103,23 +105,22 @@ tcRules :: [LRuleDecls GhcRn] -> TcM [LRuleDecls GhcTc]
 tcRules decls = mapM (wrapLocMA tcRuleDecls) decls
 
 tcRuleDecls :: RuleDecls GhcRn -> TcM (RuleDecls GhcTc)
-tcRuleDecls (HsRules { rds_src = src
+tcRuleDecls (HsRules { rds_ext = src
                      , rds_rules = decls })
    = do { tc_decls <- mapM (wrapLocMA tcRule) decls
-        ; return $ HsRules { rds_ext   = noExtField
-                           , rds_src   = src
+        ; return $ HsRules { rds_ext   = src
                            , rds_rules = tc_decls } }
 
 tcRule :: RuleDecl GhcRn -> TcM (RuleDecl GhcTc)
 tcRule (HsRule { rd_ext  = ext
-               , rd_name = rname@(L _ (_,name))
+               , rd_name = rname@(L _ name)
                , rd_act  = act
                , rd_tyvs = ty_bndrs
                , rd_tmvs = tm_bndrs
                , rd_lhs  = lhs
                , rd_rhs  = rhs })
   = addErrCtxt (ruleCtxt name)  $
-    do { traceTc "---- Rule ------" (pprFullRuleName rname)
+    do { traceTc "---- Rule ------" (pprFullRuleName (snd ext) rname)
        ; skol_info <- mkSkolemInfo (RuleSkol name)
         -- Note [Typechecking rules]
        ; (tc_lvl, stuff) <- pushTcLevelM $
@@ -128,7 +129,7 @@ tcRule (HsRule { rd_ext  = ext
        ; let (id_bndrs, lhs', lhs_wanted
                       , rhs', rhs_wanted, rule_ty) = stuff
 
-       ; traceTc "tcRule 1" (vcat [ pprFullRuleName rname
+       ; traceTc "tcRule 1" (vcat [ pprFullRuleName (snd ext) rname
                                   , ppr lhs_wanted
                                   , ppr rhs_wanted ])
 
@@ -157,7 +158,7 @@ tcRule (HsRule { rd_ext  = ext
              quant_cands = forall_tkvs { dv_kvs = weed_out (dv_kvs forall_tkvs)
                                        , dv_tvs = weed_out (dv_tvs forall_tkvs) }
        ; qtkvs <- quantifyTyVars skol_info DefaultNonStandardTyVars quant_cands
-       ; traceTc "tcRule" (vcat [ pprFullRuleName rname
+       ; traceTc "tcRule" (vcat [ pprFullRuleName (snd ext) rname
                                 , text "forall_tkvs:" <+> ppr forall_tkvs
                                 , text "quant_cands:" <+> ppr quant_cands
                                 , text "don't_default:" <+> ppr don't_default
@@ -166,7 +167,8 @@ tcRule (HsRule { rd_ext  = ext
                                 , text "rule_ty:" <+> ppr rule_ty
                                 , text "ty_bndrs:" <+> ppr ty_bndrs
                                 , text "qtkvs ++ tpl_ids:" <+> ppr (qtkvs ++ tpl_ids)
-                                , vcat [ ppr id <+> dcolon <+> ppr (idType id) | id <- tpl_ids ]
+                                , text "tpl_id info:" <+>
+                                  vcat [ ppr id <+> dcolon <+> ppr (idType id) | id <- tpl_ids ]
                   ])
 
        -- SimplfyRule Plan, step 5
@@ -230,7 +232,7 @@ tcRuleTmBndrs _ [] = return ([],[])
 tcRuleTmBndrs rule_name (L _ (RuleBndr _ (L _ name)) : rule_bndrs)
   = do  { ty <- newOpenFlexiTyVarTy
         ; (tyvars, tmvars) <- tcRuleTmBndrs rule_name rule_bndrs
-        ; return (tyvars, mkLocalId name Many ty : tmvars) }
+        ; return (tyvars, mkLocalId name ManyTy ty : tmvars) }
 tcRuleTmBndrs rule_name (L _ (RuleBndrSig _ (L _ name) rn_ty) : rule_bndrs)
 --  e.g         x :: a->a
 --  The tyvar 'a' is brought into scope first, just as if you'd written
@@ -239,7 +241,7 @@ tcRuleTmBndrs rule_name (L _ (RuleBndrSig _ (L _ name) rn_ty) : rule_bndrs)
 --   error for each out-of-scope type variable used
   = do  { let ctxt = RuleSigCtxt rule_name name
         ; (_ , tvs, id_ty) <- tcHsPatSigType ctxt HM_Sig rn_ty OpenKind
-        ; let id  = mkLocalId name Many id_ty
+        ; let id  = mkLocalId name ManyTy id_ty
                     -- See Note [Typechecking pattern signature binders] in GHC.Tc.Gen.HsType
 
               -- The type variables scope over subsequent bindings; yuk
@@ -445,7 +447,7 @@ simplifyRule name tc_lvl lhs_wanted rhs_wanted
           EvVarDest ev_id -> return ev_id
           HoleDest hole   -> -- See Note [Quantifying over coercion holes]
                              do { ev_id <- newEvVar pred
-                                ; fillCoercionHole hole (mkTcCoVarCo ev_id)
+                                ; fillCoercionHole hole (mkCoVarCo ev_id)
                                 ; return ev_id }
     mk_quant_ev ct = pprPanic "mk_quant_ev" (ppr ct)
 

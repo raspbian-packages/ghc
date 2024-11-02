@@ -24,7 +24,7 @@ data ExeDependency = ExeDependency
                      PackageName
                      UnqualComponentName -- name of executable component of package
                      VersionRange
-                     deriving (Generic, Read, Show, Eq, Typeable, Data)
+                     deriving (Generic, Read, Show, Eq, Ord, Typeable, Data)
 
 instance Binary ExeDependency
 instance Structured ExeDependency
@@ -37,7 +37,7 @@ instance Pretty ExeDependency where
       pver | isAnyVersion ver = PP.empty
            | otherwise        = pretty ver
 
--- | 
+-- |
 --
 -- Examples
 --

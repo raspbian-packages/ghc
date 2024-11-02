@@ -28,7 +28,6 @@ import GHC.Builtin.PrimOps
 import GHC.Builtin.Names
 
 import GHC.Unit.Types
-import GHC.Unit.Module.Name
 
 import GHC.Data.FastString
 import GHC.Data.SizedSeq
@@ -41,6 +40,8 @@ import GHC.Utils.Outputable
 
 import GHC.Types.Name
 import GHC.Types.Name.Env
+
+import Language.Haskell.Syntax.Module.Name
 
 -- Standard libraries
 import Data.Array.Unboxed

@@ -21,7 +21,6 @@
 #include "Stats.h"
 #include "STM.h"
 #include "Prelude.h"
-#include "ThreadLabels.h"
 #include "Updates.h"
 #include "Proftimer.h"
 #include "ProfHeap.h"
@@ -31,7 +30,6 @@
 #include "Sparks.h"
 #include "Capability.h"
 #include "Task.h"
-#include "AwaitEvent.h"
 #include "IOManager.h"
 #if defined(mingw32_HOST_OS)
 #include "win32/MIOManager.h"
@@ -71,13 +69,6 @@
  * Global variables
  * -------------------------------------------------------------------------- */
 
-#if !defined(THREADED_RTS)
-// Blocked/sleeping threads
-StgTSO *blocked_queue_hd = NULL;
-StgTSO *blocked_queue_tl = NULL;
-StgTSO *sleeping_queue = NULL;    // perhaps replace with a hash table?
-#endif
-
 // Bytes allocated since the last time a HeapOverflow exception was thrown by
 // the RTS
 uint64_t allocated_bytes_at_heapoverflow = 0;
@@ -110,7 +101,7 @@ StgWord sched_state = SCHED_RUNNING;
 Mutex sched_mutex;
 #endif
 
-#if !defined(mingw32_HOST_OS)
+#if !defined(mingw32_HOST_OS) && !defined(wasm32_HOST_ARCH)
 #define FORKPROCESS_PRIMOP_SUPPORTED
 #endif
 
@@ -327,7 +318,10 @@ schedule (Capability *initialCapability, Task *task)
         /* Notify the I/O manager that we have nothing to do.  If there are
            any outstanding I/O requests we'll block here.  If there are not
            then this is a user error and we will abort soon.  */
-        awaitEvent (emptyRunQueue(cap));
+        /* TODO: see if we can rationalise these two awaitEvent calls before
+         *       and after scheduleDetectDeadlock().
+         */
+        awaitEvent (cap, emptyRunQueue(cap));
 #else
         ASSERT(getSchedState() >= SCHED_INTERRUPTING);
 #endif
@@ -408,8 +402,9 @@ schedule (Capability *initialCapability, Task *task)
      * the user specified "context switch as often as possible", with
      * +RTS -C0
      */
-    if (RtsFlags.ConcFlags.ctxtSwitchTicks == 0
-        && !emptyThreadQueues(cap)) {
+    if (RtsFlags.ConcFlags.ctxtSwitchTicks == 0 &&
+        (!emptyRunQueue(cap) ||
+          anyPendingTimeoutsOrIO(cap->iomgr))) {
         RELAXED_STORE(&cap->context_switch, 1);
     }
 
@@ -909,14 +904,34 @@ static void
 scheduleCheckBlockedThreads(Capability *cap USED_IF_NOT_THREADS)
 {
 #if !defined(THREADED_RTS)
-    //
-    // Check whether any waiting threads need to be woken up.  If the
-    // run queue is empty, and there are no other tasks running, we
-    // can wait indefinitely for something to happen.
-    //
-    if ( !emptyQueue(blocked_queue_hd) || !emptyQueue(sleeping_queue) )
+    /* Check whether there is any completed I/O or expired timers. If so,
+     * process the competions as appropriate, which will typically cause some
+     * waiting threads to be woken up.
+     *
+     * If the run queue is empty, and there are no other threads running, we
+     * can wait indefinitely for something to happen.
+     *
+     * TODO: see if we can rationalise these two awaitEvent calls before
+     * and after scheduleDetectDeadlock()
+     *
+     * TODO: this test anyPendingTimeoutsOrIO does not have a proper
+     * implementation the WinIO I/O manager!
+     *
+     * The select() I/O manager uses the sleeping_queue and the blocked_queue,
+     * and the test checks both. The legacy win32 I/O manager only consults
+     * the blocked_queue, but then it puts threads waiting on delay# on the
+     * blocked_queue too, so that's ok.
+     *
+     * The WinIO I/O manager does not use either the sleeping_queue or the
+     * blocked_queue, but it's implementation of anyPendingTimeoutsOrIO still
+     * checks both! Since both queues will _always_ be empty then it will
+     * _always_ return false and so awaitEvent will _never_ be called here for
+     * WinIO. This may explain why there is a second call to awaitEvent below
+     * for the case of !defined(THREADED_RTS) && defined(mingw32_HOST_OS).
+     */
+    if (anyPendingTimeoutsOrIO(cap->iomgr))
     {
-        awaitEvent (emptyRunQueue(cap));
+        awaitEvent (cap, emptyRunQueue(cap));
     }
 #endif
 }
@@ -935,7 +950,7 @@ scheduleDetectDeadlock (Capability **pcap, Task *task)
      * other tasks are waiting for work, we must have a deadlock of
      * some description.
      */
-    if ( emptyThreadQueues(cap) )
+    if ( emptyRunQueue(cap) && !anyPendingTimeoutsOrIO(cap->iomgr) )
     {
 #if defined(THREADED_RTS)
         /*
@@ -1017,6 +1032,8 @@ scheduleProcessInbox (Capability **pcap USED_IF_THREADS)
         // never goes idle if the inbox is non-empty, which is why we
         // use cap->lock (cap->lock is released as the last thing
         // before going idle; see Capability.c:releaseCapability()).
+        //
+        // See Note [Heap memory barriers], section "Barriers on messages"
         r = TRY_ACQUIRE_LOCK(&cap->lock);
         if (r != 0) return;
 
@@ -1323,7 +1340,9 @@ scheduleHandleThreadFinished (Capability *cap, Task *task, StgTSO *t)
           if (t->what_next == ThreadComplete) {
               if (task->incall->ret) {
                   // NOTE: return val is stack->sp[1] (see StgStartup.cmm)
-                  *(task->incall->ret) = (StgClosure *)task->incall->tso->stackobj->sp[1];
+                  StgDeadThreadFrame *dead = (StgDeadThreadFrame *) &task->incall->tso->stackobj->sp[0];
+                  ASSERT(dead->header.info == &stg_dead_thread_info);
+                  *(task->incall->ret) = (StgClosure *) dead->result;
               }
               task->incall->rstat = Success;
           } else {
@@ -1340,8 +1359,6 @@ scheduleHandleThreadFinished (Capability *cap, Task *task, StgTSO *t)
                   task->incall->rstat = Killed;
               }
           }
-
-          removeThreadLabel(task->incall->tso->id);
 
           // We no longer consider this thread and task to be bound to
           // each other.  The TSO lives on until it is GC'd, but the
@@ -1420,7 +1437,7 @@ void stopAllCapabilitiesWith (Capability **pCap, Task *task, SyncType sync_type)
 
     acquireAllCapabilities(pCap ? *pCap : NULL, task);
 
-    pending_sync = 0;
+    RELAXED_STORE(&pending_sync, 0);
     signalCondition(&sync_finished_cond);
 }
 #endif
@@ -1604,9 +1621,13 @@ scheduleDoGC (Capability **pcap, Task *task USED_IF_THREADS,
 
     heap_census = scheduleNeedHeapProfile(true);
 
+    // We force a major collection if the size of the heap exceeds maxHeapSize.
+    // We will either return memory until we are below maxHeapSize or trigger heapOverflow.
+    bool mblock_overflow = RtsFlags.GcFlags.maxHeapSize != 0 && mblocks_allocated > BLOCKS_TO_MBLOCKS(RtsFlags.GcFlags.maxHeapSize);
+
     // Figure out which generation we are collecting, so that we can
     // decide whether this is a parallel GC or not.
-    collect_gen = calcNeeded(force_major || heap_census, NULL);
+    collect_gen = calcNeeded(force_major || heap_census || mblock_overflow , NULL);
     major_gc = (collect_gen == RtsFlags.GcFlags.generations-1);
 
 #if defined(THREADED_RTS)
@@ -1873,7 +1894,7 @@ delete_threads_and_gc:
 #if defined(THREADED_RTS)
     // reset pending_sync *before* GC, so that when the GC threads
     // emerge they don't immediately re-enter the GC.
-    pending_sync = 0;
+    RELAXED_STORE(&pending_sync, 0);
     signalCondition(&sync_finished_cond);
     config.parallel = gc_type == SYNC_GC_PAR;
     GarbageCollect(config, cap, idle_cap);
@@ -2386,11 +2407,6 @@ deleteAllThreads (void)
     // somewhere, and the main scheduler loop has to deal with it.
     // Also, the run queue is the only thing keeping these threads from
     // being GC'd, and we don't want the "main thread has been GC'd" panic.
-
-#if !defined(THREADED_RTS)
-    ASSERT(blocked_queue_hd == END_TSO_QUEUE);
-    ASSERT(sleeping_queue == END_TSO_QUEUE);
-#endif
 }
 
 /* -----------------------------------------------------------------------------
@@ -2608,6 +2624,9 @@ scheduleThreadOn(Capability *cap, StgWord cpu USED_IF_THREADS, StgTSO *tso)
 {
     tso->flags |= TSO_LOCKED; // we requested explicit affinity; don't
                               // move this thread from now on.
+
+    // We will context switch soon, but not immediately: we don't want every
+    // fork to force a context-switch.
 #if defined(THREADED_RTS)
     cpu %= enabled_capabilities;
     if (cpu == cap->no) {
@@ -2615,8 +2634,10 @@ scheduleThreadOn(Capability *cap, StgWord cpu USED_IF_THREADS, StgTSO *tso)
     } else {
         migrateThread(cap, tso, getCapability(cpu));
     }
+    contextSwitchCapability(getCapability(cpu), false);
 #else
     appendToRunQueue(cap,tso);
+    contextSwitchCapability(cap, false);
 #endif
 }
 
@@ -2719,12 +2740,6 @@ startWorkerTasks (uint32_t from USED_IF_THREADS, uint32_t to USED_IF_THREADS)
 void
 initScheduler(void)
 {
-#if !defined(THREADED_RTS)
-  blocked_queue_hd  = END_TSO_QUEUE;
-  blocked_queue_tl  = END_TSO_QUEUE;
-  sleeping_queue    = END_TSO_QUEUE;
-#endif
-
   setSchedState(SCHED_RUNNING);
   setRecentActivity(ACTIVITY_YES);
 
@@ -2803,16 +2818,6 @@ freeScheduler( void )
     RELEASE_LOCK(&sched_mutex);
 #if defined(THREADED_RTS)
     closeMutex(&sched_mutex);
-#endif
-}
-
-void markScheduler (evac_fn evac USED_IF_NOT_THREADS,
-                    void *user USED_IF_NOT_THREADS)
-{
-#if !defined(THREADED_RTS)
-    evac(user, (StgClosure **)(void *)&blocked_queue_hd);
-    evac(user, (StgClosure **)(void *)&blocked_queue_tl);
-    evac(user, (StgClosure **)(void *)&sleeping_queue);
 #endif
 }
 
@@ -2938,6 +2943,61 @@ deleteThread_(StgTSO *tso)
 }
 #endif
 
+/*
+ * Run queue manipulation
+ */
+
+void
+appendToRunQueue (Capability *cap, StgTSO *tso)
+{
+    ASSERT(tso->_link == END_TSO_QUEUE);
+    if (cap->run_queue_hd == END_TSO_QUEUE) {
+        cap->run_queue_hd = tso;
+        tso->block_info.prev = END_TSO_QUEUE;
+    } else {
+        setTSOLink(cap, cap->run_queue_tl, tso);
+        setTSOPrev(cap, tso, cap->run_queue_tl);
+    }
+    cap->run_queue_tl = tso;
+    cap->n_run_queue++;
+}
+
+void
+pushOnRunQueue (Capability *cap, StgTSO *tso)
+{
+    setTSOLink(cap, tso, cap->run_queue_hd);
+    tso->block_info.prev = END_TSO_QUEUE;
+    if (cap->run_queue_hd != END_TSO_QUEUE) {
+        setTSOPrev(cap, cap->run_queue_hd, tso);
+    }
+    cap->run_queue_hd = tso;
+    if (cap->run_queue_tl == END_TSO_QUEUE) {
+        cap->run_queue_tl = tso;
+    }
+    cap->n_run_queue++;
+}
+
+StgTSO *popRunQueue (Capability *cap)
+{
+    ASSERT(cap->n_run_queue > 0);
+    StgTSO *t = cap->run_queue_hd;
+    ASSERT(t != END_TSO_QUEUE);
+    cap->run_queue_hd = t->_link;
+
+    StgTSO *link = RELAXED_LOAD(&t->_link);
+    if (link != END_TSO_QUEUE) {
+        link->block_info.prev = END_TSO_QUEUE;
+    }
+    RELAXED_STORE(&t->_link, END_TSO_QUEUE); // no write barrier req'd
+
+    if (cap->run_queue_hd == END_TSO_QUEUE) {
+        cap->run_queue_tl = END_TSO_QUEUE;
+    }
+    cap->n_run_queue--;
+    return t;
+}
+
+
 /* -----------------------------------------------------------------------------
    raiseExceptionHelper
 
@@ -2957,19 +3017,6 @@ raiseExceptionHelper (StgRegTable *reg, StgTSO *tso, StgClosure *exception)
     // This closure represents the expression 'raise# E' where E
     // is the exception raise.  It is used to overwrite all the
     // thunks which are currently under evaluation.
-    //
-
-    // OLD COMMENT (we don't have MIN_UPD_SIZE now):
-    // LDV profiling: stg_raise_info has THUNK as its closure
-    // type. Since a THUNK takes at least MIN_UPD_SIZE words in its
-    // payload, MIN_UPD_SIZE is more appropriate than 1.  It seems that
-    // 1 does not cause any problem unless profiling is performed.
-    // However, when LDV profiling goes on, we need to linearly scan
-    // small object pool, where raise_closure is stored, so we should
-    // use MIN_UPD_SIZE.
-    //
-    // raise_closure = (StgClosure *)RET_STGCALL1(P_,allocate,
-    //                                 sizeofW(StgClosure)+1);
     //
 
     //
@@ -3034,11 +3081,51 @@ raiseExceptionHelper (StgRegTable *reg, StgTSO *tso, StgClosure *exception)
         }
 
         default:
+            // see Note [Update async masking state on unwind]
+            if (*p == (StgWord)&stg_unmaskAsyncExceptionszh_ret_info) {
+                tso->flags &= ~(TSO_BLOCKEX | TSO_INTERRUPTIBLE);
+            } else if (*p == (StgWord)&stg_maskAsyncExceptionszh_ret_info) {
+                tso->flags |= TSO_BLOCKEX | TSO_INTERRUPTIBLE;
+            } else if (*p == (StgWord)&stg_maskUninterruptiblezh_ret_info) {
+                tso->flags |= TSO_BLOCKEX;
+                tso->flags &= ~TSO_INTERRUPTIBLE;
+            }
             p = next;
             continue;
         }
     }
 }
+
+/* Note [Update async masking state on unwind]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+When we raise an exception or capture a continuation, we unwind the
+stack by searching for an enclosing `catch#` or `prompt#` frame. If we
+unwind past frames intended to restore the async exception masking
+state, we must take care to reproduce their intended effect in order
+to ensure that async exceptions are properly unmasked or remasked.
+
+On paper, this seems as simple as updating `tso->flags` appropriately,
+but in fact there is one additional wrinkle: when async exceptions are
+*unmasked*, we must eagerly check for a pending async exception and
+raise it if necessary. This is not terribly involved, but it’s not
+trivial, either (see the definition of `stg_unmaskAsyncExceptionszh_ret`),
+so we’d prefer to avoid duplicating that logic in several places.
+
+Fortunately, when we’re unwinding the stack due to a raised exception,
+this detail is actually unimportant: `catch#` implicitly masks async
+exceptions while running the handler as we explicitly *don’t* want the
+thread to be interrupted before it has a chance to handle the
+exception. However, when capturing a continuation, we don’t have this
+luxury, so we take two different strategies:
+
+* When unwinding the stack due to a raised exception (synchonrous or
+  asynchronous), we just update `tso->flags` directly and take no
+  further action.
+
+* When unwinding the stack due to a continuation capture, we update
+  the masking state *indirectly* by pushing an appropriate frame onto
+  the stack before we return. This strategy is described at length
+  in Note [Continuations and async exception masking] in Continuation.c. */
 
 
 /* -----------------------------------------------------------------------------

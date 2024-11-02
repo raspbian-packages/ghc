@@ -1,4 +1,3 @@
-
 {-# LANGUAGE Strict #-} -- See Note [Avoiding space leaks in toIface*]
 
 -- | Functions for converting Core things to interface file things.
@@ -8,8 +7,9 @@ module GHC.CoreToIface
     , toIfaceTvBndrs
     , toIfaceIdBndr
     , toIfaceBndr
+    , toIfaceTopBndr
     , toIfaceForAllBndr
-    , toIfaceTyCoVarBinders
+    , toIfaceForAllBndrs
     , toIfaceTyVar
       -- * Types
     , toIfaceType, toIfaceTypeX
@@ -36,6 +36,7 @@ module GHC.CoreToIface
     , toIfUnfolding
     , toIfaceTickish
     , toIfaceBind
+    , toIfaceTopBind
     , toIfaceAlt
     , toIfaceCon
     , toIfaceApp
@@ -62,18 +63,18 @@ import GHC.Core.Type
 import GHC.Core.Multiplicity
 import GHC.Core.PatSyn
 import GHC.Core.TyCo.Rep
+import GHC.Core.TyCo.Compare( eqType )
 import GHC.Core.TyCo.Tidy ( tidyCo )
 
 import GHC.Builtin.Types.Prim ( eqPrimTyCon, eqReprPrimTyCon )
 import GHC.Builtin.Types ( heqTyCon )
-import GHC.Builtin.Names
 
 import GHC.Iface.Syntax
 import GHC.Data.FastString
 
 import GHC.Types.Id
 import GHC.Types.Id.Info
-import GHC.Types.Id.Make ( noinlineIdName )
+import GHC.Types.Id.Make ( noinlineIdName, noinlineConstraintIdName )
 import GHC.Types.Literal
 import GHC.Types.Name
 import GHC.Types.Basic
@@ -87,9 +88,8 @@ import GHC.Types.Cpr ( topCprSig )
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
 import GHC.Utils.Misc
-import GHC.Utils.Trace
 
-import Data.Maybe ( catMaybes )
+import Data.Maybe ( isNothing, catMaybes )
 
 {- Note [Avoiding space leaks in toIface*]
    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -149,11 +149,14 @@ toIfaceBndrX fr var
   | isId var  = IfaceIdBndr (toIfaceIdBndrX fr var)
   | otherwise = IfaceTvBndr (toIfaceTvBndrX fr var)
 
-toIfaceTyCoVarBinder :: VarBndr Var vis -> VarBndr IfaceBndr vis
-toIfaceTyCoVarBinder (Bndr tv vis) = Bndr (toIfaceBndr tv) vis
+toIfaceForAllBndrs :: [VarBndr TyCoVar vis] -> [VarBndr IfaceBndr vis]
+toIfaceForAllBndrs = map toIfaceForAllBndr
 
-toIfaceTyCoVarBinders :: [VarBndr Var vis] -> [VarBndr IfaceBndr vis]
-toIfaceTyCoVarBinders = map toIfaceTyCoVarBinder
+toIfaceForAllBndr :: VarBndr TyCoVar flag -> VarBndr IfaceBndr flag
+toIfaceForAllBndr = toIfaceForAllBndrX emptyVarSet
+
+toIfaceForAllBndrX :: VarSet -> (VarBndr TyCoVar flag) -> (VarBndr IfaceBndr flag)
+toIfaceForAllBndrX fr (Bndr v vis) = Bndr (toIfaceBndrX fr v) vis
 
 {-
 ************************************************************************
@@ -223,12 +226,6 @@ toIfaceTyVar = occNameFS . getOccName
 toIfaceCoVar :: CoVar -> FastString
 toIfaceCoVar = occNameFS . getOccName
 
-toIfaceForAllBndr :: (VarBndr TyCoVar flag) -> (VarBndr IfaceBndr flag)
-toIfaceForAllBndr = toIfaceForAllBndrX emptyVarSet
-
-toIfaceForAllBndrX :: VarSet -> (VarBndr TyCoVar flag) -> (VarBndr IfaceBndr flag)
-toIfaceForAllBndrX fr (Bndr v vis) = Bndr (toIfaceBndrX fr v) vis
-
 ----------------
 toIfaceTyCon :: TyCon -> IfaceTyCon
 toIfaceTyCon tc
@@ -236,7 +233,7 @@ toIfaceTyCon tc
   where
     tc_name = tyConName tc
     info    = mkIfaceTyConInfo promoted sort
-    promoted | isPromotedDataCon tc = IsPromoted
+    promoted | isDataKindsPromotedDataCon tc = IsPromoted
              | otherwise            = NotPromoted
 
     tupleSort :: TyCon -> Maybe IfaceTyConSort
@@ -296,7 +293,7 @@ toIfaceCoercionX fr co
     go (AppCo co1 co2)      = IfaceAppCo  (go co1) (go co2)
     go (SymCo co)           = IfaceSymCo (go co)
     go (TransCo co1 co2)    = IfaceTransCo (go co1) (go co2)
-    go (NthCo _r d co)      = IfaceNthCo d (go co)
+    go (SelCo d co)         = IfaceSelCo d (go co)
     go (LRCo lr co)         = IfaceLRCo lr (go co)
     go (InstCo co arg)      = IfaceInstCo (go co) (go arg)
     go (KindCo c)           = IfaceKindCo (go c)
@@ -306,12 +303,12 @@ toIfaceCoercionX fr co
     go (UnivCo p r t1 t2)   = IfaceUnivCo (go_prov p) r
                                           (toIfaceTypeX fr t1)
                                           (toIfaceTypeX fr t2)
-    go (TyConAppCo r tc cos)
-      | tc `hasKey` funTyConKey
-      , [_,_,_,_, _] <- cos         = panic "toIfaceCoercion"
-      | otherwise                =
-        IfaceTyConAppCo r (toIfaceTyCon tc) (map go cos)
-    go (FunCo r w co1 co2)   = IfaceFunCo r (go w) (go co1) (go co2)
+    go co@(TyConAppCo r tc cos)
+      =  assertPpr (isNothing (tyConAppFunCo_maybe r tc cos)) (ppr co) $
+         IfaceTyConAppCo r (toIfaceTyCon tc) (map go cos)
+
+    go (FunCo { fco_role = r, fco_mult = w, fco_arg = co1, fco_res = co2 })
+      = IfaceFunCo r (go w) (go co1) (go co2)
 
     go (ForAllCo tv k co) = IfaceForAllCo (toIfaceBndr tv)
                                           (toIfaceCoercionX fr' k)
@@ -344,7 +341,10 @@ toIfaceAppArgsX :: VarSet -> Kind -> [Type] -> IfaceAppArgs
 -- Is 'blib' visible?  It depends on the visibility flag on j,
 -- so we have to substitute for k.  Annoying!
 toIfaceAppArgsX fr kind ty_args
-  = go (mkEmptyTCvSubst in_scope) kind ty_args
+  | null ty_args
+  = IA_Nil
+  | otherwise
+  = go (mkEmptySubst in_scope) kind ty_args
   where
     in_scope = mkInScopeSet (tyCoVarsOfTypes ty_args)
 
@@ -361,15 +361,14 @@ toIfaceAppArgsX fr kind ty_args
     go env (FunTy { ft_af = af, ft_res = res }) (t:ts)
       = IA_Arg (toIfaceTypeX fr t) argf (go env res ts)
       where
-        argf = case af of
-                 VisArg   -> Required
-                 InvisArg -> Inferred
-                   -- It's rare for a kind to have a constraint argument, but
-                   -- it can happen. See Note [AnonTCB InvisArg] in GHC.Core.TyCon.
+        argf | isVisibleFunArg af = Required
+             | otherwise          = Inferred
+             -- It's rare for a kind to have a constraint argument, but it
+             -- can happen. See Note [AnonTCB with constraint arg] in GHC.Core.TyCon.
 
     go env ty ts@(t1:ts1)
       | not (isEmptyTCvSubst env)
-      = go (zapTCvSubst env) (substTy env ty) ts
+      = go (zapSubst env) (substTy env ty) ts
         -- See Note [Care with kind instantiation] in GHC.Core.Type
 
       | otherwise
@@ -416,8 +415,8 @@ patSynToIfaceDecl ps
     (_univ_tvs, req_theta, _ex_tvs, prov_theta, args, rhs_ty) = patSynSig ps
     univ_bndrs = patSynUnivTyVarBinders ps
     ex_bndrs   = patSynExTyVarBinders ps
-    (env1, univ_bndrs') = tidyTyCoVarBinders emptyTidyEnv univ_bndrs
-    (env2, ex_bndrs')   = tidyTyCoVarBinders env1 ex_bndrs
+    (env1, univ_bndrs') = tidyForAllTyBinders emptyTidyEnv univ_bndrs
+    (env2, ex_bndrs')   = tidyForAllTyBinders env1 ex_bndrs
     to_if_pr (name, _type, needs_dummy) = (name, needs_dummy)
 
 {-
@@ -432,7 +431,7 @@ toIfaceBang :: TidyEnv -> HsImplBang -> IfaceBang
 toIfaceBang _    HsLazy              = IfNoBang
 toIfaceBang _   (HsUnpack Nothing)   = IfUnpack
 toIfaceBang env (HsUnpack (Just co)) = IfUnpackCo (toIfaceCoercion (tidyCo env co))
-toIfaceBang _   HsStrict             = IfStrict
+toIfaceBang _   (HsStrict _)         = IfStrict
 
 toIfaceSrcBang :: HsSrcBang -> IfaceSrcBang
 toIfaceSrcBang (HsSrcBang _ unpk bang) = IfSrcBang unpk bang
@@ -444,6 +443,15 @@ toIfaceLetBndr id  = IfLetBndr (occNameFS (getOccName id))
                                (toIfaceJoinInfo (isJoinId_maybe id))
   -- Put into the interface file any IdInfo that GHC.Core.Tidy.tidyLetBndr
   -- has left on the Id.  See Note [IdInfo on nested let-bindings] in GHC.Iface.Syntax
+
+toIfaceTopBndr :: Id -> IfaceTopBndrInfo
+toIfaceTopBndr id
+  = if isExternalName name
+      then IfGblTopBndr name
+      else IfLclTopBndr (occNameFS (getOccName id)) (toIfaceType (idType id))
+                        (toIfaceIdInfo (idInfo id)) (toIfaceIdDetails (idDetails id))
+  where
+    name = getName id
 
 toIfaceIdDetails :: IdDetails -> IfaceIdDetails
 toIfaceIdDetails VanillaId                      = IfVanillaId
@@ -464,7 +472,7 @@ toIfaceIdDetails other = pprTrace "toIfaceIdDetails" (ppr other)
 toIfaceIdInfo :: IdInfo -> IfaceIdInfo
 toIfaceIdInfo id_info
   = catMaybes [arity_hsinfo, caf_hsinfo, strict_hsinfo, cpr_hsinfo,
-               inline_hsinfo,  unfold_hsinfo, levity_hsinfo]
+               inline_hsinfo,  unfold_hsinfo]
                -- NB: strictness and arity must appear in the list before unfolding
                -- See GHC.IfaceToCore.tcUnfolding
   where
@@ -498,10 +506,6 @@ toIfaceIdInfo id_info
     inline_hsinfo | isDefaultInlinePragma inline_prag = Nothing
                   | otherwise = Just (HsInline inline_prag)
 
-    ------------  Representation polymorphism  ----------
-    levity_hsinfo | isNeverRepPolyIdInfo id_info = Just HsLevity
-                  | otherwise                    = Nothing
-
 toIfaceJoinInfo :: Maybe JoinArity -> IfaceJoinInfo
 toIfaceJoinInfo (Just ar) = IfaceJoinPoint ar
 toIfaceJoinInfo Nothing   = IfaceNotJoinPoint
@@ -513,20 +517,11 @@ toIfUnfolding lb (CoreUnfolding { uf_tmpl = rhs
                                 , uf_cache = cache
                                 , uf_guidance = guidance })
   = Just $ HsUnfold lb $
-    case src of
-        InlineStable
-          -> case guidance of
-               UnfWhen {ug_arity = arity, ug_unsat_ok = unsat_ok, ug_boring_ok =  boring_ok }
-                      -> IfInlineRule arity unsat_ok boring_ok if_rhs
-               _other -> IfCoreUnfold True cache if_rhs
-        InlineCompulsory -> IfCompulsory if_rhs
-        InlineRhs        -> IfCoreUnfold False cache if_rhs
+    IfCoreUnfold src cache (toIfGuidance src guidance) (toIfaceExpr rhs)
         -- Yes, even if guidance is UnfNever, expose the unfolding
         -- If we didn't want to expose the unfolding, GHC.Iface.Tidy would
         -- have stuck in NoUnfolding.  For supercompilation we want
         -- to see that unfolding!
-  where
-    if_rhs = toIfaceExpr rhs
 
 toIfUnfolding lb (DFunUnfolding { df_bndrs = bndrs, df_args = args })
   = Just (HsUnfold lb (IfDFunUnfold (map toIfaceBndr bndrs) (map toIfaceExpr args)))
@@ -543,6 +538,12 @@ toIfUnfolding _ BootUnfolding = Nothing
 
 toIfUnfolding _ NoUnfolding = Nothing
 
+toIfGuidance :: UnfoldingSource -> UnfoldingGuidance -> IfGuidance
+toIfGuidance src guidance
+  | UnfWhen arity unsat_ok boring_ok <- guidance
+  , isStableSource src = IfWhen arity unsat_ok boring_ok
+  | otherwise          = IfNoGuidance
+
 {-
 ************************************************************************
 *                                                                      *
@@ -553,7 +554,7 @@ toIfUnfolding _ NoUnfolding = Nothing
 
 toIfaceExpr :: CoreExpr -> IfaceExpr
 toIfaceExpr (Var v)         = toIfaceVar v
-toIfaceExpr (Lit (LitRubbish r)) = IfaceLitRubbish (toIfaceType r)
+toIfaceExpr (Lit (LitRubbish tc r)) = IfaceLitRubbish tc (toIfaceType r)
 toIfaceExpr (Lit l)         = IfaceLit l
 toIfaceExpr (Type ty)       = IfaceType (toIfaceType ty)
 toIfaceExpr (Coercion co)   = IfaceCo   (toIfaceCoercion co)
@@ -585,9 +586,36 @@ toIfaceTickish (Breakpoint {})         = Nothing
    -- should not be serialised (#8333)
 
 ---------------------
-toIfaceBind :: Bind Id -> IfaceBinding
+toIfaceBind :: Bind Id -> IfaceBinding IfaceLetBndr
 toIfaceBind (NonRec b r) = IfaceNonRec (toIfaceLetBndr b) (toIfaceExpr r)
 toIfaceBind (Rec prs)    = IfaceRec [(toIfaceLetBndr b, toIfaceExpr r) | (b,r) <- prs]
+
+toIfaceTopBind :: Bind Id -> IfaceBindingX IfaceMaybeRhs IfaceTopBndrInfo
+toIfaceTopBind b =
+  case b of
+    NonRec b r -> uncurry IfaceNonRec (do_one (b, r))
+    Rec prs -> IfaceRec (map do_one prs)
+  where
+        do_one (b, rhs) =
+          let top_bndr = toIfaceTopBndr b
+              rhs' = case top_bndr of
+                      -- Use the existing unfolding for a global binder if we store that anyway.
+                      -- See Note [Interface File with Core: Sharing RHSs]
+                      IfGblTopBndr {} -> if already_has_unfolding b then IfUseUnfoldingRhs else IfRhs (toIfaceExpr rhs)
+                      -- Local binders will have had unfoldings trimmed so have
+                      -- to serialise the whole RHS.
+                      IfLclTopBndr {} -> IfRhs (toIfaceExpr rhs)
+          in (top_bndr, rhs')
+
+        -- The sharing behaviour is currently disabled due to #22807, and relies on
+        -- finished #220056 to be re-enabled.
+        disabledDueTo22807 = True
+
+        already_has_unfolding b = not disabledDueTo22807
+                                && -- The identifier has an unfolding, which we are going to serialise anyway
+                                hasCoreUnfolding (realIdUnfolding b)
+                                -- But not a stable unfolding, we want the optimised unfoldings.
+                                && not (isStableUnfolding (realIdUnfolding b))
 
 ---------------------
 toIfaceAlt :: CoreAlt -> IfaceAlt
@@ -628,8 +656,8 @@ toIfaceVar :: Id -> IfaceExpr
 toIfaceVar v
     | isBootUnfolding (idUnfolding v)
     = -- See Note [Inlining and hs-boot files]
-      IfaceApp (IfaceApp (IfaceExt noinlineIdName)
-                         (IfaceType (toIfaceType (idType v))))
+      IfaceApp (IfaceApp (IfaceExt noinline_id)
+                         (IfaceType (toIfaceType ty)))
                (IfaceExt name) -- don't use mkIfaceApps, or infinite loop
 
     | Just fcall <- isFCallId_maybe v = IfaceFCall fcall (toIfaceType (idType v))
@@ -637,7 +665,12 @@ toIfaceVar v
 
     | isExternalName name             = IfaceExt name
     | otherwise                       = IfaceLcl (getOccFS name)
-  where name = idName v
+  where
+    name = idName v
+    ty   = idType v
+    noinline_id | isConstraintKind (typeKind ty) = noinlineConstraintIdName
+                | otherwise                      = noinlineIdName
+
 
 
 ---------------------
@@ -726,7 +759,8 @@ But how do we arrange for this to happen?  There are two ingredients:
     1. When we serialize out unfoldings to IfaceExprs (toIfaceVar),
     for every variable reference we see if we are referring to an
     'Id' that came from an hs-boot file.  If so, we add a `noinline`
-    to the reference.
+    to the reference.  See Note [noinlineId magic]
+    in GHC.Types.Id.Make
 
     2. But how do we know if a reference came from an hs-boot file
     or not?  We could record this directly in the 'IdInfo', but
@@ -742,5 +776,35 @@ for RSR (if it exists).  Doing so makes the bootstrapped GHC itself
 slower by 8% overall (on #9872a-d, and T1969: the reason
 is that these NOINLINE'd functions now can't be profitably inlined
 outside of the hs-boot loop.
+
+Note [Interface File with Core: Sharing RHSs]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+IMPORTANT: This optimisation is currently disabled due to #22027, it can be
+           re-enabled once #220056 is implemented.
+
+In order to avoid duplicating definitions for bindings which already have unfoldings
+we do some minor headstands to avoid serialising the RHS of a definition if it has
+*any* unfolding.
+
+* Only global things have unfoldings, because local things have had their unfoldings stripped.
+* For any global thing which has an unstable unfolding, we just use that.
+
+In order to implement this sharing:
+
+* When creating the interface, check the criteria above and don't serialise the RHS
+  if such a case.
+  See
+* When reading an interface, look at the realIdUnfolding, and then the unfoldingTemplate.
+  See `tc_iface_binding` for where this happens.
+
+There are two main reasons why the mi_extra_decls field exists rather than shoe-horning
+all the core bindings
+
+1. mi_extra_decls retains the recursive group structure of the original program which
+   is very convenient as otherwise we would have to do the analysis again when loading
+   the program.
+2. There are additional local top-level bindings which don't make it into mi_decls. It's
+   best to keep these separate from mi_decls as mi_decls is used to compute the ABI hash.
 
 -}

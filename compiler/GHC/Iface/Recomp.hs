@@ -19,6 +19,7 @@ module GHC.Iface.Recomp
 where
 
 import GHC.Prelude
+import GHC.Data.FastString
 
 import GHC.Driver.Backend
 import GHC.Driver.Config.Finder
@@ -44,13 +45,12 @@ import GHC.Utils.Error
 import GHC.Utils.Panic
 import GHC.Utils.Panic.Plain
 import GHC.Utils.Outputable as Outputable
-import GHC.Utils.Misc as Utils hiding ( eqListBy )
+import GHC.Utils.Misc as Utils
 import GHC.Utils.Binary
 import GHC.Utils.Fingerprint
 import GHC.Utils.Exception
 import GHC.Utils.Logger
 import GHC.Utils.Constants (debugIsOn)
-import GHC.Utils.Trace
 
 import GHC.Types.Annotations
 import GHC.Types.Name
@@ -70,7 +70,7 @@ import GHC.Unit.Module.Warnings
 import GHC.Unit.Module.Deps
 
 import Control.Monad
-import Data.List (sortBy, sort)
+import Data.List (sortBy, sort, sortOn)
 import qualified Data.Map as Map
 import qualified Data.Set as Set
 import Data.Word (Word64)
@@ -137,6 +137,10 @@ data MaybeValidated a
       -- ^ The old item, if it exists
   deriving (Functor)
 
+instance Outputable a => Outputable (MaybeValidated a) where
+  ppr (UpToDateItem a) = text "UpToDate" <+> ppr a
+  ppr (OutOfDateItem r _) = text "OutOfDate: " <+> ppr r
+
 outOfDateItemBecause :: RecompReason -> Maybe a -> MaybeValidated a
 outOfDateItemBecause reason item = OutOfDateItem (RecompBecause reason) item
 
@@ -165,7 +169,7 @@ instance Monoid RecompileRequired where
 
 data RecompReason
   = UnitDepRemoved UnitId
-  | ModulePackageChanged String
+  | ModulePackageChanged FastString
   | SourceFileChanged
   | ThisUnitIdChanged
   | ImpurePlugin
@@ -197,7 +201,7 @@ data RecompReason
 instance Outputable RecompReason where
   ppr = \case
     UnitDepRemoved uid       -> ppr uid <+> text "removed"
-    ModulePackageChanged s   -> text s <+> text "package changed"
+    ModulePackageChanged s   -> ftext s <+> text "package changed"
     SourceFileChanged        -> text "Source file changed"
     ThisUnitIdChanged        -> text "-this-unit-id changed"
     ImpurePlugin             -> text "Impure plugin forced recompilation"
@@ -323,7 +327,7 @@ check_old_iface hsc_env mod_summary maybe_iface
             -- If the source has changed and we're in interactive mode,
             -- avoid reading an interface; just return the one we might
             -- have been supplied with.
-            True | not (backendProducesObject $ backend dflags) ->
+            True | not (backendWritesFiles $ backend dflags) ->
                 return $ OutOfDateItem MustCompile maybe_iface
 
             -- Try and read the old interface for the current module
@@ -585,7 +589,7 @@ checkDependencies hsc_env summary iface
         liftIO $
           check_mods (sort hs) prev_dep_mods
           `recompThen`
-            let allPkgDeps = sortBy (comparing snd) $ nubOrdOn snd (ps ++ implicit_deps ++ bkpk_units)
+            let allPkgDeps = sortBy (comparing snd) $ nubOrdOn snd (ps ++ implicit_deps)
             in check_packages allPkgDeps prev_dep_pkgs
  where
 
@@ -593,7 +597,7 @@ checkDependencies hsc_env summary iface
                       -> [(t, GenLocated l ModuleName)]
                     -> IfG
                        [Either
-                          CompileReason (Either (UnitId, ModuleName) (String, UnitId))]
+                          CompileReason (Either (UnitId, ModuleName) (FastString, UnitId))]
    classify_import find_import imports =
     liftIO $ traverse (\(mb_pkg, L _ mod) ->
            let reason = ModuleChanged mod
@@ -609,9 +613,8 @@ checkDependencies hsc_env summary iface
    prev_dep_mods = map (second gwib_mod) $ Set.toAscList $ dep_direct_mods (mi_deps iface)
    prev_dep_pkgs = Set.toAscList (Set.union (dep_direct_pkgs (mi_deps iface))
                                             (dep_plugin_pkgs (mi_deps iface)))
-   bkpk_units    = map (("Signature",) . instUnitInstanceOf . moduleUnit) (requirementMerges units (moduleName (mi_module iface)))
 
-   implicit_deps = map ("Implicit",) (implicitPackageDeps dflags)
+   implicit_deps = map (fsLit "Implicit",) (implicitPackageDeps dflags)
 
    -- GHC.Prim is very special and doesn't appear in ms_textual_imps but
    -- ghc-prim will appear in the package dependencies still. In order to not confuse
@@ -620,12 +623,12 @@ checkDependencies hsc_env summary iface
                               Just home_unit
                                 | homeUnitId home_unit == primUnitId
                                 -> Left (primUnitId, mkModuleName "GHC.Prim")
-                              _ -> Right ("GHC.Prim", primUnitId)
+                              _ -> Right (fsLit "GHC.Prim", primUnitId)
 
 
    classify _ (Found _ mod)
     | (toUnitId $ moduleUnit mod) `elem` all_home_units = Right (Left ((toUnitId $ moduleUnit mod), moduleName mod))
-    | otherwise = Right (Right (moduleNameString (moduleName mod), toUnitId $ moduleUnit mod))
+    | otherwise = Right (Right (moduleNameFS (moduleName mod), toUnitId $ moduleUnit mod))
    classify reason _ = Left (RecompBecause reason)
 
    check_mods :: [(UnitId, ModuleName)] -> [(UnitId, ModuleName)] -> IO RecompileRequired
@@ -646,21 +649,21 @@ checkDependencies hsc_env summary iface
            text " not among previous dependencies"
         return $ needsRecompileBecause $ ModuleAdded new
 
-   check_packages :: [(String, UnitId)] -> [UnitId] -> IO RecompileRequired
+   check_packages :: [(FastString, UnitId)] -> [UnitId] -> IO RecompileRequired
    check_packages [] [] = return UpToDate
    check_packages [] (old:_) = do
      trace_hi_diffs logger $
       text "package " <> quotes (ppr old) <>
         text "no longer in dependencies"
      return $ needsRecompileBecause $ UnitDepRemoved old
-   check_packages (new:news) olds
+   check_packages ((new_name, new_unit):news) olds
     | Just (old, olds') <- uncons olds
-    , snd new == old = check_packages (dropWhile ((== (snd new)) . snd) news) olds'
+    , new_unit == old = check_packages (dropWhile ((== new_unit) . snd) news) olds'
     | otherwise = do
         trace_hi_diffs logger $
-         text "imported package " <> quotes (ppr new) <>
-           text " not among previous dependencies"
-        return $ needsRecompileBecause $ ModulePackageChanged $ fst new
+         text "imported package" <+> ftext new_name <+> ppr new_unit <+>
+           text "not among previous dependencies"
+        return $ needsRecompileBecause $ ModulePackageChanged new_name
 
 
 needInterface :: Module -> (ModIface -> IO RecompileRequired)
@@ -929,7 +932,7 @@ we use is:
     group_fingerprint.
 
     Since we included the sequence number in step (1) programs identical up to
-    transposition of recursive occurrences are distinguisable, avoiding the
+    transposition of recursive occurrences are distinguishable, avoiding the
     second issue mentioned above.
 
  3. Produce the final environment by extending hash_env, mapping each
@@ -1200,6 +1203,16 @@ addFingerprints hsc_env iface0
        sorted_decls = Map.elems $ Map.fromList $
                           [(getOccName d, e) | e@(_, d) <- decls_w_hashes]
 
+       -- This key is safe because mi_extra_decls contains tidied things.
+       getOcc (IfGblTopBndr b) = getOccName b
+       getOcc (IfLclTopBndr fs _ _ _) = mkVarOccFS fs
+
+       binding_key (IfaceNonRec b _) = IfaceNonRec (getOcc b) ()
+       binding_key (IfaceRec bs) = IfaceRec (map (\(b, _) -> (getOcc b, ())) bs)
+
+       sorted_extra_decls :: Maybe [IfaceBindingX IfaceMaybeRhs IfaceTopBndrInfo]
+       sorted_extra_decls = sortOn binding_key <$> mi_extra_decls iface0
+
    -- the flag hash depends on:
    --   - (some of) dflags
    -- it returns two hashes, one that shouldn't change
@@ -1233,7 +1246,7 @@ addFingerprints hsc_env iface0
    iface_hash <- computeFingerprint putNameLiterally
                       (mod_hash,
                        mi_src_hash iface0,
-                       ann_fn (mkVarOcc "module"),  -- See mkIfaceAnnCache
+                       ann_fn (mkVarOccFS (fsLit "module")),  -- See mkIfaceAnnCache
                        usages,
                        sorted_deps,
                        mi_hpc iface0)
@@ -1257,7 +1270,7 @@ addFingerprints hsc_env iface0
       , mi_fix_fn      = fix_fn
       , mi_hash_fn     = lookupOccEnv local_env
       }
-    final_iface = iface0 { mi_decls = sorted_decls, mi_final_exts = final_iface_exts }
+    final_iface = iface0 { mi_decls = sorted_decls, mi_extra_decls = sorted_extra_decls, mi_final_exts = final_iface_exts }
    --
    return final_iface
 
@@ -1630,7 +1643,7 @@ mkIfaceAnnCache anns
     pair (IfaceAnnotation target value) =
       (case target of
           NamedTarget occn -> occn
-          ModuleTarget _   -> mkVarOcc "module"
+          ModuleTarget _   -> mkVarOccFS (fsLit "module")
       , [value])
     -- flipping (++), so the first argument is always short
     env = mkOccEnv_C (flip (++)) (map pair anns)

@@ -48,7 +48,6 @@ import GHC.Platform
 
 -- Our intermediate code:
 import GHC.Cmm.BlockId
-import GHC.Cmm.Ppr           ( pprExpr )
 import GHC.Cmm
 import GHC.Cmm.Utils
 import GHC.Cmm.Switch
@@ -163,7 +162,7 @@ stmtToInstrs stmt = do
   config <- getConfig
   platform <- getPlatform
   case stmt of
-    CmmComment s   -> return (unitOL (COMMENT $ ftext s))
+    CmmComment s   -> return (unitOL (COMMENT s))
     CmmTick {}     -> return nilOL
     CmmUnwind {}   -> return nilOL
 
@@ -395,7 +394,7 @@ iselExpr64 (CmmMachOp (MO_SS_Conv W32 W64) [expr]) = do
 iselExpr64 expr
    = do
      platform <- getPlatform
-     pprPanic "iselExpr64(powerpc)" (pprExpr platform expr)
+     pprPanic "iselExpr64(powerpc)" (pdoc platform expr)
 
 
 
@@ -408,7 +407,7 @@ getRegister' :: NCGConfig -> Platform -> CmmExpr -> NatM Register
 getRegister' _ platform (CmmReg (CmmGlobal PicBaseReg))
   | OSAIX <- platformOS platform = do
         let code dst = toOL [ LD II32 dst tocAddr ]
-            tocAddr = AddrRegImm toc (ImmLit (text "ghc_toc_table[TC]"))
+            tocAddr = AddrRegImm toc (ImmLit (fsLit "ghc_toc_table[TC]"))
         return (Any II32 code)
   | target32Bit platform = do
       reg <- getPicBaseNat $ archWordFormat (target32Bit platform)
@@ -690,7 +689,7 @@ getRegister' config platform (CmmLit lit)
             `consOL` (addr_code `snocOL` LD format dst addr)
        return (Any format code)
 
-getRegister' _ platform other = pprPanic "getRegister(ppc)" (pprExpr platform other)
+getRegister' _ platform other = pprPanic "getRegister(ppc)" (pdoc platform other)
 
     -- extend?Rep: wrap integer expression of type `from`
     -- in a conversion to `to`
@@ -1754,7 +1753,7 @@ genCCall' config gcp target dest_regs args
                                 _ -> panic "genCall': unknown calling conv."
 
         argReps = map (cmmExprType platform) args
-        (argHints, _) = foreignTargetHints target
+        (_, argHints) = foreignTargetHints target
 
         roundTo a x | x `mod` a == 0 = x
                     | otherwise = x + a - (x `mod` a)
@@ -2147,7 +2146,7 @@ genSwitch config expr targets
     -- See Note [Sub-word subtlety during jump-table indexing] in
     -- GHC.CmmToAsm.X86.CodeGen for why we must first offset, then widen.
     indexExpr0 = cmmOffset platform expr offset
-    -- We widen to a native-width register to santize the high bits
+    -- We widen to a native-width register to sanitize the high bits
     indexExpr = CmmMachOp
       (MO_UU_Conv expr_w (platformWordWidth platform))
       [indexExpr0]

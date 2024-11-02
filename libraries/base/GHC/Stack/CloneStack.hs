@@ -28,7 +28,7 @@ import Foreign
 import GHC.Conc.Sync
 import GHC.Exts (Int (I#), RealWorld, StackSnapshot#, ThreadId#, Array#, sizeofArray#, indexArray#, State#, StablePtr#)
 import GHC.IO (IO (..))
-import GHC.Stack.CCS (InfoProv (..), InfoProvEnt, ipeProv, peekInfoProv)
+import GHC.InfoProv (InfoProv (..), InfoProvEnt, ipLoc, ipeProv, peekInfoProv)
 import GHC.Stable
 
 -- | A frozen snapshot of the state of an execution stack.
@@ -86,7 +86,7 @@ There are two different ways to clone a stack:
 1. `cloneMyStack#` - A primop for cloning the active thread's stack.
 2. `sendCloneStackMessage#` - A primop for cloning another thread's stack.
    Sends a RTS message (Messages.c) with a MVar to that thread. The cloned
-   stack is reveived by taking it out of this MVar.
+   stack is received by taking it out of this MVar.
 
 `cloneMyStack#` has to be a primop, because new primitive types
 (`StackSnapshot#`) cannot be marshalled by FFI. Using a `Ptr StackSnapshot` as
@@ -201,7 +201,7 @@ cloneThreadStack (ThreadId tid#) = do
   freeStablePtr boxedPtr
   takeMVar resultVar
 
--- | Represetation for the source location where a return frame was pushed on the stack.
+-- | Representation for the source location where a return frame was pushed on the stack.
 -- This happens every time when a @case ... of@ scrutinee is evaluated.
 data StackEntry = StackEntry
   { functionName :: String,
@@ -230,12 +230,12 @@ data StackEntry = StackEntry
 decode :: StackSnapshot -> IO [StackEntry]
 decode stackSnapshot = do
     stackEntries <- getDecodedStackArray stackSnapshot
-    ipes <- mapM unmarshall stackEntries
+    ipes <- mapM unmarshal stackEntries
     return $ catMaybes ipes
 
     where
-      unmarshall :: Ptr InfoProvEnt -> IO (Maybe StackEntry)
-      unmarshall ipe = if ipe == nullPtr then
+      unmarshal :: Ptr InfoProvEnt -> IO (Maybe StackEntry)
+      unmarshal ipe = if ipe == nullPtr then
                           pure Nothing
                        else do
                           infoProv <- (peekInfoProv . ipeProv) ipe

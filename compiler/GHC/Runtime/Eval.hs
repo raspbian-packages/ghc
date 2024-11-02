@@ -62,17 +62,16 @@ import GHCi.Message
 import GHCi.RemoteTypes
 import GHC.ByteCode.Types
 
-import GHC.Linker.Types
 import GHC.Linker.Loader as Loader
 
 import GHC.Hs
 
 import GHC.Core.Predicate
 import GHC.Core.InstEnv
-import GHC.Core.FamInstEnv ( FamInst )
-import GHC.Core.FVs        ( orphNamesOfFamInst )
+import GHC.Core.FamInstEnv ( FamInst, orphNamesOfFamInst )
 import GHC.Core.TyCon
 import GHC.Core.Type       hiding( typeKind )
+import GHC.Core.TyCo.Ppr
 import qualified GHC.Core.Type as Type
 
 import GHC.Iface.Env       ( newInteractiveBinder )
@@ -92,7 +91,6 @@ import GHC.Utils.Error
 import GHC.Utils.Outputable
 import GHC.Utils.Misc
 import GHC.Utils.Logger
-import GHC.Utils.Trace
 
 import GHC.Types.RepType
 import GHC.Types.Fixity.Env
@@ -122,6 +120,7 @@ import Data.Either
 import Data.IntMap (IntMap)
 import qualified Data.IntMap as IntMap
 import Data.List (find,intercalate)
+import Data.List.NonEmpty (NonEmpty)
 import Control.Monad
 import Control.Monad.Catch as MC
 import Data.Array
@@ -629,10 +628,10 @@ bindLocalsAtBreakpoint hsc_env apStack_fhv (Just BreakInfo{..}) = do
      = do { name <- newInteractiveBinder hsc_env occ (getSrcSpan old_id)
           ; return (Id.mkVanillaGlobalWithInfo name ty (idInfo old_id)) }
 
-   newTyVars :: UniqSupply -> [TcTyVar] -> TCvSubst
+   newTyVars :: UniqSupply -> [TcTyVar] -> Subst
      -- Similarly, clone the type variables mentioned in the types
      -- we have here, *and* make them all RuntimeUnk tyvars
-   newTyVars us tvs = foldl' new_tv emptyTCvSubst (tvs `zip` uniqsFromSupply us)
+   newTyVars us tvs = foldl' new_tv emptySubst (tvs `zip` uniqsFromSupply us)
    new_tv subst (tv,uniq) = extendTCvSubstWithClone subst tv new_tv
     where
      new_tv = mkRuntimeUnkTyVar (setNameUnique (tyVarName tv) uniq)
@@ -678,9 +677,12 @@ rttiEnvironment hsc_env@HscEnv{hsc_IC=ic} = do
              Nothing -> return hsc_env
              Just new_ty -> do
               case improveRTTIType hsc_env old_ty new_ty of
-               Nothing -> return $
-                        warnPprTrace True (":print failed to calculate the "
-                                           ++ "improvement for a type") empty hsc_env
+               Nothing -> warnPprTrace True (":print failed to calculate the "
+                                             ++ "improvement for a type")
+                              (vcat [ text "id" <+> ppr id
+                                    , text "old_ty" <+> debugPprType old_ty
+                                    , text "new_ty" <+> debugPprType new_ty ]) $
+                          return hsc_env
                Just subst -> do
                  let logger = hsc_logger hsc_env
                  putDumpFileMaybe logger Opt_D_dump_rtti "RTTI"
@@ -713,7 +715,7 @@ pushResume hsc_env resume = hsc_env { hsc_IC = ictxt1 }
   There are 3 situations where items are removed from the Id list
   (or replaced with `Nothing`):
   1.) If function `GHC.StgToByteCode.schemeER_wrk` (which creates
-      the Id list) doesn't find an Id in the ByteCode environement.
+      the Id list) doesn't find an Id in the ByteCode environment.
   2.) If function `GHC.Runtime.Eval.bindLocalsAtBreakpoint`
       filters out unboxed elements from the Id list, because GHCi cannot
       yet handle them.
@@ -857,7 +859,7 @@ moduleIsInterpreted modl = withSession $ \h ->
                 _not_a_home_module -> return False
 
 -- | Looks up an identifier in the current interactive context (for :info)
--- Filter the instances by the ones whose tycons (or clases resp)
+-- Filter the instances by the ones whose tycons (or classes resp)
 -- are in scope (qualified or otherwise).  Otherwise we list a whole lot too many!
 -- The exact choice of which ones to show, and which to hide, is a judgement call.
 --      (see #1581)
@@ -909,7 +911,7 @@ getRdrNamesInScope = withSession $ \hsc_env -> do
 
 -- | Parses a string as an identifier, and returns the list of 'Name's that
 -- the identifier can refer to in the current interactive context.
-parseName :: GhcMonad m => String -> m [Name]
+parseName :: GhcMonad m => String -> m (NonEmpty Name)
 parseName str = withSession $ \hsc_env -> liftIO $
    do { lrdr_name <- hscParseIdentifier hsc_env str
       ; hscTcRnLookupRdrName hsc_env lrdr_name }
@@ -993,7 +995,7 @@ typeKind normalise str = withSession $ \hsc_env ->
 
 {-
   Note [Querying instances for a type]
-
+  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
   Here is the implementation of GHC proposal 41.
   (https://github.com/ghc-proposals/ghc-proposals/blob/master/proposals/0041-ghci-instances.rst)
 
@@ -1058,7 +1060,7 @@ parseInstanceHead str = withSession $ \hsc_env0 -> do
 -- Get all the constraints required of a dictionary binding
 getDictionaryBindings :: PredType -> TcM CtEvidence
 getDictionaryBindings theta = do
-  dictName <- newName (mkDictOcc (mkVarOcc "magic"))
+  dictName <- newName (mkDictOcc (mkVarOccFS (fsLit "magic")))
   let dict_var = mkVanillaGlobal dictName theta
   loc <- getCtLocM (GivenOrigin (getSkolemInfo unkSkol)) Nothing
 
@@ -1081,8 +1083,8 @@ findMatchingInstances ty = do
     k -> Constraint where k is the type of the queried type.
   -}
   try_cls ies cls
-    | Just (_, arg_kind, res_kind) <- splitFunTy_maybe (tyConKind $ classTyCon cls)
-    , tcIsConstraintKind res_kind
+    | Just (_, _, arg_kind, res_kind) <- splitFunTy_maybe (tyConKind $ classTyCon cls)
+    , isConstraintKind res_kind
     , Type.typeKind ty `eqType` arg_kind
     , (matches, _, _) <- lookupInstEnv True ies cls [ty]
     = matches
@@ -1154,7 +1156,7 @@ checkForExistence clsInst mb_inst_tys = do
       Just (_, tys@(_:_)) -> all isTyVarTy tys
       _                   -> isTyVarTy ty
 
-  empty_subst = mkEmptyTCvSubst (mkInScopeSet (tyCoVarsOfType (idType $ is_dfun clsInst)))
+  empty_subst = mkEmptySubst (mkInScopeSet (tyCoVarsOfType (idType $ is_dfun clsInst)))
 
   {- Create a ClsInst with instantiated arguments and constraints.
 
@@ -1250,17 +1252,18 @@ dynCompileExpr expr = do
 showModule :: GhcMonad m => ModSummary -> m String
 showModule mod_summary =
     withSession $ \hsc_env -> do
-        interpreted <- moduleIsBootOrNotObjectLinkable mod_summary
         let dflags = hsc_dflags hsc_env
+        let interpreted =
+              case lookupHug (hsc_HUG hsc_env) (ms_unitid mod_summary) (ms_mod_name mod_summary) of
+               Nothing       -> panic "missing linkable"
+               Just mod_info -> isJust (homeModInfoByteCode mod_info)  && isNothing (homeModInfoObject mod_info)
         return (showSDoc dflags $ showModMsg dflags interpreted (ModuleNode [] mod_summary))
 
 moduleIsBootOrNotObjectLinkable :: GhcMonad m => ModSummary -> m Bool
 moduleIsBootOrNotObjectLinkable mod_summary = withSession $ \hsc_env ->
-  case lookupHpt (hsc_HPT hsc_env) (ms_mod_name mod_summary) of
+  case lookupHug (hsc_HUG hsc_env) (ms_unitid mod_summary) (ms_mod_name mod_summary) of
         Nothing       -> panic "missing linkable"
-        Just mod_info -> return $ case hm_linkable mod_info of
-          Nothing       -> True
-          Just linkable -> not (isObjectLinkable linkable)
+        Just mod_info -> return . isNothing $ homeModInfoByteCode mod_info
 
 ----------------------------------------------------------------------------
 -- RTTI primitives

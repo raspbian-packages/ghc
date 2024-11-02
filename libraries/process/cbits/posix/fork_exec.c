@@ -1,5 +1,10 @@
-/* ensure that execvpe is provided if possible */
+/* Ensure that execvpe and pipe2 are provided if possible */
 #define _GNU_SOURCE 1
+
+/* Ensure getpwuid_r(3) is available on Solaris. */
+#if defined(__sun)
+#define _POSIX_PTHREAD_SEMANTICS
+#endif
 
 #include "common.h"
 
@@ -24,18 +29,9 @@
 #include <signal.h>
 #endif
 
-#if defined(HAVE_VFORK_H)
-#include <vfork.h>
-#endif
-
 #include <Rts.h>
 
-#if defined(HAVE_WORKING_VFORK)
-#define myfork vfork
-#elif defined(HAVE_WORKING_FORK)
-#define myfork fork
-// We don't need a fork command on Windows
-#else
+#if !defined(HAVE_WORKING_FORK)
 #error Cannot find a working fork command
 #endif
 
@@ -65,7 +61,7 @@ setup_std_handle_fork(int fd,
 {
     switch (b->behavior) {
     case STD_HANDLE_CLOSE:
-        if (close(fd) == -1) {
+        if (close(fd) == -1 && errno != EBADF) {
             child_failed(pipe, "close");
         }
         return 0;
@@ -102,6 +98,28 @@ setup_std_handle_fork(int fd,
     }
 }
 
+/* This will `dup` the given fd such that it does not fall in the range of
+ * stdin/stdout/stderr, if necessary. The new handle will have O_CLOEXEC.
+ *
+ * This is necessary as we must ensure that the fork communications pipe does
+ * not inhabit fds 0 through 2 since we will need to manipulate these fds in
+ * setup_std_handle_fork while keeping the pipe available so that it can report
+ * errors. See #266.
+ */
+int unshadow_pipe_fd(int fd, char **failed_doing) {
+    if (fd > 2) {
+        return fd;
+    }
+
+    int new_fd = fcntl(fd, F_DUPFD_CLOEXEC, 3);
+    if (new_fd == -1) {
+        *failed_doing = "fcntl(F_DUP_FD)";
+        return -1;
+    }
+    close(fd);
+    return new_fd;
+}
+
 /* Try spawning with fork. */
 ProcHandle
 do_spawn_fork (char *const args[],
@@ -114,22 +132,27 @@ do_spawn_fork (char *const args[],
                char **failed_doing)
 {
     int forkCommunicationFds[2];
-    int r = pipe(forkCommunicationFds);
+    int r;
+
+#if defined(HAVE_PIPE2)
+    r = pipe2(forkCommunicationFds, O_CLOEXEC);
+#else
+    r = pipe(forkCommunicationFds);
+#endif
     if (r == -1) {
         *failed_doing = "pipe";
         return -1;
     }
 
-    // Block signals with Haskell handlers.  The danger here is that
-    // with the threaded RTS, a signal arrives in the child process,
-    // the RTS writes the signal information into the pipe (which is
-    // shared between parent and child), and the parent behaves as if
-    // the signal had been raised.
-    blockUserSignals();
-
-    // See #4074.  Sometimes fork() gets interrupted by the timer
-    // signal and keeps restarting indefinitely.
-    stopTimer();
+    // Ensure that the pipe fds don't shadow stdin/stdout/stderr
+    forkCommunicationFds[0] = unshadow_pipe_fd(forkCommunicationFds[0], failed_doing);
+    if (forkCommunicationFds[0] == -1) {
+        return -1;
+    }
+    forkCommunicationFds[1] = unshadow_pipe_fd(forkCommunicationFds[1], failed_doing);
+    if (forkCommunicationFds[1] == -1) {
+        return -1;
+    }
 
     // N.B. execvpe is not supposed on some platforms. In this case
     // we emulate this using fork and exec. However, to safely do so
@@ -147,7 +170,18 @@ do_spawn_fork (char *const args[],
     }
 #endif
 
-    int pid = myfork();
+    // Block signals with Haskell handlers.  The danger here is that
+    // with the threaded RTS, a signal arrives in the child process,
+    // the RTS writes the signal information into the pipe (which is
+    // shared between parent and child), and the parent behaves as if
+    // the signal had been raised.
+    blockUserSignals();
+
+    // See #4074.  Sometimes fork() gets interrupted by the timer
+    // signal and keeps restarting indefinitely.
+    stopTimer();
+
+    int pid = fork();
     switch(pid)
     {
     case -1:
@@ -159,10 +193,6 @@ do_spawn_fork (char *const args[],
         return -1;
 
     case 0:
-        // WARNING! We may now be in the child of vfork(), and any
-        // memory we modify below may also be seen in the parent
-        // process.
-
         close(forkCommunicationFds[0]);
         fcntl(forkCommunicationFds[1], F_SETFD, FD_CLOEXEC);
 
@@ -252,16 +282,17 @@ do_spawn_fork (char *const args[],
 #if defined(HAVE_EXECVPE)
             // XXX Check result
             execvpe(args[0], args, environment);
+            child_failed(forkCommunicationFds[1], "execvpe");
 #else
             // XXX Check result
             execve(exec_path, args, environment);
+            child_failed(forkCommunicationFds[1], "execve");
 #endif
         } else {
             // XXX Check result
             execvp(args[0], args);
+            child_failed(forkCommunicationFds[1], "execvp");
         }
-
-        child_failed(forkCommunicationFds[1], "exec");
 
     default:
         if ((flags & RUN_PROCESS_IN_NEW_GROUP) != 0) {
@@ -304,16 +335,8 @@ do_spawn_fork (char *const args[],
         // our responsibility to reap here as nobody else can.
         waitpid(pid, NULL, 0);
 
-        // Already closed child ends above
-        if (stdInHdl->behavior == STD_HANDLE_USE_PIPE) {
-            close(stdInHdl->use_pipe.parent_end);
-        }
-        if (stdOutHdl->behavior == STD_HANDLE_USE_PIPE) {
-            close(stdOutHdl->use_pipe.parent_end);
-        }
-        if (stdErrHdl->behavior == STD_HANDLE_USE_PIPE) {
-            close(stdErrHdl->use_pipe.parent_end);
-        }
+        // No need to close stdin, et al. here as runInteractiveProcess will
+        // handle this. See #306.
 
         pid = -1;
     }

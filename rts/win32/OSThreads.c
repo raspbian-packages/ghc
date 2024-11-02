@@ -42,7 +42,7 @@ shutdownThread(void)
 }
 
 int
-createOSThread (OSThreadId* pId, char *name STG_UNUSED,
+createOSThread (OSThreadId* pId, const char *name STG_UNUSED,
                 OSThreadProc *startProc, void *param)
 {
     HANDLE h;

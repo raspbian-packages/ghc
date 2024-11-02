@@ -1,6 +1,8 @@
 module Settings.Flavours.Validate (validateFlavour, slowValidateFlavour,
                                     quickValidateFlavour) where
 
+import qualified Data.Set as Set
+
 import Expression
 import Flavour
 import Oracles.Flag
@@ -8,17 +10,23 @@ import {-# SOURCE #-} Settings.Default
 
 -- Please update doc/flavours.md when changing this file.
 validateFlavour :: Flavour
-validateFlavour = werror $ defaultFlavour
+validateFlavour = enableLinting $ werror $ defaultFlavour
     { name = "validate"
     , args = defaultBuilderArgs <> validateArgs <> defaultPackageArgs
-    , libraryWays = mconcat [ pure [vanilla]
+    , libraryWays = Set.fromList <$>
+                    mconcat [ pure [vanilla]
                             , notStage0 ? platformSupportsSharedLibs ? pure [dynamic]
                             ]
-    , rtsWays = mconcat [ pure [vanilla, threaded, debug, threadedDebug]
+    , rtsWays = Set.fromList <$>
+                mconcat [ pure [vanilla, debug]
+                        , targetSupportsThreadedRts ? pure [threaded, threadedDebug]
                         , notStage0 ? platformSupportsSharedLibs ? pure
-                            [ dynamic, threadedDynamic, debugDynamic, threadedDebugDynamic
+                            [ dynamic, debugDynamic
                             ]
+                        , notStage0 ? platformSupportsSharedLibs ? targetSupportsThreadedRts ? pure
+                            [ threadedDynamic, threadedDebugDynamic ]
                         ]
+    , ghcDebugAssertions = (<= Stage1)
     }
 
 validateArgs :: Args
@@ -26,18 +34,20 @@ validateArgs = sourceArgs SourceArgs
     { hsDefault  = mconcat [ stage0 ? pure ["-O0", "-H64m"]
                              -- See #11487
                            , notStage0 ? arg "-fllvm-fill-undef-with-garbage"
+                           , notStage0 ? arg "-dno-debug-output"
+                           , notStage0 ? arg "-fcheck-prim-bounds"
                            ]
-    , hsLibrary  = pure ["-O", "-dcore-lint", "-dno-debug-output"]
-    , hsCompiler = mconcat [ stage0 ? pure ["-O2", "-DDEBUG"]
-                           , notStage0 ? pure ["-O", "-dcore-lint", "-dno-debug-output"]
+    , hsLibrary  = pure ["-O"]
+    , hsCompiler = mconcat [ stage0 ? pure ["-O2"]
+                           , notStage0 ? pure ["-O" ]
                            ]
     , hsGhc      = pure ["-O"] }
 
+
 slowValidateFlavour :: Flavour
-slowValidateFlavour = werror $ validateFlavour
+slowValidateFlavour = validateFlavour
     { name = "slow-validate"
-    , args = defaultBuilderArgs <> validateArgs <> defaultPackageArgs
-    , ghcDebugAssertions = True
+    , ghcDebugAssertions = const True
     }
 
 quickValidateArgs :: Args

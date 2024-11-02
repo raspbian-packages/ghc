@@ -13,6 +13,7 @@ import Data.Char
 import Data.List (union, intersperse, intercalate, nub)
 import Data.Maybe ( catMaybes )
 import System.Environment ( getArgs )
+import System.IO ( hSetEncoding, stdin, stdout, utf8 )
 
 vecOptions :: Entry -> [(String,String,Int)]
 vecOptions i =
@@ -116,7 +117,9 @@ main = getArgs >>= \args ->
                    ++ unlines (map ("            "++) known_args)
                   )
        else
-       do s <- getContents
+       do hSetEncoding stdin  utf8 -- The input file is in UTF-8. Set the encoding explicitly.
+          hSetEncoding stdout utf8
+          s <- getContents
           case parse s of
              Left err -> error ("parse error at " ++ (show err))
              Right p_o_specs@(Info _ _)
@@ -187,9 +190,6 @@ main = getArgs >>= \args ->
 
                       "--make-haskell-source"
                          -> putStr (gen_hs_source p_o_specs)
-
-                      "--make-latex-doc"
-                         -> putStr (gen_latex_doc p_o_specs)
 
                       "--wired-in-docs"
                          -> putStr (gen_wired_in_docs p_o_specs)
@@ -301,8 +301,7 @@ gen_hs_source (Info defaults entries) =
            hdr (PrimVecTypeSpec { ty = TyApp (VecTyCon n _) _ }) = wrapOp n ++ ","
            hdr (PrimVecTypeSpec {})                              = error $ "Illegal type spec"
 
-           sec s = "\n-- * " ++ escape (title s) ++ "\n"
-                    ++ (unlines $ map ("-- " ++ ) $ lines $ unlatex $ escape $ "|" ++ desc s)
+           sec s = "\n{- * " ++ title s ++ "-}\n{-|" ++ desc s ++ "-}"
 
 
            ent   (Section {})         = []
@@ -314,9 +313,9 @@ gen_hs_source (Info defaults entries) =
 
            spec o = ([ "" ] ++) . concat $
              -- Doc comments
-             [ case unlatex (escape (desc o)) ++ extra (opts o) of
+             [ case desc o ++ extra (opts o) of
                  "" -> []
-                 cmmt -> map ("-- " ++) $ lines $ "|" ++ cmmt
+                 cmmt -> lines ("{-|" ++ cmmt ++ "-}")
 
              -- Deprecations
              , [ d | Just n <- [getName o], d <- prim_deprecated (opts o) n ]
@@ -364,24 +363,6 @@ gen_hs_source (Info defaults entries) =
               -- Special case for tagToEnum#: see Note [Placeholder declarations]
 
            prim_data t = [ "data " ++ pprTy t ]
-
-           escape = concatMap (\c -> if c `elem` special then '\\':c:[] else c:[])
-                where special = "/'`\"@<"
-
-unlatex :: String -> String
-unlatex s = case s of
-  '\\':'t':'e':'x':'t':'t':'t':'{':cs -> markup "@" "@" cs
-  '{':'\\':'t':'e':'x':'t':'t':'t':' ':cs -> markup "@" "@" cs
-  '{':'\\':'t':'t':cs -> markup "@" "@" cs
-  '{':'\\':'i':'t':cs -> markup "/" "/" cs
-  '{':'\\':'e':'m':cs -> markup "/" "/" cs
-  c : cs -> c : unlatex cs
-  "" -> ""
-  where markup b e xs = b ++ mk (dropWhile isSpace xs)
-          where mk ""        = e
-                mk ('\n':cs) = ' ' : mk cs
-                mk ('}':cs)  = e ++ unlatex cs
-                mk (c:cs)    = c : mk cs
 
 -- | Extract a string representation of the name
 getName :: Entry -> Maybe String
@@ -438,195 +419,43 @@ asInfix :: String -> String
 asInfix nm | isAlpha (head nm) = "`" ++ nm ++ "`"
            | otherwise         = nm
 
-gen_latex_doc :: Info -> String
-gen_latex_doc (Info defaults entries)
-   = "\\primopdefaults{"
-         ++ mk_options defaults
-         ++ "}\n"
-     ++ (concat (map mk_entry entries))
-     where mk_entry (PrimOpSpec {cons=constr,name=n,ty=t,cat=c,desc=d,opts=o}) =
-                 "\\primopdesc{"
-                 ++ latex_encode constr ++ "}{"
-                 ++ latex_encode n ++ "}{"
-                 ++ latex_encode (zencode n) ++ "}{"
-                 ++ latex_encode (show c) ++ "}{"
-                 ++ latex_encode (mk_source_ty t) ++ "}{"
-                 ++ latex_encode (mk_core_ty t) ++ "}{"
-                 ++ d ++ "}{"
-                 ++ mk_options o
-                 ++ "}\n"
-           mk_entry (PrimVecOpSpec {}) =
-                 ""
-           mk_entry (Section {title=ti,desc=d}) =
-                 "\\primopsection{"
-                 ++ latex_encode ti ++ "}{"
-                 ++ d ++ "}\n"
-           mk_entry (PrimTypeSpec {ty=t,desc=d,opts=o}) =
-                 "\\primtypespec{"
-                 ++ latex_encode (mk_source_ty t) ++ "}{"
-                 ++ latex_encode (mk_core_ty t) ++ "}{"
-                 ++ d ++ "}{"
-                 ++ mk_options o
-                 ++ "}\n"
-           mk_entry (PrimVecTypeSpec {}) =
-                 ""
-           mk_entry (PseudoOpSpec {name=n,ty=t,desc=d,opts=o}) =
-                 "\\pseudoopspec{"
-                 ++ latex_encode (zencode n) ++ "}{"
-                 ++ latex_encode (mk_source_ty t) ++ "}{"
-                 ++ latex_encode (mk_core_ty t) ++ "}{"
-                 ++ d ++ "}{"
-                 ++ mk_options o
-                 ++ "}\n"
-           mk_source_ty typ = pty typ
-             where pty (TyF t1 t2) = pbty t1 ++ " -> " ++ pty t2
-                   pty (TyC t1 t2) = pbty t1 ++ " => " ++ pty t2
-                   pty t = pbty t
-                   pbty (TyApp tc ts) = show tc ++ (concat (map (' ':) (map paty ts)))
-                   pbty (TyUTup ts) = "(# " ++ (concat (intersperse "," (map pty ts))) ++ " #)"
-                   pbty t = paty t
-                   paty (TyVar tv) = tv
-                   paty t = "(" ++ pty t ++ ")"
 
-           mk_core_ty typ = foralls ++ (pty typ)
-             where pty (TyF t1 t2) = pbty t1 ++ " -> " ++ pty t2
-                   pty (TyC t1 t2) = pbty t1 ++ " => " ++ pty t2
-                   pty t = pbty t
-                   pbty (TyApp tc ts) = (zencode (show tc)) ++ (concat (map (' ':) (map paty ts)))
-                   pbty (TyUTup ts) = (zencode (utuplenm (length ts))) ++ (concat ((map (' ':) (map paty ts))))
-                   pbty t = paty t
-                   paty (TyVar tv) = zencode tv
-                   paty (TyApp tc []) = zencode (show tc)
-                   paty t = "(" ++ pty t ++ ")"
-                   utuplenm 1 = "(# #)"
-                   utuplenm n = "(#" ++ (replicate (n-1) ',') ++ "#)"
-                   foralls = if tvars == [] then "" else "%forall " ++ (tbinds tvars)
-                   tvars = tvars_of typ
-                   tbinds [] = ". "
-                   tbinds ("o":tbs) = "(o::TYPE q) " ++ (tbinds tbs)
-                   tbinds ("p":tbs) = "(p::TYPE r) " ++ (tbinds tbs)
-                   tbinds ("v":tbs) = "(v::TYPE (BoxedRep l)) " ++ (tbinds tbs)
-                   tbinds ("w":tbs) = "(w::TYPE (BoxedRep k)) " ++ (tbinds tbs)
-                   tbinds (tv:tbs) = tv ++ " " ++ (tbinds tbs)
-           tvars_of (TyF t1 t2) = tvars_of t1 `union` tvars_of t2
-           tvars_of (TyC t1 t2) = tvars_of t1 `union` tvars_of t2
-           tvars_of (TyApp _ ts) = foldl union [] (map tvars_of ts)
-           tvars_of (TyUTup ts) = foldr union [] (map tvars_of ts)
-           tvars_of (TyVar tv) = [tv]
+{- Note [OPTIONS_GHC in GHC.PrimopWrappers]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In PrimopWrappers we set some crucial GHC options
 
-           mk_options o =
-             "\\primoptions{"
-              ++ mk_has_side_effects o ++ "}{"
-              ++ mk_out_of_line o ++ "}{"
-              ++ mk_commutable o ++ "}{"
-              ++ mk_needs_wrapper o ++ "}{"
-              ++ mk_can_fail o ++ "}{"
-              ++ mk_fixity o ++ "}{"
-              ++ latex_encode (mk_strictness o) ++ "}{"
-              ++ "}"
+* Eta reduction: -fno-do-eta-reduction
+  In PrimopWrappers we builds a wrapper for each primop, thus
+      plusInt# = \a b. plusInt# a b
+  That's a pretty odd definition, becaues it looks recursive. What
+  actually happens is that it makes a curried, top-level bindings for
+  `plusInt#`.  When we compile PrimopWrappers, the code generator spots
+  (plusInt# a b) and generates an add instruction.
 
-           mk_has_side_effects o = mk_bool_opt o "has_side_effects" "Has side effects." "Has no side effects."
-           mk_out_of_line o = mk_bool_opt o "out_of_line" "Implemented out of line." "Implemented in line."
-           mk_commutable o = mk_bool_opt o "commutable" "Commutable." "Not commutable."
-           mk_needs_wrapper o = mk_bool_opt o "needs_wrapper" "Needs wrapper." "Needs no wrapper."
-           mk_can_fail o = mk_bool_opt o "can_fail" "Can fail." "Cannot fail."
+  Its very important that we don't eta-reduce this to
+      plusInt# = plusInt#
+  because then the special rule in the code generator doesn't fire.
 
-           mk_bool_opt o opt_name if_true if_false =
-             case lookup_attrib opt_name o of
-               Just (OptionTrue _) -> if_true
-               Just (OptionFalse _) -> if_false
-               Just (OptionString _ _) -> error "String value for boolean option"
-               Just (OptionInteger _ _) -> error "Integer value for boolean option"
-               Just (OptionFixity _) -> error "Fixity value for boolean option"
-               Just (OptionVector _) -> error "vector template for boolean option"
-               Nothing -> ""
+* Worker-wrapper: performing WW on this module is harmful even, two reasons:
+  1. Inferred strictness signatures are all bottom (because of the apparent
+     recursion), which is a lie
+  2. Doing the worker/wrapper split based on that information will
+     introduce references to absentError, which isn't available at
+     this point.
 
-           mk_strictness o =
-             case lookup_attrib "strictness" o of
-               Just (OptionString _ s) -> s  -- for now
-               Just _ -> error "Wrong value for strictness"
-               Nothing -> ""
-
-           mk_fixity o = case lookup_attrib "fixity" o of
-             Just (OptionFixity (Just (Fixity _ i d)))
-               -> pprFixityDir d ++ " " ++ show i
-             _ -> ""
-
-           zencode xs =
-             case maybe_tuple xs of
-                Just n  -> n            -- Tuples go to Z2T etc
-                Nothing -> concat (map encode_ch xs)
-             where
-               maybe_tuple "(# #)" = Just("Z1H")
-               maybe_tuple ('(' : '#' : cs) = case count_commas (0::Int) cs of
-                                                (n, '#' : ')' : _) -> Just ('Z' : shows (n+1) "H")
-                                                _                  -> Nothing
-               maybe_tuple "()" = Just("Z0T")
-               maybe_tuple ('(' : cs)       = case count_commas (0::Int) cs of
-                                                (n, ')' : _) -> Just ('Z' : shows (n+1) "T")
-                                                _            -> Nothing
-               maybe_tuple _                 = Nothing
-
-               count_commas :: Int -> String -> (Int, String)
-               count_commas n (',' : cs) = count_commas (n+1) cs
-               count_commas n cs          = (n,cs)
-
-               unencodedChar :: Char -> Bool    -- True for chars that don't need encoding
-               unencodedChar 'Z' = False
-               unencodedChar 'z' = False
-               unencodedChar c   = isAlphaNum c
-
-               encode_ch :: Char -> String
-               encode_ch c | unencodedChar c = [c]      -- Common case first
-
-               -- Constructors
-               encode_ch '('  = "ZL"    -- Needed for things like (,), and (->)
-               encode_ch ')'  = "ZR"    -- For symmetry with (
-               encode_ch '['  = "ZM"
-               encode_ch ']'  = "ZN"
-               encode_ch ':'  = "ZC"
-               encode_ch 'Z'  = "ZZ"
-
-               -- Variables
-               encode_ch 'z'  = "zz"
-               encode_ch '&'  = "za"
-               encode_ch '|'  = "zb"
-               encode_ch '^'  = "zc"
-               encode_ch '$'  = "zd"
-               encode_ch '='  = "ze"
-               encode_ch '>'  = "zg"
-               encode_ch '#'  = "zh"
-               encode_ch '.'  = "zi"
-               encode_ch '<'  = "zl"
-               encode_ch '-'  = "zm"
-               encode_ch '!'  = "zn"
-               encode_ch '+'  = "zp"
-               encode_ch '\'' = "zq"
-               encode_ch '\\' = "zr"
-               encode_ch '/'  = "zs"
-               encode_ch '*'  = "zt"
-               encode_ch '_'  = "zu"
-               encode_ch '%'  = "zv"
-               encode_ch c    = 'z' : shows (ord c) "U"
-
-           latex_encode [] = []
-           latex_encode (c:cs) | c `elem` "#$%&_^{}" = "\\" ++ c:(latex_encode cs)
-           latex_encode ('~':cs) = "\\verb!~!" ++ (latex_encode cs)
-           latex_encode ('\\':cs) = "$\\backslash$" ++ (latex_encode cs)
-           latex_encode (c:cs) = c:(latex_encode cs)
+  We prevent strictness analyis and w/w by simply doing -O0.  It's
+  a very simple module and there is no optimisation to be done
+-}
 
 gen_wrappers :: Info -> String
 gen_wrappers (Info _ entries)
-   =    "{-# LANGUAGE MagicHash, NoImplicitPrelude, UnboxedTuples #-}\n"
+   =    "-- | Users should not import this module.  It is GHC internal only.\n"
+     ++ "-- Use \"GHC.Exts\" instead.\n"
+     ++ "{-# LANGUAGE MagicHash, NoImplicitPrelude, UnboxedTuples #-}\n"
         -- Dependencies on Prelude must be explicit in libraries/base, but we
         -- don't need the Prelude here so we add NoImplicitPrelude.
-     ++ "{-# OPTIONS_GHC -Wno-deprecations -O0 #-}\n"
-        -- No point in optimising this at all.
-        -- Performing WW on this module is harmful even, two reasons:
-        --   1. Inferred strictness signatures are all bottom, which is a lie
-        --   2. Doing the worker/wrapper split based on that information will
-        --      introduce references to absentError,
-        --      which isn't available at this point.
+     ++ "{-# OPTIONS_GHC -Wno-deprecations -O0 -fno-do-eta-reduction #-}\n"
+        -- Very important OPTIONS_GHC!  See Note [OPTIONS_GHC in GHC.PrimopWrappers]
      ++ "module GHC.PrimopWrappers where\n"
      ++ "import qualified GHC.Prim\n"
      ++ "import GHC.Tuple ()\n"
@@ -818,7 +647,7 @@ gen_wired_in_docs (Info _ entries)
   = "primOpDocs =\n  [ " ++ intercalate "\n  , " (catMaybes $ map mkDoc $ concatMap desugarVectorSpec entries) ++ "\n  ]\n"
     where
       mkDoc po | Just poName <- getName po
-               , not $ null $ desc po = Just $ show (poName, unlatex $ desc po)
+               , not $ null $ desc po = Just $ show (poName, desc po)
                | otherwise = Nothing
 
 ------------------------------------------------------------------
@@ -961,13 +790,11 @@ ppType (TyApp (TyCon "MutVar#") [x,y])          = "mkMutVarPrimTy " ++ ppType x
                                                    ++ " " ++ ppType y
 ppType (TyApp (TyCon "MutableArray#") [x,y])    = "mkMutableArrayPrimTy " ++ ppType x
                                                    ++ " " ++ ppType y
-ppType (TyApp (TyCon "MutableArrayArray#") [x]) = "mkMutableArrayArrayPrimTy " ++ ppType x
 ppType (TyApp (TyCon "SmallMutableArray#") [x,y]) = "mkSmallMutableArrayPrimTy " ++ ppType x
                                                     ++ " " ++ ppType y
 ppType (TyApp (TyCon "MutableByteArray#") [x])  = "mkMutableByteArrayPrimTy "
                                                    ++ ppType x
 ppType (TyApp (TyCon "Array#") [x])             = "mkArrayPrimTy " ++ ppType x
-ppType (TyApp (TyCon "ArrayArray#") [])         = "mkArrayArrayPrimTy"
 ppType (TyApp (TyCon "SmallArray#") [x])        = "mkSmallArrayPrimTy " ++ ppType x
 
 
@@ -981,13 +808,15 @@ ppType (TyApp (TyCon "IOPort#") [x,y])   = "mkIOPortPrimTy " ++ ppType x
                                            ++ " " ++ ppType y
 ppType (TyApp (TyCon "TVar#") [x,y])     = "mkTVarPrimTy " ++ ppType x
                                            ++ " " ++ ppType y
+
+ppType (TyApp (TyCon "PromptTag#") [x])  = "mkPromptTagPrimTy " ++ ppType x
 ppType (TyApp (VecTyCon _ pptc) [])      = pptc
 
 ppType (TyUTup ts) = "(mkTupleTy Unboxed "
                      ++ listify (map ppType ts) ++ ")"
 
 ppType (TyF s d) = "(mkVisFunTyMany ("   ++ ppType s ++ ") (" ++ ppType d ++ "))"
-ppType (TyC s d) = "(mkInvisFunTyMany (" ++ ppType s ++ ") (" ++ ppType d ++ "))"
+ppType (TyC s d) = "(mkInvisFunTy (" ++ ppType s ++ ") (" ++ ppType d ++ "))"
 
 ppType other
    = error ("ppType: can't handle: " ++ show other ++ "\n")

@@ -114,7 +114,8 @@ import Control.Monad (msum, forM_)
 import Data.Char (isLower)
 import qualified Data.Map as Map
 import System.Directory
-         ( doesFileExist, getAppUserDataDirectory, createDirectoryIfMissing
+         ( doesFileExist, doesDirectoryExist
+         , getAppUserDataDirectory, createDirectoryIfMissing
          , canonicalizePath, removeFile, renameFile, getDirectoryContents
          , makeRelativeToCurrentDirectory )
 import System.FilePath          ( (</>), (<.>), takeExtension
@@ -139,12 +140,12 @@ configure verbosity hcPath hcPkgPath conf0 = do
       (userMaybeSpecifyPath "ghc" hcPath conf0)
   let implInfo = ghcVersionImplInfo ghcVersion
 
-  -- Cabal currently supports ghc >= 7.0.1 && < 9.6
+  -- Cabal currently supports ghc >= 7.0.1 && < 9.10
   -- ... and the following odd development version
-  unless (ghcVersion < mkVersion [9,6]) $
+  unless (ghcVersion < mkVersion [9,10]) $
     warn verbosity $
          "Unknown/unsupported 'ghc' version detected "
-      ++ "(Cabal " ++ prettyShow cabalVersion ++ " supports 'ghc' version < 9.6): "
+      ++ "(Cabal " ++ prettyShow cabalVersion ++ " supports 'ghc' version < 9.10): "
       ++ programPath ghcProg ++ " is version " ++ prettyShow ghcVersion
 
   -- This is slightly tricky, we have to configure ghc first, then we use the
@@ -184,10 +185,13 @@ configure verbosity hcPath hcPkgPath conf0 = do
 
   ghcInfo <- Internal.getGhcInfo verbosity implInfo ghcProg
   let ghcInfoMap = Map.fromList ghcInfo
-      extensions = -- workaround https://gitlab.haskell.org/ghc/ghc/-/issues/11214
-                   filterExt JavaScriptFFI $
-                   -- see 'filterExtTH' comment below
-                   filterExtTH $ extensions0
+      filterJS = if ghcVersion < mkVersion [9, 8] then filterExt JavaScriptFFI else id
+      extensions =
+        -- workaround https://gitlab.haskell.org/ghc/ghc/-/issues/11214
+        filterJS $
+          -- see 'filterExtTH' comment below
+          filterExtTH $
+            extensions0
 
       -- starting with GHC 8.0, `TemplateHaskell` will be omitted from
       -- `--supported-extensions` when it's not available.
@@ -522,7 +526,8 @@ buildOrReplLib mReplFlags verbosity numJobs pkg_descr lbi lib clbi = do
       comp = compiler lbi
       ghcVersion = compilerVersion comp
       implInfo  = getImplInfo comp
-      platform@(Platform _hostArch hostOS) = hostPlatform lbi
+      platform@(Platform hostArch hostOS) = hostPlatform lbi
+      hasJsSupport = hostArch == JavaScript
       has_code = not (componentIsIndefinite clbi)
 
   relLibTargetDir <- makeRelativeToCurrentDirectory libTargetDir
@@ -531,6 +536,11 @@ buildOrReplLib mReplFlags verbosity numJobs pkg_descr lbi lib clbi = do
   let runGhcProg = runGHC verbosity ghcProg comp platform
 
   let libBi = libBuildInfo lib
+
+  -- ensure extra lib dirs exist before passing to ghc
+  cleanedExtraLibDirs <- filterM doesDirectoryExist (extraLibDirs libBi)
+  cleanedExtraLibDirsStatic <- filterM doesDirectoryExist (extraLibDirsStatic libBi)
+
 
   let isGhcDynamic        = isDynamic comp
       dynamicTooSupported = supportsDynamicToo comp
@@ -561,6 +571,13 @@ buildOrReplLib mReplFlags verbosity numJobs pkg_descr lbi lib clbi = do
                       , toNubListR (cxxSources libBi)
                       , toNubListR (cmmSources libBi)
                       , toNubListR (asmSources libBi)
+                      , if hasJsSupport
+                        -- JS files are C-like with GHC's JS backend: they are
+                        -- "compiled" into `.o` files (renamed with a header).
+                        -- This is a difference from GHCJS, for which we only
+                        -- pass the JS files at link time.
+                        then toNubListR (jsSources  libBi)
+                        else mempty
                       ]
       cLikeObjs   = map (`replaceExtension` objExtension) cLikeSources
       baseOpts    = componentGhcOptions verbosity lbi libBi clbi libTargetDir
@@ -602,8 +619,8 @@ buildOrReplLib mReplFlags verbosity numJobs pkg_descr lbi lib clbi = do
                                                   else extraLibs libBi,
                       ghcOptLinkLibPath       = toNubListR $
                                                   if withFullyStaticExe lbi
-                                                    then extraLibDirsStatic libBi
-                                                    else extraLibDirs libBi,
+                                                    then cleanedExtraLibDirsStatic
+                                                    else cleanedExtraLibDirs,
                       ghcOptLinkFrameworks    = toNubListR $ PD.frameworks libBi,
                       ghcOptLinkFrameworkDirs = toNubListR $
                                                 PD.extraFrameworkDirs libBi,
@@ -688,35 +705,57 @@ buildOrReplLib mReplFlags verbosity numJobs pkg_descr lbi lib clbi = do
       | filename <- cxxSources libBi]
 
   -- build any C sources
-  unless (not has_code || null (cSources libBi)) $ do
+  let libraryName = case libName lib of
+          LMainLibName -> "the main library"
+          LSubLibName name -> "library " <> prettyShow name
+  cSrcs' <- checkCSources verbosity libraryName (cSources libBi)
+  unless (not has_code || null cSrcs') $ do
     info verbosity "Building C Sources..."
+    forM_ cSrcs' $ \filename -> do
+       let baseCcOpts    = Internal.componentCcGhcOptions verbosity implInfo
+                           lbi libBi clbi relLibTargetDir filename
+           vanillaCcOpts = if isGhcDynamic
+                           -- Dynamic GHC requires C sources to be built
+                           -- with -fPIC for REPL to work. See #2207.
+                           then baseCcOpts { ghcOptFPic = toFlag True }
+                           else baseCcOpts
+           profCcOpts    = vanillaCcOpts `mappend` mempty {
+                             ghcOptProfilingMode = toFlag True,
+                             ghcOptObjSuffix     = toFlag "p_o"
+                           }
+           sharedCcOpts  = vanillaCcOpts `mappend` mempty {
+                             ghcOptFPic        = toFlag True,
+                             ghcOptDynLinkMode = toFlag GhcDynamicOnly,
+                             ghcOptObjSuffix   = toFlag "dyn_o"
+                           }
+           odir          = fromFlag (ghcOptObjDir vanillaCcOpts)
+       createDirectoryIfMissingVerbose verbosity True odir
+       let runGhcProgIfNeeded ccOpts = do
+             needsRecomp <- checkNeedsRecompilation filename ccOpts
+             when needsRecomp $ runGhcProg ccOpts
+       runGhcProgIfNeeded vanillaCcOpts
+       unless forRepl $
+         whenSharedLib forceSharedLib (runGhcProgIfNeeded sharedCcOpts)
+       unless forRepl $ whenProfLib (runGhcProgIfNeeded profCcOpts)
+
+  -- build any JS sources
+  unless (not has_code || not hasJsSupport || null (jsSources libBi)) $ do
+    info verbosity "Building JS Sources..."
     sequence_
-      [ do let baseCcOpts    = Internal.componentCcGhcOptions verbosity implInfo
+      [ do let vanillaJsOpts = Internal.componentJsGhcOptions verbosity implInfo
                                lbi libBi clbi relLibTargetDir filename
-               vanillaCcOpts = if isGhcDynamic
-                               -- Dynamic GHC requires C sources to be built
-                               -- with -fPIC for REPL to work. See #2207.
-                               then baseCcOpts { ghcOptFPic = toFlag True }
-                               else baseCcOpts
-               profCcOpts    = vanillaCcOpts `mappend` mempty {
+               profJsOpts    = vanillaJsOpts `mappend` mempty {
                                  ghcOptProfilingMode = toFlag True,
                                  ghcOptObjSuffix     = toFlag "p_o"
                                }
-               sharedCcOpts  = vanillaCcOpts `mappend` mempty {
-                                 ghcOptFPic        = toFlag True,
-                                 ghcOptDynLinkMode = toFlag GhcDynamicOnly,
-                                 ghcOptObjSuffix   = toFlag "dyn_o"
-                               }
-               odir          = fromFlag (ghcOptObjDir vanillaCcOpts)
+               odir          = fromFlag (ghcOptObjDir vanillaJsOpts)
            createDirectoryIfMissingVerbose verbosity True odir
-           let runGhcProgIfNeeded ccOpts = do
-                 needsRecomp <- checkNeedsRecompilation filename ccOpts
-                 when needsRecomp $ runGhcProg ccOpts
-           runGhcProgIfNeeded vanillaCcOpts
-           unless forRepl $
-             whenSharedLib forceSharedLib (runGhcProgIfNeeded sharedCcOpts)
-           unless forRepl $ whenProfLib (runGhcProgIfNeeded profCcOpts)
-      | filename <- cSources libBi]
+           let runGhcProgIfNeeded jsOpts = do
+                 needsRecomp <- checkNeedsRecompilation filename jsOpts
+                 when needsRecomp $ runGhcProg jsOpts
+           runGhcProgIfNeeded vanillaJsOpts
+           unless forRepl $ whenProfLib (runGhcProgIfNeeded profJsOpts)
+      | filename <- jsSources libBi]
 
   -- build any ASM sources
   unless (not has_code || null (asmSources libBi)) $ do
@@ -892,11 +931,11 @@ buildOrReplLib mReplFlags verbosity numJobs pkg_descr lbi lib clbi = do
                 ghcOptPackages           = toNubListR $
                                            Internal.mkGhcOptPackages clbi ,
                 ghcOptLinkLibs           = extraLibs libBi,
-                ghcOptLinkLibPath        = toNubListR $ extraLibDirs libBi,
+                ghcOptLinkLibPath        = toNubListR $ cleanedExtraLibDirs,
                 ghcOptLinkFrameworks     = toNubListR $ PD.frameworks libBi,
                 ghcOptLinkFrameworkDirs  =
                   toNubListR $ PD.extraFrameworkDirs libBi,
-                ghcOptRPaths             = rpaths
+                ghcOptRPaths             = rpaths <> toNubListR (extraLibDirs libBi)
               }
           ghcStaticLinkArgs =
               mempty {
@@ -926,7 +965,7 @@ buildOrReplLib mReplFlags verbosity numJobs pkg_descr lbi lib clbi = do
                 ghcOptPackages           = toNubListR $
                                            Internal.mkGhcOptPackages clbi ,
                 ghcOptLinkLibs           = extraLibs libBi,
-                ghcOptLinkLibPath        = toNubListR $ extraLibDirs libBi
+                ghcOptLinkLibPath        = toNubListR $ cleanedExtraLibDirs
               }
 
       info verbosity (show (ghcOptPackages ghcSharedLinkArgs))
@@ -1318,6 +1357,11 @@ gbuild verbosity numJobs pkg_descr lbi bm clbi = do
   rpaths <- getRPaths lbi clbi
   buildSources <- gbuildSources verbosity (package pkg_descr) (specVersion pkg_descr) tmpDir bm
 
+  -- ensure extra lib dirs exist before passing to ghc
+  cleanedExtraLibDirs <- filterM doesDirectoryExist (extraLibDirs bnfo)
+  cleanedExtraLibDirsStatic <- filterM doesDirectoryExist (extraLibDirsStatic bnfo)
+
+
   let cSrcs               = cSourcesFiles buildSources
       cxxSrcs             = cxxSourceFiles buildSources
       inputFiles          = inputSourceFiles buildSources
@@ -1382,8 +1426,8 @@ gbuild verbosity numJobs pkg_descr lbi bm clbi = do
                                                   else extraLibs bnfo,
                       ghcOptLinkLibPath       = toNubListR $
                                                   if withFullyStaticExe lbi
-                                                    then extraLibDirsStatic bnfo
-                                                    else extraLibDirs bnfo,
+                                                    then cleanedExtraLibDirsStatic
+                                                    else cleanedExtraLibDirs,
                       ghcOptLinkFrameworks    = toNubListR $
                                                 PD.frameworks bnfo,
                       ghcOptLinkFrameworkDirs = toNubListR $
@@ -1392,7 +1436,7 @@ gbuild verbosity numJobs pkg_descr lbi bm clbi = do
                                              [tmpDir </> x | x <- cLikeObjs ++ cxxObjs]
                     }
       dynLinkerOpts = mempty {
-                      ghcOptRPaths         = rpaths,
+                      ghcOptRPaths         = rpaths <> toNubListR (extraLibDirs bnfo),
                       ghcOptInputFiles     = toNubListR
                                              [tmpDir </> x | x <- cLikeObjs ++ cxxObjs]
                    }
@@ -1486,32 +1530,32 @@ gbuild verbosity numJobs pkg_descr lbi bm clbi = do
      | filename <- cxxSrcs ]
 
   -- build any C sources
-  unless (null cSrcs) $ do
-   info verbosity "Building C Sources..."
-   sequence_
-     [ do let baseCcOpts    = Internal.componentCcGhcOptions verbosity implInfo
+  cSrcs' <- checkCSources verbosity (gbuildName bm) cSrcs
+  unless (null cSrcs') $ do
+    info verbosity "Building C Sources..."
+    forM_ cSrcs' $ \filename -> do
+      let baseCcOpts    = Internal.componentCcGhcOptions verbosity implInfo
                               lbi bnfo clbi tmpDir filename
-              vanillaCcOpts = if isGhcDynamic
-                              -- Dynamic GHC requires C sources to be built
-                              -- with -fPIC for REPL to work. See #2207.
-                              then baseCcOpts { ghcOptFPic = toFlag True }
-                              else baseCcOpts
-              profCcOpts    = vanillaCcOpts `mappend` mempty {
-                                ghcOptProfilingMode = toFlag True
-                              }
-              sharedCcOpts  = vanillaCcOpts `mappend` mempty {
-                                ghcOptFPic        = toFlag True,
-                                ghcOptDynLinkMode = toFlag GhcDynamicOnly
-                              }
-              opts | needProfiling = profCcOpts
-                   | needDynamic   = sharedCcOpts
-                   | otherwise     = vanillaCcOpts
-              odir = fromFlag (ghcOptObjDir opts)
-          createDirectoryIfMissingVerbose verbosity True odir
-          needsRecomp <- checkNeedsRecompilation filename opts
-          when needsRecomp $
-            runGhcProg opts
-     | filename <- cSrcs ]
+      let vanillaCcOpts = if isGhcDynamic
+                          -- Dynamic GHC requires C sources to be built
+                          -- with -fPIC for REPL to work. See #2207.
+                          then baseCcOpts { ghcOptFPic = toFlag True }
+                          else baseCcOpts
+      let profCcOpts    = vanillaCcOpts `mappend` mempty {
+                            ghcOptProfilingMode = toFlag True
+                          }
+      let sharedCcOpts  = vanillaCcOpts `mappend` mempty {
+                            ghcOptFPic        = toFlag True,
+                            ghcOptDynLinkMode = toFlag GhcDynamicOnly
+                          }
+      let opts | needProfiling = profCcOpts
+               | needDynamic   = sharedCcOpts
+               | otherwise     = vanillaCcOpts
+      let odir = fromFlag (ghcOptObjDir opts)
+      createDirectoryIfMissingVerbose verbosity True odir
+      needsRecomp <- checkNeedsRecompilation filename opts
+      when needsRecomp $
+        runGhcProg opts
 
   -- TODO: problem here is we need the .c files built first, so we can load them
   -- with ghci, but .c files can depend on .h files generated by ghc by ffi
@@ -1792,7 +1836,7 @@ getRPaths lbi clbi | supportRPaths hostOS = do
     supportRPaths Android     = False
     supportRPaths Ghcjs       = False
     supportRPaths Wasi        = False
-    supportRPaths Hurd        = False
+    supportRPaths Hurd        = True
     supportRPaths (OtherOS _) = False
     -- Do _not_ add a default case so that we get a warning here when a new OS
     -- is added.
@@ -1817,18 +1861,12 @@ libAbiHash verbosity _pkg_descr lbi lib clbi = do
       libBi = libBuildInfo lib
       comp        = compiler lbi
       platform    = hostPlatform lbi
-      vanillaArgs0 =
+      vanillaArgs =
         (componentGhcOptions verbosity lbi libBi clbi (componentBuildDir lbi clbi))
         `mappend` mempty {
           ghcOptMode         = toFlag GhcModeAbiHash,
           ghcOptInputModules = toNubListR $ exposedModules lib
         }
-      vanillaArgs =
-          -- Package DBs unnecessary, and break ghc-cabal. See #3633
-          -- BUT, put at least the global database so that 7.4 doesn't
-          -- break.
-          vanillaArgs0 { ghcOptPackageDBs = [GlobalPackageDB]
-                       , ghcOptPackages = mempty }
       sharedArgs = vanillaArgs `mappend` mempty {
                        ghcOptDynLinkMode = toFlag GhcDynamicOnly,
                        ghcOptFPic        = toFlag True,
@@ -1852,7 +1890,7 @@ libAbiHash verbosity _pkg_descr lbi lib clbi = do
 
   (ghcProg, _) <- requireProgram verbosity ghcProgram (withPrograms lbi)
   hash <- getProgramInvocationOutput verbosity
-          (ghcInvocation ghcProg comp platform ghcArgs)
+          =<< ghcInvocation verbosity ghcProg comp platform ghcArgs
   return (takeWhile (not . isSpace) hash)
 
 componentGhcOptions :: Verbosity -> LocalBuildInfo
@@ -2052,6 +2090,10 @@ installLib verbosity lbi targetDir dynlibTargetDir _builtDir pkg lib clbi = do
                    && null (cxxSources (libBuildInfo lib))
                    && null (cmmSources (libBuildInfo lib))
                    && null (asmSources (libBuildInfo lib))
+                   && (null (jsSources (libBuildInfo lib)) || not hasJsSupport)
+    hasJsSupport = case hostPlatform lbi of
+      Platform JavaScript _ -> True
+      _                     -> False
     has_code = not (componentIsIndefinite clbi)
     whenHasCode = when has_code
     whenVanilla = when (hasLib && withVanillaLib lbi)
@@ -2121,3 +2163,23 @@ supportsDynamicToo = Internal.ghcLookupProperty "Support dynamic-too"
 
 withExt :: FilePath -> String -> FilePath
 withExt fp ext = fp <.> if takeExtension fp /= ('.':ext) then ext else ""
+
+checkCSources :: Verbosity -> String -> [String] -> IO [String]
+checkCSources verbosity name cSrcs = do
+  let (headers, cSrcs') = partition (\filepath -> ".h" `isSuffixOf` filepath) cSrcs
+      others = filter (\filepath -> not (".c" `isSuffixOf` filepath)) cSrcs'
+  unless (null headers) $ do
+    let files = intercalate ", " headers
+    warn verbosity $ unlines
+      [ "The following header files listed in " <> name <> "'s c-sources will not be used: " <> files <> "."
+      , "Header files should be in the 'include' or 'install-include' stanza."
+      , "See https://cabal.readthedocs.io/en/3.10/cabal-package.html#pkg-field-includes"
+      ]
+  unless (null others) $ do
+    let files = intercalate ", " others
+    warn verbosity $ unlines
+      [ "The following files listed in " <> name <> "'s c-sources do not have the expected '.c' extension " <> files <> "."
+      , "C++ files should be in the 'cxx-sources' stanza."
+      , "See https://cabal.readthedocs.io/en/3.10/cabal-package.html#pkg-field-cxx-sources"
+      ]
+  return cSrcs'

@@ -68,7 +68,6 @@ import GHC.Utils.Panic
 import GHC.Utils.Panic.Plain
 import GHC.Utils.Constants (debugIsOn)
 import GHC.Utils.Logger
-import GHC.Utils.Trace
 
 import GHC.Settings.Constants
 
@@ -300,7 +299,7 @@ loadSrcInterface :: SDoc
 loadSrcInterface doc mod want_boot maybe_pkg
   = do { res <- loadSrcInterface_maybe doc mod want_boot maybe_pkg
        ; case res of
-           Failed err      -> failWithTc (TcRnUnknownMessage $ mkPlainError noHints err)
+           Failed err      -> failWithTc (mkTcRnUnknownMessage $ mkPlainError noHints err)
            Succeeded iface -> return iface }
 
 -- | Like 'loadSrcInterface', but returns a 'MaybeErr'.
@@ -603,8 +602,11 @@ This really happens in practice.  The module "GHC.Hs.Expr" gets
 This is a mess.
 
 
-Note [HPT space leak] (#15111)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Note [Home Unit Graph space leak]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Ticket: #15111
+
 In IfL, we defer some work until it is demanded using forkM, such
 as building TyThings from IfaceDecls. These thunks are stored in
 the ExternalPackageState, and they might never be poked.  If we're
@@ -615,14 +617,15 @@ for ever.
 Therefore, when loading a package interface file , we use a "clean"
 version of the HscEnv with all the data about the currently loaded
 program stripped out. Most of the fields can be panics because
-we'll never read them, but hsc_HPT needs to be empty because this
+we'll never read them, but hsc_HUG needs to be empty because this
 interface will cause other interfaces to be loaded recursively, and
-when looking up those interfaces we use the HPT in loadInterface.
+when looking up those interfaces we use the HUG in loadInterface.
 We know that none of the interfaces below here can refer to
-home-package modules however, so it's safe for the HPT to be empty.
+home-package modules however, so it's safe for the HUG to be empty.
 -}
 
 -- Note [GHC Heap Invariants]
+-- Note [Home Unit Graph space leak]
 dontLeakTheHUG :: IfL a -> IfL a
 dontLeakTheHUG thing_inside = do
   env <- getTopEnv
@@ -1081,11 +1084,12 @@ showIface logger dflags unit_state name_cache filename = do
        qualifyImportedNames mod _
            | mod == mi_module iface = NameUnqual
            | otherwise              = NameNotInScope1
-       print_unqual = QueryQualify qualifyImportedNames
+       name_ppr_ctx = QueryQualify qualifyImportedNames
                                    neverQualifyModules
                                    neverQualifyPackages
+                                   alwaysPrintPromTick
    logMsg logger MCDump noSrcSpan
-      $ withPprStyle (mkDumpStyle print_unqual)
+      $ withPprStyle (mkDumpStyle name_ppr_ctx)
       $ pprModIface unit_state iface
 
 -- | Show a ModIface but don't display details; suitable for ModIfaces stored in
@@ -1126,6 +1130,10 @@ pprModIface unit_state iface@ModIface{ mi_final_exts = exts }
         , vcat (map pprIfaceAnnotation (mi_anns iface))
         , pprFixities (mi_fixities iface)
         , vcat [ppr ver $$ nest 2 (ppr decl) | (ver,decl) <- mi_decls iface]
+        , case mi_extra_decls iface of
+            Nothing -> empty
+            Just eds -> text "extra decls:"
+                          $$ nest 2 (vcat ([ppr bs | bs <- eds]))
         , vcat (map ppr (mi_insts iface))
         , vcat (map ppr (mi_fam_insts iface))
         , vcat (map ppr (mi_rules iface))

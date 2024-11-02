@@ -1,13 +1,12 @@
 {-# LANGUAGE BangPatterns #-}
 
 module GHC.Cmm.Pipeline (
-  -- | Converts C-- with an implicit stack and native C-- calls into
-  -- optimized, CPS converted and native-call-less C--.  The latter
-  -- C-- can be used to generate assembly.
   cmmPipeline
 ) where
 
 import GHC.Prelude
+
+import GHC.Driver.Flags
 
 import GHC.Cmm
 import GHC.Cmm.Config
@@ -20,39 +19,41 @@ import GHC.Cmm.LayoutStack
 import GHC.Cmm.ProcPoint
 import GHC.Cmm.Sink
 import GHC.Cmm.Switch.Implement
+import GHC.Cmm.ThreadSanitizer
 
 import GHC.Types.Unique.Supply
-import GHC.Driver.Session
-import GHC.Driver.Config.Cmm
+
 import GHC.Utils.Error
 import GHC.Utils.Logger
-import GHC.Driver.Env
-import Control.Monad
 import GHC.Utils.Outputable
+
 import GHC.Platform
+
+import Control.Monad
 import Data.Either (partitionEithers)
 
 -----------------------------------------------------------------------------
 -- | Top level driver for C-- pipeline
 -----------------------------------------------------------------------------
 
+-- | Converts C-- with an implicit stack and native C-- calls into
+-- optimized, CPS converted and native-call-less C--.  The latter
+-- C-- can be used to generate assembly.
 cmmPipeline
- :: HscEnv -- Compilation env including
-           -- dynamic flags: -dcmm-lint -ddump-cmm-cps
+ :: Logger
+ -> CmmConfig
  -> ModuleSRTInfo        -- Info about SRTs generated so far
  -> CmmGroup             -- Input C-- with Procedures
  -> IO (ModuleSRTInfo, CmmGroupSRTs) -- Output CPS transformed C--
 
-cmmPipeline hsc_env srtInfo prog = do
-  let logger    = hsc_logger hsc_env
-  let cmmConfig = initCmmConfig (hsc_dflags hsc_env)
+cmmPipeline logger cmm_config srtInfo prog = do
   let forceRes (info, group) = info `seq` foldr seq () group
-  let platform = cmmPlatform cmmConfig
+  let platform = cmmPlatform cmm_config
   withTimingSilent logger (text "Cmm pipeline") forceRes $ do
-     tops <- {-# SCC "tops" #-} mapM (cpsTop logger platform cmmConfig) prog
+     tops <- {-# SCC "tops" #-} mapM (cpsTop logger platform cmm_config) prog
 
      let (procs, data_) = partitionEithers tops
-     (srtInfo, cmms) <- {-# SCC "doSRTs" #-} doSRTs cmmConfig srtInfo procs data_
+     (srtInfo, cmms) <- {-# SCC "doSRTs" #-} doSRTs cmm_config srtInfo procs data_
      dumpWith logger Opt_D_dump_cmm_cps "Post CPS Cmm" FormatCMM (pdoc platform cmms)
 
      return (srtInfo, cmms)
@@ -66,8 +67,8 @@ cmmPipeline hsc_env srtInfo prog = do
 --     [SRTs].
 --
 --   - in the case of a `CmmData`, the unmodified 'CmmDecl' and a 'CAFSet' containing
-cpsTop :: Logger -> Platform -> CmmConfig -> CmmDecl -> IO (Either (CAFEnv, [CmmDecl]) (CAFSet, CmmDecl))
-cpsTop _logger platform _ p@(CmmData _ statics) = return (Right (cafAnalData platform statics, p))
+cpsTop :: Logger -> Platform -> CmmConfig -> CmmDecl -> IO (Either (CAFEnv, [CmmDecl]) (CAFSet, CmmDataDecl))
+cpsTop _logger platform _ (CmmData section statics) = return (Right (cafAnalData platform statics, CmmData section statics))
 cpsTop logger platform cfg proc =
     do
       ----------- Control-flow optimisations ----------------------------------
@@ -97,6 +98,13 @@ cpsTop logger platform cfg proc =
                   runUniqSM $ cmmImplementSwitchPlans platform g
              else pure g
       dump Opt_D_dump_cmm_switch "Post switch plan" g
+
+      ----------- ThreadSanitizer instrumentation -----------------------------
+      g <- {-# SCC "annotateTSAN" #-}
+          if cmmOptThreadSanitizer cfg
+          then runUniqSM $ annotateTSAN platform g
+          else return g
+      dump Opt_D_dump_cmm_thread_sanitizer "ThreadSanitizer instrumentation" g
 
       ----------- Proc points -------------------------------------------------
       let
@@ -156,7 +164,7 @@ cpsTop logger platform cfg proc =
            return $ if cmmOptControlFlow cfg
                     then map (cmmCfgOptsProc splitting_proc_points) g
                     else g
-      g <- return (map removeUnreachableBlocksProc g)
+      g <- return $ map (removeUnreachableBlocksProc platform) g
            -- See Note [unreachable blocks]
       dumps Opt_D_dump_cmm_cfg "Post control-flow optimisations" g
 

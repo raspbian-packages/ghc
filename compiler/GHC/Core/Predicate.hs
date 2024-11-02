@@ -19,7 +19,7 @@ module GHC.Core.Predicate (
   mkHeteroPrimEqPred, mkHeteroReprPrimEqPred,
 
   -- Class predicates
-  mkClassPred, isDictTy,
+  mkClassPred, isDictTy, typeDeterminesValue,
   isClassPred, isEqPredClass, isCTupleClass,
   getClassPredTys, getClassPredTys_maybe,
   classMethodTy, classMethodInstTy,
@@ -100,7 +100,18 @@ mkClassPred :: Class -> [Type] -> PredType
 mkClassPred clas tys = mkTyConApp (classTyCon clas) tys
 
 isDictTy :: Type -> Bool
-isDictTy = isClassPred
+-- True of dictionaries (Eq a) and
+--         dictionary functions (forall a. Eq a => Eq [a])
+-- See Note [Type determines value]
+-- See #24370 (and the isDictId call in GHC.HsToCore.Binds.decomposeRuleLhs)
+--     for why it's important to catch dictionary bindings
+isDictTy ty = isClassPred pred
+  where
+    (_, pred) = splitInvisPiTys ty
+
+typeDeterminesValue :: Type -> Bool
+-- See Note [Type determines value]
+typeDeterminesValue ty = isDictTy ty && not (isIPLikePred ty)
 
 getClassPredTys :: HasDebugCallStack => PredType -> (Class, [Type])
 getClassPredTys ty = case getClassPredTys_maybe ty of
@@ -131,6 +142,19 @@ classMethodInstTy :: Id -> [Type] -> Type
 classMethodInstTy sel_id arg_tys
   = funResultTy $
     piResultTys (varType sel_id) arg_tys
+
+{- Note [Type determines value]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Only specialise on non-impicit-parameter predicates, because these
+are the ones whose *type* determines their *value*.  In particular,
+with implicit params, the type args *don't* say what the value of the
+implicit param is!  See #7101.
+
+So we treat implicit params just like ordinary arguments for the
+purposes of specialisation.  Note that we still want to specialise
+functions with implicit params if they have *other* dicts which are
+class params; see #17930.
+-}
 
 -- --------------------- Equality predicates ---------------------------------
 
@@ -225,7 +249,6 @@ isEqPrimPred ty = isCoVarType ty
 
 isCTupleClass :: Class -> Bool
 isCTupleClass cls = isTupleTyCon (classTyCon cls)
-
 
 {- *********************************************************************
 *                                                                      *

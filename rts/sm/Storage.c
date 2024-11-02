@@ -42,7 +42,7 @@
 #include "GC.h"
 #include "Evac.h"
 #include "NonMovingAllocate.h"
-#include "sm/NonMovingMark.h"
+#include "NonMovingMark.h"
 #if defined(ios_HOST_OS) || defined(darwin_HOST_OS)
 #include "Hash.h"
 #endif
@@ -365,11 +365,20 @@ listGenBlocks (ListBlocksCb cb, void *user, generation* gen)
     cb(user, gen->compact_blocks_in_import);
 }
 
+static void
+listSegmentBlocks (ListBlocksCb cb, void *user, struct NonmovingSegment *seg)
+{
+  while (seg) {
+    cb(user, Bdescr((StgPtr) seg));
+    seg = seg->link;
+  }
+}
+
 // Traverse all the different places that the rts stores blocks
 // and call a callback on each of them.
 void listAllBlocks (ListBlocksCb cb, void *user)
 {
-  uint32_t g, i;
+  uint32_t g, i, s;
   for (g = 0; g < RtsFlags.GcFlags.generations; g++) {
       for (i = 0; i < getNumCapabilities(); i++) {
           cb(user, getCapability(i)->mut_lists[g]);
@@ -389,6 +398,24 @@ void listAllBlocks (ListBlocksCb cb, void *user)
       }
       cb(user, getCapability(i)->pinned_object_blocks);
       cb(user, getCapability(i)->pinned_object_empty);
+
+      // list capabilities' current segments
+      if(RtsFlags.GcFlags.useNonmoving) {
+        for (s = 0; s < NONMOVING_ALLOCA_CNT; s++) {
+          listSegmentBlocks(cb, user, getCapability(i)->current_segments[s]);
+        }
+      }
+  }
+
+  // list blocks on the nonmoving heap
+  if(RtsFlags.GcFlags.useNonmoving) {
+    for(s = 0; s < NONMOVING_ALLOCA_CNT; s++) {
+      listSegmentBlocks(cb, user, nonmovingHeap.allocators[s].filled);
+      listSegmentBlocks(cb, user, nonmovingHeap.allocators[s].saved_filled);
+      listSegmentBlocks(cb, user, nonmovingHeap.allocators[s].active);
+    }
+    cb(user, nonmoving_large_objects);
+    cb(user, nonmoving_compact_objects);
   }
 }
 
@@ -569,8 +596,6 @@ lockCAF (StgRegTable *reg, StgIndStatic *caf)
     bh->indirectee = (StgClosure *)cap->r.rCurrentTSO;
     SET_HDR(bh, &stg_CAF_BLACKHOLE_info, caf->header.prof.ccs);
 
-    // RELEASE ordering to ensure that above writes are visible before we
-    // introduce reference as CAF indirectee.
     RELEASE_STORE(&caf->indirectee, (StgClosure *) bh);
     SET_INFO_RELEASE((StgClosure*)caf, &stg_IND_STATIC_info);
 
@@ -1407,14 +1432,14 @@ allocatePinned (Capability *cap, W_ n /*words*/, W_ alignment /*bytes*/, W_ alig
 void
 dirty_MUT_VAR(StgRegTable *reg, StgMutVar *mvar, StgClosure *old)
 {
-#if defined(THREADED_RTS)
+#if !defined(THREADED_RTS)
     // This doesn't hold in the threaded RTS as we may race with another thread.
     ASSERT(RELAXED_LOAD(&mvar->header.info) == &stg_MUT_VAR_CLEAN_info);
 #endif
 
     Capability *cap = regTableToCapability(reg);
     // No barrier required here as no other heap object fields are read. See
-    // note [Heap memory barriers] in SMP.h.
+    // Note [Heap memory barriers] in SMP.h.
     SET_INFO((StgClosure*) mvar, &stg_MUT_VAR_DIRTY_info);
     recordClosureMutated(cap, (StgClosure *) mvar);
     IF_NONMOVING_WRITE_BARRIER_ENABLED {
@@ -1435,7 +1460,7 @@ dirty_TVAR(Capability *cap, StgTVar *p,
            StgClosure *old)
 {
     // No barrier required here as no other heap object fields are read. See
-    // note [Heap memory barriers] in SMP.h.
+    // Note [Heap memory barriers] in SMP.h.
     if (RELAXED_LOAD(&p->header.info) == &stg_TVAR_CLEAN_info) {
         SET_INFO((StgClosure*) p, &stg_TVAR_DIRTY_info);
         recordClosureMutated(cap,(StgClosure*)p);
@@ -1800,6 +1825,7 @@ void flushExec (W_ len, AdjustorExecutable exec_addr)
 #elif (defined(arm_HOST_ARCH) || defined(aarch64_HOST_ARCH)) && (defined(ios_HOST_OS) || defined(darwin_HOST_OS))
   /* On iOS we need to use the special 'sys_icache_invalidate' call. */
   sys_icache_invalidate(exec_addr, len);
+#elif defined(wasm32_HOST_ARCH)
 #elif defined(__clang__)
   unsigned char* begin = (unsigned char*)exec_addr;
   unsigned char* end   = begin + len;

@@ -11,9 +11,6 @@ Extracting imported and top-level names in scope
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE LambdaCase #-}
 
-{-# OPTIONS_GHC -Wno-incomplete-uni-patterns   #-}
-{-# OPTIONS_GHC -Wno-incomplete-record-updates #-}
-
 module GHC.Rename.Names (
         rnImports, getLocalNonValBinders, newRecordSelector,
         extendGlobalRdrEnvRn,
@@ -30,7 +27,7 @@ module GHC.Rename.Names (
         ImportDeclUsage
     ) where
 
-import GHC.Prelude
+import GHC.Prelude hiding ( head, init, last, tail )
 
 import GHC.Driver.Env
 import GHC.Driver.Session
@@ -56,7 +53,6 @@ import qualified GHC.LanguageExtensions as LangExt
 import GHC.Utils.Outputable as Outputable
 import GHC.Utils.Misc as Utils
 import GHC.Utils.Panic
-import GHC.Utils.Trace
 
 import GHC.Types.Fixity.Env
 import GHC.Types.SafeHaskell
@@ -86,14 +82,19 @@ import GHC.Data.Maybe
 import GHC.Data.FastString
 import GHC.Data.FastString.Env
 
+import Language.Haskell.Syntax.Basic (FieldLabelString(..))
+
 import Control.Monad
 import Data.Either      ( partitionEithers )
 import Data.Map         ( Map )
 import qualified Data.Map as Map
 import Data.Ord         ( comparing )
-import Data.List        ( partition, (\\), find, sortBy, groupBy, sortOn )
+import Data.List        ( partition, (\\), find, sortBy )
+import Data.List.NonEmpty (NonEmpty(..))
+import qualified Data.List.NonEmpty as NE
 import Data.Function    ( on )
 import qualified Data.Set as S
+import Data.Foldable    ( toList )
 import System.FilePath  ((</>))
 
 import System.IO
@@ -114,7 +115,7 @@ we must also check that these rules hold transitively for all dependent modules
 and packages. Doing this without caching any trust information would be very
 slow as we would need to touch all packages and interface files a module depends
 on. To avoid this we make use of the property that if a modules Safe Haskell
-mode changes, this triggers a recompilation from that module in the dependecy
+mode changes, this triggers a recompilation from that module in the dependency
 graph. So we can just worry mostly about direct imports.
 
 There is one trust property that can change for a package though without
@@ -308,8 +309,9 @@ rnImportDecl this_mod
              (L loc decl@(ImportDecl { ideclName = loc_imp_mod_name
                                      , ideclPkgQual = raw_pkg_qual
                                      , ideclSource = want_boot, ideclSafe = mod_safe
-                                     , ideclQualified = qual_style, ideclImplicit = implicit
-                                     , ideclAs = as_mod, ideclHiding = imp_details }), import_reason)
+                                     , ideclQualified = qual_style
+                                     , ideclExt = XImportDeclPass { ideclImplicit = implicit }
+                                     , ideclAs = as_mod, ideclImportList = imp_details }), import_reason)
   = setSrcSpanA loc $ do
 
     case raw_pkg_qual of
@@ -349,17 +351,17 @@ rnImportDecl this_mod
              NoPkgQual         -> True
              ThisPkg uid       -> uid == homeUnitId_ (hsc_dflags hsc_env)
              OtherPkg _        -> False))
-         (addErr $ TcRnUnknownMessage $ mkPlainError noHints $
+         (addErr $ mkTcRnUnknownMessage $ mkPlainError noHints $
            (text "A module cannot import itself:" <+> ppr imp_mod_name))
 
     -- Check for a missing import list (Opt_WarnMissingImportList also
     -- checks for T(..) items but that is done in checkDodgyImport below)
     case imp_details of
-        Just (False, _) -> return () -- Explicit import list
+        Just (Exactly, _) -> return () -- Explicit import list
         _  | implicit   -> return () -- Do not bleat for implicit imports
            | qual_only  -> return ()
            | otherwise  -> whenWOptM Opt_WarnMissingImportList $ do
-                             let msg = TcRnUnknownMessage $
+                             let msg = mkTcRnUnknownMessage $
                                    mkPlainDiagnostic (WarningWithFlag Opt_WarnMissingImportList)
                                                      noHints
                                                      (missingImportListWarn imp_mod_name)
@@ -384,7 +386,7 @@ rnImportDecl this_mod
     warnIf ((want_boot == IsBoot) && (mi_boot iface == NotBoot) && isOneShot (ghcMode dflags))
            (warnRedundantSourceImport imp_mod_name)
     when (mod_safe && not (safeImportsOn dflags)) $
-        addErr $ TcRnUnknownMessage $ mkPlainError noHints $
+        addErr $ mkTcRnUnknownMessage $ mkPlainError noHints $
           (text "safe import can't be used as Safe Haskell isn't on!"
                 $+$ text ("please enable Safe Haskell through either Safe, Trustworthy or Unsafe"))
 
@@ -402,8 +404,8 @@ rnImportDecl this_mod
 
     let gbl_env = mkGlobalRdrEnv gres
 
-        is_hiding | Just (True,_) <- imp_details = True
-                  | otherwise                    = False
+        is_hiding | Just (EverythingBut,_) <- imp_details = True
+                  | otherwise                             = False
 
         -- should the import be safe?
         mod_safe' = mod_safe
@@ -426,7 +428,7 @@ rnImportDecl this_mod
     -- Complain if we import a deprecated module
     case mi_warns iface of
        WarnAll txt -> do
-         let msg = TcRnUnknownMessage $
+         let msg = mkTcRnUnknownMessage $
                mkPlainDiagnostic (WarningWithFlag Opt_WarnWarningsDeprecations)
                                  noHints
                                  (moduleWarn imp_mod_name txt)
@@ -437,16 +439,14 @@ rnImportDecl this_mod
     warnUnqualifiedImport decl iface
 
     let new_imp_decl = ImportDecl
-          { ideclExt       = noExtField
-          , ideclSourceSrc = ideclSourceSrc decl
+          { ideclExt       = ideclExt decl
           , ideclName      = ideclName decl
           , ideclPkgQual   = pkg_qual
           , ideclSource    = ideclSource decl
           , ideclSafe      = mod_safe'
           , ideclQualified = ideclQualified decl
-          , ideclImplicit  = ideclImplicit decl
           , ideclAs        = ideclAs decl
-          , ideclHiding    = new_imp_details
+          , ideclImportList = new_imp_details
           }
 
     return (L loc new_imp_decl, gbl_env, imports, mi_hpc iface)
@@ -609,7 +609,7 @@ calculateAvails home_unit other_home_units iface mod_safe' want_boot imported_by
 warnUnqualifiedImport :: ImportDecl GhcPs -> ModIface -> RnM ()
 warnUnqualifiedImport decl iface =
     when bad_import $ do
-      let msg = TcRnUnknownMessage $
+      let msg = mkTcRnUnknownMessage $
             mkPlainDiagnostic (WarningWithFlag Opt_WarnCompatUnqualifiedImports)
                               noHints
                               warning
@@ -622,8 +622,8 @@ warnUnqualifiedImport decl iface =
     has_import_list =
       -- We treat a `hiding` clause as not having an import list although
       -- it's not entirely clear this is the right choice.
-      case ideclHiding decl of
-        Just (False, _) -> True
+      case ideclImportList decl of
+        Just (Exactly, _) -> True
         _               -> False
     bad_import =
          not is_qual
@@ -642,7 +642,7 @@ warnUnqualifiedImport decl iface =
 
 warnRedundantSourceImport :: ModuleName -> TcRnMessage
 warnRedundantSourceImport mod_name
-  = TcRnUnknownMessage $ mkPlainDiagnostic WarningWithoutFlag noHints $
+  = mkTcRnUnknownMessage $ mkPlainDiagnostic WarningWithoutFlag noHints $
       text "Unnecessary {-# SOURCE #-} in the import of module" <+> quotes (ppr mod_name)
 
 {-
@@ -751,7 +751,7 @@ extendGlobalRdrEnvRn avails new_fixities
     -- This establishes INVARIANT 1 of GlobalRdrEnvs
     add_gre env gre
       | not (null dups)    -- Same OccName defined twice
-      = do { addDupDeclErr (gre : dups); return env }
+      = do { addDupDeclErr (gre :| dups); return env }
 
       | otherwise
       = return (extendGlobalRdrEnv env gre)
@@ -916,8 +916,15 @@ getLocalNonValBinders fixity_env
           --    foreign decls and pattern synonyms for an ordinary module
           --    type sigs in case of a hs-boot file only
         ; is_boot <- tcIsHsBootOrSig
-        ; let val_bndrs | is_boot   = hs_boot_sig_bndrs
-                        | otherwise = for_hs_bndrs
+        ; let val_bndrs
+                | is_boot = case binds of
+                      ValBinds _ _val_binds val_sigs ->
+                          -- In a hs-boot file, the value binders come from the
+                          --  *signatures*, and there should be no foreign binders
+                          [ L (l2l decl_loc) (unLoc n)
+                          | L decl_loc (TypeSig _ ns _) <- val_sigs, n <- ns]
+                      _ -> panic "Non-ValBinds in hs-boot group"
+                | otherwise = for_hs_bndrs
         ; val_avails <- mapM new_simple val_bndrs
 
         ; let avails    = concat nti_availss ++ val_avails
@@ -938,15 +945,8 @@ getLocalNonValBinders fixity_env
         ; traceRn "getLocalNonValBinders 3" (vcat [ppr flds, ppr field_env])
         ; return (envs, new_bndrs) } }
   where
-    ValBinds _ _val_binds val_sigs = binds
-
     for_hs_bndrs :: [LocatedN RdrName]
     for_hs_bndrs = hsForeignDeclsBinders foreign_decls
-
-    -- In a hs-boot file, the value binders come from the
-    --  *signatures*, and there should be no foreign binders
-    hs_boot_sig_bndrs = [ L (l2l decl_loc) (unLoc n)
-                        | L decl_loc (TypeSig _ ns _) <- val_sigs, n <- ns]
 
       -- the SrcSpan attached to the input should be the span of the
       -- declaration, not just the name
@@ -981,7 +981,7 @@ getLocalNonValBinders fixity_env
                                         , con_g_args = RecConGADT flds _ }))
             = [ ( find_con_name rdr
                  , concatMap find_con_decl_flds (unLoc flds))
-              | L _ rdr <- rdrs ]
+              | L _ rdr <- toList rdrs ]
 
         find_con_flds _ = []
 
@@ -994,7 +994,7 @@ getLocalNonValBinders fixity_env
         find_con_decl_fld  (L _ (FieldOcc _ (L _ rdr)))
           = expectJust "getLocalNonValBinders/find_con_decl_fld" $
               find (\ fl -> flLabel fl == lbl) flds
-          where lbl = occNameFS (rdrNameOcc rdr)
+          where lbl = FieldLabelString $ occNameFS (rdrNameOcc rdr)
 
     new_assoc :: DuplicateRecordFields -> FieldSelectors -> LInstDecl GhcPs
               -> RnM ([AvailInfo], [(Name, [FieldLabel])])
@@ -1056,7 +1056,7 @@ newRecordSelector dup_fields_ok has_sel (dc:_) (L loc (FieldOcc _ (L _ fld)))
                              , flHasFieldSelector = has_sel
                              , flSelector = selName } }
   where
-    fieldLabelString = occNameFS $ rdrNameOcc fld
+    fieldLabelString = FieldLabelString $ occNameFS $ rdrNameOcc fld
     selOccName = fieldSelectorOccName fieldLabelString (nameOccName dc) dup_fields_ok has_sel
     field | isExact fld = fld
               -- use an Exact RdrName as is to preserve the bindings
@@ -1164,7 +1164,7 @@ Suppose we have:
     data T = mkT { foo :: Int }
 
   module N where
-    import M (foo)    -- this is an ambiguity error (A)
+    import M (foo)    -- this is allowed (A)
     import M (S(foo)) -- this is allowed (B)
 
 Here M exports the OccName 'foo' twice, so we get an imp_occ_env where 'foo'
@@ -1175,8 +1175,8 @@ names (see Note [FieldLabel] in GHC.Types.FieldLabel).
          , $sel:foo:MKT -> (foo, T(foo), Nothing)
          ]
 
-Then when we look up 'foo' in lookup_name for case (A) we get both entries and
-hence report an ambiguity error.  Whereas in case (B) we reach the lookup_ie
+Then when we look up 'foo' in lookup_names for case (A) we get both entries and
+hence two Avails.  Whereas in case (B) we reach the lookup_ie
 case for IEThingWith, which looks up 'S' and then finds the unique 'foo' amongst
 its children.
 
@@ -1187,8 +1187,8 @@ See T16745 for a test of this.
 filterImports
     :: ModIface
     -> ImpDeclSpec                     -- The span for the entire import decl
-    -> Maybe (Bool, LocatedL [LIE GhcPs])    -- Import spec; True => hiding
-    -> RnM (Maybe (Bool, LocatedL [LIE GhcRn]), -- Import spec w/ Names
+    -> Maybe (ImportListInterpretation, LocatedL [LIE GhcPs])    -- Import spec; True => hiding
+    -> RnM (Maybe (ImportListInterpretation, LocatedL [LIE GhcRn]), -- Import spec w/ Names
             [GlobalRdrElt])                   -- Same again, but in GRE form
 filterImports iface decl_spec Nothing
   = return (Nothing, gresFromAvails (Just imp_spec) (mi_exports iface))
@@ -1210,8 +1210,8 @@ filterImports iface decl_spec (Just (want_hiding, L l import_items))
             pruned_avails = filterAvails keep all_avails
             hiding_spec = ImpSpec { is_decl = decl_spec, is_item = ImpAll }
 
-            gres | want_hiding = gresFromAvails (Just hiding_spec) pruned_avails
-                 | otherwise   = concatMap (gresFromIE decl_spec) items2
+            gres | want_hiding == EverythingBut = gresFromAvails (Just hiding_spec) pruned_avails
+                 | otherwise = concatMap (gresFromIE decl_spec) items2
 
         return (Just (want_hiding, L l (map fst items2)), gres)
   where
@@ -1251,13 +1251,21 @@ filterImports iface decl_spec (Just (want_hiding, L l import_items))
     isAvailTC AvailTC{} = True
     isAvailTC _ = False
 
+    -- Look up a RdrName used in an import, failing if it is ambiguous
+    -- (e.g. because it refers to multiple record fields)
     lookup_name :: IE GhcPs -> RdrName -> IELookupM (Name, AvailInfo, Maybe Name)
-    lookup_name ie rdr
+    lookup_name ie rdr = do
+        xs <- lookup_names ie rdr
+        case xs of
+          [cax] -> return cax
+          _     -> failLookupWith (AmbiguousImport rdr (map sndOf3 xs))
+
+    -- Look up a RdrName used in an import, returning multiple values if there
+    -- are several fields with the same name exposed by the module
+    lookup_names :: IE GhcPs -> RdrName -> IELookupM [(Name, AvailInfo, Maybe Name)]
+    lookup_names ie rdr
        | isQual rdr              = failLookupWith (QualImportError rdr)
-       | Just succ <- mb_success = case nonDetNameEnvElts succ of
-                                     -- See Note [Importing DuplicateRecordFields]
-                                     [(c,a,x)] -> return (greNameMangledName c, a, x)
-                                     xs -> failLookupWith (AmbiguousImport rdr (map sndOf3 xs))
+       | Just succ <- mb_success = return $ map (\ (c,a,x) -> (greNameMangledName c, a, x)) (nonDetNameEnvElts succ)
        | otherwise               = failLookupWith (BadImport ie)
       where
         mb_success = lookupOccEnv imp_occ_env (rdrNameOcc rdr)
@@ -1276,7 +1284,7 @@ filterImports iface decl_spec (Just (want_hiding, L l import_items))
             emit_warning MissingImportList = whenWOptM Opt_WarnMissingImportList $
               addTcRnDiagnostic (TcRnMissingImportList ieRdr)
             emit_warning (BadImportW ie) = whenWOptM Opt_WarnDodgyImports $ do
-              let msg = TcRnUnknownMessage $
+              let msg = mkTcRnUnknownMessage $
                     mkPlainDiagnostic (WarningWithFlag Opt_WarnDodgyImports)
                                       noHints
                                       (lookup_err_msg (BadImport ie))
@@ -1285,7 +1293,7 @@ filterImports iface decl_spec (Just (want_hiding, L l import_items))
             run_lookup :: IELookupM a -> TcRn (Maybe a)
             run_lookup m = case m of
               Failed err -> do
-                addErr $ TcRnUnknownMessage $ mkPlainError noHints (lookup_err_msg err)
+                addErr $ mkTcRnUnknownMessage $ mkPlainError noHints (lookup_err_msg err)
                 return Nothing
               Succeeded a -> return (Just a)
 
@@ -1310,9 +1318,11 @@ filterImports iface decl_spec (Just (want_hiding, L l import_items))
     lookup_ie ie = handle_bad_import $
       case ie of
         IEVar _ (L l n) -> do
-            (name, avail, _) <- lookup_name ie $ ieWrappedName n
+            -- See Note [Importing DuplicateRecordFields]
+            xs <- lookup_names ie (ieWrappedName n)
             return ([(IEVar noExtField (L l (replaceWrappedName n name)),
-                                                  trimAvail avail name)], [])
+                                                  trimAvail avail name)
+                    | (name, avail, _) <- xs ], [])
 
         IEThingAll _ (L l tc) -> do
             (name, avail, mb_parent) <- lookup_name ie $ ieWrappedName tc
@@ -1341,7 +1351,7 @@ filterImports iface decl_spec (Just (want_hiding, L l import_items))
                              -- associated type
 
         IEThingAbs _ (L l tc')
-            | want_hiding   -- hiding ( C )
+            | want_hiding == EverythingBut   -- hiding ( C )
                        -- Here the 'C' can be a data constructor
                        --  *or* a type/class, or even both
             -> let tc = ieWrappedName tc'
@@ -1403,8 +1413,8 @@ filterImports iface decl_spec (Just (want_hiding, L l import_items))
              , availTC parent [n] [])
 
         handle_bad_import m = catchIELookup m $ \err -> case err of
-          BadImport ie | want_hiding -> return ([], [BadImportW ie])
-          _                          -> failLookupWith err
+          BadImport ie | want_hiding == EverythingBut -> return ([], [BadImportW ie])
+          _ -> failLookupWith err
 
 type IELookupM = MaybeErr IELookupError
 
@@ -1480,8 +1490,8 @@ mkChildEnv gres = foldr add emptyNameEnv gres
 findChildren :: NameEnv [a] -> Name -> [a]
 findChildren env n = lookupNameEnv env n `orElse` []
 
-lookupChildren :: [GreName] -> [LIEWrappedName RdrName]
-               -> MaybeErr [LIEWrappedName RdrName]   -- The ones for which the lookup failed
+lookupChildren :: [GreName] -> [LIEWrappedName GhcPs]
+               -> MaybeErr [LIEWrappedName GhcPs]   -- The ones for which the lookup failed
                            ([LocatedA Name], [Located FieldLabel])
 -- (lookupChildren all_kids rdr_items) maps each rdr_item to its
 -- corresponding Name all_kids, if the former exists
@@ -1699,7 +1709,7 @@ warnUnusedImportDecls :: TcGblEnv -> HscSource -> RnM ()
 warnUnusedImportDecls gbl_env hsc_src
   = do { uses <- readMutVar (tcg_used_gres gbl_env)
        ; let user_imports = filterOut
-                              (ideclImplicit . unLoc)
+                              (ideclImplicit . ideclExt . unLoc)
                               (tcg_rn_imports gbl_env)
                 -- This whole function deals only with *user* imports
                 -- both for warning about unnecessary ones, and for
@@ -1731,7 +1741,7 @@ findImportUsage imports used_gres
     import_usage = mkImportMap used_gres
 
     unused_decl :: LImportDecl GhcRn -> (LImportDecl GhcRn, [GlobalRdrElt], [Name])
-    unused_decl decl@(L loc (ImportDecl { ideclHiding = imps }))
+    unused_decl decl@(L loc (ImportDecl { ideclImportList = imps }))
       = (decl, used_gres, nameSetElemsStable unused_imps)
       where
         used_gres = lookupSrcLoc (srcSpanEnd $ locA loc) import_usage
@@ -1743,7 +1753,7 @@ findImportUsage imports used_gres
 
         unused_imps   -- Not trivial; see eg #7454
           = case imps of
-              Just (False, L _ imp_ies) ->
+              Just (Exactly, L _ imp_ies) ->
                                  foldr (add_unused . unLoc) emptyNameSet imp_ies
               _other -> emptyNameSet -- No explicit import list => no unused-name list
 
@@ -1822,18 +1832,18 @@ warnUnusedImport :: WarningFlag -> NameEnv (FieldLabelString, Parent)
 warnUnusedImport flag fld_env (L loc decl, used, unused)
 
   -- Do not warn for 'import M()'
-  | Just (False,L _ []) <- ideclHiding decl
+  | Just (Exactly, L _ []) <- ideclImportList decl
   = return ()
 
   -- Note [Do not warn about Prelude hiding]
-  | Just (True, L _ hides) <- ideclHiding decl
+  | Just (EverythingBut, L _ hides) <- ideclImportList decl
   , not (null hides)
   , pRELUDE_NAME == unLoc (ideclName decl)
   = return ()
 
   -- Nothing used; drop entire declaration
   | null used
-  = let dia = TcRnUnknownMessage $
+  = let dia = mkTcRnUnknownMessage $
           mkPlainDiagnostic (WarningWithFlag flag) noHints msg1
     in addDiagnosticAt (locA loc) dia
 
@@ -1843,15 +1853,15 @@ warnUnusedImport flag fld_env (L loc decl, used, unused)
 
   -- Only one import is unused, with `SrcSpan` covering only the unused item instead of
   -- the whole import statement
-  | Just (_, L _ imports) <- ideclHiding decl
+  | Just (_, L _ imports) <- ideclImportList decl
   , length unused == 1
   , Just (L loc _) <- find (\(L _ ie) -> ((ieName ie) :: Name) `elem` unused) imports
-  = let dia = TcRnUnknownMessage $ mkPlainDiagnostic (WarningWithFlag flag) noHints msg2
+  = let dia = mkTcRnUnknownMessage $ mkPlainDiagnostic (WarningWithFlag flag) noHints msg2
     in addDiagnosticAt (locA loc) dia
 
   -- Some imports are unused
   | otherwise
-  = let dia = TcRnUnknownMessage $ mkPlainDiagnostic (WarningWithFlag flag) noHints msg2
+  = let dia = mkTcRnUnknownMessage $ mkPlainDiagnostic (WarningWithFlag flag) noHints msg2
     in addDiagnosticAt (locA loc) dia
 
   where
@@ -1910,7 +1920,7 @@ getMinimalImports = fmap combine . mapM mk_minimal
   where
     mk_minimal (L l decl, used_gres, unused)
       | null unused
-      , Just (False, _) <- ideclHiding decl
+      , Just (Exactly, _) <- ideclImportList decl
       = return (L l decl)
       | otherwise
       = do { let ImportDecl { ideclName    = L _ mod_name
@@ -1919,7 +1929,7 @@ getMinimalImports = fmap combine . mapM mk_minimal
            ; iface <- loadSrcInterface doc mod_name is_boot pkg_qual
            ; let used_avails = gresToAvailInfo used_gres
                  lies = map (L l) (concatMap (to_ie iface) used_avails)
-           ; return (L l (decl { ideclHiding = Just (False, L (l2l l) lies) })) }
+           ; return (L l (decl { ideclImportList = Just (Exactly, L (l2l l) lies) })) }
       where
         doc = text "Compute minimal imports for" <+> ppr decl
 
@@ -1956,7 +1966,7 @@ getMinimalImports = fmap combine . mapM mk_minimal
           all_non_overloaded = all (not . flIsOverloaded)
 
     combine :: [LImportDecl GhcRn] -> [LImportDecl GhcRn]
-    combine = map merge . groupBy ((==) `on` getKey) . sortOn getKey
+    combine = map merge . NE.groupAllWith getKey
 
     getKey :: LImportDecl GhcRn -> (Bool, Maybe ModuleName, ModuleName)
     getKey decl =
@@ -1968,10 +1978,9 @@ getMinimalImports = fmap combine . mapM mk_minimal
         idecl :: ImportDecl GhcRn
         idecl = unLoc decl
 
-    merge :: [LImportDecl GhcRn] -> LImportDecl GhcRn
-    merge []                     = error "getMinimalImports: unexpected empty list"
-    merge decls@((L l decl) : _) = L l (decl { ideclHiding = Just (False, L (noAnnSrcSpan (locA l)) lies) })
-      where lies = concatMap (unLoc . snd) $ mapMaybe (ideclHiding . unLoc) decls
+    merge :: NonEmpty (LImportDecl GhcRn) -> LImportDecl GhcRn
+    merge decls@((L l decl) :| _) = L l (decl { ideclImportList = Just (Exactly, L (noAnnSrcSpan (locA l)) lies) })
+      where lies = concatMap (unLoc . snd) $ mapMaybe (ideclImportList . unLoc) $ NE.toList decls
 
 
 printMinimalImports :: HscSource -> [ImportDeclUsage] -> RnM ()
@@ -2000,16 +2009,16 @@ printMinimalImports hsc_src imports_w_usage
         basefn = moduleNameString (moduleName this_mod) ++ suffix
 
 
-to_ie_post_rn_var :: (HasOccName name) => LocatedA name -> LIEWrappedName name
+to_ie_post_rn_var :: LocatedA (IdP GhcRn) -> LIEWrappedName GhcRn
 to_ie_post_rn_var (L l n)
-  | isDataOcc $ occName n = L l (IEPattern (EpaSpan $ la2r l) (L (la2na l) n))
-  | otherwise             = L l (IEName                       (L (la2na l) n))
+  | isDataOcc $ occName n = L l (IEPattern (la2e l)   (L (la2na l) n))
+  | otherwise             = L l (IEName    noExtField (L (la2na l) n))
 
 
-to_ie_post_rn :: (HasOccName name) => LocatedA name -> LIEWrappedName name
+to_ie_post_rn :: LocatedA (IdP GhcRn) -> LIEWrappedName GhcRn
 to_ie_post_rn (L l n)
-  | isTcOcc occ && isSymOcc occ = L l (IEType (EpaSpan $ la2r l) (L (la2na l) n))
-  | otherwise                   = L l (IEName                    (L (la2na l) n))
+  | isTcOcc occ && isSymOcc occ = L l (IEType (la2e l)   (L (la2na l) n))
+  | otherwise                   = L l (IEName noExtField (L (la2na l) n))
   where occ = occName n
 
 {-
@@ -2140,10 +2149,9 @@ badImportItemErr iface decl_spec ie avails
 illegalImportItemErr :: SDoc
 illegalImportItemErr = text "Illegal import item"
 
-addDupDeclErr :: [GlobalRdrElt] -> TcRn ()
-addDupDeclErr [] = panic "addDupDeclErr: empty list"
-addDupDeclErr gres@(gre : _)
-  = addErrAt (getSrcSpan (last sorted_names)) $ TcRnUnknownMessage $ mkPlainError noHints $
+addDupDeclErr :: NonEmpty GlobalRdrElt -> TcRn ()
+addDupDeclErr gres@(gre :| _)
+  = addErrAt (getSrcSpan (NE.last sorted_names)) $ mkTcRnUnknownMessage $ mkPlainError noHints $
     -- Report the error at the later location
     vcat [text "Multiple declarations of" <+>
              quotes (ppr (greOccName gre)),
@@ -2151,11 +2159,11 @@ addDupDeclErr gres@(gre : _)
              -- latter might not be in scope in the RdrEnv and so will
              -- be printed qualified.
           text "Declared at:" <+>
-                   vcat (map (ppr . nameSrcLoc) sorted_names)]
+                   vcat (toList $ ppr . nameSrcLoc <$> sorted_names)]
   where
     sorted_names =
-      sortBy (SrcLoc.leftmost_smallest `on` nameSrcSpan)
-             (map greMangledName gres)
+      NE.sortBy (SrcLoc.leftmost_smallest `on` nameSrcSpan)
+             (fmap greMangledName gres)
 
 
 
@@ -2174,7 +2182,7 @@ moduleWarn mod (DeprecatedTxt _ txt)
 
 packageImportErr :: TcRnMessage
 packageImportErr
-  = TcRnUnknownMessage $ mkPlainError noHints $
+  = mkTcRnUnknownMessage $ mkPlainError noHints $
   text "Package-qualified imports are not enabled; use PackageImports"
 
 -- This data decl will parse OK
@@ -2186,11 +2194,15 @@ packageImportErr
 -- We can get an operator as the constructor, even in the prefix form:
 --      data T = :% Int Int
 -- from interface files, which always print in prefix form
+--
+-- We also allow type constructor names, which are defined by "type data"
+-- declarations.  See Note [Type data declarations] in GHC.Rename.Module.
 
 checkConName :: RdrName -> TcRn ()
-checkConName name = checkErr (isRdrDataCon name) (badDataCon name)
+checkConName name
+  = checkErr (isRdrDataCon name || isRdrTc name) (badDataCon name)
 
 badDataCon :: RdrName -> TcRnMessage
 badDataCon name
-   = TcRnUnknownMessage $ mkPlainError noHints $
+   = mkTcRnUnknownMessage $ mkPlainError noHints $
    hsep [text "Illegal data constructor name", quotes (ppr name)]

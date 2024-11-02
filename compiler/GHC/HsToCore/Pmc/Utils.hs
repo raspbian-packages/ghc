@@ -35,8 +35,8 @@ import Control.Monad
 tracePm :: String -> SDoc -> DsM ()
 tracePm herald doc = do
   logger  <- getLogger
-  printer <- mkPrintUnqualifiedDs
-  liftIO $ putDumpFileMaybe' logger printer
+  name_ppr_ctx <- mkNamePprCtxDs
+  liftIO $ putDumpFileMaybe' logger name_ppr_ctx
             Opt_D_dump_ec_trace "" FormatText (text herald $$ (nest 2 doc))
 {-# INLINE tracePm #-}  -- see Note [INLINE conditional tracing utilities]
 
@@ -52,7 +52,7 @@ mkPmId :: Type -> DsM Id
 mkPmId ty = getUniqueM >>= \unique ->
   let occname = mkVarOccFS $ fsLit "pm"
       name    = mkInternalName unique occname noSrcSpan
-  in  return (mkLocalIdOrCoVar name Many ty)
+  in  return (mkLocalIdOrCoVar name ManyTy ty)
 {-# NOINLINE mkPmId #-} -- We'll CPR deeply, that should be enough
 
 -- | All warning flags that need to run the pattern match checker.

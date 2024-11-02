@@ -66,6 +66,22 @@ pathPath "users_guide" = "docs/users_guide"
 pathPath "Haddock" = "utils/haddock/doc"
 pathPath _ = ""
 
+needDocDeps :: Action ()
+needDocDeps = do
+    -- These cabal files are needed by the docs/users_guide/ghc_packages.py
+    -- logic to determine the versions of packages shipped with GHC.
+    let templatedCabalFiles = map pkgCabalFile
+            [ ghcBoot
+            , ghcBootTh
+            , ghci
+            , libiserv
+            , compiler
+            , ghcHeap
+            , templateHaskell
+            ]
+
+    need templatedCabalFiles
+
 -- | Build all documentation
 documentationRules :: Rules ()
 documentationRules = do
@@ -85,9 +101,6 @@ documentationRules = do
     -- Haddock's manual, and builds man pages
     "docs" ~> do
         root <- buildRoot
-
-        -- we need to ensure that `configure` has been run (#17840)
-        need [configFile]
 
         doctargets <- ghcDocs =<< flavour
         let html     = htmlRoot -/- "index.html" -- also implies "docs-haddock"
@@ -179,7 +192,7 @@ buildHtmlDocumentation = do
                              | SphinxHTML `Set.member` doctargets ]
         need $ map ((root -/-) . pathIndex) targets
 
-        copyFileUntracked "docs/index.html" file
+        copyFile "docs/index.html" file
 
 -- | Compile a Sphinx ReStructured Text package to HTML.
 buildSphinxHtml :: FilePath -> Rules ()
@@ -188,6 +201,9 @@ buildSphinxHtml path = do
     root -/- htmlRoot -/- path -/- "index.html" %> \file -> do
         let dest = takeDirectory file
             rstFilesDir = pathPath path
+
+        needDocDeps
+
         rstFiles <- getDirectoryFiles rstFilesDir ["**/*.rst"]
         need (map (rstFilesDir -/-) rstFiles)
         build $ target docContext (Sphinx HtmlMode) [pathPath path] [dest]
@@ -266,7 +282,7 @@ data PkgDocTarget = DotHaddock PackageName | HaddockPrologue PackageName
   deriving (Eq, Show)
 
 pkgDocContext :: PkgDocTarget -> Context
-pkgDocContext target = Context Stage1 (unsafeFindPackageByName name) vanilla
+pkgDocContext target = Context Stage1 (unsafeFindPackageByName name) vanilla Final
   where
     name = case target of DotHaddock n      -> n
                           HaddockPrologue n -> n
@@ -299,6 +315,9 @@ buildSphinxPdf :: FilePath -> Rules ()
 buildSphinxPdf path = do
     root <- buildRootRules
     root -/- pdfRoot -/- path <.> "pdf" %> \file -> do
+
+        needDocDeps
+
         withTempDir $ \dir -> do
             let rstFilesDir = pathPath path
             rstFiles <- getDirectoryFiles rstFilesDir ["**/*.rst"]

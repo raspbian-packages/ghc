@@ -5,7 +5,6 @@
 {-# LANGUAGE FlexibleContexts           #-}
 
 {-# OPTIONS_GHC -fprof-auto-top #-}
-{-# OPTIONS_GHC -Wno-incomplete-uni-patterns #-}
 
 --
 --  (c) The University of Glasgow 2002-2006
@@ -44,6 +43,7 @@ import GHC.Types.Literal
 import GHC.Builtin.PrimOps
 import GHC.Builtin.PrimOps.Ids (primOpId)
 import GHC.Core.Type
+import GHC.Core.TyCo.Compare (eqType)
 import GHC.Types.RepType
 import GHC.Core.DataCon
 import GHC.Core.TyCon
@@ -1463,10 +1463,11 @@ generateCCall d0 s p (CCallSpec target cconv safety) result_ty args
          push_args    = concatOL pushs_arg
          !d_after_args = d0 + wordsToBytes platform a_reps_sizeW
          a_reps_pushed_RAW
-            | null a_reps_pushed_r_to_l || not (isVoidRep (head a_reps_pushed_r_to_l))
-            = panic "GHC.StgToByteCode.generateCCall: missing or invalid World token?"
+            | x:xs <- a_reps_pushed_r_to_l
+            , isVoidRep x
+            = reverse xs
             | otherwise
-            = reverse (tail a_reps_pushed_r_to_l)
+            = panic "GHC.StgToByteCode.generateCCall: missing or invalid World token?"
 
          -- Now: a_reps_pushed_RAW are the reps which are actually on the stack.
          -- push_args is the code to do that.
@@ -1494,7 +1495,7 @@ generateCCall d0 s p (CCallSpec target cconv safety) result_ty args
             Addr# address_of_C_fn
             <placeholder-for-result#> (must be an unboxed type)
 
-         The interpreter then calls the marshall code mentioned
+         The interpreter then calls the marshal code mentioned
          in the CCALL insn, passing it (& <placeholder-for-result#>),
          that is, the addr of the topmost word in the stack.
          When this returns, the placeholder will have been
@@ -1510,7 +1511,7 @@ generateCCall d0 s p (CCallSpec target cconv safety) result_ty args
          copies the args to the C stack, calls the stacked addr,
          and parks the result back in the placeholder.  The interpreter
          calls it as a normal C call, assuming it has a signature
-            void marshall_code ( StgWord* ptr_to_top_of_stack )
+            void marshal_code ( StgWord* ptr_to_top_of_stack )
          -}
          -- resolve static address
          maybe_static_target :: Maybe Literal
@@ -1535,9 +1536,8 @@ generateCCall d0 s p (CCallSpec target cconv safety) result_ty args
          -- Get the arg reps, zapping the leading Addr# in the dynamic case
          a_reps --  | trace (showSDoc (ppr a_reps_pushed_RAW)) False = error "???"
                 | is_static = a_reps_pushed_RAW
-                | otherwise = if null a_reps_pushed_RAW
-                              then panic "GHC.StgToByteCode.generateCCall: dyn with no args"
-                              else tail a_reps_pushed_RAW
+                | _:xs <- a_reps_pushed_RAW = xs
+                | otherwise = panic "GHC.StgToByteCode.generateCCall: dyn with no args"
 
          -- push the Addr#
          (push_Addr, d_after_Addr)
@@ -1875,7 +1875,9 @@ pushLiteral padded lit =
         LitChar {}      -> code WordRep
         LitNullAddr     -> code AddrRep
         LitString {}    -> code AddrRep
-        LitRubbish {}   -> code WordRep
+        LitRubbish _ rep-> case runtimeRepPrimRep (text "pushLiteral") rep of
+                             [pr] -> code pr
+                             _    -> pprPanic "pushLiteral" (ppr lit)
         LitNumber nt _  -> case nt of
           LitNumInt     -> code IntRep
           LitNumWord    -> code WordRep
@@ -2022,11 +2024,9 @@ mkMultiBranch maybe_ncons raw_ways = do
          testEQ NoDiscr    _          = panic "mkMultiBranch NoDiscr"
 
          -- None of these will be needed if there are no non-default alts
-         (init_lo, init_hi)
-            | null notd_ways
-            = panic "mkMultiBranch: awesome foursome"
-            | otherwise
-            = case fst (head notd_ways) of
+         (init_lo, init_hi) = case notd_ways of
+            [] -> panic "mkMultiBranch: awesome foursome"
+            (discr, _):_ -> case discr of
                 DiscrI _ -> ( DiscrI minBound,  DiscrI maxBound )
                 DiscrI8 _ -> ( DiscrI8 minBound, DiscrI8 maxBound )
                 DiscrI16 _ -> ( DiscrI16 minBound, DiscrI16 maxBound )

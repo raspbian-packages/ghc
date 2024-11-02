@@ -1,7 +1,7 @@
 {-# LANGUAGE MagicHash, NoImplicitPrelude, TypeFamilies, UnboxedTuples,
              MultiParamTypeClasses, RoleAnnotations, CPP, TypeOperators,
              PolyKinds, NegativeLiterals, DataKinds, ScopedTypeVariables,
-             TypeApplications, StandaloneKindSignatures,
+             TypeApplications, StandaloneKindSignatures, GADTs,
              FlexibleInstances, UndecidableInstances #-}
 -- NegativeLiterals: see Note [Fixity of (->)]
 {-# OPTIONS_HADDOCK print-explicit-runtime-reps #-}
@@ -22,16 +22,15 @@
 -----------------------------------------------------------------------------
 
 module GHC.Types (
-        -- Data types that are built-in syntax
-        -- They are defined here, but not explicitly exported
-        --
-        --    Lists:          []( [], (:) )
-        --    Type equality:  (~)( Eq# )
-
         -- * Built-in types
         Bool(..), Char(..), Int(..), Word(..),
         Float(..), Double(..),
         Ordering(..), IO(..),
+
+        List,   -- List( [], (:) )
+          -- List constructors are not exported
+          -- because they are built-in syntax
+
         isTrue#,
         SPEC(..),
         Symbol,
@@ -41,7 +40,8 @@ module GHC.Types (
         type (~), type (~~), Coercible,
 
         -- * Representation polymorphism
-        TYPE, Levity(..), RuntimeRep(..),
+        TYPE, CONSTRAINT,
+        Levity(..), RuntimeRep(..),
         LiftedRep, UnliftedRep,
         Type, UnliftedType, Constraint,
           -- The historical type * should ideally be written as
@@ -50,6 +50,11 @@ module GHC.Types (
         ZeroBitRep, ZeroBitType,
         VecCount(..), VecElem(..),
         Void#,
+
+        -- * Boxing constructors
+        DictBox( MkDictBox ),
+        WordBox( MkWordBox), IntBox( MkIntBox),
+        FloatBox( MkFloatBox), DoubleBox( MkDoubleBox),
 
         -- * Multiplicity types
         Multiplicity(..), MultMul,
@@ -62,7 +67,6 @@ module GHC.Types (
 import GHC.Prim
 
 infixr 5 :
-
 
 {- *********************************************************************
 *                                                                      *
@@ -93,8 +97,7 @@ type (->) = FUN 'Many
 *                                                                      *
 ********************************************************************* -}
 
--- | The kind of constraints, like @Show a@
-data Constraint
+
 
 -- | The runtime representation of lifted types.
 type LiftedRep = 'BoxedRep 'Lifted
@@ -107,6 +110,9 @@ type UnliftedRep = 'BoxedRep 'Unlifted
 type ZeroBitRep = 'TupleRep '[]
 
 -------------------------
+-- | The kind of lifted constraints
+type Constraint = CONSTRAINT LiftedRep
+
 -- | The kind of types with lifted values. For example @Int :: Type@.
 type Type = TYPE LiftedRep
 
@@ -133,8 +139,9 @@ type family MultMul (a :: Multiplicity) (b :: Multiplicity) :: Multiplicity wher
 ********************************************************************* -}
 
 -- | (Kind) This is the kind of type-level symbols.
--- Declared here because class IP needs it
 data Symbol
+
+-- Symbol is declared here because class IP needs it
 
 {- *********************************************************************
 *                                                                      *
@@ -144,7 +151,7 @@ data Symbol
 
 -- | The type constructor 'Any' is type to which you can unsafely coerce any
 -- lifted type, and back. More concretely, for a lifted type @t@ and
--- value @x :: t@, -- @unsafeCoerce (unsafeCoerce x :: Any) :: t@ is equivalent
+-- value @x :: t@, @unsafeCoerce (unsafeCoerce x :: Any) :: t@ is equivalent
 -- to @x@.
 --
 type family Any :: k where { }
@@ -166,7 +173,7 @@ type family Any :: k where { }
 -- ==== __Examples__
 --
 -- Unless the OverloadedLists extension is enabled, list literals are
--- syntatic sugar for repeated applications of @:@ and @[]@.
+-- syntactic sugar for repeated applications of @:@ and @[]@.
 --
 -- >>> 1:2:3:4:[] == [1,2,3,4]
 -- True
@@ -177,7 +184,7 @@ type family Any :: k where { }
 -- >>> ['h','e','l','l','o'] == "hello"
 -- True
 --
-data [] a = [] | a : [a]
+data List a = [] | a : List a
 
 
 {- *********************************************************************
@@ -473,7 +480,7 @@ data RuntimeRep = VecRep VecCount VecElem   -- ^ a SIMD vector type
 -- RuntimeRep is intimately tied to TyCon.RuntimeRep (in GHC proper). See
 -- Note [RuntimeRep and PrimRep] in RepType.
 -- See also Note [Wiring in RuntimeRep] in GHC.Builtin.Types
--- See also Note [TYPE and RuntimeRep] in GHC.Builtin.Type.Prim
+-- See also Note [TYPE and CONSTRAINT] in GHC.Builtin.Type.Prim
 
 -- | Length of a SIMD vector type
 data VecCount = Vec2
@@ -499,6 +506,37 @@ data VecElem = Int8ElemRep
 
 {-# DEPRECATED Void# "Void# is now an alias for the unboxed tuple (# #)." #-}
 type Void# = (# #)
+
+{- *********************************************************************
+*                                                                      *
+             Boxing data constructors
+*                                                                      *
+********************************************************************* -}
+
+-- These "boxing" data types allow us to wrap up a value of kind (TYPE rr)
+-- in a box of kind Type, for each rr.
+data LiftBox   (a :: TYPE UnliftedRep) = MkLiftBox a
+
+data IntBox    (a :: TYPE IntRep)      = MkIntBox a
+data Int8Box   (a :: TYPE Int8Rep)     = MkInt8Box a
+data Int16Box  (a :: TYPE Int16Rep)    = MkInt16Box a
+data Int32Box  (a :: TYPE Int32Rep)    = MkInt32Box a
+data Int64Box  (a :: TYPE Int64Rep)    = MkInt64Box a
+
+data WordBox   (a :: TYPE WordRep)     = MkWordBox a
+data Word8Box  (a :: TYPE Word8Rep)    = MkWord8Box a
+data Word16Box (a :: TYPE Word16Rep)   = MkWord16Box a
+data Word32Box (a :: TYPE Word32Rep)   = MkWord32Box a
+data Word64Box (a :: TYPE Word64Rep)   = MkWord64Box a
+
+data FloatBox  (a :: TYPE FloatRep)    = MkFloatBox a
+data DoubleBox (a :: TYPE DoubleRep)   = MkDoubleBox a
+
+-- | Data type `Dict` provides a simple way to wrap up a (lifted)
+--   constraint as a type
+data DictBox c where
+  MkDictBox :: c => DictBox c
+
 
 {- *********************************************************************
 *                                                                      *

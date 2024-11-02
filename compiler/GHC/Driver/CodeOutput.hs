@@ -17,6 +17,7 @@ where
 import GHC.Prelude
 import GHC.Platform
 import GHC.ForeignSrcLang
+import GHC.Data.FastString
 
 import GHC.CmmToAsm     ( nativeCodeGen )
 import GHC.CmmToLlvm    ( llvmCodeGen )
@@ -27,9 +28,10 @@ import GHC.Cmm
 import GHC.Cmm.CLabel
 
 import GHC.Driver.Session
-import GHC.Driver.Config.Finder    (initFinderOpts)
-import GHC.Driver.Config.CmmToAsm  (initNCGConfig)
-import GHC.Driver.Config.CmmToLlvm (initLlvmCgConfig)
+import GHC.Driver.Config.Finder    ( initFinderOpts   )
+import GHC.Driver.Config.CmmToAsm  ( initNCGConfig    )
+import GHC.Driver.Config.CmmToLlvm ( initLlvmCgConfig )
+import GHC.Driver.LlvmConfigCache  (LlvmConfigCache)
 import GHC.Driver.Ppr
 import GHC.Driver.Backend
 
@@ -42,10 +44,10 @@ import GHC.Utils.TmpFs
 
 import GHC.Utils.Error
 import GHC.Utils.Outputable
-import GHC.Utils.Panic
 import GHC.Utils.Logger
-import GHC.Utils.Exception (bracket)
+import GHC.Utils.Exception ( bracket )
 import GHC.Utils.Ppr (Mode(..))
+import GHC.Utils.Panic.Plain ( pgmError )
 
 import GHC.Unit
 import GHC.Unit.Finder      ( mkStubPaths )
@@ -73,6 +75,7 @@ codeOutput
     :: forall a.
        Logger
     -> TmpFs
+    -> LlvmConfigCache
     -> DynFlags
     -> UnitState
     -> Module
@@ -87,7 +90,7 @@ codeOutput
            (Bool{-stub_h_exists-}, Maybe FilePath{-stub_c_exists-}),
            [(ForeignSrcLang, FilePath)]{-foreign_fps-},
            a)
-codeOutput logger tmpfs dflags unit_state this_mod filenm location genForeignStubs foreign_fps pkg_deps
+codeOutput logger tmpfs llvm_config dflags unit_state this_mod filenm location genForeignStubs foreign_fps pkg_deps
   cmm_stream
   =
     do  {
@@ -118,13 +121,12 @@ codeOutput logger tmpfs dflags unit_state this_mod filenm location genForeignStu
                   ; emitInitializerDecls this_mod stubs
                   ; return (stubs, a) }
 
-        ; (stubs, a) <- case backend dflags of
-                 NCG         -> outputAsm logger dflags this_mod location filenm
-                                          final_stream
-                 ViaC        -> outputC logger dflags filenm final_stream pkg_deps
-                 LLVM        -> outputLlvm logger dflags filenm final_stream
-                 Interpreter -> panic "codeOutput: Interpreter"
-                 NoBackend   -> panic "codeOutput: NoBackend"
+        ; (stubs, a) <- case backendCodeOutput (backend dflags) of
+                 NcgCodeOutput  -> outputAsm logger dflags this_mod location filenm
+                                             final_stream
+                 ViaCCodeOutput -> outputC logger dflags filenm final_stream pkg_deps
+                 LlvmCodeOutput -> outputLlvm logger llvm_config dflags filenm final_stream
+                 JSCodeOutput   -> outputJS logger llvm_config dflags filenm final_stream
         ; stubs_exist <- outputForeignStubs logger tmpfs dflags unit_state this_mod location stubs
         ; return (filenm, stubs_exist, foreign_fps, a)
         }
@@ -174,7 +176,7 @@ outputC logger dflags filenm cmm_stream unit_deps =
                           "C backend output"
                           FormatC
                           doc
-            let ctx = initSDocContext dflags (PprCode CStyle)
+            let ctx = initSDocContext dflags PprCode
             printSDocLn ctx LeftMode h doc
       Stream.consume cmm_stream id writeC
 
@@ -199,7 +201,7 @@ outputAsm logger dflags this_mod location filenm cmm_stream = do
   let ncg_config = initNCGConfig dflags this_mod
   {-# SCC "OutputAsm" #-} doOutput filenm $
     \h -> {-# SCC "NativeCodeGen" #-}
-      nativeCodeGen logger ncg_config location h ncg_uniqs cmm_stream
+      nativeCodeGen logger (toolSettings dflags) ncg_config location h ncg_uniqs cmm_stream
 
 {-
 ************************************************************************
@@ -209,12 +211,24 @@ outputAsm logger dflags this_mod location filenm cmm_stream = do
 ************************************************************************
 -}
 
-outputLlvm :: Logger -> DynFlags -> FilePath -> Stream IO RawCmmGroup a -> IO a
-outputLlvm logger dflags filenm cmm_stream = do
-  lcg_config <- initLlvmCgConfig logger dflags
+outputLlvm :: Logger -> LlvmConfigCache -> DynFlags -> FilePath -> Stream IO RawCmmGroup a -> IO a
+outputLlvm logger llvm_config dflags filenm cmm_stream = do
+  lcg_config <- initLlvmCgConfig logger llvm_config dflags
   {-# SCC "llvm_output" #-} doOutput filenm $
     \f -> {-# SCC "llvm_CodeGen" #-}
       llvmCodeGen logger lcg_config f cmm_stream
+
+{-
+************************************************************************
+*                                                                      *
+\subsection{JavaScript}
+*                                                                      *
+************************************************************************
+-}
+outputJS :: Logger -> LlvmConfigCache -> DynFlags -> FilePath -> Stream IO RawCmmGroup a -> IO a
+outputJS _ _ _ _ _ = pgmError $ "codeOutput: Hit JavaScript case. We should never reach here!"
+                              ++ "\nThe JS backend should shortcircuit to StgToJS after Stg."
+                              ++ "\nIf you reached this point then you've somehow made it to Cmm!"
 
 {-
 ************************************************************************
@@ -254,11 +268,11 @@ outputForeignStubs logger tmpfs dflags unit_state mod location stubs
 
      ForeignStubs (CHeader h_code) (CStub c_code _ _) -> do
         let
-            stub_c_output_d = pprCode CStyle c_code
+            stub_c_output_d = pprCode c_code
             stub_c_output_w = showSDoc dflags stub_c_output_d
 
             -- Header file protos for "foreign export"ed functions.
-            stub_h_output_d = pprCode CStyle h_code
+            stub_h_output_d = pprCode h_code
             stub_h_output_w = showSDoc dflags stub_h_output_d
 
         createDirectoryIfMissing True (takeDirectory stub_h)
@@ -311,8 +325,7 @@ outputForeignStubs logger tmpfs dflags unit_state mod location stubs
    cplusplus_ftr = "#if defined(__cplusplus)\n}\n#endif\n"
 
 
--- Don't use doOutput for dumping the f. export stubs
--- since it is more than likely that the stubs file will
+-- It is more than likely that the stubs file will
 -- turn out to be empty, in which case no file should be created.
 outputForeignStubs_help :: FilePath -> String -> String -> String -> IO Bool
 outputForeignStubs_help _fname ""      _header _footer = return False
@@ -332,7 +345,8 @@ profilingInitCode platform this_mod (local_CCs, singleton_CCSs)
  = {-# SCC profilingInitCode #-}
    initializerCStub platform fn_name decls body
  where
-   fn_name = mkInitializerStubLabel this_mod "prof_init"
+   pdocC = pprCLabel platform
+   fn_name = mkInitializerStubLabel this_mod (fsLit "prof_init")
    decls = vcat
         $  map emit_cc_decl local_CCs
         ++ map emit_ccs_decl singleton_CCSs
@@ -344,22 +358,22 @@ profilingInitCode platform this_mod (local_CCs, singleton_CCSs)
         ]
    emit_cc_decl cc =
        text "extern CostCentre" <+> cc_lbl <> text "[];"
-     where cc_lbl = pdoc platform (mkCCLabel cc)
+     where cc_lbl = pdocC (mkCCLabel cc)
    local_cc_list_label = text "local_cc_" <> ppr this_mod
    emit_cc_list ccs =
       text "static CostCentre *" <> local_cc_list_label <> text "[] ="
-      <+> braces (vcat $ [ pdoc platform (mkCCLabel cc) <> comma
+      <+> braces (vcat $ [ pdocC (mkCCLabel cc) <> comma
                          | cc <- ccs
                          ] ++ [text "NULL"])
       <> semi
 
    emit_ccs_decl ccs =
        text "extern CostCentreStack" <+> ccs_lbl <> text "[];"
-     where ccs_lbl = pdoc platform (mkCCSLabel ccs)
+     where ccs_lbl = pdocC (mkCCSLabel ccs)
    singleton_cc_list_label = text "singleton_cc_" <> ppr this_mod
    emit_ccs_list ccs =
       text "static CostCentreStack *" <> singleton_cc_list_label <> text "[] ="
-      <+> braces (vcat $ [ pdoc platform (mkCCSLabel cc) <> comma
+      <+> braces (vcat $ [ pdocC (mkCCSLabel cc) <> comma
                          | cc <- ccs
                          ] ++ [text "NULL"])
       <> semi
@@ -375,12 +389,11 @@ ipInitCode do_info_table platform this_mod
   | not do_info_table = mempty
   | otherwise = initializerCStub platform fn_nm ipe_buffer_decl body
  where
-   fn_nm = mkInitializerStubLabel this_mod "ip_init"
+   fn_nm = mkInitializerStubLabel this_mod (fsLit "ip_init")
 
    body = text "registerInfoProvList" <> parens (text "&" <> ipe_buffer_label) <> semi
 
-   ipe_buffer_label = pprCLabel platform CStyle (mkIPELabel this_mod)
+   ipe_buffer_label = pprCLabel platform (mkIPELabel this_mod)
 
    ipe_buffer_decl =
        text "extern IpeBufferListNode" <+> ipe_buffer_label <> text ";"
-

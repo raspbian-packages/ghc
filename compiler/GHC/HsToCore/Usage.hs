@@ -5,26 +5,30 @@
 module GHC.HsToCore.Usage (
     -- * Dependency/fingerprinting code (used by GHC.Iface.Make)
     mkUsageInfo, mkUsedNames,
+
+    UsageConfig(..),
     ) where
 
 import GHC.Prelude
 
 import GHC.Driver.Env
-import GHC.Driver.Session
-
 
 import GHC.Tc.Types
+
+import GHC.Iface.Load
 
 import GHC.Utils.Outputable
 import GHC.Utils.Misc
 import GHC.Utils.Fingerprint
 import GHC.Utils.Panic
+import GHC.Utils.Monad
 
 import GHC.Types.Name
 import GHC.Types.Name.Set ( NameSet, allUses )
 import GHC.Types.Unique.Set
 
 import GHC.Unit
+import GHC.Unit.Env
 import GHC.Unit.External
 import GHC.Unit.Module.Imported
 import GHC.Unit.Module.ModIface
@@ -32,6 +36,7 @@ import GHC.Unit.Module.Deps
 
 import GHC.Data.Maybe
 
+import Data.IORef
 import Data.List (sortBy)
 import Data.Map (Map)
 import qualified Data.Map as Map
@@ -64,17 +69,24 @@ its dep_orphs. This was the cause of #14128.
 mkUsedNames :: TcGblEnv -> NameSet
 mkUsedNames TcGblEnv{ tcg_dus = dus } = allUses dus
 
-mkUsageInfo :: HscEnv -> Module -> ImportedMods -> NameSet -> [FilePath]
-            -> [(Module, Fingerprint)] -> [Linkable] -> PkgsLoaded -> IO [Usage]
-mkUsageInfo hsc_env this_mod dir_imp_mods used_names dependent_files merged needed_links needed_pkgs
+data UsageConfig = UsageConfig
+  { uc_safe_implicit_imps_req :: !Bool -- ^ Are all implicit imports required to be safe for this Safe Haskell mode?
+  }
+
+mkUsageInfo :: UsageConfig -> Plugins -> FinderCache -> UnitEnv -> Module -> ImportedMods -> NameSet -> [FilePath]
+            -> [(Module, Fingerprint)] -> [Linkable] -> PkgsLoaded -> IfG [Usage]
+mkUsageInfo uc plugins fc unit_env this_mod dir_imp_mods used_names dependent_files merged needed_links needed_pkgs
   = do
-    eps <- hscEPS hsc_env
-    hashes <- mapM getFileHash dependent_files
+    eps <- liftIO $ readIORef (euc_eps (ue_eps unit_env))
+    hashes <- liftIO $ mapM getFileHash dependent_files
+    let hu = unsafeGetHomeUnit unit_env
+        hug = ue_home_unit_graph unit_env
     -- Dependencies on object files due to TH and plugins
-    object_usages <- mkObjectUsage (eps_PIT eps) hsc_env needed_links needed_pkgs
-    let mod_usages = mk_mod_usage_info (eps_PIT eps) hsc_env this_mod
+    object_usages <- liftIO $ mkObjectUsage (eps_PIT eps) plugins fc hug needed_links needed_pkgs
+    let all_home_ids = ue_all_home_unit_ids unit_env
+    mod_usages <- mk_mod_usage_info uc hu all_home_ids this_mod
                                        dir_imp_mods used_names
-        usages = mod_usages ++ [ UsageFile { usg_file_path = f
+    let usages = mod_usages ++ [ UsageFile { usg_file_path = f
                                            , usg_file_hash = hash
                                            , usg_file_label = Nothing }
                                | (f, hash) <- zip dependent_files hashes ]
@@ -151,18 +163,18 @@ to inject the appropriate dependencies.
 
 -- | Find object files corresponding to the transitive closure of given home
 -- modules and direct object files for pkg dependencies
-mkObjectUsage :: PackageIfaceTable -> HscEnv -> [Linkable] -> PkgsLoaded -> IO [Usage]
-mkObjectUsage pit hsc_env th_links_needed th_pkgs_needed = do
+mkObjectUsage :: PackageIfaceTable -> Plugins -> FinderCache -> HomeUnitGraph-> [Linkable] -> PkgsLoaded -> IO [Usage]
+mkObjectUsage pit plugins fc hug th_links_needed th_pkgs_needed = do
       let ls = ordNubOn linkableModule  (th_links_needed ++ plugins_links_needed)
           ds = concatMap loaded_pkg_hs_objs $ eltsUDFM (plusUDFM th_pkgs_needed plugin_pkgs_needed) -- TODO possibly record loaded_pkg_non_hs_objs as well
-          (plugins_links_needed, plugin_pkgs_needed) = loadedPluginDeps $ hsc_plugins hsc_env
+          (plugins_links_needed, plugin_pkgs_needed) = loadedPluginDeps plugins
       concat <$> sequence (map linkableToUsage ls ++ map librarySpecToUsage ds)
   where
     linkableToUsage (LM _ m uls) = mapM (unlinkedToUsage m) uls
 
     msg m = moduleNameString (moduleName m) ++ "[TH] changed"
 
-    fing mmsg fn = UsageFile fn <$> lookupFileCache (hsc_FC hsc_env) fn <*> pure mmsg
+    fing mmsg fn = UsageFile fn <$> lookupFileCache fc fn <*> pure mmsg
 
     unlinkedToUsage m ul =
       case nameOfObject_maybe ul of
@@ -170,7 +182,7 @@ mkObjectUsage pit hsc_env th_links_needed th_pkgs_needed = do
         Nothing ->  do
           -- This should only happen for home package things but oneshot puts
           -- home package ifaces in the PIT.
-          let miface = lookupIfaceByModule (hsc_HUG hsc_env) pit m
+          let miface = lookupIfaceByModule hug pit m
           case miface of
             Nothing -> pprPanic "mkObjectUsage" (ppr m)
             Just iface ->
@@ -182,19 +194,17 @@ mkObjectUsage pit hsc_env th_links_needed th_pkgs_needed = do
     librarySpecToUsage (DLLPath fn) = traverse (fing Nothing) [fn]
     librarySpecToUsage _ = return []
 
-mk_mod_usage_info :: PackageIfaceTable
-              -> HscEnv
+mk_mod_usage_info :: UsageConfig
+              -> HomeUnit
+              -> Set.Set UnitId
               -> Module
               -> ImportedMods
               -> NameSet
-              -> [Usage]
-mk_mod_usage_info pit hsc_env this_mod direct_imports used_names
-  = mapMaybe mkUsage usage_mods
+              -> IfG [Usage]
+mk_mod_usage_info uc home_unit home_unit_ids this_mod direct_imports used_names
+  = mapMaybeM mkUsageM usage_mods
   where
-    hpt = hsc_HUG hsc_env
-    dflags = hsc_dflags hsc_env
-    home_unit = hsc_home_unit hsc_env
-    home_unit_ids = hsc_all_home_unit_ids hsc_env
+    safe_implicit_imps_req = uc_safe_implicit_imps_req uc
 
     used_mods    = moduleEnvKeys ent_map
     dir_imp_mods = moduleEnvKeys direct_imports
@@ -228,22 +238,27 @@ mk_mod_usage_info pit hsc_env this_mod direct_imports used_names
                 in extendModuleEnvWith (\_ xs -> occ:xs) mv_map mod' [occ]
             where occ = nameOccName name
 
+    mkUsageM :: Module -> IfG (Maybe Usage)
+    mkUsageM mod | mod == this_mod -- We don't care about usages of things in *this* module
+                 || moduleUnit mod == interactiveUnit -- ... or in GHCi
+                 = return Nothing
+    mkUsageM mod = do
+      iface <- loadSysInterface (text "mk_mod_usage") mod
+        -- Make sure the interface is loaded even if we don't directly use
+        -- any symbols from it, to ensure determinism. See #22217.
+      return $ mkUsage mod iface
+
+
     -- We want to create a Usage for a home module if
     --  a) we used something from it; has something in used_names
     --  b) we imported it, even if we used nothing from it
     --     (need to recompile if its export list changes: export_fprint)
-    mkUsage :: Module -> Maybe Usage
-    mkUsage mod
-      | isNothing maybe_iface           -- We can't depend on it if we didn't
-                                        -- load its interface.
-      || mod == this_mod                -- We don't care about usages of
-                                        -- things in *this* module
-      = Nothing
-
+    mkUsage :: Module -> ModIface -> Maybe Usage
+    mkUsage mod iface
       | toUnitId (moduleUnit mod) `Set.notMember` home_unit_ids
-      = Just UsagePackageModule{ usg_mod      = mod,
-                                 usg_mod_hash = mod_hash,
-                                 usg_safe     = imp_safe }
+      = Just $ UsagePackageModule{ usg_mod      = mod,
+                                   usg_mod_hash = mod_hash,
+                                   usg_safe     = imp_safe }
         -- for package modules, we record the module hash only
 
       | (null used_occs
@@ -264,11 +279,6 @@ mk_mod_usage_info pit hsc_env this_mod direct_imports used_names
                       usg_entities = Map.toList ent_hashs,
                       usg_safe     = imp_safe }
       where
-        maybe_iface  = lookupIfaceByModule hpt pit mod
-                -- In one-shot mode, the interfaces for home-package
-                -- modules accumulate in the PIT not HPT.  Sigh.
-
-        Just iface   = maybe_iface
         finsts_mod   = mi_finsts (mi_final_exts iface)
         hash_env     = mi_hash_fn (mi_final_exts iface)
         mod_hash     = mi_mod_hash (mi_final_exts iface)
@@ -284,7 +294,7 @@ mk_mod_usage_info pit hsc_env this_mod direct_imports used_names
                 -- across all imports, why did the old code only look
                 -- at the first import?
                 Just bys -> (True, any by_is_safe bys)
-                Nothing  -> (False, safeImplicitImpsReq dflags)
+                Nothing  -> (False, safe_implicit_imps_req)
                 -- Nothing case is for references to entities which were
                 -- not directly imported (NB: the "implicit" Prelude import
                 -- counts as directly imported!  An entity is not directly

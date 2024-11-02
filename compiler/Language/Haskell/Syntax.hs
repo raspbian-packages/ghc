@@ -20,19 +20,28 @@ module Language.Haskell.Syntax (
         module Language.Haskell.Syntax.Binds,
         module Language.Haskell.Syntax.Decls,
         module Language.Haskell.Syntax.Expr,
+        module Language.Haskell.Syntax.ImpExp,
         module Language.Haskell.Syntax.Lit,
+        module Language.Haskell.Syntax.Module.Name,
         module Language.Haskell.Syntax.Pat,
         module Language.Haskell.Syntax.Type,
+        module Language.Haskell.Syntax.Concrete,
         module Language.Haskell.Syntax.Extension,
+        ModuleName(..), HsModule(..)
 ) where
 
 import Language.Haskell.Syntax.Decls
 import Language.Haskell.Syntax.Binds
 import Language.Haskell.Syntax.Expr
+import Language.Haskell.Syntax.ImpExp
+import Language.Haskell.Syntax.Module.Name
 import Language.Haskell.Syntax.Lit
+import Language.Haskell.Syntax.Concrete
 import Language.Haskell.Syntax.Extension
 import Language.Haskell.Syntax.Pat
 import Language.Haskell.Syntax.Type
+
+import Data.Maybe (Maybe)
 
 {-
 Note [Language.Haskell.Syntax.* Hierarchy]
@@ -55,5 +64,42 @@ For more details, see
 https://gitlab.haskell.org/ghc/ghc/-/wikis/implementing-trees-that-grow
 -}
 
+-- | Haskell Module
+--
+-- All we actually declare here is the top-level structure for a module.
+data HsModule p
+  =  -- | 'GHC.Parser.Annotation.AnnKeywordId's
+     --
+     --  - 'GHC.Parser.Annotation.AnnModule','GHC.Parser.Annotation.AnnWhere'
+     --
+     --  - 'GHC.Parser.Annotation.AnnOpen','GHC.Parser.Annotation.AnnSemi',
+     --    'GHC.Parser.Annotation.AnnClose' for explicit braces and semi around
+     --    hsmodImports,hsmodDecls if this style is used.
 
--- TODO Add TTG parameter to 'HsModule' and move here.
+     -- For details on above see Note [exact print annotations] in GHC.Parser.Annotation
+    HsModule {
+      hsmodExt :: XCModule p,
+        -- ^ HsModule extension point
+      hsmodName :: Maybe (XRec p ModuleName),
+        -- ^ @Nothing@: \"module X where\" is omitted (in which case the next
+        --     field is Nothing too)
+      hsmodExports :: Maybe (XRec p [LIE p]),
+        -- ^ Export list
+        --
+        --  - @Nothing@: export list omitted, so export everything
+        --
+        --  - @Just []@: export /nothing/
+        --
+        --  - @Just [...]@: as you would expect...
+        --
+        --
+        --  - 'GHC.Parser.Annotation.AnnKeywordId's : 'GHC.Parser.Annotation.AnnOpen'
+        --                                   ,'GHC.Parser.Annotation.AnnClose'
+
+        -- For details on above see Note [exact print annotations] in GHC.Parser.Annotation
+      hsmodImports :: [LImportDecl p],
+      hsmodDecls :: [LHsDecl p]
+        -- ^ Type, class, value, and interface signature decls
+   }
+  | XModule !(XXModule p)
+

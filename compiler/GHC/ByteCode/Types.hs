@@ -1,5 +1,6 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE RecordWildCards            #-}
+{-# LANGUAGE TypeApplications           #-}
 --
 --  (c) The University of Glasgow 2002-2006
 --
@@ -120,7 +121,7 @@ instance Outputable NativeCallInfo where
   ppr NativeCallInfo{..} = text "<arg_size" <+> ppr nativeCallSize <+>
                            text "stack" <+> ppr nativeCallStackSpillSize <+>
                            text "regs"  <+>
-                           ppr (map (text . show) $ regSetToList nativeCallRegs) <>
+                           ppr (map (text @SDoc . show) $ regSetToList nativeCallRegs) <>
                            char '>'
 
 

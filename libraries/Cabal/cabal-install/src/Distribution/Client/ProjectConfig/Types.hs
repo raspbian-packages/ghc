@@ -61,7 +61,7 @@ import Distribution.Simple.Compiler
 import Distribution.Simple.Setup
          ( Flag, HaddockTarget(..), TestShowDetails(..), DumpBuildInfo (..) )
 import Distribution.Simple.InstallDirs
-         ( PathTemplate )
+         ( PathTemplate, InstallDirs )
 import Distribution.Utils.NubList
          ( NubList )
 
@@ -73,7 +73,7 @@ import qualified Data.Map as Map
 
 -- | This type corresponds directly to what can be written in the
 -- @cabal.project@ file. Other sources of configuration can also be injected
--- into this type, such as the user-wide @~/.cabal/config@ file and the
+-- into this type, such as the user-wide config file and the
 -- command line of @cabal configure@ or @cabal build@.
 --
 -- Since it corresponds to the external project file it is an instance of
@@ -169,12 +169,11 @@ data ProjectConfigShared
        projectConfigHcPkg             :: Flag FilePath,
        projectConfigHaddockIndex      :: Flag PathTemplate,
 
-       -- Things that only make sense for manual mode, not --local mode
+       -- Only makes sense for manual mode, not --local mode
        -- too much control!
      --projectConfigUserInstall       :: Flag Bool,
-     --projectConfigInstallDirs       :: InstallDirs (Flag PathTemplate),
-     --TODO: [required eventually] decide what to do with InstallDirs
-     -- currently we don't allow it to be specified in the config file
+
+       projectConfigInstallDirs       :: InstallDirs (Flag PathTemplate),
        projectConfigPackageDBs        :: [Maybe PackageDB],
 
        -- configuration used both by the solver and other phases
@@ -203,6 +202,7 @@ data ProjectConfigShared
        projectConfigOnlyConstrained   :: Flag OnlyConstrained,
        projectConfigPerComponent      :: Flag Bool,
        projectConfigIndependentGoals  :: Flag IndependentGoals,
+       projectConfigPreferOldest      :: Flag PreferOldest,
 
        projectConfigProgPathExtra     :: NubList FilePath
 
@@ -287,6 +287,9 @@ data PackageConfig
        packageConfigHaddockQuickJump    :: Flag Bool, --TODO: [required eventually] use this
        packageConfigHaddockHscolourCss  :: Flag FilePath, --TODO: [required eventually] use this
        packageConfigHaddockContents     :: Flag PathTemplate, --TODO: [required eventually] use this
+       packageConfigHaddockIndex        :: Flag PathTemplate, --TODO: [required eventually] use this
+       packageConfigHaddockBaseUrl      :: Flag String, --TODO: [required eventually] use this
+       packageConfigHaddockLib          :: Flag String, --TODO: [required eventually] use this
        packageConfigHaddockForHackage   :: Flag HaddockTarget,
        -- Test options
        packageConfigTestHumanLog        :: Flag PathTemplate,
@@ -410,7 +413,8 @@ data SolverSettings
        solverSettingOnlyConstrained   :: OnlyConstrained,
        solverSettingIndexState        :: Maybe TotalIndexState,
        solverSettingActiveRepos       :: Maybe ActiveRepos,
-       solverSettingIndependentGoals  :: IndependentGoals
+       solverSettingIndependentGoals  :: IndependentGoals,
+       solverSettingPreferOldest      :: PreferOldest
        -- Things that only make sense for manual mode, not --local mode
        -- too much control!
      --solverSettingShadowPkgs        :: Bool,

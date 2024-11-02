@@ -9,6 +9,7 @@ import Expression
 import Flavour
 import Hadrian.Haskell.Cabal.Type (packageDependencies)
 import Hadrian.Oracles.Cabal (readPackageData)
+import Hadrian.Oracles.Path (fixAbsolutePathOnWindows)
 import Oracles.Setting
 import Oracles.TestSettings
 import Oracles.Flag
@@ -81,6 +82,9 @@ inTreeOutTree inTree outTree = do
 testsuiteDeps :: Rules ()
 testsuiteDeps = do
   root <- buildRootRules
+  "test:all_deps" ~> do
+    need ("test:ghc" : map cp_target checkPrograms)
+
   "test:ghc" ~> inTreeOutTree
                     (\stg -> do
                       needTestsuitePackages stg
@@ -107,14 +111,16 @@ testRules = do
     -- as the stage1 compiler needs the stage2 libraries
     -- to have any hope of passing tests.
     root -/- "stage1-test/bin/*" %> \path -> do
+
+      bin_path <- stageBinPath stage0InTree
       let prog = takeBaseName path
-          stage0prog = root -/- "stage0/bin" -/- prog <.> exe
+          stage0prog = bin_path -/- prog <.> exe
       need [stage0prog]
       abs_prog_path <- liftIO (IO.canonicalizePath stage0prog)
       -- Use the stage1 package database
-      pkgDb <- liftIO . IO.makeAbsolute =<< packageDbPath Stage1
+      pkgDb <- liftIO . IO.makeAbsolute =<< packageDbPath (PackageDbLoc Stage1 Final)
       if prog `elem` ["ghc","runghc"] then do
-          let flags = [ "-no-user-package-db", "-hide-package", "ghc" , "-package-env","-","-package-db",pkgDb]
+          let flags = [ "-no-global-package-db", "-no-user-package-db", "-hide-package", "ghc" , "-package-env","-","-package-db",pkgDb]
           writeFile' path $ unlines ["#!/bin/sh",unwords ((abs_prog_path : flags) ++ ["${1+\"$@\"}"])]
           makeExecutable path
       else if prog == "ghc-pkg" then do
@@ -146,16 +152,12 @@ testRules = do
                 top <- topDirectory
                 depsPkgs <- mod_pkgs . packageDependencies <$> readPackageData progPkg
                 bindir <- getBinaryDirectory testGhc
-                debugged <- ghcDebugged <$> flavour
-                dynPrograms <- dynamicGhcPrograms =<< flavour
+                test_args <- outOfTreeCompilerArgs
+                let dynPrograms = hasDynamic test_args
                 cmd [bindir </> "ghc" <.> exe] $
                     concatMap (\p -> ["-package", pkgName p]) depsPkgs ++
                     ["-o", top -/- path, top -/- sourcePath] ++
                     mextra ++
-                    -- If GHC is build with debug options, then build check-ppr
-                    -- also with debug options.  This allows, e.g., to print debug
-                    -- messages of various RTS subsystems while using check-ppr.
-                    (if debugged then ["-debug"] else []) ++
                     -- If GHC is build dynamic, then build check-ppr also dynamic.
                     (if dynPrograms then ["-dynamic"] else [])
 
@@ -165,7 +167,7 @@ testRules = do
         let testGhc = testCompiler args
         ghcPath <- getCompilerPath testGhc
         whenJust (stageOf testGhc) $ \stg ->
-          need . (:[]) =<< programPath (Context stg ghc vanilla)
+          need . (:[]) =<< programPath (Context stg ghc vanilla Final)
         ghcConfigProgPath <- programPath =<< programContext stage0InTree ghcConfig
         cwd <- liftIO $ IO.getCurrentDirectory
         need [makeRelative cwd ghcPath, ghcConfigProgPath]
@@ -185,14 +187,40 @@ testRules = do
         -- for example "docs_haddock"
         -- We then need to go and build these dependencies
         extra_targets <- words <$> askWithResources [] (test_target GetExtraDeps)
-        need $ filter (isOkToBuild args) extra_targets
+        let ok_to_build = filter (isOkToBuild args) extra_targets
+        putVerbose $ " | ExtraTargets: " ++ intercalate ", " extra_targets
+        putVerbose $ " | ExtraTargets (ok-to-build): " ++ intercalate ", " ok_to_build
+        need ok_to_build
 
         -- Prepare Ghc configuration file for input compiler.
         need [root -/- timeoutPath]
 
+        cross <- flag CrossCompiling
+
+        -- get relative path for the given program in the given stage
+        let relative_path_stage s p = programPath =<< programContext s p
+        let make_absolute rel_path = do
+              abs_path <- liftIO (IO.makeAbsolute rel_path)
+              fixAbsolutePathOnWindows abs_path
+
+        rel_ghc_pkg     <- relative_path_stage Stage1 ghcPkg
+        rel_hsc2hs      <- relative_path_stage Stage1 hsc2hs
+        rel_hp2ps       <- relative_path_stage Stage1 hp2ps
+        rel_haddock     <- relative_path_stage (Stage0 InTreeLibs) haddock
+        rel_hpc         <- relative_path_stage (Stage0 InTreeLibs) hpc
+        rel_runghc      <- relative_path_stage (Stage0 InTreeLibs) runGhc
+
+        -- force stage0 program building for cross
+        when cross $ need [rel_hpc, rel_haddock, rel_runghc]
+
+        prog_ghc_pkg     <- make_absolute rel_ghc_pkg
+        prog_hsc2hs      <- make_absolute rel_hsc2hs
+        prog_hp2ps       <- make_absolute rel_hp2ps
+        prog_haddock     <- make_absolute rel_haddock
+        prog_hpc         <- make_absolute rel_hpc
+        prog_runghc      <- make_absolute rel_runghc
 
         ghcPath <- getCompilerPath testCompilerArg
-
 
         makePath        <- builderPath $ Make ""
         top             <- topDirectory
@@ -221,6 +249,15 @@ testRules = do
             setEnv "TEST_HC_OPTS_INTERACTIVE" ghciFlags
             setEnv "TEST_CC" ccPath
             setEnv "TEST_CC_OPTS" ccFlags
+
+            when cross $ do
+              setEnv "GHC_PKG"   prog_ghc_pkg
+              setEnv "HSC2HS"    prog_hsc2hs
+              setEnv "HP2PS_ABS" prog_hp2ps
+              setEnv "HPC"       prog_hpc
+              setEnv "HADDOCK"   prog_haddock
+              setEnv "RUNGHC"    prog_runghc
+
             setEnv "CHECK_PPR" (top -/- root -/- checkPprProgPath)
             setEnv "CHECK_EXACT" (top -/- root -/- checkExactProgPath)
             setEnv "COUNT_DEPS" (top -/- root -/- countDepsProgPath)
@@ -248,7 +285,7 @@ testRules = do
 -- We should have built them already by this point, but
 isOkToBuild :: TestArgs -> String -> Bool
 isOkToBuild args target
-   = stageOf (testCompiler args) `elem` [Just Stage1, Just Stage2]
+   = isJust (stageOf (testCompiler args))
   || testHasInTreeFiles args
   || target `elem` map cp_target checkPrograms
 
@@ -289,8 +326,18 @@ needTestsuitePackages stg = do
   cross <- flag CrossCompiling
   when (not cross) $ needIservBins stg
   root <- buildRoot
+  liftIO $ print stg
   -- require the shims for testing stage1
-  need =<< sequence [(\f -> root -/- "stage1-test/bin" -/- takeFileName f) <$> (pkgFile stage0InTree p) | (Stage0 InTreeLibs,p) <- exepkgs]
+  when (stg == stage0InTree) $ do
+   -- Windows not supported as the wrapper scripts don't work on windows.. we could
+   -- support it with a separate .bat or C wrapper code path but seems overkill when no-one will
+   -- probably ever try and do this.
+    when windowsHost $ do
+      putFailure $ unlines [ "Testing stage1 compiler with windows is currently unsupported,"
+                             , "if you desire to do this then please open a ticket"]
+      fail "Testing stage1 is not supported"
+
+    need =<< sequence [(\f -> root -/- "stage1-test/bin" -/- takeFileName f) <$> (pkgFile stage0InTree p) | (Stage0 InTreeLibs,p) <- exepkgs]
 
 -- stage 1 ghc lives under stage0/bin,
 -- stage 2 ghc lives under stage1/bin, etc
@@ -311,18 +358,18 @@ needIservBins stg = do
     -- not working with the testsuite, see #19624
     canBuild (Stage0 {}) _ = pure Nothing
     canBuild stg w = do
-      contextDeps <- contextDependencies (Context stg iserv w)
+      contextDeps <- contextDependencies (Context stg iserv w Final)
       ws <- forM contextDeps $ \c ->
               interpretInContext c (getLibraryWays <>
                                     if Context.Type.package c == rts
                                       then getRtsWays
                                       else mempty)
       if (all (w `elem`) ws)
-        then Just <$> programPath (Context stg iserv w)
+        then Just <$> programPath (Context stg iserv w Final)
         else return Nothing
 
 
 pkgFile :: Stage -> Package -> Action FilePath
 pkgFile stage pkg
-    | isLibrary pkg = pkgConfFile (Context stage pkg profilingDynamic)
+    | isLibrary pkg = pkgConfFile (Context stage pkg profilingDynamic Final)
     | otherwise     = programPath =<< programContext stage pkg

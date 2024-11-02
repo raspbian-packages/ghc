@@ -62,7 +62,7 @@ exitifyProgram binds = map goTopLvl binds
     goTopLvl (Rec pairs) = Rec (map (second (go in_scope_toplvl)) pairs)
       -- Top-level bindings are never join points
 
-    in_scope_toplvl = emptyInScopeSet `extendInScopeSetList` bindersOfBinds binds
+    in_scope_toplvl = emptyInScopeSet `extendInScopeSetBndrs` binds
 
     go :: InScopeSet -> CoreExpr -> CoreExpr
     go _    e@(Var{})       = e
@@ -94,7 +94,7 @@ exitifyProgram binds = map goTopLvl binds
       | otherwise   = Let (Rec pairs') body'
       where
         is_join_rec = any (isJoinId . fst) pairs
-        in_scope'   = in_scope `extendInScopeSetList` bindersOf (Rec pairs)
+        in_scope'   = in_scope `extendInScopeSetBind` (Rec pairs)
         pairs'      = mapSnd (go in_scope') pairs
         body'       = go in_scope' body
 
@@ -265,7 +265,7 @@ mkExitJoinId in_scope ty join_arity = do
                          `extendInScopeSet` exit_id_tmpl -- just cosmetics
     return (uniqAway avoid exit_id_tmpl)
   where
-    exit_id_tmpl = mkSysLocal (fsLit "exit") initExitJoinUnique Many ty
+    exit_id_tmpl = mkSysLocal (fsLit "exit") initExitJoinUnique ManyTy ty
                     `asJoinId` join_arity
 
 addExit :: InScopeSet -> JoinArity -> CoreExpr -> ExitifyM JoinId
@@ -306,7 +306,7 @@ Neither do we want this to happen
   in …
 
 where the floated expression `x+x` is a bit more complicated, but still not
-intersting.
+interesting.
 
 Expressions are interesting when they move an occurrence of a variable outside
 the recursive `go` that can benefit from being obviously called once, for example:
@@ -315,7 +315,7 @@ the recursive `go` that can benefit from being obviously called once, for exampl
    see that it is called at most once, and hence improve the function’s
    strictness signature
 
-So we only hoist an exit expression out if it mentiones at least one free,
+So we only hoist an exit expression out if it mentions at least one free,
 non-imported variable.
 
 Note [Jumps can be interesting]
@@ -430,7 +430,7 @@ would).
 To prevent this, we need to recognize exit join points, and then disable
 inlining.
 
-Exit join points, recognizeable using `isExitJoinId` are join points with an
+Exit join points, recognizable using `isExitJoinId` are join points with an
 occurrence in a recursive group, and can be recognized (after the occurrence
 analyzer ran!) using `isExitJoinId`.
 This function detects joinpoints with `occ_in_lam (idOccinfo id) == True`,

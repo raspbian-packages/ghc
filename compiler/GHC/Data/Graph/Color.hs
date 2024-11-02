@@ -95,7 +95,7 @@ colorGraph iterative spinCount colors triv spill graph0
 
         -- try and color the problem nodes
         --      problem nodes are the ones that were left uncolored because they weren't triv.
-        --      theres a change we can color them here anyway.
+        --      there's a change we can color them here anyway.
         (graph_prob, ksNoColor)
                 = assignColors colors graph_triv ksProblems
 
@@ -328,8 +328,7 @@ selectColor colors graph u
                         -- See Note [Unique Determinism and code generation]
 
         colors_conflict = mkUniqSet
-                        $ catMaybes
-                        $ map nodeColor nsConflicts
+                        $ mapMaybe nodeColor nsConflicts
 
         -- the prefs of our neighbors
         colors_neighbor_prefs

@@ -135,7 +135,8 @@ typedef struct StgTSO_ {
     struct InCall_*         bound;
     struct Capability_*     cap;
 
-    struct StgTRecHeader_ * trec;       /* STM transaction record */
+    struct StgTRecHeader_ * trec;           /* STM transaction record */
+    StgArrBytes*            label;          /* Thread label */
 
     /*
      * A list of threads blocked on this TSO waiting to throw exceptions.
@@ -265,11 +266,16 @@ typedef struct StgStack_ {
     StgWord    stack[];
 } StgStack;
 
+INLINE_HEADER StgPtr stack_SpLim(StgStack *stack)
+{
+    return stack->stack + RESERVED_STACK_WORDS;
+}
+
 // Calculate SpLim from a TSO (reads tso->stackobj, but no fields from
 // the stackobj itself).
 INLINE_HEADER StgPtr tso_SpLim (StgTSO* tso)
 {
-    return tso->stackobj->stack + RESERVED_STACK_WORDS;
+    return stack_SpLim(tso->stackobj);
 }
 
 /* -----------------------------------------------------------------------------

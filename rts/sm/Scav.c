@@ -4,6 +4,10 @@
  *
  * Generational garbage collector: scavenging functions
  *
+ * Scavenging means reading already copied (evacuated) objects and evactuating
+ * any pointers the object holds and updating the pointers to their new
+ * locations.
+ *
  * Documentation on the architecture of the Garbage Collector can be
  * found in the online commentary:
  *
@@ -86,6 +90,7 @@ static void scavenge_large_bitmap (StgPtr p,
 # define scavenge_mut_arr_ptrs(info) scavenge_mut_arr_ptrs1(info)
 # define scavenge_PAP(pap) scavenge_PAP1(pap)
 # define scavenge_AP(ap) scavenge_AP1(ap)
+# define scavenge_continuation(pap) scavenge_continuation1(pap)
 # define scavenge_compact(str) scavenge_compact1(str)
 #endif
 
@@ -127,6 +132,11 @@ scavengeTSO (StgTSO *tso)
     evacuate((StgClosure **)&tso->stackobj);
 
     evacuate((StgClosure **)&tso->_link);
+
+    if (tso->label != NULL) {
+        evacuate((StgClosure **)&tso->label);
+    }
+
     if (   tso->why_blocked == BlockedOnMVar
         || tso->why_blocked == BlockedOnMVarRead
         || tso->why_blocked == BlockedOnBlackHole
@@ -375,6 +385,13 @@ scavenge_AP (StgAP *ap)
 {
     evacuate(&ap->fun);
     return scavenge_PAP_payload (ap->fun, ap->payload, ap->n_args);
+}
+
+StgPtr
+scavenge_continuation(StgContinuation *cont)
+{
+    scavenge_stack(cont->stack, cont->stack + cont->stack_size);
+    return (StgPtr)cont + continuation_sizeW(cont);
 }
 
 /* -----------------------------------------------------------------------------
@@ -822,6 +839,10 @@ scavenge_block (bdescr *bd)
         break;
       }
 
+    case CONTINUATION:
+        p = scavenge_continuation((StgContinuation *)p);
+        break;
+
     default:
         barf("scavenge: unimplemented/strange closure type %d @ %p",
              info->type, p);
@@ -1214,6 +1235,10 @@ scavenge_mark_stack(void)
             break;
           }
 
+        case CONTINUATION:
+            scavenge_continuation((StgContinuation *)p);
+            break;
+
         default:
             barf("scavenge_mark_stack: unimplemented/strange closure type %d @ %p",
                  info->type, p);
@@ -1568,8 +1593,20 @@ scavenge_one(StgPtr p)
 #endif
       break;
 
+    case BCO: {
+        StgBCO *bco = (StgBCO *)p;
+        evacuate((StgClosure **)&bco->instrs);
+        evacuate((StgClosure **)&bco->literals);
+        evacuate((StgClosure **)&bco->ptrs);
+        break;
+    }
+
     case COMPACT_NFDATA:
         scavenge_compact((StgCompactNFData*)p);
+        break;
+
+    case CONTINUATION:
+        scavenge_continuation((StgContinuation *)p);
         break;
 
     default:

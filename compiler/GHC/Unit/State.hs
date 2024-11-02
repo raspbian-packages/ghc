@@ -43,6 +43,7 @@ module GHC.Unit.State (
         LookupResult(..),
         ModuleSuggestion(..),
         ModuleOrigin(..),
+        UnusableUnit(..),
         UnusableUnitReason(..),
         pprReason,
 
@@ -174,8 +175,10 @@ data ModuleOrigin =
     -- (But maybe the user didn't realize), so we'll still keep track
     -- of these modules.)
     ModHidden
-    -- | Module is unavailable because the package is unusable.
-  | ModUnusable UnusableUnitReason
+
+    -- | Module is unavailable because the unit is unusable.
+  | ModUnusable !UnusableUnit
+
     -- | Module is public, and could have come from some places.
   | ModOrigin {
         -- | @Just False@ means that this module is in
@@ -192,6 +195,13 @@ data ModuleOrigin =
         -- more information.
       , fromPackageFlag :: Bool
       }
+
+-- | A unusable unit module origin
+data UnusableUnit = UnusableUnit
+  { uuUnit        :: !Unit               -- ^ Unusable unit
+  , uuReason      :: !UnusableUnitReason -- ^ Reason
+  , uuIsReexport  :: !Bool               -- ^ Is the "module" a reexport?
+  }
 
 instance Outputable ModuleOrigin where
     ppr ModHidden = text "hidden module"
@@ -237,7 +247,8 @@ instance Semigroup ModuleOrigin where
                     text "x: " <> ppr x $$ text "y: " <> ppr y
             g Nothing x = x
             g x Nothing = x
-    x <> y = pprPanic "ModOrigin: hidden module redefined" $
+
+    x <> y = pprPanic "ModOrigin: module origin mismatch" $
                  text "x: " <> ppr x $$ text "y: " <> ppr y
 
 instance Monoid ModuleOrigin where
@@ -538,13 +549,13 @@ lookupUnitId' :: UnitInfoMap -> UnitId -> Maybe UnitInfo
 lookupUnitId' db uid = Map.lookup uid db
 
 
--- | Looks up the given unit in the unit state, panicing if it is not found
+-- | Looks up the given unit in the unit state, panicking if it is not found
 unsafeLookupUnit :: HasDebugCallStack => UnitState -> Unit -> UnitInfo
 unsafeLookupUnit state u = case lookupUnit state u of
    Just info -> info
    Nothing   -> pprPanic "unsafeLookupUnit" (ppr u)
 
--- | Looks up the given unit id in the unit state, panicing if it is not found
+-- | Looks up the given unit id in the unit state, panicking if it is not found
 unsafeLookupUnitId :: HasDebugCallStack => UnitState -> UnitId -> UnitInfo
 unsafeLookupUnitId state uid = case lookupUnitId state uid of
    Just info -> info
@@ -711,8 +722,8 @@ getUnitDbRefs cfg = do
   let base_conf_refs = case e_pkg_path of
         Left _ -> system_conf_refs
         Right path
-         | not (null path) && isSearchPathSeparator (last path)
-         -> map PkgDbPath (splitSearchPath (init path)) ++ system_conf_refs
+         | Just (xs, x) <- snocView path, isSearchPathSeparator x
+         -> map PkgDbPath (splitSearchPath xs) ++ system_conf_refs
          | otherwise
          -> map PkgDbPath (splitSearchPath path)
 
@@ -1117,31 +1128,29 @@ findWiredInUnits logger prec_map pkgs vis_map = do
         -- available.
         --
         findWiredInUnit :: [UnitInfo] -> UnitId -> IO (Maybe (UnitId, UnitInfo))
-        findWiredInUnit pkgs wired_pkg =
-           let all_ps = [ p | p <- pkgs, p `matches` wired_pkg ]
-               all_exposed_ps =
-                    [ p | p <- all_ps
-                        , Map.member (mkUnit p) vis_map ] in
-           case all_exposed_ps of
-            [] -> case all_ps of
-                       []   -> notfound
-                       many -> pick (head (sortByPreference prec_map many))
-            many -> pick (head (sortByPreference prec_map many))
+        findWiredInUnit pkgs wired_pkg = firstJustsM [try all_exposed_ps, try all_ps, notfound]
           where
+                all_ps = [ p | p <- pkgs, p `matches` wired_pkg ]
+                all_exposed_ps = [ p | p <- all_ps, Map.member (mkUnit p) vis_map ]
+
+                try ps = case sortByPreference prec_map ps of
+                    p:_ -> Just <$> pick p
+                    _ -> pure Nothing
+
                 notfound = do
                           debugTraceMsg logger 2 $
                             text "wired-in package "
                                  <> ftext (unitIdFS wired_pkg)
                                  <> text " not found."
                           return Nothing
-                pick :: UnitInfo -> IO (Maybe (UnitId, UnitInfo))
+                pick :: UnitInfo -> IO (UnitId, UnitInfo)
                 pick pkg = do
                         debugTraceMsg logger 2 $
                             text "wired-in package "
                                  <> ftext (unitIdFS wired_pkg)
                                  <> text " mapped to "
                                  <> ppr (unitId pkg)
-                        return (Just (wired_pkg, pkg))
+                        return (wired_pkg, pkg)
 
 
   mb_wired_in_pkgs <- mapM (findWiredInUnit pkgs) wiredInUnitIds
@@ -1818,21 +1827,36 @@ mkUnusableModuleNameProvidersMap :: UnusableUnits -> ModuleNameProvidersMap
 mkUnusableModuleNameProvidersMap unusables =
     Map.foldl' extend_modmap Map.empty unusables
  where
-    extend_modmap modmap (pkg, reason) = addListTo modmap bindings
+    extend_modmap modmap (unit_info, reason) = addListTo modmap bindings
       where bindings :: [(ModuleName, Map Module ModuleOrigin)]
             bindings = exposed ++ hidden
 
-            origin = ModUnusable reason
-            pkg_id = mkUnit pkg
+            origin_reexport =  ModUnusable (UnusableUnit unit reason True)
+            origin_normal   =  ModUnusable (UnusableUnit unit reason False)
+            unit = mkUnit unit_info
 
             exposed = map get_exposed exposed_mods
-            hidden = [(m, mkModMap pkg_id m origin) | m <- hidden_mods]
+            hidden = [(m, mkModMap unit m origin_normal) | m <- hidden_mods]
 
-            get_exposed (mod, Just mod') = (mod, Map.singleton mod' origin)
-            get_exposed (mod, _)         = (mod, mkModMap pkg_id mod origin)
+            -- with re-exports, c:Foo can be reexported from two (or more)
+            -- unusable packages:
+            --  Foo -> a:Foo (unusable reason A) -> c:Foo
+            --      -> b:Foo (unusable reason B) -> c:Foo
+            --
+            -- We must be careful to not record the following (#21097):
+            --  Foo -> c:Foo (unusable reason A)
+            --      -> c:Foo (unusable reason B)
+            -- But:
+            --  Foo -> a:Foo (unusable reason A)
+            --      -> b:Foo (unusable reason B)
+            --
+            get_exposed (mod, Just _) = (mod, mkModMap unit mod origin_reexport)
+            get_exposed (mod, _) = (mod, mkModMap unit mod origin_normal)
+              -- in the reexport case, we create a virtual module that doesn't
+              -- exist but we don't care as it's only used as a key in the map.
 
-            exposed_mods = unitExposedModules pkg
-            hidden_mods  = unitHiddenModules pkg
+            exposed_mods = unitExposedModules unit_info
+            hidden_mods  = unitHiddenModules  unit_info
 
 -- | Add a list of key/value pairs to a nested map.
 --
@@ -2050,7 +2074,7 @@ mayThrowUnitErr = \case
 instance Outputable UnitErr where
     ppr = \case
         CloseUnitErr p mb_parent
-            -> (ftext (fsLit "unknown unit:") <+> ppr p)
+            -> (text "unknown unit:" <+> ppr p)
                <> case mb_parent of
                      Nothing     -> Outputable.empty
                      Just parent -> space <> parens (text "dependency of"

@@ -16,6 +16,7 @@ module GHC.StgToCmm.Bind (
 import GHC.Prelude hiding ((<*>))
 
 import GHC.Core          ( AltCon(..) )
+import GHC.Core.Opt.Arity( isOneShotBndr )
 import GHC.Runtime.Heap.Layout
 import GHC.Unit.Module
 
@@ -23,6 +24,8 @@ import GHC.Stg.Syntax
 
 import GHC.Platform
 import GHC.Platform.Profile
+
+import GHC.Builtin.Names (unpackCStringName, unpackCStringUtf8Name)
 
 import GHC.StgToCmm.Config
 import GHC.StgToCmm.Expr
@@ -86,6 +89,9 @@ cgTopRhsClosure platform rec id ccs upd_flag args body =
       lf_info       = mkClosureLFInfo platform id TopLevel [] upd_flag args
   in (cg_id_info, gen_code lf_info closure_label)
   where
+
+  gen_code :: LambdaFormInfo -> CLabel -> FCode ()
+
   -- special case for a indirection (f = g).  We create an IND_STATIC
   -- closure pointing directly to the indirectee.  This is exactly
   -- what the CAF will eventually evaluate to anyway, we're just
@@ -100,10 +106,43 @@ cgTopRhsClosure platform rec id ccs upd_flag args body =
   -- concurrent/should_run/4030 fails, for instance.
   --
   gen_code _ closure_label
-    | StgApp f [] <- body, null args, isNonRec rec
+    | StgApp f [] <- body
+    , null args
+    , isNonRec rec
     = do
          cg_info <- getCgIdInfo f
          emitDataCon closure_label indStaticInfoTable ccs [unLit (idInfoToAmode cg_info)]
+
+  -- Emit standard stg_unpack_cstring closures for top-level unpackCString# thunks.
+  --
+  -- Note that we do not do this for thunks enclosured in code ticks (e.g. hpc
+  -- ticks) since we want to ensure that these ticks are not lost (e.g.
+  -- resulting in Strings being reported by hpc as uncovered). However, we
+  -- don't worry about standard profiling ticks since unpackCString tends not
+  -- be terribly interesting in profiles. See Note [unpack_cstring closures] in
+  -- StgStdThunks.cmm.
+  gen_code _ closure_label
+    | null args
+    , StgApp f [arg] <- stripStgTicksTopE (not . tickishIsCode) body
+    , Just unpack <- is_string_unpack_op f
+    = do arg' <- getArgAmode (NonVoid arg)
+         case arg' of
+           CmmLit lit -> do
+             let info = CmmInfoTable
+                   { cit_lbl = unpack
+                   , cit_rep = HeapRep True 0 1 Thunk
+                   , cit_prof = NoProfilingInfo
+                   , cit_srt = Nothing
+                   , cit_clo = Nothing
+                   }
+             emitDecl $ CmmData (Section Data closure_label) $
+                 CmmStatics closure_label info ccs [] [lit]
+           _ -> panic "cgTopRhsClosure.gen_code"
+    where
+      is_string_unpack_op f
+        | idName f == unpackCStringName     = Just mkRtsUnpackCStringLabel
+        | idName f == unpackCStringUtf8Name = Just mkRtsUnpackCStringUtf8Label
+        | otherwise                         = Nothing
 
   gen_code lf_info _closure_label
    = do { profile <- getProfile
@@ -220,7 +259,6 @@ cgRhs id (StgRhsCon cc con mn _ts args)
 {- See Note [GC recovery] in "GHC.StgToCmm.Closure" -}
 cgRhs id (StgRhsClosure fvs cc upd_flag args body)
   = do
-    checkFunctionArgTags (text "TagCheck Failed: Rhs of" <> ppr id) id args
     profile <- getProfile
     check_tags <- stgToCmmDoTagCheck <$> getStgToCmmConfig
     use_std_ap_thunk <- stgToCmmTickyAP <$> getStgToCmmConfig
@@ -489,6 +527,7 @@ closureCodeBody top_lvl bndr cl_info cc [] body fv_details
      lf_info  = closureLFInfo cl_info
      info_tbl = mkCmmInfo cl_info bndr cc
 
+-- Functions
 closureCodeBody top_lvl bndr cl_info cc args@(arg0:_) body fv_details
   = let nv_args = nonVoidIds args
         arity = length args
@@ -514,7 +553,13 @@ closureCodeBody top_lvl bndr cl_info cc args@(arg0:_) body fv_details
                 -- Extend reader monad with information that
                 -- self-recursive tail calls can be optimized into local
                 -- jumps. See Note [Self-recursive tail calls] in GHC.StgToCmm.Expr.
-                ; withSelfLoop (bndr, loop_header_id, arg_regs) $ do
+                ; let !self_loop_info = MkSelfLoopInfo
+                        { sli_id = bndr
+                        , sli_arity = arity
+                        , sli_header_block = loop_header_id
+                        , sli_registers = arg_regs
+                        }
+                ; withSelfLoop self_loop_info $ do
                 {
                 -- Main payload
                 ; entryHeapCheck cl_info node' arity arg_regs $ do
@@ -530,7 +575,7 @@ closureCodeBody top_lvl bndr cl_info cc args@(arg0:_) body fv_details
                 -- Load free vars out of closure *after*
                 -- heap check, to reduce live vars over check
                 ; when node_points $ load_fvs node lf_info fv_bindings
-                ; checkFunctionArgTags (text "TagCheck failed - Argument to local function:" <> ppr bndr) bndr (map fromNonVoid nv_args)
+                ; checkFunctionArgTags (text "TagCheck failed - Argument to local function:" <> ppr bndr) bndr args
                 ; void $ cgExpr body
                 }}}
 
@@ -662,10 +707,19 @@ emitBlackHoleCode node = do
 
   when eager_blackholing $ do
     whenUpdRemSetEnabled $ emitUpdRemSetPushThunk node
-    emitStore (cmmOffsetW platform node (fixedHdrSizeW profile)) currentTSOExpr
+    emitAtomicStore platform MemOrderRelease
+        (cmmOffsetW platform node (fixedHdrSizeW profile))
+        currentTSOExpr
     -- See Note [Heap memory barriers] in SMP.h.
-    emitPrimCall [] MO_WriteBarrier []
-    emitStore node (CmmReg (CmmGlobal EagerBlackholeInfo))
+    emitAtomicStore platform MemOrderRelease
+        node
+        (CmmReg (CmmGlobal EagerBlackholeInfo))
+
+emitAtomicStore :: Platform -> MemoryOrdering -> CmmExpr -> CmmExpr -> FCode ()
+emitAtomicStore platform mord addr val =
+    emitPrimCall [] (MO_AtomicWrite w mord) [addr, val]
+  where
+    w = typeWidth $ cmmExprType platform val
 
 setupUpdate :: ClosureInfo -> LocalReg -> FCode () -> FCode ()
         -- Nota Bene: this function does not change Node (even if it's a CAF),
@@ -782,5 +836,5 @@ closureDescription
         -- Not called for StgRhsCon which have global info tables built in
         -- CgConTbls.hs with a description generated from the data constructor
 closureDescription mod_name name
-  = renderWithContext defaultSDocContext
+  = showSDocOneLine defaultSDocContext
     (char '<' <> pprFullName mod_name name <> char '>')

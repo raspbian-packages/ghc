@@ -22,6 +22,7 @@ module GHC.CmmToAsm.PPC.Instr
    , patchJumpInstr
    , patchRegsOfInstr
    , jumpDestsOfInstr
+   , canFallthroughTo
    , takeRegRegMoveInstr
    , takeDeltaInstr
    , mkRegRegMoveInstr
@@ -33,7 +34,7 @@ module GHC.CmmToAsm.PPC.Instr
    )
 where
 
-import GHC.Prelude
+import GHC.Prelude hiding (head, init, last, tail)
 
 import GHC.CmmToAsm.PPC.Regs
 import GHC.CmmToAsm.PPC.Cond
@@ -52,12 +53,14 @@ import GHC.Cmm.Dataflow.Label
 import GHC.Cmm
 import GHC.Cmm.Info
 import GHC.Cmm.CLabel
-import GHC.Utils.Outputable
 import GHC.Utils.Panic
 import GHC.Platform
 import GHC.Types.Unique.FM (listToUFM, lookupUFM)
 import GHC.Types.Unique.Supply
 
+import Data.Foldable (toList)
+import qualified Data.List.NonEmpty as NE
+import GHC.Data.FastString (FastString)
 import Data.Maybe (fromMaybe)
 
 
@@ -177,7 +180,7 @@ data RI
 
 data Instr
     -- comment pseudo-op
-    = COMMENT SDoc
+    = COMMENT FastString
 
     -- location pseudo-op (file, line, col, name)
     | LOCATION Int Int Int String
@@ -497,6 +500,13 @@ isJumpishInstr instr
     JMP{}       -> True
     _           -> False
 
+canFallthroughTo :: Instr -> BlockId -> Bool
+canFallthroughTo instr bid
+ = case instr of
+        BCC _ target _      -> target == bid
+        BCCFAR _ target _   -> target == bid
+        _                   -> False
+
 
 -- | Checks whether this instruction is a jump/branch instruction.
 -- One that can change the flow of control in a way that the
@@ -675,14 +685,16 @@ takeRegRegMoveInstr _  = Nothing
 -- big, we have to work around this limitation.
 
 makeFarBranches
-        :: LabelMap RawCmmStatics
+        :: Platform
+        -> LabelMap RawCmmStatics
         -> [NatBasicBlock Instr]
-        -> [NatBasicBlock Instr]
-makeFarBranches info_env blocks
-    | last blockAddresses < nearLimit = blocks
-    | otherwise = zipWith handleBlock blockAddresses blocks
+        -> UniqSM [NatBasicBlock Instr]
+makeFarBranches _platform info_env blocks
+    | NE.last blockAddresses < nearLimit = return blocks
+    | otherwise = return $ zipWith handleBlock blockAddressList blocks
     where
-        blockAddresses = scanl (+) 0 $ map blockLen blocks
+        blockAddresses = NE.scanl (+) 0 $ map blockLen blocks
+        blockAddressList = toList blockAddresses
         blockLen (BasicBlock _ instrs) = length instrs
 
         handleBlock addr (BasicBlock id instrs)
@@ -703,4 +715,4 @@ makeFarBranches info_env blocks
         -- to calculate things exactly
         nearLimit = 7000 - mapSize info_env * maxRetInfoTableSizeW
 
-        blockAddressMap = listToUFM $ zip (map blockId blocks) blockAddresses
+        blockAddressMap = listToUFM $ zip (map blockId blocks) blockAddressList

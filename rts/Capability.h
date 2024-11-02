@@ -24,6 +24,7 @@
 #include "Task.h"
 #include "Sparks.h"
 #include "sm/NonMovingMark.h" // for MarkQueue
+#include "IOManager.h" // for CapIOManager
 
 #include "BeginPrivate.h"
 
@@ -168,11 +169,10 @@ struct Capability_ {
 
     // Stats on spark creation/conversion
     SparkCounters spark_stats;
-#if !defined(mingw32_HOST_OS)
-    // IO manager for this cap
-    int io_manager_control_wr_fd;
 #endif
-#endif
+
+    // I/O manager data structures for this capability
+    CapIOManager *iomgr;
 
     // Per-capability STM-related data
     StgTVarWatchQueue *free_tvar_watch_queues;
@@ -270,11 +270,11 @@ INLINE_HEADER void releaseCapability_ (Capability* cap STG_UNUSED,
 // extern uint32_t enabled_capabilities;
 
 // Array of all the capabilities
-extern Capability **capabilities;
+extern Capability *capabilities[MAX_N_CAPABILITIES];
 
 INLINE_HEADER Capability *getCapability(uint32_t i)
 {
-    return RELAXED_LOAD(&capabilities)[i];
+    return RELAXED_LOAD(&capabilities[i]);
 }
 
 //
@@ -379,7 +379,10 @@ void shutdownCapabilities(Task *task, bool wait_foreign);
 
 // cause all capabilities to context switch as soon as possible.
 void contextSwitchAllCapabilities(void);
-INLINE_HEADER void contextSwitchCapability(Capability *cap);
+
+// if immediately is set then the capability will context-switch at the next
+// heap-check.  Otherwise it will context switch at the next failing heap-check.
+INLINE_HEADER void contextSwitchCapability(Capability *cap, bool immediately);
 
 // cause all capabilities to stop running Haskell code and return to
 // the scheduler as soon as possible.
@@ -491,9 +494,11 @@ interruptCapability (Capability *cap)
 }
 
 INLINE_HEADER void
-contextSwitchCapability (Capability *cap)
+contextSwitchCapability (Capability *cap, bool immediately)
 {
-    stopCapability(cap);
+    if(immediately) {
+        stopCapability(cap);
+    }
     RELAXED_STORE_ALWAYS(&cap->context_switch, true);
 }
 
@@ -501,7 +506,8 @@ contextSwitchCapability (Capability *cap)
 
 INLINE_HEADER bool emptyInbox(Capability *cap)
 {
-    // This may race with writes to putMVars and inbox but this harmless for the
+    // See Note [Heap memory barriers], section "Barriers on Messages".
+    // This may race with writes to putMVars but this harmless for the
     // intended uses of this function.
     TSAN_ANNOTATE_BENIGN_RACE(&cap->putMVars, "emptyInbox(cap->putMVars)");
     return (RELAXED_LOAD(&cap->inbox) == (Message*)END_TSO_QUEUE &&

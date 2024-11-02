@@ -15,12 +15,13 @@ import GHC.Prelude
 import GHC.Core
 import GHC.Core.Utils
 import GHC.Core.Make
-import GHC.Core.Opt.Arity ( exprArity, etaExpand )
+-- import GHC.Core.Opt.Arity ( exprArity, etaExpand )
 import GHC.Core.Opt.Monad ( FloatOutSwitches(..) )
 
-import GHC.Driver.Session
+import GHC.Driver.Flags  ( DumpFlag (..) )
 import GHC.Utils.Logger
-import GHC.Types.Id      ( Id, idArity, idType, isDeadEndId,
+import GHC.Types.Id      ( Id, idType,
+--                           idArity, isDeadEndId,
                            isJoinId, isJoinId_maybe )
 import GHC.Types.Tickish
 import GHC.Core.Opt.SetLevels
@@ -218,14 +219,7 @@ floatBind :: LevelledBind -> (FloatStats, FloatBinds, [CoreBind])
   -- See Note [Floating out of Rec rhss] for why things get arranged this way.
 floatBind (NonRec (TB var _) rhs)
   = case (floatRhs var rhs) of { (fs, rhs_floats, rhs') ->
-
-        -- A tiresome hack:
-        -- see Note [Bottoming floats: eta expansion] in GHC.Core.Opt.SetLevels
-    let rhs'' | isDeadEndId var
-              , exprArity rhs' < idArity var = etaExpand (idArity var) rhs'
-              | otherwise                    = rhs'
-
-    in (fs, rhs_floats, [NonRec var rhs'']) }
+      (fs, rhs_floats, [NonRec var rhs']) }
 
 floatBind (Rec pairs)
   = case floatList do_pair pairs of { (fs, rhs_floats, new_pairs) ->
@@ -349,7 +343,7 @@ Note [floatBind for top level]
 We may have a *nested* binding whose destination level is (FloatMe tOP_LEVEL), thus
          letrec { foo <0,0> = .... (let bar<0,0> = .. in ..) .... }
 The binding for bar will be in the "tops" part of the floating binds,
-and thus not partioned by floatBody.
+and thus not partitioned by floatBody.
 
 We could perhaps get rid of the 'tops' component of the floating binds,
 but this case works just as well.

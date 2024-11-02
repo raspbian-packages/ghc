@@ -17,13 +17,14 @@ module GHC.BaseDir where
 import Prelude -- See Note [Why do we import Prelude here?]
 
 import Data.List (stripPrefix)
+import Data.Maybe (listToMaybe)
 import System.FilePath
 
 -- Windows
 #if defined(mingw32_HOST_OS)
 import System.Environment (getExecutablePath)
 -- POSIX
-#elif defined(darwin_HOST_OS) || defined(linux_HOST_OS) || defined(freebsd_HOST_OS) || defined(openbsd_HOST_OS) || defined(netbsd_HOST_OS)
+#elif defined(darwin_HOST_OS) || defined(linux_HOST_OS) || defined(freebsd_HOST_OS) || defined(openbsd_HOST_OS) || defined(netbsd_HOST_OS) || defined(hurd_HOST_OS)
 import System.Environment (getExecutablePath)
 #endif
 
@@ -37,7 +38,7 @@ expandTopDir = expandPathVar "topdir"
 expandPathVar :: String -> FilePath -> String -> String
 expandPathVar var value str
   | Just str' <- stripPrefix ('$':var) str
-  , null str' || isPathSeparator (head str')
+  , maybe True isPathSeparator (listToMaybe str')
   = value ++ expandPathVar var value str'
 expandPathVar var value (x:xs) = x : expandPathVar var value xs
 expandPathVar _ _ [] = []
@@ -52,7 +53,7 @@ getBaseDir = Just . (\p -> p </> "lib") . rootDir <$> getExecutablePath
     -- that is running this function.
     rootDir :: FilePath -> FilePath
     rootDir = takeDirectory . takeDirectory . normalise
-#elif defined(darwin_HOST_OS) || defined(linux_HOST_OS) || defined(freebsd_HOST_OS) || defined(openbsd_HOST_OS) || defined(netbsd_HOST_OS)
+#elif defined(darwin_HOST_OS) || defined(linux_HOST_OS) || defined(freebsd_HOST_OS) || defined(openbsd_HOST_OS) || defined(netbsd_HOST_OS) || defined(hurd_HOST_OS)
 -- on unix, this is a bit more confusing.
 -- The layout right now is something like
 --

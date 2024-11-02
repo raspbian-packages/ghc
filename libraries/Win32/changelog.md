@@ -1,5 +1,32 @@
 # Changelog for [`Win32` package](http://hackage.haskell.org/package/Win32)
 
+## 2.13.3.0 July 2022
+
+* Add AFPP support (see #198)
+
+## 2.13.2.1 July 2022
+
+* Add function `createIcon` (see #194)
+* Add `WindowMessage` value `wM_SETICON` (see #194)
+* Add `WPARAM` values `iCON_SMALL`, `iCON_BIG` (see #194)
+* Add functions `getConsoleScreenBufferInfoEx` and
+  `getCurrentConsoleScreenBufferInfoEx`
+
+## 2.13.2.0 November 2021
+
+* Set maximum string size for getComputerName. (See #190)
+* Update withHandleToHANDLENative to handle duplex and console handles (See #191)
+
+## 2.13.1.0 November 2021
+
+* Fix a bug in which `System.Win32.MinTTY.isMinTTY` would incorrectly return
+  `False` on recent versions of MinTTY. (See #187)
+* Add all flags for CreateToolhelp32Snapshot.  (See #185)
+
+## 2.13.0.0 August 2021
+
+* Fix type of c_SetWindowLongPtr. See #180
+
 ## 2.12.0.1 June 2021
 
 * A small fix for WinIO usage. See #177

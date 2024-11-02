@@ -112,6 +112,7 @@ createThread(Capability *cap, W_ size)
     ASSIGN_Int64((W_*)&(tso->alloc_limit), 0);
 
     tso->trec = NO_TREC;
+    tso->label = NULL;
 
 #if defined(PROFILING)
     tso->prof.cccs = CCS_MAIN;
@@ -358,7 +359,7 @@ void
 migrateThread (Capability *from, StgTSO *tso, Capability *to)
 {
     // Sadly we can't assert this since migrateThread is called from
-    // scheduleDoGC, where we implicly own all capabilities.
+    // scheduleDoGC, where we implicitly own all capabilities.
     //ASSERT_FULL_CAPABILITY_INVARIANTS(from, getTask());
 
     traceEventMigrateThread (from, tso, to->no);
@@ -436,7 +437,7 @@ checkBlockingQueues (Capability *cap, StgTSO *tso)
         p = UNTAG_CLOSURE(bq->bh);
         const StgInfoTable *pinfo = ACQUIRE_LOAD(&p->header.info);
         if (pinfo != &stg_BLACKHOLE_info ||
-            ((StgInd *)p)->indirectee != (StgClosure*)bq)
+            (RELAXED_LOAD(&((StgInd *)p)->indirectee) != (StgClosure*)bq))
         {
             wakeBlockingQueue(cap,bq);
         }
@@ -467,7 +468,7 @@ updateThunk (Capability *cap, StgTSO *tso, StgClosure *thunk, StgClosure *val)
         return;
     }
 
-    v = UNTAG_CLOSURE(((StgInd*)thunk)->indirectee);
+    v = UNTAG_CLOSURE(ACQUIRE_LOAD(&((StgInd*)thunk)->indirectee));
 
     updateWithIndirection(cap, thunk, val);
 
@@ -807,7 +808,7 @@ loop:
     qinfo = ACQUIRE_LOAD(&q->header.info);
     if (qinfo == &stg_IND_info ||
         qinfo == &stg_MSG_NULL_info) {
-        q = (StgMVarTSOQueue*)((StgInd*)q)->indirectee;
+        q = (StgMVarTSOQueue*) ACQUIRE_LOAD(&((StgInd*)q)->indirectee);
         goto loop;
     }
 
@@ -853,6 +854,44 @@ loop:
     unlockClosure((StgClosure*)mvar, info);
 
     return true;
+}
+
+StgMutArrPtrs *listThreads(Capability *cap)
+{
+    ACQUIRE_LOCK(&sched_mutex);
+
+    // First count how many threads we have...
+    StgWord n_threads = 0;
+    for (unsigned g = 0; g < RtsFlags.GcFlags.generations; g++) {
+        for (StgTSO *t = generations[g].threads; t != END_TSO_QUEUE; t = t->global_link) {
+            n_threads++;
+        }
+    }
+
+    // Allocate a suitably-sized array...
+    const StgWord size = n_threads + mutArrPtrsCardTableSize(n_threads);
+    StgMutArrPtrs *arr =
+        (StgMutArrPtrs *)allocate(cap, sizeofW(StgMutArrPtrs) + size);
+    SET_HDR(arr, &stg_MUT_ARR_PTRS_DIRTY_info, CCS_SYSTEM);
+    TICK_ALLOC_PRIM(sizeofW(StgMutArrPtrs), n, 0);
+    arr->ptrs = n_threads;
+    arr->size = size;
+
+    // Populate it...
+    StgWord i = 0;
+    for (unsigned g = 0; g < RtsFlags.GcFlags.generations; g++) {
+        for (StgTSO *t = generations[g].threads; t != END_TSO_QUEUE; t = t->global_link) {
+            // It's possible that new threads have been created since we counted.
+            // Ignore them.
+            if (i == n_threads)
+                break;
+            arr->payload[i] = (StgClosure *) t;
+            i++;
+        }
+    }
+    CHECKM(i == n_threads, "listThreads: Found too few threads");
+    RELEASE_LOCK(&sched_mutex);
+    return arr;
 }
 
 /* ----------------------------------------------------------------------------
@@ -920,25 +959,24 @@ printThreadBlockage(StgTSO *tso)
 void
 printThreadStatus(StgTSO *t)
 {
-  debugBelch("\tthread %4lu @ %p ", (unsigned long)t->id, (void *)t);
-    {
-      void *label = lookupThreadLabel(t->id);
-      if (label) debugBelch("[\"%s\"] ",(char *)label);
+    debugBelch("\tthread %4lu @ %p ", (unsigned long)t->id, (void *)t);
+    if (t->label) {
+        debugBelch("[\"%.*s\"] ", (int)t->label->bytes, (char *)t->label->payload);
     }
-        switch (t->what_next) {
-        case ThreadKilled:
-            debugBelch("has been killed");
-            break;
-        case ThreadComplete:
-            debugBelch("has completed");
-            break;
-        default:
-            printThreadBlockage(t);
-        }
-        if (t->dirty) {
-            debugBelch(" (TSO_DIRTY)");
-        }
-        debugBelch("\n");
+    switch (t->what_next) {
+    case ThreadKilled:
+        debugBelch("has been killed");
+        break;
+    case ThreadComplete:
+        debugBelch("has completed");
+        break;
+    default:
+        printThreadBlockage(t);
+    }
+    if (t->dirty) {
+        debugBelch(" (TSO_DIRTY)");
+    }
+    debugBelch("\n");
 }
 
 void

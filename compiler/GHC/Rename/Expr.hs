@@ -6,6 +6,7 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeApplications    #-}
 {-# LANGUAGE TypeFamilies        #-}
+{-# LANGUAGE ViewPatterns        #-}
 
 {-# OPTIONS_GHC -Wno-incomplete-record-updates #-}
 {-# OPTIONS_GHC -Wno-incomplete-uni-patterns   #-}
@@ -23,11 +24,12 @@ free variables.
 -}
 
 module GHC.Rename.Expr (
-        rnLExpr, rnExpr, rnStmts,
-        AnnoBody
+        rnLExpr, rnExpr, rnStmts, mkExpandedExpr,
+        AnnoBody, UnexpectedStatement(..)
    ) where
 
 import GHC.Prelude
+import GHC.Data.FastString
 
 import GHC.Rename.Bind ( rnLocalBindsAndThen, rnLocalValBindsLHS, rnLocalValBindsRHS
                         , rnMatchGroup, rnGRHS, makeMiniFixityEnv)
@@ -47,7 +49,7 @@ import GHC.Rename.Utils ( bindLocalNamesFV, checkDupNames
                         , genHsVar, genLHsVar, genHsApp, genHsApps
                         , genAppType )
 import GHC.Rename.Unbound ( reportUnboundName )
-import GHC.Rename.Splice  ( rnTypedBracket, rnUntypedBracket, rnSpliceExpr, checkThLocalName )
+import GHC.Rename.Splice  ( rnTypedBracket, rnUntypedBracket, rnTypedSplice, rnUntypedSpliceExpr, checkThLocalName )
 import GHC.Rename.HsType
 import GHC.Rename.Pat
 import GHC.Driver.Session
@@ -55,7 +57,6 @@ import GHC.Builtin.Names
 
 import GHC.Types.FieldLabel
 import GHC.Types.Fixity
-import GHC.Types.Hint (suggestExtension)
 import GHC.Types.Id.Make
 import GHC.Types.Name
 import GHC.Types.Name.Set
@@ -73,8 +74,10 @@ import Control.Monad
 import GHC.Builtin.Types ( nilDataConName )
 import qualified GHC.LanguageExtensions as LangExt
 
+import Language.Haskell.Syntax.Basic (FieldLabelString(..))
+
 import Data.List (unzip4, minimumBy)
-import Data.List.NonEmpty ( NonEmpty(..) )
+import Data.List.NonEmpty ( NonEmpty(..), nonEmpty )
 import Data.Maybe (isJust, isNothing)
 import Control.Arrow (first)
 import Data.Ord
@@ -122,7 +125,7 @@ but several have a little bit of special treatment:
 * HsIf (if-the-else)
      if b then e1 else e2  ==>  ifThenElse b e1 e2
   We do this /only/ if rebindable syntax is on, because the coverage
-  checker looks for HsIf (see GHC.HsToCore.Coverage.addTickHsExpr)
+  checker looks for HsIf (see GHC.HsToCore.Ticks.addTickHsExpr)
   That means the typechecker and desugarer need to understand HsIf
   for the non-rebindable-syntax case.
 
@@ -150,6 +153,41 @@ but several have a little bit of special treatment:
   The typechecker turns `OpApp` into a use of `HsExpansion`
   on the fly, in GHC.Tc.Gen.Head.splitHsApps.  RebindableSyntax
   does not affect this.
+
+* RecordUpd: we desugar record updates into case expressions,
+  in GHC.Tc.Gen.Expr.tcExpr.
+
+  Example:
+
+    data T p q = T1 { x :: Int, y :: Bool, z :: Char }
+               | T2 { v :: Char }
+               | T3 { x :: Int }
+               | T4 { p :: Float, y :: Bool, x :: Int }
+               | T5
+
+    e { x=e1, y=e2 }
+      ===>
+    let { x' = e1; y' = e2 } in
+    case e of
+       T1 _ _ z -> T1 x' y' z
+       T4 p _ _ -> T4 p y' x'
+
+  See Note [Record Updates] in GHC.Tc.Gen.Expr for more details.
+
+  This is done in the typechecker, not the renamer, for two reasons:
+
+    - (Until we implement GHC proposal #366)
+      We need to know the type of the record to disambiguate its fields.
+
+    - We use the type signature of the data constructor to provide IdSigs
+      to the let-bound variables (x', y' in the example above). This is
+      needed to accept programs such as
+
+        data R b = MkR { f :: (forall a. a -> a) -> (Int,b), c :: Int }
+        foo r = r { f = \ k -> (k 3, k 'x') }
+
+      in which an updated field has a higher-rank type.
+      See Wrinkle [Using IdSig] in Note [Record Updates] in GHC.Tc.Gen.Expr.
 
 Note [Overloaded labels]
 ~~~~~~~~~~~~~~~~~~~~~~~~
@@ -210,8 +248,9 @@ finishHsVar (L l name)
 rnUnboundVar :: RdrName -> RnM (HsExpr GhcRn, FreeVars)
 rnUnboundVar v = do
   deferOutofScopeVariables <- goptM Opt_DeferOutOfScopeVariables
+  -- See Note [Reporting unbound names] for difference between qualified and unqualified names.
   unless (isUnqual v || deferOutofScopeVariables) (reportUnboundName v >> return ())
-  return (HsUnboundVar noExtField (rdrNameOcc v), emptyFVs)
+  return (HsUnboundVar noExtField v, emptyFVs)
 
 rnExpr (HsVar _ (L l v))
   = do { dflags <- getDynFlags
@@ -245,10 +284,10 @@ rnExpr (HsUnboundVar _ v)
   = return (HsUnboundVar noExtField v, emptyFVs)
 
 -- HsOverLabel: see Note [Handling overloaded and rebindable constructs]
-rnExpr (HsOverLabel _ v)
+rnExpr (HsOverLabel _ src v)
   = do { (from_label, fvs) <- lookupSyntaxName fromLabelClassOpName
-       ; return ( mkExpandedExpr (HsOverLabel noAnn v) $
-                  HsAppType noExtField (genLHsVar from_label) hs_ty_arg
+       ; return ( mkExpandedExpr (HsOverLabel noAnn src v) $
+                  HsAppType noExtField (genLHsVar from_label) noHsTok hs_ty_arg
                 , fvs ) }
   where
     hs_ty_arg = mkEmptyWildCardBndrs $ wrapGenSpan $
@@ -279,12 +318,12 @@ rnExpr (HsApp x fun arg)
        ; (arg',fvArg) <- rnLExpr arg
        ; return (HsApp x fun' arg', fvFun `plusFV` fvArg) }
 
-rnExpr (HsAppType _ fun arg)
+rnExpr (HsAppType _ fun at arg)
   = do { type_app <- xoptM LangExt.TypeApplications
        ; unless type_app $ addErr $ typeAppErr "type" $ hswc_body arg
        ; (fun',fvFun) <- rnLExpr fun
        ; (arg',fvArg) <- rnHsWcType HsTypeCtx arg
-       ; return (HsAppType NoExtField fun' arg', fvFun `plusFV` fvArg) }
+       ; return (HsAppType NoExtField fun' at arg', fvFun `plusFV` fvArg) }
 
 rnExpr (OpApp _ e1 op e2)
   = do  { (e1', fv_e1) <- rnLExpr e1
@@ -340,7 +379,8 @@ rnExpr (HsProjection _ fs)
 rnExpr e@(HsTypedBracket _ br_body)   = rnTypedBracket e br_body
 rnExpr e@(HsUntypedBracket _ br_body) = rnUntypedBracket e br_body
 
-rnExpr (HsSpliceE _ splice) = rnSpliceExpr splice
+rnExpr (HsTypedSplice   _ splice) = rnTypedSplice splice
+rnExpr (HsUntypedSplice _ splice) = rnUntypedSpliceExpr splice
 
 ---------------------------------------------
 --      Sections
@@ -368,7 +408,7 @@ rnExpr (HsPragE x prag expr)
        ; return (HsPragE x (rn_prag prag) expr', fvs_expr) }
   where
     rn_prag :: HsPragE GhcPs -> HsPragE GhcRn
-    rn_prag (HsPragSCC x1 src ann) = HsPragSCC x1 src ann
+    rn_prag (HsPragSCC x ann) = HsPragSCC x ann
 
 rnExpr (HsLam x matches)
   = do { (matches', fvMatch) <- rnMatchGroup LambdaExpr rnLExpr matches
@@ -446,13 +486,11 @@ rnExpr (RecordUpd { rupd_expr = expr, rupd_flds = rbinds })
             }
       Right flds ->  -- 'OverloadedRecordUpdate' is in effect. Record dot update desugaring.
         do { ; unlessXOptM LangExt.RebindableSyntax $
-                 addErr $ TcRnUnknownMessage $ mkPlainError noHints $
-                   text "RebindableSyntax is required if OverloadedRecordUpdate is enabled."
+                 addErr TcRnNoRebindableSyntaxRecordDot
              ; let punnedFields = [fld | (L _ fld) <- flds, hfbPun fld]
              ; punsEnabled <-xoptM LangExt.NamedFieldPuns
              ; unless (null punnedFields || punsEnabled) $
-                 addErr $ TcRnUnknownMessage $ mkPlainError noHints $
-                   text "For this to work enable NamedFieldPuns."
+                 addErr TcRnNoFieldPunsRecordDot
              ; (getField, fv_getField) <- lookupSyntaxName getFieldName
              ; (setField, fv_setField) <- lookupSyntaxName setFieldName
              ; (e, fv_e) <- rnLExpr expr
@@ -527,16 +565,11 @@ rnExpr e@(HsStatic _ expr) = do
     -- absolutely prepared to cope with static forms, we check for
     -- -XStaticPointers here as well.
     unlessXOptM LangExt.StaticPointers $
-      addErr $ TcRnUnknownMessage $ mkPlainError noHints $
-        hang (text "Illegal static expression:" <+> ppr e)
-                  2 (text "Use StaticPointers to enable this extension")
+      addErr $ TcRnIllegalStaticExpression e
     (expr',fvExpr) <- rnLExpr expr
     stage <- getStage
     case stage of
-      Splice _ -> addErr $ TcRnUnknownMessage $ mkPlainError noHints $ sep
-             [ text "static forms cannot be used in splices:"
-             , nest 2 $ ppr e
-             ]
+      Splice _ -> addErr $ TcRnIllegalStaticFormInSplice e
       _ -> return ()
     mod <- getModule
     let fvExpr' = filterNameSet (nameIsLocalOrFrom mod) fvExpr
@@ -659,6 +692,16 @@ Note the wrinkles:
       (e `op`)  ==>   op e
   with no auxiliary function at all.  Simple!
 
+* leftSection and rightSection switch on ImpredicativeTypes locally,
+  during Quick Look; see GHC.Tc.Gen.App.wantQuickLook. Consider
+  test DeepSubsumption08:
+     type Setter st t a b = forall f. Identical f => blah
+     (.~) :: Setter s t a b -> b -> s -> t
+     clear :: Setter a a' b (Maybe b') -> a -> a'
+     clear = (.~ Nothing)
+   The expansion look like (rightSection (.~) Nothing).  So we must
+   instantiate `rightSection` first type argument to a polytype!
+   Hence the special magic in App.wantQuickLook.
 
 Historical Note [Desugaring operator sections]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -709,6 +752,28 @@ bindNonRec will automatically do the right thing, giving us:
     case expr of y -> (\x -> op y x)
 
 See #18151.
+
+Note [Reporting unbound names]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Faced with an out-of-scope `RdrName` there are two courses of action
+A. Report an error immediately (and return a HsUnboundVar). This will halt GHC after the renamer is complete
+B. Return a HsUnboundVar without reporting an error.  That will allow the typechecker to run, which in turn
+   can give a better error message, notably giving the type of the variable via the "typed holes" mechanism.
+
+When `-fdefer-out-of-scope-variables` is on we follow plan B.
+
+When it is not, we follow plan B for unqualified names, and plan A for qualified names.
+
+If a name is qualified, and out of scope, then by default an error will be raised
+because the user was already more precise. They specified a specific qualification
+and either
+  * The qualification didn't exist, so that precision was wrong.
+  * Or the qualification existed and the thing we were looking for wasn't where
+    the qualification said it would be.
+
+However we can still defer this error completely, and we do defer it if
+`-fdefer-out-of-scope-variables` is enabled.
+
 -}
 
 {-
@@ -972,9 +1037,6 @@ See Note [Deterministic UniqFM] to learn more about nondeterminism.
 
 type AnnoBody body
   = ( Outputable (body GhcPs)
-    , Anno (StmtLR GhcPs GhcPs (LocatedA (body GhcPs))) ~ SrcSpanAnnA
-    , Anno (StmtLR GhcRn GhcPs (LocatedA (body GhcPs))) ~ SrcSpanAnnA
-    , Anno (StmtLR GhcRn GhcRn (LocatedA (body GhcRn))) ~ SrcSpanAnnA
     )
 
 -- | Rename some Stmts
@@ -1039,15 +1101,13 @@ rnStmtsWithFreeVars ctxt _ [] thing_inside
        ; (thing, fvs) <- thing_inside []
        ; return (([], thing), fvs) }
 
-rnStmtsWithFreeVars mDoExpr@(HsDoStmt MDoExpr{}) rnBody stmts thing_inside    -- Deal with mdo
+rnStmtsWithFreeVars mDoExpr@(HsDoStmt MDoExpr{}) rnBody (nonEmpty -> Just stmts) thing_inside    -- Deal with mdo
   = -- Behave like do { rec { ...all but last... }; last }
     do { ((stmts1, (stmts2, thing)), fvs)
-           <- rnStmt mDoExpr rnBody (noLocA $ mkRecStmt noAnn (noLocA all_but_last)) $ \ _ ->
-              do { last_stmt' <- checkLastStmt mDoExpr last_stmt
+           <- rnStmt mDoExpr rnBody (noLocA $ mkRecStmt noAnn (noLocA (NE.init stmts))) $ \ _ ->
+              do { last_stmt' <- checkLastStmt mDoExpr (NE.last stmts)
                  ; rnStmt mDoExpr rnBody last_stmt' thing_inside }
         ; return (((stmts1 ++ stmts2), thing), fvs) }
-  where
-    Just (all_but_last, last_stmt) = snocView stmts
 
 rnStmtsWithFreeVars ctxt rnBody (lstmt@(L loc _) : lstmts) thing_inside
   | null lstmts
@@ -1059,7 +1119,7 @@ rnStmtsWithFreeVars ctxt rnBody (lstmt@(L loc _) : lstmts) thing_inside
   = do { ((stmts1, (stmts2, thing)), fvs)
             <- setSrcSpanA loc                  $
                do { checkStmt ctxt lstmt
-                  ; rnStmt ctxt rnBody lstmt    $ \ bndrs1 ->
+                  ; rnStmt ctxt rnBody lstmt $ \ bndrs1 ->
                     rnStmtsWithFreeVars ctxt rnBody lstmts  $ \ bndrs2 ->
                     thing_inside (bndrs1 ++ bndrs2) }
         ; return (((stmts1 ++ stmts2), thing), fvs) }
@@ -1154,9 +1214,10 @@ rnStmt ctxt rnBody (L loc (RecStmt { recS_stmts = L _ rec_stmts })) thing_inside
   = do  { (return_op, fvs1)  <- lookupQualifiedDoStmtName ctxt returnMName
         ; (mfix_op,   fvs2)  <- lookupQualifiedDoStmtName ctxt mfixName
         ; (bind_op,   fvs3)  <- lookupQualifiedDoStmtName ctxt bindMName
-        ; let empty_rec_stmt = emptyRecStmtName { recS_ret_fn  = return_op
-                                                , recS_mfix_fn = mfix_op
-                                                , recS_bind_fn = bind_op }
+        ; let empty_rec_stmt = (emptyRecStmtName :: StmtLR GhcRn GhcRn (LocatedA (body GhcRn)))
+                                { recS_ret_fn  = return_op
+                                , recS_mfix_fn = mfix_op
+                                , recS_bind_fn = bind_op }
 
         -- Step1: Bring all the binders of the mdo into scope
         -- (Remember that this also removes the binders from the
@@ -1262,9 +1323,7 @@ rnParallelStmts ctxt return_op segs thing_inside
            ; return ((seg':segs', thing), fvs) }
 
     cmpByOcc n1 n2 = nameOccName n1 `compare` nameOccName n2
-    dupErr vs = addErr $ TcRnUnknownMessage $ mkPlainError noHints $
-                  (text "Duplicate binding in parallel list comprehension for:"
-                    <+> quotes (ppr (NE.head vs)))
+    dupErr vs = addErr $ TcRnListComprehensionDuplicateBinding (NE.head vs)
 
 lookupQualifiedDoStmtName :: HsStmtContext GhcRn -> Name -> RnM (SyntaxExpr GhcRn, FreeVars)
 -- Like lookupStmtName, but respects QualifiedDo
@@ -1332,7 +1391,7 @@ Note that
   (c) The 'bs' in the second group must obviously not be captured by
       the binding in the first group
 
-To satisfy (a) we nest the segements.
+To satisfy (a) we nest the segments.
 To satisfy (b) we check for duplicates just before thing_inside.
 To satisfy (c) we reset the LocalRdrEnv each time.
 
@@ -1353,8 +1412,8 @@ type Segment stmts = (Defs,
 
 
 -- wrapper that does both the left- and right-hand sides
-rnRecStmtsAndThen :: AnnoBody body =>
-                     HsStmtContext GhcRn
+rnRecStmtsAndThen :: AnnoBody body
+                  => HsStmtContext GhcRn
                   -> (body GhcPs -> RnM (body GhcRn, FreeVars))
                   -> [LStmt GhcPs (LocatedA (body GhcPs))]
                          -- assumes that the FreeVars returned includes
@@ -1417,7 +1476,8 @@ rn_rec_stmt_lhs fix_env (L loc (BindStmt _ pat body))
       return [(L loc (BindStmt noAnn pat' body), fv_pat)]
 
 rn_rec_stmt_lhs _ (L _ (LetStmt _ binds@(HsIPBinds {})))
-  = failWith (badIpBinds (text "an mdo expression") binds)
+  = failWith (badIpBinds (Left binds))
+
 
 rn_rec_stmt_lhs fix_env (L loc (LetStmt _ (HsValBinds x binds)))
     = do (_bound_names, binds') <- rnLocalValBindsLHS fix_env binds
@@ -1491,7 +1551,7 @@ rn_rec_stmt ctxt rnBody _ (L loc (BindStmt _ pat' (L lb body)), fv_pat)
                   L loc (BindStmt xbsrn pat' (L lb body')))] }
 
 rn_rec_stmt _ _ _ (L _ (LetStmt _ binds@(HsIPBinds {})), _)
-  = failWith (badIpBinds (text "an mdo expression") binds)
+  = failWith (badIpBinds (Right binds))
 
 rn_rec_stmt _ _ all_bndrs (L loc (LetStmt _ (HsValBinds x binds')), _)
   = do { (binds', du_binds) <- rnLocalValBindsRHS (mkNameSet all_bndrs) binds'
@@ -1516,8 +1576,8 @@ rn_rec_stmt _ _ _ (L _ (LetStmt _ (EmptyLocalBinds _)), _)
 rn_rec_stmt _ _ _ stmt@(L _ (ApplicativeStmt {}), _)
   = pprPanic "rn_rec_stmt: ApplicativeStmt" (ppr stmt)
 
-rn_rec_stmts :: AnnoBody body =>
-                HsStmtContext GhcRn
+rn_rec_stmts :: AnnoBody body
+             => HsStmtContext GhcRn
              -> (body GhcPs -> RnM (body GhcRn, FreeVars))
              -> [Name]
              -> [(LStmtLR GhcRn GhcPs (LocatedA (body GhcPs)), FreeVars)]
@@ -1527,8 +1587,7 @@ rn_rec_stmts ctxt rnBody bndrs stmts
        ; return (concat segs_s) }
 
 ---------------------------------------------
-segmentRecStmts :: AnnoBody body
-                => SrcSpan -> HsStmtContext GhcRn
+segmentRecStmts :: SrcSpan -> HsStmtContext GhcRn
                 -> Stmt GhcRn (LocatedA (body GhcRn))
                 -> [Segment (LStmt GhcRn (LocatedA (body GhcRn)))]
                 -> (FreeVars, Bool)
@@ -1759,7 +1818,7 @@ transformation loses the ability to do A and C in parallel.
 
 The algorithm works by first splitting the sequence of statements into
 independent "segments", and a separate "tail" (the final statement). In
-our example above, the segements would be
+our example above, the segments would be
 
      [ x <- A
      , y <- B x ]
@@ -2114,7 +2173,9 @@ stmtTreeToStmts monad_names ctxt (StmtTreeApplicative trees) tail tail_fvs = do
         if | L _ ApplicativeStmt{} <- last stmts' ->
              return (unLoc tup, emptyNameSet)
            | otherwise -> do
-             (ret, _) <- lookupQualifiedDoExpr (HsDoStmt ctxt) returnMName
+             -- Need 'pureAName' and not 'returnMName' here, so that it requires
+             -- 'Applicative' and not 'Monad' whenever possible (until #20540 is fixed).
+             (ret, _) <- lookupQualifiedDoExpr (HsDoStmt ctxt) pureAName
              let expr = HsApp noComments (noLocA ret) tup
              return (expr, emptyFVs)
      return ( ApplicativeArgMany
@@ -2132,19 +2193,19 @@ stmtTreeToStmts monad_names ctxt (StmtTreeApplicative trees) tail tail_fvs = do
 segments
   :: [(ExprLStmt GhcRn, FreeVars)]
   -> [[(ExprLStmt GhcRn, FreeVars)]]
-segments stmts = map fst $ merge $ reverse $ map reverse $ walk (reverse stmts)
+segments stmts = merge $ reverse $ map reverse $ walk (reverse stmts)
   where
     allvars = mkNameSet (concatMap (collectStmtBinders CollNoDictBinders . unLoc . fst) stmts)
 
     -- We would rather not have a segment that just has LetStmts in
-    -- it, so combine those with an adjacent segment where possible.
+    -- it, so combine those with the next segment where possible.
+    -- We don't merge it with the previous segment because the merged segment
+    -- would require 'Monad' while it may otherwise only require 'Applicative'.
     merge [] = []
     merge (seg : segs)
        = case rest of
-          [] -> [(seg,all_lets)]
-          ((s,s_lets):ss) | all_lets || s_lets
-               -> (seg ++ s, all_lets && s_lets) : ss
-          _otherwise -> (seg,all_lets) : rest
+          s:ss | all_lets -> (seg ++ s) : ss
+          _otherwise -> seg : rest
       where
         rest = merge segs
         all_lets = all (isLetStmt . fst) seg
@@ -2182,7 +2243,7 @@ segments stmts = map fst $ merge $ reverse $ map reverse $ walk (reverse stmts)
 
 {-
 Note [ApplicativeDo and strict patterns]
-
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 A strict pattern match is really a dependency.  For example,
 
 do
@@ -2211,7 +2272,7 @@ isStrictPattern (L loc pat) =
     WildPat{}       -> False
     VarPat{}        -> False
     LazyPat{}       -> False
-    AsPat _ _ p     -> isStrictPattern p
+    AsPat _ _ _ p   -> isStrictPattern p
     ParPat _ _ p _  -> isStrictPattern p
     ViewPat _ _ p   -> isStrictPattern p
     SigPat _ p _    -> isStrictPattern p
@@ -2237,7 +2298,7 @@ isStrictPattern (L loc pat) =
 
 {-
 Note [ApplicativeDo and refutable patterns]
-
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Refutable patterns in do blocks are desugared to use the monadic 'fail' operation.
 This means that sometimes an applicative block needs to be wrapped in 'join' simply because
 of a refutable pattern, in order for the types to work out.
@@ -2384,7 +2445,7 @@ isReturnApp monad_names (L loc e) mb_pure = case e of
   _otherwise -> Nothing
  where
   is_var f (L _ (HsPar _ _ e _)) = is_var f e
-  is_var f (L _ (HsAppType _ e _)) = is_var f e
+  is_var f (L _ (HsAppType _ e _ _)) = is_var f e
   is_var f (L _ (HsVar _ (L _ r))) = f r
        -- TODO: I don't know how to get this right for rebindable syntax
   is_var _ _ = False
@@ -2405,24 +2466,18 @@ isReturnApp monad_names (L loc e) mb_pure = case e of
 checkEmptyStmts :: HsStmtContext GhcRn -> RnM ()
 -- We've seen an empty sequence of Stmts... is that ok?
 checkEmptyStmts ctxt
-  = unless (okEmpty ctxt) (addErr (emptyErr ctxt))
-
-okEmpty :: HsStmtContext a -> Bool
-okEmpty (PatGuard {}) = True
-okEmpty _             = False
-
-emptyErr :: HsStmtContext GhcRn -> TcRnMessage
-emptyErr (ParStmtCtxt {})   = TcRnUnknownMessage $ mkPlainError noHints $
-  text "Empty statement group in parallel comprehension"
-emptyErr (TransStmtCtxt {}) = TcRnUnknownMessage $ mkPlainError noHints $
-  text "Empty statement group preceding 'group' or 'then'"
-emptyErr ctxt@(HsDoStmt _)  = TcRnUnknownMessage $ mkPlainError [suggestExtension LangExt.NondecreasingIndentation] $
-  text "Empty" <+> pprStmtContext ctxt
-emptyErr ctxt               = TcRnUnknownMessage $ mkPlainError noHints $
-  text "Empty" <+> pprStmtContext ctxt
+  = mapM_ (addErr . TcRnEmptyStmtsGroup) mb_err
+  where
+    mb_err = case ctxt of
+      PatGuard {}      -> Nothing -- Pattern guards can be empty
+      ParStmtCtxt {}   -> Just EmptyStmtsGroupInParallelComp
+      TransStmtCtxt {} -> Just EmptyStmtsGroupInTransformListComp
+      HsDoStmt flav    -> Just $ EmptyStmtsGroupInDoNotation flav
+      ArrowExpr        -> Just EmptyStmtsGroupInArrowNotation
 
 ----------------------
-checkLastStmt :: AnnoBody body => HsStmtContext GhcRn
+checkLastStmt :: AnnoBody body
+              => HsStmtContext GhcRn
               -> LStmt GhcPs (LocatedA (body GhcPs))
               -> RnM (LStmt GhcPs (LocatedA (body GhcPs)))
 checkLastStmt ctxt lstmt@(L loc stmt)
@@ -2439,11 +2494,10 @@ checkLastStmt ctxt lstmt@(L loc stmt)
           BodyStmt _ e _ _ -> return (L loc (mkLastStmt e))
           LastStmt {}      -> return lstmt   -- "Deriving" clauses may generate a
                                              -- LastStmt directly (unlike the parser)
-          _                -> do { addErr $ TcRnUnknownMessage $ mkPlainError noHints $
-                                     (hang last_error 2 (ppr stmt))
+          _                -> do { addErr $ TcRnLastStmtNotExpr ctxt
+                                          $ UnexpectedStatement stmt
                                  ; return lstmt }
-    last_error = (text "The last statement in" <+> pprAStmtContext ctxt
-                  <+> text "must be an expression")
+
 
     check_comp  -- Expect LastStmt; this should be enforced by the parser!
       = case stmt of
@@ -2454,35 +2508,25 @@ checkLastStmt ctxt lstmt@(L loc stmt)
       = do { checkStmt ctxt lstmt; return lstmt }
 
 -- Checking when a particular Stmt is ok
-checkStmt :: HsStmtContext GhcRn
+checkStmt :: AnnoBody body
+          => HsStmtContext GhcRn
           -> LStmt GhcPs (LocatedA (body GhcPs))
           -> RnM ()
 checkStmt ctxt (L _ stmt)
   = do { dflags <- getDynFlags
        ; case okStmt dflags ctxt stmt of
-           IsValid        -> return ()
-           NotValid extra -> addErr $ TcRnUnknownMessage $ mkPlainError noHints (msg $$ extra) }
-  where
-   msg = sep [ text "Unexpected" <+> pprStmtCat stmt <+> text "statement"
-             , text "in" <+> pprAStmtContext ctxt ]
-
-pprStmtCat :: Stmt (GhcPass a) body -> SDoc
-pprStmtCat (TransStmt {})     = text "transform"
-pprStmtCat (LastStmt {})      = text "return expression"
-pprStmtCat (BodyStmt {})      = text "body"
-pprStmtCat (BindStmt {})      = text "binding"
-pprStmtCat (LetStmt {})       = text "let"
-pprStmtCat (RecStmt {})       = text "rec"
-pprStmtCat (ParStmt {})       = text "parallel"
-pprStmtCat (ApplicativeStmt {}) = panic "pprStmtCat: ApplicativeStmt"
+           IsValid      -> return ()
+           NotValid ext -> addErr $
+              TcRnUnexpectedStatementInContext
+                ctxt (UnexpectedStatement stmt) ext }
 
 ------------
-emptyInvalid :: Validity  -- Payload is the empty document
-emptyInvalid = NotValid Outputable.empty
+emptyInvalid :: Validity' (Maybe LangExt.Extension)
+emptyInvalid = NotValid Nothing -- Invalid, and no extension to suggest
 
 okStmt, okDoStmt, okCompStmt, okParStmt
    :: DynFlags -> HsStmtContext GhcRn
-   -> Stmt GhcPs (LocatedA (body GhcPs)) -> Validity
+   -> Stmt GhcPs (LocatedA (body GhcPs)) -> Validity' (Maybe LangExt.Extension)
 -- Return Nothing if OK, (Just extra) if not ok
 -- The "extra" is an SDoc that is appended to a generic error message
 
@@ -2496,7 +2540,7 @@ okStmt dflags ctxt stmt
 
 okDoFlavourStmt
   :: DynFlags -> HsDoFlavour -> HsStmtContext GhcRn
-  -> Stmt GhcPs (LocatedA (body GhcPs)) -> Validity
+  -> Stmt GhcPs (LocatedA (body GhcPs)) -> Validity' (Maybe LangExt.Extension)
 okDoFlavourStmt dflags flavour ctxt stmt = case flavour of
       DoExpr{}     -> okDoStmt   dflags ctxt stmt
       MDoExpr{}    -> okDoStmt   dflags ctxt stmt
@@ -2505,7 +2549,7 @@ okDoFlavourStmt dflags flavour ctxt stmt = case flavour of
       MonadComp    -> okCompStmt dflags ctxt stmt
 
 -------------
-okPatGuardStmt :: Stmt GhcPs (LocatedA (body GhcPs)) -> Validity
+okPatGuardStmt :: Stmt GhcPs (LocatedA (body GhcPs)) -> Validity' (Maybe LangExt.Extension)
 okPatGuardStmt stmt
   = case stmt of
       BodyStmt {} -> IsValid
@@ -2525,7 +2569,7 @@ okDoStmt dflags ctxt stmt
        RecStmt {}
          | LangExt.RecursiveDo `xopt` dflags -> IsValid
          | ArrowExpr <- ctxt -> IsValid    -- Arrows allows 'rec'
-         | otherwise         -> NotValid (text "Use RecursiveDo")
+         | otherwise         -> NotValid (Just LangExt.RecursiveDo)
        BindStmt {} -> IsValid
        LetStmt {}  -> IsValid
        BodyStmt {} -> IsValid
@@ -2539,10 +2583,10 @@ okCompStmt dflags _ stmt
        BodyStmt {} -> IsValid
        ParStmt {}
          | LangExt.ParallelListComp `xopt` dflags -> IsValid
-         | otherwise -> NotValid (text "Use ParallelListComp")
+         | otherwise -> NotValid (Just LangExt.ParallelListComp)
        TransStmt {}
          | LangExt.TransformListComp `xopt` dflags -> IsValid
-         | otherwise -> NotValid (text "Use TransformListComp")
+         | otherwise -> NotValid (Just LangExt.TransformListComp)
        RecStmt {}  -> emptyInvalid
        LastStmt {} -> emptyInvalid  -- Should not happen (dealt with by checkLastStmt)
        ApplicativeStmt {} -> emptyInvalid
@@ -2554,21 +2598,14 @@ checkTupleSection args
         ; checkErr (all tupArgPresent args || tuple_section) msg }
   where
     msg :: TcRnMessage
-    msg = TcRnUnknownMessage $ mkPlainError noHints $
-      text "Illegal tuple section: use TupleSections"
+    msg = TcRnIllegalTupleSection
 
 ---------
 sectionErr :: HsExpr GhcPs -> TcRnMessage
-sectionErr expr
-  = TcRnUnknownMessage $ mkPlainError noHints $
-    hang (text "A section must be enclosed in parentheses")
-       2 (text "thus:" <+> (parens (ppr expr)))
+sectionErr = TcRnSectionWithoutParentheses
 
-badIpBinds :: Outputable a => SDoc -> a -> TcRnMessage
-badIpBinds what binds
-  = TcRnUnknownMessage $ mkPlainError noHints $
-    hang (text "Implicit-parameter bindings illegal in" <+> what)
-         2 (ppr binds)
+badIpBinds :: Either (HsLocalBindsLR GhcPs GhcPs) (HsLocalBindsLR GhcRn GhcPs) -> TcRnMessage
+badIpBinds = TcRnIllegalImplicitParameterBindings
 
 ---------
 
@@ -2638,7 +2675,7 @@ getMonadFailOp ctxt
       | (isQualifiedDo || rebindableSyntax) && overloadedStrings = do
         (failExpr, failFvs) <- lookupQualifiedDoExpr ctxt failMName
         (fromStringExpr, fromStringFvs) <- lookupSyntaxExpr fromStringName
-        let arg_lit = mkVarOcc "arg"
+        let arg_lit = mkVarOccFS (fsLit "arg")
         arg_name <- newSysName arg_lit
         let arg_syn_expr = nlHsVar arg_name
             body :: LHsExpr GhcRn =
@@ -2673,7 +2710,7 @@ mkExpandedExpr a b = XExpr (HsExpanded a b)
 --
 -- See Note [Overview of record dot syntax] in GHC.Hs.Expr.
 
--- mkGetField arg field calcuates a get_field @field arg expression.
+-- mkGetField arg field calculates a get_field @field arg expression.
 -- e.g. z.x = mkGetField z x = get_field @x z
 mkGetField :: Name -> LHsExpr GhcRn -> LocatedAn NoEpAnns FieldLabelString -> HsExpr GhcRn
 mkGetField get_field arg field = unLoc (head $ mkGet get_field [arg] field)
@@ -2681,11 +2718,11 @@ mkGetField get_field arg field = unLoc (head $ mkGet get_field [arg] field)
 -- mkSetField a field b calculates a set_field @field expression.
 -- e.g mkSetSetField a field b = set_field @"field" a b (read as "set field 'field' on a to b").
 mkSetField :: Name -> LHsExpr GhcRn -> LocatedAn NoEpAnns FieldLabelString -> LHsExpr GhcRn -> HsExpr GhcRn
-mkSetField set_field a (L _ field) b =
+mkSetField set_field a (L _ (FieldLabelString field)) b =
   genHsApp (genHsApp (genHsVar set_field `genAppType` genHsTyLit field)  a) b
 
 mkGet :: Name -> [LHsExpr GhcRn] -> LocatedAn NoEpAnns FieldLabelString -> [LHsExpr GhcRn]
-mkGet get_field l@(r : _) (L _ field) =
+mkGet get_field l@(r : _) (L _ (FieldLabelString field)) =
   wrapGenSpan (genHsApp (genHsVar get_field `genAppType` genHsTyLit field) r) : l
 mkGet _ [] _ = panic "mkGet : The impossible has happened!"
 
@@ -2702,7 +2739,7 @@ mkProjection getFieldName circName (field :| fields) = foldl' f (proj field) fie
     f acc field = genHsApps circName $ map wrapGenSpan [proj field, acc]
 
     proj :: LocatedAn NoEpAnns FieldLabelString -> HsExpr GhcRn
-    proj (L _ f) = genHsVar getFieldName `genAppType` genHsTyLit f
+    proj (L _ (FieldLabelString f)) = genHsVar getFieldName `genAppType` genHsTyLit f
 
 -- mkProjUpdateSetField calculates functions representing dot notation record updates.
 -- e.g. Suppose an update like foo.bar = 1.

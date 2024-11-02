@@ -34,7 +34,7 @@ import GHC.Prelude
 
 import GHC.Platform
 
-import GHC.Types.Id.Make ( voidPrimId )
+import GHC.Types.Id.Make ( unboxedUnitExpr )
 import GHC.Types.Id
 import GHC.Types.Literal
 import GHC.Types.Name.Occurrence ( occNameFS )
@@ -46,10 +46,12 @@ import GHC.Core
 import GHC.Core.Make
 import GHC.Core.SimpleOpt (  exprIsConApp_maybe, exprIsLiteral_maybe )
 import GHC.Core.DataCon ( DataCon,dataConTagZ, dataConTyCon, dataConWrapId, dataConWorkId )
-import GHC.Core.Utils  ( cheapEqExpr, exprIsHNF, exprType
+import GHC.Core.Utils  ( cheapEqExpr, exprIsHNF
                        , stripTicksTop, stripTicksTopT, mkTicks )
 import GHC.Core.Multiplicity
+import GHC.Core.Rules.Config
 import GHC.Core.Type
+import GHC.Core.TyCo.Compare( eqType )
 import GHC.Core.TyCon
    ( tyConDataCons_maybe, isAlgTyCon, isEnumerationTyCon
    , isNewTyCon, tyConDataCons
@@ -69,7 +71,6 @@ import GHC.Utils.Outputable
 import GHC.Utils.Misc
 import GHC.Utils.Panic
 import GHC.Utils.Panic.Plain
-import GHC.Utils.Trace
 
 import Control.Applicative ( Alternative(..) )
 import Control.Monad
@@ -419,15 +420,14 @@ primOpRules nm = \case
                                         [Lit (LitNumber _ l1), Lit (LitNumber _ l2)] <- getArgs
                                         platform <- getPlatform
                                         let r = l1 * l2
-                                        pure $ mkCoreUbxTup [intPrimTy,intPrimTy,intPrimTy]
+                                        pure $ mkCoreUnboxedTuple
                                           [ Lit (if platformInIntRange platform r then zeroi platform else onei platform)
                                           , mkIntLitWrap platform (r `shiftR` platformWordSizeInBits platform)
                                           , mkIntLitWrap platform r
                                           ]
 
                                     , zeroElem >>= \z ->
-                                        pure (mkCoreUbxTup [intPrimTy,intPrimTy,intPrimTy]
-                                                           [z,z,z])
+                                        pure (mkCoreUnboxedTuple [z,z,z])
 
                                       -- timesInt2# 1# other
                                       -- ~~~>
@@ -436,7 +436,7 @@ primOpRules nm = \case
                                       -- repeated to fill a word.
                                     , identityPlatform onei >>= \other -> do
                                         platform <- getPlatform
-                                        pure $ mkCoreUbxTup [intPrimTy,intPrimTy,intPrimTy]
+                                        pure $ mkCoreUnboxedTuple
                                           [ Lit (zeroi platform)
                                           , mkCoreApps (Var (primOpId IntSubOp))
                                               [ Lit (zeroi platform)
@@ -999,8 +999,7 @@ retLit l = do platform <- getPlatform
 retLitNoC :: (Platform -> Literal) -> RuleM CoreExpr
 retLitNoC l = do platform <- getPlatform
                  let lit = l platform
-                 let ty = literalType lit
-                 return $ mkCoreUbxTup [ty, ty] [Lit lit, Lit (zeroi platform)]
+                 return $ mkCoreUnboxedTuple [Lit lit, Lit (zeroi platform)]
 
 word8Op2
   :: (Integral a, Integral b)
@@ -1095,9 +1094,8 @@ floatOp2 _ _ _ _ = Nothing
 --------------------------
 floatDecodeOp :: RuleOpts -> Literal -> Maybe CoreExpr
 floatDecodeOp env (LitFloat ((decodeFloat . fromRational @Float) -> (m, e)))
-  = Just $ mkCoreUbxTup [intPrimTy, intPrimTy]
-                        [ mkIntVal (roPlatform env) (toInteger m)
-                        , mkIntVal (roPlatform env) (toInteger e) ]
+  = Just $ mkCoreUnboxedTuple [ mkIntVal (roPlatform env) (toInteger m)
+                              , mkIntVal (roPlatform env) (toInteger e) ]
 floatDecodeOp _   _
   = Nothing
 
@@ -1112,9 +1110,8 @@ doubleOp2 _ _ _ _ = Nothing
 --------------------------
 doubleDecodeOp :: RuleOpts -> Literal -> Maybe CoreExpr
 doubleDecodeOp env (LitDouble ((decodeFloat . fromRational @Double) -> (m, e)))
-  = Just $ mkCoreUbxTup [int64PrimTy, intPrimTy]
-                        [ Lit (mkLitInt64Wrap (toInteger m))
-                        , mkIntVal platform (toInteger e) ]
+  = Just $ mkCoreUnboxedTuple [ Lit (mkLitInt64Wrap (toInteger m))
+                              , mkIntVal platform (toInteger e) ]
   where
     platform = roPlatform env
 doubleDecodeOp _   _
@@ -1221,9 +1218,8 @@ intResult' platform result = Lit (mkLitIntWrap platform result)
 -- Integer is in the target Int range and the corresponding overflow flag
 -- (@0#@/@1#@) if it wasn't.
 intCResult :: Platform -> Integer -> Maybe CoreExpr
-intCResult platform result = Just (mkPair [Lit lit, Lit c])
+intCResult platform result = Just (mkCoreUnboxedTuple [Lit lit, Lit c])
   where
-    mkPair = mkCoreUbxTup [intPrimTy, intPrimTy]
     (lit, b) = mkLitIntWrapC platform result
     c = if b then onei platform else zeroi platform
 
@@ -1263,9 +1259,8 @@ wordResult' platform result = Lit (mkLitWordWrap platform result)
 -- Integer is in the target Word range and the corresponding carry flag
 -- (@0#@/@1#@) if it wasn't.
 wordCResult :: Platform -> Integer -> Maybe CoreExpr
-wordCResult platform result = Just (mkPair [Lit lit, Lit c])
+wordCResult platform result = Just (mkCoreUnboxedTuple [Lit lit, Lit c])
   where
-    mkPair = mkCoreUbxTup [wordPrimTy, intPrimTy]
     (lit, b) = mkLitWordWrapC platform result
     c = if b then onei platform else zeroi platform
 
@@ -1282,7 +1277,7 @@ word64Result' :: Integer -> CoreExpr
 word64Result' result = Lit (mkLitWord64Wrap result)
 
 
--- | 'ambiant (primop x) = x', but not nececesarily 'primop (ambient x) = x'.
+-- | 'ambient (primop x) = x', but not necessarily 'primop (ambient x) = x'.
 semiInversePrimOp :: PrimOp -> RuleM CoreExpr
 semiInversePrimOp primop = do
   [Var primop_id `App` e] <- getArgs
@@ -1409,11 +1404,11 @@ as follows:
     let x = I# (error "invalid shift")
     in ...
 
-This was originally done in the fix to #16449 but this breaks the let/app
-invariant (see Note [Core let/app invariant] in GHC.Core) as noted in #16742.
-For the reasons discussed in Note [Checking versus non-checking primops] (in
-the PrimOp module) there is no safe way rewrite the argument of I# such that
-it bottoms.
+This was originally done in the fix to #16449 but this breaks the let-can-float
+invariant (see Note [Core let-can-float invariant] in GHC.Core) as noted in #16742.
+For the reasons discussed in Note [Checking versus non-checking
+primops] (in the PrimOp module) there is no safe way to rewrite the argument of I#
+such that it bottoms.
 
 Consequently we instead take advantage of the fact that large shifts are
 undefined behavior (see associated documentation in primops.txt.pp) and
@@ -1619,7 +1614,7 @@ leftIdentityCPlatform id_lit = do
   [Lit l1, e2] <- getArgs
   guard $ l1 == id_lit platform
   let no_c = Lit (zeroi platform)
-  return (mkCoreUbxTup [exprType e2, intPrimTy] [e2, no_c])
+  return (mkCoreUnboxedTuple [e2, no_c])
 
 rightIdentityPlatform :: (Platform -> Literal) -> RuleM CoreExpr
 rightIdentityPlatform id_lit = do
@@ -1636,7 +1631,7 @@ rightIdentityCPlatform id_lit = do
   [e1, Lit l2] <- getArgs
   guard $ l2 == id_lit platform
   let no_c = Lit (zeroi platform)
-  return (mkCoreUbxTup [exprType e1, intPrimTy] [e1, no_c])
+  return (mkCoreUnboxedTuple [e1, no_c])
 
 identityPlatform :: (Platform -> Literal) -> RuleM CoreExpr
 identityPlatform lit =
@@ -1811,7 +1806,7 @@ tagToEnumRule = do
 
     -- See Note [tagToEnum#]
     _ -> warnPprTrace True "tagToEnum# on non-enumeration type" (ppr ty) $
-         return $ mkRuntimeErrorApp rUNTIME_ERROR_ID ty "tagToEnum# on non-enumeration type"
+         return $ mkImpossibleExpr ty "tagToEnum# on non-enumeration type"
 
 ------------------------------
 dataToTagRule :: RuleM CoreExpr
@@ -1830,12 +1825,12 @@ dataToTagRule = a `mplus` b
     --   dataToTag x
     -- where x's unfolding is a constructor application
     b = do
-      dflags <- getPlatform
+      platform <- getPlatform
       [_, val_arg] <- getArgs
       in_scope <- getInScopeEnv
       (_,floats, dc,_,_) <- liftMaybe $ exprIsConApp_maybe in_scope val_arg
       massert (not (isNewTyCon (dataConTyCon dc)))
-      return $ wrapFloats floats (mkIntVal dflags (toInteger (dataConTagZ dc)))
+      return $ wrapFloats floats (mkIntVal platform (toInteger (dataConTagZ dc)))
 
 {- Note [dataToTag# magic]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1951,9 +1946,9 @@ Implementing seq#.  The compiler has magic for SeqOp in
 
 seqRule :: RuleM CoreExpr
 seqRule = do
-  [Type ty_a, Type _ty_s, a, s] <- getArgs
+  [Type _ty_a, Type _ty_s, a, s] <- getArgs
   guard $ exprIsHNF a
-  return $ mkCoreUbxTup [exprType s, ty_a] [s, a]
+  return $ mkCoreUnboxedTuple [s, a]
 
 -- spark# :: forall a s . a -> State# s -> (# State# s, a #)
 sparkRule :: RuleM CoreExpr
@@ -2098,10 +2093,10 @@ builtinBignumRules =
         x <- isNaturalLiteral a0
         y <- isNaturalLiteral a1
         -- return an unboxed sum: (# (# #) | Natural #)
-        let ret n v = pure $ mkCoreUbxSum 2 n [unboxedUnitTy,naturalTy] v
+        let ret n v = pure $ mkCoreUnboxedSum 2 n [unboxedUnitTy,naturalTy] v
         platform <- getPlatform
         if x < y
-            then ret 1 $ Var voidPrimId
+            then ret 1 unboxedUnitExpr
             else ret 2 $ mkNaturalExpr platform (x - y)
 
     -- unary operations
@@ -2131,12 +2126,12 @@ builtinBignumRules =
   , divop_one  "integerRem"     integerRemName     rem     mkIntegerExpr
   , divop_one  "integerDiv"     integerDivName     div     mkIntegerExpr
   , divop_one  "integerMod"     integerModName     mod     mkIntegerExpr
-  , divop_both "integerDivMod"  integerDivModName  divMod  mkIntegerExpr integerTy
-  , divop_both "integerQuotRem" integerQuotRemName quotRem mkIntegerExpr integerTy
+  , divop_both "integerDivMod"  integerDivModName  divMod  mkIntegerExpr
+  , divop_both "integerQuotRem" integerQuotRemName quotRem mkIntegerExpr
 
   , divop_one  "naturalQuot"    naturalQuotName    quot    mkNaturalExpr
   , divop_one  "naturalRem"     naturalRemName     rem     mkNaturalExpr
-  , divop_both "naturalQuotRem" naturalQuotRemName quotRem mkNaturalExpr naturalTy
+  , divop_both "naturalQuotRem" naturalQuotRemName quotRem mkNaturalExpr
 
     -- conversions from Rational for Float/Double literals
   , rational_to "rationalToFloat"  rationalToFloatName  mkFloatExpr
@@ -2238,7 +2233,7 @@ builtinBignumRules =
       -- We use a host Int to compute the popCount. If we compile on a 32-bit
       -- host for a 64-bit target, the result may be different than if computed
       -- by the target. So we disable this rule if sizes don't match.
-      guard (platformWordSizeInBits platform == finiteBitSize (0 :: Word))
+      guard (platformWordSizeInBits platform <= finiteBitSize (0 :: Word))
       [a0] <- getArgs
       x <- isBignumLiteral a0
       pure $ Lit (mk_lit platform (fromIntegral (popCount x)))
@@ -2286,14 +2281,14 @@ builtinBignumRules =
       platform <- getPlatform
       pure $ mk_lit platform (n `divop` d)
 
-    divop_both str name divop mk_lit ty = mkRule str name 2 $ do
+    divop_both str name divop mk_lit = mkRule str name 2 $ do
       [a0,a1] <- getArgs
       n <- isBignumLiteral a0
       d <- isBignumLiteral a1
       guard (d /= 0)
       let (r,s) = n `divop` d
       platform <- getPlatform
-      pure $ mkCoreUbxTup [ty,ty] [mk_lit platform r, mk_lit platform s]
+      pure $ mkCoreUnboxedTuple [mk_lit platform r, mk_lit platform s]
 
     integer_encode_float :: RealFloat a => String -> Name -> (a -> CoreExpr) -> CoreRule
     integer_encode_float str name mk_lit = mkRule str name 2 $ do
@@ -2403,7 +2398,7 @@ match_cstring_foldr_lit _ _ _ _ _ = Nothing
 -- Also, look into variable's unfolding just in case the expression we look for
 -- is in a top-level thunk.
 stripStrTopTicks :: InScopeEnv -> CoreExpr -> ([CoreTickish], CoreExpr)
-stripStrTopTicks (_,id_unf) e = case e of
+stripStrTopTicks (ISE _ id_unf) e = case e of
   Var v
     | Just rhs <- expandUnfolding_maybe (id_unf v)
     -> stripTicksTop tickishFloatable rhs
@@ -2903,7 +2898,7 @@ mulFoldingRules' platform arg1 arg2 num_ops = case (arg1,arg2) of
 
 andFoldingRules' :: Platform -> CoreExpr -> CoreExpr -> NumOps -> Maybe CoreExpr
 andFoldingRules' platform arg1 arg2 num_ops = case (arg1, arg2) of
-    -- R2) * `or` `and` simplications
+    -- R2) * `or` `and` simplifications
     -- l1 and (l2 and x) ==> (l1 and l2) and x
     (L l1, is_lit_and num_ops -> Just (l2, x))
        -> Just (mkL (l1 .&. l2) `and` x)
@@ -2926,7 +2921,7 @@ andFoldingRules' platform arg1 arg2 num_ops = case (arg1, arg2) of
 
 orFoldingRules' :: Platform -> CoreExpr -> CoreExpr -> NumOps -> Maybe CoreExpr
 orFoldingRules' platform arg1 arg2 num_ops = case (arg1, arg2) of
-    -- R2) *  `or` `and` simplications
+    -- R2) *  `or` `and` simplifications
     -- l1 or (l2 or x) ==> (l1 or l2) or x
     (L l1, is_lit_or num_ops -> Just (l2, x))
        -> Just (mkL (l1 .|. l2) `or` x)

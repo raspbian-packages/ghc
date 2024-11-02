@@ -22,49 +22,62 @@ module Distribution.Client.CmdRun (
 import Prelude ()
 import Distribution.Client.Compat.Prelude hiding (toList)
 
-import Distribution.Client.ProjectOrchestration
 import Distribution.Client.CmdErrorMessages
          ( renderTargetSelector, showTargetSelector,
            renderTargetProblem,
            renderTargetProblemNoTargets, plural, targetSelectorPluralPkgs,
-           targetSelectorFilter, renderListCommaAnd )
-import Distribution.Client.TargetProblem
-         ( TargetProblem (..) )
-
-import Distribution.Client.NixStyleOptions
-         ( NixStyleFlags (..), nixStyleOptions, defaultNixStyleFlags )
-import Distribution.Client.Setup
-         ( GlobalFlags(..), ConfigFlags(..) )
+           targetSelectorFilter, renderListCommaAnd,
+           renderListPretty )
 import Distribution.Client.GlobalFlags
          ( defaultGlobalFlags )
-import Distribution.Simple.Flag
-         ( fromFlagOrDefault )
-import Distribution.Simple.Command
-         ( CommandUI(..), usageAlternatives )
-import Distribution.Types.ComponentName
-         ( showComponentName )
-import Distribution.Verbosity
-         ( normal, silent )
-import Distribution.Simple.Utils
-         ( wrapText, die', info, notice )
-import Distribution.Client.ProjectPlanning
-         ( ElaboratedConfiguredPackage(..)
-         , ElaboratedInstallPlan, binDirectoryFor )
-import Distribution.Client.ProjectPlanning.Types
-         ( dataDirsEnvironmentForPlan )
 import Distribution.Client.InstallPlan
          ( toList, foldPlanPackage )
-import Distribution.Types.UnqualComponentName
-         ( UnqualComponentName, unUnqualComponentName )
+import Distribution.Client.NixStyleOptions
+         ( NixStyleFlags (..), nixStyleOptions, defaultNixStyleFlags )
+import Distribution.Client.ProjectConfig.Types
+import Distribution.Client.ProjectOrchestration
+import Distribution.Client.ProjectPlanning
+         ( ElaboratedConfiguredPackage(..)
+         , ElaboratedInstallPlan, binDirectoryFor
+         )
+import Distribution.Client.ProjectPlanning.Types
+         ( dataDirsEnvironmentForPlan, elabExeDependencyPaths )
+import Distribution.Client.ScriptUtils
+         ( AcceptNoTargets(..), TargetContext(..)
+         , updateContextAndWriteProjectFile, withContextAndSelectors
+         , movedExePath )
+import Distribution.Client.Setup
+         ( GlobalFlags(..), ConfigFlags(..) )
+import Distribution.Client.TargetProblem
+         ( TargetProblem (..) )
+import Distribution.Simple.Command
+         ( CommandUI(..), usageAlternatives )
+import Distribution.Simple.Flag
+         ( fromFlagOrDefault )
+import Distribution.Simple.Program.Find
+         ( ProgramSearchPathEntry(..), defaultProgramSearchPath,
+           programSearchPathAsPATHVar, logExtraProgramSearchPath
+         )
 import Distribution.Simple.Program.Run
          ( runProgramInvocation, ProgramInvocation(..),
            emptyProgramInvocation )
+import Distribution.Simple.Utils
+         ( wrapText, die', info, notice, safeHead )
+import Distribution.Types.ComponentName
+         ( componentNameRaw )
 import Distribution.Types.UnitId
          ( UnitId )
-import Distribution.Client.ScriptUtils
-         ( AcceptNoTargets(..), withContextAndSelectors, updateContextAndWriteProjectFile, TargetContext(..) )
+import Distribution.Utils.NubList
+         ( fromNubList )
 
+import Distribution.Types.UnqualComponentName
+         ( UnqualComponentName, unUnqualComponentName )
+import Distribution.Verbosity
+         ( normal, silent )
+
+import Data.List (group)
 import qualified Data.Set as Set
+
 import System.Directory
          ( doesFileExist )
 import System.FilePath
@@ -120,7 +133,7 @@ runCommand = CommandUI
 --
 runAction :: NixStyleFlags () -> [String] -> GlobalFlags -> IO ()
 runAction flags@NixStyleFlags {..} targetAndArgs globalFlags
-  = withContextAndSelectors RejectNoTargets (Just ExeKind) flags targetStr globalFlags $ \targetCtx ctx targetSelectors -> do
+  = withContextAndSelectors RejectNoTargets (Just ExeKind) flags targetStr globalFlags OtherCommand $ \targetCtx ctx targetSelectors -> do
     (baseCtx, defaultVerbosity) <- case targetCtx of
       ProjectContext             -> return (ctx, normal)
       GlobalContext              -> return (ctx, normal)
@@ -214,13 +227,30 @@ runAction flags@NixStyleFlags {..} targetAndArgs globalFlags
         ++ exeName
         ++ ":\n"
         ++ unlines (fmap (\p -> " - in package " ++ prettyShow (elabUnitId p)) elabPkgs)
-    let exePath = binDirectoryFor (distDirLayout baseCtx)
-                                  (elaboratedShared buildCtx)
-                                  pkg
-                                  exeName
-               </> exeName
+
+    let defaultExePath = binDirectoryFor
+                            (distDirLayout baseCtx)
+                            (elaboratedShared buildCtx)
+                             pkg
+                             exeName
+                       </> exeName
+        exePath = fromMaybe defaultExePath (movedExePath selectedComponent (distDirLayout baseCtx) (elaboratedShared buildCtx) pkg)
+
     let dryRun = buildSettingDryRun (buildSettings baseCtx)
               || buildSettingOnlyDownload (buildSettings baseCtx)
+
+    let extraPath =
+          elabExeDependencyPaths pkg
+            ++ ( fromNubList
+                  . projectConfigProgPathExtra
+                  . projectConfigShared
+                  . projectConfig
+                  $ baseCtx
+               )
+
+    logExtraProgramSearchPath verbosity extraPath
+
+    progPath <- programSearchPathAsPATHVar (map ProgramSearchPathDir extraPath ++ defaultProgramSearchPath)
 
     if dryRun
        then notice verbosity "Running of executable suppressed by flag(s)"
@@ -230,7 +260,8 @@ runAction flags@NixStyleFlags {..} targetAndArgs globalFlags
            emptyProgramInvocation {
              progInvokePath  = exePath,
              progInvokeArgs  = args,
-             progInvokeEnv   = dataDirsEnvironmentForPlan
+             progInvokeEnv   = ("PATH", Just $ progPath)
+                             : dataDirsEnvironmentForPlan
                                  (distDirLayout baseCtx)
                                  elaboratedPlan
            }
@@ -424,14 +455,13 @@ renderRunProblem :: RunProblem -> String
 renderRunProblem (TargetProblemMatchesMultiple targetSelector targets) =
     "The run command is for running a single executable at once. The target '"
  ++ showTargetSelector targetSelector ++ "' refers to "
- ++ renderTargetSelector targetSelector ++ " which includes "
- ++ renderListCommaAnd ( ("the "++) <$>
-                         showComponentName <$>
-                         availableTargetComponentName <$>
-                         foldMap
-                           (\kind -> filterTargetsKind kind targets)
-                           [ExeKind, TestKind, BenchKind] )
- ++ "."
+ ++ renderTargetSelector targetSelector ++ " which includes \n"
+ ++ unlines ((\(label, xs) -> "- " ++ label ++ ": " ++ renderListPretty xs)
+    <$> (zip ["executables", "test-suites", "benchmarks"]
+     $  filter (not . null) . map removeDuplicates
+     $  map (componentNameRaw . availableTargetComponentName)
+    <$> (flip filterTargetsKind $ targets) <$> [ExeKind, TestKind, BenchKind] ))
+    where removeDuplicates = catMaybes . map safeHead . group . sort
 
 renderRunProblem (TargetProblemMultipleTargets selectorMap) =
     "The run command is for running a single executable at once. The targets "

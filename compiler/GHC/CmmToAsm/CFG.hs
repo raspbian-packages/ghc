@@ -47,7 +47,6 @@ import GHC.Platform
 import GHC.Cmm.BlockId
 import GHC.Cmm as Cmm
 
-import GHC.Cmm.Utils
 import GHC.Cmm.Switch
 import GHC.Cmm.Dataflow.Collections
 import GHC.Cmm.Dataflow.Label
@@ -78,7 +77,6 @@ import GHC.Utils.Panic.Plain
 --import GHC.Cmm.DebugBlock
 --import GHC.Data.OrdList
 --import GHC.Cmm.DebugBlock.Trace
-import GHC.Cmm.Ppr () -- For Outputable instances
 
 import Data.List (sort, nub, partition)
 import Data.STRef.Strict
@@ -221,7 +219,7 @@ hasNode m node =
 
 
 -- | Check if the nodes in the cfg and the set of blocks are the same.
---   In a case of a missmatch we panic and show the difference.
+--   In a case of a mismatch we panic and show the difference.
 sanityCheckCfg :: CFG -> LabelSet -> SDoc -> Bool
 sanityCheckCfg m blockSet msg
     | blockSet == cfgNodes
@@ -309,7 +307,7 @@ shortcutWeightMap cuts cfg
         -- Create a unification variable for each of the nodes in a rewrite
         cuts_vars <- traverse (\p -> (p,) <$> fresh (Just p)) (concatMap (\(a, b) -> [a] ++ maybe [] (:[]) b) cuts_list)
         let cuts_map = mapFromList cuts_vars :: LabelMap (Point s (Maybe BlockId))
-        -- Then unify according the the rewrites in the cuts map
+        -- Then unify according to the rewrites in the cuts map
         mapM_ (\(from, to) -> expectJust "shortcutWeightMap" (mapLookup from cuts_map)
                               `union` expectJust "shortcutWeightMap" (maybe (Just null) (flip mapLookup cuts_map) to) ) cuts_list
         -- Then recover the unique representative, which is the result of following
@@ -387,10 +385,7 @@ addWeightEdge from to weight cfg =
 
 delEdge :: BlockId -> BlockId -> CFG -> CFG
 delEdge from to m =
-    mapAlter remDest from m
-    where
-        remDest Nothing = Nothing
-        remDest (Just wm) = Just $ mapDelete to wm
+    mapAdjust (mapDelete to) from m
 
 
 -- | Destinations from bid ordered by weight (descending)
@@ -419,11 +414,11 @@ getEdgeInfo from to m
 
 getEdgeWeight :: CFG -> BlockId -> BlockId -> EdgeWeight
 getEdgeWeight cfg from to =
-    edgeWeight $ expectJust "Edgeweight for noexisting block" $
+    edgeWeight $ expectJust "Edgeweight for nonexisting block" $
                  getEdgeInfo from to cfg
 
 getTransitionSource :: BlockId -> BlockId -> CFG -> TransitionSource
-getTransitionSource from to cfg = transitionSource $ expectJust "Source info for noexisting block" $
+getTransitionSource from to cfg = transitionSource $ expectJust "Source info for nonexisting block" $
                         getEdgeInfo from to cfg
 
 reverseEdges :: CFG -> CFG
@@ -665,7 +660,7 @@ getCfg platform weights graph =
         (CmmCall { cml_cont = Nothing })   -> []
         other ->
             panic "Foo" $
-            assertPpr False (ppr "Unknown successor cause:" <>
+            assertPpr False (text "Unknown successor cause:" <>
               (pdoc platform branch <+> text "=>" <> pdoc platform (G.successors other))) $
             map (\x -> ((bid,x),mkEdgeInfo 0)) $ G.successors other
       where
@@ -1025,11 +1020,11 @@ Currently implemented is a heuristic to predict that we do not exit
 loops (lehPredicts) and one to predict that backedges are more likely
 than any other edge.
 
-The back edge case is special as it superceeds any other heuristic if it
+The back edge case is special as it supersedes any other heuristic if it
 applies.
 
 Do NOT rely solely on nofib results for benchmarking this. I recommend at least
-comparing megaparsec and container benchmarks. Nofib does not seeem to have
+comparing megaparsec and container benchmarks. Nofib does not seem to have
 many instances of "loopy" Cmm where these make a difference.
 
 TODO:
@@ -1350,7 +1345,7 @@ calcFreqs graph backEdges loops revPostOrder = runST $ do
                                 vcat (map (\(k,m) -> ppr (k,m :: IM.IntMap Double)) $ IM.toList g)
                             )
 
-    nodeCount = IM.foldl' (\count toMap -> IM.foldlWithKey' countTargets count toMap) (IM.size graph) graph
+    nodeCount = IM.foldl' (\count toMap -> IM.foldlWithKey' countTargets (count + 1) toMap) 0 graph
       where
         countTargets = (\count k _ -> countNode k + count )
         countNode n = if IM.member n graph then 0 else 1

@@ -22,7 +22,7 @@ bool isAdrp(addr_t p);
 bool isLoadStore(addr_t p);
 bool isAddSub(addr_t p);
 bool isVectorOp(addr_t p);
-int64_t decodeAddendAarch64(Section * section, Elf_Rel * rel) GNU_ATTRIBUTE(__noreturn__);
+int64_t decodeAddendAarch64(Section * section, Elf_Rel * rel) STG_NORETURN;
 bool encodeAddendAarch64(Section * section, Elf_Rel * rel, int64_t addend);
 
 bool isBranch(addr_t p) {
@@ -51,8 +51,8 @@ bool isVectorOp(addr_t p) {
 typedef uint32_t inst_t;
 
 int64_t
-decodeAddendAarch64(Section * section __attribute__((unused)),
-                    Elf_Rel * rel __attribute__((unused)))
+decodeAddendAarch64(Section * section STG_UNUSED,
+                    Elf_Rel * rel STG_UNUSED)
 {
     abort(/* we don't support Rel locations yet. */);
 }

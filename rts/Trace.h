@@ -65,6 +65,7 @@ enum CapsetType { CapsetTypeCustom = CAPSET_TYPE_CUSTOM,
 #define DEBUG_hpc         RtsFlags.DebugFlags.hpc
 #define DEBUG_sparks      RtsFlags.DebugFlags.sparks
 #define DEBUG_compact     RtsFlags.DebugFlags.compact
+#define DEBUG_continuation RtsFlags.DebugFlags.continuation
 
 // Event-enabled flags
 // These semantically booleans but we use a dense packing to minimize their
@@ -229,7 +230,8 @@ void traceUserBinaryMsg(Capability *cap, uint8_t *msg, size_t size);
  */
 void traceThreadLabel_(Capability *cap,
                        StgTSO     *tso,
-                       char       *label);
+                       char       *label,
+                       size_t      len);
 
 
 #if defined(DEBUG)
@@ -354,7 +356,7 @@ void flushTrace(void);
 #define debugTrace(class, str, ...) /* nothing */
 #define debugTraceCap(class, cap, str, ...) /* nothing */
 #define traceThreadStatus(class, tso) /* nothing */
-#define traceThreadLabel_(cap, tso, label) /* nothing */
+#define traceThreadLabel_(cap, tso, label, len) /* nothing */
 #define traceCapEvent(cap, tag) /* nothing */
 #define traceCapsetEvent(tag, capset, info) /* nothing */
 #define traceWallClockTime_() /* nothing */
@@ -423,8 +425,8 @@ void dtraceUserMarkerWrapper(Capability *cap, char *msg);
     HASKELLEVENT_REQUEST_PAR_GC(cap)
 #define dtraceCreateSparkThread(cap, spark_tid)         \
     HASKELLEVENT_CREATE_SPARK_THREAD(cap, spark_tid)
-#define dtraceThreadLabel(cap, tso, label)              \
-    HASKELLEVENT_THREAD_LABEL(cap, tso, label)
+#define dtraceThreadLabel(cap, tso, label, len)         \
+    HASKELLEVENT_THREAD_LABEL(cap, tso, label, len)
 #define dtraceCapCreate(cap)                            \
     HASKELLEVENT_CAP_CREATE(cap)
 #define dtraceCapDelete(cap)                            \
@@ -519,7 +521,7 @@ void dtraceUserMarkerWrapper(Capability *cap, char *msg);
 #define dtraceRequestSeqGc(cap)                         /* nothing */
 #define dtraceRequestParGc(cap)                         /* nothing */
 #define dtraceCreateSparkThread(cap, spark_tid)         /* nothing */
-#define dtraceThreadLabel(cap, tso, label)              /* nothing */
+#define dtraceThreadLabel(cap, tso, label, len)         /* nothing */
 #define dtraceUserMsg(cap, msg)                         /* nothing */
 #define dtraceUserMarker(cap, msg)                      /* nothing */
 #define dtraceGcIdle(cap)                               /* nothing */
@@ -660,12 +662,13 @@ INLINE_HEADER void traceEventThreadWakeup(Capability *cap       STG_UNUSED,
 
 INLINE_HEADER void traceThreadLabel(Capability *cap   STG_UNUSED,
                                     StgTSO     *tso   STG_UNUSED,
-                                    char       *label STG_UNUSED)
+                                    char       *label STG_UNUSED,
+                                    size_t      len   STG_UNUSED)
 {
     if (RTS_UNLIKELY(TRACE_sched)) {
-        traceThreadLabel_(cap, tso, label);
+        traceThreadLabel_(cap, tso, label, len);
     }
-    dtraceThreadLabel((EventCapNo)cap->no, (EventThreadID)tso->id, label);
+    dtraceThreadLabel((EventCapNo)cap->no, (EventThreadID)tso->id, label, len);
 }
 
 INLINE_HEADER void traceEventGcStart(Capability *cap STG_UNUSED)

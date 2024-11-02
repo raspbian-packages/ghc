@@ -230,7 +230,7 @@ emitCostCentreDecl cc = do
   ; modl  <- newByteStringCLit (bytesFS $ moduleNameFS
                                         $ moduleName
                                         $ cc_mod cc)
-  ; loc <- newByteStringCLit $ utf8EncodeString $
+  ; loc <- newByteStringCLit $ utf8EncodeByteString $
                    renderWithContext ctx (ppr $! costCentreSrcSpan cc)
   ; let
      lits = [ zero platform,  -- StgInt ccID,
@@ -274,24 +274,27 @@ sizeof_ccs_words platform
   where
    (ws,ms) = pc_SIZEOF_CostCentreStack (platformConstants platform) `divMod` platformWordSizeInBytes platform
 
--- | Emit info-table provenance declarations
-initInfoTableProv ::  [CmmInfoTable] -> InfoTableProvMap -> FCode CStub
-initInfoTableProv infos itmap
+-- | Emit info-table provenance declarations and track IPE stats.
+--
+-- Note that the stats passed to this function will (rather, should) only ever
+-- contain stats for skipped STACK info tables accumulated in
+-- 'generateCgIPEStub'.
+initInfoTableProv :: IPEStats -> [CmmInfoTable] -> InfoTableProvMap -> FCode (Maybe (IPEStats, CStub))
+initInfoTableProv stats infos itmap
   = do
        cfg <- getStgToCmmConfig
-       let ents       = convertInfoProvMap infos this_mod itmap
-           info_table = stgToCmmInfoTableMap cfg
-           platform   = stgToCmmPlatform     cfg
-           this_mod   = stgToCmmThisModule   cfg
-
+       let (stats', ents) = convertInfoProvMap cfg this_mod itmap stats infos
+           info_table    = stgToCmmInfoTableMap cfg
+           platform      = stgToCmmPlatform     cfg
+           this_mod      = stgToCmmThisModule   cfg
        case ents of
-         [] -> return mempty
+         [] -> return Nothing
          _  -> do
            -- Emit IPE buffer
            emitIpeBufferListNode this_mod ents
 
            -- Create the C stub which initialises the IPE map
-           return (ipInitCode info_table platform this_mod)
+           return (Just (stats', ipInitCode info_table platform this_mod))
 
 -- ---------------------------------------------------------------------------
 -- Set the current cost centre stack

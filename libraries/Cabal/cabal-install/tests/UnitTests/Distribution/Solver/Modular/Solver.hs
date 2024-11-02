@@ -30,6 +30,8 @@ tests = [
       testGroup "Simple dependencies" [
           runTest $         mkTest db1 "alreadyInstalled"   ["A"]      (solverSuccess [])
         , runTest $         mkTest db1 "installLatest"      ["B"]      (solverSuccess [("B", 2)])
+        , runTest $ preferOldest
+                  $         mkTest db1 "installOldest"      ["B"]      (solverSuccess [("B", 1)])
         , runTest $         mkTest db1 "simpleDep1"         ["C"]      (solverSuccess [("B", 1), ("C", 1)])
         , runTest $         mkTest db1 "simpleDep2"         ["D"]      (solverSuccess [("B", 2), ("D", 1)])
         , runTest $         mkTest db1 "failTwoVersions"    ["C", "D"] anySolverFailure
@@ -146,11 +148,13 @@ tests = [
         , runTest $ mkTest db12 "baseShim5" ["D"] anySolverFailure
         , runTest $ mkTest db12 "baseShim6" ["E"] (solverSuccess [("E", 1), ("syb", 2)])
         ]
-    , testGroup "Base" [
+    , testGroup "Base and Nonupgradable" [
           runTest $ mkTest dbBase "Refuse to install base without --allow-boot-library-installs" ["base"] $
                       solverFailure (isInfixOf "only already installed instances can be used")
         , runTest $ allowBootLibInstalls $ mkTest dbBase "Install base with --allow-boot-library-installs" ["base"] $
                       solverSuccess [("base", 1), ("ghc-prim", 1), ("integer-gmp", 1), ("integer-simple", 1)]
+        , runTest $ mkTest dbNonupgrade "Refuse to install newer ghc requested by another library" ["A"] $
+                      solverFailure (isInfixOf "rejecting: ghc-2.0.0 (constraint from non-upgradeable package requires installed instance)")
         ]
     , testGroup "reject-unconstrained" [
           runTest $ onlyConstrained $ mkTest db12 "missing syb" ["E"] $
@@ -1120,6 +1124,13 @@ dbBase = [
     , Right $ exAv "integer-simple" 1 []
     , Right $ exAv "integer-gmp" 1 []
     ]
+
+dbNonupgrade :: ExampleDb
+dbNonupgrade = [
+    Left $ exInst "ghc" 1 "ghc-1" []
+  , Right $ exAv "ghc" 2 []
+  , Right $ exAv "A" 1 [ExFix "ghc" 2]
+  ]
 
 db13 :: ExampleDb
 db13 = [

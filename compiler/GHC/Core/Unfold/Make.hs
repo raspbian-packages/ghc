@@ -9,13 +9,12 @@ module GHC.Core.Unfold.Make
    , mkFinalUnfolding'
    , mkSimpleUnfolding
    , mkWorkerUnfolding
-   , mkInlineUnfolding
-   , mkInlineUnfoldingWithArity
+   , mkInlineUnfoldingWithArity, mkInlineUnfoldingNoArity
    , mkInlinableUnfolding
    , mkWrapperUnfolding
-   , mkCompulsoryUnfolding
-   , mkCompulsoryUnfolding'
+   , mkCompulsoryUnfolding, mkCompulsoryUnfolding'
    , mkDFunUnfolding
+   , mkDataConUnfolding
    , specUnfolding
    , certainlyWillInline
    )
@@ -44,10 +43,10 @@ import {-# SOURCE #-} GHC.Core.SimpleOpt
 
 
 
-mkFinalUnfolding :: UnfoldingOpts -> UnfoldingSource -> DmdSig -> CoreExpr -> Maybe UnfoldingCache -> Unfolding
+mkFinalUnfolding :: UnfoldingOpts -> UnfoldingSource -> DmdSig -> CoreExpr -> Unfolding
 -- "Final" in the sense that this is a GlobalId that will not be further
 -- simplified; so the unfolding should be occurrence-analysed
-mkFinalUnfolding opts src strict_sig expr = mkFinalUnfolding' opts src strict_sig expr
+mkFinalUnfolding opts src strict_sig expr = mkFinalUnfolding' opts src strict_sig expr Nothing
 
 -- See Note [Tying the 'CoreUnfolding' knot] for why interfaces need
 -- to pass a precomputed 'UnfoldingCache'
@@ -60,15 +59,14 @@ mkFinalUnfolding' opts src strict_sig expr
                 (isDeadEndSig strict_sig)
                 expr
 
--- | Used for things that absolutely must be unfolded
-mkCompulsoryUnfolding :: SimpleOpts -> CoreExpr -> Unfolding
-mkCompulsoryUnfolding opts expr = mkCompulsoryUnfolding' (simpleOptExpr opts expr)
+-- | Same as 'mkCompulsoryUnfolding' but simplifies the unfolding first
+mkCompulsoryUnfolding' :: SimpleOpts -> CoreExpr -> Unfolding
+mkCompulsoryUnfolding' opts expr = mkCompulsoryUnfolding (simpleOptExpr opts expr)
 
--- | Same as 'mkCompulsoryUnfolding' but no simple optimiser pass is performed
--- on the unfolding.
-mkCompulsoryUnfolding' :: CoreExpr -> Unfolding
-mkCompulsoryUnfolding' expr
-  = mkCoreUnfolding InlineCompulsory True
+-- | Used for things that absolutely must be unfolded
+mkCompulsoryUnfolding :: CoreExpr -> Unfolding
+mkCompulsoryUnfolding expr
+  = mkCoreUnfolding CompulsorySrc True
                     expr Nothing
                     (UnfWhen { ug_arity = 0    -- Arity of unfolding doesn't matter
                              , ug_unsat_ok = unSaturatedOk, ug_boring_ok = boringCxtOk })
@@ -81,7 +79,7 @@ mkCompulsoryUnfolding' expr
 
 mkSimpleUnfolding :: UnfoldingOpts -> CoreExpr -> Unfolding
 mkSimpleUnfolding !opts rhs
-  = mkUnfolding opts InlineRhs False False rhs Nothing
+  = mkUnfolding opts VanillaSrc False False rhs Nothing
 
 mkDFunUnfolding :: [Var] -> DataCon -> [CoreExpr] -> Unfolding
 mkDFunUnfolding bndrs con ops
@@ -90,11 +88,21 @@ mkDFunUnfolding bndrs con ops
                   , df_args = map occurAnalyseExpr ops }
                   -- See Note [Occurrence analysis of unfoldings]
 
+mkDataConUnfolding :: CoreExpr -> Unfolding
+-- Used for non-newtype data constructors with non-trivial wrappers
+mkDataConUnfolding expr
+  = mkCoreUnfolding StableSystemSrc True expr Nothing guide
+    -- No need to simplify the expression
+  where
+    guide = UnfWhen { ug_arity     = manifestArity expr
+                    , ug_unsat_ok  = unSaturatedOk
+                    , ug_boring_ok = False }
+
 mkWrapperUnfolding :: SimpleOpts -> CoreExpr -> Arity -> Unfolding
 -- Make the unfolding for the wrapper in a worker/wrapper split
 -- after demand/CPR analysis
 mkWrapperUnfolding opts expr arity
-  = mkCoreUnfolding InlineStable True
+  = mkCoreUnfolding StableSystemSrc True
                     (simpleOptExpr opts expr) Nothing
                     (UnfWhen { ug_arity     = arity
                              , ug_unsat_ok  = unSaturatedOk
@@ -113,13 +121,13 @@ mkWorkerUnfolding opts work_fn
 
 mkWorkerUnfolding _ _ _ = noUnfolding
 
--- | Make an unfolding that may be used unsaturated
+-- | Make an INLINE unfolding that may be used unsaturated
 -- (ug_unsat_ok = unSaturatedOk) and that is reported as having its
 -- manifest arity (the number of outer lambdas applications will
 -- resolve before doing any work).
-mkInlineUnfolding :: SimpleOpts -> CoreExpr -> Unfolding
-mkInlineUnfolding opts expr
-  = mkCoreUnfolding InlineStable
+mkInlineUnfoldingNoArity :: SimpleOpts -> UnfoldingSource -> CoreExpr -> Unfolding
+mkInlineUnfoldingNoArity opts src expr
+  = mkCoreUnfolding src
                     True         -- Note [Top-level flag on inline rules]
                     expr' Nothing guide
   where
@@ -129,11 +137,11 @@ mkInlineUnfolding opts expr
                     , ug_boring_ok = boring_ok }
     boring_ok = inlineBoringOk expr'
 
--- | Make an unfolding that will be used once the RHS has been saturated
+-- | Make an INLINE unfolding that will be used once the RHS has been saturated
 -- to the given arity.
-mkInlineUnfoldingWithArity :: Arity -> SimpleOpts -> CoreExpr -> Unfolding
-mkInlineUnfoldingWithArity arity opts expr
-  = mkCoreUnfolding InlineStable
+mkInlineUnfoldingWithArity :: SimpleOpts -> UnfoldingSource -> Arity -> CoreExpr -> Unfolding
+mkInlineUnfoldingWithArity opts src arity expr
+  = mkCoreUnfolding src
                     True         -- Note [Top-level flag on inline rules]
                     expr' Nothing guide
   where
@@ -146,9 +154,9 @@ mkInlineUnfoldingWithArity arity opts expr
     boring_ok | arity == 0 = True
               | otherwise  = inlineBoringOk expr'
 
-mkInlinableUnfolding :: SimpleOpts -> CoreExpr -> Unfolding
-mkInlinableUnfolding opts expr
-  = mkUnfolding (so_uf_opts opts) InlineStable False False expr' Nothing
+mkInlinableUnfolding :: SimpleOpts -> UnfoldingSource -> CoreExpr -> Unfolding
+mkInlinableUnfolding opts src expr
+  = mkUnfolding (so_uf_opts opts) src False False expr' Nothing
   where
     expr' = simpleOptExpr opts expr
 
@@ -164,7 +172,7 @@ specUnfolding opts spec_bndrs spec_app rule_lhs_args
               df@(DFunUnfolding { df_bndrs = old_bndrs, df_con = con, df_args = args })
   = assertPpr (rule_lhs_args `equalLength` old_bndrs)
               (ppr df $$ ppr rule_lhs_args) $
-           -- For this ASSERT see Note [DFunUnfoldings] in GHC.Core.Opt.Specialise
+           -- For this ASSERT see Note [Specialising DFuns] in GHC.Core.Opt.Specialise
     mkDFunUnfolding spec_bndrs con (map spec_arg args)
       -- For DFunUnfoldings we transform
       --       \obs. MkD <op1> ... <opn>
@@ -203,25 +211,41 @@ specUnfolding to specialise its unfolding.  Some important points:
   must do so too!  Otherwise we lose the magic rules that make it
   interact with ClassOps
 
-* There is a bit of hack for INLINABLE functions:
-     f :: Ord a => ....
-     f = <big-rhs>
-     {- INLINABLE f #-}
-  Now if we specialise f, should the specialised version still have
-  an INLINABLE pragma?  If it does, we'll capture a specialised copy
-  of <big-rhs> as its unfolding, and that probably won't inline.  But
-  if we don't, the specialised version of <big-rhs> might be small
-  enough to inline at a call site. This happens with Control.Monad.liftM3,
-  and can cause a lot more allocation as a result (nofib n-body shows this).
+* For a /stable/ CoreUnfolding, we specialise the unfolding, no matter
+  how big, iff it has UnfWhen guidance.  This happens for INLINE
+  functions, and for wrappers.  For these, it would be very odd if a
+  function marked INLINE was specialised (because of some local use),
+  and then forever after (including importing modules) the specialised
+  version wasn't INLINEd!  After all, the programmer said INLINE.
 
-  Moreover, keeping the INLINABLE thing isn't much help, because
+* However, for a stable CoreUnfolding with guidance UnfoldIfGoodArgs,
+  which arises from INLINABLE functions, we drop the unfolding.
+  See #4874 for persuasive examples.  Suppose we have
+    {-# INLINABLE f #-}
+    f :: Ord a => [a] -> Int f xs = letrec f' = ...f'... in f'
+
+  Then, when f is specialised and optimised we might get
+    wgo :: [Int] -> Int#
+    wgo = ...wgo...
+    f_spec :: [Int] -> Int
+    f_spec xs = case wgo xs of { r -> I# r }
+
+  and we clearly want to inline f_spec at call sites.  But if we still
+  have the big, un-optimised of f (albeit specialised) captured in the
+  stable unfolding for f_spec, we won't get that optimisation.
+
+  This happens with Control.Monad.liftM3, and can cause a lot more
+  allocation as a result (nofib n-body shows this).
+
+  Moreover, keeping the stable unfolding isn't much help, because
   the specialised function (probably) isn't overloaded any more.
 
-  Conclusion: drop the INLINEALE pragma.  In practice what this means is:
-     if a stable unfolding has UnfoldingGuidance of UnfWhen,
-        we keep it (so the specialised thing too will always inline)
-     if a stable unfolding has UnfoldingGuidance of UnfIfGoodArgs
-        (which arises from INLINABLE), we discard it
+  TL;DR: we simply drop the stable unfolding when specialising. It's not
+  really a complete solution; ignoring specialisation for now, INLINABLE
+  functions don't get properly strictness analysed, for example.
+  Moreover, it means that the specialised function has an INLINEABLE
+  pragma, but no stable unfolding. But it works well for examples
+  involving specialisation, which is the dominant use of INLINABLE.
 
 Note [Honour INLINE on 0-ary bindings]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -310,6 +334,7 @@ mkUnfolding opts src top_lvl is_bottoming expr cache
 
 mkCoreUnfolding :: UnfoldingSource -> Bool -> CoreExpr
                 -> Maybe UnfoldingCache -> UnfoldingGuidance -> Unfolding
+-- Occurrence-analyses the expression before capturing it
 mkCoreUnfolding src top_lvl expr precomputed_cache guidance
   = CoreUnfolding { uf_tmpl = cache `seq`
                               occurAnalyseExpr expr
@@ -354,14 +379,12 @@ certainlyWillInline opts fn_info rhs'
              UnfIfGoodArgs { ug_size = size, ug_args = args }
                         -> do_cunf size args src' tmpl'
         where
-          src' = -- Do not change InlineCompulsory!
-                 case src of
-                   InlineCompulsory -> InlineCompulsory
-                   _                -> InlineStable
-          tmpl' = -- Do not overwrite stable unfoldings!
-                  case src of
-                    InlineRhs -> occurAnalyseExpr rhs'
-                    _         -> uf_tmpl fn_unf
+          src' | isCompulsorySource src = src  -- Do not change InlineCompulsory!
+               | otherwise              = StableSystemSrc
+
+          tmpl' | isStableSource src = uf_tmpl fn_unf
+                | otherwise          = occurAnalyseExpr rhs'
+                -- Do not overwrite stable unfoldings!
 
       DFunUnfolding {} -> Just fn_unf  -- Don't w/w DFuns; it never makes sense
                                        -- to do so, and even if it is currently a
@@ -430,12 +453,12 @@ Note [Thoughtful forcing in mkCoreUnfolding]
 
 Core expressions retained in unfoldings is one of biggest uses of memory when compiling
 a program. Therefore we have to be careful about retaining copies of old or redundant
-templates (see !6202 for a particularlly bad case).
+templates (see !6202 for a particularly bad case).
 
 With that in mind we want to maintain the invariant that each unfolding only references
 a single CoreExpr. One place where we have to be careful is in mkCoreUnfolding.
 
-* The template of the unfolding is the result of performing occurence analysis
+* The template of the unfolding is the result of performing occurrence analysis
   (Note [Occurrence analysis of unfoldings])
 * Predicates are applied to the unanalysed expression
 
@@ -456,7 +479,7 @@ Therefore we basically had two options in order to fix this:
 1. Perform the predicates on the analysed expression.
 2. Force the predicates to remove retainer to the old expression if we force the template.
 
-Option 1 is bad because occurence analysis is expensive and destroys any sharing of the unfolding
+Option 1 is bad because occurrence analysis is expensive and destroys any sharing of the unfolding
 with the actual program. (Testing this approach showed peak 25G memory usage)
 
 Therefore we got for Option 2 which performs a little more work but compensates by

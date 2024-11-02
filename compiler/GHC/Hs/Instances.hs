@@ -231,6 +231,16 @@ deriving instance Data (ForeignDecl GhcPs)
 deriving instance Data (ForeignDecl GhcRn)
 deriving instance Data (ForeignDecl GhcTc)
 
+-- deriving instance (DataIdLR p p) => Data (ForeignImport p)
+deriving instance Data (ForeignImport GhcPs)
+deriving instance Data (ForeignImport GhcRn)
+deriving instance Data (ForeignImport GhcTc)
+
+-- deriving instance (DataIdLR p p) => Data (ForeignExport p)
+deriving instance Data (ForeignExport GhcPs)
+deriving instance Data (ForeignExport GhcRn)
+deriving instance Data (ForeignExport GhcTc)
+
 -- deriving instance (DataIdLR p p) => Data (RuleDecls p)
 deriving instance Data (RuleDecls GhcPs)
 deriving instance Data (RuleDecls GhcRn)
@@ -373,15 +383,12 @@ deriving instance Data (HsMatchContext GhcPs)
 deriving instance Data (HsMatchContext GhcRn)
 deriving instance Data (HsMatchContext GhcTc)
 
--- deriving instance (DataIdLR p p) => Data (HsSplice p)
-deriving instance Data (HsSplice GhcPs)
-deriving instance Data (HsSplice GhcRn)
-deriving instance Data (HsSplice GhcTc)
+-- deriving instance (DataIdLR p p) => Data (HsUntypedSplice p)
+deriving instance Data (HsUntypedSplice GhcPs)
+deriving instance Data (HsUntypedSplice GhcRn)
+deriving instance Data (HsUntypedSplice GhcTc)
 
--- deriving instance (DataIdLR p p) => Data (HsSplicedThing p)
-deriving instance Data (HsSplicedThing GhcPs)
-deriving instance Data (HsSplicedThing GhcRn)
-deriving instance Data (HsSplicedThing GhcTc)
+deriving instance Data a => Data (HsUntypedSpliceResult a)
 
 -- deriving instance (DataIdLR p p) => Data (HsQuote p)
 deriving instance Data (HsQuote GhcPs)
@@ -395,7 +402,6 @@ deriving instance Data (ArithSeqInfo GhcPs)
 deriving instance Data (ArithSeqInfo GhcRn)
 deriving instance Data (ArithSeqInfo GhcTc)
 
-deriving instance Data RecordUpdTc
 deriving instance Data CmdTopTc
 deriving instance Data PendingRnSplice
 deriving instance Data PendingTcSplice
@@ -430,6 +436,10 @@ deriving instance Data (Pat GhcRn)
 deriving instance Data (Pat GhcTc)
 
 deriving instance Data ConPatTc
+
+deriving instance Data (HsConPatTyArg GhcPs)
+deriving instance Data (HsConPatTyArg GhcRn)
+deriving instance Data (HsConPatTyArg GhcTc)
 
 deriving instance (Data a, Data b) => Data (HsFieldBind a b)
 
@@ -479,6 +489,11 @@ deriving instance (Data flag) => Data (HsTyVarBndr flag GhcTc)
 deriving instance Data (HsType GhcPs)
 deriving instance Data (HsType GhcRn)
 deriving instance Data (HsType GhcTc)
+
+-- deriving instance (DataIdLR p p) => Data (HsTyLit p)
+deriving instance Data (HsTyLit GhcPs)
+deriving instance Data (HsTyLit GhcRn)
+deriving instance Data (HsTyLit GhcTc)
 
 -- deriving instance Data (HsLinearArrowTokens p)
 deriving instance Data (HsLinearArrowTokens GhcPs)

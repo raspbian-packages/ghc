@@ -1,10 +1,9 @@
-{-# LANGUAGE ExistentialQuantification #-}
+{-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE TypeFamilies #-}
 
 module GHC.Parser.Errors.Types where
 
 import GHC.Prelude
-
-import Data.Typeable
 
 import GHC.Core.TyCon (Role)
 import GHC.Data.FastString
@@ -15,10 +14,10 @@ import GHC.Types.Error
 import GHC.Types.Hint
 import GHC.Types.Name.Occurrence (OccName)
 import GHC.Types.Name.Reader
-import GHC.Unit.Module.Name
-import GHC.Utils.Outputable
 import Data.List.NonEmpty (NonEmpty)
 import GHC.Types.SrcLoc (PsLoc)
+
+import GHC.Generics ( Generic )
 
 -- The type aliases below are useful to make some type signatures a bit more
 -- descriptive, like 'handleWarningsThrowErrors' in 'GHC.Driver.Main'.
@@ -60,6 +59,7 @@ data PsHeaderMessage
         tests/driver/T2499
   -}
   | PsErrUnknownOptionsPragma !String
+  deriving Generic
 
 
 data PsMessage
@@ -68,7 +68,7 @@ data PsMessage
         arbitrary messages to be embedded. The typical use case would be GHC plugins
         willing to emit custom diagnostics.
     -}
-   forall a. (Diagnostic a, Typeable a) => PsUnknownMessage a
+    PsUnknownMessage UnknownDiagnostic
 
     {-| A group of parser messages emitted in 'GHC.Parser.Header'.
         See Note [Messages from GHC.Parser.Header].
@@ -78,7 +78,7 @@ data PsMessage
    {-| PsWarnBidirectionalFormatChars is a warning (controlled by the -Wwarn-bidirectional-format-characters flag)
    that occurs when unicode bi-directional format characters are found within in a file
 
-   The 'PsLoc' contains the exact position in the buffer the character occured, and the
+   The 'PsLoc' contains the exact position in the buffer the character occurred, and the
    string contains a description of the character.
    -}
    | PsWarnBidirectionalFormatChars (NonEmpty (PsLoc, Char, String))
@@ -117,8 +117,9 @@ data PsMessage
    -}
    | PsWarnTransitionalLayout !TransLayoutReason
 
-   -- | Unrecognised pragma
-   | PsWarnUnrecognisedPragma
+   -- | Unrecognised pragma. First field is the actual pragma name which
+   -- might be empty. Second field is the set of valid candidate pragmas.
+   | PsWarnUnrecognisedPragma !String ![String]
    | PsWarnMisplacedPragma !FileHeaderPragmaType
 
    -- | Invalid Haddock comment position
@@ -456,12 +457,21 @@ data PsMessage
 
    -- | Parse error in right operator section pattern
    -- TODO: embed the proper operator, if possible
-   | forall infixOcc. (OutputableBndr infixOcc) => PsErrParseRightOpSectionInPat !infixOcc !(PatBuilder GhcPs)
+   | PsErrParseRightOpSectionInPat !RdrName !(PatBuilder GhcPs)
 
    -- | Illegal linear arrow or multiplicity annotation in GADT record syntax
    | PsErrIllegalGadtRecordMultiplicity !(HsArrow GhcPs)
 
    | PsErrInvalidCApiImport
+
+   | PsErrMultipleConForNewtype !RdrName !Int
+
+   | PsErrUnicodeCharLooksLike
+      Char -- ^ the problematic character
+      Char -- ^ the character it looks like
+      String -- ^ the name of the character that it looks like
+
+   deriving Generic
 
 -- | Extra details about a parse error, which helps
 -- us in determining which should be the hints to
@@ -496,7 +506,7 @@ data ParseContext
   = ParseContext
   { is_infix :: !(Maybe RdrName)
     -- ^ If 'Just', this is an infix
-    -- pattern with the binded operator name
+    -- pattern with the bound operator name
   , incomplete_do_block :: !PatIncompleteDoBlock
     -- ^ Did the parser likely fail due to an incomplete do block?
   } deriving Eq
@@ -504,7 +514,7 @@ data ParseContext
 data PsErrInPatDetails
   = PEIP_NegApp
     -- ^ Negative application pattern?
-  | PEIP_TypeArgs [HsPatSigType GhcPs]
+  | PEIP_TypeArgs [HsConPatTyArg GhcPs]
     -- ^ The list of type arguments for the pattern
   | PEIP_RecPattern [LPat GhcPs]    -- ^ The pattern arguments
                     !PatIsRecursive -- ^ Is the parsed pattern recursive?

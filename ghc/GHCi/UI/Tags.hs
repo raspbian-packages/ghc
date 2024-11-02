@@ -16,24 +16,22 @@ module GHCi.UI.Tags (
 import GHC.Utils.Exception
 import GHC
 import GHCi.UI.Monad
-import GHC.Utils.Outputable
 
 -- ToDo: figure out whether we need these, and put something appropriate
 -- into the GHC API instead
 import GHC.Types.Name (nameOccName)
-import GHC.Types.Name.Occurrence (pprOccName)
+import GHC.Types.Name.Occurrence (occNameString)
 import GHC.Core.ConLike
 import GHC.Utils.Monad
-import GHC.Unit.State
-import GHC.Driver.Env
+import GHC.Data.FastString
 
 import Control.Monad
 import Data.Function
-import Data.List (sort, sortBy, groupBy)
+import Data.List (sort, sortOn)
+import qualified Data.List.NonEmpty as NE
 import Data.Maybe
 import Data.Ord
 import GHC.Driver.Phases
-import GHC.Driver.Ppr
 import GHC.Utils.Panic
 import Prelude
 import System.Directory
@@ -63,7 +61,7 @@ data TagsKind = ETags | CTagsWithLineNumbers | CTagsWithRegExes
 
 ghciCreateTagsFile :: TagsKind -> FilePath -> GHCi ()
 ghciCreateTagsFile kind file = do
-  liftIO $ putStrLn "Tags generation from GHCi will be deprecated in future releases"
+  liftIO $ putStrLn "Tags generation from GHCi will be deprecated in GHC 9.8"
   liftIO $ putStrLn "Use the method described in https://gitlab.haskell.org/ghc/ghc/-/wikis/commentary/GHCi/Tags"
   createTagsFile kind file
 
@@ -96,14 +94,10 @@ listModuleTags m = do
   case mbModInfo of
     Nothing -> return []
     Just mInfo -> do
-       dflags <- getDynFlags
-       unit_state <- hsc_units <$> getSession
-       mb_print_unqual <- GHC.mkPrintUnqualifiedForModule mInfo
-       let unqual = fromMaybe GHC.alwaysQualify mb_print_unqual
        let names = fromMaybe [] $ GHC.modInfoTopLevelScope mInfo
        let localNames = filter ((m==) . nameModule) names
        mbTyThings <- mapM GHC.lookupName localNames
-       return $! [ tagInfo dflags unit_state unqual exported kind name realLoc
+       return $! [ tagInfo exported kind name realLoc
                      | tyThing <- catMaybes mbTyThings
                      , let name = getName tyThing
                      , let exported = GHC.modInfoIsExportedName mInfo name
@@ -132,13 +126,12 @@ data TagInfo = TagInfo
 
 
 -- get tag info, for later translation into Vim or Emacs style
-tagInfo :: DynFlags -> UnitState -> PrintUnqualified
-        -> Bool -> Char -> Name -> RealSrcLoc
+tagInfo :: Bool -> Char -> Name -> RealSrcLoc
         -> TagInfo
-tagInfo dflags unit_state unqual exported kind name loc
+tagInfo exported kind name loc
     = TagInfo exported kind
-        (showSDocForUser dflags unit_state unqual $ pprOccName (nameOccName name))
-        (showSDocForUser dflags unit_state unqual $ ftext (srcLocFile loc))
+        (occNameString $ nameOccName name)
+        (unpackFS (srcLocFile loc))
         (srcLocLine loc) (srcLocCol loc) Nothing
 
 -- throw an exception when someone tries to overwrite existing source file (fix for #10989)
@@ -176,14 +169,13 @@ collateAndWriteTags ETags file tagInfos = do -- etags style, Emacs/XEmacs
 
 makeTagGroupsWithSrcInfo :: [TagInfo] -> IO [[TagInfo]]
 makeTagGroupsWithSrcInfo tagInfos = do
-  let groups = groupBy ((==) `on` tagFile) $ sortBy (comparing tagFile) tagInfos
+  let groups = NE.groupAllWith tagFile tagInfos
   mapM addTagSrcInfo groups
 
   where
-    addTagSrcInfo [] = throwGhcException (CmdLineError "empty tag file group??")
-    addTagSrcInfo group@(tagInfo:_) = do
+    addTagSrcInfo group@(tagInfo NE.:| _) = do
       file <- readFile $ tagFile tagInfo
-      let sortedGroup = sortBy (comparing tagLine) group
+      let sortedGroup = sortOn tagLine (NE.toList group)
       return $ perFile sortedGroup 1 0 $ lines file
 
     perFile allTags@(tag:tags) cnt pos allLs@(l:ls)

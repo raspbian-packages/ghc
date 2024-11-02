@@ -12,30 +12,37 @@
 -- It's hard to put these functions anywhere else without causing
 -- some unnecessary loops in the module dependency graph.
 module GHC.Utils.Panic
-   ( GhcException(..)
+   ( -- * GHC exception type
+     GhcException(..)
    , showGhcException
    , showGhcExceptionUnsafe
    , throwGhcException
    , throwGhcExceptionIO
    , handleGhcException
 
+     -- * Command error throwing patterns
    , pgmError
    , panic
    , pprPanic
-   , assertPanic
-   , assertPprPanic
-   , assertPpr
-   , assertPprM
-   , massertPpr
    , sorry
    , panicDoc
    , sorryDoc
    , pgmErrorDoc
    , cmdLineError
    , cmdLineErrorIO
+     -- ** Assertions
+   , assertPanic
+   , assertPprPanic
+   , assertPpr
+   , assertPprMaybe
+   , assertPprM
+   , massertPpr
+
+     -- * Call stacks
    , callStackDoc
    , prettyCallStackDoc
 
+     -- * Exception utilities
    , Exception.Exception(..)
    , showException
    , safeShowException
@@ -46,7 +53,7 @@ module GHC.Utils.Panic
    )
 where
 
-import GHC.Prelude
+import GHC.Prelude.Basic
 import GHC.Stack
 
 import GHC.Utils.Outputable
@@ -309,6 +316,12 @@ assertPpr cond msg a =
   if debugIsOn && not cond
     then withFrozenCallStack (assertPprPanic msg)
     else a
+
+assertPprMaybe :: HasCallStack => Maybe SDoc -> a -> a
+{-# INLINE assertPprMaybe #-}
+assertPprMaybe mb_msg a
+  | debugIsOn, Just msg <- mb_msg = withFrozenCallStack (assertPprPanic msg)
+  | otherwise                     = a
 
 massertPpr :: (HasCallStack, Applicative m) => Bool -> SDoc -> m ()
 {-# INLINE massertPpr #-}

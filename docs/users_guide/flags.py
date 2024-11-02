@@ -50,7 +50,6 @@ import sphinx
 from sphinx import addnodes
 from sphinx.domains.std import GenericObject
 from sphinx.errors import SphinxError
-
 from utils import build_table_from_list, parse_version
 
 import os.path

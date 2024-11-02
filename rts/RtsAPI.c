@@ -19,13 +19,10 @@
 #include "StablePtr.h"
 #include "Threads.h"
 #include "Weak.h"
+#include "sm/NonMoving.h"
 
 /* ----------------------------------------------------------------------------
    Building Haskell objects from C datatypes.
-
-   TODO: Currently this code does not tag created pointers,
-         however it is not unsafe (the constructor code will do it)
-         just inefficient.
    ------------------------------------------------------------------------- */
 HaskellObj
 rts_mkChar (Capability *cap, HsChar c)
@@ -713,6 +710,16 @@ Capability *pauseTokenCapability(PauseToken *pauseToken) {
 // See Note [Locking and Pausing the RTS]
 PauseToken *rts_pause (void)
 {
+
+    // Wait for any nonmoving collection to finish before pausing the RTS.
+    // The nonmoving collector needs to synchronise with the mutator,
+    // so pausing the mutator while a collection is ongoing might lead to deadlock or
+    // capabilities being prematurely re-awoken.
+    if (RtsFlags.GcFlags.useNonmoving) {
+      ACQUIRE_LOCK(&nonmoving_collection_mutex);
+    }
+
+
     // It is an error if this thread already paused the RTS. If another
     // thread has paused the RTS, then rts_pause will block until rts_resume is
     // called (and compete with other threads calling rts_pause). The blocking
@@ -775,6 +782,10 @@ void rts_resume (PauseToken *pauseToken)
     releaseAllCapabilities(getNumCapabilities(), NULL, task);
     exitMyTask();
     stgFree(pauseToken);
+
+    if (RtsFlags.GcFlags.useNonmoving) {
+      RELEASE_LOCK(&nonmoving_collection_mutex);
+    }
 }
 
 // See RtsAPI.h
@@ -866,7 +877,7 @@ void rts_listMiscRoots (ListRootsCb cb, void *user)
 }
 
 #else
-PauseToken GNU_ATTRIBUTE(__noreturn__)
+PauseToken STG_NORETURN
 *rts_pause (void)
 {
     errorBelch("Warning: Pausing the RTS is only possible for "
@@ -874,7 +885,7 @@ PauseToken GNU_ATTRIBUTE(__noreturn__)
     stg_exit(EXIT_FAILURE);
 }
 
-void GNU_ATTRIBUTE(__noreturn__)
+void STG_NORETURN
 rts_resume (PauseToken *pauseToken STG_UNUSED)
 {
     errorBelch("Warning: Resuming the RTS is only possible for "

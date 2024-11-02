@@ -688,8 +688,9 @@ void updateRemembSetPushThunkEager(Capability *cap,
     case IND:
     {
         StgInd *ind = (StgInd *) thunk;
-        if (check_in_nonmoving_heap(ind->indirectee)) {
-            push_closure(queue, ind->indirectee, NULL);
+        StgClosure *indirectee = ACQUIRE_LOAD(&ind->indirectee);
+        if (check_in_nonmoving_heap(indirectee)) {
+            push_closure(queue, indirectee, NULL);
         }
         break;
     }
@@ -918,6 +919,7 @@ static MarkQueueEnt markQueuePop (MarkQueue *q)
         // MarkQueueEnt encoding always places the pointer to the object to be
         // marked first.
         prefetchForRead(&new.mark_closure.p->header.info);
+        prefetchForRead(&(UNTAG_CLOSURE(new.mark_closure.p)->header.info));
         prefetchForRead(Bdescr((StgPtr) new.mark_closure.p));
         q->prefetch_queue[i] = new;
         i = (i + 1) % MARK_PREFETCH_QUEUE_DEPTH;
@@ -1048,6 +1050,9 @@ trace_tso (MarkQueue *queue, StgTSO *tso)
     trace_trec_header(queue, tso->trec);
     markQueuePushClosure_(queue, (StgClosure *) tso->stackobj);
     markQueuePushClosure_(queue, (StgClosure *) tso->_link);
+    if (tso->label != NULL) {
+        markQueuePushClosure_(queue, (StgClosure *) tso->label);
+    }
     if (   tso->why_blocked == BlockedOnMVar
         || tso->why_blocked == BlockedOnMVarRead
         || tso->why_blocked == BlockedOnBlackHole
@@ -1709,6 +1714,12 @@ mark_closure (MarkQueue *queue, const StgClosure *p0, StgClosure **origin)
     case COMPACT_NFDATA:
         break;
 
+    case CONTINUATION: {
+        StgContinuation *cont = (StgContinuation *)p;
+        trace_stack_(queue, cont->stack, cont->stack + cont->stack_size);
+        break;
+    }
+
     default:
         barf("mark_closure: unimplemented/strange closure type %d @ %p",
              info->type, p);
@@ -1998,7 +2009,7 @@ bool nonmovingTidyWeaks (struct MarkQueue_ *queue)
 
         // See Note [Weak pointer processing and the non-moving GC] in
         // MarkWeak.c
-        bool key_in_nonmoving = Bdescr((StgPtr) w->key)->flags & BF_NONMOVING;
+        bool key_in_nonmoving = HEAP_ALLOCED_GC(w->key) && Bdescr((StgPtr) w->key)->flags & BF_NONMOVING;
         if (!key_in_nonmoving || nonmovingIsNowAlive(w->key)) {
             nonmovingMarkLiveWeak(queue, w);
             did_work = true;

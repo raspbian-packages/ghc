@@ -419,7 +419,7 @@ void freeHeapProfiling (void)
 }
 
 /* --------------------------------------------------------------------------
- * Initialize the heap profilier
+ * Initialize the heap profiler
  * ----------------------------------------------------------------------- */
 void
 initHeapProfiling(void)
@@ -1219,6 +1219,10 @@ heapCensusBlock(Census *census, bdescr *bd)
             size = sizeofW(StgTRecChunk);
             break;
 
+        case CONTINUATION:
+            size = continuation_sizeW((StgContinuation *)p);
+            break;
+
         case COMPACT_NFDATA:
             barf("heapCensus, found compact object in the wrong list");
             break;
@@ -1241,9 +1245,9 @@ heapCensusBlock(Census *census, bdescr *bd)
          * use this to scan for the next valid heap closure.
          *
          * Note that not all types of slop are relevant here, only the ones
-         * that can reman after major GC. So essentially just large objects
+         * that can remain after major GC. So essentially just large objects
          * and pinned objects. All other closures will have been packed nice
-         * and thight into fresh blocks.
+         * and tight into fresh blocks.
          */
     }
 }

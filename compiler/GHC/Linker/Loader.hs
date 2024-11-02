@@ -77,6 +77,7 @@ import GHC.Unit.Env
 import GHC.Unit.Finder
 import GHC.Unit.Module
 import GHC.Unit.Module.ModIface
+import GHC.Unit.Module.WholeCoreBindings
 import GHC.Unit.Module.Deps
 import GHC.Unit.Home.ModInfo
 import GHC.Unit.State as Packages
@@ -837,11 +838,17 @@ getLinkDeps hsc_env pls replace_osuf span mods
 
     while_linking_expr = text "while linking an interpreted expression"
 
-        -- This one is a build-system bug
+
+    -- See Note [Using Byte Code rather than Object Code for Template Haskell]
+    homeModLinkable :: DynFlags -> HomeModInfo -> Maybe Linkable
+    homeModLinkable dflags hmi =
+      if gopt Opt_UseBytecodeRatherThanObjects dflags
+        then homeModInfoByteCode hmi <|> homeModInfoObject hmi
+        else homeModInfoObject hmi   <|> homeModInfoByteCode hmi
 
     get_linkable osuf mod      -- A home-package module
         | Just mod_info <- lookupHugByModule mod (hsc_HUG hsc_env)
-        = adjust_linkable (Maybes.expectJust "getLinkDeps" (hm_linkable mod_info))
+        = adjust_linkable (Maybes.expectJust "getLinkDeps" (homeModLinkable dflags mod_info))
         | otherwise
         = do    -- It's not in the HPT because we are in one shot mode,
                 -- so use the Finder to get a ModLocation...
@@ -886,7 +893,34 @@ getLinkDeps hsc_env pls replace_osuf span mods
             adjust_ul _ (DotA fp) = panic ("adjust_ul DotA " ++ show fp)
             adjust_ul _ (DotDLL fp) = panic ("adjust_ul DotDLL " ++ show fp)
             adjust_ul _ l@(BCOs {}) = return l
+            adjust_ul _ l@LoadedBCOs{} = return l
+            adjust_ul _ (CoreBindings (WholeCoreBindings _ mod _))     = pprPanic "Unhydrated core bindings" (ppr mod)
 
+{-
+Note [Using Byte Code rather than Object Code for Template Haskell]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The `-fprefer-byte-code` flag allows a user to specify that they want to use
+byte code (if availble) rather than object code for home module dependenices
+when executing Template Haskell splices.
+
+Why might you want to use byte code rather than object code?
+
+* Producing object code is much slower than producing byte code (for example if you're using -fno-code)
+* Linking many large object files, which happens once per splice, is quite expensive. (#21700)
+
+So we allow the user to choose to use byte code rather than object files if they want to avoid these
+two pitfalls.
+
+When using `-fprefer-byte-code` you have to arrange to have the byte code availble.
+In normal --make mode it will not be produced unless you enable `-fbyte-code-and-object-code`.
+See Note [Home module build products] for some more information about that.
+
+The only other place where the flag is consulted is when enabling code generation
+with `-fno-code`, which does so to anticipate what decision we will make at the
+splice point about what we would prefer.
+
+-}
 
 {- **********************************************************************
 
@@ -916,7 +950,7 @@ loadDecls interp hsc_env span cbc@CompiledByteCode{..} = do
           new_bindings <- linkSomeBCOs bco_opts interp le2 [cbc]
           nms_fhvs <- makeForeignNamedHValueRefs interp new_bindings
           let ce2  = extendClosureEnv (closure_env le2) nms_fhvs
-              !pls2 = pls { linker_env = le2 { closure_env = ce2 } }
+              pls2 = pls { linker_env = le2 { closure_env = ce2 } }
           return (pls2, (nms_fhvs, links_needed, units_needed))
   where
     free_names = uniqDSetToList $
@@ -1131,7 +1165,7 @@ dynLinkBCOs bco_opts interp pls bcos = do
             unlinkeds                = concatMap linkableUnlinked new_bcos
 
             cbcs :: [CompiledByteCode]
-            cbcs      = map byteCodeOfObject unlinkeds
+            cbcs      = concatMap byteCodeOfObject unlinkeds
 
 
             le1 = linker_env pls
@@ -1150,7 +1184,7 @@ dynLinkBCOs bco_opts interp pls bcos = do
         new_binds <- makeForeignNamedHValueRefs interp to_add
 
         let ce2 = extendClosureEnv (closure_env le2) new_binds
-        return $! pls1 { linker_env = le2 { closure_env = ce2 } }
+        return pls1 { linker_env = le2 { closure_env = ce2 } }
 
 -- Link a bunch of BCOs and return references to their values
 linkSomeBCOs :: BCOOpts
@@ -1499,7 +1533,7 @@ load_dyn interp hsc_env crash_early dll = do
         else
           when (diag_wopt Opt_WarnMissedExtraSharedLib diag_opts)
             $ logMsg logger
-                (mkMCDiagnostic diag_opts $ WarningWithFlag Opt_WarnMissedExtraSharedLib)
+                (mkMCDiagnostic diag_opts (WarningWithFlag Opt_WarnMissedExtraSharedLib) Nothing)
                   noSrcSpan $ withPprStyle defaultUserStyle (note err)
   where
     diag_opts = initDiagOpts (hsc_dflags hsc_env)
@@ -1687,7 +1721,7 @@ locateLib interp hsc_env is_hs lib_dirs gcc_dirs lib0
       , not loading_dynamic_hs_libs
       , interpreterProfiled interp
       = do
-          let diag = mkMCDiagnostic diag_opts WarningWithoutFlag
+          let diag = mkMCDiagnostic diag_opts WarningWithoutFlag Nothing
           logMsg logger diag noSrcSpan $ withPprStyle defaultErrStyle $
             text "Interpreter failed to load profiled static library" <+> text lib <> char '.' $$
               text " \tTrying dynamic library instead. If this fails try to rebuild" <+>
@@ -1747,7 +1781,7 @@ gccSearchDirCache = unsafePerformIO $ newIORef []
 -- fork/exec is expensive on Windows, for each time we ask GCC for a library we
 -- have to eat the cost of af least 3 of these: gcc -> real_gcc -> cc1.
 -- So instead get a list of location that GCC would search and use findDirs
--- which hopefully is written in an optimized mannor to take advantage of
+-- which hopefully is written in an optimized manner to take advantage of
 -- caching. At the very least we remove the overhead of the fork/exec and waits
 -- which dominate a large percentage of startup time on Windows.
 getGccSearchDirectory :: Logger -> DynFlags -> String -> IO [FilePath]
@@ -1773,9 +1807,9 @@ getGccSearchDirectory logger dflags key = do
             find :: String -> String -> String
             find r x = let lst = lines x
                            val = filter (r `isPrefixOf`) lst
-                       in if null val
-                             then []
-                             else case break (=='=') (head val) of
+                       in case val of
+                              [] -> []
+                              x:_ -> case break (=='=') x of
                                      (_ , [])    -> []
                                      (_, (_:xs)) -> xs
 

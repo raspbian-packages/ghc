@@ -15,6 +15,7 @@ import GHC.Utils.Outputable (SDoc)
 import GHC.Cmm.BlockId
 
 import GHC.CmmToAsm.Config
+import GHC.Data.FastString
 
 -- | Holds a list of source and destination registers used by a
 --      particular instruction.
@@ -70,10 +71,16 @@ class Instruction instr where
                 :: instr -> Bool
 
 
-        -- | Give the possible destinations of this jump instruction.
+        -- | Give the possible *local block* destinations of this jump instruction.
         --      Must be defined for all jumpish instructions.
         jumpDestsOfInstr
                 :: instr -> [BlockId]
+
+        -- | Check if the instr always transfers control flow
+        -- to the given block. Used by code layout to eliminate
+        -- jumps that can be replaced by fall through.
+        canFallthroughTo
+                :: instr -> BlockId -> Bool
 
 
         -- | Change the destination of this jump instruction.
@@ -160,4 +167,4 @@ class Instruction instr where
         pprInstr :: Platform -> instr -> SDoc
 
         -- Create a comment instruction
-        mkComment :: SDoc -> [instr]
+        mkComment :: FastString -> [instr]

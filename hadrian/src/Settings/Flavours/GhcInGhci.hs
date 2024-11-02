@@ -1,7 +1,10 @@
 module Settings.Flavours.GhcInGhci (ghcInGhciFlavour) where
 
+import qualified Data.Set as Set
+
 import Expression
 import Flavour
+import Oracles.Flag
 import {-# SOURCE #-} Settings.Default
 
 -- Please update doc/flavours.md when changing this file.
@@ -12,8 +15,8 @@ ghcInGhciFlavour = defaultFlavour
     -- We can't build DLLs on Windows (yet). Actually we should only
     -- include the dynamic way when we have a dynamic host GHC, but just
     -- checking for Windows seems simpler for now.
-    , libraryWays = pure [vanilla] <> pure [ dynamic | not windowsHost ]
-    , rtsWays     = pure [vanilla, threaded] <> pure [ dynamic | not windowsHost ]
+    , libraryWays = pure (Set.fromList [vanilla]) <> pure (Set.fromList [ dynamic | not windowsHost ])
+    , rtsWays     = pure (Set.fromList [vanilla]) <> (targetSupportsThreadedRts ? pure (Set.fromList [threaded])) <> pure (Set.fromList [ dynamic | not windowsHost ])
     , dynamicGhcPrograms = return False }
 
 ghciArgs :: Args

@@ -5,19 +5,21 @@
 -}
 
 {-# LANGUAGE CPP #-}
+{-# LANGUAGE LambdaCase #-}
 
 module GHC.Builtin.PrimOps (
         PrimOp(..), PrimOpVecCat(..), allThePrimOps,
         primOpType, primOpSig, primOpResultType,
         primOpTag, maxPrimOpTag, primOpOcc,
         primOpWrapperId,
+        pprPrimOp,
 
         tagToEnumKey,
 
         primOpOutOfLine, primOpCodeSize,
         primOpOkForSpeculation, primOpOkForSideEffects,
         primOpIsCheap, primOpFixity, primOpDocs,
-        primOpIsDiv,
+        primOpIsDiv, primOpIsReallyInline,
 
         getPrimOpResultInfo,  isComparisonPrimOp, PrimOpResultInfo(..),
 
@@ -325,8 +327,8 @@ Note [Checking versus non-checking primops]
       never throw an exception, so we cannot rewrite to a call to error.
 
   It is important that a non-checking primop never be transformed in a way that
-  would cause it to bottom. Doing so would violate Core's let/app invariant
-  (see Note [Core let/app invariant] in GHC.Core) which is critical to
+  would cause it to bottom. Doing so would violate Core's let-can-float invariant
+  (see Note [Core let-can-float invariant] in GHC.Core) which is critical to
   the simplifier's ability to float without fear of changing program meaning.
 
 
@@ -479,7 +481,7 @@ Two main predicates on primops test these flags:
   * The "no-float-out" thing is achieved by ensuring that we never
     let-bind a can_fail or has_side_effects primop.  The RHS of a
     let-binding (which can float in and out freely) satisfies
-    exprOkForSpeculation; this is the let/app invariant.  And
+    exprOkForSpeculation; this is the let-can-float invariant.  And
     exprOkForSpeculation is false of can_fail and has_side_effects.
 
   * So can_fail and has_side_effects primops will appear only as the
@@ -658,7 +660,7 @@ to link primops; it rather does a rather hacky symbol lookup (see
 GHC.ByteCode.Linker.primopToCLabel). TODO: Perhaps this should be changed?
 
 Note that these wrappers aren't *quite* as expressive as their unwrapped
-breathren, in that they may exhibit less representation polymorphism.
+brethren, in that they may exhibit less representation polymorphism.
 For instance, consider the case of mkWeakNoFinalizer#, which has type:
 
     mkWeakNoFinalizer# :: forall (r :: RuntimeRep) (k :: TYPE r) (v :: Type).
@@ -788,8 +790,10 @@ compare_fun_ty ty = mkVisFunTysMany [ty, ty] intPrimTy
 
 -- Output stuff:
 
-pprPrimOp  :: PrimOp -> SDoc
+pprPrimOp  :: IsLine doc => PrimOp -> doc
 pprPrimOp other_op = pprOccName (primOpOcc other_op)
+{-# SPECIALIZE pprPrimOp :: PrimOp -> SDoc #-}
+{-# SPECIALIZE pprPrimOp :: PrimOp -> HLine #-} -- see Note [SPECIALIZE to HDoc] in GHC.Utils.Outputable
 
 {-
 ************************************************************************
@@ -804,3 +808,12 @@ data PrimCall = PrimCall CLabelString Unit
 instance Outputable PrimCall where
   ppr (PrimCall lbl pkgId)
         = text "__primcall" <+> ppr pkgId <+> ppr lbl
+
+-- | Indicate if a primop is really inline: that is, it isn't out-of-line and it
+-- isn't SeqOp/DataToTagOp which are two primops that evaluate their argument
+-- hence induce thread/stack/heap changes.
+primOpIsReallyInline :: PrimOp -> Bool
+primOpIsReallyInline = \case
+  SeqOp       -> False
+  DataToTagOp -> False
+  p           -> not (primOpOutOfLine p)

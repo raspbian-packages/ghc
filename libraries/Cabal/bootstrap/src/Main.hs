@@ -1,3 +1,5 @@
+{-# LANGUAGE CPP #-}
+
 module Main (main) where
 
 import Control.Monad      (when)
@@ -34,9 +36,15 @@ main = do
 
 main1 :: FilePath -> IO ()
 main1 planPath = do
-    meta <- I.cachedHackageMetadata
+    meta <- getMap <$> I.cachedHackageMetadata
     plan <- P.decodePlanJson planPath
     main2 meta plan
+  where
+#if MIN_VERSION_cabal_install_parsers(0,4,0)
+    getMap = snd
+#else
+    getMap = id
+#endif
 
 main2 :: Map.Map C.PackageName I.PackageInfo -> P.PlanJson -> IO ()
 main2 meta plan = do
@@ -73,7 +81,7 @@ main2 meta plan = do
                   { builtinPackageName = pkgname
                   , builtinVersion     = ver
                   }
-            
+
             _ -> do
                 (src, rev, revhash) <- case P.uSha256 unit of
                     Just _  -> do
@@ -85,7 +93,7 @@ main2 meta plan = do
                         return
                             ( Hackage
                             , Just $ fromIntegral (I.riRevision relInfo)
-                            , P.sha256FromByteString $ I.getSHA256 $ I.riCabal relInfo
+                            , P.sha256FromByteString $ I.getSHA256 $ getHash relInfo
                             )
 
                     Nothing -> case P.uType unit of
@@ -109,6 +117,12 @@ main2 meta plan = do
         { resBuiltin      = builtin
         , resDependencies = deps
         }
+  where
+#if MIN_VERSION_cabal_install_parsers(0,6,0)
+    getHash = I.riCabalHash
+#else
+    getHash = I.riCabal
+#endif
 
 bfs :: P.PlanJson -> P.Unit -> IO [P.Unit]
 bfs plan unit0 = do

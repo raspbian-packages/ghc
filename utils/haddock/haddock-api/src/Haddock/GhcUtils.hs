@@ -5,6 +5,8 @@
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE MonadComprehensions #-}
 {-# OPTIONS_GHC -fno-warn-orphans #-}
 {-# OPTIONS_GHC -Wno-incomplete-record-updates #-}
 {-# OPTIONS_HADDOCK hide #-}
@@ -25,7 +27,10 @@ module Haddock.GhcUtils where
 
 import Control.Arrow
 import Data.Char ( isSpace )
+import Data.Foldable ( toList, foldl' )
+import Data.List.NonEmpty ( NonEmpty )
 import Data.Maybe ( mapMaybe, fromMaybe )
+import qualified Data.Set as Set
 
 import Haddock.Types( DocName, DocNameI, XRecCond )
 
@@ -37,14 +42,13 @@ import GHC.Types.Name
 import GHC.Unit.Module
 import GHC
 import GHC.Driver.Session
-import GHC.Types.Basic
 import GHC.Types.SrcLoc  ( advanceSrcLoc )
 import GHC.Types.Var     ( Specificity, VarBndr(..), TyVarBinder
-                         , tyVarKind, updateTyVarKind, isInvisibleArgFlag )
+                         , tyVarKind, updateTyVarKind, isInvisibleForAllTyFlag )
 import GHC.Types.Var.Set ( VarSet, emptyVarSet )
 import GHC.Types.Var.Env ( TyVarEnv, extendVarEnv, elemVarEnv, emptyVarEnv )
 import GHC.Core.TyCo.Rep ( Type(..) )
-import GHC.Core.Type     ( isRuntimeRepVar )
+import GHC.Core.Type     ( isRuntimeRepVar, binderVar )
 import GHC.Builtin.Types( liftedRepTy )
 
 import           GHC.Data.StringBuffer ( StringBuffer )
@@ -76,7 +80,7 @@ filterSigNames p (FixSig _ (FixitySig _ ns ty)) =
   case filter (p . unLoc) ns of
     []       -> Nothing
     filtered -> Just (FixSig noAnn (FixitySig noExtField filtered ty))
-filterSigNames _ orig@(MinimalSig _ _ _)      = Just orig
+filterSigNames _ orig@(MinimalSig _ _)      = Just orig
 filterSigNames p (TypeSig _ ns ty) =
   case filter (p . unLoc) ns of
     []       -> Nothing
@@ -127,8 +131,8 @@ hsTyVarNameI (KindedTyVar _ _ (L _ n) _) = n
 hsLTyVarNameI :: LHsTyVarBndr flag DocNameI -> DocName
 hsLTyVarNameI = hsTyVarNameI . unLoc
 
-getConNamesI :: ConDecl DocNameI -> [LocatedN DocName]
-getConNamesI ConDeclH98  {con_name  = name}  = [name]
+getConNamesI :: ConDecl DocNameI -> NonEmpty (LocatedN DocName)
+getConNamesI ConDeclH98  {con_name  = name}  = pure name
 getConNamesI ConDeclGADT {con_names = names} = names
 
 hsSigTypeI :: LHsSigType DocNameI -> LHsType DocNameI
@@ -255,21 +259,19 @@ restrictTo names (L loc decl) = L loc $ case decl of
   _ -> decl
 
 restrictDataDefn :: [Name] -> HsDataDefn GhcRn -> HsDataDefn GhcRn
-restrictDataDefn names defn@(HsDataDefn { dd_ND = new_or_data, dd_cons = cons })
-  | DataType <- new_or_data
-  = defn { dd_cons = restrictCons names cons }
-  | otherwise    -- Newtype
-  = case restrictCons names cons of
-      []    -> defn { dd_ND = DataType, dd_cons = [] }
-      [con] -> defn { dd_cons = [con] }
-      _ -> error "Should not happen"
+restrictDataDefn names d = d { dd_cons = restrictDataDefnCons names (dd_cons d) }
 
-restrictCons :: [Name] -> [LConDecl GhcRn] -> [LConDecl GhcRn]
-restrictCons names decls = [ L p d | L p (Just d) <- map (fmap keep) decls ]
+restrictDataDefnCons :: [Name] -> DataDefnCons (LConDecl GhcRn) -> DataDefnCons (LConDecl GhcRn)
+restrictDataDefnCons names = \ case
+    DataTypeCons is_type_data cons -> DataTypeCons is_type_data (restrictCons names cons)
+    NewTypeCon con -> maybe (DataTypeCons False []) NewTypeCon $ restrictCons names (Just con)
+
+restrictCons :: MonadFail m => [Name] -> m (LConDecl GhcRn) -> m (LConDecl GhcRn)
+restrictCons names decls = [ L p d | L p (Just d) <- fmap keep <$> decls ]
   where
     keep :: ConDecl GhcRn -> Maybe (ConDecl GhcRn)
     keep d
-      | any (\n -> n `elem` names) (map unLoc $ getConNames d) =
+      | any (`elem` names) (unLoc <$> getConNames d) =
         case d of
           ConDeclH98 { con_args = con_args' } -> case con_args' of
             PrefixCon {} -> Just d
@@ -338,7 +340,7 @@ reparenTypePrec = go
   where
 
   -- Shorter name for 'reparenType'
-  go :: XParTy a ~ EpAnn AnnParen => Precedence -> HsType a -> HsType a
+  go :: Precedence -> HsType a -> HsType a
   go _ (HsBangTy x b ty)     = HsBangTy x b (reparenLType ty)
   go _ (HsTupleTy x con tys) = HsTupleTy x con (map reparenLType tys)
   go _ (HsSumTy x tys)       = HsSumTy x (map reparenLType tys)
@@ -358,7 +360,6 @@ reparenTypePrec = go
           p' _   = PREC_TOP -- parens will get added anyways later...
           ctxt' = mapXRec @a (\xs -> map (goL (p' xs)) xs) ctxt
       in paren p PREC_CTX $ HsQualTy x ctxt' (goL PREC_TOP ty)
-    -- = paren p PREC_FUN $ HsQualTy x (fmap (mapXRec @a (map reparenLType)) ctxt) (reparenLType ty)
   go p (HsFunTy x w ty1 ty2)
     = paren p PREC_FUN $ HsFunTy x w (goL PREC_FUN ty1) (goL PREC_TOP ty2)
   go p (HsAppTy x fun_ty arg_ty)
@@ -376,12 +377,11 @@ reparenTypePrec = go
   go _ t@XHsType{} = t
 
   -- Located variant of 'go'
-  goL :: XParTy a ~ EpAnn AnnParen => Precedence -> LHsType a -> LHsType a
+  goL :: Precedence -> LHsType a -> LHsType a
   goL ctxt_prec = mapXRec @a (go ctxt_prec)
 
   -- Optionally wrap a type in parens
-  paren :: XParTy a ~ EpAnn AnnParen
-        => Precedence            -- Precedence of context
+  paren :: Precedence            -- Precedence of context
         -> Precedence            -- Precedence of top-level operator
         -> HsType a -> HsType a  -- Wrap in parens if (ctxt >= op)
   paren ctxt_prec op_prec | ctxt_prec >= op_prec = HsParTy noAnn . wrapXRec @a
@@ -471,7 +471,7 @@ instance Parent (ConDecl GhcRn) where
 
 instance Parent (TyClDecl GhcRn) where
   children d
-    | isDataDecl  d = map unLoc $ concatMap (getConNames . unLoc)
+    | isDataDecl  d = map unLoc $ concatMap (toList . getConNames . unLoc)
                                 $ (dd_cons . tcdDataDefn) d
     | isClassDecl d =
         map (unLoc . fdLName . unLoc) (tcdATs d) ++
@@ -485,7 +485,7 @@ family = getName &&& children
 
 
 familyConDecl :: ConDecl GHC.GhcRn -> [(Name, [Name])]
-familyConDecl d = zip (map unLoc (getConNames d)) (repeat $ children d)
+familyConDecl d = zip (toList $ unLoc <$> getConNames d) (repeat $ children d)
 
 -- | A mapping from the parent (main-binder) to its children and from each
 -- child to its grand-children, recursively.
@@ -650,6 +650,27 @@ tryCppLine !loc !buf = spanSpace (S.prevChar buf '\n' == '\n') loc buf
         (c   , b') -> spanCppLine (advanceSrcLoc l c) b'
 
 -------------------------------------------------------------------------------
+-- * Names in a 'Type'
+-------------------------------------------------------------------------------
+
+-- | Given a 'Type', return a set of 'Name's coming from the 'TyCon's within
+-- the type.
+typeNames :: Type -> Set.Set Name
+typeNames ty = go ty Set.empty
+  where
+    go :: Type -> Set.Set Name -> Set.Set Name
+    go t acc =
+      case t of
+        TyVarTy {} -> acc
+        AppTy t1 t2 ->  go t2 $ go t1 acc
+        FunTy _ _ t1 t2 -> go t2 $ go t1 acc
+        TyConApp tcon args -> foldl' (\s t' -> go t' s) (Set.insert (getName tcon) acc) args
+        ForAllTy bndr t' -> go t' $ go (tyVarKind (binderVar bndr)) acc
+        LitTy _ -> acc
+        CastTy t' _ -> go t' acc
+        CoercionTy {} -> acc
+
+-------------------------------------------------------------------------------
 -- * Free variables of a 'Type'
 -------------------------------------------------------------------------------
 
@@ -724,7 +745,7 @@ defaultRuntimeRepVars = go emptyVarEnv
     go :: TyVarEnv () -> Type -> Type
     go subs (ForAllTy (Bndr var flg) ty)
       | isRuntimeRepVar var
-      , isInvisibleArgFlag flg
+      , isInvisibleForAllTyFlag flg
       = let subs' = extendVarEnv subs var ()
         in go subs' ty
       | otherwise

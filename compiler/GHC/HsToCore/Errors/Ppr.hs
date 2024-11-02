@@ -1,4 +1,8 @@
+{-# LANGUAGE DataKinds #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE GADTs #-}
+{-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE TypeFamilies #-}
 {-# OPTIONS_GHC -fno-warn-orphans #-} -- instance Diagnostic DsMessage
 
 module GHC.HsToCore.Errors.Ppr where
@@ -11,6 +15,7 @@ import GHC.HsToCore.Errors.Types
 import GHC.Prelude
 import GHC.Types.Basic (pprRuleName)
 import GHC.Types.Error
+import GHC.Types.Error.Codes ( constructorCode )
 import GHC.Types.Id (idType)
 import GHC.Types.SrcLoc
 import GHC.Utils.Misc
@@ -20,9 +25,11 @@ import GHC.HsToCore.Pmc.Ppr
 
 
 instance Diagnostic DsMessage where
-  diagnosticMessage = \case
-    DsUnknownMessage m
-      -> diagnosticMessage m
+  type DiagnosticOpts DsMessage = NoDiagnosticOpts
+  defaultDiagnosticOpts = NoDiagnosticOpts
+  diagnosticMessage _ = \case
+    DsUnknownMessage (UnknownDiagnostic @e m)
+      -> diagnosticMessage (defaultDiagnosticOpts @e) m
     DsEmptyEnumeration
       -> mkSimpleDecorated $ text "Enumeration is empty"
     DsIdentitiesFound conv_fn type_of_conv
@@ -79,7 +86,7 @@ instance Diagnostic DsMessage where
               hang (text "Top-level" <+> text desc <+> text "aren't allowed:") 2 (ppr bind)
     DsUselessSpecialiseForClassMethodSelector poly_id
       -> mkSimpleDecorated $
-           text "Ignoring useless SPECIALISE pragma for NOINLINE function:" <+> quotes (ppr poly_id)
+           text "Ignoring useless SPECIALISE pragma for class selector:" <+> quotes (ppr poly_id)
     DsUselessSpecialiseForNoInlineFunction poly_id
       -> mkSimpleDecorated $
           text "Ignoring useless SPECIALISE pragma for NOINLINE function:" <+> quotes (ppr poly_id)
@@ -111,8 +118,6 @@ instance Diagnostic DsMessage where
             | isTyVar b = text "type variable" <+> quotes (ppr b)
             | isEvVar b = text "constraint"    <+> quotes (ppr (varType b))
             | otherwise = text "variable"      <+> quotes (ppr b)
-    DsMultipleConForNewtype names
-      -> mkSimpleDecorated $ text "Multiple constructors for newtype:" <+> pprQuotedList names
     DsLazyPatCantBindVarsOfUnliftedType unlifted_bndrs
       -> mkSimpleDecorated $
           hang (text "A lazy (~) pattern cannot bind variables of unlifted type." $$
@@ -223,7 +228,6 @@ instance Diagnostic DsMessage where
     DsRuleLhsTooComplicated{}                   -> WarningWithoutFlag
     DsRuleIgnoredDueToConstructor{}             -> WarningWithoutFlag
     DsRuleBindersNotBound{}                     -> WarningWithoutFlag
-    DsMultipleConForNewtype{}                   -> ErrorWithoutFlag
     DsLazyPatCantBindVarsOfUnliftedType{}       -> ErrorWithoutFlag
     DsNotYetHandledByTH{}                       -> ErrorWithoutFlag
     DsAggregatedViewExpressions{}               -> WarningWithoutFlag
@@ -235,7 +239,7 @@ instance Diagnostic DsMessage where
     DsRuleMightInlineFirst{}                    -> WarningWithFlag Opt_WarnInlineRuleShadowing
     DsAnotherRuleMightFireFirst{}               -> WarningWithFlag Opt_WarnInlineRuleShadowing
 
-  diagnosticHints  = \case
+  diagnosticHints = \case
     DsUnknownMessage m          -> diagnosticHints m
     DsEmptyEnumeration          -> noHints
     DsIdentitiesFound{}         -> noHints
@@ -260,7 +264,6 @@ instance Diagnostic DsMessage where
     DsRuleLhsTooComplicated{}                   -> noHints
     DsRuleIgnoredDueToConstructor{}             -> noHints
     DsRuleBindersNotBound{}                     -> noHints
-    DsMultipleConForNewtype{}                   -> noHints
     DsLazyPatCantBindVarsOfUnliftedType{}       -> noHints
     DsNotYetHandledByTH{}                       -> noHints
     DsAggregatedViewExpressions{}               -> noHints
@@ -271,6 +274,8 @@ instance Diagnostic DsMessage where
     DsRecBindsNotAllowedForUnliftedTys{}        -> noHints
     DsRuleMightInlineFirst _ lhs_id rule_act    -> [SuggestAddInlineOrNoInlinePragma lhs_id rule_act]
     DsAnotherRuleMightFireFirst _ bad_rule _    -> [SuggestAddPhaseToCompetingRule bad_rule]
+
+  diagnosticCode = constructorCode
 
 {-
 Note [Suggest NegativeLiterals]

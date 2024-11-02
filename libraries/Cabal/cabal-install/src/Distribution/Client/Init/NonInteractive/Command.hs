@@ -139,7 +139,7 @@ createProject comp v pkgIx srcDb initFlags = do
       return $ ProjectSettings
         (mkOpts comments cabalSpec) pkgDesc (Just libTarget)
         (Just exeTarget) testTarget
-    
+
     TestSuite -> do
       testTarget <- genTestTarget initFlags comp pkgIx cabalSpec
 
@@ -274,14 +274,16 @@ licenseHeuristics :: Interactive m => InitFlags -> m SpecLicense
 licenseHeuristics flags = getLicense flags $ guessLicense flags
 
 -- | The author's name. Prompt, or try to guess from an existing
---   darcs repo.
+--   git repo.
 authorHeuristics :: Interactive m => InitFlags -> m String
-authorHeuristics flags = getAuthor flags guessAuthorEmail
+authorHeuristics flags = guessAuthorName >>=
+  maybe (getAuthor flags $ return "Unknown") (getAuthor flags . return)
 
 -- | The author's email. Prompt, or try to guess from an existing
---   darcs repo.
+--   git repo.
 emailHeuristics :: Interactive m => InitFlags -> m String
-emailHeuristics flags = getEmail flags guessAuthorName
+emailHeuristics flags = guessAuthorEmail >>=
+  maybe (getEmail flags $ return "Unknown") (getEmail flags . return)
 
 -- | Prompt for a homepage URL for the package.
 homepageHeuristics :: Interactive m => InitFlags -> m String
@@ -358,7 +360,7 @@ exposedModulesHeuristics flags = do
 
           otherModules' <- libOtherModulesHeuristics flags
           return $ filter (`notElem` otherModules') modulesNames
-        
+
         else
           return []
 

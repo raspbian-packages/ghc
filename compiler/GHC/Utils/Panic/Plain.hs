@@ -28,7 +28,7 @@ import GHC.Settings.Config
 import GHC.Utils.Constants
 import GHC.Utils.Exception as Exception
 import GHC.Stack
-import GHC.Prelude
+import GHC.Prelude.Basic
 import System.IO.Unsafe
 
 -- | This type is very similar to 'GHC.Utils.Panic.GhcException', but it omits
@@ -101,11 +101,12 @@ throwPlainGhcException :: PlainGhcException -> a
 throwPlainGhcException = Exception.throw
 
 -- | Panics and asserts.
-panic, sorry, pgmError :: String -> a
+panic, sorry, pgmError :: HasCallStack => String -> a
 panic    x = unsafeDupablePerformIO $ do
    stack <- ccsToStrings =<< getCurrentCCS x
+   let doc = unlines $ fmap ("  "++) $ lines (prettyCallStack callStack)
    if null stack
-      then throwPlainGhcException (PlainPanic x)
+      then throwPlainGhcException (PlainPanic (x ++ '\n' : doc))
       else throwPlainGhcException (PlainPanic (x ++ '\n' : renderStack stack))
 
 sorry    x = throwPlainGhcException (PlainSorry x)

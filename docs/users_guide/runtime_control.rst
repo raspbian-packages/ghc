@@ -1363,10 +1363,12 @@ recommended for everyday use!
 .. rts-flag::  -Dl  DEBUG: linker
 .. rts-flag::  -DL  DEBUG: linker (verbose); implies :rts-flag:`-Dl`
 .. rts-flag::  -Dm  DEBUG: stm
+.. rts-flag::  -Dn  DEBUG: non-moving garbage collector
 .. rts-flag::  -Dz  DEBUG: stack squeezing
 .. rts-flag::  -Dc  DEBUG: program coverage
 .. rts-flag::  -Dr  DEBUG: sparks
 .. rts-flag::  -DC  DEBUG: compact
+.. rts-flag::  -Dk  DEBUG: continuation
 
     Debug messages will be sent to the binary event log file instead of
     stdout if the :rts-flag:`-l ⟨flags⟩` option is added. This might be useful

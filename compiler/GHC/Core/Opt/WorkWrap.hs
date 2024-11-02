@@ -5,18 +5,19 @@
 -}
 
 
-module GHC.Core.Opt.WorkWrap ( wwTopBinds ) where
+module GHC.Core.Opt.WorkWrap
+ ( WwOpts (..)
+ , wwTopBinds
+ )
+where
 
 import GHC.Prelude
-
-import GHC.Driver.Session
 
 import GHC.Core
 import GHC.Core.Unfold.Make
 import GHC.Core.Utils  ( exprType, exprIsHNF )
 import GHC.Core.Type
 import GHC.Core.Opt.WorkWrap.Utils
-import GHC.Core.FamInstEnv
 import GHC.Core.SimpleOpt
 
 import GHC.Types.Var
@@ -34,8 +35,6 @@ import GHC.Utils.Outputable
 import GHC.Utils.Panic
 import GHC.Utils.Panic.Plain
 import GHC.Utils.Monad
-import GHC.Utils.Trace
-import GHC.Unit.Types
 import GHC.Core.DataCon
 
 {-
@@ -66,14 +65,12 @@ info for exported values).
 \end{enumerate}
 -}
 
-wwTopBinds :: Module -> DynFlags -> FamInstEnvs -> UniqSupply -> CoreProgram -> CoreProgram
+wwTopBinds :: WwOpts -> UniqSupply -> CoreProgram -> CoreProgram
 
-wwTopBinds this_mod dflags fam_envs us top_binds
+wwTopBinds ww_opts us top_binds
   = initUs_ us $ do
     top_binds' <- mapM (wwBind ww_opts) top_binds
     return (concat top_binds')
-  where
-    ww_opts = initWwOpts this_mod dflags fam_envs
 
 {-
 ************************************************************************
@@ -197,19 +194,47 @@ will not be specialised at call sites in other modules.
 
 This comes up in practice (#6056).
 
-Solution: do the w/w for strictness analysis, but transfer the Stable
-unfolding to the *worker*.  So we will get something like this:
+Solution:
 
-  {-# INLINE[2] f #-}
+* Do the w/w for strictness analysis, even for INLINABLE functions
+
+* Transfer the Stable unfolding to the *worker*.  How do we "transfer
+  the unfolding"? Easy: by using the old one, wrapped in work_fn! See
+  GHC.Core.Unfold.Make.mkWorkerUnfolding.
+
+* We use the /original, user-specified/ function's InlineSpec pragma
+  for both the wrapper and the worker (see `mkStrWrapperInlinePrag`).
+  So if f is INLINEABLE, both worker and wrapper will get an InlineSpec
+  of (Inlinable "blah").
+
+  It's important that both get this, because the specialiser uses
+  the existence of a /user-specified/ INLINE/INLINABLE pragma to
+  drive specialisation of imported functions.  See  GHC.Core.Opt.Specialise
+  Note [Specialising imported functions]
+
+* Remember, the subsequent inlining behaviour of the wrapper is expressed by
+  (a) the stable unfolding
+  (b) the unfolding guidance of UnfWhen
+  (c) the inl_act activation (see Note [Wrapper activation]
+
+For our {-# INLINEABLE f #-} example above, we will get something a
+bit like like this:
+
+  {-# Has stable unfolding, active in phase 2;
+      plus InlineSpec = INLINEABLE #-}
   f :: Ord a => [a] -> Int -> a
   f d x y = case y of I# y' -> fw d x y'
 
-  {-# INLINABLE[2] fw #-}
+  {-# Has stable unfolding, plus InlineSpec = INLINEABLE #-}
   fw :: Ord a => [a] -> Int# -> a
   fw d x y' = let y = I# y' in ...f...
 
-How do we "transfer the unfolding"? Easy: by using the old one, wrapped
-in work_fn! See GHC.Core.Unfold.Make.mkWorkerUnfolding.
+
+(Historical note: we used to always give the wrapper an INLINE pragma,
+but CSE will not happen if there is a user-specified pragma, but
+should happen for w/w’ed things (#14186).  But now we simply propagate
+any user-defined pragma info, so we'll defeat CSE (rightly) only when
+there is a user-supplied INLINE/INLINEABLE pragma.)
 
 Note [No worker/wrapper for record selectors]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -488,7 +513,7 @@ Reminder: Note [Don't w/w INLINE things], so we don't need to worry
           about INLINE things here.
 
 
-What if `foo` has no specialiations, is worker/wrappered (with the
+What if `foo` has no specialisations, is worker/wrappered (with the
 wrapper inlining very early), and exported; and then in an importing
 module we have {-# SPECIALISE foo : ... #-}?
 
@@ -497,19 +522,6 @@ specialisation for foo's worker, which we will do too.  That seems
 fine.  (To work reliably, `foo` would need an INLINABLE pragma,
 in which case we don't unpack dictionaries for the worker; see
 see Note [Do not unbox class dictionaries].)
-
-Note [Wrapper NoUserInlinePrag]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-We use NoUserInlinePrag on the wrapper, to say that there is no
-user-specified inline pragma. (The worker inherits that; see Note
-[Worker/wrapper for INLINABLE functions].)  The wrapper has no pragma
-given by the user.
-
-(Historical note: we used to give the wrapper an INLINE pragma, but
-CSE will not happen if there is a user-specified pragma, but should
-happen for w/w’ed things (#14186).  We don't need a pragma, because
-everything we needs is expressed by (a) the stable unfolding and (b)
-the inl_act activation.)
 
 Note [Drop absent bindings]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -647,7 +659,7 @@ as simple as I thought.  Consider this:
         in p `seq` (v,v)
 
 I think we'll give `f` the strictness signature `<SP(M,A)>`, where the
-`M` sayd that we'll evaluate the first component of the pair at most
+`M` says that we'll evaluate the first component of the pair at most
 once.  Why?  Because the RHS of the thunk `v` is evaluated at most
 once.
 
@@ -682,10 +694,11 @@ is there only to generate used-once info for single-entry thunks.
 
 Note [Don't eta expand in w/w]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-A binding where the manifestArity of the RHS is less than idArity of the binder
-means GHC.Core.Opt.Arity didn't eta expand that binding. When this happens, it does so
-for a reason (see Note [exprArity invariant] in GHC.Core.Opt.Arity) and we probably have
-a PAP, cast or trivial expression as RHS.
+A binding where the manifestArity of the RHS is less than idArity of
+the binder means GHC.Core.Opt.Arity didn't eta expand that binding
+When this happens, it does so for a reason (see Note [Arity invariants for bindings]
+in GHC.Core.Opt.Arity) and we probably have a PAP, cast or trivial expression
+as RHS.
 
 Below is a historical account of what happened when w/w still did eta expansion.
 Nowadays, it doesn't do that, but will simply w/w for the wrong arity, unleashing
@@ -746,11 +759,7 @@ by LitRubbish (see Note [Drop absent bindings]) so there is no great harm.
 ---------------------
 splitFun :: WwOpts -> Id -> CoreExpr -> UniqSM [(Id, CoreExpr)]
 splitFun ww_opts fn_id rhs
-  | not (wrap_dmds `lengthIs` count isId arg_vars)
-    -- See Note [Don't eta expand in w/w]
-  = return [(fn_id, rhs)]
-
-  | otherwise
+  | Just (arg_vars, body) <- collectNValBinders_maybe (length wrap_dmds) rhs
   = warnPprTrace (not (wrap_dmds `lengthIs` (arityInfo fn_info)))
                  "splitFun"
                  (ppr fn_id <+> (ppr wrap_dmds $$ ppr cpr)) $
@@ -773,10 +782,13 @@ splitFun ww_opts fn_id rhs
               -> do { work_uniq <- getUniqueM
                     ; return (mkWWBindPair ww_opts fn_id fn_info arg_vars body
                                            work_uniq div stuff) } }
+
+  | otherwise    -- See Note [Don't eta expand in w/w]
+  = return [(fn_id, rhs)]
+
   where
     uf_opts = so_uf_opts (wo_simple_opts ww_opts)
     fn_info = idInfo fn_id
-    (arg_vars, body) = collectBinders rhs
 
     (wrap_dmds, div) = splitDmdSig (dmdSigInfo fn_info)
 
@@ -874,17 +886,23 @@ mkWWBindPair ww_opts fn_id fn_info fn_args fn_body work_uniq div
     fn_rules        = ruleInfoRules (ruleInfo fn_info)
 
 mkStrWrapperInlinePrag :: InlinePragma -> [CoreRule] -> InlinePragma
--- See Note [Wrapper activation]
-mkStrWrapperInlinePrag (InlinePragma { inl_act = act, inl_rule = rule_info }) rules
+mkStrWrapperInlinePrag (InlinePragma { inl_inline = fn_inl
+                                     , inl_act    = fn_act
+                                     , inl_rule   = rule_info }) rules
   = InlinePragma { inl_src    = SourceText "{-# INLINE"
-                 , inl_inline = NoUserInlinePrag -- See Note [Wrapper NoUserInlinePrag]
                  , inl_sat    = Nothing
+
+                 , inl_inline = fn_inl
+                      -- See Note [Worker/wrapper for INLINABLE functions]
+
                  , inl_act    = activeAfter wrapper_phase
+                      -- See Note [Wrapper activation]
+
                  , inl_rule   = rule_info }  -- RuleMatchInfo is (and must be) unaffected
   where
     -- See Note [Wrapper activation]
     wrapper_phase = foldr (laterPhase . get_rule_phase) earliest_inline_phase rules
-    earliest_inline_phase = beginPhase act `laterPhase` nextPhase InitialPhase
+    earliest_inline_phase = beginPhase fn_act `laterPhase` nextPhase InitialPhase
           -- laterPhase (nextPhase InitialPhase) is a temporary hack
           -- to inline no earlier than phase 2.  I got regressions in
           -- 'mate', due to changes in full laziness due to Note [Case
@@ -906,15 +924,15 @@ attach OneShot annotations to the worker’s lambda binders.
 Example:
 
   -- Original function
-  f [Demand=<L,1*C1(U)>] :: (a,a) -> a
+  f [Demand=<L,1*C(1,U)>] :: (a,a) -> a
   f = \p -> ...
 
   -- Wrapper
-  f [Demand=<L,1*C1(U)>] :: a -> a -> a
+  f [Demand=<L,1*C(1,U)>] :: a -> a -> a
   f = \p -> case p of (a,b) -> $wf a b
 
   -- Worker
-  $wf [Demand=<L,1*C1(C1(U))>] :: Int -> Int
+  $wf [Demand=<L,1*C(1,C(1,U))>] :: Int -> Int
   $wf = \a b -> ...
 
 We need to check whether the original function is called once, with
@@ -923,7 +941,7 @@ takes the arity of the original function (resp. the wrapper) and the demand on
 the original function.
 
 The demand on the worker is then calculated using mkWorkerDemand, and always of
-the form [Demand=<L,1*(C1(...(C1(U))))>]
+the form [Demand=<L,1*(C(1,...(C(1,U))))>]
 
 Note [Thunk splitting]
 ~~~~~~~~~~~~~~~~~~~~~~

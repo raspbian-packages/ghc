@@ -16,9 +16,6 @@
 (c) The GRASP/AQUA Project, Glasgow University, 1992-1998
 -}
 
-
-{-# OPTIONS_GHC -Wno-incomplete-record-updates #-}
-
 -- | Abstract syntax of global declarations.
 --
 -- Definitions for: @SynDecl@ and @ConDecl@, @ClassDecl@,
@@ -27,7 +24,7 @@ module GHC.Hs.Decls (
   -- * Toplevel declarations
   HsDecl(..), LHsDecl, HsDataDefn(..), HsDeriving, LHsFunDep,
   HsDerivingClause(..), LHsDerivingClause, DerivClauseTys(..), LDerivClauseTys,
-  NewOrData(..), newOrDataToFlavour,
+  NewOrData, newOrDataToFlavour, anyLConIsGadt,
   StandaloneKindSig(..), LStandaloneKindSig, standaloneKindSigName,
 
   -- ** Class or type declarations
@@ -43,7 +40,8 @@ module GHC.Hs.Decls (
   tyClDeclLName, tyClDeclTyVars,
   hsDeclHasCusk, famResultKindSignature,
   FamilyDecl(..), LFamilyDecl,
-  FunDep(..),
+  FunDep(..), ppDataDefnHeader,
+  pp_vanilla_decl_head,
 
   -- ** Instance declarations
   InstDecl(..), LInstDecl, FamilyInfo(..),
@@ -69,7 +67,7 @@ module GHC.Hs.Decls (
   -- ** @default@ declarations
   DefaultDecl(..), LDefaultDecl,
   -- ** Template haskell declaration splice
-  SpliceExplicitFlag(..),
+  SpliceDecoration(..),
   SpliceDecl(..), LSpliceDecl,
   -- ** Foreign function interface declarations
   ForeignDecl(..), LForeignDecl, ForeignImport(..), ForeignExport(..),
@@ -104,7 +102,7 @@ import GHC.Prelude
 
 import Language.Haskell.Syntax.Decls
 
-import {-# SOURCE #-} GHC.Hs.Expr ( pprExpr, pprSpliceDecl )
+import {-# SOURCE #-} GHC.Hs.Expr ( pprExpr, pprUntypedSplice )
         -- Because Expr imports Decls via HsBracket
 
 import GHC.Hs.Binds
@@ -120,16 +118,19 @@ import GHC.Types.Name.Set
 import GHC.Types.Fixity
 
 -- others:
+import GHC.Utils.Misc (count)
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
 import GHC.Types.SrcLoc
 import GHC.Types.SourceText
 import GHC.Core.Type
+import GHC.Core.TyCon (TyConFlavour(NewtypeFlavour,DataTypeFlavour))
 import GHC.Types.ForeignCall
 
 import GHC.Data.Bag
 import GHC.Data.Maybe
 import Data.Data (Data)
+import Data.Foldable (toList)
 
 {-
 ************************************************************************
@@ -186,6 +187,10 @@ partitionBindsAndSigs = go
         DocD _ d
           -> (bs, ss, ts, tfis, dfis, L l d : docs)
         _ -> pprPanic "partitionBindsAndSigs" (ppr decl)
+
+-- Okay, I need to reconstruct the document comments, but for now:
+instance Outputable (DocDecl name) where
+  ppr _ = text "<document comment>"
 
 type instance XCHsGroup (GhcPass _) = NoExtField
 type instance XXHsGroup (GhcPass _) = DataConCantHappen
@@ -313,7 +318,13 @@ type instance XXSpliceDecl     (GhcPass _) = DataConCantHappen
 
 instance OutputableBndrId p
        => Outputable (SpliceDecl (GhcPass p)) where
-   ppr (SpliceDecl _ (L _ e) f) = pprSpliceDecl e f
+  ppr (SpliceDecl _ (L _ e) DollarSplice) = pprUntypedSplice True Nothing e
+  ppr (SpliceDecl _ (L _ e) BareSplice)   = pprUntypedSplice False Nothing e
+
+instance Outputable SpliceDecoration where
+  ppr x = text $ show x
+
+
 
 {-
 ************************************************************************
@@ -333,7 +344,14 @@ type instance XDataDecl     GhcPs = EpAnn [AddEpAnn]
 type instance XDataDecl     GhcRn = DataDeclRn
 type instance XDataDecl     GhcTc = DataDeclRn
 
-type instance XClassDecl    GhcPs = (EpAnn [AddEpAnn], AnnSortKey, LayoutInfo)  -- See Note [Class LayoutInfo]
+data DataDeclRn = DataDeclRn
+             { tcdDataCusk :: Bool    -- ^ does this have a CUSK?
+                 -- See Note [CUSKs: complete user-supplied kind signatures]
+             , tcdFVs      :: NameSet }
+  deriving Data
+
+type instance XClassDecl    GhcPs = (EpAnn [AddEpAnn], AnnSortKey)
+
   -- TODO:AZ:tidy up AnnSortKey above
 type instance XClassDecl    GhcRn = NameSet -- FVs
 type instance XClassDecl    GhcTc = NameSet -- FVs
@@ -342,6 +360,17 @@ type instance XXTyClDecl    (GhcPass _) = DataConCantHappen
 
 type instance XCTyFamInstDecl (GhcPass _) = EpAnn [AddEpAnn]
 type instance XXTyFamInstDecl (GhcPass _) = DataConCantHappen
+
+------------- Pretty printing FamilyDecls -----------
+
+pprFlavour :: FamilyInfo pass -> SDoc
+pprFlavour DataFamily            = text "data"
+pprFlavour OpenTypeFamily        = text "type"
+pprFlavour (ClosedTypeFamily {}) = text "type"
+
+instance Outputable (FamilyInfo pass) where
+  ppr info = pprFlavour info <+> text "family"
+
 
 -- Dealing with names
 
@@ -360,6 +389,21 @@ tyClDeclLName (FamDecl { tcdFam = fd })     = familyDeclLName fd
 tyClDeclLName (SynDecl { tcdLName = ln })   = ln
 tyClDeclLName (DataDecl { tcdLName = ln })  = ln
 tyClDeclLName (ClassDecl { tcdLName = ln }) = ln
+
+countTyClDecls :: [TyClDecl pass] -> (Int, Int, Int, Int, Int)
+        -- class, synonym decls, data, newtype, family decls
+countTyClDecls decls
+ = (count isClassDecl    decls,
+    count isSynDecl      decls,  -- excluding...
+    count isDataTy       decls,  -- ...family...
+    count isNewTy        decls,  -- ...instances
+    count isFamilyDecl   decls)
+ where
+   isDataTy DataDecl{ tcdDataDefn = HsDataDefn { dd_cons = DataTypeCons _ _ } } = True
+   isDataTy _                                                       = False
+
+   isNewTy DataDecl{ tcdDataDefn = HsDataDefn { dd_cons = NewTypeCon _ } } = True
+   isNewTy _                                                      = False
 
 -- FIXME: tcdName is commonly used by both GHC and third-party tools, so it
 -- needs to be polymorphic in the pass
@@ -441,10 +485,11 @@ pp_vanilla_decl_head thing (HsQTvs { hsq_explicit = tyvars }) fixity context
  = hsep [pprLHsContext context, pp_tyvars tyvars]
   where
     pp_tyvars (varl:varsr)
-      | fixity == Infix && length varsr > 1
+      | fixity == Infix, varr:varsr'@(_:_) <- varsr
+         -- If varsr has at least 2 elements, parenthesize.
          = hsep [char '(',ppr (unLoc varl), pprInfixOcc (unLoc thing)
-                , (ppr.unLoc) (head varsr), char ')'
-                , hsep (map (ppr.unLoc) (tail varsr))]
+                , (ppr.unLoc) varr, char ')'
+                , hsep (map (ppr.unLoc) varsr')]
       | fixity == Infix
          = hsep [ppr (unLoc varl), pprInfixOcc (unLoc thing)
          , hsep (map (ppr.unLoc) varsr)]
@@ -457,8 +502,8 @@ pprTyClDeclFlavour (ClassDecl {})   = text "class"
 pprTyClDeclFlavour (SynDecl {})     = text "type"
 pprTyClDeclFlavour (FamDecl { tcdFam = FamilyDecl { fdInfo = info }})
   = pprFlavour info <+> text "family"
-pprTyClDeclFlavour (DataDecl { tcdDataDefn = HsDataDefn { dd_ND = nd } })
-  = ppr nd
+pprTyClDeclFlavour (DataDecl { tcdDataDefn = HsDataDefn { dd_cons = nd } })
+  = ppr (dataDefnConsNewOrData nd)
 
 instance OutputableBndrId p => Outputable (FunDep (GhcPass p)) where
   ppr = pprFunDep
@@ -590,6 +635,15 @@ instance OutputableBndrId p
             Just (L _ via@ViaStrategy{}) -> (empty, ppr via)
             _                            -> (ppDerivStrategy dcs, empty)
 
+-- | A short description of a @DerivStrategy'@.
+derivStrategyName :: DerivStrategy a -> SDoc
+derivStrategyName = text . go
+  where
+    go StockStrategy    {} = "stock"
+    go AnyclassStrategy {} = "anyclass"
+    go NewtypeStrategy  {} = "newtype"
+    go ViaStrategy      {} = "via"
+
 type instance XDctSingle (GhcPass _) = NoExtField
 type instance XDctMulti  (GhcPass _) = NoExtField
 type instance XXDerivClauseTys (GhcPass _) = DataConCantHappen
@@ -612,9 +666,10 @@ type instance XConDeclH98  (GhcPass _) = EpAnn [AddEpAnn]
 
 type instance XXConDecl (GhcPass _) = DataConCantHappen
 
+-- Codomain could be 'NonEmpty', but at the moment all users need a list.
 getConNames :: ConDecl GhcRn -> [LocatedN Name]
 getConNames ConDeclH98  {con_name  = name}  = [name]
-getConNames ConDeclGADT {con_names = names} = names
+getConNames ConDeclGADT {con_names = names} = toList names
 
 -- | Return @'Just' fields@ if a data constructor declaration uses record
 -- syntax (i.e., 'RecCon'), where @fields@ are the field selectors.
@@ -632,28 +687,41 @@ hsConDeclTheta :: Maybe (LHsContext (GhcPass p)) -> [LHsType (GhcPass p)]
 hsConDeclTheta Nothing            = []
 hsConDeclTheta (Just (L _ theta)) = theta
 
-pp_data_defn :: (OutputableBndrId p)
-                  => (Maybe (LHsContext (GhcPass p)) -> SDoc)   -- Printing the header
-                  -> HsDataDefn (GhcPass p)
-                  -> SDoc
-pp_data_defn pp_hdr (HsDataDefn { dd_ND = new_or_data, dd_ctxt = context
-                                , dd_cType = mb_ct
-                                , dd_kindSig = mb_sig
-                                , dd_cons = condecls, dd_derivs = derivings })
-  | null condecls
-  = ppr new_or_data <+> pp_ct <+> pp_hdr context <+> pp_sig
-    <+> pp_derivings derivings
-
-  | otherwise
-  = hang (ppr new_or_data <+> pp_ct  <+> pp_hdr context <+> pp_sig)
-       2 (pp_condecls condecls $$ pp_derivings derivings)
+ppDataDefnHeader
+ :: (OutputableBndrId p)
+ => (Maybe (LHsContext (GhcPass p)) -> SDoc)   -- Printing the header
+ -> HsDataDefn (GhcPass p)
+ -> SDoc
+ppDataDefnHeader pp_hdr HsDataDefn
+  { dd_ctxt = context
+  , dd_cType = mb_ct
+  , dd_kindSig = mb_sig
+  , dd_cons = condecls }
+  = pp_type <+> ppr (dataDefnConsNewOrData condecls) <+> pp_ct <+> pp_hdr context <+> pp_sig
   where
+    pp_type
+      | isTypeDataDefnCons condecls = text "type"
+      | otherwise = empty
     pp_ct = case mb_ct of
                Nothing   -> empty
                Just ct -> ppr ct
     pp_sig = case mb_sig of
                Nothing   -> empty
                Just kind -> dcolon <+> ppr kind
+
+pp_data_defn :: (OutputableBndrId p)
+                  => (Maybe (LHsContext (GhcPass p)) -> SDoc)   -- Printing the header
+                  -> HsDataDefn (GhcPass p)
+                  -> SDoc
+pp_data_defn pp_hdr defn@HsDataDefn
+  { dd_cons = condecls
+  , dd_derivs = derivings }
+  | null condecls
+  = ppDataDefnHeader pp_hdr defn <+> pp_derivings derivings
+
+  | otherwise
+  = hang (ppDataDefnHeader pp_hdr defn) 2 (pp_condecls (toList condecls) $$ pp_derivings derivings)
+  where
     pp_derivings ds = vcat (map ppr ds)
 
 instance OutputableBndrId p
@@ -667,15 +735,10 @@ instance OutputableBndrId p
 
 pp_condecls :: forall p. OutputableBndrId p => [LConDecl (GhcPass p)] -> SDoc
 pp_condecls cs
-  | gadt_syntax                  -- In GADT syntax
+  | anyLConIsGadt cs             -- In GADT syntax
   = hang (text "where") 2 (vcat (map ppr cs))
   | otherwise                    -- In H98 syntax
   = equals <+> sep (punctuate (text " |") (map ppr cs))
-  where
-    gadt_syntax = case cs of
-      []                      -> False
-      (L _ ConDeclH98{}  : _) -> False
-      (L _ ConDeclGADT{} : _) -> True
 
 instance (OutputableBndrId p) => Outputable (ConDecl (GhcPass p)) where
     ppr = pprConDecl
@@ -703,7 +766,7 @@ pprConDecl (ConDeclH98 { con_name = L _ con
 pprConDecl (ConDeclGADT { con_names = cons, con_bndrs = L _ outer_bndrs
                         , con_mb_cxt = mcxt, con_g_args = args
                         , con_res_ty = res_ty, con_doc = doc })
-  = pprMaybeWithDoc doc $ ppr_con_names cons <+> dcolon
+  = pprMaybeWithDoc doc $ ppr_con_names (toList cons) <+> dcolon
     <+> (sep [pprHsOuterSigTyVarBndrs outer_bndrs <+> pprLHsContext mcxt,
               sep (ppr_args args ++ [ppr res_ty]) ])
   where
@@ -797,9 +860,9 @@ pprDataFamInstDecl top_lvl (DataFamInstDecl { dfid_eqn =
                   -- pp_data_defn pretty-prints the kind sig. See #14817.
 
 pprDataFamInstFlavour :: DataFamInstDecl (GhcPass p) -> SDoc
-pprDataFamInstFlavour (DataFamInstDecl { dfid_eqn =
-                       (FamEqn { feqn_rhs = HsDataDefn { dd_ND = nd }})})
-  = ppr nd
+pprDataFamInstFlavour DataFamInstDecl
+  { dfid_eqn = FamEqn { feqn_rhs = HsDataDefn { dd_cons = cons }}}
+  = ppr (dataDefnConsNewOrData cons)
 
 pprHsFamInstLHS :: (OutputableBndrId p)
    => IdP (GhcPass p)
@@ -869,6 +932,23 @@ instDeclDataFamInsts inst_decls
       = map unLoc fam_insts
     do_one (L _ (DataFamInstD { dfid_inst = fam_inst }))      = [fam_inst]
     do_one (L _ (TyFamInstD {}))                              = []
+
+-- | Convert a 'NewOrData' to a 'TyConFlavour'
+newOrDataToFlavour :: NewOrData -> TyConFlavour
+newOrDataToFlavour NewType  = NewtypeFlavour
+newOrDataToFlavour DataType = DataTypeFlavour
+
+instance Outputable NewOrData where
+  ppr NewType  = text "newtype"
+  ppr DataType = text "data"
+
+-- At the moment we only call this with @f = '[]'@ and @f = 'DataDefnCons'@.
+anyLConIsGadt :: Foldable f => f (GenLocated l (ConDecl pass)) -> Bool
+anyLConIsGadt xs = case toList xs of
+    L _ ConDeclGADT {} : _ -> True
+    _ -> False
+{-# SPECIALIZE anyLConIsGadt :: [GenLocated l (ConDecl pass)] -> Bool #-}
+{-# SPECIALIZE anyLConIsGadt :: DataDefnCons (GenLocated l (ConDecl pass)) -> Bool #-}
 
 {-
 ************************************************************************
@@ -986,6 +1066,14 @@ type instance XForeignExport   GhcTc = Coercion
 
 type instance XXForeignDecl    (GhcPass _) = DataConCantHappen
 
+type instance XCImport (GhcPass _) = Located SourceText -- original source text for the C entity
+type instance XXForeignImport  (GhcPass _) = DataConCantHappen
+
+type instance XCExport (GhcPass _) = Located SourceText -- original source text for the C entity
+type instance XXForeignExport  (GhcPass _) = DataConCantHappen
+
+-- pretty printing of foreign declarations
+
 instance OutputableBndrId p
        => Outputable (ForeignDecl (GhcPass p)) where
   ppr (ForeignImport { fd_name = n, fd_sig_ty = ty, fd_fi = fimport })
@@ -995,6 +1083,40 @@ instance OutputableBndrId p
     hang (text "foreign export" <+> ppr fexport <+> ppr n)
        2 (dcolon <+> ppr ty)
 
+instance OutputableBndrId p
+       => Outputable (ForeignImport (GhcPass p)) where
+  ppr (CImport (L _ srcText) cconv safety mHeader spec) =
+    ppr cconv <+> ppr safety
+      <+> pprWithSourceText srcText (pprCEntity spec "")
+    where
+      pp_hdr = case mHeader of
+               Nothing -> empty
+               Just (Header _ header) -> ftext header
+
+      pprCEntity (CLabel lbl) _ =
+        doubleQuotes $ text "static" <+> pp_hdr <+> char '&' <> ppr lbl
+      pprCEntity (CFunction (StaticTarget st _lbl _ isFun)) src =
+        if dqNeeded then doubleQuotes ce else empty
+          where
+            dqNeeded = (take 6 src == "static")
+                    || isJust mHeader
+                    || not isFun
+                    || st /= NoSourceText
+            ce =
+                  -- We may need to drop leading spaces first
+                  (if take 6 src == "static" then text "static" else empty)
+              <+> pp_hdr
+              <+> (if isFun then empty else text "value")
+              <+> (pprWithSourceText st empty)
+      pprCEntity (CFunction DynamicTarget) _ =
+        doubleQuotes $ text "dynamic"
+      pprCEntity CWrapper _ = doubleQuotes $ text "wrapper"
+
+instance OutputableBndrId p
+       => Outputable (ForeignExport (GhcPass p)) where
+  ppr (CExport _ (L _ (CExportStatic _ lbl cconv))) =
+    ppr cconv <+> char '"' <> ppr lbl <> char '"'
+
 {-
 ************************************************************************
 *                                                                      *
@@ -1003,19 +1125,20 @@ instance OutputableBndrId p
 ************************************************************************
 -}
 
-type instance XCRuleDecls    GhcPs = EpAnn [AddEpAnn]
-type instance XCRuleDecls    GhcRn = NoExtField
-type instance XCRuleDecls    GhcTc = NoExtField
+type instance XCRuleDecls    GhcPs = (EpAnn [AddEpAnn], SourceText)
+type instance XCRuleDecls    GhcRn = SourceText
+type instance XCRuleDecls    GhcTc = SourceText
 
 type instance XXRuleDecls    (GhcPass _) = DataConCantHappen
 
-type instance XHsRule       GhcPs = EpAnn HsRuleAnn
-type instance XHsRule       GhcRn = HsRuleRn
-type instance XHsRule       GhcTc = HsRuleRn
+type instance XHsRule       GhcPs = (EpAnn HsRuleAnn, SourceText)
+type instance XHsRule       GhcRn = (HsRuleRn, SourceText)
+type instance XHsRule       GhcTc = (HsRuleRn, SourceText)
+
+data HsRuleRn = HsRuleRn NameSet NameSet -- Free-vars from the LHS and RHS
+  deriving Data
 
 type instance XXRuleDecl    (GhcPass _) = DataConCantHappen
-
-type instance Anno (SourceText, RuleName) = SrcAnn NoEpAnns
 
 data HsRuleAnn
   = HsRuleAnn
@@ -1036,19 +1159,24 @@ type instance XRuleBndrSig  (GhcPass _) = EpAnn [AddEpAnn]
 type instance XXRuleBndr    (GhcPass _) = DataConCantHappen
 
 instance (OutputableBndrId p) => Outputable (RuleDecls (GhcPass p)) where
-  ppr (HsRules { rds_src = st
+  ppr (HsRules { rds_ext = ext
                , rds_rules = rules })
     = pprWithSourceText st (text "{-# RULES")
           <+> vcat (punctuate semi (map ppr rules)) <+> text "#-}"
+              where st = case ghcPass @p of
+                           GhcPs | (_, st) <- ext -> st
+                           GhcRn -> ext
+                           GhcTc -> ext
 
 instance (OutputableBndrId p) => Outputable (RuleDecl (GhcPass p)) where
-  ppr (HsRule { rd_name = name
+  ppr (HsRule { rd_ext  = ext
+              , rd_name = name
               , rd_act  = act
               , rd_tyvs = tys
               , rd_tmvs = tms
               , rd_lhs  = lhs
               , rd_rhs  = rhs })
-        = sep [pprFullRuleName name <+> ppr act,
+        = sep [pprFullRuleName st name <+> ppr act,
                nest 4 (pp_forall_ty tys <+> pp_forall_tm tys
                                         <+> pprExpr (unLoc lhs)),
                nest 6 (equals <+> pprExpr (unLoc rhs)) ]
@@ -1057,10 +1185,18 @@ instance (OutputableBndrId p) => Outputable (RuleDecl (GhcPass p)) where
           pp_forall_ty (Just qtvs) = forAllLit <+> fsep (map ppr qtvs) <> dot
           pp_forall_tm Nothing | null tms = empty
           pp_forall_tm _ = forAllLit <+> fsep (map ppr tms) <> dot
+          st = case ghcPass @p of
+                 GhcPs | (_, st) <- ext -> st
+                 GhcRn | (_, st) <- ext -> st
+                 GhcTc | (_, st) <- ext -> st
 
 instance (OutputableBndrId p) => Outputable (RuleBndr (GhcPass p)) where
    ppr (RuleBndr _ name) = ppr name
    ppr (RuleBndrSig _ name ty) = parens (ppr name <> dcolon <> ppr ty)
+
+pprFullRuleName :: SourceText -> GenLocated a (RuleName) -> SDoc
+pprFullRuleName st (L _ n) = pprWithSourceText st (doubleQuotes $ ftext n)
+
 
 {-
 ************************************************************************
@@ -1070,9 +1206,9 @@ instance (OutputableBndrId p) => Outputable (RuleBndr (GhcPass p)) where
 ************************************************************************
 -}
 
-type instance XWarnings      GhcPs = EpAnn [AddEpAnn]
-type instance XWarnings      GhcRn = NoExtField
-type instance XWarnings      GhcTc = NoExtField
+type instance XWarnings      GhcPs = (EpAnn [AddEpAnn], SourceText)
+type instance XWarnings      GhcRn = SourceText
+type instance XWarnings      GhcTc = SourceText
 
 type instance XXWarnDecls    (GhcPass _) = DataConCantHappen
 
@@ -1082,9 +1218,13 @@ type instance XXWarnDecl    (GhcPass _) = DataConCantHappen
 
 instance OutputableBndrId p
         => Outputable (WarnDecls (GhcPass p)) where
-    ppr (Warnings _ (SourceText src) decls)
+    ppr (Warnings ext decls)
       = text src <+> vcat (punctuate comma (map ppr decls)) <+> text "#-}"
-    ppr (Warnings _ NoSourceText _decls) = panic "WarnDecls"
+      where src = case ghcPass @p of
+              GhcPs | (_, SourceText src) <- ext -> src
+              GhcRn | SourceText src <- ext -> src
+              GhcTc | SourceText src <- ext -> src
+              _ -> panic "WarnDecls"
 
 instance OutputableBndrId p
        => Outputable (WarnDecl (GhcPass p)) where
@@ -1100,11 +1240,11 @@ instance OutputableBndrId p
 ************************************************************************
 -}
 
-type instance XHsAnnotation (GhcPass _) = EpAnn AnnPragma
+type instance XHsAnnotation (GhcPass _) = (EpAnn AnnPragma, SourceText)
 type instance XXAnnDecl     (GhcPass _) = DataConCantHappen
 
 instance (OutputableBndrId p) => Outputable (AnnDecl (GhcPass p)) where
-    ppr (HsAnnotation _ _ provenance expr)
+    ppr (HsAnnotation _ provenance expr)
       = hsep [text "{-#", pprAnnProvenance provenance, pprExpr (unLoc expr), text "#-}"]
 
 pprAnnProvenance :: OutputableBndrId p => AnnProvenance (GhcPass p) -> SDoc
@@ -1185,3 +1325,6 @@ type instance Anno (WarnDecl (GhcPass p)) = SrcSpanAnnA
 type instance Anno (AnnDecl (GhcPass p)) = SrcSpanAnnA
 type instance Anno (RoleAnnotDecl (GhcPass p)) = SrcSpanAnnA
 type instance Anno (Maybe Role) = SrcAnn NoEpAnns
+type instance Anno CCallConv   = SrcSpan
+type instance Anno Safety      = SrcSpan
+type instance Anno CExportSpec = SrcSpan

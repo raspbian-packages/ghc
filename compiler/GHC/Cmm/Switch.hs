@@ -8,11 +8,11 @@ module GHC.Cmm.Switch (
      switchTargetsToList, eqSwitchTargetWith,
 
      SwitchPlan(..),
-     backendSupportsSwitch,
+     backendHasNativeSwitch,
      createSwitchPlan,
   ) where
 
-import GHC.Prelude
+import GHC.Prelude hiding (head)
 
 import GHC.Utils.Outputable
 import GHC.Driver.Backend
@@ -20,8 +20,7 @@ import GHC.Utils.Panic
 import GHC.Cmm.Dataflow.Label (Label)
 
 import Data.Maybe
-import Data.List (groupBy)
-import Data.Function (on)
+import Data.List.NonEmpty (NonEmpty (..), groupWith, head)
 import qualified Data.Map as M
 
 -- Note [Cmm Switches, the general plan]
@@ -201,11 +200,11 @@ switchTargetsToList (SwitchTargets _ _ mbdef branches)
 
 -- | Groups cases with equal targets, suitable for pretty-printing to a
 -- c-like switch statement with fall-through semantics.
-switchTargetsFallThrough :: SwitchTargets -> ([([Integer], Label)], Maybe Label)
+switchTargetsFallThrough :: SwitchTargets -> ([(NonEmpty Integer, Label)], Maybe Label)
 switchTargetsFallThrough (SwitchTargets _ _ mbdef branches) = (groups, mbdef)
   where
-    groups = map (\xs -> (map fst xs, snd (head xs))) $
-             groupBy ((==) `on` snd) $
+    groups = fmap (\xs -> (fmap fst xs, snd (head xs))) $
+             groupWith snd $
              M.toList branches
 
 -- | Custom equality helper, needed for "GHC.Cmm.CommonBlockElim"
@@ -312,13 +311,6 @@ and slowed down all other cases making it not worthwhile.
 -}
 
 
--- | Does the backend support switch out of the box? Then leave this to the
--- backend!
-backendSupportsSwitch :: Backend -> Bool
-backendSupportsSwitch ViaC = True
-backendSupportsSwitch LLVM = True
-backendSupportsSwitch _    = False
-
 -- | This function creates a SwitchPlan from a SwitchTargets value, breaking it
 -- down into smaller pieces suitable for code generation.
 createSwitchPlan :: SwitchTargets -> SwitchPlan
@@ -372,7 +364,7 @@ breakTooSmall m
 ---  Step 3: Fill in the blanks
 ---
 
--- | A FlatSwitchPlan is a list of SwitchPlans, with an integer inbetween every
+-- | A FlatSwitchPlan is a list of SwitchPlans, with an integer in between every
 -- two entries, dividing the range.
 -- So if we have (abusing list syntax) [plan1,n,plan2], then we use plan1 if
 -- the expression is < n, and plan2 otherwise.

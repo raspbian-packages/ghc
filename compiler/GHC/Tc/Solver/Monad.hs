@@ -8,14 +8,14 @@
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE ViewPatterns #-}
 
-{-# OPTIONS_GHC -Wno-incomplete-record-updates -Wno-orphans #-}
+{-# OPTIONS_GHC -Wno-orphans #-}
 
 -- | Monadic definitions for the constraint solver
 module GHC.Tc.Solver.Monad (
 
     -- The TcS monad
     TcS, runTcS, runTcSEarlyAbort, runTcSWithEvBinds, runTcSInerts,
-    failTcS, warnTcS, addErrTcS, wrapTcS,
+    failTcS, warnTcS, addErrTcS, wrapTcS, ctLocWarnTcS,
     runTcSEqualities,
     nestTcS, nestImplicTcS, setEvBindsTcS,
     emitImplicationTcS, emitTvImplicationTcS,
@@ -25,7 +25,7 @@ module GHC.Tc.Solver.Monad (
     updWorkListTcS,
     pushLevelNoWorkList,
 
-    runTcPluginTcS, addUsedGRE, addUsedGREs, keepAlive,
+    runTcPluginTcS, recordUsedGREs,
     matchGlobalInst, TcM.ClsInstResult(..),
 
     QCInst(..),
@@ -89,7 +89,7 @@ module GHC.Tc.Solver.Monad (
     instDFunType,                              -- Instantiation
 
     -- MetaTyVars
-    newFlexiTcSTy, instFlexi, instFlexiX,
+    newFlexiTcSTy, instFlexiX,
     cloneMetaTyVar,
     tcInstSkolTyVarsX,
 
@@ -131,27 +131,29 @@ import qualified GHC.Tc.Instance.Class as TcM( matchGlobalInst, ClsInstResult(..
 import qualified GHC.Tc.Utils.Env      as TcM
        ( checkWellStaged, tcGetDefaultTys, tcLookupClass, tcLookupId, topIdLvl
        , tcInitTidyEnv )
+
+import GHC.Driver.Session
+
 import GHC.Tc.Instance.Class( InstanceWhat(..), safeOverlap, instanceReturnsDictCon )
 import GHC.Tc.Utils.TcType
-import GHC.Driver.Session
+import GHC.Tc.Solver.Types
+import GHC.Tc.Solver.InertSet
+import GHC.Tc.Types.Evidence
+import GHC.Tc.Errors.Types
+
 import GHC.Core.Type
 import qualified GHC.Core.TyCo.Rep as Rep  -- this needs to be used only very locally
 import GHC.Core.Coercion
 import GHC.Core.Reduction
-
-import GHC.Tc.Solver.Types
-import GHC.Tc.Solver.InertSet
-
-import GHC.Tc.Types.Evidence
 import GHC.Core.Class
 import GHC.Core.TyCon
-import GHC.Tc.Errors.Types
-import GHC.Types.Error ( mkPlainError, noHints )
 
+import GHC.Types.Error ( mkPlainError, noHints )
 import GHC.Types.Name
 import GHC.Types.TyThing
+import GHC.Types.Name.Reader
+
 import GHC.Unit.Module ( HasModule, getModule, extractModule )
-import GHC.Types.Name.Reader ( GlobalRdrEnv, GlobalRdrElt )
 import qualified GHC.Rename.Env as TcM
 import GHC.Types.Var
 import GHC.Types.Var.Env
@@ -173,7 +175,8 @@ import Control.Monad
 import GHC.Utils.Monad
 import Data.IORef
 import GHC.Exts (oneShot)
-import Data.List ( mapAccumL, partition, find )
+import Data.List ( mapAccumL, partition )
+import Data.Foldable
 
 #if defined(DEBUG)
 import GHC.Data.Graph.Directed
@@ -220,21 +223,17 @@ addInertForAll new_qci
 
 {- Note [Do not add duplicate quantified instances]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Consider this (#15244):
+As an optimisation, we avoid adding duplicate quantified instances to the
+inert set; we use a simple duplicate check using tcEqType for simplicity,
+even though it doesn't account for superficial differences, e.g. it will count
+the following two constraints as different (#22223):
 
-  f :: (C g, D g) => ....
-  class S g => C g where ...
-  class S g => D g where ...
-  class (forall a. Eq a => Eq (g a)) => S g where ...
+  - forall a b. C a b
+  - forall b a. C a b
 
-Then in f's RHS there are two identical quantified constraints
-available, one via the superclasses of C and one via the superclasses
-of D.  The two are identical, and it seems wrong to reject the program
-because of that. But without doing duplicate-elimination we will have
-two matching QCInsts when we try to solve constraints arising from f's
-RHS.
-
-The simplest thing is simply to eliminate duplicates, which we do here.
+The main logic that allows us to pick local instances, even in the presence of
+duplicates, is explained in Note [Use only the best matching quantified constraint]
+in GHC.Tc.Solver.Interact.
 -}
 
 {- *********************************************************************
@@ -674,8 +673,18 @@ lookupInInerts :: CtLoc -> TcPredType -> TcS (Maybe CtEvidence)
 lookupInInerts loc pty
   | ClassPred cls tys <- classifyPredType pty
   = do { inerts <- getTcSInerts
-       ; return (lookupSolvedDict inerts loc cls tys `mplus`
-                 fmap ctEvidence (lookupInertDict (inert_cans inerts) loc cls tys)) }
+       ; let mb_solved = lookupSolvedDict inerts loc cls tys
+             mb_inert  = fmap ctEvidence (lookupInertDict (inert_cans inerts) loc cls tys)
+       ; return $ do -- Maybe monad
+            found_ev <- mb_solved `mplus` mb_inert
+
+            -- We're about to "solve" the wanted we're looking up, so we
+            -- must make sure doing so wouldn't run afoul of
+            -- Note [Solving superclass constraints] in GHC.Tc.TyCl.Instance.
+            -- Forgetting this led to #20666.
+            guard $ not (prohibitedSuperClassSolve (ctEvLoc found_ev) loc)
+
+            return found_ev }
   | otherwise -- NB: No caching for equalities, IPs, holes, or errors
   = return Nothing
 
@@ -785,7 +794,11 @@ data TcSEnv
     }
 
 ---------------
-newtype TcS a = TcS { unTcS :: TcSEnv -> TcM a } deriving (Functor)
+newtype TcS a = TcS { unTcS :: TcSEnv -> TcM a }
+  deriving (Functor)
+
+instance MonadFix TcS where
+  mfix k = TcS $ \env -> mfix (\x -> unTcS (k x) env)
 
 -- | Smart constructor for 'TcS', as describe in Note [The one-shot state
 -- monad trick] in "GHC.Utils.Monad".
@@ -843,6 +856,10 @@ failTcS      = wrapTcS . TcM.failWith
 warnTcS msg  = wrapTcS (TcM.addDiagnostic msg)
 addErrTcS    = wrapTcS . TcM.addErr
 panicTcS doc = pprPanic "GHC.Tc.Solver.Canonical" doc
+
+-- | Emit a warning within the 'TcS' monad at the location given by the 'CtLoc'.
+ctLocWarnTcS :: CtLoc -> TcRnMessage -> TcS ()
+ctLocWarnTcS loc msg = wrapTcS $ TcM.setCtLocM loc $ TcM.addDiagnostic msg
 
 traceTcS :: String -> SDoc -> TcS ()
 traceTcS herald doc = wrapTcS (TcM.traceTc herald doc)
@@ -902,7 +919,7 @@ runTcS tcs
        ; ev_binds <- TcM.getTcEvBindsMap ev_binds_var
        ; return (res, ev_binds) }
 
--- | This variant of 'runTcS' will immediatley fail upon encountering an
+-- | This variant of 'runTcS' will immediately fail upon encountering an
 -- insoluble ct. See Note [Speeding up valid hole-fits]. Its one usage
 -- site does not need the ev_binds, so we do not return them.
 runTcSEarlyAbort :: TcS a -> TcM a
@@ -1365,17 +1382,22 @@ tcLookupClass c = wrapTcS $ TcM.tcLookupClass c
 tcLookupId :: Name -> TcS Id
 tcLookupId n = wrapTcS $ TcM.tcLookupId n
 
--- Setting names as used (used in the deriving of Coercible evidence)
--- Too hackish to expose it to TcS? In that case somehow extract the used
--- constructors from the result of solveInteract
-addUsedGREs :: [GlobalRdrElt] -> TcS ()
-addUsedGREs gres = wrapTcS  $ TcM.addUsedGREs gres
+-- Any use of this function is a bit suspect, because it violates the
+-- pure veneer of TcS. But it's just about warnings around unused imports
+-- and local constructors (GHC will issue fewer warnings than it otherwise
+-- might), so it's not worth losing sleep over.
+recordUsedGREs :: Bag GlobalRdrElt -> TcS ()
+recordUsedGREs gres
+  = do { wrapTcS $ TcM.addUsedGREs gre_list
+         -- If a newtype constructor was imported, don't warn about not
+         -- importing it...
+       ; wrapTcS $ traverse_ (TcM.keepAlive . greMangledName) gre_list }
+         -- ...and similarly, if a newtype constructor was defined in the same
+         -- module, don't warn about it being unused.
+         -- See Note [Tracking unused binding and imports] in GHC.Tc.Utils.
 
-addUsedGRE :: Bool -> GlobalRdrElt -> TcS ()
-addUsedGRE warn_if_deprec gre = wrapTcS $ TcM.addUsedGRE warn_if_deprec gre
-
-keepAlive :: Name -> TcS ()
-keepAlive = wrapTcS . TcM.keepAlive
+  where
+    gre_list = bagToList gres
 
 -- Various smaller utilities [TODO, maybe will be absorbed in the instance matcher]
 -- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1616,22 +1638,21 @@ newFlexiTcSTy knd = wrapTcS (TcM.newFlexiTyVarTy knd)
 cloneMetaTyVar :: TcTyVar -> TcS TcTyVar
 cloneMetaTyVar tv = wrapTcS (TcM.cloneMetaTyVar tv)
 
-instFlexi :: [TKVar] -> TcS TCvSubst
-instFlexi = instFlexiX emptyTCvSubst
-
-instFlexiX :: TCvSubst -> [TKVar] -> TcS TCvSubst
+instFlexiX :: Subst -> [TKVar] -> TcS Subst
 instFlexiX subst tvs
   = wrapTcS (foldlM instFlexiHelper subst tvs)
 
-instFlexiHelper :: TCvSubst -> TKVar -> TcM TCvSubst
+instFlexiHelper :: Subst -> TKVar -> TcM Subst
+-- Makes fresh tyvar, extends the substitution, and the in-scope set
 instFlexiHelper subst tv
   = do { uniq <- TcM.newUnique
        ; details <- TcM.newMetaDetails TauTv
-       ; let name = setNameUnique (tyVarName tv) uniq
-             kind = substTyUnchecked subst (tyVarKind tv)
-             ty'  = mkTyVarTy (mkTcTyVar name kind details)
-       ; TcM.traceTc "instFlexi" (ppr ty')
-       ; return (extendTvSubst subst tv ty') }
+       ; let name   = setNameUnique (tyVarName tv) uniq
+             kind   = substTyUnchecked subst (tyVarKind tv)
+             tv'    = mkTcTyVar name kind details
+             subst' = extendTvSubstWithClone subst tv tv'
+       ; TcM.traceTc "instFlexi" (ppr tv')
+       ; return (extendTvSubst subst' tv (mkTyVarTy tv')) }
 
 matchGlobalInst :: DynFlags
                 -> Bool      -- True <=> caller is the short-cut solver
@@ -1640,7 +1661,7 @@ matchGlobalInst :: DynFlags
 matchGlobalInst dflags short_cut cls tys
   = wrapTcS (TcM.matchGlobalInst dflags short_cut cls tys)
 
-tcInstSkolTyVarsX :: SkolemInfo -> TCvSubst -> [TyVar] -> TcS (TCvSubst, [TcTyVar])
+tcInstSkolTyVarsX :: SkolemInfo -> Subst -> [TyVar] -> TcS (Subst, [TcTyVar])
 tcInstSkolTyVarsX skol_info subst tvs = wrapTcS $ TcM.tcInstSkolTyVarsX skol_info subst tvs
 
 -- Creating and setting evidence variables and CtFlavors
@@ -1691,7 +1712,7 @@ setWantedEvTerm (HoleDest hole) tm
   = -- See Note [Yukky eq_sel for a HoleDest]
     do { let co_var = coHoleCoVar hole
        ; setEvBind (mkWantedEvBind co_var tm)
-       ; fillCoercionHole hole (mkTcCoVarCo co_var) }
+       ; fillCoercionHole hole (mkCoVarCo co_var) }
 
 setWantedEvTerm (EvVarDest ev_id) tm
   = setEvBind (mkWantedEvBind ev_id tm)
@@ -1875,7 +1896,7 @@ solverDepthError loc ty
        ; env0 <- TcM.tcInitTidyEnv
        ; let tidy_env     = tidyFreeTyCoVars env0 (tyCoVarsOfTypeList ty)
              tidy_ty      = tidyType tidy_env ty
-             msg = TcRnUnknownMessage $ mkPlainError noHints $
+             msg = mkTcRnUnknownMessage $ mkPlainError noHints $
                vcat [ text "Reduction stack overflow; size =" <+> ppr depth
                       , hang (text "When simplifying the following type:")
                            2 (ppr tidy_ty)
@@ -1945,7 +1966,7 @@ breakTyEqCycle_maybe ev cte_result lhs rhs
                               -- causing trouble? See Detail (5) of Note.
       = do { let (fun_args, extra_args) = splitAt (tyConArity tc) tys
                  fun_app                = mkTyConApp tc fun_args
-                 fun_app_kind           = tcTypeKind fun_app
+                 fun_app_kind           = typeKind fun_app
            ; fun_redn <- emit_work fun_app_kind fun_app
            ; arg_redns <- unzipRedns <$> mapM go extra_args
            ; return $ mkAppRedns fun_redn arg_redns }
@@ -2015,5 +2036,5 @@ restoreTyVarCycles is
 rewriterView :: TcType -> Maybe TcType
 rewriterView ty@(Rep.TyConApp tc _)
   | isForgetfulSynTyCon tc || (isTypeSynonymTyCon tc && not (isFamFreeTyCon tc))
-  = tcView ty
+  = coreView ty
 rewriterView _other = Nothing

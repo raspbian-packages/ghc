@@ -1,16 +1,97 @@
 # Changelog for [`base` package](http://hackage.haskell.org/package/base)
 
-## 4.17.2.0 *August 2023*
+## 4.18.2.1 *April 2024*
+  * Various documentation improvements
+
+## 4.18.2.0 *January 2024*
+  * Update to [Unicode 15.1.0](https://www.unicode.org/versions/Unicode15.1.0/).
+  * Improve String & IsString documentation.
+
+## 4.18.1.0 *September 2023*
+
+   * Add missing int64/word64-to-double/float rules ([CLC Proposal #203](https://github.com/haskell/core-libraries-committee/issues/203))
 
    * Restore `mingwex` dependency on Windows (#23309).
 
    * Fix an incorrect CPP guard on `darwin_HOST_OS`.
 
-## 4.17.1.0 *April 2023*
+## 4.18.0.0 *March 2023*
 
-   * Remove `mingwex` dependency on Windows (#22166).
-
-   * Fix inconsistency with decoding terminal input on Windows (#21488).
+  * Add `INLINABLE` pragmas to `generic*` functions in Data.OldList ([CLC proposal #129](https://github.com/haskell/core-libraries-committee/issues/130))
+  * `Foreign.C.ConstPtr.ConstrPtr` was added to encode `const`-qualified
+    pointer types in foreign declarations when using `CApiFFI` extension. ([CLC proposal #117](https://github.com/haskell/core-libraries-committee/issues/117))
+  * Add `forall a. Functor (p a)` superclass for `Bifunctor p` ([CLC proposal #91](https://github.com/haskell/core-libraries-committee/issues/91))
+  * Add Functor instances for `(,,,,) a b c d`, `(,,,,,) a b c d e` and
+    `(,,,,,) a b c d e f`.
+  * Exceptions thrown by weak pointer finalizers can now be reported by setting
+    a global exception handler, using `System.Mem.Weak.setFinalizerExceptionHandler`.
+    The default behaviour is unchanged (exceptions are ignored and not reported).
+  * `Numeric.Natural` re-exports `GHC.Natural.minusNaturalMaybe`
+    ([CLC proposal #45](https://github.com/haskell/core-libraries-committee/issues/45))
+  * Add `Data.Foldable1` and `Data.Bifoldable1`
+    ([CLC proposal #9](https://github.com/haskell/core-libraries-committee/issues/9))
+  * Add `applyWhen` to `Data.Function`
+    ([CLC proposal #71](https://github.com/haskell/core-libraries-committee/issues/71))
+  * Add functions `mapAccumM` and `forAccumM` to `Data.Traversable`
+    ([CLC proposal #65](https://github.com/haskell/core-libraries-committee/issues/65))
+  * Add default implementation of `(<>)` in terms of `sconcat` and `mempty` in
+    terms of `mconcat` ([CLC proposal #61](https://github.com/haskell/core-libraries-committee/issues/61)).
+  * `GHC.Conc.Sync.listThreads` was added, allowing the user to list the threads
+    (both running and blocked) of the program.
+  * `GHC.Conc.Sync.labelThreadByteArray#` was added, allowing the user to specify
+    a thread label by way of a `ByteArray#` containing a UTF-8-encoded string.
+    The old `GHC.Conc.Sync.labelThread` is now implemented in terms of this
+    function.
+  * `GHC.Conc.Sync.threadLabel` was added, allowing the user to query the label
+    of a given `ThreadId`.
+  * Add `inits1` and `tails1` to `Data.List.NonEmpty`
+    ([CLC proposal #67](https://github.com/haskell/core-libraries-committee/issues/67))
+  * Change default `Ord` implementation of `(>=)`, `(>)`, and `(<)` to use
+    `(<=)` instead of `compare` ([CLC proposal #24](https://github.com/haskell/core-libraries-committee/issues/24)).
+  * Export `liftA2` from `Prelude`. This means that the entirety of `Applicative`
+    is now exported from `Prelude`
+    ([CLC proposal #50](https://github.com/haskell/core-libraries-committee/issues/50),
+    [the migration
+    guide](https://github.com/haskell/core-libraries-committee/blob/main/guides/export-lifta2-prelude.md))
+  * Update to [Unicode 15.0.0](https://www.unicode.org/versions/Unicode15.0.0/).
+  * Add standard Unicode case predicates `isUpperCase` and `isLowerCase` to
+    `GHC.Unicode` and `Data.Char`. These predicates use the standard Unicode
+    case properties and are more intuitive than `isUpper` and `isLower`
+    ([CLC proposal #90](https://github.com/haskell/core-libraries-committee/issues/90))
+  * Add `Eq` and `Ord` instances for `Generically1`.
+  * Relax instances for Functor combinators; put superclass on Class1 and Class2
+    to make non-breaking ([CLC proposal #10](https://github.com/haskell/core-libraries-committee/issues/10),
+    [migration guide](https://github.com/haskell/core-libraries-committee/blob/main/guides/functor-combinator-instances-and-class1s.md))
+  * Add `gcdetails_block_fragmentation_bytes` to `GHC.Stats.GCDetails` to track heap fragmentation.
+  * `GHC.TypeLits` and `GHC.TypeNats` now export the `natSing`, `symbolSing`,
+    and `charSing` methods of `KnownNat`, `KnownSymbol`, and `KnownChar`,
+    respectively. They also export the `SNat`, `SSymbol`, and `SChar` types
+    that are used in these methods and provide an API to interact with these
+    types, per
+    [CLC proposal #85](https://github.com/haskell/core-libraries-committee/issues/85).
+  * The `Enum` instance of `Down a` now enumerates values in the opposite
+    order as the `Enum a` instance ([CLC proposal #51](https://github.com/haskell/core-libraries-committee/issues/51))
+  * `Foreign.Marshal.Pool` now uses the RTS internal arena instead of libc
+    `malloc` for allocation. It avoids the O(n) overhead of maintaining a list
+    of individually allocated pointers as well as freeing each one of them when
+    freeing a `Pool` (#14762, #18338)
+  * `Type.Reflection.Unsafe` is now marked as unsafe.
+  * Add `Data.Typeable.heqT`, a kind-heterogeneous version of
+    `Data.Typeable.eqT`
+    ([CLC proposal #99](https://github.com/haskell/core-libraries-committee/issues/99))
+  * Various declarations GHC's new info-table provenance feature have been
+    moved from `GHC.Stack.CCS` to a new `GHC.InfoProv` module:
+    * The `InfoProv`, along its `ipName`, `ipDesc`, `ipTyDesc`, `ipLabel`,
+      `ipMod`, and `ipLoc` fields, have been moved.
+    * `InfoProv` now has additional `ipSrcFile` and `ipSrcSpan` fields. `ipLoc`
+      is now a function computed from these fields.
+    * The `whereFrom` function has been moved
+  * Add functions `traceWith`, `traceShowWith`, `traceEventWith` to
+    `Debug.Trace`, per
+    [CLC proposal #36](https://github.com/haskell/core-libraries-committee/issues/36).
+  * Refactor `generalCategory` to stop very large literal string being inlined to call-sites.
+      ([CLC proposal #130](https://github.com/haskell/core-libraries-committee/issues/130))
+  * Add INLINABLE pragmas to `generic*` functions in Data.OldList ([CLC proposal #129](https://github.com/haskell/core-libraries-committee/issues/130))
 
 ## 4.17.0.0 *August 2022*
 

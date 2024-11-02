@@ -24,15 +24,17 @@ import GHC.Tc.Utils.Env
 
 import GHC.Core
 import GHC.Core.Unfold
+-- import GHC.Core.Unfold.Make
 import GHC.Core.FVs
 import GHC.Core.Tidy
-import GHC.Core.Seq     (seqBinds)
-import GHC.Core.Opt.Arity   ( exprArity, exprBotStrictness_maybe, typeArity )
+import GHC.Core.Seq         ( seqBinds )
+import GHC.Core.Opt.Arity   ( exprArity, typeArity, exprBotStrictness_maybe )
 import GHC.Core.InstEnv
-import GHC.Core.Type     ( tidyTopType, Type )
+import GHC.Core.Type     ( Type, tidyTopType )
 import GHC.Core.DataCon
 import GHC.Core.TyCon
 import GHC.Core.Class
+import GHC.Core.Opt.OccurAnal ( occurAnalyseExpr )
 
 import GHC.Iface.Tidy.StaticPtrTable
 import GHC.Iface.Env
@@ -40,7 +42,6 @@ import GHC.Iface.Env
 import GHC.Utils.Outputable
 import GHC.Utils.Misc( filterOut )
 import GHC.Utils.Panic
-import GHC.Utils.Trace
 import GHC.Utils.Logger as Logger
 import qualified GHC.Utils.Error as Err
 
@@ -51,8 +52,7 @@ import GHC.Types.Var
 import GHC.Types.Id
 import GHC.Types.Id.Make ( mkDictSelRhs )
 import GHC.Types.Id.Info
-import GHC.Types.Demand  ( isDeadEndAppSig, isNopSig, isDeadEndSig )
-import GHC.Types.Cpr     ( mkCprSig, botCpr )
+import GHC.Types.Demand  ( isDeadEndAppSig, isNopSig, nopSig, isDeadEndSig )
 import GHC.Types.Basic
 import GHC.Types.Name hiding (varName)
 import GHC.Types.Name.Set
@@ -73,7 +73,6 @@ import Data.Function
 import Data.List        ( sortBy, mapAccumL )
 import qualified Data.Set as S
 import GHC.Types.CostCentre
-import GHC.Core.Opt.OccurAnal (occurAnalyseExpr)
 
 {-
 Constructing the TypeEnv, Instances, Rules from which the
@@ -380,9 +379,10 @@ tidyProgram opts (ModGuts { mg_module           = mod
                           }) = do
 
   let implicit_binds = concatMap getImplicitBinds tcs
+      all_binds = implicit_binds ++ binds
 
-  (unfold_env, tidy_occ_env) <- chooseExternalIds opts mod binds implicit_binds imp_rules
-  let (trimmed_binds, trimmed_rules) = findExternalRules opts binds imp_rules unfold_env
+  (unfold_env, tidy_occ_env) <- chooseExternalIds opts mod all_binds imp_rules
+  let (trimmed_binds, trimmed_rules) = findExternalRules opts all_binds imp_rules unfold_env
 
   (tidy_env, tidy_binds) <- tidyTopBinds unfold_env boot_exports tidy_occ_env trimmed_binds
 
@@ -419,7 +419,7 @@ tidyProgram opts (ModGuts { mg_module           = mod
       tidy_rules     = tidyRules tidy_env trimmed_rules
 
       -- See Note [Injecting implicit bindings]
-      all_tidy_binds = implicit_binds ++ tidy_binds'
+      all_tidy_binds = tidy_binds'
 
       -- Get the TyCons to generate code for.  Careful!  We must use
       -- the untidied TyCons here, because we need
@@ -646,12 +646,11 @@ type UnfoldEnv  = IdEnv (Name{-new name-}, Bool {-show unfolding-})
 chooseExternalIds :: TidyOpts
                   -> Module
                   -> [CoreBind]
-                  -> [CoreBind]
                   -> [CoreRule]
                   -> IO (UnfoldEnv, TidyOccEnv)
                   -- Step 1 from the notes above
 
-chooseExternalIds opts mod binds implicit_binds imp_id_rules
+chooseExternalIds opts mod binds imp_id_rules
   = do { (unfold_env1,occ_env1) <- search init_work_list emptyVarEnv init_occ_env
        ; let internal_ids = filter (not . (`elemVarEnv` unfold_env1)) binders
        ; tidy_internal internal_ids unfold_env1 occ_env1 }
@@ -680,10 +679,9 @@ chooseExternalIds opts mod binds implicit_binds imp_id_rules
   rule_rhs_vars = mapUnionVarSet ruleRhsFreeVars imp_id_rules
 
   binders          = map fst $ flattenBinds binds
-  implicit_binders = bindersOfBinds implicit_binds
   binder_set       = mkVarSet binders
 
-  avoids   = [getOccName name | bndr <- binders ++ implicit_binders,
+  avoids   = [getOccName name | bndr <- binders,
                                 let name = idName bndr,
                                 isExternalName name ]
                 -- In computing our "avoids" list, we must include
@@ -875,9 +873,9 @@ dffvBind(x,r)
 dffvLetBndr :: Bool -> Id -> DFFV ()
 -- Gather the free vars of the RULES and unfolding of a binder
 -- We always get the free vars of a *stable* unfolding, but
--- for a *vanilla* one (InlineRhs), the flag controls what happens:
+-- for a *vanilla* one (VanillaSrc), the flag controls what happens:
 --   True <=> get fvs of even a *vanilla* unfolding
---   False <=> ignore an InlineRhs
+--   False <=> ignore a VanillaSrc
 -- For nested bindings (call from dffvBind) we always say "False" because
 --       we are taking the fvs of the RHS anyway
 -- For top-level bindings (call from addExternal, via bndrFvsInOrder)
@@ -889,10 +887,9 @@ dffvLetBndr vanilla_unfold id
     idinfo = idInfo id
 
     go_unf (CoreUnfolding { uf_tmpl = rhs, uf_src = src })
-       = case src of
-           InlineRhs | vanilla_unfold -> dffvExpr rhs
-                     | otherwise      -> return ()
-           _                          -> dffvExpr rhs
+       | isStableSource src = dffvExpr rhs
+       | vanilla_unfold     = dffvExpr rhs
+       | otherwise          = return ()
 
     go_unf (DFunUnfolding { df_bndrs = bndrs, df_args = args })
              = extendScopeList bndrs $ mapM_ dffvExpr args
@@ -964,6 +961,13 @@ NB: if a binding is kept alive for some *other* reason (e.g. f_spec is
 called in the final code), we keep the rule too.
 
 This stuff is the only reason for the ru_auto field in a Rule.
+
+NB: In #18532 we looked at keeping auto-rules and it turned out to just make
+compiler performance worse while increasing code sizes at the same time. The impact
+varied. Compiling Cabal got ~3% slower, allocated ~3% more and wrote 15% more code to disk.
+Nofib only saw 0.7% more compiler allocations and executable file size growth. But given
+there was no difference in runtime for these benchmarks it turned out to be flat out worse.
+See the ticket for more details.
 -}
 
 findExternalRules :: TidyOpts
@@ -975,7 +979,8 @@ findExternalRules :: TidyOpts
 findExternalRules opts binds imp_id_rules unfold_env
   = (trimmed_binds, filter keep_rule all_rules)
   where
-    imp_rules         = filter expose_rule imp_id_rules
+    imp_rules | (opt_expose_rules opts) = filter expose_rule imp_id_rules
+              | otherwise               = []
     imp_user_rule_fvs = mapUnionVarSet user_rule_rhs_fvs imp_rules
 
     user_rule_rhs_fvs rule | isAutoRule rule = emptyVarSet
@@ -996,16 +1001,14 @@ findExternalRules opts binds imp_id_rules unfold_env
         -- RHS: the auto rules that might mention a binder that has
         --      been discarded; see Note [Trimming auto-rules]
 
-    expose_rule rule
-        | not (opt_expose_rules opts) = False
-        | otherwise  = all is_external_id (ruleLhsFreeIdsList rule)
+    expose_rule rule = all is_external_id (ruleLhsFreeIdsList rule)
                 -- Don't expose a rule whose LHS mentions a locally-defined
                 -- Id that is completely internal (i.e. not visible to an
                 -- importing module).  NB: ruleLhsFreeIds only returns LocalIds.
                 -- See Note [Which rules to expose]
 
     is_external_id id = case lookupVarEnv unfold_env id of
-                          Just (name, _) -> isExternalName name
+                          Just (name, _) -> isExternalName name && not (isImplicitId id)
                           Nothing        -> False
 
     trim_binds :: [CoreBind]
@@ -1020,7 +1023,7 @@ findExternalRules opts binds imp_id_rules unfold_env
        = ([], emptyVarSet, imp_user_rule_fvs, imp_rules)
 
     trim_binds (bind:binds)
-       | any needed bndrs    -- Keep binding
+       | any needed bndrs    -- Keep this binding
        = ( bind : binds', bndr_set', needed_fvs', local_rules ++ rules )
        | otherwise           -- Discard binding altogether
        = stuff
@@ -1041,7 +1044,8 @@ findExternalRules opts binds imp_id_rules unfold_env
             -- In needed_fvs', we don't bother to delete binders from the fv set
 
          local_rules  = [ rule
-                        | id <- bndrs
+                        | (opt_expose_rules opts)
+                        , id <- bndrs
                         , is_external_id id   -- Only collect rules for external Ids
                         , rule <- idCoreRules id
                         , expose_rule rule ]  -- and ones that can fire in a client
@@ -1093,12 +1097,12 @@ tidyTopName mod name_cache maybe_ref occ_env id
 
   | otherwise = panic "tidyTopName"
   where
-    name        = idName id
+    !name       = idName id
     external    = isJust maybe_ref
     global      = isExternalName name
     local       = not global
     internal    = not external
-    loc         = nameSrcSpan name
+    !loc        = nameSrcSpan name
 
     old_occ     = nameOccName name
     new_occ | Just ref <- maybe_ref
@@ -1218,27 +1222,27 @@ tidyTopPair unfold_env boot_exports rhs_tidy_env (bndr, rhs)
 --      Indeed, CorePrep must eta expand where necessary to make
 --      the manifest arity equal to the claimed arity.
 --
-tidyTopIdInfo :: TidyEnv -> Name -> Type -> CoreExpr -> CoreExpr
-              -> IdInfo -> Bool -> IdInfo
+tidyTopIdInfo :: TidyEnv -> Name -> Type
+              -> CoreExpr -> CoreExpr -> IdInfo -> Bool -> IdInfo
 tidyTopIdInfo rhs_tidy_env name rhs_ty orig_rhs tidy_rhs idinfo show_unfold
   | not is_external     -- For internal Ids (not externally visible)
   = vanillaIdInfo       -- we only need enough info for code generation
                         -- Arity and strictness info are enough;
                         --      c.f. GHC.Core.Tidy.tidyLetBndr
         `setArityInfo`      arity
-        `setDmdSigInfo` final_sig
-        `setCprSigInfo`        final_cpr
-        `setUnfoldingInfo`  minimal_unfold_info  -- See Note [Preserve evaluatedness]
+        `setDmdSigInfo`     final_sig
+        `setCprSigInfo`     final_cpr
+        `setUnfoldingInfo`  minimal_unfold_info  -- See note [Preserve evaluatedness]
                                                  -- in GHC.Core.Tidy
 
   | otherwise           -- Externally-visible Ids get the whole lot
   = vanillaIdInfo
-        `setArityInfo`         arity
-        `setDmdSigInfo`    final_sig
-        `setCprSigInfo`           final_cpr
-        `setOccInfo`           robust_occ_info
-        `setInlinePragInfo`    (inlinePragInfo idinfo)
-        `setUnfoldingInfo`     unfold_info
+        `setArityInfo`       arity
+        `setDmdSigInfo`      final_sig
+        `setCprSigInfo`      final_cpr
+        `setOccInfo`         robust_occ_info
+        `setInlinePragInfo`  inlinePragInfo idinfo
+        `setUnfoldingInfo`   unfold_info
                 -- NB: we throw away the Rules
                 -- They have already been extracted by findExternalRules
   where
@@ -1253,23 +1257,32 @@ tidyTopIdInfo rhs_tidy_env name rhs_ty orig_rhs tidy_rhs idinfo show_unfold
     mb_bot_str = exprBotStrictness_maybe orig_rhs
 
     sig = dmdSigInfo idinfo
-    final_sig | not $ isNopSig sig
+    final_sig | not (isNopSig sig)
               = warnPprTrace (_bottom_hidden sig) "tidyTopIdInfo" (ppr name) sig
-              -- try a cheap-and-cheerful bottom analyser
-              | Just (_, nsig) <- mb_bot_str = nsig
-              | otherwise                    = sig
+
+              -- No demand signature, so try a
+              -- cheap-and-cheerful bottom analyser
+              | Just (_, bot_str_sig, _) <- mb_bot_str
+              = bot_str_sig
+
+              -- No strictness info
+              | otherwise = nopSig
 
     cpr = cprSigInfo idinfo
-    final_cpr | Just _ <- mb_bot_str
-              = mkCprSig arity botCpr
+    final_cpr | Just (_, _, bot_cpr_sig) <- mb_bot_str
+              = bot_cpr_sig
               | otherwise
               = cpr
 
-    _bottom_hidden id_sig = case mb_bot_str of
-                                  Nothing         -> False
-                                  Just (arity, _) -> not (isDeadEndAppSig id_sig arity)
+    _bottom_hidden id_sig
+      = case mb_bot_str of
+          Nothing            -> False
+          Just (arity, _, _) -> not (isDeadEndAppSig id_sig arity)
 
     --------- Unfolding ------------
+    -- Force unfold_info (hence bangs), otherwise the old unfolding
+    -- is retained during code generation. See #22071
+
     unf_info = realUnfoldingInfo idinfo
     !minimal_unfold_info = trimUnfolding unf_info
 
@@ -1277,26 +1290,9 @@ tidyTopIdInfo rhs_tidy_env name rhs_ty orig_rhs tidy_rhs idinfo show_unfold
                  = tidyTopUnfolding rhs_tidy_env tidy_rhs unf_info
                  | otherwise
                  = minimal_unfold_info
-
      -- NB: use `orig_rhs` not `tidy_rhs` in this call to mkFinalUnfolding
      -- else you get a black hole (#22122). Reason: mkFinalUnfolding
      -- looks at IdInfo, and that is knot-tied in tidyTopBind (the Rec case)
-
-    -- NB: do *not* expose the worker if show_unfold is off,
-    --     because that means this thing is a loop breaker or
-    --     marked NOINLINE or something like that
-    -- This is important: if you expose the worker for a loop-breaker
-    -- then you can make the simplifier go into an infinite loop, because
-    -- in effect the unfolding is exposed.  See #1709
-    --
-    -- You might think that if show_unfold is False, then the thing should
-    -- not be w/w'd in the first place.  But a legitimate reason is this:
-    --    the function returns bottom
-    -- In this case, show_unfold will be false (we don't expose unfoldings
-    -- for bottoming functions), but we might still have a worker/wrapper
-    -- split (see Note [Worker/wrapper for bottoming functions] in
-    -- GHC.Core.Opt.WorkWrap)
-
 
     --------- Arity ------------
     -- Usually the Id will have an accurate arity on it, because
@@ -1305,8 +1301,12 @@ tidyTopIdInfo rhs_tidy_env name rhs_ty orig_rhs tidy_rhs idinfo show_unfold
     -- did was to let-bind a non-atomic argument and then float
     -- it to the top level. So it seems more robust just to
     -- fix it here.
-    arity = exprArity orig_rhs `min` (length $ typeArity rhs_ty)
-
+    arity = exprArity orig_rhs `min` typeArity rhs_ty
+            -- orig_rhs: using tidy_rhs would make a black hole, since
+            --           exprArity uses the arities of Ids inside the rhs
+            --
+            -- typeArity: see Note [Arity invariants for bindings]
+            --            in GHC.Core.Opt.Arity
 
 ------------ Unfolding  --------------
 tidyTopUnfolding :: TidyEnv -> CoreExpr -> Unfolding -> Unfolding
@@ -1355,4 +1355,107 @@ them from tidy_unf_rhs.
 And (unlike tidyNestedUnfolding) don't deep-seq the new unfolding,
 because that'll cause a black hole (I /think/ because occurAnalyseExpr
 looks in IdInfo).
+
+
+************************************************************************
+*                                                                      *
+                  Old, dead, type-trimming code
+*                                                                      *
+************************************************************************
+
+We used to try to "trim off" the constructors of data types that are
+not exported, to reduce the size of interface files, at least without
+-O.  But that is not always possible: see the old Note [When we can't
+trim types] below for exceptions.
+
+Then (#7445) I realised that the TH problem arises for any data type
+that we have deriving( Data ), because we can invoke
+   Language.Haskell.TH.Quote.dataToExpQ
+to get a TH Exp representation of a value built from that data type.
+You don't even need {-# LANGUAGE TemplateHaskell #-}.
+
+At this point I give up. The pain of trimming constructors just
+doesn't seem worth the gain.  So I've dumped all the code, and am just
+leaving it here at the end of the module in case something like this
+is ever resurrected.
+
+
+Note [When we can't trim types]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The basic idea of type trimming is to export algebraic data types
+abstractly (without their data constructors) when compiling without
+-O, unless of course they are explicitly exported by the user.
+
+We always export synonyms, because they can be mentioned in the type
+of an exported Id.  We could do a full dependency analysis starting
+from the explicit exports, but that's quite painful, and not done for
+now.
+
+But there are some times we can't do that, indicated by the 'no_trim_types' flag.
+
+First, Template Haskell.  Consider (#2386) this
+        module M(T, makeOne) where
+          data T = Yay String
+          makeOne = [| Yay "Yep" |]
+Notice that T is exported abstractly, but makeOne effectively exports it too!
+A module that splices in $(makeOne) will then look for a declaration of Yay,
+so it'd better be there.  Hence, brutally but simply, we switch off type
+constructor trimming if TH is enabled in this module.
+
+Second, data kinds.  Consider (#5912)
+     {-# LANGUAGE DataKinds #-}
+     module M() where
+     data UnaryTypeC a = UnaryDataC a
+     type Bug = 'UnaryDataC
+We always export synonyms, so Bug is exposed, and that means that
+UnaryTypeC must be too, even though it's not explicitly exported.  In
+effect, DataKinds means that we'd need to do a full dependency analysis
+to see what data constructors are mentioned.  But we don't do that yet.
+
+In these two cases we just switch off type trimming altogether.
+
+mustExposeTyCon :: Bool         -- Type-trimming flag
+                -> NameSet      -- Exports
+                -> TyCon        -- The tycon
+                -> Bool         -- Can its rep be hidden?
+-- We are compiling without -O, and thus trying to write as little as
+-- possible into the interface file.  But we must expose the details of
+-- any data types whose constructors or fields are exported
+mustExposeTyCon no_trim_types exports tc
+  | no_trim_types               -- See Note [When we can't trim types]
+  = True
+
+  | not (isAlgTyCon tc)         -- Always expose synonyms (otherwise we'd have to
+                                -- figure out whether it was mentioned in the type
+                                -- of any other exported thing)
+  = True
+
+  | isEnumerationTyCon tc       -- For an enumeration, exposing the constructors
+  = True                        -- won't lead to the need for further exposure
+
+  | isFamilyTyCon tc            -- Open type family
+  = True
+
+  -- Below here we just have data/newtype decls or family instances
+
+  | null data_cons              -- Ditto if there are no data constructors
+  = True                        -- (NB: empty data types do not count as enumerations
+                                -- see Note [Enumeration types] in GHC.Core.TyCon
+
+  | any exported_con data_cons  -- Expose rep if any datacon or field is exported
+  = True
+
+  | isNewTyCon tc && isFFITy (snd (newTyConRhs tc))
+  = True   -- Expose the rep for newtypes if the rep is an FFI type.
+           -- For a very annoying reason.  'Foreign import' is meant to
+           -- be able to look through newtypes transparently, but it
+           -- can only do that if it can "see" the newtype representation
+
+  | otherwise
+  = False
+  where
+    data_cons = tyConDataCons tc
+    exported_con con = any (`elemNameSet` exports)
+                           (dataConName con : dataConFieldLabels con)
 -}
+

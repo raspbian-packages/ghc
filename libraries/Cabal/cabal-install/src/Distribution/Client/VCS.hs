@@ -1,3 +1,4 @@
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE NamedFieldPuns, RecordWildCards, RankNTypes #-}
@@ -49,12 +50,17 @@ import Distribution.Simple.Program
          , simpleProgram, findProgramVersion
          , ProgramInvocation(..), programInvocation, runProgramInvocation, getProgramInvocationOutput
          , emptyProgramDb, requireProgram )
+import Distribution.Simple.Program.Db
+         ( appendProgramSearchPath )
 import Distribution.Version
          ( mkVersion )
 import qualified Distribution.PackageDescription as PD
 
+#if !MIN_VERSION_base(4,18,0)
 import Control.Applicative
          ( liftA2 )
+#endif
+
 import Control.Exception
          ( throw, try )
 import Control.Monad.Trans
@@ -165,17 +171,20 @@ validateSourceRepos rs =
 
 
 configureVCS :: Verbosity
+             -> [FilePath] -- ^ Extra prog paths
              -> VCS Program
              -> IO (VCS ConfiguredProgram)
-configureVCS verbosity vcs@VCS{vcsProgram = prog} =
-    asVcsConfigured <$> requireProgram verbosity prog emptyProgramDb
+configureVCS verbosity progPaths vcs@VCS{vcsProgram = prog} = do
+    progPath <- appendProgramSearchPath verbosity progPaths emptyProgramDb
+    asVcsConfigured <$> requireProgram verbosity prog progPath
   where
     asVcsConfigured (prog', _) = vcs { vcsProgram = prog' }
 
 configureVCSs :: Verbosity
+              -> [FilePath] -- ^ Extra prog paths
               -> Map RepoType (VCS Program)
               -> IO (Map RepoType (VCS ConfiguredProgram))
-configureVCSs verbosity = traverse (configureVCS verbosity)
+configureVCSs verbosity progPaths = traverse (configureVCS verbosity progPaths)
 
 
 -- ------------------------------------------------------------
@@ -205,7 +214,7 @@ cloneSourceRepo verbosity vcs
                                srcuri destdir
 
 
--- | Syncronise a set of 'SourceRepo's referring to the same repository with
+-- | Synchronise a set of 'SourceRepo's referring to the same repository with
 -- corresponding local directories. The local directories may or may not
 -- already exist.
 --
@@ -654,7 +663,7 @@ svnProgram = (simpleProgram "svn") {
 --
 --
 --                    ----->  foo on branch B ----->
---    resolve confict                                  Initial patch
+--    resolve conflict                                  Initial patch
 --                    ----->  foo on branch A ----->
 --
 --    Which is seems reasonable.

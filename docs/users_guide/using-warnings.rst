@@ -60,6 +60,7 @@ To reverse ``-Werror``, which makes all warnings into errors, use ``-Wwarn``.
         * :ghc-flag:`-Wunrecognised-warning-flags`
         * :ghc-flag:`-Winaccessible-code`
         * :ghc-flag:`-Wstar-binder`
+        * :ghc-flag:`-Wstar-is-type`
         * :ghc-flag:`-Woperator-whitespace-ext-conflict`
         * :ghc-flag:`-Wambiguous-fields`
         * :ghc-flag:`-Wunicode-bidirectional-format-characters`
@@ -160,7 +161,6 @@ The following flags are simple ways to select standard "packages" of warnings:
 
         * :ghc-flag:`-Wsemigroup`
         * :ghc-flag:`-Wnoncanonical-monoid-instances`
-        * :ghc-flag:`-Wstar-is-type`
         * :ghc-flag:`-Wcompat-unqualified-imports`
         * :ghc-flag:`-Wtype-equality-out-of-scope`
 
@@ -1077,6 +1077,9 @@ of ``-W(no-)*``.
     This option isn't enabled by default because it can be very noisy,
     and it often doesn't indicate a bug in the program.
 
+    This flag is broken since GHC 9.6.1. See :ghc-ticket:`23520` for more
+    details.
+
 .. ghc-flag:: -Wmissing-deriving-strategies
     :shortdesc: warn when a deriving clause is missing a deriving strategy
     :type: dynamic
@@ -1504,9 +1507,6 @@ of ``-W(no-)*``.
      This warning allows to detect such uses of ``*`` before the actual
      breaking change takes place. The recommended fix is to replace ``*`` with
      ``Type`` imported from ``Data.Kind``.
-
-     Being part of the :ghc-flag:`-Wcompat` option group, this warning is off by
-     default, but will be switched on in a future GHC release.
 
 .. ghc-flag:: -Wstar-binder
      :shortdesc: warn about binding the ``(*)`` type operator despite
@@ -2354,6 +2354,22 @@ of ``-W(no-)*``.
     be used even when :extension:`TypeOperators` is disabled. The warning is
     triggered whenever this happens, and can be addressed by enabling the
     extension.
+
+.. ghc-flag:: -Wloopy-superclass-solve
+    :shortdesc: warn when creating potentially-loopy superclass constraint evidence
+    :type: dynamic
+    :reverse: -Wno-loopy-superclass-solve
+
+    :since: 9.6.1
+
+    As explained in :ref:`undecidable_instances`, when using
+    :extension:`UndecidableInstances` it is possible for GHC to construct
+    non-terminating evidence for certain superclass constraints.
+
+    This behaviour is scheduled to be removed in a future GHC version.
+    In the meantime, GHC emits this warning to inform users of potential
+    non-termination. Users can manually add the required constraint to the context
+    to avoid the problem (thus silencing the warning).
 
 If you're feeling really paranoid, the :ghc-flag:`-dcore-lint` option is a good choice.
 It turns on heavyweight intra-pass sanity-checking within GHC. (It checks GHC's

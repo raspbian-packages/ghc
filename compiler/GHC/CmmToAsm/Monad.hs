@@ -1,5 +1,7 @@
 {-# LANGUAGE DeriveFunctor #-}
-{-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE DerivingVia #-}
+{-# LANGUAGE PatternSynonyms #-}
+{-# LANGUAGE ViewPatterns #-}
 
 -- -----------------------------------------------------------------------------
 --
@@ -20,7 +22,6 @@ module GHC.CmmToAsm.Monad (
         addImmediateSuccessorNat,
         updateCfgNat,
         getUniqueNat,
-        mapAccumLNat,
         setDeltaNat,
         getConfig,
         getPlatform,
@@ -32,7 +33,6 @@ module GHC.CmmToAsm.Monad (
         getPicBaseMaybeNat,
         getPicBaseNat,
         getCfgWeights,
-        getModLoc,
         getFileId,
         getDebugBlock,
 
@@ -67,10 +67,9 @@ import GHC.Types.Unique.Supply
 import GHC.Types.Unique         ( Unique )
 import GHC.Unit.Module
 
-import Control.Monad    ( ap )
-
-import GHC.Utils.Outputable (SDoc, ppr)
+import GHC.Utils.Outputable (SDoc, HDoc, ppr)
 import GHC.Utils.Panic      (pprPanic)
+import GHC.Utils.Monad.State.Strict (State (..), runState, state)
 import GHC.Utils.Misc
 import GHC.CmmToAsm.CFG
 import GHC.CmmToAsm.CFG.Weight
@@ -80,19 +79,29 @@ data NcgImpl statics instr jumpDest = NcgImpl {
     cmmTopCodeGen             :: RawCmmDecl -> NatM [NatCmmDecl statics instr],
     generateJumpTableForInstr :: instr -> Maybe (NatCmmDecl statics instr),
     getJumpDestBlockId        :: jumpDest -> Maybe BlockId,
+    -- | Does this jump always jump to a single destination and is shortcutable?
+    --
+    -- We use this to determine shortcutable instructions - See Note [What is shortcutting]
+    -- Note that if we return a destination here we *most* support the relevant shortcutting in
+    -- shortcutStatics for jump tables and shortcutJump for the instructions itself.
     canShortcut               :: instr -> Maybe jumpDest,
+    -- | Replace references to blockIds with other destinations - used to update jump tables.
     shortcutStatics           :: (BlockId -> Maybe jumpDest) -> statics -> statics,
+    -- | Change the jump destination(s) of an instruction.
     shortcutJump              :: (BlockId -> Maybe jumpDest) -> instr -> instr,
     -- | 'Module' is only for printing internal labels. See Note [Internal proc
     -- labels] in CLabel.
-    pprNatCmmDecl             :: NatCmmDecl statics instr -> SDoc,
+    pprNatCmmDeclS            :: NatCmmDecl statics instr -> SDoc,
+    pprNatCmmDeclH            :: NatCmmDecl statics instr -> HDoc,
+        -- see Note [pprNatCmmDeclS and pprNatCmmDeclH]
     maxSpillSlots             :: Int,
     allocatableRegs           :: [RealReg],
     ncgAllocMoreStack         :: Int -> NatCmmDecl statics instr
                               -> UniqSM (NatCmmDecl statics instr, [(BlockId,BlockId)]),
     -- ^ The list of block ids records the redirected jumps to allow us to update
     -- the CFG.
-    ncgMakeFarBranches        :: LabelMap RawCmmStatics -> [NatBasicBlock instr] -> [NatBasicBlock instr],
+    ncgMakeFarBranches        :: Platform -> LabelMap RawCmmStatics -> [NatBasicBlock instr]
+                              -> UniqSM [NatBasicBlock instr],
     extractUnwindPoints       :: [instr] -> [UnwindPoint],
     -- ^ given the instruction sequence of a block, produce a list of
     -- the block's 'UnwindPoint's
@@ -104,14 +113,64 @@ data NcgImpl statics instr jumpDest = NcgImpl {
     -- when possible.
     }
 
+{- Note [supporting shortcutting]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+For the concept of shortcutting see Note [What is shortcutting].
+
+In order to support shortcutting across multiple backends uniformly we
+use canShortcut, shortcutStatics and shortcutJump.
+
+canShortcut tells us if the backend support shortcutting of a instruction
+and if so what destination we should retarget instruction to instead.
+
+shortcutStatics exists to allow us to update jump destinations in jump tables.
+
+shortcutJump updates the instructions itself.
+
+A backend can opt out of those by always returning Nothing for canShortcut
+and implementing shortcutStatics/shortcutJump as \_ x -> x
+
+-}
+
+{- Note [pprNatCmmDeclS and pprNatCmmDeclH]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Each NcgImpl provides two implementations of its CmmDecl printer, pprNatCmmDeclS
+and pprNatCmmDeclH, which are specialized to SDoc and HDoc, respectively
+(see Note [SDoc versus HDoc] in GHC.Utils.Outputable). These are both internally
+implemented as a single, polymorphic function, but they need to be stored using
+monomorphic types to ensure the specialized versions are used, which is
+essential for performance (see Note [SPECIALIZE to HDoc] in GHC.Utils.Outputable).
+
+One might wonder why we bother with pprNatCmmDeclS and SDoc at all, since we
+have a perfectly serviceable HDoc-based implementation that is more efficient.
+However, it turns out we benefit from keeping both, for two (related) reasons:
+
+  1. Although we absolutely want to take care to use pprNatCmmDeclH for actual
+     code generation (the improved performance there is why we have HDoc at
+     all!), we also sometimes print assembly for debug dumps, when requested via
+     -ddump-asm. In this case, it’s more convenient to produce an SDoc, which
+     can be concatenated with other SDocs for consistency with the general-
+     purpose dump file infrastructure.
+
+  2. Some debug information is sometimes useful to include in -ddump-asm that is
+     neither necessary nor useful in normal code generation, and it turns out to
+     be tricky to format neatly using the one-line-at-a-time model of HLine/HDoc.
+
+Therefore, we provide both pprNatCmmDeclS and pprNatCmmDeclH, and we sometimes
+include additional information in the SDoc variant using dualDoc
+(see Note [dualLine and dualDoc] in GHC.Utils.Outputable). However, it is
+absolutely *critical* that pprNatCmmDeclS is not actually used unless -ddump-asm
+is provided, as that would rather defeat the whole point. (Fortunately, the
+difference in allocations between the two implementations is so vast that such a
+mistake would readily show up in performance tests). -}
+
 data NatM_State
         = NatM_State {
                 natm_us          :: UniqSupply,
-                natm_delta       :: Int,
+                natm_delta       :: Int, -- ^ Stack offset for unwinding information
                 natm_imports     :: [(CLabel)],
                 natm_pic         :: Maybe Reg,
                 natm_config      :: NCGConfig,
-                natm_modloc      :: ModLocation,
                 natm_fileid      :: DwarfFiles,
                 natm_debug_map   :: LabelMap DebugBlock,
                 natm_cfg         :: CFG
@@ -122,38 +181,35 @@ data NatM_State
 
 type DwarfFiles = UniqFM FastString (FastString, Int)
 
-newtype NatM result = NatM (NatM_State -> (result, NatM_State))
-    deriving (Functor)
+newtype NatM a = NatM' (State NatM_State a)
+  deriving stock (Functor)
+  deriving (Applicative, Monad) via State NatM_State
+
+pattern NatM :: (NatM_State -> (a, NatM_State)) -> NatM a
+pattern NatM f <- NatM' (runState -> f)
+  where NatM f  = NatM' (state f)
+{-# COMPLETE NatM #-}
 
 unNat :: NatM a -> NatM_State -> (a, NatM_State)
 unNat (NatM a) = a
 
-mkNatM_State :: UniqSupply -> Int -> NCGConfig -> ModLocation ->
+mkNatM_State :: UniqSupply -> Int -> NCGConfig ->
                 DwarfFiles -> LabelMap DebugBlock -> CFG -> NatM_State
 mkNatM_State us delta config
-        = \loc dwf dbg cfg ->
+        = \dwf dbg cfg ->
                 NatM_State
                         { natm_us = us
                         , natm_delta = delta
                         , natm_imports = []
                         , natm_pic = Nothing
                         , natm_config = config
-                        , natm_modloc = loc
                         , natm_fileid = dwf
                         , natm_debug_map = dbg
                         , natm_cfg = cfg
                         }
 
 initNat :: NatM_State -> NatM a -> (a, NatM_State)
-initNat init_st m
-        = case unNat m init_st of { (r,st) -> (r,st) }
-
-instance Applicative NatM where
-      pure = returnNat
-      (<*>) = ap
-
-instance Monad NatM where
-  (>>=) = thenNat
+initNat = flip unNat
 
 instance MonadUnique NatM where
   getUniqueSupplyM = NatM $ \st ->
@@ -163,27 +219,6 @@ instance MonadUnique NatM where
   getUniqueM = NatM $ \st ->
       case takeUniqFromSupply (natm_us st) of
           (uniq, us') -> (uniq, st {natm_us = us'})
-
-thenNat :: NatM a -> (a -> NatM b) -> NatM b
-thenNat expr cont
-        = NatM $ \st -> case unNat expr st of
-                        (result, st') -> unNat (cont result) st'
-
-returnNat :: a -> NatM a
-returnNat result
-        = NatM $ \st ->  (result, st)
-
-mapAccumLNat :: (acc -> x -> NatM (acc, y))
-                -> acc
-                -> [x]
-                -> NatM (acc, [y])
-
-mapAccumLNat _ b []
-  = return (b, [])
-mapAccumLNat f b (x:xs)
-  = do (b__2, x__2)  <- f b x
-       (b__3, xs__2) <- mapAccumLNat f b__2 xs
-       return (b__3, x__2:xs__2)
 
 getUniqueNat :: NatM Unique
 getUniqueNat = NatM $ \ st ->
@@ -244,9 +279,7 @@ addImmediateSuccessorNat block succ = do
 
 getBlockIdNat :: NatM BlockId
 getBlockIdNat
- = do   u <- getUniqueNat
-        return (mkBlockId u)
-
+ = mkBlockId <$> getUniqueNat
 
 getNewLabelNat :: NatM CLabel
 getNewLabelNat
@@ -308,10 +341,6 @@ getPicBaseNat rep
                  -> do
                         reg <- getNewRegNat rep
                         NatM (\state -> (reg, state { natm_pic = Just reg }))
-
-getModLoc :: NatM ModLocation
-getModLoc
-        = NatM $ \ st -> (natm_modloc st, st)
 
 -- | Get native code generator configuration
 getConfig :: NatM NCGConfig

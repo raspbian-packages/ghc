@@ -11,9 +11,12 @@
 {-# LANGUAGE ScopedTypeVariables     #-}
 {-# LANGUAGE TypeApplications        #-}
 {-# LANGUAGE TypeFamilyDependencies  #-}
+{-# LANGUAGE StandaloneDeriving      #-}
 {-# LANGUAGE UndecidableSuperClasses #-} -- for IsPass; see Note [NoGhcTc]
 {-# LANGUAGE UndecidableInstances    #-} -- Wrinkle in Note [Trees That Grow]
                                          -- in module Language.Haskell.Syntax.Extension
+
+{-# OPTIONS_GHC -Wno-orphans #-} -- Outputable
 
 module GHC.Hs.Extension where
 
@@ -22,7 +25,10 @@ module GHC.Hs.Extension where
 
 import GHC.Prelude
 
+import GHC.TypeLits (KnownSymbol, symbolVal)
+
 import Data.Data hiding ( Fixity )
+import Language.Haskell.Syntax.Concrete
 import Language.Haskell.Syntax.Extension
 import GHC.Types.Name
 import GHC.Types.Name.Reader
@@ -239,3 +245,20 @@ type instance Anno (HsUniToken tok utok) = TokenLocation
 
 noHsUniTok :: GenLocated TokenLocation (HsUniToken tok utok)
 noHsUniTok = L NoTokenLoc HsNormalTok
+
+--- Outputable
+
+instance Outputable NoExtField where
+  ppr _ = text "NoExtField"
+
+instance Outputable DataConCantHappen where
+  ppr = dataConCantHappen
+
+instance KnownSymbol tok => Outputable (HsToken tok) where
+   ppr _ = text (symbolVal (Proxy :: Proxy tok))
+
+instance (KnownSymbol tok, KnownSymbol utok) => Outputable (HsUniToken tok utok) where
+   ppr HsNormalTok  = text (symbolVal (Proxy :: Proxy tok))
+   ppr HsUnicodeTok = text (symbolVal (Proxy :: Proxy utok))
+
+deriving instance Typeable p => Data (LayoutInfo (GhcPass p))

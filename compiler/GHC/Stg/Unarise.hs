@@ -2,8 +2,6 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE TupleSections    #-}
 
-{-# OPTIONS_GHC -Wno-incomplete-uni-patterns #-}
-
 {-
 (c) The GRASP/AQUA Project, Glasgow University, 1992-2012
 
@@ -358,20 +356,17 @@ Note [Post-unarisation invariants]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 STG programs after unarisation have these invariants:
 
-  * No unboxed sums at all.
+ 1. No unboxed sums at all.
 
-  * No unboxed tuple binders. Tuples only appear in return position.
+ 2. No unboxed tuple binders. Tuples only appear in return position.
 
-  * DataCon applications (StgRhsCon and StgConApp) don't have void arguments.
+ 3. Binders and literals always have zero (for void arguments) or one PrimRep.
+
+ 4. DataCon applications (StgRhsCon and StgConApp) don't have void arguments.
     This means that it's safe to wrap `StgArg`s of DataCon applications with
     `GHC.StgToCmm.Env.NonVoid`, for example.
 
-  * Similar to unboxed tuples, Note [Rubbish literals] of TupleRep may only
-    appear in return position.
-
-  * Alt binders (binders in patterns) are always non-void.
-
-  * Binders always have zero (for void arguments) or one PrimRep.
+ 5. Alt binders (binders in patterns) are always non-void.
 -}
 
 module GHC.Stg.Unarise (unarise) where
@@ -391,6 +386,7 @@ import GHC.Utils.Monad (mapAccumLM)
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
 import GHC.Utils.Panic.Plain
+import GHC.Types.RepType
 import GHC.Stg.Syntax
 import GHC.Stg.Utils
 import GHC.Core.Type
@@ -400,9 +396,9 @@ import GHC.Types.Unique.Supply
 import GHC.Types.Unique
 import GHC.Utils.Misc
 import GHC.Types.Var.Env
-import GHC.Types.RepType
 
 import Data.Bifunctor (second)
+import Data.List.NonEmpty (NonEmpty (..))
 import Data.Maybe (mapMaybe)
 import qualified Data.IntMap as IM
 import GHC.Builtin.PrimOps
@@ -440,7 +436,7 @@ initUnariseEnv :: VarEnv UnariseVal -> UnariseEnv
 initUnariseEnv = UnariseEnv
 data UnariseVal
   = MultiVal [OutStgArg] -- MultiVal to tuple. Can be empty list (void).
-  | UnaryVal OutStgArg   -- See NOTE [Renaming during unarisation].
+  | UnaryVal OutStgArg   -- See Note [Renaming during unarisation].
 
 instance Outputable UnariseVal where
   ppr (MultiVal args) = text "MultiVal" <+> ppr args
@@ -556,7 +552,7 @@ unariseExpr rho (StgCase scrut bndr alt_ty alts)
 
   -- See (3) of Note [Rubbish literals] in GHC.Types.Literal
   | StgLit lit <- scrut
-  , Just args' <- unariseRubbish_maybe lit
+  , Just args' <- unariseLiteral_maybe lit
   = elimCase rho args' bndr alt_ty alts
 
   -- general case
@@ -593,20 +589,24 @@ unariseUbxSumOrTupleArgs rho us dc args ty_args
   | otherwise
   = panic "unariseUbxSumOrTupleArgs: Constructor not a unboxed sum or tuple"
 
--- Doesn't return void args.
-unariseRubbish_maybe :: Literal -> Maybe [OutStgArg]
-unariseRubbish_maybe (LitRubbish rep)
+-- Returns @Nothing@ if the given literal is already unary (exactly
+-- one PrimRep).  Doesn't return void args.
+--
+-- This needs to exist because rubbish literals can have any representation.
+-- See also Note [Rubbish literals] in GHC.Types.Literal.
+unariseLiteral_maybe :: Literal -> Maybe [OutStgArg]
+unariseLiteral_maybe (LitRubbish torc rep)
   | [prep] <- preps
-  , not (isVoidRep prep)
+  , assert (not (isVoidRep prep)) True
   = Nothing   -- Single, non-void PrimRep. Nothing to do!
 
   | otherwise -- Multiple reps, possibly with VoidRep. Eliminate via elimCase
-  = Just [ StgLitArg (LitRubbish (primRepToType prep))
-         | prep <- preps, not (isVoidRep prep) ]
+  = Just [ StgLitArg (LitRubbish torc (primRepToRuntimeRep prep))
+         | prep <- preps, assert (not (isVoidRep prep)) True ]
   where
-    preps = runtimeRepPrimRep (text "unariseRubbish_maybe") rep
+    preps = runtimeRepPrimRep (text "unariseLiteral_maybe") rep
 
-unariseRubbish_maybe _ = Nothing
+unariseLiteral_maybe _ = Nothing
 
 --------------------------------------------------------------------------------
 
@@ -632,10 +632,9 @@ elimCase rho args bndr (MultiValAlt _) [GenStgAlt{ alt_con   = _
 
        unariseExpr rho2 rhs'
 
-elimCase rho args bndr (MultiValAlt _) alts
+elimCase rho args@(tag_arg : real_args) bndr (MultiValAlt _) alts
   | isUnboxedSumBndr bndr
-  = do let (tag_arg : real_args) = args
-       tag_bndr <- mkId (mkFastString "tag") tagTy
+  = do tag_bndr <- mkId (mkFastString "tag") tagTy
           -- this won't be used but we need a binder anyway
        let rho1 = extendRho rho bndr (MultiVal args)
            scrut' = case tag_arg of
@@ -848,7 +847,7 @@ castArgRename ops in_arg rhs =
 
 -- Construct a case binder used when casting sums, of a given type and unique.
 mkCastVar :: Unique -> Type -> Id
-mkCastVar uq ty = mkSysLocal (fsLit "cst_sum") uq Many ty
+mkCastVar uq ty = mkSysLocal (fsLit "cst_sum") uq ManyTy ty
 
 mkCast :: StgArg -> PrimOp -> OutId -> Type -> StgExpr -> StgExpr
 mkCast arg_in cast_op out_id out_ty in_rhs =
@@ -879,7 +878,7 @@ mkUbxSum
      )
 mkUbxSum dc ty_args args0 us
   = let
-      (_ : sum_slots) = ubxSumRepType (map typePrimRep ty_args)
+      _ :| sum_slots = ubxSumRepType (map typePrimRep ty_args)
       -- drop tag slot
       field_slots = (mapMaybe (typeSlotTy . stgArgType) args0)
       tag = dataConTag dc
@@ -946,13 +945,13 @@ mkUbxSum dc ty_args args0 us
 -- See Note [aBSENT_SUM_FIELD_ERROR_ID] in "GHC.Core.Make"
 --
 ubxSumRubbishArg :: SlotTy -> StgArg
-ubxSumRubbishArg PtrLiftedSlot    = StgVarArg aBSENT_SUM_FIELD_ERROR_ID
-ubxSumRubbishArg PtrUnliftedSlot  = StgVarArg aBSENT_SUM_FIELD_ERROR_ID
-ubxSumRubbishArg WordSlot   = StgLitArg (LitNumber LitNumWord 0)
-ubxSumRubbishArg Word64Slot = StgLitArg (LitNumber LitNumWord64 0)
-ubxSumRubbishArg FloatSlot  = StgLitArg (LitFloat 0)
-ubxSumRubbishArg DoubleSlot = StgLitArg (LitDouble 0)
-ubxSumRubbishArg (VecSlot n e) = StgLitArg (LitRubbish vec_rep)
+ubxSumRubbishArg PtrLiftedSlot   = StgVarArg aBSENT_SUM_FIELD_ERROR_ID
+ubxSumRubbishArg PtrUnliftedSlot = StgVarArg aBSENT_SUM_FIELD_ERROR_ID
+ubxSumRubbishArg WordSlot        = StgLitArg (LitNumber LitNumWord 0)
+ubxSumRubbishArg Word64Slot      = StgLitArg (LitNumber LitNumWord64 0)
+ubxSumRubbishArg FloatSlot       = StgLitArg (LitFloat 0)
+ubxSumRubbishArg DoubleSlot      = StgLitArg (LitDouble 0)
+ubxSumRubbishArg (VecSlot n e)   = StgLitArg (LitRubbish TypeLike vec_rep)
   where vec_rep = primRepToRuntimeRep (VecRep n e)
 
 --------------------------------------------------------------------------------
@@ -971,7 +970,7 @@ For arguments (StgArg) and binders (Id) we have two kind of unarisation:
     Here after unarise we should still get a function with arity 3. Similarly
     in the call site we shouldn't remove void arguments:
 
-      f (# (# #), (# #) #) voidId rw
+      f (# (# #), (# #) #) void# rw
 
     When unarising <body>, we extend the environment with these binders:
 
@@ -1054,7 +1053,11 @@ unariseFunArg rho (StgVarArg x) =
     Just (MultiVal as)  -> as
     Just (UnaryVal arg) -> [arg]
     Nothing             -> [StgVarArg x]
-unariseFunArg _ arg = [arg]
+unariseFunArg _ arg@(StgLitArg lit) = case unariseLiteral_maybe lit of
+  -- forgetting to unariseLiteral_maybe here caused #23914
+  Just [] -> [voidArg]
+  Just as -> as
+  Nothing -> [arg]
 
 unariseFunArgs :: UnariseEnv -> [StgArg] -> [StgArg]
 unariseFunArgs = concatMap . unariseFunArg
@@ -1080,7 +1083,7 @@ unariseConArg rho (StgVarArg x) =
                                      -- is a void, and so should be eliminated
       | otherwise -> [StgVarArg x]
 unariseConArg _ arg@(StgLitArg lit)
-  | Just as <- unariseRubbish_maybe lit
+  | Just as <- unariseLiteral_maybe lit
   = as
   | otherwise
   = assert (not (isZeroBitTy (literalType lit))) -- We have no non-rubbish void literals

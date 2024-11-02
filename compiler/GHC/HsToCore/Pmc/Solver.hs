@@ -1,4 +1,3 @@
-
 {-# LANGUAGE LambdaCase          #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE ViewPatterns        #-}
@@ -46,6 +45,7 @@ import GHC.Utils.Monad (allM)
 import GHC.Utils.Panic
 import GHC.Utils.Panic.Plain
 import GHC.Data.Bag
+
 import GHC.Types.Basic (Levity(..))
 import GHC.Types.CompleteMatch
 import GHC.Types.Unique.Set
@@ -56,13 +56,17 @@ import GHC.Types.Name
 import GHC.Types.Var      (EvVar)
 import GHC.Types.Var.Env
 import GHC.Types.Var.Set
+import GHC.Types.Unique.Supply
+
 import GHC.Core
-import GHC.Core.FVs       (exprFreeVars)
+import GHC.Core.FVs         (exprFreeVars)
+import GHC.Core.TyCo.Compare( eqType )
 import GHC.Core.Map.Expr
+import GHC.Core.Predicate (typeDeterminesValue)
 import GHC.Core.SimpleOpt (simpleOptExpr, exprIsConApp_maybe)
 import GHC.Core.Utils     (exprType)
-import GHC.Core.Make      (mkListExpr, mkCharExpr)
-import GHC.Types.Unique.Supply
+import GHC.Core.Make      (mkListExpr, mkCharExpr, mkImpossibleExpr)
+
 import GHC.Data.FastString
 import GHC.Types.SrcLoc
 import GHC.Data.Maybe
@@ -73,9 +77,8 @@ import GHC.Core.TyCon
 import GHC.Core.TyCon.RecWalk
 import GHC.Builtin.Names
 import GHC.Builtin.Types
-import GHC.Builtin.Types.Prim (tYPETyCon)
 import GHC.Core.TyCo.Rep
-import GHC.Core.TyCo.Subst (elemTCvSubst)
+import GHC.Core.TyCo.Subst (elemSubst)
 import GHC.Core.Type
 import GHC.Tc.Solver   (tcNormalise, tcCheckGivens, tcCheckWanteds)
 import GHC.Core.Unify    (tcMatchTy)
@@ -96,9 +99,6 @@ import Data.Monoid   (Any(..))
 import Data.List     (sortBy, find)
 import qualified Data.List.NonEmpty as NE
 import Data.Ord      (comparing)
-
-import GHC.Utils.Trace
-_ = pprTrace -- to silence unused import warnings
 
 --
 -- * Main exports
@@ -147,11 +147,16 @@ updRcm f (RCM vanilla pragmas)
 -- Ex.: @vanillaCompleteMatchTC 'Maybe' ==> Just ("Maybe", {'Just','Nothing'})@
 vanillaCompleteMatchTC :: TyCon -> Maybe CompleteMatch
 vanillaCompleteMatchTC tc =
-  let -- TYPE acts like an empty data type on the term-level (#14086), but
-      -- it is a PrimTyCon, so tyConDataCons_maybe returns Nothing. Hence a
-      -- special case.
-      mb_dcs | tc == tYPETyCon = Just []
-             | otherwise       = tyConDataCons_maybe tc
+  let mb_dcs | -- TYPE acts like an empty data type on the term level (#14086),
+               -- but it is a PrimTyCon, so tyConDataCons_maybe returns Nothing.
+               -- Hence a special case.
+               tc == tYPETyCon    = Just []
+             | -- Similarly, treat `type data` declarations as empty data types on
+               -- the term level, as `type data` data constructors only exist at
+               -- the type level (#22964).
+               -- See Note [Type data declarations] in GHC.Rename.Module.
+               isTypeDataTyCon tc = Just []
+             | otherwise          = tyConDataCons_maybe tc
   in vanillaCompleteMatch . mkUniqDSet . map RealDataCon <$> mb_dcs
 
 -- | Initialise from 'dsGetCompleteMatches' (containing all COMPLETE pragmas)
@@ -409,7 +414,7 @@ pmIsClosedType ty
     -- (See "Type#type_classification" for what an algebraic type is.)
     --
     -- This is qualified with \"like\" because of a particular special
-    -- case: TYPE (the underlyind kind behind Type, among others). TYPE
+    -- case: TYPE (the underlying kind behind Type, among others). TYPE
     -- is conceptually a datatype (and thus algebraic), but in practice it is
     -- a primitive builtin type, so we must check for it specially.
     --
@@ -642,7 +647,7 @@ nameTyCt pred_ty = do
   unique <- getUniqueM
   let occname = mkVarOccFS (fsLit ("pm_"++show unique))
       idname  = mkInternalName unique occname noSrcSpan
-  return (mkLocalIdOrCoVar idname Many pred_ty)
+  return (mkLocalIdOrCoVar idname ManyTy pred_ty)
 
 -----------------------------
 -- ** Adding term constraints
@@ -881,7 +886,7 @@ addCoreCt nabla x e = do
       where
         expr_ty       = exprType e
         expr_in_scope = mkInScopeSet (exprFreeVars e)
-        in_scope_env  = (expr_in_scope, const NoUnfolding)
+        in_scope_env  = ISE expr_in_scope noUnfoldingFun
         -- It's inconvenient to get hold of a global in-scope set
         -- here, but it'll only be needed if exprIsConApp_maybe ends
         -- up substituting inside a forall or lambda (i.e. seldom)
@@ -918,7 +923,7 @@ addCoreCt nabla x e = do
           ex_tys                 = map exprToType ex_ty_args
           vis_args               = reverse $ take arty $ reverse val_args
       uniq_supply <- lift $ lift $ getUniqueSupplyM
-      let (_, ex_tvs) = cloneTyVarBndrs (mkEmptyTCvSubst in_scope) dc_ex_tvs uniq_supply
+      let (_, ex_tvs) = cloneTyVarBndrs (mkEmptySubst in_scope) dc_ex_tvs uniq_supply
           ty_cts      = equateTys (map mkTyVarTy ex_tvs) ex_tys
       -- 1. @x ≁ ⊥@ if 'K' is not a Newtype constructor (#18341)
       when (not (isNewDataCon dc)) $
@@ -942,22 +947,121 @@ addCoreCt nabla x e = do
     pm_alt_con_app :: Id -> PmAltCon -> [TyVar] -> [Id] -> StateT Nabla (MaybeT DsM) ()
     pm_alt_con_app x con tvs args = modifyT $ \nabla -> addConCt nabla x con tvs args
 
+-- | Like 'modify', but with an effectful modifier action
+modifyT :: Monad m => (s -> m s) -> StateT s m ()
+modifyT f = StateT $ fmap ((,) ()) . f
+
 -- | Finds a representant of the semantic equality class of the given @e@.
 -- Which is the @x@ of a @let x = e'@ constraint (with @e@ semantically
 -- equivalent to @e'@) we encountered earlier, or a fresh identifier if
 -- there weren't any such constraints.
 representCoreExpr :: Nabla -> CoreExpr -> DsM (Id, Nabla)
 representCoreExpr nabla@MkNabla{ nabla_tm_st = ts@TmSt{ ts_reps = reps } } e
-  | Just rep <- lookupCoreMap reps e = pure (rep, nabla)
+  | Just rep <- lookupCoreMap reps key = pure (rep, nabla)
   | otherwise = do
       rep <- mkPmId (exprType e)
-      let reps'  = extendCoreMap reps e rep
+      let reps'  = extendCoreMap reps key rep
       let nabla' = nabla{ nabla_tm_st = ts{ ts_reps = reps' } }
       pure (rep, nabla')
+  where
+    key = makeDictsCoherent e
+      -- Use a key in which dictionaries for the same type become equal.
+      -- See Note [Unique dictionaries in the TmOracle CoreMap]
 
--- | Like 'modify', but with an effectful modifier action
-modifyT :: Monad m => (s -> m s) -> StateT s m ()
-modifyT f = StateT $ fmap ((,) ()) . f
+-- | Change out 'Id's which are uniquely determined by their type to a
+-- common value, so that different names for dictionaries of the same type
+-- are considered equal when building a 'CoreMap'.
+--
+-- See Note [Unique dictionaries in the TmOracle CoreMap]
+makeDictsCoherent :: CoreExpr -> CoreExpr
+makeDictsCoherent var@(Var v)
+  | let ty = idType v
+  , typeDeterminesValue ty
+  = mkImpossibleExpr ty "Solver.makeDictsCoherent"
+  | otherwise
+  = var
+makeDictsCoherent lit@(Lit {})
+  = lit
+makeDictsCoherent (App f a)
+  = App (makeDictsCoherent f) (makeDictsCoherent a)
+makeDictsCoherent (Lam f body)
+  = Lam f (makeDictsCoherent body)
+makeDictsCoherent (Let bndr body)
+  = Let
+      (go_bndr bndr)
+      (makeDictsCoherent body)
+  where
+    go_bndr (NonRec bndr expr) = NonRec bndr (makeDictsCoherent expr)
+    go_bndr (Rec bndrs) = Rec (map ( \(b, expr) -> (b, makeDictsCoherent expr) ) bndrs)
+makeDictsCoherent (Case scrut bndr ty alts)
+  = Case scrut bndr ty
+      [ Alt con bndr expr'
+      | Alt con bndr expr <- alts
+      , let expr' = makeDictsCoherent expr ]
+makeDictsCoherent (Cast expr co)
+  = Cast (makeDictsCoherent expr) co
+makeDictsCoherent (Tick tick expr)
+  = Tick tick (makeDictsCoherent expr)
+makeDictsCoherent ty@(Type {})
+  = ty
+makeDictsCoherent co@(Coercion {})
+  = co
+
+{- Note [Unique dictionaries in the TmOracle CoreMap]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Any two dictionaries for a coherent typeclass should be considered equal
+in the TmOracle CoreMap, as this allows us to report better pattern-match
+warnings.
+
+Consider for example T21662:
+
+  view_fn :: forall (n :: Nat). KnownNat n => Int -> Bool
+
+  foo :: Int -> Int
+  foo (view_fn @12 -> True ) = 0
+  foo (view_fn @12 -> False) = 1
+
+In this example, the pattern match is exhaustive because we have covered
+the range of the view pattern function. However, we may fail to recognise
+the fact that the two cases use the same view function if the KnownNat
+dictionaries aren't syntactically equal:
+
+  eqn 1: [let ds_d1p0 = view_fn @12 $dKnownNat_a1ny ds_d1oR,  True <- ds_d1p0]
+  eqn 2: [let ds_d1p6 = view_fn @12 $dKnownNat_a1nC ds_d1oR, False <- ds_d1p6]
+
+Note that the uniques of the KnownNat 12 dictionary differ. If we fail to utilise
+the coherence of the KnownNat constraint, then we have to pessimistically assume
+that we have two function calls with different arguments:
+
+  foo (fn arg1 -> True ) = ...
+  foo (fn arg2 -> False) = ...
+
+In this case we can't determine whether the pattern matches are complete, so we
+emit a pattern match warning.
+
+Solution: replace all 'Id's whose type uniquely determines its value with
+a common value, e.g. in the above example we would replace both
+$dKnownNat_a1ny and $dKnownNat_a1nC with error @(KnownNat 12).
+
+Why did we choose this solution? Here are some alternatives that were considered:
+
+  1. Perform CSE first. This would common up the dictionaries before we compare
+     using the CoreMap.
+     However, this is architecturally difficult as it would require threading
+     a CSEnv through to desugarPat.
+  2. Directly modify CoreMap so that any two dictionaries of the same type are
+     considered equal.
+     The problem is that this affects all users of CoreMap. For example, CSE
+     would now assume that any two dictionaries of the same type are equal,
+     but this isn't necessarily true in the presence of magicDict, which
+     violates coherence by design. It seems more prudent to limit the changes
+     to the pattern-match checker only, to avoid undesirable consequences.
+
+In the end, replacing dictionaries with an error value in the pattern-match
+checker was the most self-contained, although we might want to revisit once
+we implement a more robust approach to computing equality in the pattern-match
+checker (see #19272).
+-}
 
 {- Note [The Pos/Neg invariant]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -968,7 +1072,7 @@ or are redundant. Examples:
 * @x ~ Just y@, @x ≁ [Just]@. 'eqPmAltCon' returns @Equal@, so refute.
 * @x ~ Nothing@, @x ≁ [Just]@. 'eqPmAltCon' returns @Disjoint@, so negative
   info is redundant and should be discarded.
-* @x ~ I# y@, @x ≁ [4,2]@. 'eqPmAltCon' returns @PossiblyOverlap@, so orthogal.
+* @x ~ I# y@, @x ≁ [4,2]@. 'eqPmAltCon' returns @PossiblyOverlap@, so orthogonal.
   We keep this info in order to be able to refute a redundant match on i.e. 4
   later on.
 
@@ -1245,7 +1349,7 @@ varNeedsTesting old_ty_st MkNabla{nabla_ty_st=new_ty_st} vi = do
 -- Internally uses and updates the CompleteMatchs in vi_rcm.
 --
 -- NB: Does /not/ filter each CompleteMatch with the oracle; members may
---     remain that do not statisfy it.  This lazy approach just
+--     remain that do not satisfy it.  This lazy approach just
 --     avoids doing unnecessary work.
 instantiate :: Int -> Nabla -> VarInfo -> MaybeT DsM VarInfo
 instantiate fuel nabla vi = {-# SCC "instantiate" #-}
@@ -1382,7 +1486,7 @@ triviallyInhabitedTyConKeys = mkUniqSet [
 compareConLikeTestability :: ConLike -> ConLike -> Ordering
 -- We should instantiate DataCons first, because they are likely to occur in
 -- multiple COMPLETE sets at once and we might find that multiple COMPLETE sets
--- are inhabitated by instantiating only a single DataCon.
+-- are inhabited by instantiating only a single DataCon.
 compareConLikeTestability PatSynCon{}     _               = GT
 compareConLikeTestability _               PatSynCon{}     = GT
 compareConLikeTestability (RealDataCon a) (RealDataCon b) = mconcat
@@ -1477,7 +1581,7 @@ instCon fuel nabla@MkNabla{nabla_ty_st = ty_st} x con = {-# SCC "instCon" #-} Ma
 -- Make sure that @ty@ is normalised before.
 --
 -- See Note [Matching against a ConLike result type].
-matchConLikeResTy :: FamInstEnvs -> TyState -> Type -> ConLike -> DsM (Maybe TCvSubst)
+matchConLikeResTy :: FamInstEnvs -> TyState -> Type -> ConLike -> DsM (Maybe Subst)
 matchConLikeResTy env _              ty (RealDataCon dc) = pure $ do
   (rep_tc, tc_args, _co) <- splitReprTyConApp_maybe env ty
   if rep_tc == dataConTyCon dc
@@ -1486,7 +1590,7 @@ matchConLikeResTy env _              ty (RealDataCon dc) = pure $ do
 matchConLikeResTy _   (TySt _ inert) ty (PatSynCon ps) = {-# SCC "matchConLikeResTy" #-} runMaybeT $ do
   let (univ_tvs,req_theta,_,_,_,con_res_ty) = patSynSig ps
   subst <- MaybeT $ pure $ tcMatchTy con_res_ty ty
-  guard $ all (`elemTCvSubst` subst) univ_tvs -- See the Note about T11336b
+  guard $ all (`elemSubst` subst) univ_tvs -- See the Note about T11336b
   if null req_theta
     then pure subst
     else do
@@ -1521,7 +1625,7 @@ A complete algorithm would mean that
      definition be flagged as inexhaustive (no false positives).
 
 Via the LYG algorithm, we reduce both these properties to a property on
-the inhabitation test of refinementment types:
+the inhabitation test of refinement types:
   *Soundness*:    If the inhabitation test says "no" for a given refinement type
                   Nabla, then it provably has no inhabitant.
   *Completeness*: If the inhabitation test says "yes" for a given refinement type
@@ -1637,7 +1741,7 @@ If we try to instantiate each of its fields, that will require us to once again
 check if `MkT` is inhabitable in each of those three fields, which in turn will
 require us to check if `MkT` is inhabitable again... As you can see, the
 branching factor adds up quickly, and if the initial fuel is, say,
-100, then the inhabiation test will effectively take forever.
+100, then the inhabitation test will effectively take forever.
 
 To mitigate this, we check the branching factor every time we are about to do
 inhabitation testing in 'instCon'. If the branching factor exceeds 1
@@ -1738,7 +1842,7 @@ DataCons and PatSynCons:
 
 Note [Instantiating a ConLike]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-`instCon` implements the the \(Inst\) function from Figure 8 of the LYG paper.
+`instCon` implements the \(Inst\) function from Figure 8 of the LYG paper.
 
 Given the following type of ConLike `K`
 

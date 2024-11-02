@@ -1,5 +1,5 @@
 name:          process
-version:       1.6.17.0
+version:       1.6.19.0
 -- NOTE: Don't forget to update ./changelog.md
 license:       BSD3
 license-file:  LICENSE
@@ -58,19 +58,24 @@ library
         c-sources:
             cbits/win32/runProcess.c
         other-modules: System.Process.Windows
-        build-depends: Win32 >=2.4 && < 2.14
+        build-depends: Win32 >=2.4 && < 2.15
         -- ole32 and rpcrt4 are needed to create GUIDs for unique named pipes
         -- for process.
         extra-libraries: kernel32, ole32, rpcrt4
         cpp-options: -DWINDOWS
     else
-        c-sources:
-            cbits/posix/runProcess.c
-            cbits/posix/fork_exec.c
-            cbits/posix/posix_spawn.c
-            cbits/posix/find_executable.c
-        other-modules: System.Process.Posix
-        build-depends: unix >= 2.5 && < 2.9
+        if arch(javascript)
+            js-sources:
+                jsbits/process.js
+            other-modules: System.Process.JavaScript
+        else
+            c-sources:
+                cbits/posix/runProcess.c
+                cbits/posix/fork_exec.c
+                cbits/posix/posix_spawn.c
+                cbits/posix/find_executable.c
+            other-modules: System.Process.Posix
+            build-depends: unix >= 2.5 && < 2.9
 
     include-dirs: include
     includes:
@@ -81,10 +86,10 @@ library
 
     ghc-options: -Wall
 
-    build-depends: base      >= 4.10 && < 4.19,
+    build-depends: base      >= 4.10 && < 4.20,
                    directory >= 1.1 && < 1.4,
-                   filepath  >= 1.2 && < 1.5,
-                   deepseq   >= 1.1 && < 1.5
+                   filepath  >= 1.2 && < 1.6,
+                   deepseq   >= 1.1 && < 1.6
 
 test-suite test
   default-language: Haskell2010

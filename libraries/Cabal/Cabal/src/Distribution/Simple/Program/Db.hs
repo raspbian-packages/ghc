@@ -34,6 +34,7 @@ module Distribution.Simple.Program.Db (
     -- ** Query and manipulate the program db
     addKnownProgram,
     addKnownPrograms,
+    appendProgramSearchPath,
     lookupKnownProgram,
     knownPrograms,
     getProgramSearchPath,
@@ -46,6 +47,7 @@ module Distribution.Simple.Program.Db (
     userSpecifyArgss,
     userSpecifiedArgs,
     lookupProgram,
+    lookupProgramByName,
     updateProgram,
     configuredPrograms,
 
@@ -222,6 +224,21 @@ modifyProgramSearchPath :: (ProgramSearchPath -> ProgramSearchPath)
 modifyProgramSearchPath f db =
   setProgramSearchPath (f $ getProgramSearchPath db) db
 
+-- | Modify the current 'ProgramSearchPath' used by the 'ProgramDb'
+-- by appending the provided extra paths. Also logs the added paths
+-- in info verbosity.
+appendProgramSearchPath
+  :: Verbosity
+  -> [FilePath]
+  -> ProgramDb
+  -> IO ProgramDb
+appendProgramSearchPath verbosity extraPaths db =
+  if not $ null extraPaths
+    then do
+      logExtraProgramSearchPath verbosity extraPaths
+      pure $ modifyProgramSearchPath (map ProgramSearchPathDir extraPaths ++) db
+    else pure db
+
 -- |User-specify this path.  Basically override any path information
 -- for this program in the configuration. If it's not a known
 -- program ignore it.
@@ -293,8 +310,11 @@ userSpecifiedArgs prog =
 
 -- | Try to find a configured program
 lookupProgram :: Program -> ProgramDb -> Maybe ConfiguredProgram
-lookupProgram prog = Map.lookup (programName prog) . configuredProgs
+lookupProgram = lookupProgramByName . programName
 
+-- | Try to find a configured program
+lookupProgramByName :: String -> ProgramDb -> Maybe ConfiguredProgram
+lookupProgramByName name = Map.lookup name . configuredProgs
 
 -- | Update a configured program in the database.
 updateProgram :: ConfiguredProgram -> ProgramDb

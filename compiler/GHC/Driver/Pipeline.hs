@@ -7,6 +7,8 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE ConstraintKinds #-}
 {-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE ViewPatterns #-}
+{-# LANGUAGE TypeApplications #-}
 
 -----------------------------------------------------------------------------
 --
@@ -40,7 +42,7 @@ module GHC.Driver.Pipeline (
    TPipelineClass, MonadUse(..),
 
    preprocessPipeline, fullPipeline, hscPipeline, hscBackendPipeline, hscPostBackendPipeline,
-   hscGenBackendPipeline, asPipeline, viaCPipeline, cmmCppPipeline, cmmPipeline,
+   hscGenBackendPipeline, asPipeline, viaCPipeline, cmmCppPipeline, cmmPipeline, jsPipeline,
    llvmPipeline, llvmLlcPipeline, llvmManglePipeline, pipelineStart,
 
    -- * Default method of running a pipeline
@@ -60,6 +62,7 @@ import GHC.Driver.Errors
 import GHC.Driver.Errors.Types
 import GHC.Driver.Pipeline.Monad
 import GHC.Driver.Config.Diagnostic
+import GHC.Driver.Config.StgToJS
 import GHC.Driver.Phases
 import GHC.Driver.Pipeline.Execute
 import GHC.Driver.Pipeline.Phases
@@ -71,12 +74,16 @@ import GHC.Driver.Hooks
 import GHC.Platform.Ways
 
 import GHC.SysTools
+import GHC.SysTools.Cpp
 import GHC.Utils.TmpFs
 
 import GHC.Linker.ExtraObj
 import GHC.Linker.Static
 import GHC.Linker.Static.Utils
 import GHC.Linker.Types
+
+import GHC.StgToJS.Linker.Linker
+import GHC.StgToJS.Linker.Types (defaultJSLinkConfig)
 
 import GHC.Utils.Outputable
 import GHC.Utils.Error
@@ -96,7 +103,7 @@ import GHC.Runtime.Loader      ( initializePlugins )
 
 
 import GHC.Types.Basic       ( SuccessFlag(..), ForeignSrcLang(..) )
-import GHC.Types.Error       ( singleMessage, getMessages )
+import GHC.Types.Error       ( singleMessage, getMessages, UnknownDiagnostic (..) )
 import GHC.Types.Target
 import GHC.Types.SrcLoc
 import GHC.Types.SourceFile
@@ -122,6 +129,7 @@ import qualified Data.Set as Set
 
 import Data.Time        ( getCurrentTime )
 import GHC.Iface.Recomp
+import GHC.Types.Unique.DSet
 
 -- Simpler type synonym for actions in the pipeline monad
 type P m = TPipelineClass TPhase m
@@ -155,13 +163,14 @@ preprocess hsc_env input_fn mb_input_buf mb_phase =
     handler (ProgramError msg) =
       return $ Left $ singleMessage $
         mkPlainErrorMsgEnvelope srcspan $
-        DriverUnknownMessage $ mkPlainError noHints $ text msg
+        DriverUnknownMessage $ UnknownDiagnostic $ mkPlainError noHints $ text msg
     handler ex = throwGhcExceptionIO ex
 
     to_driver_messages :: Messages GhcMessage -> Messages DriverMessage
     to_driver_messages msgs = case traverse to_driver_message msgs of
       Nothing    -> pprPanic "non-driver message in preprocess"
-                             (vcat $ pprMsgEnvelopeBagWithLoc (getMessages msgs))
+                             -- MP: Default config is fine here as it's just in a panic.
+                             (vcat $ pprMsgEnvelopeBagWithLoc (defaultDiagnosticOpts @GhcMessage) (getMessages msgs))
       Just msgs' -> msgs'
 
     to_driver_message = \case
@@ -209,7 +218,7 @@ compileOne :: HscEnv
            -> Int             -- ^ module N ...
            -> Int             -- ^ ... of M
            -> Maybe ModIface  -- ^ old interface, if we have one
-           -> Maybe Linkable  -- ^ old linkable, if we have one
+           -> HomeModLinkable  -- ^ old linkable, if we have one
            -> IO HomeModInfo   -- ^ the complete HomeModInfo, if successful
 
 compileOne = compileOne' (Just batchMsg)
@@ -220,7 +229,7 @@ compileOne' :: Maybe Messager
             -> Int             -- ^ module N ...
             -> Int             -- ^ ... of M
             -> Maybe ModIface  -- ^ old interface, if we have one
-            -> Maybe Linkable  -- ^ old linkable, if we have one
+            -> HomeModLinkable
             -> IO HomeModInfo   -- ^ the complete HomeModInfo, if successful
 
 compileOne' mHscMessage
@@ -229,33 +238,31 @@ compileOne' mHscMessage
 
    debugTraceMsg logger 2 (text "compile: input file" <+> text input_fnpp)
 
-   let flags = hsc_dflags hsc_env0
-     in do unless (gopt Opt_KeepHiFiles flags) $
-               addFilesToClean tmpfs TFL_CurrentModule $
-                   [ml_hi_file $ ms_location summary]
-           unless (gopt Opt_KeepOFiles flags) $
-               addFilesToClean tmpfs TFL_GhcSession $
-                   [ml_obj_file $ ms_location summary]
+   unless (gopt Opt_KeepHiFiles lcl_dflags) $
+             addFilesToClean tmpfs TFL_CurrentModule $
+                 [ml_hi_file $ ms_location summary]
+   unless (gopt Opt_KeepOFiles lcl_dflags) $
+             addFilesToClean tmpfs TFL_GhcSession $
+                 [ml_obj_file $ ms_location summary]
 
+   -- Initialise plugins here for any plugins enabled locally for a module.
    plugin_hsc_env <- initializePlugins hsc_env
    let pipe_env = mkPipeEnv NoStop input_fn Nothing pipelineOutput
    status <- hscRecompStatus mHscMessage plugin_hsc_env upd_summary
                 mb_old_iface mb_old_linkable (mod_index, nmods)
    let pipeline = hscPipeline pipe_env (setDumpPrefix pipe_env plugin_hsc_env, upd_summary, status)
-   (iface, linkable) <- runPipeline (hsc_hooks hsc_env) pipeline
+   (iface, linkable) <- runPipeline (hsc_hooks plugin_hsc_env) pipeline
    -- See Note [ModDetails and --make mode]
-   details <- initModDetails plugin_hsc_env upd_summary iface
-   return $! HomeModInfo iface details linkable
+   details <- initModDetails plugin_hsc_env iface
+   linkable' <- traverse (initWholeCoreBindings plugin_hsc_env iface details) (homeMod_bytecode linkable)
+   return $! HomeModInfo iface details (linkable { homeMod_bytecode = linkable' })
 
  where lcl_dflags  = ms_hspp_opts summary
        location    = ms_location summary
        input_fn    = expectJust "compile:hs" (ml_hs_file location)
        input_fnpp  = ms_hspp_file summary
 
-       pipelineOutput = case bcknd of
-         Interpreter -> NoOutputFile
-         NoBackend -> NoOutputFile
-         _ -> Persistent
+       pipelineOutput = backendPipelineOutput bcknd
 
        logger = hsc_logger hsc_env0
        tmpfs  = hsc_tmpfs hsc_env0
@@ -279,7 +286,10 @@ compileOne' mHscMessage
          -- was set), force it to generate byte-code. This is NOT transitive and
          -- only applies to direct targets.
          | loadAsByteCode
-         = (Interpreter, gopt_set (lcl_dflags { backend = Interpreter }) Opt_ForceRecomp)
+         = ( interpreterBackend
+           , gopt_set (lcl_dflags { backend = interpreterBackend }) Opt_ForceRecomp
+           )
+
          | otherwise
          = (backend dflags, lcl_dflags)
        -- See Note [Filepaths and Multiple Home Units]
@@ -360,17 +370,17 @@ link :: GhcLink                 -- ^ interactive or batch
 link ghcLink logger tmpfs hooks dflags unit_env batch_attempt_linking mHscMessage hpt =
   case linkHook hooks of
       Nothing -> case ghcLink of
-          NoLink        -> return Succeeded
-          LinkBinary    -> normal_link
-          LinkStaticLib -> normal_link
-          LinkDynLib    -> normal_link
-          LinkMergedObj -> normal_link
-          LinkInMemory
-              | platformMisc_ghcWithInterpreter $ platformMisc dflags
-              -> -- Not Linking...(demand linker will do the job)
-                 return Succeeded
-              | otherwise
-              -> panicBadLink LinkInMemory
+        NoLink        -> return Succeeded
+        LinkBinary    -> normal_link
+        LinkStaticLib -> normal_link
+        LinkDynLib    -> normal_link
+        LinkMergedObj -> normal_link
+        LinkInMemory
+          | platformMisc_ghcWithInterpreter $ platformMisc dflags
+           -- Not Linking...(demand linker will do the job)
+            -> return Succeeded
+          | otherwise
+            -> panicBadLink LinkInMemory
       Just h  -> h ghcLink dflags batch_attempt_linking hpt
   where
     normal_link = link' logger tmpfs dflags unit_env batch_attempt_linking mHscMessage hpt
@@ -406,9 +416,11 @@ link' logger tmpfs dflags unit_env batch_attempt_linking mHscMessager hpt
                           $ home_mod_infos
 
             -- the linkables to link
-            linkables = map (expectJust "link".hm_linkable) home_mod_infos
+            linkables = map (expectJust "link". homeModInfoObject) home_mod_infos
 
+        debugTraceMsg logger 3 (text "link: hmi ..." $$ vcat (map (ppr . mi_module . hm_iface) home_mod_infos))
         debugTraceMsg logger 3 (text "link: linkables are ..." $$ vcat (map ppr linkables))
+        debugTraceMsg logger 3 (text "link: pkg deps are ..." $$ vcat (map ppr pkg_deps))
 
         -- check for the -no-link flag
         if isNoLink (ghcLink dflags)
@@ -419,7 +431,8 @@ link' logger tmpfs dflags unit_env batch_attempt_linking mHscMessager hpt
         let getOfiles LM{ linkableUnlinked } = map nameOfObject (filter isObject linkableUnlinked)
             obj_files = concatMap getOfiles linkables
             platform  = targetPlatform dflags
-            exe_file  = exeFileName platform staticLink (outputFile_ dflags)
+            arch_os   = platformArchOS platform
+            exe_file  = exeFileName arch_os staticLink (outputFile_ dflags)
 
         linking_needed <- linkingNeeded logger dflags unit_env staticLink linkables pkg_deps
 
@@ -431,12 +444,13 @@ link' logger tmpfs dflags unit_env batch_attempt_linking mHscMessager hpt
 
 
         -- Don't showPass in Batch mode; doLink will do that for us.
-        let link = case ghcLink dflags of
-                LinkBinary    -> linkBinary logger tmpfs
-                LinkStaticLib -> linkStaticLib logger
-                LinkDynLib    -> linkDynLibCheck logger tmpfs
-                other         -> panicBadLink other
-        link dflags unit_env obj_files pkg_deps
+        case ghcLink dflags of
+          LinkBinary
+            | backendUseJSLinker (backend dflags) -> linkJSBinary logger dflags unit_env obj_files pkg_deps
+            | otherwise -> linkBinary logger tmpfs dflags unit_env obj_files pkg_deps
+          LinkStaticLib -> linkStaticLib logger dflags unit_env obj_files pkg_deps
+          LinkDynLib    -> linkDynLibCheck logger tmpfs dflags unit_env obj_files pkg_deps
+          other         -> panicBadLink other
 
         debugTraceMsg logger 3 (text "link: done")
 
@@ -449,6 +463,15 @@ link' logger tmpfs dflags unit_env batch_attempt_linking mHscMessager hpt
         return Succeeded
 
 
+linkJSBinary :: Logger -> DynFlags -> UnitEnv -> [FilePath] -> [UnitId] -> IO ()
+linkJSBinary logger dflags unit_env obj_files pkg_deps = do
+  -- we use the default configuration for now. In the future we may expose
+  -- settings to the user via DynFlags.
+  let lc_cfg   = defaultJSLinkConfig
+  let cfg      = initStgToJSConfig dflags
+  let extra_js = mempty
+  jsLinkBinary lc_cfg cfg extra_js logger dflags unit_env obj_files pkg_deps
+
 linkingNeeded :: Logger -> DynFlags -> UnitEnv -> Bool -> [Linkable] -> [UnitId] -> IO RecompileRequired
 linkingNeeded logger dflags unit_env staticLink linkables pkg_deps = do
         -- if the modification time on the executable is later than the
@@ -456,7 +479,8 @@ linkingNeeded logger dflags unit_env staticLink linkables pkg_deps = do
         -- linking (unless the -fforce-recomp flag was given).
   let platform   = ue_platform unit_env
       unit_state = ue_units unit_env
-      exe_file   = exeFileName platform staticLink (outputFile_ dflags)
+      arch_os    = platformArchOS platform
+      exe_file   = exeFileName arch_os staticLink (outputFile_ dflags)
   e_exe_time <- tryIO $ getModificationUTCTime exe_file
   case e_exe_time of
     Left _  -> return $ NeedsRecompile MustCompile
@@ -472,8 +496,18 @@ linkingNeeded logger dflags unit_env staticLink linkables pkg_deps = do
 
         -- next, check libraries. XXX this only checks Haskell libraries,
         -- not extra_libraries or -l things from the command line.
+        -- pkg_deps is just the direct dependencies so take the transitive closure here
+        -- to decide if we need to relink or not.
+        let pkg_hslibs acc uid
+              | uid `elementOfUniqDSet` acc = acc
+              | Just c <- lookupUnitId unit_state uid =
+                  foldl' @[] pkg_hslibs (addOneToUniqDSet acc uid) (unitDepends c)
+              | otherwise = acc
+
+            all_pkg_deps = foldl' @[] pkg_hslibs emptyUniqDSet pkg_deps
+
         let pkg_hslibs  = [ (collectLibraryDirs (ways dflags) [c], lib)
-                          | Just c <- map (lookupUnitId unit_state) pkg_deps,
+                          | Just c <- map (lookupUnitId unit_state) (uniqDSetToList all_pkg_deps),
                             lib <- unitHsLibs (ghcNameVersion dflags) (ways dflags) c ]
 
         pkg_libfiles <- mapM (uncurry (findHSLib platform (ways dflags))) pkg_hslibs
@@ -504,7 +538,11 @@ findHSLib platform ws dirs lib = do
 -- Compile files in one-shot mode.
 
 oneShot :: HscEnv -> StopPhase -> [(String, Maybe Phase)] -> IO ()
-oneShot hsc_env stop_phase srcs = do
+oneShot orig_hsc_env stop_phase srcs = do
+  -- In oneshot mode, initialise plugins specified on command line
+  -- we also initialise in ghc/Main but this might be used as an entry point by API clients who
+  -- should initialise their own plugins but may not.
+  hsc_env <- initializePlugins orig_hsc_env
   o_files <- mapMaybeM (compileFile hsc_env stop_phase) srcs
   case stop_phase of
     StopPreprocess -> return ()
@@ -527,7 +565,7 @@ compileFile hsc_env stop_phase (src, mb_phase) = do
         -- When linking, the -o argument refers to the linker's output.
         -- otherwise, we use it as the name for the pipeline's output.
         output
-         | NoBackend <- backend dflags, notStopPreprocess = NoOutputFile
+         | not (backendGeneratesCode (backend dflags)), notStopPreprocess = NoOutputFile
                 -- avoid -E -fno-code undesirable interactions. see #20439
          | NoStop <- stop_phase, not (isNoLink ghc_link) = Persistent
                 -- -o foo applies to linker
@@ -540,23 +578,27 @@ compileFile hsc_env stop_phase (src, mb_phase) = do
 
 
 doLink :: HscEnv -> [FilePath] -> IO ()
-doLink hsc_env o_files =
-    let
-        dflags   = hsc_dflags   hsc_env
-        logger   = hsc_logger   hsc_env
-        unit_env = hsc_unit_env hsc_env
-        tmpfs    = hsc_tmpfs    hsc_env
-    in case ghcLink dflags of
-        NoLink        -> return ()
-        LinkBinary    -> linkBinary         logger tmpfs dflags unit_env o_files []
-        LinkStaticLib -> linkStaticLib      logger       dflags unit_env o_files []
-        LinkDynLib    -> linkDynLibCheck    logger tmpfs dflags unit_env o_files []
-        LinkMergedObj
-          | Just out <- outputFile dflags
-          , let objs = [ f | FileOption _ f <- ldInputs dflags ]
-                      -> joinObjectFiles hsc_env (o_files ++ objs) out
-          | otherwise -> panic "Output path must be specified for LinkMergedObj"
-        other         -> panicBadLink other
+doLink hsc_env o_files = do
+  let
+    dflags   = hsc_dflags   hsc_env
+    logger   = hsc_logger   hsc_env
+    unit_env = hsc_unit_env hsc_env
+    tmpfs    = hsc_tmpfs    hsc_env
+
+  case ghcLink dflags of
+    NoLink        -> return ()
+    LinkBinary
+      | backendUseJSLinker (backend dflags)
+                  -> linkJSBinary logger dflags unit_env o_files []
+      | otherwise -> linkBinary logger tmpfs dflags unit_env o_files []
+    LinkStaticLib -> linkStaticLib      logger       dflags unit_env o_files []
+    LinkDynLib    -> linkDynLibCheck    logger tmpfs dflags unit_env o_files []
+    LinkMergedObj
+      | Just out <- outputFile dflags
+      , let objs = [ f | FileOption _ f <- ldInputs dflags ]
+                  -> joinObjectFiles hsc_env (o_files ++ objs) out
+      | otherwise -> panic "Output path must be specified for LinkMergedObj"
+    other         -> panicBadLink other
 
 -----------------------------------------------------------------------------
 -- stub .h and .c files (for foreign export support), and cc files.
@@ -581,6 +623,7 @@ compileForeign hsc_env lang stub_c = do
               LangObjc   -> viaCPipeline Cobjc
               LangObjcxx -> viaCPipeline Cobjcxx
               LangAsm    -> \pe hsc_env ml fp -> asPipeline True pe hsc_env ml fp
+              LangJs     -> \pe hsc_env ml fp -> Just <$> foreignJsPipeline pe hsc_env ml fp
 #if __GLASGOW_HASKELL__ < 811
               RawObject  -> panic "compileForeign: should be unreachable"
 #endif
@@ -590,7 +633,7 @@ compileForeign hsc_env lang stub_c = do
           -- This should never happen as viaCPipeline should only return `Nothing` when the stop phase is `StopC`.
           -- and the same should never happen for asPipeline
           -- Future refactoring to not check StopC for this case
-          Nothing -> pprPanic "compileForeign" (ppr stub_c)
+          Nothing -> pprPanic "compileForeign" (text stub_c)
           Just fp -> return fp
 
 compileEmptyStub :: DynFlags -> HscEnv -> FilePath -> ModLocation -> ModuleName -> IO ()
@@ -604,14 +647,27 @@ compileEmptyStub dflags hsc_env basename location mod_name = do
   -- and https://github.com/haskell/cabal/issues/2257
   let logger = hsc_logger hsc_env
   let tmpfs  = hsc_tmpfs hsc_env
-  empty_stub <- newTempName logger tmpfs (tmpDir dflags) TFL_CurrentModule "c"
   let home_unit = hsc_home_unit hsc_env
-      src = text "int" <+> ppr (mkHomeModule home_unit mod_name) <+> text "= 0;"
-  writeFile empty_stub (showSDoc dflags (pprCode CStyle src))
-  let pipe_env = (mkPipeEnv NoStop empty_stub Nothing Persistent) { src_basename = basename}
-      pipeline = viaCPipeline HCc pipe_env hsc_env (Just location) empty_stub
-  _ <- runPipeline (hsc_hooks hsc_env) pipeline
-  return ()
+
+  case backendCodeOutput (backend dflags) of
+    JSCodeOutput -> do
+      empty_stub <- newTempName logger tmpfs (tmpDir dflags) TFL_CurrentModule "js"
+      let src = ppr (mkHomeModule home_unit mod_name) <+> text "= 0;"
+      writeFile empty_stub (showSDoc dflags (pprCode src))
+      let pipe_env = (mkPipeEnv NoStop empty_stub Nothing Persistent) { src_basename = basename}
+          pipeline = Just <$> foreignJsPipeline pipe_env hsc_env (Just location) empty_stub
+      _ <- runPipeline (hsc_hooks hsc_env) pipeline
+      pure ()
+
+    _ -> do
+      empty_stub <- newTempName logger tmpfs (tmpDir dflags) TFL_CurrentModule "c"
+      let src = text "int" <+> ppr (mkHomeModule home_unit mod_name) <+> text "= 0;"
+      writeFile empty_stub (showSDoc dflags (pprCode src))
+      let pipe_env = (mkPipeEnv NoStop empty_stub Nothing Persistent) { src_basename = basename}
+          pipeline = viaCPipeline HCc pipe_env hsc_env (Just location) empty_stub
+      _ <- runPipeline (hsc_hooks hsc_env) pipeline
+      pure ()
+
 
 
 {- Environment Initialisation -}
@@ -689,8 +745,9 @@ preprocessPipeline pipe_env hsc_env input_fn = do
             -- Reparse with original hsc_env so that we don't get duplicated options
             use (T_FileArgs hsc_env pp_fn)
 
-  liftIO (printOrThrowDiagnostics (hsc_logger hsc_env) (initDiagOpts dflags3) (GhcPsMessage <$> p_warns3))
-  liftIO (handleFlagWarnings (hsc_logger hsc_env) (initDiagOpts dflags3) warns3)
+  let print_config = initPrintConfig dflags3
+  liftIO (printOrThrowDiagnostics (hsc_logger hsc_env) print_config (initDiagOpts dflags3) (GhcPsMessage <$> p_warns3))
+  liftIO (handleFlagWarnings (hsc_logger hsc_env) print_config (initDiagOpts dflags3) warns3)
   return (dflags3, pp_fn)
 
 
@@ -711,7 +768,7 @@ preprocessPipeline pipe_env hsc_env input_fn = do
            $ phaseIfFlag hsc_env flag def action
 
 -- | The complete compilation pipeline, from start to finish
-fullPipeline :: P m => PipeEnv -> HscEnv -> FilePath -> HscSource -> m (ModIface, Maybe Linkable)
+fullPipeline :: P m => PipeEnv -> HscEnv -> FilePath -> HscSource -> m (ModIface, HomeModLinkable)
 fullPipeline pipe_env hsc_env pp_fn src_flavour = do
   (dflags, input_fn) <- preprocessPipeline pipe_env hsc_env pp_fn
   let hsc_env' = hscSetFlags dflags hsc_env
@@ -720,7 +777,7 @@ fullPipeline pipe_env hsc_env pp_fn src_flavour = do
   hscPipeline pipe_env (hsc_env_with_plugins, mod_sum, hsc_recomp_status)
 
 -- | Everything after preprocess
-hscPipeline :: P m => PipeEnv ->  ((HscEnv, ModSummary, HscRecompStatus)) -> m (ModIface, Maybe Linkable)
+hscPipeline :: P m => PipeEnv ->  ((HscEnv, ModSummary, HscRecompStatus)) -> m (ModIface, HomeModLinkable)
 hscPipeline pipe_env (hsc_env_with_plugins, mod_sum, hsc_recomp_status) = do
   case hsc_recomp_status of
     HscUpToDate iface mb_linkable -> return (iface, mb_linkable)
@@ -729,28 +786,28 @@ hscPipeline pipe_env (hsc_env_with_plugins, mod_sum, hsc_recomp_status) = do
       hscBackendAction <- use (T_HscPostTc hsc_env_with_plugins mod_sum tc_result warnings mb_old_hash )
       hscBackendPipeline pipe_env hsc_env_with_plugins mod_sum hscBackendAction
 
-hscBackendPipeline :: P m => PipeEnv -> HscEnv -> ModSummary -> HscBackendAction -> m (ModIface, Maybe Linkable)
+hscBackendPipeline :: P m => PipeEnv -> HscEnv -> ModSummary -> HscBackendAction -> m (ModIface, HomeModLinkable)
 hscBackendPipeline pipe_env hsc_env mod_sum result =
-  case backend (hsc_dflags hsc_env) of
-    NoBackend ->
-      case result of
-        HscUpdate iface ->  return (iface, Nothing)
-        HscRecomp {} -> (,) <$> liftIO (mkFullIface hsc_env (hscs_partial_iface result) Nothing Nothing) <*> pure Nothing
-    -- TODO: Why is there not a linkable?
-    -- Interpreter -> (,) <$> use (T_IO (mkFullIface hsc_env (hscs_partial_iface result) Nothing)) <*> pure Nothing
-    _ -> do
+  if backendGeneratesCode (backend (hsc_dflags hsc_env)) then
+    do
       res <- hscGenBackendPipeline pipe_env hsc_env mod_sum result
       when (gopt Opt_BuildDynamicToo (hsc_dflags hsc_env)) $ do
           let dflags' = setDynamicNow (hsc_dflags hsc_env) -- set "dynamicNow"
           () <$ hscGenBackendPipeline pipe_env (hscSetFlags dflags' hsc_env) mod_sum result
       return res
+  else
+    case result of
+      HscUpdate iface ->  return (iface, emptyHomeModInfoLinkable)
+      HscRecomp {} -> (,) <$> liftIO (mkFullIface hsc_env (hscs_partial_iface result) Nothing Nothing) <*> pure emptyHomeModInfoLinkable
+    -- TODO: Why is there not a linkable?
+    -- Interpreter -> (,) <$> use (T_IO (mkFullIface hsc_env (hscs_partial_iface result) Nothing)) <*> pure Nothing
 
 hscGenBackendPipeline :: P m
   => PipeEnv
   -> HscEnv
   -> ModSummary
   -> HscBackendAction
-  -> m (ModIface, Maybe Linkable)
+  -> m (ModIface, HomeModLinkable)
 hscGenBackendPipeline pipe_env hsc_env mod_sum result = do
   let mod_name = moduleName (ms_mod mod_sum)
       src_flavour = (ms_hsc_src mod_sum)
@@ -765,7 +822,8 @@ hscGenBackendPipeline pipe_env hsc_env mod_sum result = do
         unlinked_time <- liftIO (liftIO getCurrentTime)
         final_unlinked <- DotO <$> use (T_MergeForeign pipe_env hsc_env o_fp fos)
         let !linkable = LM unlinked_time (ms_mod mod_sum) [final_unlinked]
-        return (Just linkable)
+        -- Add the object linkable to the potential bytecode linkable which was generated in HscBackend.
+        return (mlinkable { homeMod_object = Just linkable })
   return (miface, final_linkable)
 
 asPipeline :: P m => Bool -> PipeEnv -> HscEnv -> Maybe ModLocation -> FilePath -> m (Maybe ObjFile)
@@ -776,10 +834,10 @@ asPipeline use_cpp pipe_env hsc_env location input_fn =
 
 viaCPipeline :: P m => Phase -> PipeEnv -> HscEnv -> Maybe ModLocation -> FilePath -> m (Maybe FilePath)
 viaCPipeline c_phase pipe_env hsc_env location input_fn = do
-  out_fn <- use (T_Cc c_phase pipe_env hsc_env input_fn)
+  out_fn <- use (T_Cc c_phase pipe_env hsc_env location input_fn)
   case stop_phase pipe_env of
     StopC -> return Nothing
-    _ -> asPipeline False pipe_env hsc_env location out_fn
+    _ -> return $ Just out_fn
 
 llvmPipeline :: P m => PipeEnv -> HscEnv -> Maybe ModLocation -> FilePath -> m (Maybe FilePath)
 llvmPipeline pipe_env hsc_env location fp = do
@@ -812,16 +870,32 @@ cmmPipeline pipe_env hsc_env input_fn = do
     Nothing -> return Nothing
     Just mo_fn -> Just <$> use (T_MergeForeign pipe_env hsc_env mo_fn fos)
 
+jsPipeline :: P m => PipeEnv -> HscEnv -> Maybe ModLocation -> FilePath -> m FilePath
+jsPipeline pipe_env hsc_env location input_fn = do
+  use (T_Js pipe_env hsc_env location input_fn)
+
+foreignJsPipeline :: P m => PipeEnv -> HscEnv -> Maybe ModLocation -> FilePath -> m FilePath
+foreignJsPipeline pipe_env hsc_env location input_fn = do
+  use (T_ForeignJs pipe_env hsc_env location input_fn)
+
 hscPostBackendPipeline :: P m => PipeEnv -> HscEnv -> HscSource -> Backend -> Maybe ModLocation -> FilePath -> m (Maybe FilePath)
 hscPostBackendPipeline _ _ HsBootFile _ _ _   = return Nothing
 hscPostBackendPipeline _ _ HsigFile _ _ _     = return Nothing
 hscPostBackendPipeline pipe_env hsc_env _ bcknd ml input_fn =
-  case bcknd of
-        ViaC        -> viaCPipeline HCc pipe_env hsc_env ml input_fn
-        NCG         -> asPipeline False pipe_env hsc_env ml input_fn
-        LLVM        -> llvmPipeline pipe_env hsc_env ml input_fn
-        NoBackend   -> return Nothing
-        Interpreter -> return Nothing
+  applyPostHscPipeline (backendPostHscPipeline bcknd) pipe_env hsc_env ml input_fn
+
+applyPostHscPipeline
+    :: TPipelineClass TPhase m
+    => DefunctionalizedPostHscPipeline
+    -> PipeEnv -> HscEnv -> Maybe ModLocation -> FilePath -> m (Maybe FilePath)
+applyPostHscPipeline NcgPostHscPipeline =
+    \pe he ml fp -> asPipeline False pe he ml fp
+applyPostHscPipeline ViaCPostHscPipeline = viaCPipeline HCc
+applyPostHscPipeline LlvmPostHscPipeline =
+    \pe he ml fp -> llvmPipeline pe he ml fp
+applyPostHscPipeline JSPostHscPipeline =
+    \pe he ml fp -> Just <$> jsPipeline pe he ml fp
+applyPostHscPipeline NoPostHscPipeline = \_ _ _ _ -> return Nothing
 
 -- Pipeline from a given suffix
 pipelineStart :: P m => PipeEnv -> HscEnv -> FilePath -> Maybe Phase -> m (Maybe FilePath)
@@ -854,9 +928,8 @@ pipelineStart pipe_env hsc_env input_fn mb_phase =
    as :: P m => Bool -> m (Maybe FilePath)
    as use_cpp = asPipeline use_cpp pipe_env hsc_env Nothing input_fn
 
-   objFromLinkable (_, Just (LM _ _ [DotO lnk])) = Just lnk
+   objFromLinkable (_, homeMod_object -> Just (LM _ _ [DotO lnk])) = Just lnk
    objFromLinkable _ = Nothing
-
 
    fromPhase :: P m => Phase -> m (Maybe FilePath)
    fromPhase (Unlit p)  = frontend p
@@ -875,6 +948,7 @@ pipelineStart pipe_env hsc_env input_fn mb_phase =
    fromPhase StopLn     = return (Just input_fn)
    fromPhase CmmCpp     = cmmCppPipeline pipe_env hsc_env input_fn
    fromPhase Cmm        = cmmPipeline pipe_env hsc_env input_fn
+   fromPhase Js         = Just <$> foreignJsPipeline pipe_env hsc_env Nothing input_fn
    fromPhase MergeForeign = panic "fromPhase: MergeForeign"
 
 {-
@@ -891,7 +965,7 @@ The idea in the future is that we can now implement different instiations of
 `TPipelineClass` to give different behaviours that the default `HookedPhase` implementation:
 
 * Additional logging of different phases
-* Automatic parrelism (in the style of shake)
+* Automatic parallelism (in the style of shake)
 * Easy consumption by external tools such as ghcide
 * Easier to create your own pipeline and extend existing pipelines.
 

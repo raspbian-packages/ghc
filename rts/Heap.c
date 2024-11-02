@@ -173,7 +173,7 @@ StgWord collect_pointers(StgClosure *closure, StgClosure *ptrs[]) {
         case IND:
         case IND_STATIC:
         case BLACKHOLE:
-            ptrs[nptrs++] = (StgClosure *)(((StgInd *)closure)->indirectee);
+            ptrs[nptrs++] = (StgClosure *) ACQUIRE_LOAD(&((StgInd *)closure)->indirectee);
             break;
 
         case MUT_ARR_PTRS_CLEAN:
@@ -223,6 +223,10 @@ StgWord collect_pointers(StgClosure *closure, StgClosure *ptrs[]) {
             ASSERT((StgClosure *)((StgTSO *)closure)->bq != NULL);
             ptrs[nptrs++] = (StgClosure *)((StgTSO *)closure)->bq;
 
+            if ((StgClosure *)((StgTSO *)closure)->label != NULL) {
+                ptrs[nptrs++] = (StgClosure *)((StgTSO *)closure)->label;
+            }
+
             break;
         case WEAK: {
             StgWeak *w = (StgWeak *)closure;
@@ -236,6 +240,10 @@ StgWord collect_pointers(StgClosure *closure, StgClosure *ptrs[]) {
             }
             break;
         }
+
+        case CONTINUATION:
+            // See the note in AP_STACK about the stack chunk.
+            break;
 
         default:
             fprintf(stderr,"closurePtrs: Cannot handle type %s yet\n",
@@ -270,7 +278,7 @@ StgMutArrPtrs *heap_view_closurePtrs(Capability *cap, StgClosure *closure) {
     for (StgWord i = 0; i<nptrs; i++) {
         arr->payload[i] = ptrs[i];
     }
-    free(ptrs);
+    stgFree(ptrs);
 
     return arr;
 }

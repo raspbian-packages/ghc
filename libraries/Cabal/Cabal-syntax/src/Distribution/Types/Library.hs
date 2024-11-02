@@ -25,10 +25,10 @@ data Library = Library
     , reexportedModules :: [ModuleReexport]
     , signatures        :: [ModuleName]       -- ^ What sigs need implementations?
     , libExposed        :: Bool               -- ^ Is the lib to be exposed by default? (i.e. whether its modules available in GHCi for example)
-    , libVisibility     :: LibraryVisibility  -- ^ Whether this multilib can be dependent from outside.
+    , libVisibility     :: LibraryVisibility  -- ^ Whether this multilib can be used as a dependency for other packages.
     , libBuildInfo      :: BuildInfo
     }
-    deriving (Generic, Show, Eq, Read, Typeable, Data)
+    deriving (Generic, Show, Eq, Ord, Read, Typeable, Data)
 
 instance L.HasBuildInfo Library where
     buildInfo f l = (\x -> l { libBuildInfo = x }) <$> f (libBuildInfo l)

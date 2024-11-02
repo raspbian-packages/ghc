@@ -21,7 +21,6 @@ import GHC.Settings.Utils         ( maybeRead )
 import GHC.Settings.Config        ( cProjectVersion )
 import GHC.Prelude
 import GHC.Utils.Binary
-import GHC.Iface.Binary           ( getDictFastString )
 import GHC.Data.FastMutInt
 import GHC.Data.FastString        ( FastString )
 import GHC.Types.Name
@@ -331,7 +330,7 @@ fromHieName nc hie_name = do
 
     KnownKeyName u -> case lookupKnownKeyName u of
       Nothing -> pprPanic "fromHieName:unknown known-key unique"
-                          (ppr (unpkUnique u))
+                          (ppr u)
       Just n -> pure n
 
 -- ** Reading and writing `HieName`'s
@@ -339,10 +338,10 @@ fromHieName nc hie_name = do
 putHieName :: BinHandle -> HieName -> IO ()
 putHieName bh (ExternalName mod occ span) = do
   putByte bh 0
-  put_ bh (mod, occ, span)
+  put_ bh (mod, occ, BinSrcSpan span)
 putHieName bh (LocalName occName span) = do
   putByte bh 1
-  put_ bh (occName, span)
+  put_ bh (occName, BinSrcSpan span)
 putHieName bh (KnownKeyName uniq) = do
   putByte bh 2
   put_ bh $ unpkUnique uniq
@@ -353,10 +352,10 @@ getHieName bh = do
   case t of
     0 -> do
       (modu, occ, span) <- get bh
-      return $ ExternalName modu occ span
+      return $ ExternalName modu occ $ unBinSrcSpan span
     1 -> do
       (occ, span) <- get bh
-      return $ LocalName occ span
+      return $ LocalName occ $ unBinSrcSpan span
     2 -> do
       (c,i) <- get bh
       return $ KnownKeyName $ mkUnique c i

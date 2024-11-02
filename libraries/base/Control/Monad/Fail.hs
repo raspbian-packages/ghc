@@ -31,7 +31,7 @@
 --   fail = {- ...fail implementation... -}
 -- @
 --
--- See <https://prime.haskell.org/wiki/Libraries/Proposals/MonadFail>
+-- See <https://gitlab.haskell.org/haskell/prime/-/wikis/libraries/proposals/monad-fail>
 -- for more details.
 --
 -- @since 4.9.0.0
@@ -60,6 +60,10 @@ import GHC.Base (String, Monad(), Maybe(Nothing), IO(), failIO)
 -- @
 -- fail _ = mzero
 -- @
+--
+-- @fail s@ should be an action that runs in the monad itself, not an
+-- exception (except in instances of @MonadIO@).  In particular,
+-- @fail@ should not be implemented in terms of @error@.
 --
 -- @since 4.9.0.0
 class Monad m => MonadFail m where

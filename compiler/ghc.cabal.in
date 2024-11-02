@@ -39,16 +39,11 @@ extra-source-files:
 
 
 custom-setup
-    setup-depends: base >= 3 && < 5, Cabal >= 1.6 && <3.9, directory, process, filepath
+    setup-depends: base >= 3 && < 5, Cabal >= 1.6 && <3.10, directory, process, filepath
 
 Flag internal-interpreter
     Description: Build with internal interpreter support.
     Default: False
-    Manual: True
-
-Flag terminfo
-    Description: Build GHC with terminfo support on non-Windows platforms.
-    Default: True
     Manual: True
 
 Flag dynamic-system-linker
@@ -76,7 +71,7 @@ Library
     if flag(build-tool-depends)
       build-tool-depends: alex:alex >= 3.2.6, happy:happy >= 1.20.0, genprimopcode:genprimopcode, deriveConstants:deriveConstants
 
-    Build-Depends: base       >= 4.11 && < 4.18,
+    Build-Depends: base       >= 4.11 && < 4.19,
                    deepseq    >= 1.4 && < 1.5,
                    directory  >= 1   && < 1.4,
                    process    >= 1   && < 1.7,
@@ -86,9 +81,9 @@ Library
                    containers >= 0.6.2.1 && < 0.7,
                    array      >= 0.1 && < 0.6,
                    filepath   >= 1   && < 1.5,
-                   template-haskell == 2.19.*,
+                   template-haskell == 2.20.*,
                    hpc        == 0.6.*,
-                   transformers == 0.5.*,
+                   transformers >= 0.5 && < 0.7,
                    exceptions == 0.10.*,
                    stm,
                    ghc-boot   == @ProjectVersionMunged@,
@@ -96,10 +91,8 @@ Library
                    ghci == @ProjectVersionMunged@
 
     if os(windows)
-        Build-Depends: Win32  >= 2.3 && < 2.13
+        Build-Depends: Win32  >= 2.3 && < 2.14
     else
-        if flag(terminfo)
-            Build-Depends: terminfo == 0.4.*
         Build-Depends: unix   >= 2.7 && < 2.9
 
     GHC-Options: -Wall
@@ -206,15 +199,15 @@ Library
         GHC.Cmm.Node
         GHC.Cmm.Opt
         GHC.Cmm.Parser
+        GHC.Cmm.Parser.Config
         GHC.Cmm.Parser.Monad
         GHC.Cmm.Pipeline
-        GHC.Cmm.Ppr
-        GHC.Cmm.Ppr.Decl
-        GHC.Cmm.Ppr.Expr
         GHC.Cmm.ProcPoint
+        GHC.Cmm.Reg
         GHC.Cmm.Sink
         GHC.Cmm.Switch
         GHC.Cmm.Switch.Implement
+        GHC.Cmm.ThreadSanitizer
         GHC.CmmToAsm
         GHC.Cmm.LRegSet
         GHC.CmmToAsm.AArch64
@@ -286,6 +279,8 @@ Library
         GHC.CmmToLlvm.Mangler
         GHC.CmmToLlvm.Ppr
         GHC.CmmToLlvm.Regs
+        GHC.Cmm.Dominators
+        GHC.Cmm.Reducibility
         GHC.Cmm.Type
         GHC.Cmm.Utils
         GHC.Core
@@ -299,6 +294,7 @@ Library
         GHC.Core.FVs
         GHC.Core.InstEnv
         GHC.Core.Lint
+        GHC.Core.Lint.Interactive
         GHC.Core.LateCC
         GHC.Core.Make
         GHC.Core.Map.Expr
@@ -318,14 +314,17 @@ Library
         GHC.Core.Opt.Monad
         GHC.Core.Opt.OccurAnal
         GHC.Core.Opt.Pipeline
+        GHC.Core.Opt.Pipeline.Types
         GHC.Core.Opt.SetLevels
         GHC.Core.Opt.Simplify
         GHC.Core.Opt.Simplify.Env
+        GHC.Core.Opt.Simplify.Iteration
         GHC.Core.Opt.Simplify.Monad
         GHC.Core.Opt.Simplify.Utils
         GHC.Core.Opt.SpecConstr
         GHC.Core.Opt.Specialise
         GHC.Core.Opt.StaticArgs
+        GHC.Core.Opt.Stats
         GHC.Core.Opt.WorkWrap
         GHC.Core.Opt.WorkWrap.Utils
         GHC.Core.PatSyn
@@ -334,6 +333,7 @@ Library
         GHC.Core.Predicate
         GHC.Core.Reduction
         GHC.Core.Rules
+        GHC.Core.Rules.Config
         GHC.Core.Seq
         GHC.Core.SimpleOpt
         GHC.Core.Stats
@@ -343,6 +343,7 @@ Library
         GHC.CoreToStg
         GHC.CoreToStg.Prep
         GHC.Core.TyCo.FVs
+        GHC.Core.TyCo.Compare
         GHC.Core.TyCon
         GHC.Core.TyCon.Env
         GHC.Core.TyCon.RecWalk
@@ -369,11 +370,15 @@ Library
         GHC.Data.FiniteMap
         GHC.Data.Graph.Base
         GHC.Data.Graph.Color
+        GHC.Data.Graph.Collapse
         GHC.Data.Graph.Directed
+        GHC.Data.Graph.Inductive.Graph
+        GHC.Data.Graph.Inductive.PatriciaTree
         GHC.Data.Graph.Ops
         GHC.Data.Graph.Ppr
         GHC.Data.Graph.UnVar
         GHC.Data.IOEnv
+        GHC.Data.List.Infinite
         GHC.Data.List.SetOps
         GHC.Data.Maybe
         GHC.Data.OrdList
@@ -383,19 +388,34 @@ Library
         GHC.Data.Strict
         GHC.Data.StringBuffer
         GHC.Data.TrieMap
+        GHC.Data.Unboxed
         GHC.Data.UnionFind
         GHC.Driver.Backend
+        GHC.Driver.Backend.Internal
         GHC.Driver.Backpack
         GHC.Driver.Backpack.Syntax
         GHC.Driver.CmdLine
         GHC.Driver.CodeOutput
         GHC.Driver.Config
         GHC.Driver.Config.Cmm
+        GHC.Driver.Config.Cmm.Parser
         GHC.Driver.Config.CmmToAsm
         GHC.Driver.Config.CmmToLlvm
+        GHC.Driver.Config.Core.Lint
+        GHC.Driver.Config.Core.Lint.Interactive
+        GHC.Driver.Config.Core.Opt.Arity
+        GHC.Driver.Config.Core.Opt.LiberateCase
+        GHC.Driver.Config.Core.Opt.Simplify
+        GHC.Driver.Config.Core.Opt.WorkWrap
+        GHC.Driver.Config.Core.Rules
+        GHC.Driver.Config.CoreToStg
+        GHC.Driver.Config.CoreToStg.Prep
         GHC.Driver.Config.Diagnostic
         GHC.Driver.Config.Finder
         GHC.Driver.Config.HsToCore
+        GHC.Driver.Config.HsToCore.Ticks
+        GHC.Driver.Config.HsToCore.Usage
+        GHC.Driver.Config.Linker
         GHC.Driver.Config.Logger
         GHC.Driver.Config.Parser
         GHC.Driver.Config.Stg.Debug
@@ -404,6 +424,7 @@ Library
         GHC.Driver.Config.Stg.Ppr
         GHC.Driver.Config.StgToCmm
         GHC.Driver.Config.Tidy
+        GHC.Driver.Config.StgToJS
         GHC.Driver.Env
         GHC.Driver.Env.KnotVars
         GHC.Driver.Env.Types
@@ -413,6 +434,7 @@ Library
         GHC.Driver.Flags
         GHC.Driver.GenerateCgIPEStub
         GHC.Driver.Hooks
+        GHC.Driver.LlvmConfigCache
         GHC.Driver.Main
         GHC.Driver.Make
         GHC.Driver.MakeFile
@@ -424,6 +446,7 @@ Library
         GHC.Driver.Pipeline.Phases
         GHC.Driver.Pipeline.Monad
         GHC.Driver.Plugins
+        GHC.Driver.Plugins.External
         GHC.Driver.Ppr
         GHC.Driver.Session
         GHC.Hs
@@ -443,13 +466,18 @@ Library
         GHC.HsToCore
         GHC.HsToCore.Arrows
         GHC.HsToCore.Binds
+        GHC.HsToCore.Breakpoints
         GHC.HsToCore.Coverage
         GHC.HsToCore.Docs
         GHC.HsToCore.Errors.Ppr
         GHC.HsToCore.Errors.Types
         GHC.HsToCore.Expr
+        GHC.HsToCore.Foreign.C
         GHC.HsToCore.Foreign.Call
         GHC.HsToCore.Foreign.Decl
+        GHC.HsToCore.Foreign.JavaScript
+        GHC.HsToCore.Foreign.Prim
+        GHC.HsToCore.Foreign.Utils
         GHC.HsToCore.GuardedRHSs
         GHC.HsToCore.ListComp
         GHC.HsToCore.Match
@@ -465,6 +493,7 @@ Library
         GHC.HsToCore.Pmc.Types
         GHC.HsToCore.Pmc.Utils
         GHC.HsToCore.Quote
+        GHC.HsToCore.Ticks
         GHC.HsToCore.Types
         GHC.HsToCore.Usage
         GHC.HsToCore.Utils
@@ -490,7 +519,12 @@ Library
         GHC.Iface.Tidy.StaticPtrTable
         GHC.IfaceToCore
         GHC.Iface.Type
+        GHC.JS.Make
+        GHC.JS.Ppr
+        GHC.JS.Syntax
+        GHC.JS.Transform
         GHC.Linker
+        GHC.Linker.Config
         GHC.Linker.Dynamic
         GHC.Linker.ExtraObj
         GHC.Linker.Loader
@@ -529,12 +563,15 @@ Library
         GHC.Platform.Reg.Class
         GHC.Platform.Regs
         GHC.Platform.RISCV64
+        GHC.Platform.LoongArch64
         GHC.Platform.S390X
+        GHC.Platform.Wasm32
         GHC.Platform.Ways
         GHC.Platform.X86
         GHC.Platform.X86_64
         GHC.Plugins
         GHC.Prelude
+        GHC.Prelude.Basic
         GHC.Rename.Bind
         GHC.Rename.Doc
         GHC.Rename.Env
@@ -603,10 +640,43 @@ Library
         GHC.StgToCmm.Ticky
         GHC.StgToCmm.Types
         GHC.StgToCmm.Utils
+        GHC.StgToJS
+        GHC.StgToJS.Apply
+        GHC.StgToJS.Arg
+        GHC.StgToJS.Closure
+        GHC.StgToJS.CodeGen
+        GHC.StgToJS.CoreUtils
+        GHC.StgToJS.DataCon
+        GHC.StgToJS.Deps
+        GHC.StgToJS.Expr
+        GHC.StgToJS.ExprCtx
+        GHC.StgToJS.FFI
+        GHC.StgToJS.Heap
+        GHC.StgToJS.Ids
+        GHC.StgToJS.Literal
+        GHC.StgToJS.Monad
+        GHC.StgToJS.Object
+        GHC.StgToJS.Prim
+        GHC.StgToJS.Profiling
+        GHC.StgToJS.Printer
+        GHC.StgToJS.Regs
+        GHC.StgToJS.Rts.Types
+        GHC.StgToJS.Rts.Rts
+        GHC.StgToJS.Sinker
+        GHC.StgToJS.Stack
+        GHC.StgToJS.StaticPtr
+        GHC.StgToJS.StgUtils
+        GHC.StgToJS.Symbols
+        GHC.StgToJS.Types
+        GHC.StgToJS.Utils
+        GHC.StgToJS.Linker.Linker
+        GHC.StgToJS.Linker.Types
+        GHC.StgToJS.Linker.Utils
         GHC.Stg.Unarise
         GHC.SysTools
         GHC.SysTools.Ar
         GHC.SysTools.BaseDir
+        GHC.SysTools.Cpp
         GHC.SysTools.Elf
         GHC.SysTools.Info
         GHC.SysTools.Process
@@ -684,6 +754,7 @@ Library
         GHC.Types.Cpr
         GHC.Types.Demand
         GHC.Types.Error
+        GHC.Types.Error.Codes
         GHC.Types.FieldLabel
         GHC.Types.Fixity
         GHC.Types.Fixity.Env
@@ -707,6 +778,7 @@ Library
         GHC.Types.Name.Shape
         GHC.Types.Name.Ppr
         GHC.Types.PkgQual
+        GHC.Types.ProfAuto
         GHC.Types.RepType
         GHC.Types.SafeHaskell
         GHC.Types.SourceError
@@ -746,8 +818,8 @@ Library
         GHC.Unit.Module.ModDetails
         GHC.Unit.Module.ModGuts
         GHC.Unit.Module.ModIface
+        GHC.Unit.Module.WholeCoreBindings
         GHC.Unit.Module.ModSummary
-        GHC.Unit.Module.Name
         GHC.Unit.Module.Status
         GHC.Unit.Module.Warnings
         GHC.Unit.Parser
@@ -772,7 +844,6 @@ Library
         GHC.Utils.Misc
         GHC.Utils.Monad
         GHC.Utils.Monad.State.Strict
-        GHC.Utils.Monad.State.Lazy
         GHC.Utils.Outputable
         GHC.Utils.Panic
         GHC.Utils.Panic.Plain
@@ -780,13 +851,24 @@ Library
         GHC.Utils.Ppr.Colour
         GHC.Utils.TmpFs
         GHC.Utils.Trace
+        GHC.Wasm.ControlFlow
+        GHC.Wasm.ControlFlow.FromCmm
+        GHC.CmmToAsm.Wasm
+        GHC.CmmToAsm.Wasm.Asm
+        GHC.CmmToAsm.Wasm.FromCmm
+        GHC.CmmToAsm.Wasm.Types
+        GHC.CmmToAsm.Wasm.Utils
 
         Language.Haskell.Syntax
+        Language.Haskell.Syntax.Basic
         Language.Haskell.Syntax.Binds
+        Language.Haskell.Syntax.Concrete
         Language.Haskell.Syntax.Decls
         Language.Haskell.Syntax.Expr
         Language.Haskell.Syntax.Extension
+        Language.Haskell.Syntax.ImpExp
         Language.Haskell.Syntax.Lit
+        Language.Haskell.Syntax.Module.Name
         Language.Haskell.Syntax.Pat
         Language.Haskell.Syntax.Type
 

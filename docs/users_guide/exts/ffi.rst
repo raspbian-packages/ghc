@@ -12,6 +12,8 @@ Foreign function interface (FFI)
 
     :since: 6.8.1
 
+    :status: Included in :extension:`Haskell2010`, :extension:`GHC2021`
+
     Allow use of the Haskell foreign function interface.
 
 GHC (mostly) conforms to the Haskell Foreign Function Interface as specified
@@ -288,6 +290,8 @@ Primitive imports
 
     :since: 6.12.1
 
+    :status: InternalUseOnly
+
 With :extension:`GHCForeignImportPrim`, GHC extends the FFI with an additional
 calling convention ``prim``, e.g.: ::
 
@@ -295,9 +299,10 @@ calling convention ``prim``, e.g.: ::
 
 This is used to import functions written in Cmm code that follow an
 internal GHC calling convention. The arguments and results must be
-unboxed types, except that an argument may be of type ``Any`` (by way of
+unboxed types, except that an argument may be of type ``Any :: Type``
+or ``Any :: UnliftedType`` (which can be arranged by way of
 ``unsafeCoerce#``) and the result type is allowed to be an unboxed tuple
-or the type ``Any``.
+or the types ``Any :: Type`` or ``Any :: UnliftedType``.
 
 This feature is not intended for use outside of the core libraries that
 come with GHC. For more details see the
@@ -431,6 +436,18 @@ specified. The syntax looks like: ::
 
     data    {-# CTYPE "unistd.h" "useconds_t" #-} T = ...
     newtype {-# CTYPE            "useconds_t" #-} T = ...
+
+In case foreign declarations contain ``const``-qualified pointer return
+type, ``ConstPtr`` from :base-ref:`Foreign.C.ConstPtr` may be used to
+encode this, e.g. ::
+
+    foreign import capi "header.h f" f :: CInt -> ConstPtr CInt
+
+which corresponds to
+
+.. code-block:: c
+
+    const *int f(int);
 
 ``hs_thread_done()``
 ~~~~~~~~~~~~~~~~~~~~
@@ -987,7 +1004,7 @@ the data.  We can do it like this:
        sp <- newStablePtrPrimMVar mvar
        fp <- mallocForeignPtr
        withForeignPtr fp $ \presult -> do
-         cap <- threadCapability =<< myThreadId
+         (cap, _) <- threadCapability =<< myThreadId
          scheduleCallback sp cap presult
          takeMVar mvar `onException`
            forkIO (do takeMVar mvar; touchForeignPtr fp)

@@ -203,11 +203,11 @@ ioManagerDie (void)
     {
         // Shut down IO managers
         for (i=0; i < getNumCapabilities(); i++) {
-            const int fd = RELAXED_LOAD(&getCapability(i)->io_manager_control_wr_fd);
+            const int fd = RELAXED_LOAD(&getCapability(i)->iomgr->control_fd);
             if (0 <= fd) {
                 r = write(fd, &byte, 1);
                 if (r == -1) { sysErrorBelch("ioManagerDie: write"); }
-                RELAXED_STORE(&getCapability(i)->io_manager_control_wr_fd, -1);
+                RELAXED_STORE(&getCapability(i)->iomgr->control_fd, -1);
             }
         }
     }
@@ -489,7 +489,7 @@ startSignalHandlers(Capability *cap)
                                            rts_mkPtr(cap, info)),
                                  rts_mkInt(cap, info->si_signo)));
     scheduleThread(cap, t);
-    labelThread(cap, t, "signal handler thread");
+    setThreadLabel(cap, t, "signal handler thread");
   }
 
   unblockUserSignals();
@@ -561,7 +561,7 @@ empty_handler (int sig STG_UNUSED)
 /* -----------------------------------------------------------------------------
    SIGTSTP handling
 
-   When a process is suspeended with ^Z and resumed again, the shell
+   When a process is suspended with ^Z and resumed again, the shell
    makes no attempt to save and restore the terminal settings.  So on
    resume, any terminal setting modifications we made (e.g. turning off
    ICANON due to hSetBuffering NoBuffering) may well be lost.  Hence,

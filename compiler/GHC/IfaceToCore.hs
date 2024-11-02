@@ -11,12 +11,13 @@ Type checking of type signatures in interface files
 {-# LANGUAGE FlexibleContexts #-}
 
 {-# OPTIONS_GHC -Wno-incomplete-record-updates #-}
-{-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE TupleSections #-}
+{-# LANGUAGE RecordWildCards #-}
 
 module GHC.IfaceToCore (
         tcLookupImported_maybe,
         importDecl, checkWiredInTyCon, tcHiBootIface, typecheckIface,
+        typecheckWholeCoreBindings,
         typecheckIfacesForMerging,
         typecheckIfaceForInstantiate,
         tcIfaceDecl, tcIfaceDecls,
@@ -24,7 +25,7 @@ module GHC.IfaceToCore (
         tcIfaceAnnotations, tcIfaceCompleteMatches,
         tcIfaceExpr,    -- Desired by HERMIT (#7683)
         tcIfaceGlobal,
-        tcIfaceOneShot,
+        tcIfaceOneShot, tcTopIfaceBindings,
         hydrateCgBreakInfo
  ) where
 
@@ -36,6 +37,7 @@ import Data.Word
 
 import GHC.Driver.Env
 import GHC.Driver.Session
+import GHC.Driver.Config.Core.Lint ( initLintConfig )
 
 import GHC.Builtin.Types.Literals(typeNatCoAxiomRules)
 import GHC.Builtin.Types
@@ -61,8 +63,9 @@ import GHC.Core.TyCo.Subst ( substTyCoVars )
 import GHC.Core.InstEnv
 import GHC.Core.FamInstEnv
 import GHC.Core
-import GHC.Core.Unify( RoughMatchTc(..) )
+import GHC.Core.RoughMap( RoughMatchTc(..) )
 import GHC.Core.Utils
+import GHC.Core.Unfold( calcUnfoldingGuidance )
 import GHC.Core.Unfold.Make
 import GHC.Core.Lint
 import GHC.Core.Make
@@ -101,7 +104,9 @@ import GHC.Types.SrcLoc
 import GHC.Types.TypeEnv
 import GHC.Types.Unique.FM
 import GHC.Types.Unique.DSet ( mkUniqDSet )
+import GHC.Types.Unique.Set ( nonDetEltsUniqSet )
 import GHC.Types.Unique.Supply
+import GHC.Types.Demand( isDeadEndSig )
 import GHC.Types.Literal
 import GHC.Types.Var as Var
 import GHC.Types.Var.Set
@@ -121,6 +126,10 @@ import qualified GHC.Data.BooleanFormula as BF
 import Control.Monad
 import GHC.Parser.Annotation
 import GHC.Driver.Env.KnotVars
+import GHC.Unit.Module.WholeCoreBindings
+import Data.IORef
+import Data.Foldable
+import GHC.Builtin.Names (ioTyConName, rOOT_MAIN)
 
 {-
 This module takes
@@ -237,6 +246,12 @@ typecheckIface iface
                               }
     }
 
+typecheckWholeCoreBindings :: IORef TypeEnv ->  WholeCoreBindings -> IfG [CoreBind]
+typecheckWholeCoreBindings type_var (WholeCoreBindings tidy_bindings this_mod _) =
+  initIfaceLcl this_mod (text "typecheckWholeCoreBindings") NotBoot $ do
+    tcTopIfaceBindings type_var tidy_bindings
+
+
 {-
 ************************************************************************
 *                                                                      *
@@ -330,7 +345,7 @@ d1 `withRolesFrom` d2
     mergeRoles roles1 roles2 = zipWithEqual "mergeRoles" max roles1 roles2
 
 isRepInjectiveIfaceDecl :: IfaceDecl -> Bool
-isRepInjectiveIfaceDecl IfaceData{ ifCons = IfDataTyCon _ } = True
+isRepInjectiveIfaceDecl IfaceData{ ifCons = IfDataTyCon{} } = True
 isRepInjectiveIfaceDecl IfaceFamily{ ifFamFlav = IfaceDataFamilyTyCon } = True
 isRepInjectiveIfaceDecl _ = False
 
@@ -581,9 +596,9 @@ tcHiBootIface hsc_src mod
             Nothing -> return NoSelfBoot
             -- error cases
             Just (GWIB { gwib_isBoot = is_boot }) -> case is_boot of
-              IsBoot -> failWithTc (TcRnUnknownMessage $ mkPlainError noHints (elaborate err))
+              IsBoot -> failWithTc (mkTcRnUnknownMessage $ mkPlainError noHints (elaborate err))
               -- The hi-boot file has mysteriously disappeared.
-              NotBoot -> failWithTc (TcRnUnknownMessage $ mkPlainError noHints moduleLoop)
+              NotBoot -> failWithTc (mkTcRnUnknownMessage $ mkPlainError noHints moduleLoop)
               -- Someone below us imported us!
               -- This is a loop with no hi-boot in the way
     }}}}
@@ -610,7 +625,7 @@ mkSelfBootInfo iface mds
        return $ SelfBoot { sb_mds = mds
                          , sb_tcs = mkNameSet tcs }
   where
-    -- Retuerns @True@ if, when you call 'tcIfaceDecl' on
+    -- Returns @True@ if, when you call 'tcIfaceDecl' on
     -- this 'IfaceDecl', an ATyCon would be returned.
     -- NB: This code assumes that a TyCon cannot be implicit.
     isIfaceTyCon IfaceId{}      = False
@@ -876,7 +891,7 @@ tc_iface_decl _ _ (IfacePatSyn{ ifName = name
                               , ifFieldLabels = field_labels })
   = do { traceIf (text "tc_iface_decl" <+> ppr name)
        ; matcher <- tc_pr if_matcher
-       ; builder <- fmapMaybeM tc_pr if_builder
+       ; builder <- traverse tc_pr if_builder
        ; bindIfaceForAllBndrs univ_bndrs $ \univ_tvs -> do
        { bindIfaceForAllBndrs ex_bndrs $ \ex_tvs -> do
        { patsyn <- forkM (mk_doc name) $
@@ -894,6 +909,58 @@ tc_iface_decl _ _ (IfacePatSyn{ ifName = name
      tc_pr :: (IfExtName, Bool) -> IfL (Name, Type, Bool)
      tc_pr (nm, b) = do { id <- forkM (ppr nm) (tcIfaceExtId nm)
                         ; return (nm, idType id, b) }
+
+tcTopIfaceBindings :: IORef TypeEnv -> [IfaceBindingX IfaceMaybeRhs IfaceTopBndrInfo]
+          -> IfL [CoreBind]
+tcTopIfaceBindings ty_var ver_decls
+   = do
+      int <- mapM tcTopBinders  ver_decls
+      let all_ids :: [Id] = concatMap toList int
+      liftIO $ modifyIORef ty_var (flip extendTypeEnvList (map AnId all_ids))
+
+      extendIfaceIdEnv all_ids $ mapM (tc_iface_bindings) int
+
+tcTopBinders :: IfaceBindingX a IfaceTopBndrInfo -> IfL (IfaceBindingX a Id)
+tcTopBinders = traverse mk_top_id
+
+tc_iface_bindings ::  IfaceBindingX IfaceMaybeRhs Id -> IfL CoreBind
+tc_iface_bindings (IfaceNonRec b rhs) = do
+    rhs' <- tc_iface_binding b rhs
+    return $ NonRec b rhs'
+tc_iface_bindings (IfaceRec bs) = do
+  rs <- mapM (\(b, rhs) -> (b,) <$> tc_iface_binding b rhs) bs
+  return (Rec rs)
+
+-- | See Note [Interface File with Core: Sharing RHSs]
+tc_iface_binding :: Id -> IfaceMaybeRhs -> IfL CoreExpr
+tc_iface_binding i IfUseUnfoldingRhs =
+  case maybeUnfoldingTemplate $ realIdUnfolding i of
+    Just e -> return e
+    Nothing -> pprPanic "tc_iface_binding" (vcat [text "Binding" <+> quotes (ppr i) <+> text "had an unfolding when the interface file was created"
+                                                 , text "which has now gone missing, something has badly gone wrong."
+                                                 , text "Unfolding:" <+> ppr (realIdUnfolding i)])
+
+tc_iface_binding _ (IfRhs rhs) = tcIfaceExpr rhs
+
+mk_top_id :: IfaceTopBndrInfo -> IfL Id
+mk_top_id (IfGblTopBndr gbl_name)
+  -- See Note [Root-main Id]
+  -- This special binding is actually defined in the current module
+  -- (hence don't go looking for it externally) but the module name is rOOT_MAIN
+  -- rather than the current module so we need this special case.
+  -- See some similar logic in `GHC.Rename.Env`.
+  | Just rOOT_MAIN == nameModule_maybe gbl_name
+    = do
+        ATyCon ioTyCon <- tcIfaceGlobal ioTyConName
+        return $ mkExportedVanillaId gbl_name (mkTyConApp ioTyCon [unitTy])
+  | otherwise = tcIfaceExtId gbl_name
+mk_top_id (IfLclTopBndr raw_name iface_type info details) = do
+   name <- newIfaceName (mkVarOccFS raw_name)
+   ty <- tcIfaceType iface_type
+   info' <- tcIdInfo False TopLevel name ty info
+   details' <- tcIdDetails ty details
+   let new_id = mkGlobalId details' name ty info'
+   return new_id
 
 tcIfaceDecls :: Bool
           -> [(Fingerprint, IfaceDecl)]
@@ -1039,11 +1106,12 @@ tcIfaceDataCons tycon_name tycon tc_tybinders if_cons
   = case if_cons of
         IfAbstractTyCon
           -> return AbstractTyCon
-        IfDataTyCon cons
+        IfDataTyCon type_data cons
           -> do  { data_cons  <- mapM tc_con_decl cons
                  ; return $
                      mkLevPolyDataTyConRhs
                        (isFixedRuntimeRepKind $ tyConResKind tycon)
+                       type_data
                        data_cons }
         IfNewTyCon con
           -> do  { data_con  <- tc_con_decl con
@@ -1129,7 +1197,7 @@ tcIfaceDataCons tycon_name tycon tc_tybinders if_cons
 
     tc_strict :: IfaceBang -> IfL HsImplBang
     tc_strict IfNoBang = return (HsLazy)
-    tc_strict IfStrict = return (HsStrict)
+    tc_strict IfStrict = return (HsStrict True)
     tc_strict IfUnpack = return (HsUnpack Nothing)
     tc_strict (IfUnpackCo if_co) = do { co <- tcIfaceCo if_co
                                       ; return (HsUnpack (Just co)) }
@@ -1231,7 +1299,7 @@ tcIfaceRule (IfaceRule {ifRuleName = name, ifActivation = act, ifRuleBndrs = bnd
                                         (nonDetEltsUFM $ if_id_env lcl_env) ++
                                         bndrs' ++
                                         exprsFreeIdsList args')
-                      ; case lintExpr dflags in_scope rhs' of
+                      ; case lintExpr (initLintConfig dflags in_scope) rhs' of
                           Nothing   -> return ()
                           Just errs -> do
                             logger <- getLogger
@@ -1409,11 +1477,10 @@ tcIfaceCo = go
 
     go (IfaceReflCo t)           = Refl <$> tcIfaceType t
     go (IfaceGReflCo r t mco)    = GRefl r <$> tcIfaceType t <*> go_mco mco
-    go (IfaceFunCo r w c1 c2)    = mkFunCo r <$> go w <*> go c1 <*> go c2
-    go (IfaceTyConAppCo r tc cs)
-      = TyConAppCo r <$> tcIfaceTyCon tc <*> mapM go cs
+    go (IfaceFunCo r w c1 c2)    = mkFunCoNoFTF r <$> go w <*> go c1 <*> go c2
+    go (IfaceTyConAppCo r tc cs) = TyConAppCo r <$> tcIfaceTyCon tc <*> mapM go cs
     go (IfaceAppCo c1 c2)        = AppCo <$> go c1 <*> go c2
-    go (IfaceForAllCo tv k c)  = do { k' <- go k
+    go (IfaceForAllCo tv k c)    = do { k' <- go k
                                       ; bindIfaceBndr tv $ \ tv' ->
                                         ForAllCo tv' k' <$> go c }
     go (IfaceCoVarCo n)          = CoVarCo <$> go_var n
@@ -1425,8 +1492,8 @@ tcIfaceCo = go
                                             <*> go c2
     go (IfaceInstCo c1 t2)       = InstCo   <$> go c1
                                             <*> go t2
-    go (IfaceNthCo d c)          = do { c' <- go c
-                                      ; return $ mkNthCo (nthCoRole d c') d c' }
+    go (IfaceSelCo d c)          = do { c' <- go c
+                                      ; return $ mkSelCo d c' }
     go (IfaceLRCo lr c)          = LRCo lr  <$> go c
     go (IfaceKindCo c)           = KindCo   <$> go c
     go (IfaceSubCo c)            = SubCo    <$> go c
@@ -1468,9 +1535,9 @@ tcIfaceExpr (IfaceLcl name)
 tcIfaceExpr (IfaceExt gbl)
   = Var <$> tcIfaceExtId gbl
 
-tcIfaceExpr (IfaceLitRubbish rep)
+tcIfaceExpr (IfaceLitRubbish tc rep)
   = do rep' <- tcIfaceType rep
-       return (Lit (LitRubbish rep'))
+       return (Lit (LitRubbish tc rep'))
 
 tcIfaceExpr (IfaceLit lit)
   = do lit' <- tcIfaceLit lit
@@ -1515,7 +1582,7 @@ tcIfaceExpr (IfaceCase scrut case_bndr alts)  = do
     case_bndr_name <- newIfaceName (mkVarOccFS case_bndr)
     let
         scrut_ty   = exprType scrut'
-        case_mult = Many
+        case_mult  = ManyTy
         case_bndr' = mkLocalIdOrCoVar case_bndr_name case_mult scrut_ty
      -- "OrCoVar" since a coercion can be a scrutinee with -fdefer-type-errors
      -- (e.g. see test T15695). Ticket #17291 covers fixing this problem.
@@ -1535,7 +1602,7 @@ tcIfaceExpr (IfaceLet (IfaceNonRec (IfLetBndr fs ty info ji) rhs) body)
         ; ty'     <- tcIfaceType ty
         ; id_info <- tcIdInfo False {- Don't ignore prags; we are inside one! -}
                               NotTopLevel name ty' info
-        ; let id = mkLocalIdWithInfo name Many ty' id_info
+        ; let id = mkLocalIdWithInfo name ManyTy ty' id_info
                      `asJoinId_maybe` tcJoinInfo ji
         ; rhs' <- tcIfaceExpr rhs
         ; body' <- extendIfaceIdEnv [id] (tcIfaceExpr body)
@@ -1551,7 +1618,7 @@ tcIfaceExpr (IfaceLet (IfaceRec pairs) body)
    tc_rec_bndr (IfLetBndr fs ty _ ji)
      = do { name <- newIfaceName (mkVarOccFS fs)
           ; ty'  <- tcIfaceType ty
-          ; return (mkLocalId name Many ty' `asJoinId_maybe` tcJoinInfo ji) }
+          ; return (mkLocalId name ManyTy ty' `asJoinId_maybe` tcJoinInfo ji) }
    tc_pair (IfLetBndr _ _ info _, rhs) id
      = do { rhs' <- tcIfaceExpr rhs
           ; id_info <- tcIdInfo False {- Don't ignore prags; we are inside one! -}
@@ -1660,8 +1727,8 @@ tcIdInfo ignore_prags toplvl name ty info = do
     need_prag :: IfaceInfoItem -> Bool
       -- Always read in compulsory unfoldings
       -- See Note [Always expose compulsory unfoldings] in GHC.Iface.Tidy
-    need_prag (HsUnfold _ (IfCompulsory {})) = True
-    need_prag _                              = False
+    need_prag (HsUnfold _ (IfCoreUnfold src _ _ _)) = isCompulsorySource src
+    need_prag _ = False
 
     tcPrag :: IdInfo -> IfaceInfoItem -> IfL IdInfo
     tcPrag info HsNoCafRefs        = return (info `setCafInfo`   NoCafRefs)
@@ -1669,7 +1736,6 @@ tcIdInfo ignore_prags toplvl name ty info = do
     tcPrag info (HsDmdSig str)     = return (info `setDmdSigInfo` str)
     tcPrag info (HsCprSig cpr)     = return (info `setCprSigInfo` cpr)
     tcPrag info (HsInline prag)    = return (info `setInlinePragInfo` prag)
-    tcPrag info HsLevity           = return (info `setNeverRepPoly` ty)
     tcPrag info (HsLFInfo lf_info) = do
       lf_info <- tcLFInfo lf_info
       return (info `setLFInfo` lf_info)
@@ -1722,25 +1788,17 @@ tcLFInfo lfi = case lfi of
 
 tcUnfolding :: TopLevelFlag -> Name -> Type -> IdInfo -> IfaceUnfolding -> IfL Unfolding
 -- See Note [Lazily checking Unfoldings]
-tcUnfolding toplvl name _ info (IfCoreUnfold stable cache if_expr)
+tcUnfolding toplvl name _ info (IfCoreUnfold src cache if_guidance if_expr)
   = do  { uf_opts <- unfoldingOpts <$> getDynFlags
-        ; expr <- tcUnfoldingRhs False toplvl name if_expr
-        ; let unf_src | stable    = InlineStable
-                      | otherwise = InlineRhs
-        ; return $ mkFinalUnfolding uf_opts unf_src strict_sig expr (Just cache) }
+        ; expr <- tcUnfoldingRhs (isCompulsorySource src) toplvl name if_expr
+        ; let guidance = case if_guidance of
+                 IfWhen arity unsat_ok boring_ok -> UnfWhen arity unsat_ok boring_ok
+                 IfNoGuidance -> calcUnfoldingGuidance uf_opts is_top_bottoming expr
+          -- See Note [Tying the 'CoreUnfolding' knot]
+        ; return $ mkCoreUnfolding src True expr (Just cache) guidance }
   where
     -- Strictness should occur before unfolding!
-    strict_sig = dmdSigInfo info
-
-tcUnfolding toplvl name _ _ (IfCompulsory if_expr)
-  = do  { expr <- tcUnfoldingRhs True toplvl name if_expr
-        ; return $ mkCompulsoryUnfolding' expr }
-
-tcUnfolding toplvl name _ _ (IfInlineRule arity unsat_ok boring_ok if_expr)
-  = do  { expr <- tcUnfoldingRhs False toplvl name if_expr
-        ; return $ mkCoreUnfolding InlineStable True expr Nothing guidance }
-  where
-    guidance = UnfWhen { ug_arity = arity, ug_unsat_ok = unsat_ok, ug_boring_ok = boring_ok }
+    is_top_bottoming = isTopLevel toplvl && isDeadEndSig (dmdSigInfo info)
 
 tcUnfolding _toplvl name dfun_ty _ (IfDFunUnfold bs ops)
   = bindIfaceBndrs bs $ \ bs' ->
@@ -1814,7 +1872,7 @@ in the middle of checking (so looking at it would cause a loop).
 
 Conclusion: `tcUnfolding` must return an `Unfolding` whose `uf_src` field is readable without
 forcing the `uf_tmpl` field. In particular, all the functions used at the end of
-`tcUnfolding` (such as `mkFinalUnfolding`, `mkCompulsoryUnfolding'`, `mkCoreUnfolding`) must be
+`tcUnfolding` (such as `mkFinalUnfolding`, `mkCoreUnfolding`) must be
 lazy in `expr`.
 
 Ticket #21139
@@ -1831,10 +1889,10 @@ tcUnfoldingRhs is_compulsory toplvl name expr
     -- See Note [Linting Unfoldings from Interfaces] in GHC.Core.Lint
     when (isTopLevel toplvl) $
       whenGOptM Opt_DoCoreLinting $ do
-        in_scope <- get_in_scope
+        in_scope <- nonDetEltsUniqSet <$> get_in_scope
         dflags   <- getDynFlags
         logger   <- getLogger
-        case lintUnfolding is_compulsory dflags noSrcLoc in_scope core_expr' of
+        case lintUnfolding is_compulsory (initLintConfig dflags in_scope) noSrcLoc core_expr' of
           Nothing   -> return ()
           Just errs -> liftIO $
             displayLintResults logger False doc
@@ -1903,7 +1961,7 @@ tcIfaceGlobal name
 
         { mb_thing <- importDecl name   -- It's imported; go get it
         ; case mb_thing of
-            Failed err      -> failIfM err
+            Failed err      -> failIfM (ppr name <+> err)
             Succeeded thing -> return thing
         }}}
 
@@ -1966,11 +2024,12 @@ tcIfaceGlobal name
 -- this expression *after* typechecking T.
 
 tcIfaceTyCon :: IfaceTyCon -> IfL TyCon
-tcIfaceTyCon (IfaceTyCon name info)
+tcIfaceTyCon (IfaceTyCon name _info)
   = do { thing <- tcIfaceGlobal name
-       ; return $ case ifaceTyConIsPromoted info of
-           NotPromoted -> tyThingTyCon thing
-           IsPromoted  -> promoteDataCon $ tyThingDataCon thing }
+       ; case thing of
+              ATyCon tc -> return tc
+              AConLike (RealDataCon dc) -> return (promoteDataCon dc)
+              _ -> pprPanic "tcIfaceTyCon" (ppr thing) }
 
 tcIfaceCoAxiom :: Name -> IfL (CoAxiom Branched)
 tcIfaceCoAxiom name = do { thing <- tcIfaceImplicit name

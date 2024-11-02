@@ -31,8 +31,9 @@ import Distribution.PackageDescription
 import Distribution.ModuleName
 import Distribution.Simple.Compiler
 import Distribution.Simple.Flag
-import Distribution.Simple.Program.Types
+import Distribution.Simple.Program.Find (getExtraPathEnv)
 import Distribution.Simple.Program.Run
+import Distribution.Simple.Program.Types
 import Distribution.System
 import Distribution.Pretty
 import Distribution.Types.ComponentId
@@ -563,20 +564,25 @@ data GhcDynLinkMode = GhcStaticOnly       -- ^ @-static@
 data GhcProfAuto = GhcProfAutoAll       -- ^ @-fprof-auto@
                  | GhcProfAutoToplevel  -- ^ @-fprof-auto-top@
                  | GhcProfAutoExported  -- ^ @-fprof-auto-exported@
+                 | GhcProfLate          -- ^ @-fprof-late
  deriving (Show, Eq)
 
 runGHC :: Verbosity -> ConfiguredProgram -> Compiler -> Platform  -> GhcOptions
        -> IO ()
 runGHC verbosity ghcProg comp platform opts = do
-  runProgramInvocation verbosity (ghcInvocation ghcProg comp platform opts)
+  runProgramInvocation verbosity =<< ghcInvocation verbosity ghcProg comp platform opts
 
+ghcInvocation :: Verbosity -> ConfiguredProgram -> Compiler -> Platform -> GhcOptions
+              -> IO ProgramInvocation
+ghcInvocation verbosity ghcProg comp platform opts = do
+  -- NOTE: GHC is the only program whose path we modify with more values than
+  -- the standard @extra-prog-path@, namely the folders of the executables in
+  -- the components, see @componentGhcOptions@.
+  let envOverrides = programOverrideEnv ghcProg
+  extraPath <- getExtraPathEnv verbosity envOverrides (fromNubListR (ghcOptExtraPath opts))
+  let ghcProg' = ghcProg{programOverrideEnv = envOverrides ++ extraPath}
 
-ghcInvocation :: ConfiguredProgram -> Compiler -> Platform -> GhcOptions
-              -> ProgramInvocation
-ghcInvocation prog comp platform opts =
-    (programInvocation prog (renderGhcOptions comp platform opts)) {
-        progInvokePathEnv = fromNubListR (ghcOptExtraPath opts)
-    }
+  pure $ programInvocation ghcProg' (renderGhcOptions comp platform opts)
 
 renderGhcOptions :: Compiler -> Platform -> GhcOptions -> [String]
 renderGhcOptions comp _platform@(Platform _arch os) opts
@@ -633,6 +639,9 @@ renderGhcOptions comp _platform@(Platform _arch os) opts
       Just GhcProfAutoAll
         | flagProfAuto implInfo -> ["-fprof-auto"]
         | otherwise             -> ["-auto-all"] -- not the same, but close
+      Just GhcProfLate
+        | flagProfLate implInfo -> ["-fprof-late"]
+        | otherwise             -> ["-fprof-auto-top"] -- not the same, not very close, but what we have.
       Just GhcProfAutoToplevel
         | flagProfAuto implInfo -> ["-fprof-auto-top"]
         | otherwise             -> ["-auto-all"]

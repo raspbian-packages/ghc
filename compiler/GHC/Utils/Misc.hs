@@ -4,11 +4,8 @@
 {-# LANGUAGE KindSignatures #-}
 {-# LANGUAGE ConstraintKinds #-}
 {-# LANGUAGE BangPatterns #-}
-{-# LANGUAGE TupleSections #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE MagicHash #-}
-
-{-# OPTIONS_GHC -Wno-incomplete-uni-patterns #-}
 
 -- | Highly random utility functions
 --
@@ -18,9 +15,7 @@ module GHC.Utils.Misc (
 
         -- * General list processing
         zipEqual, zipWithEqual, zipWith3Equal, zipWith4Equal,
-        zipLazy, stretchZipWith, zipWithAndUnzip, zipAndUnzip,
-
-        zipWithLazy, zipWith3Lazy,
+        stretchZipWith, zipWithAndUnzip, zipAndUnzip,
 
         filterByList, filterByLists, partitionByList,
 
@@ -29,7 +24,6 @@ module GHC.Utils.Misc (
         mapFst, mapSnd, chkAppend,
         mapAndUnzip, mapAndUnzip3,
         filterOut, partitionWith,
-        mapAccumM,
 
         dropWhileEndLE, spanEnd, last2, lastMaybe, onJust,
 
@@ -45,6 +39,8 @@ module GHC.Utils.Misc (
 
         chunkList,
 
+        holes,
+
         changeLast,
         mapLastM,
 
@@ -59,10 +55,8 @@ module GHC.Utils.Misc (
 
         -- * Tuples
         fstOf3, sndOf3, thdOf3,
-        firstM, first3M, secondM,
         fst3, snd3, third3,
         uncurry3,
-        liftFst, liftSnd,
 
         -- * List operations controlled by another list
         takeList, dropList, splitAtList, split,
@@ -72,8 +66,7 @@ module GHC.Utils.Misc (
         sortWith, minWith, nubSort, ordNub, ordNubOn,
 
         -- * Comparisons
-        isEqual, eqListBy, eqMaybeBy,
-        thenCmp, cmpList,
+        isEqual,
         removeSpaces,
         (<&&>), (<||>),
 
@@ -127,7 +120,7 @@ module GHC.Utils.Misc (
         HasDebugCallStack,
     ) where
 
-import GHC.Prelude
+import GHC.Prelude.Basic hiding ( head, init, last, tail )
 
 import GHC.Utils.Exception
 import GHC.Utils.Panic.Plain
@@ -136,18 +129,20 @@ import GHC.Utils.Fingerprint
 
 import Data.Data
 import qualified Data.List as List
-import Data.List.NonEmpty  ( NonEmpty(..) )
+import qualified Data.List as Partial ( head )
+import Data.List.NonEmpty  ( NonEmpty(..), last, nonEmpty )
+import qualified Data.List.NonEmpty as NE
 
 import GHC.Exts
 import GHC.Stack (HasCallStack)
 
-import Control.Applicative ( liftA2 )
-import Control.Monad    ( liftM, guard )
+import Control.Monad    ( guard )
 import Control.Monad.IO.Class ( MonadIO, liftIO )
 import System.IO.Error as IO ( isDoesNotExistError )
 import System.Directory ( doesDirectoryExist, getModificationTime, renameFile )
 import System.FilePath
 
+import Data.Bifunctor   ( first, second )
 import Data.Char        ( isUpper, isAlphaNum, isSpace, chr, ord, isDigit, toUpper
                         , isHexDigit, digitToInt )
 import Data.Int
@@ -158,9 +153,6 @@ import qualified Data.IntMap as IM
 import qualified Data.Set as Set
 
 import Data.Time
-
-infixr 9 `thenCmp`
-
 
 {-
 ************************************************************************
@@ -203,21 +195,6 @@ third3 f (a, b, c) = (a, b, f c)
 uncurry3 :: (a -> b -> c -> d) -> (a, b, c) -> d
 uncurry3 f (a, b, c) = f a b c
 
-liftFst :: (a -> b) -> (a, c) -> (b, c)
-liftFst f (a,c) = (f a, c)
-
-liftSnd :: (a -> b) -> (c, a) -> (c, b)
-liftSnd f (c,a) = (c, f a)
-
-firstM :: Monad m => (a -> m c) -> (a, b) -> m (c, b)
-firstM f (x, y) = liftM (\x' -> (x', y)) (f x)
-
-first3M :: Monad m => (a -> m d) -> (a, b, c) -> m (d, b, c)
-first3M f (x, y, z) = liftM (\x' -> (x', y, z)) (f x)
-
-secondM :: Monad m => (b -> m c) -> (a, b) -> m (a, c)
-secondM f (x, y) = (x,) <$> f y
-
 {-
 ************************************************************************
 *                                                                      *
@@ -251,10 +228,10 @@ are of equal length.  Alastair Reid thinks this should only happen if
 DEBUGging on; hey, why not?
 -}
 
-zipEqual        :: String -> [a] -> [b] -> [(a,b)]
-zipWithEqual    :: String -> (a->b->c) -> [a]->[b]->[c]
-zipWith3Equal   :: String -> (a->b->c->d) -> [a]->[b]->[c]->[d]
-zipWith4Equal   :: String -> (a->b->c->d->e) -> [a]->[b]->[c]->[d]->[e]
+zipEqual        :: HasDebugCallStack => String -> [a] -> [b] -> [(a,b)]
+zipWithEqual    :: HasDebugCallStack => String -> (a->b->c) -> [a]->[b]->[c]
+zipWith3Equal   :: HasDebugCallStack => String -> (a->b->c->d) -> [a]->[b]->[c]->[d]
+zipWith4Equal   :: HasDebugCallStack => String -> (a->b->c->d->e) -> [a]->[b]->[c]->[d]->[e]
 
 #if !defined(DEBUG)
 zipEqual      _ = zip
@@ -280,25 +257,6 @@ zipWith4Equal msg z (a:as) (b:bs) (c:cs) (d:ds)
 zipWith4Equal _   _ [] [] [] [] =  []
 zipWith4Equal msg _ _  _  _  _  =  panic ("zipWith4Equal: unequal lists: "++msg)
 #endif
-
--- | 'zipLazy' is a kind of 'zip' that is lazy in the second list (observe the ~)
-zipLazy :: [a] -> [b] -> [(a,b)]
-zipLazy []     _       = []
-zipLazy (x:xs) ~(y:ys) = (x,y) : zipLazy xs ys
-
--- | 'zipWithLazy' is like 'zipWith' but is lazy in the second list.
--- The length of the output is always the same as the length of the first
--- list.
-zipWithLazy :: (a -> b -> c) -> [a] -> [b] -> [c]
-zipWithLazy _ []     _       = []
-zipWithLazy f (a:as) ~(b:bs) = f a b : zipWithLazy f as bs
-
--- | 'zipWith3Lazy' is like 'zipWith3' but is lazy in the second and third lists.
--- The length of the output is always the same as the length of the first
--- list.
-zipWith3Lazy :: (a -> b -> c -> d) -> [a] -> [b] -> [c] -> [d]
-zipWith3Lazy _ []     _       _       = []
-zipWith3Lazy f (a:as) ~(b:bs) ~(c:cs) = f a b c : zipWith3Lazy f as bs cs
 
 -- | 'filterByList' takes a list of Bools and a list of some elements and
 -- filters out these elements for which the corresponding value in the list of
@@ -350,11 +308,11 @@ stretchZipWith p z f (x:xs) ys
                 []     -> []
                 (y:ys) -> f x y : stretchZipWith p z f xs ys
 
-mapFst :: (a->c) -> [(a,b)] -> [(c,b)]
-mapSnd :: (b->c) -> [(a,b)] -> [(a,c)]
+mapFst :: Functor f => (a->c) -> f(a,b) -> f(c,b)
+mapSnd :: Functor f => (b->c) -> f(a,b) -> f(a,c)
 
-mapFst f xys = [(f x, y) | (x,y) <- xys]
-mapSnd f xys = [(x, f y) | (x,y) <- xys]
+mapFst = fmap . first
+mapSnd = fmap . second
 
 mapAndUnzip :: (a -> (b, c)) -> [a] -> ([b], [c])
 
@@ -529,6 +487,13 @@ chunkList :: Int -> [a] -> [[a]]
 chunkList _ [] = []
 chunkList n xs = as : chunkList n bs where (as,bs) = splitAt n xs
 
+-- | Compute all the ways of removing a single element from a list.
+--
+--  > holes [1,2,3] = [(1, [2,3]), (2, [1,3]), (3, [1,2])]
+holes :: [a] -> [(a, [a])]
+holes []     = []
+holes (x:xs) = (x, xs) : mapSnd (x:) (holes xs)
+
 -- | Replace the last element of a list with another element.
 changeLast :: [a] -> a -> [a]
 changeLast []     _  = panic "changeLast"
@@ -536,20 +501,9 @@ changeLast [_]    x  = [x]
 changeLast (x:xs) x' = x : changeLast xs x'
 
 -- | Apply an effectful function to the last list element.
--- Assumes a non-empty list (panics otherwise).
-mapLastM :: Functor f => (a -> f a) -> [a] -> f [a]
-mapLastM _ [] = panic "mapLastM: empty list"
-mapLastM f [x] = (\x' -> [x']) <$> f x
-mapLastM f (x:xs) = (x:) <$> mapLastM f xs
-
-mapAccumM :: (Monad m) => (r -> a -> m (r, b)) -> r -> [a] -> m (r, [b])
-mapAccumM f = go
-  where
-    go acc [] = pure (acc,[])
-    go acc (x:xs) = do
-      (acc',y) <- f acc x
-      (acc'',ys) <- go acc' xs
-      pure (acc'', y:ys)
+mapLastM :: Functor f => (a -> f a) -> NonEmpty a -> f (NonEmpty a)
+mapLastM f (x:|[]) = NE.singleton <$> f x
+mapLastM f (x0:|x1:xs) = (x0 NE.<|) <$> mapLastM f (x1:|xs)
 
 whenNonEmpty :: Applicative m => [a] -> (NonEmpty a -> m ()) -> m ()
 whenNonEmpty []     _ = pure ()
@@ -613,7 +567,7 @@ isSortedBy cmp = sorted
 
 minWith :: Ord b => (a -> b) -> [a] -> a
 minWith get_key xs = assert (not (null xs) )
-                     head (sortWith get_key xs)
+                     Partial.head (sortWith get_key xs)
 
 nubSort :: Ord a => [a] -> [a]
 nubSort = Set.toAscList . Set.fromList
@@ -764,16 +718,14 @@ spanEnd p l = go l [] [] l
           | p x       = go yes (x : rev_yes) rev_no                  xs
           | otherwise = go xs  []            (x : rev_yes ++ rev_no) xs
 
--- | Get the last two elements in a list. Partial!
+-- | Get the last two elements in a list.
 {-# INLINE last2 #-}
-last2 :: [a] -> (a,a)
-last2 = List.foldl' (\(_,x2) x -> (x2,x)) (partialError,partialError)
-  where
-    partialError = panic "last2 - list length less than two"
+last2 :: [a] -> Maybe (a,a)
+last2 = uncurry (liftA2 (,)) . List.foldl' (\(_,x2) x -> (x2, Just x)) (Nothing, Nothing)
 
 lastMaybe :: [a] -> Maybe a
 lastMaybe [] = Nothing
-lastMaybe xs = Just $ last xs
+lastMaybe (x:xs) = Just $ last (x:|xs)
 
 -- | @onJust x m f@ applies f to the value inside the Just or returns the default.
 onJust :: b -> Maybe a -> (a->b) -> b
@@ -787,17 +739,12 @@ onJust dflt = flip (maybe dflt)
 -- If you are guaranteed to use both, this will
 -- be more efficient.
 snocView :: [a] -> Maybe ([a],a)
-snocView [] = Nothing
-snocView xs
-    | (xs,x) <- go xs
-    = Just (xs,x)
+snocView = fmap go . nonEmpty
   where
-    go :: [a] -> ([a],a)
-    go [x] = ([],x)
-    go (x:xs)
-        | !(xs',x') <- go xs
-        = (x:xs', x')
-    go [] = error "impossible"
+    go :: NonEmpty a -> ([a],a)
+    go (x:|xs) = case nonEmpty xs of
+        Nothing -> ([],x)
+        Just xs -> case go xs of !(xs', x') -> (x:xs', x')
 
 split :: Char -> String -> [String]
 split c s = case rest of
@@ -824,30 +771,6 @@ isEqual :: Ordering -> Bool
 isEqual GT = False
 isEqual EQ = True
 isEqual LT = False
-
-thenCmp :: Ordering -> Ordering -> Ordering
-{-# INLINE thenCmp #-}
-thenCmp EQ       ordering = ordering
-thenCmp ordering _        = ordering
-
-eqListBy :: (a->a->Bool) -> [a] -> [a] -> Bool
-eqListBy _  []     []     = True
-eqListBy eq (x:xs) (y:ys) = eq x y && eqListBy eq xs ys
-eqListBy _  _      _      = False
-
-eqMaybeBy :: (a ->a->Bool) -> Maybe a -> Maybe a -> Bool
-eqMaybeBy _  Nothing  Nothing  = True
-eqMaybeBy eq (Just x) (Just y) = eq x y
-eqMaybeBy _  _        _        = False
-
-cmpList :: (a -> a -> Ordering) -> [a] -> [a] -> Ordering
-    -- `cmpList' uses a user-specified comparer
-
-cmpList _   []     [] = EQ
-cmpList _   []     _  = LT
-cmpList _   _      [] = GT
-cmpList cmp (a:as) (b:bs)
-  = case cmp a b of { EQ -> cmpList cmp as bs; xxx -> xxx }
 
 removeSpaces :: String -> String
 removeSpaces = dropWhileEndLE isSpace . dropWhile isSpace
@@ -971,10 +894,10 @@ fuzzyMatch key vals = fuzzyLookup key [(v,v) | v <- vals]
 -- | Search for possible matches to the users input in the given list,
 -- returning a small number of ranked results
 fuzzyLookup :: String -> [(String,a)] -> [a]
-fuzzyLookup user_entered possibilites
+fuzzyLookup user_entered possibilities
   = map fst $ take mAX_RESULTS $ List.sortBy (comparing snd)
     [ (poss_val, sort_key)
-    | (poss_str, poss_val) <- possibilites
+    | (poss_str, poss_val) <- possibilities
     , let distance = restrictedDamerauLevenshteinDistance poss_str user_entered
     , distance <= fuzzy_threshold
     , let sort_key = (distance, length poss_str, poss_str)
@@ -1007,7 +930,7 @@ fuzzyLookup user_entered possibilites
 -}
 
 unzipWith :: (a -> b -> c) -> [(a, b)] -> [c]
-unzipWith f pairs = map ( \ (a, b) -> f a b ) pairs
+unzipWith = fmap . uncurry
 
 seqList :: [a] -> b -> b
 seqList [] b = b
@@ -1340,9 +1263,9 @@ withAtomicRename targetFile f = do
 -- string is returned in the first component (and the second one is just
 -- empty).
 splitLongestPrefix :: String -> (Char -> Bool) -> (String,String)
-splitLongestPrefix str pred
-  | null r_pre = (str,           [])
-  | otherwise  = (reverse (tail r_pre), reverse r_suf)
+splitLongestPrefix str pred = case r_pre of
+    [] -> (str,           [])
+    _:r_pre' -> (reverse r_pre', reverse r_suf)
                            -- 'tail' drops the char satisfying 'pred'
   where (r_suf, r_pre) = break pred (reverse str)
 

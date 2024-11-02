@@ -67,7 +67,7 @@ import GHC.Types.Unique.Supply
 import GHC.Data.Bag
 import GHC.Utils.Monad.State.Strict
 
-import Data.List (mapAccumL, groupBy, partition)
+import Data.List (mapAccumL, partition)
 import Data.Maybe
 import Data.IntSet              (IntSet)
 
@@ -131,6 +131,11 @@ instance Instruction instr => Instruction (InstrSR instr) where
         isJumpishInstr i
          = case i of
                 Instr instr     -> isJumpishInstr instr
+                _               -> False
+
+        canFallthroughTo i bid
+         = case i of
+                Instr instr     -> canFallthroughTo instr bid
                 _               -> False
 
         jumpDestsOfInstr i
@@ -911,13 +916,11 @@ livenessSCCs platform blockmap done
                 -> a -> b
                 -> (a,c)
 
-            iterateUntilUnchanged f eq a b
-                = head $
-                  concatMap tail $
-                  groupBy (\(a1, _) (a2, _) -> eq a1 a2) $
-                  iterate (\(a, _) -> f a b) $
-                  (a, panic "RegLiveness.livenessSCCs")
-
+            iterateUntilUnchanged f eq aa b = go aa
+              where
+                go a = if eq a a' then ac else go a'
+                  where
+                    ac@(a', _) = f a b
 
             linearLiveness
                 :: Instruction instr

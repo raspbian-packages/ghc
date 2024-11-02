@@ -22,12 +22,10 @@ import GHC.Driver.Pipeline.Phases
 import GHC.Driver.Env hiding (Hsc)
 import GHC.Unit.Module.Location
 import GHC.Driver.Phases
-import GHC.Unit.Module.Name ( ModuleName )
 import GHC.Unit.Types
 import GHC.Types.SourceFile
 import GHC.Unit.Module.Status
 import GHC.Unit.Module.ModIface
-import GHC.Linker.Types
 import GHC.Driver.Backend
 import GHC.Driver.Session
 import GHC.Driver.CmdLine
@@ -44,11 +42,11 @@ import GHC.Utils.TmpFs
 import GHC.Platform
 import Data.List (intercalate, isInfixOf)
 import GHC.Unit.Env
-import GHC.SysTools.Info
 import GHC.Utils.Error
 import Data.Maybe
 import GHC.CmmToLlvm.Mangler
 import GHC.SysTools
+import GHC.SysTools.Cpp
 import GHC.Utils.Panic.Plain
 import System.Directory
 import System.FilePath
@@ -59,29 +57,31 @@ import GHC.Unit.State
 import GHC.Unit.Home
 import GHC.Data.Maybe
 import GHC.Iface.Make
-import Data.Time
 import GHC.Driver.Config.Parser
 import GHC.Parser.Header
 import GHC.Data.StringBuffer
 import GHC.Types.SourceError
 import GHC.Unit.Finder
-import GHC.Runtime.Loader
 import Data.IORef
 import GHC.Types.Name.Env
 import GHC.Platform.Ways
-import GHC.Platform.ArchOS
-import GHC.CmmToLlvm.Base ( llvmVersionList )
+import GHC.Driver.LlvmConfigCache (readLlvmConfigCache)
+import GHC.CmmToLlvm.Config (LlvmTarget (..), LlvmConfig (..))
 import {-# SOURCE #-} GHC.Driver.Pipeline (compileForeign, compileEmptyStub)
 import GHC.Settings
 import System.IO
 import GHC.Linker.ExtraObj
 import GHC.Linker.Dynamic
-import Data.Version
 import GHC.Utils.Panic
 import GHC.Unit.Module.Env
 import GHC.Driver.Env.KnotVars
 import GHC.Driver.Config.Finder
 import GHC.Rename.Names
+import GHC.StgToJS.Linker.Linker (embedJsFile)
+
+import Language.Haskell.Syntax.Module.Name
+import GHC.Unit.Home.ModInfo
+import GHC.Runtime.Loader (initializePlugins)
 
 newtype HookedUse a = HookedUse { runHookedUse :: (Hooks, PhaseHook) -> IO a }
   deriving (Functor, Applicative, Monad, MonadIO, MonadThrow, MonadCatch) via (ReaderT (Hooks, PhaseHook) IO)
@@ -121,9 +121,16 @@ runPhase (T_CmmCpp pipe_env hsc_env input_fn) = do
         (hsc_tmpfs hsc_env)
         (hsc_dflags hsc_env)
         (hsc_unit_env hsc_env)
-        False{-not raw-}
+        (CppOpts
+          { cppUseCc       = True
+          , cppLinePragmas = True
+          })
         input_fn output_fn
   return output_fn
+runPhase (T_Js pipe_env hsc_env location js_src) =
+  runJsPhase pipe_env hsc_env location js_src
+runPhase (T_ForeignJs pipe_env hsc_env location js_src) =
+  runForeignJsPhase pipe_env hsc_env location js_src
 runPhase (T_Cmm pipe_env hsc_env input_fn) = do
   let dflags = hsc_dflags hsc_env
   let next_phase = hscPostBackendPhase HsSrcFile (backend dflags)
@@ -133,7 +140,7 @@ runPhase (T_Cmm pipe_env hsc_env input_fn) = do
   let foreign_os = maybeToList stub_o
   return (foreign_os, output_fn)
 
-runPhase (T_Cc phase pipe_env hsc_env input_fn) = runCcPhase phase pipe_env hsc_env input_fn
+runPhase (T_Cc phase pipe_env hsc_env location input_fn) = runCcPhase phase pipe_env hsc_env location input_fn
 runPhase (T_As cpp pipe_env hsc_env location input_fn) = do
   runAsPhase cpp pipe_env hsc_env location input_fn
 runPhase (T_LlvmOpt pipe_env hsc_env input_fn) =
@@ -209,6 +216,7 @@ runLlvmLlcPhase pipe_env hsc_env input_fn = do
     --
     -- Observed at least with -mtriple=arm-unknown-linux-gnueabihf -enable-tbaa
     --
+    llvm_config <- readLlvmConfigCache (hsc_llvm_config hsc_env)
     let dflags = hsc_dflags hsc_env
         logger = hsc_logger hsc_env
         llvmOpts = case llvmOptLevel dflags of
@@ -217,7 +225,7 @@ runLlvmLlcPhase pipe_env hsc_env input_fn = do
           _ -> "-O2"
 
         defaultOptions = map GHC.SysTools.Option . concatMap words . snd
-                         $ unzip (llvmOptions dflags)
+                         $ unzip (llvmOptions llvm_config dflags)
         optFlag = if null (getOpts dflags opt_lc)
                   then map GHC.SysTools.Option $ words llvmOpts
                   else []
@@ -243,16 +251,17 @@ runLlvmOptPhase :: PipeEnv -> HscEnv -> FilePath -> IO FilePath
 runLlvmOptPhase pipe_env hsc_env input_fn = do
     let dflags = hsc_dflags hsc_env
         logger = hsc_logger hsc_env
+    llvm_config <- readLlvmConfigCache (hsc_llvm_config hsc_env)
     let -- we always (unless -optlo specified) run Opt since we rely on it to
         -- fix up some pretty big deficiencies in the code we generate
         optIdx = max 0 $ min 2 $ llvmOptLevel dflags  -- ensure we're in [0,2]
-        llvmOpts = case lookup optIdx $ llvmPasses $ llvmConfig dflags of
+        llvmOpts = case lookup optIdx $ llvmPasses llvm_config of
                     Just passes -> passes
                     Nothing -> panic ("runPhase LlvmOpt: llvm-passes file "
                                       ++ "is missing passes for level "
                                       ++ show optIdx)
         defaultOptions = map GHC.SysTools.Option . concat . fmap words . fst
-                         $ unzip (llvmOptions dflags)
+                         $ unzip (llvmOptions llvm_config dflags)
 
         -- don't specify anything if user has specified commands. We do this
         -- for opt but not llc since opt is very specifically for optimisation
@@ -284,13 +293,11 @@ runAsPhase with_cpp pipe_env hsc_env location input_fn = do
 
         -- LLVM from version 3.0 onwards doesn't support the OS X system
         -- assembler, so we use clang as the assembler instead. (#5636)
-        let (as_prog, get_asm_info) | backend dflags == LLVM
-                    , platformOS platform == OSDarwin
-                    = (GHC.SysTools.runClang, pure Clang)
-                    | otherwise
-                    = (GHC.SysTools.runAs, getAssemblerInfo logger dflags)
-
-        asmInfo <- get_asm_info
+        let (as_prog, get_asm_info) =
+                ( applyAssemblerProg $ backendAssemblerProg (backend dflags)
+                , applyAssemblerInfoGetter $ backendAssemblerInfoGetter (backend dflags)
+                )
+        asmInfo <- get_asm_info logger dflags platform
 
         let cmdline_include_paths = includePaths dflags
         let pic_c_flags = picCCOpts dflags
@@ -310,6 +317,7 @@ runAsPhase with_cpp pipe_env hsc_env location input_fn = do
               = withAtomicRename outputFilename $ \temp_outputFilename ->
                     as_prog
                        logger dflags
+                       platform
                        (local_includes ++ global_includes
                        -- See Note [-fPIC for assembler]
                        ++ map GHC.SysTools.Option pic_c_flags
@@ -318,6 +326,10 @@ runAsPhase with_cpp pipe_env hsc_env location input_fn = do
                           | platformOS (targetPlatform dflags) == OSMinGW32
                           , not $ target32Bit (targetPlatform dflags)
                           ]
+
+                       -- See Note [-Wa,--no-type-check on wasm32]
+                       ++ [ GHC.SysTools.Option "-Wa,--no-type-check"
+                          | platformArch (targetPlatform dflags) == ArchWasm32]
 
                        ++ (if any (asmInfo ==) [Clang, AppleClang, AppleClang51]
                             then [GHC.SysTools.Option "-Qunused-arguments"]
@@ -338,8 +350,87 @@ runAsPhase with_cpp pipe_env hsc_env location input_fn = do
         return output_fn
 
 
-runCcPhase :: Phase -> PipeEnv -> HscEnv -> FilePath -> IO FilePath
-runCcPhase cc_phase pipe_env hsc_env input_fn = do
+-- Note [JS Backend .o file procedure]
+-- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+--
+-- The JS backend breaks some of the assumptions on file generation order
+-- because it directly produces .o files. This violation breaks some of the
+-- assumptions on file timestamps, particularly in the postHsc phase. The
+-- postHsc phase for the JS backend is performed in 'runJsPhase'. Consider
+-- what the NCG does:
+--
+-- With other NCG backends we have the following order:
+-- 1. The backend produces a .s file
+-- 2. Then we write the interface file, .hi
+-- 3. Then we generate a .o file in a postHsc phase (calling the asm phase etc.)
+--
+-- For the JS Backend this order is different
+-- 1. The JS Backend _directly_ produces .o files
+-- 2. Then we write the interface file. Notice that this breaks the ordering
+-- of .hi > .o (step 2 and step 3 in the NCG above).
+--
+-- This violation results in timestamp checks which pass on the NCG but fail
+-- in the JS backend. In particular, checks that compare 'ms_obj_date', and
+-- 'ms_iface_date' in 'GHC.Unit.Module.ModSummary'.
+--
+-- Thus to fix this ordering we touch the object files we generated earlier
+-- to ensure these timestamps abide by the proper ordering.
+
+-- | Run the JS Backend postHsc phase.
+runJsPhase :: PipeEnv -> HscEnv -> Maybe ModLocation -> FilePath -> IO FilePath
+runJsPhase _pipe_env hsc_env _location input_fn = do
+  let dflags     = hsc_dflags   hsc_env
+  let logger     = hsc_logger   hsc_env
+
+  -- The object file is already generated. We only touch it to ensure the
+  -- timestamp is refreshed, see Note [JS Backend .o file procedure].
+  touchObjectFile logger dflags input_fn
+
+  return input_fn
+
+-- | Deal with foreign JS files (embed them into .o files)
+runForeignJsPhase :: PipeEnv -> HscEnv -> Maybe ModLocation -> FilePath -> IO FilePath
+runForeignJsPhase pipe_env hsc_env _location input_fn = do
+  let dflags     = hsc_dflags   hsc_env
+  let logger     = hsc_logger   hsc_env
+  let tmpfs      = hsc_tmpfs    hsc_env
+  let unit_env   = hsc_unit_env hsc_env
+
+  output_fn <- phaseOutputFilenameNew StopLn pipe_env hsc_env Nothing
+  embedJsFile logger dflags tmpfs unit_env input_fn output_fn
+  return output_fn
+
+
+applyAssemblerInfoGetter
+    :: DefunctionalizedAssemblerInfoGetter
+    -> Logger -> DynFlags -> Platform -> IO CompilerInfo
+applyAssemblerInfoGetter StandardAssemblerInfoGetter logger dflags _platform =
+    getAssemblerInfo logger dflags
+applyAssemblerInfoGetter JSAssemblerInfoGetter _ _ _ =
+    pure Emscripten
+applyAssemblerInfoGetter DarwinClangAssemblerInfoGetter logger dflags platform =
+    if platformOS platform == OSDarwin then
+        pure Clang
+    else
+        getAssemblerInfo logger dflags
+
+applyAssemblerProg
+    :: DefunctionalizedAssemblerProg
+    -> Logger -> DynFlags -> Platform -> [Option] -> IO ()
+applyAssemblerProg StandardAssemblerProg logger dflags _platform =
+    runAs logger dflags
+applyAssemblerProg JSAssemblerProg logger dflags _platform =
+    runEmscripten logger dflags
+applyAssemblerProg DarwinClangAssemblerProg logger dflags platform =
+    if platformOS platform == OSDarwin then
+        runClang logger dflags
+    else
+        runAs logger dflags
+
+
+
+runCcPhase :: Phase -> PipeEnv -> HscEnv -> Maybe ModLocation -> FilePath -> IO FilePath
+runCcPhase cc_phase pipe_env hsc_env location input_fn = do
   let dflags    = hsc_dflags hsc_env
   let logger    = hsc_logger hsc_env
   let unit_env  = hsc_unit_env hsc_env
@@ -402,9 +493,11 @@ runCcPhase cc_phase pipe_env hsc_env input_fn = do
              | llvmOptLevel dflags >= 1 = [ "-O" ]
              | otherwise            = []
 
-  -- Decide next phase
-  let next_phase = As False
-  output_fn <- phaseOutputFilenameNew next_phase pipe_env hsc_env Nothing
+  output_fn <- phaseOutputFilenameNew StopLn pipe_env hsc_env location
+
+  -- we create directories for the object file, because it
+  -- might be a hierarchical module.
+  createDirectoryIfMissing True (takeDirectory output_fn)
 
   let
     more_hcc_opts =
@@ -425,13 +518,21 @@ runCcPhase cc_phase pipe_env hsc_env input_fn = do
 
   ghcVersionH <- getGhcVersionPathName dflags unit_env
 
-  GHC.SysTools.runCc (phaseForeignLanguage cc_phase) logger tmpfs dflags (
-                  [ GHC.SysTools.FileOption "" input_fn
+  withAtomicRename output_fn $ \temp_outputFilename ->
+    GHC.SysTools.runCc (phaseForeignLanguage cc_phase) logger tmpfs dflags (
+                  [ GHC.SysTools.Option "-c"
+                  , GHC.SysTools.FileOption "" input_fn
                   , GHC.SysTools.Option "-o"
-                  , GHC.SysTools.FileOption "" output_fn
+                  , GHC.SysTools.FileOption "" temp_outputFilename
                   ]
                  ++ map GHC.SysTools.Option (
                     pic_c_flags
+
+                 -- See Note [Produce big objects on Windows]
+                 ++ [ "-Wa,-mbig-obj"
+                    | platformOS (targetPlatform dflags) == OSMinGW32
+                    , not $ target32Bit (targetPlatform dflags)
+                    ]
 
           -- Stub files generated for foreign exports references the runIO_closure
           -- and runNonIO_closure symbols, which are defined in the base package.
@@ -452,7 +553,6 @@ runCcPhase cc_phase pipe_env hsc_env input_fn = do
                        then gcc_extra_viac_flags ++ more_hcc_opts
                        else [])
                  ++ verbFlags
-                 ++ [ "-S" ]
                  ++ cc_opt
                  ++ [ "-include", ghcVersionH ]
                  ++ framework_paths
@@ -470,7 +570,7 @@ runHscBackendPhase :: PipeEnv
                    -> HscSource
                    -> ModLocation
                    -> HscBackendAction
-                   -> IO ([FilePath], ModIface, Maybe Linkable, FilePath)
+                   -> IO ([FilePath], ModIface, HomeModLinkable, FilePath)
 runHscBackendPhase pipe_env hsc_env mod_name src_flavour location result = do
   let dflags = hsc_dflags hsc_env
       logger = hsc_logger hsc_env
@@ -478,13 +578,13 @@ runHscBackendPhase pipe_env hsc_env mod_name src_flavour location result = do
       next_phase = hscPostBackendPhase src_flavour (backend dflags)
   case result of
       HscUpdate iface ->
-          if | NoBackend <- backend dflags  ->
+          if | not (backendGeneratesCode (backend dflags))  ->
                 panic "HscUpdate not relevant for NoBackend"
-             | Interpreter <- backend dflags -> do
+             | not (backendGeneratesCodeForHsBoot (backend dflags)) -> do
                 -- In Interpreter way, there is just no linkable for hs-boot files
                 -- and we don't want to write an empty `o-boot` file when we're not
                 -- supposed to be writing any .o files (#22669)
-                return ([], iface, Nothing, o_file)
+                return ([], iface, emptyHomeModInfoLinkable, o_file)
              | otherwise -> do
                  case src_flavour of
                    HsigFile -> do
@@ -499,46 +599,37 @@ runHscBackendPhase pipe_env hsc_env mod_name src_flavour location result = do
                    HsBootFile -> touchObjectFile logger dflags o_file
                    HsSrcFile -> panic "HscUpdate not relevant for HscSrcFile"
 
-                     -- MP: I wonder if there are any lurking bugs here because we
-                     -- return Linkable == emptyHomeModInfoLinkable, despite the fact that there is a
-                     -- linkable (.o-boot) which we check for in `Iface/Recomp.hs` and
-                     -- then will carry around the linkable if we're doing
-                     -- recompilation.
-                 return ([], iface, Nothing, o_file)
+                 -- MP: I wonder if there are any lurking bugs here because we
+                 -- return Linkable == emptyHomeModInfoLinkable, despite the fact that there is a
+                 -- linkable (.o-boot) which we check for in `Iface/Recomp.hs` and
+                 -- then will carry around the linkable if we're doing
+                 -- recompilation.
+                 return ([], iface, emptyHomeModInfoLinkable, o_file)
       HscRecomp { hscs_guts = cgguts,
                   hscs_mod_location = mod_location,
                   hscs_partial_iface = partial_iface,
                   hscs_old_iface_hash = mb_old_iface_hash
                 }
-        -> case backend dflags of
-          NoBackend -> panic "HscRecomp not relevant for NoBackend"
-          Interpreter -> do
-              -- In interpreted mode the regular codeGen backend is not run so we
-              -- generate a interface without codeGen info.
-              final_iface <- mkFullIface hsc_env partial_iface Nothing Nothing
-              hscMaybeWriteIface logger dflags True final_iface mb_old_iface_hash location
-
-              (hasStub, comp_bc, spt_entries) <- hscInteractive hsc_env cgguts mod_location
-
-              stub_o <- case hasStub of
-                        Nothing -> return []
-                        Just stub_c -> do
-                            stub_o <- compileStub hsc_env stub_c
-                            return [DotO stub_o]
-
-              let hs_unlinked = [BCOs comp_bc spt_entries]
-              unlinked_time <- getCurrentTime
-              let !linkable = LM unlinked_time (mkHomeModule (hsc_home_unit hsc_env) mod_name)
-                             (hs_unlinked ++ stub_o)
-              return ([], final_iface, Just linkable, panic "interpreter")
-          _ -> do
+        -> if not (backendGeneratesCode (backend dflags)) then
+             panic "HscRecomp not relevant for NoBackend"
+           else if backendWritesFiles (backend dflags) then
+             do
               output_fn <- phaseOutputFilenameNew next_phase pipe_env hsc_env (Just location)
-              (outputFilename, mStub, foreign_files, mb_stg_infos, mb_cg_infos) <-
+              (outputFilename, mStub, foreign_files, stg_infos, cg_infos) <-
+
                 hscGenHardCode hsc_env cgguts mod_location output_fn
-              final_iface <- mkFullIface hsc_env partial_iface mb_stg_infos mb_cg_infos
+              final_iface <- mkFullIface hsc_env partial_iface stg_infos cg_infos
 
               -- See Note [Writing interface files]
               hscMaybeWriteIface logger dflags False final_iface mb_old_iface_hash mod_location
+              mlinkable <-
+                if backendGeneratesCode (backend dflags) && gopt Opt_ByteCodeAndObjectCode dflags
+                  then do
+                    bc <- generateFreshByteCode hsc_env mod_name (mkCgInteractiveGuts cgguts) mod_location
+                    return $ emptyHomeModInfoLinkable { homeMod_bytecode = Just bc }
+
+                  else return emptyHomeModInfoLinkable
+
 
               stub_o <- mapM (compileStub hsc_env) mStub
               foreign_os <-
@@ -549,7 +640,16 @@ runHscBackendPhase pipe_env hsc_env mod_name src_flavour location result = do
               -- have some way to do before the object file is produced
               -- In future we can split up the driver logic more so that this function
               -- is in TPipeline and in this branch we can invoke the rest of the backend phase.
-              return (fos, final_iface, Nothing, outputFilename)
+              return (fos, final_iface, mlinkable, outputFilename)
+
+           else
+              -- In interpreted mode the regular codeGen backend is not run so we
+              -- generate a interface without codeGen info.
+            do
+              final_iface <- mkFullIface hsc_env partial_iface Nothing Nothing
+              hscMaybeWriteIface logger dflags True final_iface mb_old_iface_hash location
+              bc <- generateFreshByteCode hsc_env mod_name (mkCgInteractiveGuts cgguts) mod_location
+              return ([], final_iface, emptyHomeModInfoLinkable { homeMod_bytecode = Just bc } , panic "interpreter")
 
 
 runUnlitPhase :: HscEnv -> FilePath -> FilePath -> IO FilePath
@@ -558,8 +658,8 @@ runUnlitPhase hsc_env input_fn output_fn = do
        -- escape the characters \, ", and ', but don't try to escape
        -- Unicode or anything else (so we don't use Util.charToC
        -- here).  If we get this wrong, then in
-       -- GHC.HsToCore.Coverage.isGoodTickSrcSpan where we check that the filename in
-       -- a SrcLoc is the same as the source filenaame, the two will
+       -- GHC.HsToCore.Ticks.isGoodTickSrcSpan where we check that the filename in
+       -- a SrcLoc is the same as the source filename, the two will
        -- look bogusly different. See test:
        -- libraries/hpc/tests/function/subdir/tough2.hs
        escape ('\\':cs) = '\\':'\\': escape cs
@@ -599,7 +699,10 @@ runCppPhase hsc_env input_fn output_fn = do
            (hsc_tmpfs hsc_env)
            (hsc_dflags hsc_env)
            (hsc_unit_env hsc_env)
-           True{-raw-}
+           (CppOpts
+              { cppUseCc       = False
+              , cppLinePragmas = True
+              })
            input_fn output_fn
   return output_fn
 
@@ -621,9 +724,11 @@ runHscPhase pipe_env hsc_env0 input_fn src_flavour = do
       new_includes = addImplicitQuoteInclude paths [current_dir]
       paths = includePaths dflags0
       dflags = dflags0 { includePaths = new_includes }
-      hsc_env = hscSetFlags dflags hsc_env0
+      hsc_env1 = hscSetFlags dflags hsc_env0
 
-
+  -- Initialise plugins as the flags passed into runHscPhase might have local plugins just
+  -- specific to this module.
+  hsc_env <- initializePlugins hsc_env1
 
   -- gather the imports and module name
   (hspp_buf,mod_name,imps,src_imps, ghc_prim_imp) <- do
@@ -683,18 +788,17 @@ runHscPhase pipe_env hsc_env0 input_fn src_flavour = do
   -- run the compiler!
   let msg :: Messager
       msg hsc_env _ what _ = oneShotMsg (hsc_logger hsc_env) what
-  plugin_hsc_env' <- initializePlugins hsc_env
 
   -- Need to set the knot-tying mutable variable for interface
   -- files. See GHC.Tc.Utils.TcGblEnv.tcg_type_env_var.
   -- See also Note [hsc_type_env_var hack]
   type_env_var <- newIORef emptyNameEnv
-  let plugin_hsc_env = plugin_hsc_env' { hsc_type_env_vars = knotVarsFromModuleEnv (mkModuleEnv [(mod, type_env_var)]) }
+  let hsc_env' = hsc_env { hsc_type_env_vars = knotVarsFromModuleEnv (mkModuleEnv [(mod, type_env_var)]) }
 
-  status <- hscRecompStatus (Just msg) plugin_hsc_env mod_summary
-                        Nothing Nothing (1, 1)
+  status <- hscRecompStatus (Just msg) hsc_env' mod_summary
+                        Nothing emptyHomeModInfoLinkable (1, 1)
 
-  return (plugin_hsc_env, mod_summary, status)
+  return (hsc_env', mod_summary, status)
 
 -- | Calculate the ModLocation from the provided DynFlags. This function is only used
 -- in one-shot mode and therefore takes into account the effect of -o/-ohi flags
@@ -813,7 +917,7 @@ getOutputFilename logger tmpfs stop_phase output basename dflags next_phase mayb
  | StopLn <- next_phase, Just loc <- maybe_location  =
       return $ if dynamicNow dflags then ml_dyn_obj_file loc
                                     else ml_obj_file loc
- -- 2. If output style is persistant then
+ -- 2. If output style is persistent then
  | is_last_phase, Persistent   <- output = persistent_fn
  -- 3. Specific file is only set when outputFile is set by -o
  -- If we are in dynamic mode but -dyno is not set then write to the same path as
@@ -835,9 +939,11 @@ getOutputFilename logger tmpfs stop_phase output basename dflags next_phase mayb
  | otherwise                             = newTempName logger tmpfs (tmpDir dflags) TFL_CurrentModule
    suffix
     where
-          getOutputFile_ dflags = case outputFile_ dflags of
-                                    Nothing -> pprPanic "SpecificFile: No filename" (ppr $ (dynamicNow dflags, outputFile_ dflags, dynOutputFile_ dflags))
-                                    Just fn -> fn
+          getOutputFile_ dflags =
+            case outputFile_ dflags of
+              Nothing -> pprPanic "SpecificFile: No filename" (ppr (dynamicNow dflags) $$
+                                                               text (fromMaybe "-" (dynOutputFile_ dflags)))
+              Just fn -> fn
 
           hcsuf      = hcSuf dflags
           odir       = objectDir dflags
@@ -879,11 +985,11 @@ getOutputFilename logger tmpfs stop_phase output basename dflags next_phase mayb
 
 -- | LLVM Options. These are flags to be passed to opt and llc, to ensure
 -- consistency we list them in pairs, so that they form groups.
-llvmOptions :: DynFlags
+llvmOptions :: LlvmConfig
+            -> DynFlags
             -> [(String, String)]  -- ^ pairs of (opt, llc) arguments
-llvmOptions dflags =
-       [("-enable-tbaa -tbaa",  "-enable-tbaa") | gopt Opt_LlvmTBAA dflags ]
-    ++ [("-relocation-model=" ++ rmodel
+llvmOptions llvm_config dflags =
+       [("-relocation-model=" ++ rmodel
         ,"-relocation-model=" ++ rmodel) | not (null rmodel)]
     ++ [("-stack-alignment=" ++ (show align)
         ,"-stack-alignment=" ++ (show align)) | align > 0 ]
@@ -895,7 +1001,7 @@ llvmOptions dflags =
     ++ [("", "-target-abi=" ++ abi) | not (null abi) ]
 
   where target = platformMisc_llvmTarget $ platformMisc dflags
-        Just (LlvmTarget _ mcpu mattr) = lookup target (llvmTargets $ llvmConfig dflags)
+        Just (LlvmTarget _ mcpu mattr) = lookup target (llvmTargets llvm_config)
 
         -- Relocation models
         rmodel | gopt Opt_PIC dflags         = "pic"
@@ -927,156 +1033,14 @@ llvmOptions dflags =
         abi :: String
         abi = case platformArch (targetPlatform dflags) of
                 ArchRISCV64 -> "lp64d"
+                ArchLoongArch64 -> "lp64d"
                 _           -> ""
-
-
--- Note [Filepaths and Multiple Home Units]
-offsetIncludePaths :: DynFlags -> IncludeSpecs -> IncludeSpecs
-offsetIncludePaths dflags (IncludeSpecs incs quotes impl) =
-     let go = map (augmentByWorkingDirectory dflags)
-     in IncludeSpecs (go incs) (go quotes) (go impl)
--- -----------------------------------------------------------------------------
--- Running CPP
-
--- | Run CPP
---
--- UnitEnv is needed to compute MIN_VERSION macros
-doCpp :: Logger -> TmpFs -> DynFlags -> UnitEnv -> Bool -> FilePath -> FilePath -> IO ()
-doCpp logger tmpfs dflags unit_env raw input_fn output_fn = do
-    let hscpp_opts = picPOpts dflags
-    let cmdline_include_paths = offsetIncludePaths dflags (includePaths dflags)
-    let unit_state = ue_units unit_env
-    pkg_include_dirs <- mayThrowUnitErr
-                        (collectIncludeDirs <$> preloadUnitsInfo unit_env)
-    -- MP: This is not quite right, the headers which are supposed to be installed in
-    -- the package might not be the same as the provided include paths, but it's a close
-    -- enough approximation for things to work. A proper solution would be to have to declare which paths should
-    -- be propagated to dependent packages.
-    let home_pkg_deps =
-         [homeUnitEnv_dflags . ue_findHomeUnitEnv uid $ unit_env | uid <- ue_transitiveHomeDeps (ue_currentUnit unit_env) unit_env]
-        dep_pkg_extra_inputs = [offsetIncludePaths fs (includePaths fs) | fs <- home_pkg_deps]
-
-    let include_paths_global = foldr (\ x xs -> ("-I" ++ x) : xs) []
-          (includePathsGlobal cmdline_include_paths ++ pkg_include_dirs
-                                                    ++ concatMap includePathsGlobal dep_pkg_extra_inputs)
-    let include_paths_quote = foldr (\ x xs -> ("-iquote" ++ x) : xs) []
-          (includePathsQuote cmdline_include_paths ++
-           includePathsQuoteImplicit cmdline_include_paths)
-    let include_paths = include_paths_quote ++ include_paths_global
-
-    let verbFlags = getVerbFlags dflags
-
-    let cpp_prog args | raw       = GHC.SysTools.runCpp logger dflags args
-                      | otherwise = GHC.SysTools.runCc Nothing logger tmpfs dflags
-                                        (GHC.SysTools.Option "-E" : args)
-
-    let platform   = targetPlatform dflags
-        targetArch = stringEncodeArch $ platformArch platform
-        targetOS = stringEncodeOS $ platformOS platform
-        isWindows = platformOS platform == OSMinGW32
-    let target_defs =
-          [ "-D" ++ HOST_OS     ++ "_BUILD_OS",
-            "-D" ++ HOST_ARCH   ++ "_BUILD_ARCH",
-            "-D" ++ targetOS    ++ "_HOST_OS",
-            "-D" ++ targetArch  ++ "_HOST_ARCH" ]
-        -- remember, in code we *compile*, the HOST is the same our TARGET,
-        -- and BUILD is the same as our HOST.
-
-    let io_manager_defs =
-          [ "-D__IO_MANAGER_WINIO__=1" | isWindows ] ++
-          [ "-D__IO_MANAGER_MIO__=1"               ]
-
-    let sse_defs =
-          [ "-D__SSE__"      | isSseEnabled      platform ] ++
-          [ "-D__SSE2__"     | isSse2Enabled     platform ] ++
-          [ "-D__SSE4_2__"   | isSse4_2Enabled   dflags ]
-
-    let avx_defs =
-          [ "-D__AVX__"      | isAvxEnabled      dflags ] ++
-          [ "-D__AVX2__"     | isAvx2Enabled     dflags ] ++
-          [ "-D__AVX512CD__" | isAvx512cdEnabled dflags ] ++
-          [ "-D__AVX512ER__" | isAvx512erEnabled dflags ] ++
-          [ "-D__AVX512F__"  | isAvx512fEnabled  dflags ] ++
-          [ "-D__AVX512PF__" | isAvx512pfEnabled dflags ]
-
-    backend_defs <- getBackendDefs logger dflags
-
-    let th_defs = [ "-D__GLASGOW_HASKELL_TH__" ]
-    -- Default CPP defines in Haskell source
-    ghcVersionH <- getGhcVersionPathName dflags unit_env
-    let hsSourceCppOpts = [ "-include", ghcVersionH ]
-
-    -- MIN_VERSION macros
-    let uids = explicitUnits unit_state
-        pkgs = mapMaybe (lookupUnit unit_state . fst) uids
-    mb_macro_include <-
-        if not (null pkgs) && gopt Opt_VersionMacros dflags
-            then do macro_stub <- newTempName logger tmpfs (tmpDir dflags) TFL_CurrentModule "h"
-                    writeFile macro_stub (generatePackageVersionMacros pkgs)
-                    -- Include version macros for every *exposed* package.
-                    -- Without -hide-all-packages and with a package database
-                    -- size of 1000 packages, it takes cpp an estimated 2
-                    -- milliseconds to process this file. See #10970
-                    -- comment 8.
-                    return [GHC.SysTools.FileOption "-include" macro_stub]
-            else return []
-
-    cpp_prog       (   map GHC.SysTools.Option verbFlags
-                    ++ map GHC.SysTools.Option include_paths
-                    ++ map GHC.SysTools.Option hsSourceCppOpts
-                    ++ map GHC.SysTools.Option target_defs
-                    ++ map GHC.SysTools.Option backend_defs
-                    ++ map GHC.SysTools.Option th_defs
-                    ++ map GHC.SysTools.Option hscpp_opts
-                    ++ map GHC.SysTools.Option sse_defs
-                    ++ map GHC.SysTools.Option avx_defs
-                    ++ map GHC.SysTools.Option io_manager_defs
-                    ++ mb_macro_include
-        -- Set the language mode to assembler-with-cpp when preprocessing. This
-        -- alleviates some of the C99 macro rules relating to whitespace and the hash
-        -- operator, which we tend to abuse. Clang in particular is not very happy
-        -- about this.
-                    ++ [ GHC.SysTools.Option     "-x"
-                       , GHC.SysTools.Option     "assembler-with-cpp"
-                       , GHC.SysTools.Option     input_fn
-        -- We hackily use Option instead of FileOption here, so that the file
-        -- name is not back-slashed on Windows.  cpp is capable of
-        -- dealing with / in filenames, so it works fine.  Furthermore
-        -- if we put in backslashes, cpp outputs #line directives
-        -- with *double* backslashes.   And that in turn means that
-        -- our error messages get double backslashes in them.
-        -- In due course we should arrange that the lexer deals
-        -- with these \\ escapes properly.
-                       , GHC.SysTools.Option     "-o"
-                       , GHC.SysTools.FileOption "" output_fn
-                       ])
-
-getBackendDefs :: Logger -> DynFlags -> IO [String]
-getBackendDefs logger dflags | backend dflags == LLVM = do
-    llvmVer <- figureLlvmVersion logger dflags
-    return $ case fmap llvmVersionList llvmVer of
-               Just [m] -> [ "-D__GLASGOW_HASKELL_LLVM__=" ++ format (m,0) ]
-               Just (m:n:_) -> [ "-D__GLASGOW_HASKELL_LLVM__=" ++ format (m,n) ]
-               _ -> []
-  where
-    format (major, minor)
-      | minor >= 100 = error "getBackendDefs: Unsupported minor version"
-      | otherwise = show $ (100 * major + minor :: Int) -- Contract is Int
-
-getBackendDefs _ _ =
-    return []
 
 -- | What phase to run after one of the backend code generators has run
 hscPostBackendPhase :: HscSource -> Backend -> Phase
 hscPostBackendPhase HsBootFile _    =  StopLn
 hscPostBackendPhase HsigFile _      =  StopLn
-hscPostBackendPhase _ bcknd =
-  case bcknd of
-        ViaC        -> HCc
-        NCG         -> As False
-        LLVM        -> LlvmOpt
-        NoBackend   -> StopLn
-        Interpreter -> StopLn
+hscPostBackendPhase _ bcknd = backendNormalSuccessorPhase bcknd
 
 
 compileStub :: HscEnv -> FilePath -> IO FilePath
@@ -1117,7 +1081,7 @@ none of this can be used in that case.
 Note [Object merging]
 ~~~~~~~~~~~~~~~~~~~~~
 On most platforms one can "merge" a set of relocatable object files into a new,
-partiall-linked-but-still-relocatable object. In a typical UNIX-style linker,
+partially-linked-but-still-relocatable object. In a typical UNIX-style linker,
 this is accomplished with the `ld -r` command. We rely on this for two ends:
 
  * We rely on `ld -r` to squash together split sections, making GHCi loading
@@ -1129,13 +1093,17 @@ this is accomplished with the `ld -r` command. We rely on this for two ends:
 The command used for object linking is set using the -pgmlm and -optlm
 command-line options.
 
-Sadly, the LLD linker that we use on Windows does not support the `-r` flag
-needed to support object merging (see #21068). For this reason on Windows we do
-not support GHCi objects.  To deal with foreign stubs we build a static archive
-of all of a module's object files instead merging them. Consequently, we can
-end up producing `.o` files which are in fact static archives. However,
-toolchains generally don't have a problem with this as they use file headers,
-not the filename, to determine the nature of inputs.
+However, `ld -r` is broken in some cases:
+
+ * The LLD linker that we use on Windows does not support the `-r`
+   flag needed to support object merging (see #21068). For this reason
+   on Windows we do not support GHCi objects.
+
+In these cases, we bundle a module's own object file with its foreign
+stub's object file, instead of merging them. Consequently, we can end
+up producing `.o` files which are in fact static archives. This can
+only work if `ar -L` is supported, so the archive `.o` files can be
+properly added to the final static library.
 
 Note that this has somewhat non-obvious consequences when producing
 initializers and finalizers. See Note [Initializers and finalizers in Cmm]
@@ -1165,16 +1133,9 @@ joinObjectFiles hsc_env o_files output_fn
   let toolSettings' = toolSettings dflags
       ldIsGnuLd = toolSettings_ldIsGnuLd toolSettings'
       ld_r args = GHC.SysTools.runMergeObjects (hsc_logger hsc_env) (hsc_tmpfs hsc_env) (hsc_dflags hsc_env) (
-                        map GHC.SysTools.Option ld_build_id
-                     ++ [ GHC.SysTools.Option "-o",
+                        [ GHC.SysTools.Option "-o",
                           GHC.SysTools.FileOption "" output_fn ]
                      ++ args)
-
-      -- suppress the generation of the .note.gnu.build-id section,
-      -- which we don't need and sometimes causes ld to emit a
-      -- warning:
-      ld_build_id | toolSettings_ldSupportsBuildId toolSettings' = ["--build-id=none"]
-                  | otherwise                                    = []
 
   if ldIsGnuLd
      then do
@@ -1229,36 +1190,6 @@ linkDynLibCheck logger tmpfs dflags unit_env o_files dep_units = do
 
 
 
--- ---------------------------------------------------------------------------
--- Macros (cribbed from Cabal)
-
-generatePackageVersionMacros :: [UnitInfo] -> String
-generatePackageVersionMacros pkgs = concat
-  -- Do not add any C-style comments. See #3389.
-  [ generateMacros "" pkgname version
-  | pkg <- pkgs
-  , let version = unitPackageVersion pkg
-        pkgname = map fixchar (unitPackageNameString pkg)
-  ]
-
-fixchar :: Char -> Char
-fixchar '-' = '_'
-fixchar c   = c
-
-generateMacros :: String -> String -> Version -> String
-generateMacros prefix name version =
-  concat
-  ["#define ", prefix, "VERSION_",name," ",show (showVersion version),"\n"
-  ,"#define MIN_", prefix, "VERSION_",name,"(major1,major2,minor) (\\\n"
-  ,"  (major1) <  ",major1," || \\\n"
-  ,"  (major1) == ",major1," && (major2) <  ",major2," || \\\n"
-  ,"  (major1) == ",major1," && (major2) == ",major2," && (minor) <= ",minor,")"
-  ,"\n\n"
-  ]
-  where
-    (major1:major2:minor:_) = map show (versionBranch version ++ repeat 0)
-
-
 -- -----------------------------------------------------------------------------
 -- Misc.
 
@@ -1268,22 +1199,6 @@ touchObjectFile :: Logger -> DynFlags -> FilePath -> IO ()
 touchObjectFile logger dflags path = do
   createDirectoryIfMissing True $ takeDirectory path
   GHC.SysTools.touch logger dflags "Touching object file" path
-
--- | Find out path to @ghcversion.h@ file
-getGhcVersionPathName :: DynFlags -> UnitEnv -> IO FilePath
-getGhcVersionPathName dflags unit_env = do
-  candidates <- case ghcVersionFile dflags of
-    Just path -> return [path]
-    Nothing -> do
-        ps <- mayThrowUnitErr (preloadUnitsInfo' unit_env [rtsUnitId])
-        return ((</> "ghcversion.h") <$> collectIncludeDirs ps)
-
-  found <- filterM doesFileExist candidates
-  case found of
-      []    -> throwGhcExceptionIO (InstallationError
-                                    ("ghcversion.h missing; tried: "
-                                      ++ intercalate ", " candidates))
-      (x:_) -> return x
 
 -- Note [-fPIC for assembler]
 -- ~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1353,9 +1268,9 @@ Introduction
 
   4) -fhpc
   At some point during compilation with -fhpc, in the function
-  `GHC.HsToCore.Coverage.isGoodTickSrcSpan`, we compare the filename that a
+  `GHC.HsToCore.Ticks.isGoodTickSrcSpan`, we compare the filename that a
   `SrcSpan` refers to with the name of the file we are currently compiling.
-  For some reason I don't yet understand, they can sometimes legitimally be
+  For some reason I don't yet understand, they can sometimes legitimately be
   different, and then hpc ignores that SrcSpan.
 
 Problem
@@ -1382,4 +1297,31 @@ Archeology
   that commit was addressing has since been solved in a different manner, in a
   commit called "Fix the filename passed to unlit" (1eedbc6b). So the
   `normalise` is no longer necessary.
+-}
+
+{-
+Note [-Wa,--no-type-check on wasm32]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Wasm32 has a type system and corresponding validation rules, so it's
+possible to produce syntactically valid object code that doesn't pass
+validation.
+
+We have no problem with that, but we do have a problem with clang.
+When clang takes an assembly input for wasm32, it uses its internal
+type-checker, which is a huge source of trouble (see llvm ticket
+#56935 #58438): it may reject valid assembly, and even worse, it may
+silently alter the output object code!!! The worsest of all, is the
+person that added the wasm32 asm typechecker logic has moved on from
+Google/LLVM, and while other LLVM devs may be knowledgable enough to
+fix this mess, they likely got tons of other stuff on their table and
+don't care enough.
+
+We do have an escape hatch, just pass -Wa,--no-type-check to clang to
+bypass the entire wasm32 asm typechecking logic. There's little point
+in type-checking object code at compile-time anyway, the wasm engines
+will do type-checking at run-time. And even if we want to add some
+linting flag to do compile-time checks, we should just rely on
+battle-tested external tools instead of a completely broken horror
+story.
 -}

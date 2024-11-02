@@ -3836,6 +3836,17 @@ _ACEOF
 fi
 done
 
+for ac_func in pipe2
+do :
+  ac_fn_c_check_func "$LINENO" "pipe2" "ac_cv_func_pipe2"
+if test "x$ac_cv_func_pipe2" = xyes; then :
+  cat >>confdefs.h <<_ACEOF
+#define HAVE_PIPE2 1
+_ACEOF
+
+fi
+done
+
 
 # posix_spawn checks
 for ac_header in spawn.h
@@ -3850,7 +3861,7 @@ fi
 
 done
 
-for ac_func in posix_spawnp posix_spawn_file_actions_addchdir
+for ac_func in posix_spawnp posix_spawn_file_actions_addchdir_np posix_spawn_file_actions_addchdir
 do :
   as_ac_var=`$as_echo "ac_cv_func_$ac_func" | $as_tr_sh`
 ac_fn_c_check_func "$LINENO" "$ac_func" "$as_ac_var"

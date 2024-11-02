@@ -98,7 +98,7 @@ This is important for example in the simplifier. Most passes of the simplifier u
 the same mask 's'. However in some places we create a unique supply using `mkSplitUniqSupply`
 and thread it through the code, while in GHC.Core.Opt.Simplify.Monad  we use the
 `instance MonadUnique SimplM`, which uses `mkSplitUniqSupply` in getUniqueSupplyM
-and `uniqFromMask` in getUniqeM.
+and `uniqFromMask` in getUniqueM.
 
 Ultimately all these boil down to each new unique consisting of the mask and the result from
 a call to `genSym`. The later producing a distinct number for each invocation ensuring
@@ -158,7 +158,7 @@ and hardcode the mask into the MonadUnique instance. On top of all the
 benefits of threading the mask this *also* has the benefit of avoiding
 the mask getting captured in thunks, or being passed around at runtime.
 It does however come at the cost of having to use a fixed Mask for all
-code run in this Monad. But rememeber, the Mask is purely cosmetic:
+code run in this Monad. But remember, the Mask is purely cosmetic:
 See Note [Uniques and masks].
 
 NB: It's *not* an optimization to pass around the UniqSupply inside an

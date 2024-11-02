@@ -29,7 +29,8 @@ module GHC.Cmm.DebugBlock (
 
   -- * Unwinding information
   UnwindTable, UnwindPoint(..),
-  UnwindExpr(..), toUnwindExpr
+  UnwindExpr(..), toUnwindExpr,
+  pprUnwindTable
   ) where
 
 import GHC.Prelude
@@ -38,12 +39,12 @@ import GHC.Platform
 import GHC.Cmm.BlockId
 import GHC.Cmm.CLabel
 import GHC.Cmm
+import GHC.Cmm.Reg ( pprGlobalReg )
 import GHC.Cmm.Utils
 import GHC.Data.FastString ( nilFS, mkFastString )
 import GHC.Unit.Module
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
-import GHC.Cmm.Ppr.Expr ( pprExpr )
 import GHC.Types.SrcLoc
 import GHC.Types.Tickish
 import GHC.Utils.Misc      ( seqList )
@@ -78,7 +79,7 @@ data DebugBlock =
   , dblBlocks     :: ![DebugBlock] -- ^ Nested blocks
   }
 
-instance OutputableP env CLabel => OutputableP env DebugBlock where
+instance OutputableP Platform DebugBlock where
   pdoc env blk =
             (if | dblProcedure blk == dblLabel blk
                 -> text "proc"
@@ -86,7 +87,7 @@ instance OutputableP env CLabel => OutputableP env DebugBlock where
                 -> text "pp-blk"
                 | otherwise
                 -> text "blk") <+>
-            ppr (dblLabel blk) <+> parens (pdoc env (dblCLabel blk)) <+>
+            ppr (dblLabel blk) <+> parens (pprAsmLabel env (dblCLabel blk)) <+>
             (maybe empty ppr (dblSourceTick blk)) <+>
             (maybe (text "removed") ((text "pos " <>) . ppr)
                    (dblPosition blk)) <+>
@@ -122,7 +123,7 @@ cmmDebugGen modLoc decls = map (blocksForScope Nothing) topScopes
                    | otherwise                   = panic "findP impossible"
 #endif
 
-      scopeMap = foldr (uncurry insertMulti) Map.empty childScopes
+      scopeMap = foldl' (\acc (key, scope) -> insertMulti key scope acc) Map.empty childScopes
 
       -- This allows us to recover ticks that we lost by flattening
       -- the graph. Basically, if the parent is A but the child is
@@ -496,9 +497,9 @@ LOC this information will end up in is Y.
 -- | A label associated with an 'UnwindTable'
 data UnwindPoint = UnwindPoint !CLabel !UnwindTable
 
-instance OutputableP env CLabel => OutputableP env UnwindPoint where
+instance OutputableP Platform UnwindPoint where
   pdoc env (UnwindPoint lbl uws) =
-      braces $ pdoc env lbl <> colon
+      braces $ pprAsmLabel env lbl <> colon
       <+> hsep (punctuate comma $ map pprUw $ Map.toList uws)
     where
       pprUw (g, expr) = ppr g <> char '=' <> pdoc env expr
@@ -520,16 +521,24 @@ data UnwindExpr = UwConst !Int                  -- ^ literal value
                 | UwTimes UnwindExpr UnwindExpr
                 deriving (Eq)
 
-instance OutputableP env CLabel => OutputableP env UnwindExpr where
+instance OutputableP Platform UnwindExpr where
   pdoc = pprUnwindExpr 0
 
-pprUnwindExpr :: OutputableP env CLabel => Rational -> env -> UnwindExpr -> SDoc
+pprUnwindTable :: IsLine doc => Platform -> UnwindTable -> doc
+pprUnwindTable platform u = brackets (fsep (punctuate comma (map print_entry (Map.toList u))))
+  where print_entry (reg, Nothing) =
+          parens (sep [pprGlobalReg reg, text "Nothing"])
+        print_entry (reg, Just x)  =
+          parens (sep [pprGlobalReg reg, text "Just" <+> pprUnwindExpr 0 platform x])
+  -- Follow instance Outputable (Map.Map GlobalReg (Maybe UnwindExpr))
+
+pprUnwindExpr :: IsLine doc => Rational -> Platform -> UnwindExpr -> doc
 pprUnwindExpr p env = \case
-  UwConst i     -> ppr i
-  UwReg g 0     -> ppr g
+  UwConst i     -> int i
+  UwReg g 0     -> pprGlobalReg g
   UwReg g x     -> pprUnwindExpr p env (UwPlus (UwReg g 0) (UwConst x))
   UwDeref e     -> char '*' <> pprUnwindExpr 3 env e
-  UwLabel l     -> pdoc env l
+  UwLabel l     -> pprAsmLabel env l
   UwPlus e0 e1
    | p <= 0     -> pprUnwindExpr 0 env e0 <> char '+' <> pprUnwindExpr 0 env e1
   UwMinus e0 e1
@@ -537,6 +546,8 @@ pprUnwindExpr p env = \case
   UwTimes e0 e1
    | p <= 1     -> pprUnwindExpr 2 env e0 <> char '*' <> pprUnwindExpr 2 env e1
   other         -> parens (pprUnwindExpr 0 env other)
+{-# SPECIALIZE pprUnwindExpr :: Rational -> Platform -> UnwindExpr -> SDoc #-}
+{-# SPECIALIZE pprUnwindExpr :: Rational -> Platform -> UnwindExpr -> HLine #-} -- see Note [SPECIALIZE to HDoc] in GHC.Utils.Outputable
 
 -- | Conversion of Cmm expressions to unwind expressions. We check for
 -- unsupported operator usages and simplify the expression as far as
@@ -559,6 +570,6 @@ toUnwindExpr platform e@(CmmMachOp op [e1, e2])   =
     (MO_Sub{}, u1,        u2       ) -> UwMinus u1 u2
     (MO_Mul{}, u1,        u2       ) -> UwTimes u1 u2
     _otherwise -> pprPanic "Unsupported operator in unwind expression!"
-                           (pprExpr platform e)
+                           (pdoc platform e)
 toUnwindExpr platform e
   = pprPanic "Unsupported unwind expression!" (pdoc platform e)

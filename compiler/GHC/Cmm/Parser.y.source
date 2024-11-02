@@ -221,15 +221,10 @@ See Note [Heap memory barriers] in SMP.h for details.
 {
 {-# LANGUAGE TupleSections #-}
 
-module GHC.Cmm.Parser ( parseCmmFile ) where
+module GHC.Cmm.Parser ( parseCmmFile, CmmParserConfig(..) ) where
 
 import GHC.Prelude
 import qualified Prelude -- for happy-generated code
-
-import GHC.Driver.Session
-import GHC.Driver.Ppr
-import GHC.Driver.Config.Parser (initParserOpts)
-import GHC.Driver.Config.StgToCmm
 
 import GHC.Platform
 import GHC.Platform.Profile
@@ -261,6 +256,7 @@ import GHC.Cmm.Info
 import GHC.Cmm.BlockId
 import GHC.Cmm.Lexer
 import GHC.Cmm.CLabel
+import GHC.Cmm.Parser.Config
 import GHC.Cmm.Parser.Monad hiding (getPlatform, getProfile)
 import qualified GHC.Cmm.Parser.Monad as PD
 import GHC.Cmm.CallConv
@@ -464,7 +460,7 @@ static  :: { CmmParse [CmmStatic] }
                         mkStaticClosure profile (mkForeignLabel $3 Nothing ForeignLabelInExternalPackage IsData)
                          -- mkForeignLabel because these are only used
                          -- for CHARLIKE and INTLIKE closures in the RTS.
-                        dontCareCCS (map getLit lits) [] [] [] } }
+                        dontCareCCS (map getLit lits) [] [] [] [] } }
         -- arrays of closures required for the CHARLIKE & INTLIKE arrays
 
 lits    :: { [CmmParse CmmExpr] }
@@ -479,7 +475,7 @@ cmmproc :: { CmmParse () }
                          platform <- getPlatform;
                          ctx      <- getContext;
                          formals <- sequence (fromMaybe [] $3);
-                         withName (renderWithContext ctx (pdoc platform entry_ret_label))
+                         withName (showSDocOneLine ctx (pprCLabel platform entry_ret_label))
                            $4;
                          return (entry_ret_label, info, stk_formals, formals) }
                      let do_layout = isJust $3
@@ -522,15 +518,14 @@ info    :: { CmmParse (CLabel, Maybe CmmInfoTable, [LocalReg]) }
                                              , cit_prof = prof, cit_srt = Nothing, cit_clo = Nothing },
                                 []) }
 
-        | 'INFO_TABLE_FUN' '(' NAME ',' INT ',' INT ',' INT ',' STRING ',' STRING ',' INT ')'
-                -- ptrs, nptrs, closure type, description, type, fun type
+        | 'INFO_TABLE_FUN' '(' NAME ',' INT ',' INT ',' INT ',' STRING ',' STRING ',' INT ',' INT ')'
+                -- ptrs, nptrs, closure type, description, type, arity, fun type
                 {% do
                       home_unit_id <- getHomeUnitId
                       liftP $ pure $ do
                         profile <- getProfile
                         let prof = profilingInfo profile $11 $13
-                            ty   = Fun 0 (ArgSpec (fromIntegral $15))
-                                  -- Arity zero, arg_type $15
+                            ty   = Fun (fromIntegral $15) (ArgSpec (fromIntegral $17))
                             rep = mkRTSRep (fromIntegral $9) $
                                       mkHeapRep profile False (fromIntegral $5)
                                                       (fromIntegral $7) ty
@@ -540,7 +535,7 @@ info    :: { CmmParse (CLabel, Maybe CmmInfoTable, [LocalReg]) }
                                              , cit_prof = prof, cit_srt = Nothing, cit_clo = Nothing },
                                 []) }
                 -- we leave most of the fields zero here.  This is only used
-                -- to generate the BCO info table in the RTS at the moment.
+                -- to generate the BCO and CONTINUATION info tables in the RTS at the moment.
 
         | 'INFO_TABLE_CONSTR' '(' NAME ',' INT ',' INT ',' INT ',' INT ',' STRING ',' STRING ')'
                 -- ptrs, nptrs, tag, closure type, description, type
@@ -978,8 +973,9 @@ nameToMachOp name =
 
 exprOp :: FastString -> [CmmParse CmmExpr] -> PD (CmmParse CmmExpr)
 exprOp name args_code = do
-  profile     <- PD.getProfile
-  align_check <- gopt Opt_AlignmentSanitisation <$> getDynFlags
+  pdc     <- PD.getPDConfig
+  let profile = PD.pdProfile pdc
+  let align_check = PD.pdSanitizeAlignment pdc
   case lookupUFM (exprMacros profile align_check) name of
      Just f  -> return $ do
         args <- sequence args_code
@@ -1014,7 +1010,6 @@ machOps = listToUFM $
         ( "ne",         MO_Ne ),
         ( "mul",        MO_Mul ),
         ( "mulmayoflo",  MO_S_MulMayOflo ),
-        ( "mulmayoflou", MO_U_MulMayOflo ),
         ( "neg",        MO_S_Neg ),
         ( "quot",       MO_S_Quot ),
         ( "rem",        MO_S_Rem ),
@@ -1296,7 +1291,7 @@ profilingInfo profile desc_str ty_str
 staticClosure :: UnitId -> FastString -> FastString -> [CmmLit] -> CmmParse ()
 staticClosure pkg cl_label info payload
   = do profile <- getProfile
-       let lits = mkStaticClosure profile (mkCmmInfoLabel pkg info) dontCareCCS payload [] [] []
+       let lits = mkStaticClosure profile (mkCmmInfoLabel pkg info) dontCareCCS payload [] [] [] []
        code $ emitDataLits (mkCmmDataLabel pkg (NeedExternDecl True) cl_label) lits
 
 foreignCall
@@ -1547,43 +1542,40 @@ initEnv profile = listToUFM [
   ]
   where platform = profilePlatform profile
 
-
-parseCmmFile :: DynFlags
+parseCmmFile :: CmmParserConfig
              -> Module
              -> HomeUnit
              -> FilePath
              -> IO (Messages PsMessage, Messages PsMessage, Maybe (CmmGroup, [InfoProvEnt]))
-parseCmmFile dflags this_mod home_unit filename = do
+parseCmmFile cmmpConfig this_mod home_unit filename = do
   buf <- hGetStringBuffer filename
   let
         init_loc = mkRealSrcLoc (mkFastString filename) 1 1
-        opts       = initParserOpts dflags
-        init_state = (initParserState opts buf init_loc) { lex_state = [0] }
+        init_state = (initParserState (cmmpParserOpts cmmpConfig) buf init_loc) { lex_state = [0] }
                 -- reset the lex_state: the Lexer monad leaves some stuff
                 -- in there we don't want.
-  case unPD cmmParse dflags home_unit init_state of
+        pdConfig = cmmpPDConfig cmmpConfig
+  case unPD cmmParse pdConfig home_unit init_state of
     PFailed pst -> do
         let (warnings,errors) = getPsMessages pst
         return (warnings, errors, Nothing)
     POk pst code -> do
         st <- initC
-        let fstate = F.initFCodeState (profilePlatform $ targetProfile dflags)
-        let config = initStgToCmmConfig dflags no_module
+        let fstate = F.initFCodeState (profilePlatform $ pdProfile pdConfig)
         let fcode = do
-              ((), cmm) <- getCmm $ unEC code "global" (initEnv (targetProfile dflags)) [] >> return ()
+              ((), cmm) <- getCmm $ unEC code "global" (initEnv (pdProfile pdConfig)) [] >> return ()
               -- See Note [Mapping Info Tables to Source Positions] (IPE Maps)
               let used_info
                     | do_ipe    = map (cmmInfoTableToInfoProvEnt this_mod) (mapMaybe topInfoTable cmm)
                     | otherwise = []
                     where
-                      do_ipe = stgToCmmInfoTableMap config
+                      do_ipe = stgToCmmInfoTableMap $ cmmpStgToCmmConfig cmmpConfig
               ((), cmm2) <- getCmm $ emitIpeBufferListNode this_mod used_info
               return (cmm ++ cmm2, used_info)
-            (cmm, _) = runC config fstate st fcode
+            (cmm, _) = runC (cmmpStgToCmmConfig cmmpConfig) fstate st fcode
             (warnings,errors) = getPsMessages pst
         if not (isEmptyMessages errors)
          then return (warnings, errors, Nothing)
          else return (warnings, errors, Just cmm)
-  where
-        no_module = panic "parseCmmFile: no module"
+
 }

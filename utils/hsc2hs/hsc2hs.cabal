@@ -1,6 +1,6 @@
 cabal-version: >=1.10
 Name: hsc2hs
-Version: 0.68.8
+Version: 0.68.9
 
 Copyright: 2000, Marcin Kowalczyk
 License: BSD3
@@ -25,7 +25,23 @@ Category: Development
 Data-Dir: data/
 Data-Files: template-hsc.h
 build-type: Simple
-tested-with: GHC==8.10.1, GHC==8.8.3, GHC==8.6.5, GHC==8.4.4, GHC==8.2.2, GHC==8.0.2, GHC==7.10.3, GHC==7.8.4, GHC==7.6.3, GHC==7.4.2, GHC==7.2.2, GHC==7.0.4
+
+tested-with:
+  GHC == 9.4.1
+  GHC == 9.2.2
+  GHC == 9.0.2
+  GHC == 8.10.7
+  GHC == 8.8.4
+  GHC == 8.6.5
+  GHC == 8.4.4
+  GHC == 8.2.2
+  GHC == 8.0.2
+  GHC == 7.10.3
+  GHC == 7.8.4
+  GHC == 7.6.3
+  GHC == 7.4.2
+  GHC == 7.2.2
+  GHC == 7.0.4
 
 extra-source-files:
   changelog.md
@@ -62,7 +78,7 @@ Executable hsc2hs
 
     Other-Extensions: CPP, NoMonomorphismRestriction
 
-    Build-Depends: base       >= 4.3.0 && < 4.18,
+    Build-Depends: base       >= 4.3.0 && < 4.19,
                    containers >= 0.4.0 && < 0.7,
                    directory  >= 1.1.0 && < 1.4,
                    filepath   >= 1.2.0 && < 1.5,

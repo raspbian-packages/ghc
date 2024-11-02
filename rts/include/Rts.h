@@ -121,7 +121,7 @@ extern "C" {
    -------------------------------------------------------------------------- */
 
 void _assertFail(const char *filename, unsigned int linenum)
-   GNUC3_ATTRIBUTE(__noreturn__);
+   STG_NORETURN;
 
 void _warnFail(const char *filename, unsigned int linenum);
 
@@ -167,7 +167,10 @@ void _warnFail(const char *filename, unsigned int linenum);
 #endif /* DEBUG */
 
 #if __STDC_VERSION__ >= 201112L
-#define GHC_STATIC_ASSERT(x, msg) static_assert((x), msg)
+// `_Static_assert` is provided by C11 but is deprecated and replaced by
+// `static_assert` in C23. Perhaps some day we should instead use the latter.
+// See #22777.
+#define GHC_STATIC_ASSERT(x, msg) _Static_assert((x), msg)
 #else
 #define GHC_STATIC_ASSERT(x, msg)
 #endif
@@ -290,7 +293,7 @@ DLL_IMPORT_RTS extern char  *prog_name;
 void reportStackOverflow(StgTSO* tso);
 void reportHeapOverflow(void);
 
-void stg_exit(int n) GNU_ATTRIBUTE(__noreturn__);
+void stg_exit(int n) STG_NORETURN;
 
 #if !defined(mingw32_HOST_OS)
 int stg_sig_install (int, int, void *);

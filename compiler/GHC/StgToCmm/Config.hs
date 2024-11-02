@@ -22,8 +22,8 @@ data StgToCmmConfig = StgToCmmConfig
                                                  -- Cmm/Parser.y which preloads it with a panic
   , stgToCmmTmpDir        :: !TempDir            -- ^ Temp Dir for files used in compilation
   , stgToCmmContext       :: !SDocContext        -- ^ Context for StgToCmm phase
-  , stgToCmmDebugLevel    :: !Int                -- ^ The verbosity of debug messages
-  , stgToCmmBinBlobThresh :: !(Maybe Word)        -- ^ Threshold at which Binary literals (e.g. strings)
+  , stgToCmmEmitDebugInfo :: !Bool               -- ^ Whether we wish to output debug information
+  , stgToCmmBinBlobThresh :: !(Maybe Word)       -- ^ Threshold at which Binary literals (e.g. strings)
                                                  -- are either dumped to a file and a CmmFileEmbed literal
                                                  -- is emitted (over threshold), or become a CmmString
                                                  -- Literal (under or at threshold). CmmFileEmbed is only supported
@@ -49,8 +49,9 @@ data StgToCmmConfig = StgToCmmConfig
   , stgToCmmFastPAPCalls   :: !Bool              -- ^
   , stgToCmmSCCProfiling   :: !Bool              -- ^ Check if cost-centre profiling is enabled
   , stgToCmmEagerBlackHole :: !Bool              -- ^
-  , stgToCmmInfoTableMap   :: !Bool              -- ^ true means generate C Stub for IPE map, See note [Mapping
-                                                 -- Info Tables to Source Positions]
+  , stgToCmmInfoTableMap   :: !Bool              -- ^ true means generate C Stub for IPE map, See Note [Mapping Info Tables to Source Positions]
+  , stgToCmmInfoTableMapWithFallback :: !Bool    -- ^ Include info tables with fallback source locations in the info table map
+  , stgToCmmInfoTableMapWithStack :: !Bool       -- ^ Include info tables for STACK closures in the info table map
   , stgToCmmOmitYields     :: !Bool              -- ^ true means omit heap checks when no allocation is performed
   , stgToCmmOmitIfPragmas  :: !Bool              -- ^ true means don't generate interface programs (implied by -O0)
   , stgToCmmPIC            :: !Bool              -- ^ true if @-fPIC@
@@ -66,7 +67,6 @@ data StgToCmmConfig = StgToCmmConfig
   , stgToCmmAllowQuotRem2             :: !Bool   -- ^ Allowed to generate QuotRem
   , stgToCmmAllowExtendedAddSubInstrs :: !Bool   -- ^ Allowed to generate AddWordC, SubWordC, Add2, etc.
   , stgToCmmAllowIntMul2Instr         :: !Bool   -- ^ Allowed to generate IntMul2 instruction
-  , stgToCmmAllowFabsInstrs           :: !Bool   -- ^ Allowed to generate Fabs instructions
   , stgToCmmTickyAP                   :: !Bool   -- ^ Disable use of precomputed standard thunks.
   ------------------------------ SIMD flags ------------------------------------
   -- Each of these flags checks vector compatibility with the backend requested

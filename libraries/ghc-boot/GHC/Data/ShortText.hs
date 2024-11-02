@@ -1,6 +1,6 @@
 {-# LANGUAGE BangPatterns, MagicHash, UnboxedTuples, GeneralizedNewtypeDeriving, DerivingStrategies, CPP #-}
 {-# OPTIONS_GHC -O2 -funbox-strict-fields #-}
--- gross hack: we manuvered ourselves into a position where we can't boot GHC with a LLVM based GHC anymore.
+-- gross hack: we maneuvered ourselves into a position where we can't boot GHC with a LLVM based GHC anymore.
 -- LLVM based GHC's fail to compile memcmp ffi calls.  These end up as memcmp$def in the llvm ir, however we
 -- don't have any prototypes and subsequently the llvm toolchain chokes on them.  Since 7fdcce6d, we use
 -- ShortText for the package database.  This however introduces this very module; which through inlining ends
@@ -10,7 +10,7 @@
 -- The solution thusly is to force late binding via the linker instead of inlining when comping with the
 -- bootstrap compiler.  This will produce a slower (slightly less optimised) stage1 compiler only.
 --
--- See issue 18857. hsyl20 deserves credit for coming up with the idea for the soltuion.
+-- See issue 18857. hsyl20 deserves credit for coming up with the idea for the solution.
 --
 -- This can be removed when we exit the boot compiler window. Thus once we drop GHC-9.2 as boot compiler,
 -- we can drop this code as well.
@@ -29,6 +29,7 @@ module GHC.Data.ShortText (
         -- * ShortText
         ShortText(..),
         -- ** Conversion to and from String
+        singleton,
         pack,
         unpack,
         -- ** Operations
@@ -67,14 +68,19 @@ instance IsString ShortText where
 
 -- | /O(n)/ Returns the length of the 'ShortText' in characters.
 codepointLength :: ShortText -> Int
-codepointLength st = unsafeDupablePerformIO $ countUTF8Chars (contents st)
+codepointLength st = utf8CountCharsShortByteString (contents st)
+
 -- | /O(1)/ Returns the length of the 'ShortText' in bytes.
 byteLength :: ShortText -> Int
 byteLength st = SBS.length $ contents st
 
 -- | /O(n)/ Convert a 'String' into a 'ShortText'.
 pack :: String -> ShortText
-pack s = unsafeDupablePerformIO $ ShortText <$> utf8EncodeShortByteString s
+pack s = ShortText $ utf8EncodeShortByteString s
+
+-- | Create a singleton
+singleton :: Char -> ShortText
+singleton s = pack [s]
 
 -- | /O(n)/ Convert a 'ShortText' into a 'String'.
 unpack :: ShortText -> String
@@ -100,8 +106,10 @@ splitFilePath st = DeepSeq.force $ map (ShortText . SBS.toShort) $ B8.splitWith 
 -- non-printable characters.
 head :: ShortText -> Char
 head st
-  | SBS.null $ contents st = error "head: Empty ShortText"
-  | otherwise              = Prelude.head $ unpack st
+  | hd:_ <- unpack st
+  = hd
+  | otherwise
+  = error "head: Empty ShortText"
 
 -- | /O(n)/ The 'stripPrefix' function takes two 'ShortText's and returns 'Just' the remainder of
 -- the second iff the first is its prefix, and otherwise Nothing.

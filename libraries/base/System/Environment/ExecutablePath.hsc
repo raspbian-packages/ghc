@@ -18,8 +18,17 @@
 
 module System.Environment.ExecutablePath
   ( getExecutablePath
+##if !defined(javascript_HOST_ARCH)
   , executablePath
+##endif
   ) where
+
+##if defined(javascript_HOST_ARCH)
+
+getExecutablePath :: IO FilePath
+getExecutablePath = return "a.jsexe"
+
+##else
 
 -- The imports are purposely kept completely disjoint to prevent edits
 -- to one OS implementation from breaking another.
@@ -101,6 +110,10 @@ getExecutablePath :: IO FilePath
 --
 -- Note that for scripts and interactive sessions, the result is the path to
 -- the interpreter (e.g. ghci.)
+--
+-- Note also that while most operating systems return @Nothing@ if the
+-- executable file was deleted/unlinked, some (including NetBSD) return the
+-- original path.
 --
 -- @since 4.17.0.0
 executablePath :: Maybe (IO (Maybe FilePath))
@@ -368,3 +381,5 @@ executablePath = Nothing
 --------------------------------------------------------------------------------
 
 #endif
+
+##endif

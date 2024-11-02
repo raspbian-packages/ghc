@@ -28,13 +28,15 @@ import Distribution.Client.NixStyleOptions
 import Distribution.Client.ProjectOrchestration
 import Distribution.Client.ProjectPlanning.Types
 import Distribution.Client.ScriptUtils
-       (AcceptNoTargets(..), TargetContext(..), updateContextAndWriteProjectFile, withContextAndSelectors)
+       ( AcceptNoTargets(..), TargetContext(..)
+       , updateContextAndWriteProjectFile, withContextAndSelectors
+       , movedExePath )
 import Distribution.Client.Setup                 (GlobalFlags (..))
 import Distribution.Client.TargetProblem         (TargetProblem (..))
 import Distribution.Simple.BuildPaths            (dllExtension, exeExtension)
 import Distribution.Simple.Command               (CommandUI (..))
 import Distribution.Simple.Setup                 (configVerbosity, fromFlagOrDefault)
-import Distribution.Simple.Utils                 (die', wrapText)
+import Distribution.Simple.Utils                 (die', withOutputMarker, wrapText)
 import Distribution.System                       (Platform)
 import Distribution.Types.ComponentName          (showComponentName)
 import Distribution.Types.UnitId                 (UnitId)
@@ -78,7 +80,7 @@ listbinAction flags@NixStyleFlags{..} args globalFlags = do
       _   -> die' verbosity "One target is required, given multiple"
 
   -- configure and elaborate target selectors
-  withContextAndSelectors RejectNoTargets (Just ExeKind) flags [target] globalFlags $ \targetCtx ctx targetSelectors -> do
+  withContextAndSelectors RejectNoTargets (Just ExeKind) flags [target] globalFlags OtherCommand $ \targetCtx ctx targetSelectors -> do
     baseCtx <- case targetCtx of
       ProjectContext             -> return ctx
       GlobalContext              -> return ctx
@@ -133,7 +135,18 @@ listbinAction flags@NixStyleFlags{..} args globalFlags = do
 
     case binfiles of
         []     -> die' verbosity "No target found"
-        [exe] -> putStrLn exe
+        [exe]  -> putStr $ withOutputMarker verbosity $ exe ++ "\n"
+                    -- Andreas, 2023-01-13, issue #8400:
+                    -- Regular output of `list-bin` should go to stdout unconditionally,
+                    -- but for the sake of the testsuite, we want to mark it so it goes
+                    -- into the golden value for the test.
+                    -- Note: 'withOutputMarker' only checks 'isVerboseMarkOutput',
+                    -- thus, we can reuse @verbosity@ here, even if other components
+                    -- of @verbosity@ may be wrong (like 'VStderr', verbosity level etc.).
+                    -- Andreas, 2023-01-20:
+                    -- Appending the newline character here rather than using 'putStrLn'
+                    -- because an active 'withOutputMarker' produces text that ends
+                    -- in newline characters.
         _ -> die' verbosity "Multiple targets found"
   where
     defaultVerbosity = verboseStderr silent
@@ -159,7 +172,7 @@ listbinAction flags@NixStyleFlags{..} args globalFlags = do
 
         bin_file c = case c of
             CD.ComponentExe s
-               | s == selectedComponent -> [bin_file' s]
+               | s == selectedComponent -> [moved_bin_file s]
             CD.ComponentTest s
                | s == selectedComponent -> [bin_file' s]
             CD.ComponentBench s
@@ -182,6 +195,8 @@ listbinAction flags@NixStyleFlags{..} args globalFlags = do
             if elabBuildStyle elab == BuildInplaceOnly
             then dist_dir </> "build" </> prettyShow s </> ("lib" ++ prettyShow s) <.> dllExtension plat
             else InstallDirs.bindir (elabInstallDirs elab) </> ("lib" ++ prettyShow s) <.> dllExtension plat
+
+        moved_bin_file s = fromMaybe (bin_file' s) (movedExePath selectedComponent distDirLayout elaboratedSharedConfig elab)
 
 -------------------------------------------------------------------------------
 -- Target Problem: the very similar to CmdRun

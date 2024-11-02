@@ -23,7 +23,7 @@ module GHC.HsToCore.Monad (
         newSysLocalsDs, newUniqueId,
         newFailLocalDs, newPredVarDs,
         getSrcSpanDs, putSrcSpanDs, putSrcSpanDsA,
-        mkPrintUnqualifiedDs,
+        mkNamePprCtxDs,
         newUnique,
         UniqSupply, newUniqueSupply,
         getGhcModeDs, dsGetFamInstEnvs,
@@ -167,11 +167,11 @@ data MatchResult a
   | MR_Fallible (CoreExpr -> DsM a)
   deriving (Functor)
 
--- | Product is an "or" on falliblity---the combined match result is infallible
+-- | Product is an "or" on fallibility---the combined match result is infallible
 -- only if the left and right argument match results both were.
 --
 -- This is useful for combining a bunch of alternatives together and then
--- getting the overall falliblity of the entire group. See 'mkDataConCase' for
+-- getting the overall fallibility of the entire group. See 'mkDataConCase' for
 -- an example.
 instance Applicative MatchResult where
   pure v = MR_Infallible (pure v)
@@ -199,7 +199,7 @@ fixDs    = fixM
 
 type DsWarning = (SrcSpan, SDoc)
         -- Not quite the same as a WarnMsg, we have an SDoc here
-        -- and we'll do the print_unqual stuff later on to turn it
+        -- and we'll do the name_ppr_ctx stuff later on to turn it
         -- into a Doc.
 
 -- | Run a 'DsM' action inside the 'TcM' monad.
@@ -237,12 +237,13 @@ mkDsEnvsFromTcGbl hsc_env msg_var tcg_env
              type_env = tcg_type_env tcg_env
              rdr_env  = tcg_rdr_env tcg_env
              fam_inst_env = tcg_fam_inst_env tcg_env
+             ptc = initPromotionTickContext (hsc_dflags hsc_env)
              complete_matches = hptCompleteSigs hsc_env         -- from the home package
                                 ++ tcg_complete_matches tcg_env -- from the current module
                                 ++ eps_complete_matches eps     -- from imports
              -- re-use existing next_wrapper_num to ensure uniqueness
              next_wrapper_num_var = tcg_next_wrapper_num tcg_env
-       ; return $ mkDsEnvs unit_env this_mod rdr_env type_env fam_inst_env
+       ; return $ mkDsEnvs unit_env this_mod rdr_env type_env fam_inst_env ptc
                            msg_var cc_st_var next_wrapper_num_var complete_matches
        }
 
@@ -272,6 +273,7 @@ initDsWithModGuts hsc_env (ModGuts { mg_module = this_mod, mg_binds = binds
        ; eps <- liftIO $ hscEPS hsc_env
        ; let unit_env = hsc_unit_env hsc_env
              type_env = typeEnvFromEntities ids tycons patsyns fam_insts
+             ptc = initPromotionTickContext (hsc_dflags hsc_env)
              complete_matches = hptCompleteSigs hsc_env     -- from the home package
                                 ++ local_complete_matches  -- from the current module
                                 ++ eps_complete_matches eps -- from imports
@@ -281,7 +283,7 @@ initDsWithModGuts hsc_env (ModGuts { mg_module = this_mod, mg_binds = binds
              ids = concatMap bindsToIds binds
 
              envs  = mkDsEnvs unit_env this_mod rdr_env type_env
-                              fam_inst_env msg_var cc_st_var
+                              fam_inst_env ptc msg_var cc_st_var
                               next_wrapper_num complete_matches
        ; runDs hsc_env envs thing_inside
        }
@@ -317,13 +319,14 @@ initTcDsForSolver thing_inside
          thing_inside
        ; case mb_ret of
            Just ret -> pure ret
-           Nothing  -> pprPanic "initTcDsForSolver" (vcat $ pprMsgEnvelopeBagWithLoc (getErrorMessages msgs)) }
+           Nothing  -> pprPanic "initTcDsForSolver" (vcat $ pprMsgEnvelopeBagWithLocDefault (getErrorMessages msgs)) }
 
 mkDsEnvs :: UnitEnv -> Module -> GlobalRdrEnv -> TypeEnv -> FamInstEnv
+         -> PromotionTickContext
          -> IORef (Messages DsMessage) -> IORef CostCentreState
          -> IORef (ModuleEnv Int) -> CompleteMatches
          -> (DsGblEnv, DsLclEnv)
-mkDsEnvs unit_env mod rdr_env type_env fam_inst_env msg_var cc_st_var
+mkDsEnvs unit_env mod rdr_env type_env fam_inst_env ptc msg_var cc_st_var
          next_wrapper_num complete_matches
   = let if_genv = IfGblEnv { if_doc       = text "mkDsEnvs"
   -- Failing tests here are `ghci` and `T11985` if you get this wrong.
@@ -340,7 +343,7 @@ mkDsEnvs unit_env mod rdr_env type_env fam_inst_env msg_var cc_st_var
                            , ds_fam_inst_env = fam_inst_env
                            , ds_gbl_rdr_env  = rdr_env
                            , ds_if_env  = (if_genv, if_lenv)
-                           , ds_unqual  = mkPrintUnqualified unit_env rdr_env
+                           , ds_name_ppr_ctx = mkNamePprCtx ptc unit_env rdr_env
                            , ds_msgs    = msg_var
                            , ds_complete_matches = complete_matches
                            , ds_cc_st   = cc_st_var
@@ -378,7 +381,7 @@ duplicateLocalDs old_local
 
 newPredVarDs :: PredType -> DsM Var
 newPredVarDs
- = mkSysLocalOrCoVarM (fsLit "ds") Many  -- like newSysLocalDs, but we allow covars
+ = mkSysLocalOrCoVarM (fsLit "ds") ManyTy  -- like newSysLocalDs, but we allow covars
 
 newSysLocalDs, newFailLocalDs :: Mult -> Type -> DsM Id
 newSysLocalDs = mkSysLocalM (fsLit "ds")
@@ -425,7 +428,7 @@ diagnosticDs dsMessage
   = do { env <- getGblEnv
        ; loc <- getSrcSpanDs
        ; !diag_opts <- initDiagOpts <$> getDynFlags
-       ; let msg = mkMsgEnvelope diag_opts loc (ds_unqual env) dsMessage
+       ; let msg = mkMsgEnvelope diag_opts loc (ds_name_ppr_ctx env) dsMessage
        ; updMutVar (ds_msgs env) (\ msgs -> msg `addMessage` msgs) }
 
 -- | Issue an error, but return the expression for (), so that we can continue
@@ -443,8 +446,8 @@ failWithDs msg
 failDs :: DsM a
 failDs = failM
 
-mkPrintUnqualifiedDs :: DsM PrintUnqualified
-mkPrintUnqualifiedDs = ds_unqual <$> getGblEnv
+mkNamePprCtxDs :: DsM NamePprCtx
+mkNamePprCtxDs = ds_name_ppr_ctx <$> getGblEnv
 
 instance MonadThings (IOEnv (Env DsGblEnv DsLclEnv)) where
     lookupThing = dsLookupGlobal

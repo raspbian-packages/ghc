@@ -112,7 +112,6 @@ import GHC.Hs.Dump
 
 import GHC.Core.PatSyn    ( pprPatSynType )
 import GHC.Core.Predicate ( classMethodTy )
-import GHC.Core.FVs         ( orphNamesOfFamInst )
 import GHC.Core.InstEnv
 import GHC.Core.TyCon
 import GHC.Core.ConLike
@@ -121,9 +120,10 @@ import GHC.Core.Type
 import GHC.Core.Class
 import GHC.Core.Coercion.Axiom
 import GHC.Core.Reduction ( Reduction(..) )
-import GHC.Core.Unify( RoughMatchTc(..) )
+import GHC.Core.RoughMap( RoughMatchTc(..) )
+import GHC.Core.TyCo.Ppr( debugPprType )
 import GHC.Core.FamInstEnv
-   ( FamInst, pprFamInst, famInstsRepTyCons
+   ( FamInst, pprFamInst, famInstsRepTyCons, orphNamesOfFamInst
    , famInstEnvElts, extendFamInstEnvList, normaliseType )
 
 import GHC.Parser.Header       ( mkPrelImports )
@@ -176,7 +176,10 @@ import GHC.Data.List.SetOps
 import GHC.Data.Bag
 import qualified GHC.Data.BooleanFormula as BF
 
+import Data.Functor.Classes ( liftEq )
 import Data.List ( sortBy, sort )
+import Data.List.NonEmpty ( NonEmpty (..) )
+import qualified Data.List.NonEmpty as NE
 import Data.Ord
 import Data.Data ( Data )
 import qualified Data.Set as S
@@ -242,9 +245,8 @@ tcRnModuleTcRnM :: HscEnv
 tcRnModuleTcRnM hsc_env mod_sum
                 (HsParsedModule {
                    hpm_module =
-                      (L loc (HsModule _ _ maybe_mod export_ies
-                                       import_decls local_decls mod_deprec
-                                       maybe_doc_hdr)),
+                      (L loc (HsModule (XModulePs _ _ mod_deprec maybe_doc_hdr)
+                                       maybe_mod export_ies import_decls local_decls)),
                    hpm_src_files = src_files
                 })
                 (this_mod, prel_imp_loc)
@@ -265,7 +267,7 @@ tcRnModuleTcRnM hsc_env mod_sum
                                implicit_prelude import_decls }
 
         ; when (notNull prel_imports) $ do
-            let msg = TcRnUnknownMessage $
+            let msg = mkTcRnUnknownMessage $
                         mkPlainDiagnostic (WarningWithFlag Opt_WarnImplicitPrelude) noHints (implicitPreludeWarn)
             addDiagnostic msg
 
@@ -283,7 +285,7 @@ tcRnModuleTcRnM hsc_env mod_sum
                                                      ++ import_decls))
         ; let { mkImport mod_name = noLocA
                 $ (simpleImportDecl mod_name)
-                  { ideclHiding = Just (False, noLocA [])}}
+                  { ideclImportList = Just (Exactly, noLocA [])}}
         ; let { withReason t imps = map (,text t) imps }
         ; let { all_imports = withReason "is implicitly imported" prel_imports
                   ++ withReason "is directly imported" import_decls
@@ -628,7 +630,7 @@ tc_rn_src_decls ds
                         { Nothing -> return ()
                         ; Just (SpliceDecl _ (L loc _) _, _) ->
                             setSrcSpanA loc
-                            $ addErr (TcRnUnknownMessage $ mkPlainError noHints $ text
+                            $ addErr (mkTcRnUnknownMessage $ mkPlainError noHints $ text
                                 ("Declaration splices are not "
                                   ++ "permitted inside top-level "
                                   ++ "declarations added with addTopDecls"))
@@ -750,7 +752,7 @@ tcRnHsBootDecls hsc_src decls
 
 badBootDecl :: HscSource -> String -> LocatedA decl -> TcM ()
 badBootDecl hsc_src what (L loc _)
-  = addErrAt (locA loc) $ TcRnUnknownMessage $ mkPlainError noHints $
+  = addErrAt (locA loc) $ mkTcRnUnknownMessage $ mkPlainError noHints $
     (char 'A' <+> text what
       <+> text "declaration is not (currently) allowed in a"
       <+> (case hsc_src of
@@ -889,9 +891,9 @@ checkHiBootIface'
       | name `elem` boot_dfun_names = return ()
 
         -- Check that the actual module exports the same thing
-      | not (null missing_names)
-      = addErrAt (nameSrcSpan (head missing_names))
-                 (missingBootThing True (head missing_names) "exported by")
+      | missing_name:_ <- missing_names
+      = addErrAt (nameSrcSpan missing_name)
+                 (missingBootThing True missing_name "exported by")
 
         -- If the boot module does not *define* the thing, we are done
         -- (it simply re-exports it, and names match, so nothing further to do)
@@ -1066,7 +1068,7 @@ checkBootTyCon is_boot tc1 tc2
                  (text "The types of" <+> pname1 <+>
                   text "are different") `andThenCheck`
            if is_boot
-               then check (eqMaybeBy eqDM def_meth1 def_meth2)
+               then check (liftEq eqDM def_meth1 def_meth2)
                           (text "The default methods associated with" <+> pname1 <+>
                            text "are different")
                else check (subDM op_ty1 def_meth1 def_meth2)
@@ -1093,6 +1095,7 @@ checkBootTyCon is_boot tc1 tc2
        -- Order of pattern matching matters.
        subDM _ Nothing _ = True
        subDM _ _ Nothing = False
+
        -- If the hsig wrote:
        --
        --   f :: a -> a
@@ -1100,11 +1103,14 @@ checkBootTyCon is_boot tc1 tc2
        --
        -- this should be validly implementable using an old-fashioned
        -- vanilla default method.
-       subDM t1 (Just (_, GenericDM t2)) (Just (_, VanillaDM))
-        = eqTypeX env t1 t2
+       subDM t1 (Just (_, GenericDM gdm_t1)) (Just (_, VanillaDM))
+        = eqType t1 gdm_t1   -- Take care (#22476).  Both t1 and gdm_t1 come
+                             -- from tc1, so use eqType, and /not/ eqTypeX
+
        -- This case can occur when merging signatures
        subDM t1 (Just (_, VanillaDM)) (Just (_, GenericDM t2))
         = eqTypeX env t1 t2
+
        subDM _ (Just (_, VanillaDM)) (Just (_, VanillaDM)) = True
        subDM _ (Just (_, GenericDM t1)) (Just (_, GenericDM t2))
         = eqTypeX env t1 t2
@@ -1115,15 +1121,15 @@ checkBootTyCon is_boot tc1 tc2
        eqATDef _ _ = False
 
        eqFD (as1,bs1) (as2,bs2) =
-         eqListBy (eqTypeX env) (mkTyVarTys as1) (mkTyVarTys as2) &&
-         eqListBy (eqTypeX env) (mkTyVarTys bs1) (mkTyVarTys bs2)
+         liftEq (eqTypeX env) (mkTyVarTys as1) (mkTyVarTys as2) &&
+         liftEq (eqTypeX env) (mkTyVarTys bs1) (mkTyVarTys bs2)
     in
     checkRoles roles1 roles2 `andThenCheck`
           -- Checks kind of class
-    check (eqListBy eqFD clas_fds1 clas_fds2)
+    check (liftEq eqFD clas_fds1 clas_fds2)
           (text "The functional dependencies do not match") `andThenCheck`
     checkUnless (isAbstractTyCon tc1) $
-    check (eqListBy (eqTypeX env) sc_theta1 sc_theta2)
+    check (liftEq (eqTypeX env) sc_theta1 sc_theta2)
           (text "The class constraints do not match") `andThenCheck`
     checkListBy eqSig op_stuff1 op_stuff2 (text "methods") `andThenCheck`
     checkListBy eqAT ats1 ats2 (text "associated types") `andThenCheck`
@@ -1191,7 +1197,7 @@ checkBootTyCon is_boot tc1 tc2
   , Just env <- eqVarBndrs emptyRnEnv2 (tyConTyVars tc1) (tyConTyVars tc2)
   = assert (tc1 == tc2) $
     checkRoles roles1 roles2 `andThenCheck`
-    check (eqListBy (eqTypeX env)
+    check (liftEq (eqTypeX env)
                      (tyConStupidTheta tc1) (tyConStupidTheta tc2))
           (text "The datatype contexts do not match") `andThenCheck`
     eqAlgRhs tc1 (algTyConRhs tc1) (algTyConRhs tc2)
@@ -1250,7 +1256,7 @@ checkBootTyCon is_boot tc1 tc2
     --          data T a = MkT
     --
     -- If you write this, we'll treat T as injective, and make inferences
-    -- like T a ~R T b ==> a ~N b (mkNthCo).  But if we can
+    -- like T a ~R T b ==> a ~N b (mkSelCo).  But if we can
     -- subsequently replace T with one at phantom role, we would then be able to
     -- infer things like T Int ~R T Bool which is bad news.
     --
@@ -1276,7 +1282,7 @@ checkBootTyCon is_boot tc1 tc2
     -- but ONLY if the type synonym is nullary and has no type family
     -- applications.  This arises from two properties of skolem abstract data:
     --
-    --    For any T (with some number of paramaters),
+    --    For any T (with some number of parameters),
     --
     --    1. T is a valid type (it is "curryable"), and
     --
@@ -1337,7 +1343,7 @@ checkBootTyCon is_boot tc1 tc2
          check (dataConIsInfix c1 == dataConIsInfix c2)
                (text "The fixities of" <+> pname1 <+>
                 text "differ") `andThenCheck`
-         check (eqListBy eqHsBang (dataConImplBangs c1) (dataConImplBangs c2))
+         check (liftEq eqHsBang (dataConImplBangs c1) (dataConImplBangs c2))
                (text "The strictness annotations for" <+> pname1 <+>
                 text "differ") `andThenCheck`
          check (map flSelector (dataConFieldLabels c1) == map flSelector (dataConFieldLabels c2))
@@ -1368,7 +1374,7 @@ checkBootTyCon is_boot tc1 tc2
                                      , cab_lhs = lhs2, cab_rhs = rhs2 })
       | Just env1 <- eqVarBndrs emptyRnEnv2 tvs1 tvs2
       , Just env  <- eqVarBndrs env1        cvs1 cvs2
-      = eqListBy (eqTypeX env) lhs1 lhs2 &&
+      = liftEq (eqTypeX env) lhs1 lhs2 &&
         eqTypeX env rhs1 rhs2
 
       | otherwise = False
@@ -1379,7 +1385,7 @@ emptyRnEnv2 = mkRnEnv2 emptyInScopeSet
 ----------------
 missingBootThing :: Bool -> Name -> String -> TcRnMessage
 missingBootThing is_boot name what
-  = TcRnUnknownMessage $ mkPlainError noHints $
+  = mkTcRnUnknownMessage $ mkPlainError noHints $
     quotes (ppr name) <+> text "is exported by the"
     <+> (if is_boot then text "hs-boot" else text "hsig")
     <+> text "file, but not"
@@ -1387,7 +1393,7 @@ missingBootThing is_boot name what
 
 badReexportedBootThing :: Bool -> Name -> Name -> TcRnMessage
 badReexportedBootThing is_boot name name'
-  = TcRnUnknownMessage $ mkPlainError noHints $
+  = mkTcRnUnknownMessage $ mkPlainError noHints $
     withUserStyle alwaysQualify AllTheWay $ vcat
         [ text "The" <+> (if is_boot then text "hs-boot" else text "hsig")
            <+> text "file (re)exports" <+> quotes (ppr name)
@@ -1396,7 +1402,7 @@ badReexportedBootThing is_boot name name'
 
 bootMisMatch :: Bool -> SDoc -> TyThing -> TyThing -> TcRnMessage
 bootMisMatch is_boot extra_info real_thing boot_thing
-  = TcRnUnknownMessage $ mkPlainError noHints $
+  = mkTcRnUnknownMessage $ mkPlainError noHints $
     pprBootMisMatch is_boot extra_info real_thing real_doc boot_doc
   where
     to_doc
@@ -1427,7 +1433,7 @@ bootMisMatch is_boot extra_info real_thing boot_thing
 
 instMisMatch :: DFunId -> TcRnMessage
 instMisMatch dfun
-  = TcRnUnknownMessage $ mkPlainError noHints $
+  = mkTcRnUnknownMessage $ mkPlainError noHints $
     hang (text "instance" <+> ppr (idType dfun))
        2 (text "is defined in the hs-boot file, but not in the module itself")
 
@@ -1620,7 +1626,7 @@ tcPreludeClashWarn warnFlag name = do
                 (hang (ppr name) 4 (sep [ppr clashingElts]))
 
     ; let warn_msg x = addDiagnosticAt (nameSrcSpan (greMangledName x)) $
-            TcRnUnknownMessage $
+            mkTcRnUnknownMessage $
             mkPlainDiagnostic (WarningWithFlag warnFlag) noHints $ (hsep
               [ text "Local definition of"
               , (quotes . ppr . nameOccName . greMangledName) x
@@ -1650,7 +1656,7 @@ tcPreludeClashWarn warnFlag name = do
 
         -- Implicit (Prelude) import?
         isImplicit :: ImportDecl GhcRn -> Bool
-        isImplicit = ideclImplicit
+        isImplicit = ideclImplicit . ideclExt
 
         -- Unqualified import?
         isUnqualified :: ImportDecl GhcRn -> Bool
@@ -1660,17 +1666,17 @@ tcPreludeClashWarn warnFlag name = do
         --   Nothing -> No explicit imports
         --   Just (False, <names>) -> Explicit import list of <names>
         --   Just (True , <names>) -> Explicit hiding of <names>
-        importListOf :: ImportDecl GhcRn -> Maybe (Bool, [Name])
-        importListOf = fmap toImportList . ideclHiding
+        importListOf :: ImportDecl GhcRn -> Maybe (ImportListInterpretation, [Name])
+        importListOf = fmap toImportList . ideclImportList
           where
             toImportList (h, loc) = (h, map (ieName . unLoc) (unLoc loc))
 
         isExplicit :: ImportDecl GhcRn -> Bool
         isExplicit x = case importListOf x of
             Nothing -> False
-            Just (False, explicit)
+            Just (Exactly, explicit)
                 -> nameOccName name `elem`    map nameOccName explicit
-            Just (True, hidden)
+            Just (EverythingBut, hidden)
                 -> nameOccName name `notElem` map nameOccName hidden
 
         -- Check whether the given name would be imported (unqualified) from
@@ -1733,7 +1739,7 @@ tcMissingParentClassWarn warnFlag isName shouldName
            ; let instLoc = srcLocSpan . nameSrcLoc $ getName isInst
                  warnMsg (RM_KnownTc name:_) =
                       addDiagnosticAt instLoc $
-                        TcRnUnknownMessage $ mkPlainDiagnostic (WarningWithFlag warnFlag) noHints $
+                        mkTcRnUnknownMessage $ mkPlainDiagnostic (WarningWithFlag warnFlag) noHints $
                            hsep [ (quotes . ppr . nameOccName) name
                                 , text "is an instance of"
                                 , (ppr . nameOccName . className) isClass
@@ -1871,7 +1877,7 @@ checkMain explicit_mod_hdr export_ies
         -- in other modes, add error message and go on with typechecking.
 
     noMainMsg main_mod main_occ
-      = TcRnUnknownMessage $ mkPlainError noHints $
+      = mkTcRnUnknownMessage $ mkPlainError noHints $
             text "The" <+> ppMainFn main_occ
         <+> text "is not" <+> text defOrExp <+> text "module"
         <+> quotes (ppr main_mod)
@@ -1913,7 +1919,7 @@ generateMainBinding tcg_env main_name = do
     ; (ev_binds, main_expr) <- setMainCtxt main_name io_ty $
                                tcCheckMonoExpr main_expr_rn io_ty
 
-            -- See Note [Root-main id]
+            -- See Note [Root-main Id]
             -- Construct the binding
             --      :Main.main :: IO res_ty = runMainIO res_ty main
     ; run_main_id <- tcLookupId runMainIOName
@@ -1983,7 +1989,7 @@ the moving parts:
   - check that the export list does indeed export something called 'foo'
   - generateMainBinding: generate the root-main binding
        :Main.main = runMainIO M.foo
-  See Note [Root-main id]
+  See Note [Root-main Id]
 
 An annoying consequence of having both checkMainType and checkMain is
 that, when (but only when) -fdefer-type-errors is on, we may report an
@@ -2039,6 +2045,14 @@ being called "Main.main".  That's why root_main_id has a fixed module
 This is unusual: it's a LocalId whose Name has a Module from another
 module. Tiresomely, we must filter it out again in GHC.Iface.Make, less we
 get two defns for 'main' in the interface file!
+
+When using `-fwrite-if-simplified-core` the root_main_id can end up in an interface file.
+When the interface is read back in we have to add a special case when creating the
+Id because otherwise we would go looking for the :Main module which obviously doesn't
+exist. For this logic see GHC.IfaceToCore.mk_top_id.
+
+There is also some similar (probably dead) logic in GHC.Rename.Env which says it
+was added for External Core which faced a similar issue.
 
 
 *********************************************************
@@ -2189,7 +2203,7 @@ tcRnStmt hsc_env rdr_stmt
     return (global_ids, zonked_expr, fix_env)
     }
   where
-    bad_unboxed id = addErr $ TcRnUnknownMessage $ mkPlainError noHints $
+    bad_unboxed id = addErr $ mkTcRnUnknownMessage $ mkPlainError noHints $
       (sep [text "GHCi can't bind a variable of unlifted type:",
                                   nest 2 (pprPrefixOcc id <+> dcolon <+> ppr (idType id))])
 
@@ -2223,10 +2237,8 @@ type Plan = TcM PlanResult
 
 -- | Try the plans in order. If one fails (by raising an exn), try the next.
 -- If one succeeds, take it.
-runPlans :: [Plan] -> TcM PlanResult
-runPlans []     = panic "runPlans"
-runPlans [p]    = p
-runPlans (p:ps) = tryTcDiscardingErrs (runPlans ps) p
+runPlans :: NonEmpty Plan -> Plan
+runPlans = foldr1 (flip tryTcDiscardingErrs)
 
 -- | Typecheck (and 'lift') a stmt entered by the user in GHCi into the
 -- GHCi 'environment'.
@@ -2298,30 +2310,31 @@ tcUserStmt (L loc (BodyStmt _ expr _ _))
 
               -- See Note [GHCi Plans]
 
-              it_plans = [
+              it_plans =
                     -- Plan A
                     do { stuff@([it_id], _) <- tcGhciStmts [bind_stmt, print_it]
                        ; it_ty <- zonkTcType (idType it_id)
-                       ; when (isUnitTy $ it_ty) failM
-                       ; return stuff },
+                       ; when (isUnitTy it_ty) failM
+                       ; return stuff } :|
 
                         -- Plan B; a naked bind statement
-                    tcGhciStmts [bind_stmt],
+                  [ tcGhciStmts [bind_stmt]
 
                         -- Plan C; check that the let-binding is typeable all by itself.
                         -- If not, fail; if so, try to print it.
                         -- The two-step process avoids getting two errors: one from
                         -- the expression itself, and one from the 'print it' part
                         -- This two-step story is very clunky, alas
-                    do { _ <- checkNoErrs (tcGhciStmts [let_stmt])
+                  , do { _ <- checkNoErrs (tcGhciStmts [let_stmt])
                                 --- checkNoErrs defeats the error recovery of let-bindings
                        ; tcGhciStmts [let_stmt, print_it] } ]
 
               -- Plans where we don't bind "it"
-              no_it_plans = [
-                    tcGhciStmts [no_it_a] ,
-                    tcGhciStmts [no_it_b] ,
-                    tcGhciStmts [no_it_c] ]
+              no_it_plans =
+                tcGhciStmts [no_it_a] :|
+                tcGhciStmts [no_it_b] :
+                tcGhciStmts [no_it_c] :
+                []
 
         ; generate_it <- goptM Opt_NoIt
 
@@ -2413,13 +2426,13 @@ tcUserStmt rdr_stmt@(L loc _)
        ; let print_result_plan
                | opt_pr_flag                         -- The flag says "print result"
                , [v] <- collectLStmtBinders CollNoDictBinders gi_stmt  -- One binder
-               = [mk_print_result_plan gi_stmt v]
-               | otherwise = []
+               = Just $ mk_print_result_plan gi_stmt v
+               | otherwise = Nothing
 
         -- The plans are:
         --      [stmt; print v]         if one binder and not v::()
         --      [stmt]                  otherwise
-       ; plan <- runPlans (print_result_plan ++ [tcGhciStmts [gi_stmt]])
+       ; plan <- runPlans $ maybe id (NE.<|) print_result_plan $ NE.singleton $ tcGhciStmts [gi_stmt]
        ; return (plan, fix_env) }
   where
     mk_print_result_plan stmt v
@@ -2544,8 +2557,8 @@ isGHCiMonad hsc_env ty
                 _ <- tcLookupInstance ghciClass [userTy]
                 return name
 
-            Just _  -> failWithTc $ TcRnUnknownMessage $ mkPlainError noHints $ text "Ambiguous type!"
-            Nothing -> failWithTc $ TcRnUnknownMessage $ mkPlainError noHints $ text ("Can't find type:" ++ ty)
+            Just _  -> failWithTc $ mkTcRnUnknownMessage $ mkPlainError noHints $ text "Ambiguous type!"
+            Nothing -> failWithTc $ mkTcRnUnknownMessage $ mkPlainError noHints $ text ("Can't find type:" ++ ty)
 
 -- | How should we infer a type? See Note [TcRnExprMode]
 data TcRnExprMode = TM_Inst     -- ^ Instantiate inferred quantifiers only (:type)
@@ -2669,8 +2682,15 @@ tcRnType :: HscEnv
 tcRnType hsc_env flexi normalise rdr_type
   = runTcInteractive hsc_env $
     setXOptM LangExt.PolyKinds $   -- See Note [Kind-generalise in tcRnType]
-    do { (HsWC { hswc_ext = wcs, hswc_body = rn_type }, _fvs)
-               <- rnHsWcType GHCiCtx (mkHsWildCardBndrs rdr_type)
+    do { (HsWC { hswc_ext = wcs, hswc_body = rn_sig_type@(L _ (HsSig{sig_bndrs = outer_bndrs, sig_body = body })) }, _fvs)
+                 -- we are using 'rnHsSigWcType' to bind the unbound type variables
+                 -- and in combination with 'tcOuterTKBndrs' we are able to
+                 -- implicitly quantify them as if the user wrote 'forall' by
+                 -- hand (see #19217). This allows kind check to work in presence
+                 -- of free type variables :
+                 -- ghci> :k [a]
+                 -- [a] :: *
+               <- rnHsSigWcType GHCiCtx (mkHsWildCardBndrs $ noLocA (mkHsImplicitSigType rdr_type))
                   -- The type can have wild cards, but no implicit
                   -- generalisation; e.g.   :kind (T _)
        ; failIfErrsM
@@ -2680,14 +2700,14 @@ tcRnType hsc_env flexi normalise rdr_type
         -- Now kind-check the type
         -- It can have any rank or kind
         -- First bring into scope any wildcards
-       ; traceTc "tcRnType" (vcat [ppr wcs, ppr rn_type])
-       ; ((ty, kind), wanted)
+       ; traceTc "tcRnType" (vcat [ppr wcs, ppr rn_sig_type])
+       ; si <- mkSkolemInfo $ SigTypeSkol (GhciCtxt True)
+       ; ((_, (ty, kind)), wanted)
                <- captureTopConstraints $
                   pushTcLevelM_         $
                   bindNamedWildCardBinders wcs $ \ wcs' ->
                   do { mapM_ emitNamedTypeHole wcs'
-                     ; tcInferLHsTypeUnsaturated rn_type }
-
+                     ; tcOuterTKBndrs si outer_bndrs $ tcInferLHsTypeUnsaturated body }
        -- Since all the wanteds are equalities, the returned bindings will be empty
        ; empty_binds <- simplifyTop wanted
        ; massertPpr (isEmptyBag empty_binds) (ppr empty_binds)
@@ -2709,7 +2729,8 @@ tcRnType hsc_env flexi normalise rdr_type
                                normaliseType fam_envs Nominal ty
                  | otherwise = ty
 
-       ; return (ty', mkInfForAllTys kvs (tcTypeKind ty')) }
+       ; traceTc "tcRnExpr" (debugPprType ty $$ debugPprType ty')
+       ; return (ty', mkInfForAllTys kvs (typeKind ty')) }
 
 
 {- Note [TcRnExprMode]
@@ -2721,7 +2742,7 @@ https://github.com/ghc-proposals/ghc-proposals/blob/master/proposals/0179-printi
 
 :type / TM_Inst
 
-  In this mode, we report the type obained by instantiating only the
+  In this mode, we report the type obtained by instantiating only the
   /inferred/ quantifiers of e's type, solving constraints, and
   re-generalising, as discussed in #11376.
 
@@ -2841,7 +2862,7 @@ tcRnLookupRdrName hsc_env (L loc rdr_name)
          let rdr_names = dataTcOccs rdr_name
        ; names_s <- mapM lookupInfoOccRn rdr_names
        ; let names = concat names_s
-       ; when (null names) (addErrTc $ TcRnUnknownMessage $ mkPlainError noHints $
+       ; when (null names) (addErrTc $ mkTcRnUnknownMessage $ mkPlainError noHints $
            (text "Not in scope:" <+> quotes (ppr rdr_name)))
        ; return names }
 

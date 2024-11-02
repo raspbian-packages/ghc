@@ -3,7 +3,6 @@ module GHC.Driver.Config.Cmm
   ) where
 
 import GHC.Cmm.Config
-import GHC.Cmm.Switch (backendSupportsSwitch)
 
 import GHC.Driver.Session
 import GHC.Driver.Backend
@@ -19,10 +18,12 @@ initCmmConfig dflags = CmmConfig
   , cmmDoLinting           = gopt Opt_DoCmmLinting        dflags
   , cmmOptElimCommonBlks   = gopt Opt_CmmElimCommonBlocks dflags
   , cmmOptSink             = gopt Opt_CmmSink             dflags
+  , cmmOptThreadSanitizer  = gopt Opt_CmmThreadSanitizer dflags
   , cmmGenStackUnwindInstr = debugLevel dflags > 0
   , cmmExternalDynamicRefs = gopt Opt_ExternalDynamicRefs dflags
-  , cmmDoCmmSwitchPlans    = not . backendSupportsSwitch . backend $ dflags
-  , cmmSplitProcPoints     = (backend dflags /= NCG)
+  , cmmDoCmmSwitchPlans    = not (backendHasNativeSwitch (backend dflags))
+                             || platformArch platform == ArchWasm32
+  , cmmSplitProcPoints     = not (backendSupportsUnsplitProcPoints (backend dflags))
                              || not (platformTablesNextToCode platform)
                              || usingInconsistentPicReg
   }

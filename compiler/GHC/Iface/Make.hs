@@ -42,13 +42,15 @@ import GHC.Core.TyCon
 import GHC.Core.Coercion.Axiom
 import GHC.Core.ConLike
 import GHC.Core.DataCon
+import GHC.Core.FVs ( orphNamesOfAxiomLHS )
 import GHC.Core.Type
 import GHC.Core.Multiplicity
 import GHC.Core.InstEnv
 import GHC.Core.FamInstEnv
 import GHC.Core.Ppr
-import GHC.Core.Unify( RoughMatchTc(..) )
+import GHC.Core.RoughMap( RoughMatchTc(..) )
 
+import GHC.Driver.Config.HsToCore.Usage
 import GHC.Driver.Env
 import GHC.Driver.Backend
 import GHC.Driver.Session
@@ -76,15 +78,14 @@ import GHC.Types.CompleteMatch
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
 import GHC.Utils.Panic.Plain
-import GHC.Utils.Misc  hiding ( eqListBy )
+import GHC.Utils.Misc
 import GHC.Utils.Logger
-import GHC.Utils.Trace
 
 import GHC.Data.FastString
 import GHC.Data.Maybe
 
 import GHC.HsToCore.Docs
-import GHC.HsToCore.Usage ( mkUsageInfo, mkUsedNames )
+import GHC.HsToCore.Usage
 
 import GHC.Unit
 import GHC.Unit.Module.Warnings
@@ -110,11 +111,12 @@ import GHC.Stg.Pipeline (StgCgInfos)
 -}
 
 mkPartialIface :: HscEnv
+               -> CoreProgram
                -> ModDetails
                -> ModSummary
                -> ModGuts
                -> PartialModIface
-mkPartialIface hsc_env mod_details mod_summary
+mkPartialIface hsc_env core_prog mod_details mod_summary
   ModGuts{ mg_module       = this_mod
          , mg_hsc_src      = hsc_src
          , mg_usages       = usages
@@ -128,7 +130,7 @@ mkPartialIface hsc_env mod_details mod_summary
          , mg_trust_pkg    = self_trust
          , mg_docs         = docs
          }
-  = mkIface_ hsc_env this_mod hsc_src used_th deps rdr_env fix_env warns hpc_info self_trust
+  = mkIface_ hsc_env this_mod core_prog hsc_src used_th deps rdr_env fix_env warns hpc_info self_trust
              safe_mode usages docs mod_summary mod_details
 
 -- | Fully instantiate an interface. Adds fingerprints and potentially code
@@ -193,9 +195,10 @@ mkIfaceTc :: HscEnv
           -> SafeHaskellMode    -- The safe haskell mode
           -> ModDetails         -- gotten from mkBootModDetails, probably
           -> ModSummary
+          -> Maybe CoreProgram
           -> TcGblEnv           -- Usages, deprecations, etc
           -> IO ModIface
-mkIfaceTc hsc_env safe_mode mod_details mod_summary
+mkIfaceTc hsc_env safe_mode mod_details mod_summary mb_program
   tc_result@TcGblEnv{ tcg_mod = this_mod,
                       tcg_src = hsc_src,
                       tcg_imports = imports,
@@ -219,6 +222,10 @@ mkIfaceTc hsc_env safe_mode mod_details mod_summary
           used_th <- readIORef tc_splice_used
           dep_files <- (readIORef dependent_files)
           (needed_links, needed_pkgs) <- readIORef (tcg_th_needed_deps tc_result)
+          let uc = initUsageConfig hsc_env
+              plugins = hsc_plugins hsc_env
+              fc = hsc_FC hsc_env
+              unit_env = hsc_unit_env hsc_env
           -- Do NOT use semantic module here; this_mod in mkUsageInfo
           -- is used solely to decide if we should record a dependency
           -- or not.  When we instantiate a signature, the semantic
@@ -226,13 +233,13 @@ mkIfaceTc hsc_env safe_mode mod_details mod_summary
           -- but if you pass that in here, we'll decide it's the local
           -- module and does not need to be recorded as a dependency.
           -- See Note [Identity versus semantic module]
-          usages <- mkUsageInfo hsc_env this_mod (imp_mods imports) used_names
+          usages <- initIfaceLoad hsc_env $ mkUsageInfo uc plugins fc unit_env this_mod (imp_mods imports) used_names
                       dep_files merged needed_links needed_pkgs
 
           docs <- extractDocs (ms_hspp_opts mod_summary) tc_result
 
           let partial_iface = mkIface_ hsc_env
-                   this_mod hsc_src
+                   this_mod (fromMaybe [] mb_program) hsc_src
                    used_th deps rdr_env
                    fix_env warns hpc_info
                    (imp_trust_own_pkg imports) safe_mode usages
@@ -241,7 +248,7 @@ mkIfaceTc hsc_env safe_mode mod_details mod_summary
 
           mkFullIface hsc_env partial_iface Nothing Nothing
 
-mkIface_ :: HscEnv -> Module -> HscSource
+mkIface_ :: HscEnv -> Module -> CoreProgram -> HscSource
          -> Bool -> Dependencies -> GlobalRdrEnv
          -> NameEnv FixItem -> Warnings GhcRn -> HpcInfo
          -> Bool
@@ -252,7 +259,7 @@ mkIface_ :: HscEnv -> Module -> HscSource
          -> ModDetails
          -> PartialModIface
 mkIface_ hsc_env
-         this_mod hsc_src used_th deps rdr_env fix_env src_warns
+         this_mod core_prog hsc_src used_th deps rdr_env fix_env src_warns
          hpc_info pkg_trust_req safe_mode usages
          docs mod_summary
          ModDetails{  md_insts     = insts,
@@ -272,6 +279,9 @@ mkIface_ hsc_env
         semantic_mod = homeModuleNameInstantiation home_unit (moduleName this_mod)
         entities = typeEnvElts type_env
         show_linear_types = xopt LangExt.LinearTypes (hsc_dflags hsc_env)
+
+        extra_decls = if gopt Opt_WriteIfSimplifiedCore dflags then Just [ toIfaceTopBind b | b <- core_prog ]
+                                                               else Nothing
         decls  = [ tyThingToIfaceDecl show_linear_types entity
                  | entity <- entities,
                    let name = getName entity,
@@ -323,6 +333,7 @@ mkIface_ hsc_env
           mi_globals     = maybeGlobalRdrEnv rdr_env,
           mi_used_th     = used_th,
           mi_decls       = decls,
+          mi_extra_decls = extra_decls,
           mi_hpc         = isHpcUsed hpc_info,
           mi_trust       = trust_info,
           mi_trust_pkg   = pkg_trust_req,
@@ -349,7 +360,7 @@ mkIface_ hsc_env
      -- scope available. (#5534)
      maybeGlobalRdrEnv :: GlobalRdrEnv -> Maybe GlobalRdrEnv
      maybeGlobalRdrEnv rdr_env
-         | backendRetainsAllBindings (backend dflags) = Just rdr_env
+         | backendWantsGlobalBindings (backend dflags) = Just rdr_env
          | otherwise                                  = Nothing
 
      ifFamInstTcName = ifFamInstFam
@@ -522,7 +533,7 @@ tyConToIfaceDecl env tycon
     , IfaceData { ifName    = getName tycon,
                   ifBinders = if_binders,
                   ifResKind = if_res_kind,
-                  ifCType   = tyConCType tycon,
+                  ifCType   = tyConCType_maybe tycon,
                   ifRoles   = tyConRoles tycon,
                   ifCtxt    = tidyToIfaceContext tc_env1 (tyConStupidTheta tycon),
                   ifCons    = ifaceConDecls (algTyConRhs tycon),
@@ -540,7 +551,7 @@ tyConToIfaceDecl env tycon
                   ifCType      = Nothing,
                   ifRoles      = tyConRoles tycon,
                   ifCtxt       = [],
-                  ifCons       = IfDataTyCon [],
+                  ifCons       = IfDataTyCon False [],
                   ifGadtSyntax = False,
                   ifParent     = IfNoParent })
   where
@@ -549,7 +560,7 @@ tyConToIfaceDecl env tycon
     -- an error.
     (tc_env1, tc_binders) = tidyTyConBinders env (tyConBinders tycon)
     tc_tyvars      = binderVars tc_binders
-    if_binders     = toIfaceTyCoVarBinders tc_binders
+    if_binders     = toIfaceForAllBndrs tc_binders
                      -- No tidying of the binders; they are already tidy
     if_res_kind    = tidyToIfaceType tc_env1 (tyConResKind tycon)
     if_syn_type ty = tidyToIfaceType tc_env1 ty
@@ -574,9 +585,10 @@ tyConToIfaceDecl env tycon
             axn  = coAxiomName ax
 
     ifaceConDecls (NewTyCon { data_con = con })    = IfNewTyCon  (ifaceConDecl con)
-    ifaceConDecls (DataTyCon { data_cons = cons }) = IfDataTyCon (map ifaceConDecl cons)
-    ifaceConDecls (TupleTyCon { data_con = con })  = IfDataTyCon [ifaceConDecl con]
-    ifaceConDecls (SumTyCon { data_cons = cons })  = IfDataTyCon (map ifaceConDecl cons)
+    ifaceConDecls (DataTyCon { data_cons = cons, is_type_data = type_data })
+      = IfDataTyCon type_data (map ifaceConDecl cons)
+    ifaceConDecls (TupleTyCon { data_con = con })  = IfDataTyCon False [ifaceConDecl con]
+    ifaceConDecls (SumTyCon { data_cons = cons })  = IfDataTyCon False (map ifaceConDecl cons)
     ifaceConDecls AbstractTyCon                    = IfAbstractTyCon
         -- The AbstractTyCon case happens when a TyCon has been trimmed
         -- during tidying.
@@ -590,7 +602,7 @@ tyConToIfaceDecl env tycon
                     ifConInfix   = dataConIsInfix data_con,
                     ifConWrapper = isJust (dataConWrapId_maybe data_con),
                     ifConExTCvs  = map toIfaceBndr ex_tvs',
-                    ifConUserTvBinders = map toIfaceForAllBndr user_bndrs',
+                    ifConUserTvBinders = toIfaceForAllBndrs user_bndrs',
                     ifConEqSpec  = map (to_eq_spec . eqSpecPair) eq_spec,
                     ifConCtxt    = tidyToIfaceContext con_env2 theta,
                     ifConArgTys  =
@@ -617,18 +629,18 @@ tyConToIfaceDecl env tycon
                      -- A bit grimy, perhaps, but it's simple!
 
           (con_env2, ex_tvs') = tidyVarBndrs con_env1 ex_tvs
-          user_bndrs' = map (tidyUserTyCoVarBinder con_env2) user_bndrs
+          user_bndrs' = map (tidyUserForAllTyBinder con_env2) user_bndrs
           to_eq_spec (tv,ty) = (tidyTyVar con_env2 tv, tidyToIfaceType con_env2 ty)
 
           -- By this point, we have tidied every universal and existential
-          -- tyvar. Because of the dcUserTyCoVarBinders invariant
+          -- tyvar. Because of the dcUserForAllTyBinders invariant
           -- (see Note [DataCon user type variable binders]), *every*
           -- user-written tyvar must be contained in the substitution that
           -- tidying produced. Therefore, tidying the user-written tyvars is a
           -- simple matter of looking up each variable in the substitution,
           -- which tidyTyCoVarOcc accomplishes.
-          tidyUserTyCoVarBinder :: TidyEnv -> InvisTVBinder -> InvisTVBinder
-          tidyUserTyCoVarBinder env (Bndr tv vis) =
+          tidyUserForAllTyBinder :: TidyEnv -> InvisTVBinder -> InvisTVBinder
+          tidyUserForAllTyBinder env (Bndr tv vis) =
             Bndr (tidyTyCoVarOcc env tv) vis
 
 classToIfaceDecl :: TidyEnv -> Class -> (TidyEnv, IfaceDecl)
@@ -636,7 +648,7 @@ classToIfaceDecl env clas
   = ( env1
     , IfaceClass { ifName   = getName tycon,
                    ifRoles  = tyConRoles (classTyCon clas),
-                   ifBinders = toIfaceTyCoVarBinders tc_binders,
+                   ifBinders = toIfaceForAllBndrs tc_binders,
                    ifBody   = body,
                    ifFDs    = map toIfaceFD clas_fds })
   where
@@ -691,7 +703,7 @@ tidyTyConBinder :: TidyEnv -> TyConBinder -> (TidyEnv, TyConBinder)
 tidyTyConBinder env@(_, subst) tvb@(Bndr tv vis)
  = case lookupVarEnv subst tv of
      Just tv' -> (env,  Bndr tv' vis)
-     Nothing  -> tidyTyCoVarBinder env tvb
+     Nothing  -> tidyForAllTyBinder env tvb
 
 tidyTyConBinders :: TidyEnv -> [TyConBinder] -> (TidyEnv, [TyConBinder])
 tidyTyConBinders = mapAccumL tidyTyConBinder
@@ -729,7 +741,7 @@ famInstToIfaceFamInst (FamInst { fi_axiom    = axiom,
           nameModule (coAxiomName axiom)
     is_local name = nameIsLocalOrFrom mod name
 
-    lhs_names = filterNameSet is_local (orphNamesOfCoCon axiom)
+    lhs_names = filterNameSet is_local (orphNamesOfAxiomLHS axiom)
 
     orph | is_local fam_decl
          = NotOrphan (nameOccName fam_decl)

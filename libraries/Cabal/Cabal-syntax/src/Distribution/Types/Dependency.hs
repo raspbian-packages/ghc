@@ -44,7 +44,7 @@ data Dependency = Dependency
                     -- ^ The set of libraries required from the package.
                     -- Only the selected libraries will be built.
                     -- It does not affect the cabal-install solver yet.
-                  deriving (Generic, Read, Show, Eq, Typeable, Data)
+                  deriving (Generic, Read, Show, Eq, Ord, Typeable, Data)
 
 depPkgName :: Dependency -> PackageName
 depPkgName (Dependency pn _ _) = pn
@@ -77,16 +77,16 @@ instance NFData Dependency where rnf = genericRnf
 
 -- |
 --
--- >>> prettyShow $ Dependency "pkg" anyVersion mainLibSet
+-- >>> prettyShow $ Dependency (mkPackageName "pkg") anyVersion mainLibSet
 -- "pkg"
 --
--- >>> prettyShow $ Dependency "pkg" anyVersion $ NES.insert (LSubLibName "sublib") mainLibSet
+-- >>> prettyShow $ Dependency (mkPackageName "pkg") anyVersion $ NES.insert (LSubLibName $ mkUnqualComponentName "sublib") mainLibSet
 -- "pkg:{pkg, sublib}"
 --
--- >>> prettyShow $ Dependency "pkg" anyVersion $ NES.singleton (LSubLibName "sublib")
+-- >>> prettyShow $ Dependency (mkPackageName "pkg") anyVersion $ NES.singleton (LSubLibName $ mkUnqualComponentName "sublib")
 -- "pkg:sublib"
 --
--- >>> prettyShow $ Dependency "pkg" anyVersion $ NES.insert (LSubLibName "sublib-b") $ NES.singleton (LSubLibName "sublib-a")
+-- >>> prettyShow $ Dependency (mkPackageName "pkg") anyVersion $ NES.insert (LSubLibName $ mkUnqualComponentName "sublib-b") $ NES.singleton (LSubLibName $ mkUnqualComponentName "sublib-a")
 -- "pkg:{sublib-a, sublib-b}"
 --
 instance Pretty Dependency where

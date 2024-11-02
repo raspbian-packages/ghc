@@ -21,10 +21,10 @@ import GHC.Core.DataCon
 import GHC.Core.PatSyn
 import GHC.Core.TyCo.Rep
 import GHC.Core.Type
-import GHC.Core.Utils
 import GHC.Hs
 import GHC.Tc.Types.Evidence
 import GHC.Types.Id
+import GHC.Types.Var( VarBndr(..) )
 import GHC.Types.SrcLoc
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
@@ -48,7 +48,7 @@ hsPatType (VarPat _ lvar)               = idType (unLoc lvar)
 hsPatType (BangPat _ pat)               = hsLPatType pat
 hsPatType (LazyPat _ pat)               = hsLPatType pat
 hsPatType (LitPat _ lit)                = hsLitType lit
-hsPatType (AsPat _ var _)               = idType (unLoc var)
+hsPatType (AsPat _ var _ _)             = idType (unLoc var)
 hsPatType (ViewPat ty _ _)              = ty
 hsPatType (ListPat ty _)                = mkListTy ty
 hsPatType (TuplePat tys _ bx)           = mkTupleTy1 bx tys
@@ -94,14 +94,14 @@ hsExprType :: HsExpr GhcTc -> Type
 hsExprType (HsVar _ (L _ id)) = idType id
 hsExprType (HsUnboundVar (HER _ ty _) _) = ty
 hsExprType (HsRecSel _ (FieldOcc id _)) = idType id
-hsExprType (HsOverLabel v _) = dataConCantHappen v
+hsExprType (HsOverLabel v _ _) = dataConCantHappen v
 hsExprType (HsIPVar v _) = dataConCantHappen v
 hsExprType (HsOverLit _ lit) = overLitType lit
 hsExprType (HsLit _ lit) = hsLitType lit
 hsExprType (HsLam     _ (MG { mg_ext = match_group })) = matchGroupTcType match_group
 hsExprType (HsLamCase _ _ (MG { mg_ext = match_group })) = matchGroupTcType match_group
 hsExprType (HsApp _ f _) = funResultTy $ lhsExprType f
-hsExprType (HsAppType x f _) = piResultTy (lhsExprType f) x
+hsExprType (HsAppType x f _ _) = piResultTy (lhsExprType f) x
 hsExprType (OpApp v _ _ _) = dataConCantHappen v
 hsExprType (NegApp _ _ se) = syntaxExprType se
 hsExprType (HsPar _ _ e _) = lhsExprType e
@@ -116,11 +116,7 @@ hsExprType (HsLet _ _ _ _ body) = lhsExprType body
 hsExprType (HsDo ty _ _) = ty
 hsExprType (ExplicitList ty _) = mkListTy ty
 hsExprType (RecordCon con_expr _ _) = hsExprType con_expr
-hsExprType e@(RecordUpd (RecordUpdTc { rupd_cons = cons, rupd_out_tys = out_tys }) _ _) =
-  case cons of
-    con_like:_ -> conLikeResTy con_like out_tys
-    []         -> pprPanic "hsExprType: RecordUpdTc with empty rupd_cons"
-                           (ppr e)
+hsExprType (RecordUpd v _ _) = dataConCantHappen v
 hsExprType (HsGetField { gf_ext = v }) = dataConCantHappen v
 hsExprType (HsProjection { proj_ext = v }) = dataConCantHappen v
 hsExprType (ExprWithTySig _ e _) = lhsExprType e
@@ -129,13 +125,14 @@ hsExprType (ArithSeq _ mb_overloaded_op asi) = case mb_overloaded_op of
   Nothing -> asi_ty
   where
     asi_ty = arithSeqInfoType asi
-hsExprType (HsTypedBracket   (HsBracketTc _ ty _wrap _pending) _) = ty
-hsExprType (HsUntypedBracket (HsBracketTc _ ty _wrap _pending) _) = ty
-hsExprType e@(HsSpliceE{}) = pprPanic "hsExprType: Unexpected HsSpliceE"
-                                      (ppr e)
-                               -- Typed splices should have been eliminated during zonking, but we
-                               -- can't use `dataConCantHappen` since they are still present before
-                               -- than in the typechecked AST
+hsExprType (HsTypedBracket   (HsBracketTc { hsb_ty = ty }) _) = ty
+hsExprType (HsUntypedBracket (HsBracketTc { hsb_ty = ty }) _) = ty
+hsExprType e@(HsTypedSplice{}) = pprPanic "hsExprType: Unexpected HsTypedSplice"
+                                          (ppr e)
+                                      -- Typed splices should have been eliminated during zonking, but we
+                                      -- can't use `dataConCantHappen` since they are still present before
+                                      -- than in the typechecked AST.
+hsExprType (HsUntypedSplice ext _) = dataConCantHappen ext
 hsExprType (HsProc _ _ lcmd_top) = lhsCmdTopType lcmd_top
 hsExprType (HsStatic (_, ty) _s) = ty
 hsExprType (HsPragE _ _ e) = lhsExprType e
@@ -185,9 +182,9 @@ hsWrapperType wrap ty = prTypeType $ go wrap (ty,[])
           exp_res = hsWrapperType w2 act_res
       in mkFunctionType m exp_arg exp_res
     go (WpCast co)        = liftPRType $ \_ -> coercionRKind co
-    go (WpEvLam v)        = liftPRType $ mkInvisFunTyMany (idType v)
+    go (WpEvLam v)        = liftPRType $ mkInvisFunTy (idType v)
     go (WpEvApp _)        = liftPRType $ funResultTy
-    go (WpTyLam tv)       = liftPRType $ mkForAllTy tv Inferred
+    go (WpTyLam tv)       = liftPRType $ mkForAllTy (Bndr tv Inferred)
     go (WpTyApp ta)       = \(ty,tas) -> (ty, ta:tas)
     go (WpLet _)          = id
     go (WpMultCoercion _) = id
@@ -196,7 +193,7 @@ lhsCmdTopType :: LHsCmdTop GhcTc -> Type
 lhsCmdTopType (L _ (HsCmdTop (CmdTopTc _ ret_ty _) _)) = ret_ty
 
 matchGroupTcType :: MatchGroupTc -> Type
-matchGroupTcType (MatchGroupTc args res) = mkVisFunTys args res
+matchGroupTcType (MatchGroupTc args res _) = mkScaledFunTys args res
 
 syntaxExprType :: SyntaxExpr GhcTc -> Type
 syntaxExprType (SyntaxExprTc e _ _) = hsExprType e

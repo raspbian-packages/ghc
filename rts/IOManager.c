@@ -19,9 +19,11 @@
 #include "rts/IOInterface.h" // exported
 #include "IOManager.h"       // RTS internal
 #include "Capability.h"
+#include "Schedule.h"
 #include "RtsFlags.h"
+#include "RtsUtils.h"
 
-#if !defined(mingw32_HOST_OS)
+#if !defined(mingw32_HOST_OS) && defined(HAVE_SIGNAL_H)
 #include "posix/Signals.h"
 #endif
 
@@ -32,7 +34,30 @@
 #endif
 
 
-/* Called in the RTS initialisation
+/* Allocate and initialise the per-capability CapIOManager that lives in each
+ * Capability. Called early in the RTS initialisation.
+ */
+void initCapabilityIOManager(CapIOManager **piomgr)
+{
+    CapIOManager *iomgr =
+      (CapIOManager *) stgMallocBytes(sizeof(CapIOManager),
+                                      "initCapabilityIOManager");
+
+#if defined(THREADED_RTS)
+#if !defined(mingw32_HOST_OS)
+    iomgr->control_fd = -1;
+#endif
+#else // !defined(THREADED_RTS)
+    iomgr->blocked_queue_hd = END_TSO_QUEUE;
+    iomgr->blocked_queue_tl = END_TSO_QUEUE;
+    iomgr->sleeping_queue   = END_TSO_QUEUE;
+#endif
+
+    *piomgr = iomgr;
+}
+
+
+/* Called late in the RTS initialisation
  */
 void
 initIOManager(void)
@@ -75,7 +100,7 @@ initIOManagerAfterFork(Capability **pcap USED_IF_THREADS_AND_NOT_MINGW32)
      * No Windows impl since no forking.
      *
      * TODO: figure out if it is necessary for the threaded MIO case for the
-     * starting of the IO managager threads to be synchronous. It would be
+     * starting of the IO manager threads to be synchronous. It would be
      * simpler if it could start them asynchronously and thus not have to
      * have the pcap as an inout param, that could be modified. In practice it
      * cannot be modified anyway since in the contexts where it is called
@@ -131,6 +156,19 @@ void wakeupIOManager(void)
 #endif
 }
 
+void markCapabilityIOManager(evac_fn       evac  USED_IF_NOT_THREADS,
+                             void         *user  USED_IF_NOT_THREADS,
+                             CapIOManager *iomgr USED_IF_NOT_THREADS)
+{
+
+#if !defined(THREADED_RTS)
+    evac(user, (StgClosure **)(void *)&iomgr->blocked_queue_hd);
+    evac(user, (StgClosure **)(void *)&iomgr->blocked_queue_tl);
+    evac(user, (StgClosure **)(void *)&iomgr->sleeping_queue);
+#endif
+
+}
+
 
 /* Declared in rts/IOInterface.h. Used only by the MIO threaded I/O manager on
  * Unix platforms.
@@ -140,10 +178,42 @@ void
 setIOManagerControlFd(uint32_t cap_no USED_IF_THREADS, int fd USED_IF_THREADS) {
 #if defined(THREADED_RTS)
     if (cap_no < getNumCapabilities()) {
-        RELAXED_STORE(&getCapability(cap_no)->io_manager_control_wr_fd, fd);
+        RELAXED_STORE(&getCapability(cap_no)->iomgr->control_fd, fd);
     } else {
         errorBelch("warning: setIOManagerControlFd called with illegal capability number.");
     }
 #endif
+}
+#endif
+
+#if !defined(THREADED_RTS)
+void appendToIOBlockedQueue(Capability *cap, StgTSO *tso)
+{
+    CapIOManager *iomgr = cap->iomgr;
+    ASSERT(tso->_link == END_TSO_QUEUE);
+    if (iomgr->blocked_queue_hd == END_TSO_QUEUE) {
+        iomgr->blocked_queue_hd = tso;
+    } else {
+        setTSOLink(cap, iomgr->blocked_queue_tl, tso);
+    }
+    iomgr->blocked_queue_tl = tso;
+}
+
+void insertIntoSleepingQueue(Capability *cap, StgTSO *tso, LowResTime target)
+{
+    CapIOManager *iomgr = cap->iomgr;
+    StgTSO *prev = NULL;
+    StgTSO *t = iomgr->sleeping_queue;
+    while (t != END_TSO_QUEUE && t->block_info.target < target) {
+        prev = t;
+        t = t->_link;
+    }
+
+    tso->_link = t;
+    if (prev == NULL) {
+        iomgr->sleeping_queue = tso;
+    } else {
+        setTSOLink(cap, prev, tso);
+    }
 }
 #endif

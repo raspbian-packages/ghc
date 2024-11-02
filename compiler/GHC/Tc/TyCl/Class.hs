@@ -18,7 +18,6 @@ module GHC.Tc.TyCl.Class
    , tcClassMinimalDef
    , HsSigFun
    , mkHsSigFun
-   , badMethodErr
    , instDeclCtxt1
    , instDeclCtxt2
    , instDeclCtxt3
@@ -71,6 +70,7 @@ import GHC.Data.BooleanFormula
 
 import Control.Monad
 import Data.List ( mapAccumL, partition )
+import qualified Data.List.NonEmpty as NE
 
 {-
 Dictionary handling
@@ -100,7 +100,7 @@ generates
 
         newtype CDict a = CDict (forall b. a -> b -> b)
 
-Now DictTy in Type is just a form of type synomym:
+Now DictTy in Type is just a form of type synonym:
         DictTy c t = TyConTy CDict `AppTy` t
 
 Death to "ExpandingDicts".
@@ -112,10 +112,6 @@ Death to "ExpandingDicts".
 *                                                                      *
 ************************************************************************
 -}
-
-illegalHsigDefaultMethod :: Name -> TcRnMessage
-illegalHsigDefaultMethod n = TcRnUnknownMessage $ mkPlainError noHints $
-    text "Illegal default method(s) in class definition of" <+> ppr n <+> text "in hsig file"
 
 tcClassSigs :: Name                -- Name of the class
             -> [LSig GhcRn]
@@ -131,7 +127,7 @@ tcClassSigs clas sigs def_methods
        ; op_info <- concatMapM (addLocM (tc_sig gen_dm_env)) vanilla_sigs
 
        ; let op_names = mkNameSet [ n | (n,_,_) <- op_info ]
-       ; sequence_ [ failWithTc (badMethodErr clas n)
+       ; sequence_ [ failWithTc (TcRnBadMethodErr clas n)
                    | n <- dm_bind_names, not (n `elemNameSet` op_names) ]
                    -- Value binding for non class-method (ie no TypeSig)
 
@@ -142,11 +138,12 @@ tcClassSigs clas sigs def_methods
                -- (Generic signatures without value bindings indicate
                -- that a default of this form is expected to be
                -- provided.)
-               when (not (null def_methods)) $
-                failWithTc (illegalHsigDefaultMethod clas)
+               case bagToList def_methods of
+                 []           -> return ()
+                 meth : meths -> failWithTc (TcRnIllegalHsigDefaultMethods clas (meth NE.:| meths))
             else
                -- Error for each generic signature without value binding
-               sequence_ [ failWithTc (badGenericMethod clas n)
+               sequence_ [ failWithTc (TcRnBadGenericMethod clas n)
                          | (n,_) <- gen_dm_prs, not (n `elem` dm_bind_names) ]
 
        ; traceTc "tcClassSigs 2" (ppr clas)
@@ -237,7 +234,7 @@ tcDefMeth :: Class -> [TyVar] -> EvVar -> LHsBinds GhcRn
 
 tcDefMeth _ _ _ _ _ prag_fn (sel_id, Nothing)
   = do { -- No default method
-         mapM_ (addLocMA (badDmPrag sel_id))
+         mapM_ (addLocMA (badDmPrag sel_id ))
                (lookupPragEnv prag_fn (idName sel_id))
        ; return emptyBag }
 
@@ -263,9 +260,8 @@ tcDefMeth clas tyvars this_dict binds_in hs_sig_fn prag_fn
 
        ; spec_prags <- discardConstraints $
                        tcSpecPrags global_dm_id prags
-       ; let dia = TcRnUnknownMessage $
-               mkPlainDiagnostic WarningWithoutFlag noHints $
-                (text "Ignoring SPECIALISE pragmas on default method" <+> quotes (ppr sel_name))
+       ; let dia = TcRnIgnoreSpecialisePragmaOnDefMethod sel_name
+
        ; diagnosticTc (not (null spec_prags)) dia
 
        ; let hs_ty = hs_sig_fn sel_name
@@ -295,7 +291,7 @@ tcDefMeth clas tyvars this_dict binds_in hs_sig_fn prag_fn
 
              ctxt = FunSigCtxt sel_name warn_redundant
 
-       ; let local_dm_id = mkLocalId local_dm_name Many local_dm_ty
+       ; let local_dm_id = mkLocalId local_dm_name ManyTy local_dm_ty
              local_dm_sig = CompleteSig { sig_bndr = local_dm_id
                                         , sig_ctxt  = ctxt
                                         , sig_loc   = getLocA hs_ty }
@@ -341,7 +337,7 @@ tcClassMinimalDef _clas sigs op_info
         -- since you can't write a default implementation.
         when (tcg_src tcg_env /= HsigFile) $
             whenIsJust (isUnsatisfied (mindef `impliesAtom`) defMindef) $
-                       (\bf -> addDiagnosticTc (warningMinimalDefIncomplete bf))
+                       (\bf -> addDiagnosticTc (TcRnWarningMinimalDefIncomplete bf))
         return mindef
   where
     -- By default require all methods without a default implementation
@@ -404,7 +400,7 @@ findMinimalDef :: [LSig GhcRn] -> Maybe ClassMinimalDef
 findMinimalDef = firstJusts . map toMinimalDef
   where
     toMinimalDef :: LSig GhcRn -> Maybe ClassMinimalDef
-    toMinimalDef (L _ (MinimalSig _ _ (L _ bf))) = Just (fmap unLoc bf)
+    toMinimalDef (L _ (MinimalSig _ (L _ bf))) = Just (fmap unLoc bf)
     toMinimalDef _                               = Nothing
 
 {-
@@ -442,18 +438,6 @@ This makes the error messages right.
 ************************************************************************
 -}
 
-badMethodErr :: Outputable a => a -> Name -> TcRnMessage
-badMethodErr clas op
-  = TcRnUnknownMessage $ mkPlainError noHints $
-    hsep [text "Class", quotes (ppr clas),
-          text "does not have a method", quotes (ppr op)]
-
-badGenericMethod :: Outputable a => a -> Name -> TcRnMessage
-badGenericMethod clas op
-  = TcRnUnknownMessage $ mkPlainError noHints $
-    hsep [text "Class", quotes (ppr clas),
-          text "has a generic-default signature without a binding", quotes (ppr op)]
-
 {-
 badGenericInstanceType :: LHsBinds Name -> SDoc
 badGenericInstanceType binds
@@ -473,19 +457,10 @@ dupGenericInsts tc_inst_infos
   where
     ppr_inst_ty (_,inst) = ppr (simpleInstInfoTy inst)
 -}
+
 badDmPrag :: TcId -> Sig GhcRn -> TcM ()
 badDmPrag sel_id prag
-  = addErrTc (TcRnUnknownMessage $ mkPlainError noHints $
-    text "The" <+> hsSigDoc prag <+> text "for default method"
-              <+> quotes (ppr sel_id)
-              <+> text "lacks an accompanying binding")
-
-warningMinimalDefIncomplete :: ClassMinimalDef -> TcRnMessage
-warningMinimalDefIncomplete mindef
-  = TcRnUnknownMessage $ mkPlainDiagnostic WarningWithoutFlag noHints $
-  vcat [ text "The MINIMAL pragma does not require:"
-         , nest 2 (pprBooleanFormulaNice mindef)
-         , text "but there is no default implementation." ]
+  = addErrTc (TcRnDefaultMethodForPragmaLacksBinding sel_id prag)
 
 instDeclCtxt1 :: LHsSigType GhcRn -> SDoc
 instDeclCtxt1 hs_inst_ty
@@ -506,7 +481,7 @@ inst_decl_ctxt doc = hang (text "In the instance declaration for")
                         2 (quotes doc)
 
 tcATDefault :: SrcSpan
-            -> TCvSubst
+            -> Subst
             -> NameSet
             -> ClassATItem
             -> TcM [FamInst]
@@ -600,10 +575,10 @@ tcATDefault loc inst_subst defined_ats (ATI fam_tc defs)
 --   but it does not apply the substitution to the variables themselves. As
 --   such, 'substTyVarBndrs' returns a list of 'TyVar's rather than a list of
 --   'Type's.
-substATBndrs :: TCvSubst -> [TyVar] -> (TCvSubst, [Type])
+substATBndrs :: Subst -> [TyVar] -> (Subst, [Type])
 substATBndrs = mapAccumL substATBndr
   where
-    substATBndr :: TCvSubst -> TyVar -> (TCvSubst, Type)
+    substATBndr :: Subst -> TyVar -> (Subst, Type)
     substATBndr subst tc_tv
         -- Case (1) in the Haddocks
       | Just ty <- lookupVarEnv (getTvSubstEnv subst) tc_tv
@@ -622,10 +597,6 @@ warnMissingAT name
        -- hs-boot and signatures never need to provide complete "definitions"
        -- of any sort, as they aren't really defining anything, but just
        -- constraining items which are defined elsewhere.
-       ; let dia = TcRnUnknownMessage $
-               mkPlainDiagnostic (WarningWithFlag Opt_WarnMissingMethods) noHints $
-                 (text "No explicit" <+> text "associated type"
-                                     <+> text "or default declaration for"
-                                     <+> quotes (ppr name))
+       ; let dia = TcRnNoExplicitAssocTypeOrDefaultDeclaration name
        ; diagnosticTc  (warn && hsc_src == HsSrcFile) dia
                        }

@@ -16,15 +16,16 @@ module GHC.Data.BooleanFormula (
         pprBooleanFormula, pprBooleanFormulaNice
   ) where
 
-import GHC.Prelude
+import GHC.Prelude hiding ( init, last )
 
 import Data.List ( nub, intersperse )
+import Data.List.NonEmpty ( NonEmpty (..), init, last )
 import Data.Data
 
 import GHC.Utils.Monad
 import GHC.Utils.Outputable
 import GHC.Utils.Binary
-import GHC.Parser.Annotation ( LocatedL )
+import GHC.Parser.Annotation ( LocatedL, noLocA )
 import GHC.Types.SrcLoc
 import GHC.Types.Unique
 import GHC.Types.Unique.Set
@@ -227,7 +228,7 @@ pprBooleanFormulaNice = pprBooleanFormula' pprVar pprAnd pprOr 0
   pprAnd p = cparen (p > 1) . pprAnd'
   pprAnd' [] = empty
   pprAnd' [x,y] = x <+> text "and" <+> y
-  pprAnd' xs@(_:_) = fsep (punctuate comma (init xs)) <> text ", and" <+> last xs
+  pprAnd' (x:xs) = fsep (punctuate comma (init (x:|xs))) <> text ", and" <+> last (x:|xs)
   pprOr p xs = cparen (p > 1) $ text "either" <+> sep (intersperse (text "or") xs)
 
 instance (OutputableBndr a) => Outputable (BooleanFormula a) where
@@ -250,14 +251,14 @@ pprBooleanFormulaNormal = go
 
 instance Binary a => Binary (BooleanFormula a) where
   put_ bh (Var x)    = putByte bh 0 >> put_ bh x
-  put_ bh (And xs)   = putByte bh 1 >> put_ bh xs
-  put_ bh (Or  xs)   = putByte bh 2 >> put_ bh xs
-  put_ bh (Parens x) = putByte bh 3 >> put_ bh x
+  put_ bh (And xs)   = putByte bh 1 >> put_ bh (unLoc <$> xs)
+  put_ bh (Or  xs)   = putByte bh 2 >> put_ bh (unLoc <$> xs)
+  put_ bh (Parens x) = putByte bh 3 >> put_ bh (unLoc x)
 
   get bh = do
     h <- getByte bh
     case h of
-      0 -> Var    <$> get bh
-      1 -> And    <$> get bh
-      2 -> Or     <$> get bh
-      _ -> Parens <$> get bh
+      0 -> Var                  <$> get bh
+      1 -> And    . fmap noLocA <$> get bh
+      2 -> Or     . fmap noLocA <$> get bh
+      _ -> Parens . noLocA      <$> get bh

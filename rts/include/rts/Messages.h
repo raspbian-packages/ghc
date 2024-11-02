@@ -31,15 +31,15 @@
  * expected to return.
  */
 void barf(const char *s, ...)
-   GNUC3_ATTRIBUTE(__noreturn__)
+   STG_NORETURN
    STG_PRINTF_ATTR(1, 2);
 
 void vbarf(const char *s, va_list ap)
-   GNUC3_ATTRIBUTE(__noreturn__);
+   STG_NORETURN;
 
 // declared in Rts.h:
 // extern void _assertFail(const char *filename, unsigned int linenum)
-//    GNUC3_ATTRIBUTE(__noreturn__);
+//    STG_NORETURN;
 
 /*
  * An error condition which is caused by and/or can be corrected by
@@ -78,7 +78,6 @@ void debugBelch(const char *s, ...)
 
 int vdebugBelch(const char *s, va_list ap);
 
-
 /* Hooks for redirecting message generation: */
 
 typedef void RtsMsgFunction(const char *, va_list);
@@ -94,3 +93,8 @@ extern RtsMsgFunction rtsFatalInternalErrorFn;
 extern RtsMsgFunctionRetLen rtsDebugMsgFn;
 extern RtsMsgFunction rtsErrorMsgFn;
 extern RtsMsgFunction rtsSysErrorMsgFn;
+
+/* Used by code generator */
+void rtsBadAlignmentBarf(void) STG_NORETURN;
+void rtsOutOfBoundsAccess(void) STG_NORETURN;
+void rtsMemcpyRangeOverlap(void) STG_NORETURN;

@@ -1,9 +1,16 @@
 {-# LANGUAGE CPP #-}
+
 #if __GLASGOW_HASKELL__ >= 704
+{-# LANGUAGE DeriveGeneric, StandaloneDeriving #-}
+#endif
+
+-- Starting from directory-1.3.8.0 "System.Directory" is no longer Safe.
+#if __GLASGOW_HASKELL__ >= 704 && !MIN_VERSION_directory(1,3,8)
 {-# LANGUAGE Safe #-}
 #elif __GLASGOW_HASKELL__ >= 702
 {-# LANGUAGE Trustworthy #-}
 #endif
+
 -----------------------------------------
 -- Andy Gill and Colin Runciman, June 2006
 ------------------------------------------
@@ -22,7 +29,11 @@ module Trace.Hpc.Util
        , writeFileUtf8
        ) where
 
-import Control.DeepSeq (deepseq)
+#if __GLASGOW_HASKELL__ >= 704
+import GHC.Generics (Generic)
+#endif
+
+import Control.DeepSeq (deepseq, NFData)
 import qualified Control.Exception as Exception
 import Data.List(foldl')
 import Data.Char (ord)
@@ -80,6 +91,13 @@ class HpcHash a where
   toHash :: a -> Hash
 
 newtype Hash = Hash Word32 deriving (Eq)
+
+#if __GLASGOW_HASKELL__ >= 704
+-- | @since 0.6.2.0
+deriving instance (Generic Hash)
+-- | @since 0.6.2.0
+instance NFData Hash
+#endif
 
 instance Read Hash where
   readsPrec p n = [ (Hash v,rest)

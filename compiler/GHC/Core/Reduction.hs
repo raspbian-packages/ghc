@@ -35,14 +35,16 @@ import GHC.Core.TyCon      ( TyCon )
 import GHC.Core.Type
 
 import GHC.Data.Pair       ( Pair(Pair) )
+import GHC.Data.List.Infinite ( Infinite (..) )
+import qualified GHC.Data.List.Infinite as Inf
 
-import GHC.Types.Var       ( setTyVarKind )
+import GHC.Types.Var       ( VarBndr(..), setTyVarKind )
 import GHC.Types.Var.Env   ( mkInScopeSet )
 import GHC.Types.Var.Set   ( TyCoVarSet )
 
 import GHC.Utils.Misc      ( HasDebugCallStack, equalLength )
 import GHC.Utils.Outputable
-import GHC.Utils.Panic     ( assertPpr, panic )
+import GHC.Utils.Panic     ( assertPpr )
 
 {-
 %************************************************************************
@@ -349,25 +351,25 @@ mkAppRedn (Reduction co1 ty1) (Reduction co2 ty2)
 --
 -- Combines 'mkFunCo' and 'mkFunTy'.
 mkFunRedn :: Role
-          -> AnonArgFlag
+          -> FunTyFlag
           -> ReductionN -- ^ multiplicity reduction
           -> Reduction  -- ^ argument reduction
           -> Reduction  -- ^ result reduction
           -> Reduction
-mkFunRedn r vis
+mkFunRedn r af
   (Reduction w_co w_ty)
   (Reduction arg_co arg_ty)
   (Reduction res_co res_ty)
     = mkReduction
-        (mkFunCo r w_co arg_co res_co)
-        (mkFunTy vis w_ty arg_ty res_ty)
+        (mkFunCo1 r af w_co arg_co res_co)
+        (mkFunTy    af w_ty arg_ty res_ty)
 {-# INLINE mkFunRedn #-}
 
 -- | Create a 'Reduction' associated to a Π type,
 -- from a kind 'Reduction' and a body 'Reduction'.
 --
 -- Combines 'mkForAllCo' and 'mkForAllTy'.
-mkForAllRedn :: ArgFlag
+mkForAllRedn :: ForAllTyFlag
              -> TyVar
              -> ReductionN -- ^ kind reduction
              -> Reduction  -- ^ body reduction
@@ -375,7 +377,7 @@ mkForAllRedn :: ArgFlag
 mkForAllRedn vis tv1 (Reduction h ki') (Reduction co ty)
   = mkReduction
       (mkForAllCo tv1 h co)
-      (mkForAllTy tv2 vis ty)
+      (mkForAllTy (Bndr tv2 vis) ty)
   where
     tv2 = setTyVarKind tv1 ki'
 {-# INLINE mkForAllRedn #-}
@@ -784,11 +786,11 @@ data ArgsReductions =
 -- This function is only called in two locations, so the amount of code duplication
 -- should be rather reasonable despite the size of the function.
 simplifyArgsWorker :: HasDebugCallStack
-                   => [TyCoBinder] -> Kind
+                   => [PiTyBinder] -> Kind
                        -- the binders & result kind (not a Π-type) of the function applied to the args
                        -- list of binders can be shorter or longer than the list of args
                    -> TyCoVarSet   -- free vars of the args
-                   -> [Role]       -- list of roles, r
+                   -> Infinite Role-- list of roles, r
                    -> [Reduction]  -- rewritten type arguments, arg_i
                                    -- each comes with the coercion used to rewrite it,
                                    -- arg_co_i :: ty_i ~ arg_i
@@ -810,10 +812,10 @@ simplifyArgsWorker orig_ki_binders orig_inner_ki orig_fvs
     orig_lc = emptyLiftingContext $ mkInScopeSet orig_fvs
 
     go :: LiftingContext  -- mapping from tyvars to rewriting coercions
-       -> [TyCoBinder]    -- Unsubsted binders of function's kind
-       -> Kind        -- Unsubsted result kind of function (not a Pi-type)
-       -> [Role]      -- Roles at which to rewrite these ...
-       -> [Reduction] -- rewritten arguments, with their rewriting coercions
+       -> [PiTyBinder]    -- Unsubsted binders of function's kind
+       -> Kind            -- Unsubsted result kind of function (not a Pi-type)
+       -> Infinite Role   -- Roles at which to rewrite these ...
+       -> [Reduction]     -- rewritten arguments, with their rewriting coercions
        -> ArgsReductions
     go !lc binders inner_ki _ []
         -- The !lc makes the function strict in the lifting context
@@ -826,10 +828,10 @@ simplifyArgsWorker orig_ki_binders orig_inner_ki orig_fvs
         kind_co | noFreeVarsOfType final_kind = MRefl
                 | otherwise                   = MCo $ liftCoSubst Nominal lc final_kind
 
-    go lc (binder:binders) inner_ki (role:roles) (arg_redn:arg_redns)
+    go lc (binder:binders) inner_ki (Inf role roles) (arg_redn:arg_redns)
       =  -- We rewrite an argument ty with arg_redn = Reduction arg_co arg
          -- By Note [Rewriting] in GHC.Tc.Solver.Rewrite invariant (F2),
-         -- tcTypeKind(ty) = tcTypeKind(arg).
+         -- typeKind(ty) = typeKind(arg).
          -- However, it is possible that arg will be used as an argument to a function
          -- whose kind is different, if earlier arguments have been rewritten.
          -- We thus need to compose the reduction with a kind coercion to ensure
@@ -837,11 +839,11 @@ simplifyArgsWorker orig_ki_binders orig_inner_ki orig_fvs
          --
          -- The bangs here have been observed to improve performance
          -- significantly in optimized builds; see #18502
-         let !kind_co = liftCoSubst Nominal lc (tyCoBinderType binder)
+         let !kind_co = liftCoSubst Nominal lc (piTyBinderType binder)
              !(Reduction casted_co casted_xi)
                       = mkCoherenceRightRedn role arg_redn kind_co
          -- now, extend the lifting context with the new binding
-             !new_lc | Just tv <- tyCoBinderVar_maybe binder
+             !new_lc | Just tv <- namedPiTyBinder_maybe binder
                      = extendLiftingContextAndInScope lc tv casted_co
                      | otherwise
                      = lc
@@ -859,7 +861,7 @@ simplifyArgsWorker orig_ki_binders orig_inner_ki orig_fvs
             (arg_cos, res_co)     = decomposePiCos co1 co1_kind unrewritten_tys
             casted_args           = assertPpr (equalLength arg_redns arg_cos)
                                               (ppr arg_redns $$ ppr arg_cos)
-                                  $ zipWith3 mkCoherenceRightRedn roles arg_redns arg_cos
+                                  $ zipWith3 mkCoherenceRightRedn (Inf.toList roles) arg_redns arg_cos
                -- In general decomposePiCos can return fewer cos than tys,
                -- but not here; because we're well typed, there will be enough
                -- binders. Note that decomposePiCos does substitutions, so even
@@ -874,19 +876,3 @@ simplifyArgsWorker orig_ki_binders orig_inner_ki orig_fvs
               = go zapped_lc bndrs new_inner roles casted_args
         in
           ArgsReductions redns_out (res_co `mkTransMCoR` res_co_out)
-
-    go _ _ _ _ _ = panic
-        "simplifyArgsWorker wandered into deeper water than usual"
-           -- This debug information is commented out because leaving it in
-           -- causes a ~2% increase in allocations in T9872d.
-           -- That's independent of the analogous case in rewrite_args_fast
-           -- in GHC.Tc.Solver.Rewrite:
-           -- each of these causes a 2% increase on its own, so commenting them
-           -- both out gives a 4% decrease in T9872d.
-           {-
-
-             (vcat [ppr orig_binders,
-                    ppr orig_inner_ki,
-                    ppr (take 10 orig_roles), -- often infinite!
-                    ppr orig_tys])
-           -}

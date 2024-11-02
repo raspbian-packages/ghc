@@ -55,10 +55,6 @@ module GHC.Hs.Utils(
   mkLHsTupleExpr, mkLHsVarTuple, missingTupArg,
   mkLocatedList,
 
-  -- * Constructing general big tuples
-  -- $big_tuples
-  mkChunkified, chunkify,
-
   -- * Bindings
   mkFunBind, mkVarBind, mkHsVarBind, mkSimpleGeneratedFunBind, mkTopFunBind,
   mkPatSynBind,
@@ -66,7 +62,7 @@ module GHC.Hs.Utils(
   spanHsLocaLBinds,
 
   -- * Literals
-  mkHsIntegral, mkHsFractional, mkHsIsString, mkHsString, mkHsStringPrimLit,
+  mkHsIntegral, mkHsFractional, mkHsIsString, mkHsString, mkHsStringFS, mkHsStringPrimLit,
   mkHsCharPrimLit,
 
   -- * Patterns
@@ -89,10 +85,6 @@ module GHC.Hs.Utils(
   unitRecStmtTc,
   mkLetStmt,
 
-  -- * Template Haskell
-  mkUntypedSplice, mkTypedSplice,
-  mkHsQuasiQuote,
-
   -- * Collecting binders
   isUnliftedHsBind, isBangedHsBind,
 
@@ -113,7 +105,7 @@ module GHC.Hs.Utils(
   lStmtsImplicits, hsValBindsImplicits, lPatImplicits
   ) where
 
-import GHC.Prelude
+import GHC.Prelude hiding (head, init, last, tail)
 
 import GHC.Hs.Decls
 import GHC.Hs.Binds
@@ -126,12 +118,16 @@ import GHC.Hs.Extension
 import GHC.Parser.Annotation
 
 import GHC.Tc.Types.Evidence
-import GHC.Core.TyCo.Rep
-import GHC.Core.Multiplicity ( pattern Many )
-import GHC.Builtin.Types ( unitTy )
-import GHC.Tc.Utils.TcType
+
+import GHC.Core.Coercion( isReflCo )
+import GHC.Core.Multiplicity ( pattern ManyTy )
 import GHC.Core.DataCon
 import GHC.Core.ConLike
+import GHC.Core.Make   ( mkChunkified )
+import GHC.Core.Type   ( Type, isUnliftedType )
+
+import GHC.Builtin.Types ( unitTy )
+
 import GHC.Types.Id
 import GHC.Types.Name
 import GHC.Types.Name.Set hiding ( unitFV )
@@ -142,17 +138,20 @@ import GHC.Types.Basic
 import GHC.Types.SrcLoc
 import GHC.Types.Fixity
 import GHC.Types.SourceText
+
 import GHC.Data.FastString
 import GHC.Data.Bag
-import GHC.Settings.Constants
 
 import GHC.Utils.Misc
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
 
 import Data.Either
+import Data.Foldable ( toList )
 import Data.Function
 import Data.List ( partition, deleteBy )
+import Data.List.NonEmpty ( nonEmpty )
+import qualified Data.List.NonEmpty as NE
 
 {-
 ************************************************************************
@@ -200,7 +199,7 @@ unguardedRHS :: Anno (GRHS (GhcPass p) (LocatedA (body (GhcPass p))))
 unguardedRHS an loc rhs = [L (noAnnSrcSpan loc) (GRHS an [] rhs)]
 
 type AnnoBody p body
-  = ( XMG (GhcPass p) (LocatedA (body (GhcPass p))) ~ NoExtField
+  = ( XMG (GhcPass p) (LocatedA (body (GhcPass p))) ~ Origin
     , Anno [LocatedA (Match (GhcPass p) (LocatedA (body (GhcPass p))))] ~ SrcSpanAnnL
     , Anno (Match (GhcPass p) (LocatedA (body (GhcPass p)))) ~ SrcSpanAnnA
     )
@@ -209,9 +208,8 @@ mkMatchGroup :: AnnoBody p body
              => Origin
              -> LocatedL [LocatedA (Match (GhcPass p) (LocatedA (body (GhcPass p))))]
              -> MatchGroup (GhcPass p) (LocatedA (body (GhcPass p)))
-mkMatchGroup origin matches = MG { mg_ext = noExtField
-                                 , mg_alts = matches
-                                 , mg_origin = origin }
+mkMatchGroup origin matches = MG { mg_ext = origin
+                                 , mg_alts = matches }
 
 mkLamCaseMatchGroup :: AnnoBody p body
                     => Origin
@@ -224,8 +222,9 @@ mkLamCaseMatchGroup origin lc_variant (L l matches)
 
 mkLocatedList :: Semigroup a
   => [GenLocated (SrcAnn a) e2] -> LocatedAn an [GenLocated (SrcAnn a) e2]
-mkLocatedList [] = noLocA []
-mkLocatedList ms = L (noAnnSrcSpan $ locA $ combineLocsA (head ms) (last ms)) ms
+mkLocatedList ms = case nonEmpty ms of
+    Nothing -> noLocA []
+    Just ms1 -> L (noAnnSrcSpan $ locA $ combineLocsA (NE.head ms1) (NE.last ms1)) ms
 
 mkHsApp :: LHsExpr (GhcPass id) -> LHsExpr (GhcPass id) -> LHsExpr (GhcPass id)
 mkHsApp e1 e2 = addCLocAA e1 e2 (HsApp noComments e1 e2)
@@ -249,7 +248,7 @@ mkHsAppsWith
 mkHsAppsWith mkLocated = foldl' (mkHsAppWith mkLocated)
 
 mkHsAppType :: LHsExpr GhcRn -> LHsWcType GhcRn -> LHsExpr GhcRn
-mkHsAppType e t = addCLocAA t_body e (HsAppType noExtField e paren_wct)
+mkHsAppType e t = addCLocAA t_body e (HsAppType noExtField e noHsTok paren_wct)
   where
     t_body    = hswc_body t
     paren_wct = t { hswc_body = parenthesizeHsType appPrec t_body }
@@ -257,7 +256,7 @@ mkHsAppType e t = addCLocAA t_body e (HsAppType noExtField e paren_wct)
 mkHsAppTypes :: LHsExpr GhcRn -> [LHsWcType GhcRn] -> LHsExpr GhcRn
 mkHsAppTypes = foldl' mkHsAppType
 
-mkHsLam :: (IsPass p, XMG (GhcPass p) (LHsExpr (GhcPass p)) ~ NoExtField)
+mkHsLam :: (IsPass p, XMG (GhcPass p) (LHsExpr (GhcPass p)) ~ Origin)
         => [LPat (GhcPass p)]
         -> LHsExpr (GhcPass p)
         -> LHsExpr (GhcPass p)
@@ -269,7 +268,7 @@ mkHsLam pats body = mkHsPar (L (getLoc body) (HsLam noExtField matches))
 
 mkHsLams :: [TyVar] -> [EvVar] -> LHsExpr GhcTc -> LHsExpr GhcTc
 mkHsLams tyvars dicts expr = mkLHsWrap (mkWpTyLams tyvars
-                                       <.> mkWpLams dicts) expr
+                                       <.> mkWpEvLams dicts) expr
 
 -- |A simple case alternative with a single pattern, no binds, no guards;
 -- pre-typechecking
@@ -345,13 +344,17 @@ emptyRecStmtName :: (Anno [GenLocated
                         ~ SrcSpanAnnL)
                  => StmtLR GhcRn GhcRn bodyR
 emptyRecStmtId   :: Stmt GhcTc (LocatedA (HsCmd GhcTc))
-mkRecStmt        :: (Anno [GenLocated
+
+mkRecStmt :: forall (idL :: Pass) bodyR.
+                    (Anno [GenLocated
                              (Anno (StmtLR (GhcPass idL) GhcPs bodyR))
                              (StmtLR (GhcPass idL) GhcPs bodyR)]
                         ~ SrcSpanAnnL)
                  => EpAnn AnnList
                  -> LocatedL [LStmtLR (GhcPass idL) GhcPs bodyR]
                  -> StmtLR (GhcPass idL) GhcPs bodyR
+mkRecStmt anns stmts  = (emptyRecStmt' anns :: StmtLR (GhcPass idL) GhcPs bodyR)
+                             { recS_stmts = stmts }
 
 
 mkHsIntegral     i  = OverLit noExtField (HsIntegral       i)
@@ -411,7 +414,7 @@ mkTcBindStmt pat body = BindStmt (XBindStmtTc { xbstc_bindOp = noSyntaxExpr,
                                                 xbstc_boundResultType = unitTy,
                                                    -- unitTy is a dummy value
                                                    -- can't panic here: it's forced during zonking
-                                                xbstc_boundResultMult = Many,
+                                                xbstc_boundResultMult = ManyTy,
                                                 xbstc_failOp = Nothing }) pat body
 
 emptyRecStmt' :: forall idL idR body .
@@ -438,7 +441,6 @@ emptyRecStmt     = emptyRecStmt' noAnn
 emptyRecStmtName = emptyRecStmt' noExtField
 emptyRecStmtId   = emptyRecStmt' unitRecStmtTc
                                         -- a panic might trigger during zonking
-mkRecStmt anns stmts  = (emptyRecStmt' anns) { recS_stmts = stmts }
 
 mkLetStmt :: EpAnn [AddEpAnn] -> HsLocalBinds GhcPs -> StmtLR GhcPs GhcPs (LocatedA b)
 mkLetStmt anns binds = LetStmt anns binds
@@ -449,21 +451,11 @@ mkLetStmt anns binds = LetStmt anns binds
 mkHsOpApp :: LHsExpr GhcPs -> IdP GhcPs -> LHsExpr GhcPs -> HsExpr GhcPs
 mkHsOpApp e1 op e2 = OpApp noAnn e1 (noLocA (HsVar noExtField (noLocA op))) e2
 
-unqualSplice :: RdrName
-unqualSplice = mkRdrUnqual (mkVarOccFS (fsLit "splice"))
-
-mkUntypedSplice :: EpAnn [AddEpAnn] -> SpliceDecoration -> LHsExpr GhcPs -> HsSplice GhcPs
-mkUntypedSplice ann hasParen e = HsUntypedSplice ann hasParen unqualSplice e
-
-mkTypedSplice :: EpAnn [AddEpAnn] -> SpliceDecoration -> LHsExpr GhcPs -> HsSplice GhcPs
-mkTypedSplice ann hasParen e = HsTypedSplice ann hasParen unqualSplice e
-
-mkHsQuasiQuote :: RdrName -> SrcSpan -> FastString -> HsSplice GhcPs
-mkHsQuasiQuote quoter span quote
-  = HsQuasiQuote noExtField unqualSplice quoter span quote
-
 mkHsString :: String -> HsLit (GhcPass p)
 mkHsString s = HsString NoSourceText (mkFastString s)
+
+mkHsStringFS :: FastString -> HsLit (GhcPass p)
+mkHsStringFS s = HsString NoSourceText s
 
 mkHsStringPrimLit :: FastString -> HsLit (GhcPass p)
 mkHsStringPrimLit fs = HsStringPrim NoSourceText (bytesFS fs)
@@ -670,7 +662,7 @@ missingTupArg ann = Missing ann
 mkLHsPatTup :: [LPat GhcRn] -> LPat GhcRn
 mkLHsPatTup []     = noLocA $ TuplePat noExtField [] Boxed
 mkLHsPatTup [lpat] = lpat
-mkLHsPatTup lpats  = L (getLoc (head lpats)) $ TuplePat noExtField lpats Boxed
+mkLHsPatTup lpats@(lpat:_) = L (getLoc lpat) $ TuplePat noExtField lpats Boxed
 
 -- | The Big equivalents for the source tuple expressions
 mkBigLHsVarTup :: IsSrcSpanAnn p a
@@ -688,47 +680,6 @@ mkBigLHsVarPatTup bs = mkBigLHsPatTup (map nlVarPat bs)
 
 mkBigLHsPatTup :: [LPat GhcRn] -> LPat GhcRn
 mkBigLHsPatTup = mkChunkified mkLHsPatTup
-
--- $big_tuples
--- #big_tuples#
---
--- GHCs built in tuples can only go up to 'mAX_TUPLE_SIZE' in arity, but
--- we might conceivably want to build such a massive tuple as part of the
--- output of a desugaring stage (notably that for list comprehensions).
---
--- We call tuples above this size \"big tuples\", and emulate them by
--- creating and pattern matching on >nested< tuples that are expressible
--- by GHC.
---
--- Nesting policy: it's better to have a 2-tuple of 10-tuples (3 objects)
--- than a 10-tuple of 2-tuples (11 objects), so we want the leaves of any
--- construction to be big.
---
--- If you just use the 'mkBigCoreTup', 'mkBigCoreVarTupTy', 'mkTupleSelector'
--- and 'mkTupleCase' functions to do all your work with tuples you should be
--- fine, and not have to worry about the arity limitation at all.
-
--- | Lifts a \"small\" constructor into a \"big\" constructor by recursive decomposition
-mkChunkified :: ([a] -> a)      -- ^ \"Small\" constructor function, of maximum input arity 'mAX_TUPLE_SIZE'
-             -> [a]             -- ^ Possible \"big\" list of things to construct from
-             -> a               -- ^ Constructed thing made possible by recursive decomposition
-mkChunkified small_tuple as = mk_big_tuple (chunkify as)
-  where
-        -- Each sub-list is short enough to fit in a tuple
-    mk_big_tuple [as] = small_tuple as
-    mk_big_tuple as_s = mk_big_tuple (chunkify (map small_tuple as_s))
-
-chunkify :: [a] -> [[a]]
--- ^ Split a list into lists that are small enough to have a corresponding
--- tuple arity. The sub-lists of the result all have length <= 'mAX_TUPLE_SIZE'
--- But there may be more than 'mAX_TUPLE_SIZE' sub-lists
-chunkify xs
-  | n_xs <= mAX_TUPLE_SIZE = [xs]
-  | otherwise              = split xs
-  where
-    n_xs     = length xs
-    split [] = []
-    split xs = take mAX_TUPLE_SIZE xs : split (drop mAX_TUPLE_SIZE xs)
 
 {-
 ************************************************************************
@@ -823,7 +774,7 @@ mkHsWrapPat co_fn p ty | isIdHsWrapper co_fn = p
                        | otherwise           = XPat $ CoPat co_fn p ty
 
 mkHsWrapPatCo :: TcCoercionN -> Pat GhcTc -> Type -> Pat GhcTc
-mkHsWrapPatCo co pat ty | isTcReflCo co = pat
+mkHsWrapPatCo co pat ty | isReflCo co = pat
                         | otherwise     = XPat $ CoPat (mkWpCastN co) pat ty
 
 mkHsDictLet :: TcEvBinds -> LHsExpr GhcTc -> LHsExpr GhcTc
@@ -845,7 +796,7 @@ mkFunBind origin fn ms
   = FunBind { fun_id = fn
             , fun_matches = mkMatchGroup origin (noLocA ms)
             , fun_ext = noExtField
-            , fun_tick = [] }
+            }
 
 mkTopFunBind :: Origin -> LocatedN Name -> [LMatch GhcRn (LHsExpr GhcRn)]
              -> HsBind GhcRn
@@ -854,7 +805,7 @@ mkTopFunBind origin fn ms = FunBind { fun_id = fn
                                     , fun_matches = mkMatchGroup origin (noLocA ms)
                                     , fun_ext  = emptyNameSet -- NB: closed
                                                               --     binding
-                                    , fun_tick = [] }
+                                    }
 
 mkHsVarBind :: SrcSpan -> RdrName -> LHsExpr GhcPs -> LHsBind GhcPs
 mkHsVarBind loc var rhs = mkSimpleGeneratedFunBind loc var [] rhs
@@ -877,7 +828,7 @@ mkPatSynBind name details lpat dir anns = PatSynBind noExtField psb
 -- |If any of the matches in the 'FunBind' are infix, the 'FunBind' is
 -- considered infix.
 isInfixFunBind :: forall id1 id2. UnXRec id2 => HsBindLR id1 id2 -> Bool
-isInfixFunBind (FunBind { fun_matches = MG _ matches _ })
+isInfixFunBind (FunBind { fun_matches = MG _ matches })
   = any (isInfixMatch . unXRec @id2) (unXRec @id2 matches)
 isInfixFunBind _ = False
 
@@ -1203,7 +1154,7 @@ collect_pat flag pat bndrs = case pat of
   WildPat _             -> bndrs
   LazyPat _ pat         -> collect_lpat flag pat bndrs
   BangPat _ pat         -> collect_lpat flag pat bndrs
-  AsPat _ a pat         -> unXRec @p a : collect_lpat flag pat bndrs
+  AsPat _ a _ pat       -> unXRec @p a : collect_lpat flag pat bndrs
   ViewPat _ _ pat       -> collect_lpat flag pat bndrs
   ParPat _ _ pat _      -> collect_lpat flag pat bndrs
   ListPat _ pats        -> foldr (collect_lpat flag) bndrs pats
@@ -1214,9 +1165,7 @@ collect_pat flag pat bndrs = case pat of
   NPlusKPat _ n _ _ _ _ -> unXRec @p n : bndrs
   SigPat _ pat _        -> collect_lpat flag pat bndrs
   XPat ext              -> collectXXPat @p flag ext bndrs
-  SplicePat _ (HsSpliced _ _ (HsSplicedPat pat))
-                        -> collect_pat flag pat bndrs
-  SplicePat _ _         -> bndrs
+  SplicePat ext _       -> collectXSplicePat @p flag ext bndrs
   -- See Note [Dictionary binders in ConPatOut]
   ConPat {pat_args=ps}  -> case flag of
     CollNoDictBinders   -> foldr (collect_lpat flag) bndrs (hsConPatArgs ps)
@@ -1242,6 +1191,7 @@ add_ev_bndr (EvBind { eb_lhs = b }) bs | isId b    = b:bs
 class UnXRec p => CollectPass p where
   collectXXPat :: CollectFlag p -> XXPat p -> [IdP p] -> [IdP p]
   collectXXHsBindsLR :: forall pR. XXHsBindsLR p pR -> [IdP p] -> [IdP p]
+  collectXSplicePat :: CollectFlag p -> XSplicePat p -> [IdP p] -> [IdP p]
 
 instance IsPass p => CollectPass (GhcPass p) where
   collectXXPat flag ext =
@@ -1262,6 +1212,13 @@ instance IsPass p => CollectPass (GhcPass p) where
         -- I don't think we want the binders from the abe_binds
 
         -- binding (hence see AbsBinds) is in zonking in GHC.Tc.Utils.Zonk
+
+  collectXSplicePat flag ext =
+      case ghcPass @p of
+        GhcPs -> id
+        GhcRn | (HsUntypedSpliceTop _ pat) <- ext -> collect_pat flag pat
+        GhcRn | (HsUntypedSpliceNested _)  <- ext -> id
+        GhcTc -> dataConCantHappen ext
 
 
 {-
@@ -1448,7 +1405,7 @@ hsDataDefnBinders :: IsPass p
                   => HsDataDefn (GhcPass p)
                   -> ([LocatedA (IdP (GhcPass p))], [LFieldOcc (GhcPass p)])
 hsDataDefnBinders (HsDataDefn { dd_cons = cons })
-  = hsConDeclsBinders cons
+  = hsConDeclsBinders (toList cons)
   -- See Note [Binders in family instances]
 
 -------------------
@@ -1475,7 +1432,7 @@ hsConDeclsBinders cons
            -- remove only the first occurrence of any seen field in order to
            -- avoid circumventing detection of duplicate fields (#9156)
            ConDeclGADT { con_names = names, con_g_args = args }
-             -> (map (L loc . unLoc) names ++ ns, flds ++ fs)
+             -> (toList (L loc . unLoc <$> names) ++ ns, flds ++ fs)
              where
                 (remSeen', flds) = get_flds_gadt remSeen args
                 (ns, fs) = go remSeen' rs
@@ -1593,7 +1550,7 @@ lPatImplicits = hs_lpat
 
     hs_pat (LazyPat _ pat)      = hs_lpat pat
     hs_pat (BangPat _ pat)      = hs_lpat pat
-    hs_pat (AsPat _ _ pat)      = hs_lpat pat
+    hs_pat (AsPat _ _ _ pat)    = hs_lpat pat
     hs_pat (ViewPat _ _ pat)    = hs_lpat pat
     hs_pat (ParPat _ _ pat _)   = hs_lpat pat
     hs_pat (ListPat _ pats)     = hs_lpats pats
@@ -1618,7 +1575,7 @@ lPatImplicits = hs_lpat
             (explicit, implicit) = partitionEithers [if pat_explicit then Left fld else Right fld
                                                     | (i, fld) <- [0..] `zip` rec_flds fs
                                                     ,  let  pat_explicit =
-                                                              maybe True ((i<) . unLoc)
+                                                              maybe True ((i<) . unRecFieldsDotDot . unLoc)
                                                                          (rec_dotdot fs)]
             err_loc = maybe (getLocA n) getLoc (rec_dotdot fs)
 

@@ -1,3 +1,22 @@
+0.10.7 [2022.12.04]
+-------------------
+* On pre-8.0 GHCs, drop the `call-stack` dependency. This dependency was
+  introduced in `exceptions-0.10.6`, but it induced breakage in libraries
+  that derived instances of `MonadThrow`, `MonadCatch`, or `MonadMask` for
+  newtypes without first enabling `ConstraintKinds` and `FlexibleContexts`.
+  (Later versions of GHC do not require these language extensions for derived
+  instances, so only old GHCs were affected.) To avoid breakage, `exceptions`
+  no longer uses `HasCallStack` constraints on pre-8.0 versions of GHC.
+
+  Note that `exceptions` still uses `HasCallStack` constraints on GHC 8.0 and
+  later, and as a result, these versions of GHC are unaffected by this change.
+
+0.10.6 [2022.11.30]
+-------------------
+* The class methods and functions in `Control.Monad.Catch` now have
+  `HasCallStack` constraints.
+* Drop support for GHC 7.0 and 7.2.
+
 0.10.5 [2022.05.07]
 -------------------
 * Allow building with `transformers-0.6.*` and `mtl-2.3.*`.

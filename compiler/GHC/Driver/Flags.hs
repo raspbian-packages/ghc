@@ -1,8 +1,11 @@
 module GHC.Driver.Flags
    ( DumpFlag(..)
+   , getDumpFlagFrom
+   , enabledIfVerbose
    , GeneralFlag(..)
    , Language(..)
    , optimisationFlags
+   , codeGenFlags
 
    -- * Warnings
    , WarningFlag(..)
@@ -24,6 +27,7 @@ import GHC.Utils.Outputable
 import GHC.Utils.Binary
 import GHC.Data.EnumSet as EnumSet
 
+import Control.DeepSeq
 import Control.Monad (guard)
 import Data.List.NonEmpty (NonEmpty(..))
 import Data.Maybe (fromMaybe,mapMaybe)
@@ -37,6 +41,9 @@ instance Outputable Language where
 instance Binary Language where
   put_ bh = put_ bh . fromEnum
   get bh = toEnum <$> get bh
+
+instance NFData Language where
+  rnf x = x `seq` ()
 
 -- | Debugging flags
 data DumpFlag
@@ -64,6 +71,7 @@ data DumpFlag
    | Opt_D_dump_cmm_split
    | Opt_D_dump_cmm_info
    | Opt_D_dump_cmm_cps
+   | Opt_D_dump_cmm_thread_sanitizer
    -- end cmm subflags
    | Opt_D_dump_cfg_weights -- ^ Dump the cfg used for block layout.
    | Opt_D_dump_asm
@@ -75,6 +83,7 @@ data DumpFlag
    | Opt_D_dump_asm_stats
    | Opt_D_dump_c_backend
    | Opt_D_dump_llvm
+   | Opt_D_dump_js
    | Opt_D_dump_core_stats
    | Opt_D_dump_deriv
    | Opt_D_dump_ds
@@ -141,13 +150,55 @@ data DumpFlag
    | Opt_D_no_debug_output
    | Opt_D_dump_faststrings
    | Opt_D_faststring_stats
+   | Opt_D_ipe_stats
    deriving (Eq, Show, Enum)
+
+-- | Helper function to query whether a given `DumpFlag` is enabled or not.
+getDumpFlagFrom
+  :: (a -> Int) -- ^ Getter for verbosity setting
+  -> (a -> EnumSet DumpFlag) -- ^ Getter for the set of enabled dump flags
+  -> DumpFlag -> a -> Bool
+getDumpFlagFrom getVerbosity getFlags f x
+  =  (f `EnumSet.member` getFlags x)
+  || (getVerbosity x >= 4 && enabledIfVerbose f)
+
+-- | Is the flag implicitly enabled when the verbosity is high enough?
+enabledIfVerbose :: DumpFlag -> Bool
+enabledIfVerbose Opt_D_dump_tc_trace               = False
+enabledIfVerbose Opt_D_dump_rn_trace               = False
+enabledIfVerbose Opt_D_dump_cs_trace               = False
+enabledIfVerbose Opt_D_dump_if_trace               = False
+enabledIfVerbose Opt_D_dump_tc                     = False
+enabledIfVerbose Opt_D_dump_rn                     = False
+enabledIfVerbose Opt_D_dump_rn_stats               = False
+enabledIfVerbose Opt_D_dump_hi_diffs               = False
+enabledIfVerbose Opt_D_verbose_core2core           = False
+enabledIfVerbose Opt_D_verbose_stg2stg             = False
+enabledIfVerbose Opt_D_dump_splices                = False
+enabledIfVerbose Opt_D_th_dec_file                 = False
+enabledIfVerbose Opt_D_dump_rule_firings           = False
+enabledIfVerbose Opt_D_dump_rule_rewrites          = False
+enabledIfVerbose Opt_D_dump_simpl_trace            = False
+enabledIfVerbose Opt_D_dump_rtti                   = False
+enabledIfVerbose Opt_D_dump_inlinings              = False
+enabledIfVerbose Opt_D_dump_verbose_inlinings      = False
+enabledIfVerbose Opt_D_dump_core_stats             = False
+enabledIfVerbose Opt_D_dump_asm_stats              = False
+enabledIfVerbose Opt_D_dump_types                  = False
+enabledIfVerbose Opt_D_dump_simpl_iterations       = False
+enabledIfVerbose Opt_D_dump_ticked                 = False
+enabledIfVerbose Opt_D_dump_view_pattern_commoning = False
+enabledIfVerbose Opt_D_dump_mod_cycles             = False
+enabledIfVerbose Opt_D_dump_mod_map                = False
+enabledIfVerbose Opt_D_dump_ec_trace               = False
+enabledIfVerbose _                                 = True
 
 -- | Enumerates the simple on-or-off dynamic flags
 data GeneralFlag
 -- See Note [Updating flag description in the User's Guide]
 
    = Opt_DumpToFile                     -- ^ Append dump output to files instead of stdout.
+   | Opt_DumpWithWays                   -- ^ Use foo.ways.<dumpFlag> instead of foo.<dumpFlag>
    | Opt_D_dump_minimal_imports
    | Opt_DoCoreLinting
    | Opt_DoLinearCoreLinting
@@ -162,6 +213,8 @@ data GeneralFlag
 
    | Opt_DistinctConstructorTables
    | Opt_InfoTableMap
+   | Opt_InfoTableMapWithFallback
+   | Opt_InfoTableMapWithStack
 
    | Opt_WarnIsError                    -- -Werror; makes warnings fatal
    | Opt_ShowWarnGroups                 -- Show the group a warning belongs to
@@ -176,6 +229,7 @@ data GeneralFlag
    | Opt_PrintUnicodeSyntax
    | Opt_PrintExpandedSynonyms
    | Opt_PrintPotentialInstances
+   | Opt_PrintRedundantPromotionTicks
    | Opt_PrintTypecheckerElaboration
 
    -- optimisation opts
@@ -187,10 +241,16 @@ data GeneralFlag
    | Opt_KillOneShot
    | Opt_FullLaziness
    | Opt_FloatIn
+   | Opt_LocalFloatOut -- ^ Enable floating out of let-bindings in the
+                      --   simplifier
+   | Opt_LocalFloatOutTopLevel -- ^ Enable floating out of let-bindings at the
+                               --   top level in the simplifier
+                               --   N.B. See Note [RHS Floating]
    | Opt_LateSpecialise
    | Opt_Specialise
    | Opt_SpecialiseAggressively
    | Opt_CrossModuleSpecialise
+   | Opt_PolymorphicSpecialisation
    | Opt_InlineGenerics
    | Opt_InlineGenericsAggressively
    | Opt_StaticArgumentTransformation
@@ -213,7 +273,6 @@ data GeneralFlag
    | Opt_RegsGraph                      -- do graph coloring register allocation
    | Opt_RegsIterative                  -- do iterative coalescing graph coloring register allocation
    | Opt_PedanticBottoms                -- Be picky about how we treat bottom
-   | Opt_LlvmTBAA                       -- Use LLVM TBAA infrastructure for improving AA (hidden flag)
    | Opt_LlvmFillUndefWithGarbage       -- Testing for undef bugs (hidden flag)
    | Opt_IrrefutableTuples
    | Opt_CmmSink
@@ -304,6 +363,7 @@ data GeneralFlag
    | Opt_Ticky_Dyn_Thunk
    | Opt_Ticky_Tag
    | Opt_Ticky_AP                    -- ^ Use regular thunks even when we could use std ap thunks in order to get entry counts
+   | Opt_CmmThreadSanitizer
    | Opt_RPath
    | Opt_RelativeDynlibPaths
    | Opt_CompactUnwind               -- ^ @-fcompact-unwind@
@@ -314,7 +374,7 @@ data GeneralFlag
    | Opt_VersionMacros
    | Opt_WholeArchiveHsLibs
    -- copy all libs into a single folder prior to linking binaries
-   -- this should elivate the excessive command line limit restrictions
+   -- this should alleviate the excessive command line limit restrictions
    -- on windows, by only requiring a single -L argument instead of
    -- one for each dependency.  At the time of this writing, gcc
    -- forwards all -L flags to the collect2 command without using a
@@ -324,6 +384,7 @@ data GeneralFlag
    | Opt_KeepCAFs
    | Opt_KeepGoing
    | Opt_ByteCode
+   | Opt_ByteCodeAndObjectCode
    | Opt_LinkRts
 
    -- output style opts
@@ -379,6 +440,9 @@ data GeneralFlag
    | Opt_SuppressTimestamps -- ^ Suppress timestamps in dumps
    | Opt_SuppressCoreSizes  -- ^ Suppress per binding Core size stats in dumps
 
+   -- Error message suppression
+   | Opt_ShowErrorContext
+
    -- temporary flags
    | Opt_AutoLinkPackages
    | Opt_ImplicitImportQualified
@@ -395,6 +459,8 @@ data GeneralFlag
    | Opt_KeepOFiles
 
    | Opt_BuildDynamicToo
+   | Opt_WriteIfSimplifiedCore
+   | Opt_UseBytecodeRatherThanObjects
 
    -- safe haskell flags
    | Opt_DistrustAllPackages
@@ -405,15 +471,11 @@ data GeneralFlag
    | Opt_G_NoOptCoercion
    deriving (Eq, Show, Enum)
 
--- Check whether a flag should be considered an "optimisation flag"
--- for purposes of recompilation avoidance (see
--- Note [Ignoring some flag changes] in GHC.Iface.Recomp.Flags). Being listed here is
--- not a guarantee that the flag has no other effect. We could, and
--- perhaps should, separate out the flags that have some minor impact on
--- program semantics and/or error behavior (e.g., assertions), but
--- then we'd need to go to extra trouble (and an additional flag)
--- to allow users to ignore the optimisation level even though that
--- means ignoring some change.
+-- | The set of flags which affect optimisation for the purposes of
+-- recompilation avoidance. Specifically, these include flags which
+-- affect code generation but not the semantics of the program.
+--
+-- See Note [Ignoring some flag changes] in GHC.Iface.Recomp.Flags)
 optimisationFlags :: EnumSet GeneralFlag
 optimisationFlags = EnumSet.fromList
    [ Opt_CallArity
@@ -445,16 +507,11 @@ optimisationFlags = EnumSet.fromList
    , Opt_EnableRewriteRules
    , Opt_RegsGraph
    , Opt_RegsIterative
-   , Opt_PedanticBottoms
-   , Opt_LlvmTBAA
-   , Opt_LlvmFillUndefWithGarbage
    , Opt_IrrefutableTuples
    , Opt_CmmSink
    , Opt_CmmElimCommonBlocks
    , Opt_AsmShortcutting
-   , Opt_OmitYields
    , Opt_FunToThunk
-   , Opt_DictsStrict
    , Opt_DmdTxDictSel
    , Opt_Loopification
    , Opt_CfgBlocklayout
@@ -463,8 +520,49 @@ optimisationFlags = EnumSet.fromList
    , Opt_WorkerWrapper
    , Opt_WorkerWrapperUnlift
    , Opt_SolveConstantDicts
+   ]
+
+-- | The set of flags which affect code generation and can change a program's
+-- runtime behavior (other than performance). These include flags which affect:
+--
+--  * user visible debugging information (e.g. info table provenance)
+--  * the ability to catch runtime errors (e.g. -fignore-asserts)
+--  * the runtime result of the program (e.g. -fomit-yields)
+--  * which code or interface file declarations are emitted
+--
+-- We also considered placing flags which affect asympototic space behavior
+-- (e.g. -ffull-laziness) however this would mean that changing optimisation
+-- levels would trigger recompilation even with -fignore-optim-changes,
+-- regressing #13604.
+--
+-- Also, arguably Opt_IgnoreAsserts should be here as well; however, we place
+-- it instead in 'optimisationFlags' since it is implied by @-O[12]@ and
+-- therefore would also break #13604.
+--
+-- See #23369.
+codeGenFlags :: EnumSet GeneralFlag
+codeGenFlags = EnumSet.fromList
+   [ -- Flags that affect runtime result
+     Opt_EagerBlackHoling
+   , Opt_ExcessPrecision
+   , Opt_DictsStrict
+   , Opt_PedanticBottoms
+   , Opt_OmitYields
+
+     -- Flags that affect generated code
+   , Opt_ExposeAllUnfoldings
+   , Opt_NoTypeableBinds
+
+     -- Flags that affect catching of runtime errors
    , Opt_CatchNonexhaustiveCases
-   , Opt_IgnoreAsserts
+   , Opt_LlvmFillUndefWithGarbage
+   , Opt_DoTagInferenceChecks
+
+     -- Flags that affect debugging information
+   , Opt_DistinctConstructorTables
+   , Opt_InfoTableMap
+   , Opt_InfoTableMapWithStack
+   , Opt_InfoTableMapWithFallback
    ]
 
 data WarningFlag =
@@ -566,7 +664,8 @@ data WarningFlag =
    | Opt_WarnGADTMonoLocalBinds                      -- Since 9.4
    | Opt_WarnTypeEqualityOutOfScope                  -- Since 9.4
    | Opt_WarnTypeEqualityRequiresOperators           -- Since 9.4
-   deriving (Eq, Ord, Show, Enum)
+   | Opt_WarnLoopySuperclassSolve                    -- Since 9.6
+   deriving (Eq, Ord, Show, Enum, Bounded)
 
 -- | Return the names of a WarningFlag
 --
@@ -670,6 +769,7 @@ warnFlagNames wflag = case wflag of
   Opt_WarnUnicodeBidirectionalFormatCharacters    -> "unicode-bidirectional-format-characters" :| []
   Opt_WarnGADTMonoLocalBinds                      -> "gadt-mono-local-binds" :| []
   Opt_WarnTypeEqualityOutOfScope                  -> "type-equality-out-of-scope" :| []
+  Opt_WarnLoopySuperclassSolve                    -> "loopy-superclass-solve" :| []
   Opt_WarnTypeEqualityRequiresOperators           -> "type-equality-requires-operators" :| []
 
 -- -----------------------------------------------------------------------------
@@ -758,6 +858,7 @@ standardWarnings -- see Note [Documenting warning flags]
         Opt_WarnUnrecognisedWarningFlags,
         Opt_WarnSimplifiableClassConstraints,
         Opt_WarnStarBinder,
+        Opt_WarnStarIsType,
         Opt_WarnInaccessibleCode,
         Opt_WarnSpaceAfterBang,
         Opt_WarnNonCanonicalMonadInstances,
@@ -766,6 +867,7 @@ standardWarnings -- see Note [Documenting warning flags]
         Opt_WarnForallIdentifier,
         Opt_WarnUnicodeBidirectionalFormatCharacters,
         Opt_WarnGADTMonoLocalBinds,
+        Opt_WarnLoopySuperclassSolve,
         Opt_WarnTypeEqualityRequiresOperators
       ]
 
@@ -799,7 +901,6 @@ minusWallOpts
         Opt_WarnMissingPatternSynonymSignatures,
         Opt_WarnUnusedRecordWildcards,
         Opt_WarnRedundantRecordWildcards,
-        Opt_WarnStarIsType,
         Opt_WarnIncompleteUniPatterns,
         Opt_WarnIncompletePatternsRecUpd
       ]
@@ -817,7 +918,6 @@ minusWcompatOpts :: [WarningFlag]
 minusWcompatOpts
     = [ Opt_WarnSemigroup
       , Opt_WarnNonCanonicalMonoidInstances
-      , Opt_WarnStarIsType
       , Opt_WarnCompatUnqualifiedImports
       , Opt_WarnTypeEqualityOutOfScope
       ]

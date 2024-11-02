@@ -45,40 +45,50 @@
 
    -------------------------------------------------------------------------- */
 
-INLINE_HEADER void SET_INFO(StgClosure *c, const StgInfoTable *info) {
+EXTERN_INLINE void SET_INFO(StgClosure *c, const StgInfoTable *info);
+EXTERN_INLINE void SET_INFO(StgClosure *c, const StgInfoTable *info) {
     RELAXED_STORE(&c->header.info, info);
 }
-INLINE_HEADER void SET_INFO_RELEASE(StgClosure *c, const StgInfoTable *info) {
+
+EXTERN_INLINE void SET_INFO_RELEASE(StgClosure *c, const StgInfoTable *info);
+EXTERN_INLINE void SET_INFO_RELEASE(StgClosure *c, const StgInfoTable *info) {
     RELEASE_STORE(&c->header.info, info);
 }
-INLINE_HEADER const StgInfoTable *GET_INFO(StgClosure *c) {
+EXTERN_INLINE const StgInfoTable *GET_INFO(StgClosure *c);
+EXTERN_INLINE const StgInfoTable *GET_INFO(StgClosure *c) {
     return RELAXED_LOAD(&c->header.info);
 }
 
+EXTERN_INLINE StgInfoTable      *INFO_PTR_TO_STRUCT     (const StgInfoTable *info);
+EXTERN_INLINE StgRetInfoTable   *RET_INFO_PTR_TO_STRUCT (const StgInfoTable *info);
+EXTERN_INLINE StgFunInfoTable   *FUN_INFO_PTR_TO_STRUCT (const StgInfoTable *info);
+EXTERN_INLINE StgThunkInfoTable *THUNK_INFO_PTR_TO_STRUCT(const StgInfoTable *info);
+EXTERN_INLINE StgConInfoTable   *CON_INFO_PTR_TO_STRUCT (const StgInfoTable *info);
+EXTERN_INLINE StgFunInfoTable   *itbl_to_fun_itbl       (const StgInfoTable *i);
+EXTERN_INLINE StgRetInfoTable   *itbl_to_ret_itbl       (const StgInfoTable *i);
+EXTERN_INLINE StgThunkInfoTable *itbl_to_thunk_itbl     (const StgInfoTable *i);
+EXTERN_INLINE StgConInfoTable   *itbl_to_con_itbl       (const StgInfoTable *i);
+
 #if defined(TABLES_NEXT_TO_CODE)
-EXTERN_INLINE StgInfoTable *INFO_PTR_TO_STRUCT(const StgInfoTable *info);
 EXTERN_INLINE StgInfoTable *INFO_PTR_TO_STRUCT(const StgInfoTable *info) {return (StgInfoTable *)info - 1;}
-EXTERN_INLINE StgRetInfoTable *RET_INFO_PTR_TO_STRUCT(const StgInfoTable *info);
 EXTERN_INLINE StgRetInfoTable *RET_INFO_PTR_TO_STRUCT(const StgInfoTable *info) {return (StgRetInfoTable *)info - 1;}
-INLINE_HEADER StgFunInfoTable *FUN_INFO_PTR_TO_STRUCT(const StgInfoTable *info) {return (StgFunInfoTable *)info - 1;}
-INLINE_HEADER StgThunkInfoTable *THUNK_INFO_PTR_TO_STRUCT(const StgInfoTable *info) {return (StgThunkInfoTable *)info - 1;}
-INLINE_HEADER StgConInfoTable *CON_INFO_PTR_TO_STRUCT(const StgInfoTable *info) {return (StgConInfoTable *)info - 1;}
-INLINE_HEADER StgFunInfoTable *itbl_to_fun_itbl(const StgInfoTable *i) {return (StgFunInfoTable *)(i + 1) - 1;}
-INLINE_HEADER StgRetInfoTable *itbl_to_ret_itbl(const StgInfoTable *i) {return (StgRetInfoTable *)(i + 1) - 1;}
-INLINE_HEADER StgThunkInfoTable *itbl_to_thunk_itbl(const StgInfoTable *i) {return (StgThunkInfoTable *)(i + 1) - 1;}
-INLINE_HEADER StgConInfoTable *itbl_to_con_itbl(const StgInfoTable *i) {return (StgConInfoTable *)(i + 1) - 1;}
+EXTERN_INLINE StgFunInfoTable *FUN_INFO_PTR_TO_STRUCT(const StgInfoTable *info) {return (StgFunInfoTable *)info - 1;}
+EXTERN_INLINE StgThunkInfoTable *THUNK_INFO_PTR_TO_STRUCT(const StgInfoTable *info) {return (StgThunkInfoTable *)info - 1;}
+EXTERN_INLINE StgConInfoTable *CON_INFO_PTR_TO_STRUCT(const StgInfoTable *info) {return (StgConInfoTable *)info - 1;}
+EXTERN_INLINE StgFunInfoTable *itbl_to_fun_itbl(const StgInfoTable *i) {return (StgFunInfoTable *)(i + 1) - 1;}
+EXTERN_INLINE StgRetInfoTable *itbl_to_ret_itbl(const StgInfoTable *i) {return (StgRetInfoTable *)(i + 1) - 1;}
+EXTERN_INLINE StgThunkInfoTable *itbl_to_thunk_itbl(const StgInfoTable *i) {return (StgThunkInfoTable *)(i + 1) - 1;}
+EXTERN_INLINE StgConInfoTable *itbl_to_con_itbl(const StgInfoTable *i) {return (StgConInfoTable *)(i + 1) - 1;}
 #else
-EXTERN_INLINE StgInfoTable *INFO_PTR_TO_STRUCT(const StgInfoTable *info);
 EXTERN_INLINE StgInfoTable *INFO_PTR_TO_STRUCT(const StgInfoTable *info) {return (StgInfoTable *)info;}
-EXTERN_INLINE StgRetInfoTable *RET_INFO_PTR_TO_STRUCT(const StgInfoTable *info);
 EXTERN_INLINE StgRetInfoTable *RET_INFO_PTR_TO_STRUCT(const StgInfoTable *info) {return (StgRetInfoTable *)info;}
-INLINE_HEADER StgFunInfoTable *FUN_INFO_PTR_TO_STRUCT(const StgInfoTable *info) {return (StgFunInfoTable *)info;}
-INLINE_HEADER StgThunkInfoTable *THUNK_INFO_PTR_TO_STRUCT(const StgInfoTable *info) {return (StgThunkInfoTable *)info;}
-INLINE_HEADER StgConInfoTable *CON_INFO_PTR_TO_STRUCT(const StgInfoTable *info) {return (StgConInfoTable *)info;}
-INLINE_HEADER StgFunInfoTable *itbl_to_fun_itbl(const StgInfoTable *i) {return (StgFunInfoTable *)i;}
-INLINE_HEADER StgRetInfoTable *itbl_to_ret_itbl(const StgInfoTable *i) {return (StgRetInfoTable *)i;}
-INLINE_HEADER StgThunkInfoTable *itbl_to_thunk_itbl(const StgInfoTable *i) {return (StgThunkInfoTable *)i;}
-INLINE_HEADER StgConInfoTable *itbl_to_con_itbl(const StgInfoTable *i) {return (StgConInfoTable *)i;}
+EXTERN_INLINE StgFunInfoTable *FUN_INFO_PTR_TO_STRUCT(const StgInfoTable *info) {return (StgFunInfoTable *)info;}
+EXTERN_INLINE StgThunkInfoTable *THUNK_INFO_PTR_TO_STRUCT(const StgInfoTable *info) {return (StgThunkInfoTable *)info;}
+EXTERN_INLINE StgConInfoTable *CON_INFO_PTR_TO_STRUCT(const StgInfoTable *info) {return (StgConInfoTable *)info;}
+EXTERN_INLINE StgFunInfoTable *itbl_to_fun_itbl(const StgInfoTable *i) {return (StgFunInfoTable *)i;}
+EXTERN_INLINE StgRetInfoTable *itbl_to_ret_itbl(const StgInfoTable *i) {return (StgRetInfoTable *)i;}
+EXTERN_INLINE StgThunkInfoTable *itbl_to_thunk_itbl(const StgInfoTable *i) {return (StgThunkInfoTable *)i;}
+EXTERN_INLINE StgConInfoTable *itbl_to_con_itbl(const StgInfoTable *i) {return (StgConInfoTable *)i;}
 #endif
 
 EXTERN_INLINE const StgInfoTable *get_itbl(const StgClosure *c);
@@ -99,22 +109,26 @@ EXTERN_INLINE const StgRetInfoTable *get_ret_itbl(const StgClosure *c)
     return RET_INFO_PTR_TO_STRUCT(RELAXED_LOAD(&c->header.info));
 }
 
-INLINE_HEADER const StgFunInfoTable *get_fun_itbl(const StgClosure *c)
+EXTERN_INLINE const StgFunInfoTable *get_fun_itbl(const StgClosure *c);
+EXTERN_INLINE const StgFunInfoTable *get_fun_itbl(const StgClosure *c)
 {
     return FUN_INFO_PTR_TO_STRUCT(RELAXED_LOAD(&c->header.info));
 }
 
-INLINE_HEADER const StgThunkInfoTable *get_thunk_itbl(const StgClosure *c)
+EXTERN_INLINE const StgThunkInfoTable *get_thunk_itbl(const StgClosure *c);
+EXTERN_INLINE const StgThunkInfoTable *get_thunk_itbl(const StgClosure *c)
 {
     return THUNK_INFO_PTR_TO_STRUCT(RELAXED_LOAD(&c->header.info));
 }
 
-INLINE_HEADER const StgConInfoTable *get_con_itbl(const StgClosure *c)
+EXTERN_INLINE const StgConInfoTable *get_con_itbl(const StgClosure *c);
+EXTERN_INLINE const StgConInfoTable *get_con_itbl(const StgClosure *c)
 {
     return CON_INFO_PTR_TO_STRUCT(RELAXED_LOAD(&c->header.info));
 }
 
-INLINE_HEADER StgHalfWord GET_TAG(const StgClosure *con)
+EXTERN_INLINE StgHalfWord GET_TAG(const StgClosure *con);
+EXTERN_INLINE StgHalfWord GET_TAG(const StgClosure *con)
 {
     return get_itbl(con)->srt;
 }
@@ -174,7 +188,8 @@ INLINE_HEADER StgHalfWord GET_TAG(const StgClosure *con)
 #define THUNK_STATIC_LINK(p) (&(p)->payload[1])
 #define IND_STATIC_LINK(p)   (&(p)->payload[1])
 
-INLINE_HEADER StgClosure **
+EXTERN_INLINE StgClosure **STATIC_LINK(const StgInfoTable *info, StgClosure *p);
+EXTERN_INLINE StgClosure **
 STATIC_LINK(const StgInfoTable *info, StgClosure *p)
 {
     switch (info->type) {
@@ -192,10 +207,12 @@ STATIC_LINK(const StgInfoTable *info, StgClosure *p)
    INTLIKE and CHARLIKE closures.
    -------------------------------------------------------------------------- */
 
-INLINE_HEADER P_ CHARLIKE_CLOSURE(int n) {
+EXTERN_INLINE P_ CHARLIKE_CLOSURE(int n);
+EXTERN_INLINE P_ CHARLIKE_CLOSURE(int n) {
     return (P_)&stg_CHARLIKE_closure[(n)-MIN_CHARLIKE];
 }
-INLINE_HEADER P_ INTLIKE_CLOSURE(int n) {
+EXTERN_INLINE P_ INTLIKE_CLOSURE(int n);
+EXTERN_INLINE P_ INTLIKE_CLOSURE(int n) {
     return (P_)&stg_INTLIKE_closure[(n)-MIN_INTLIKE];
 }
 
@@ -204,26 +221,26 @@ INLINE_HEADER P_ INTLIKE_CLOSURE(int n) {
    For more information look at the comments in Cmm.h
    ------------------------------------------------------------------------- */
 
-static inline StgWord
-GET_CLOSURE_TAG(const StgClosure * p)
+EXTERN_INLINE StgWord GET_CLOSURE_TAG(const StgClosure * p);
+EXTERN_INLINE StgWord GET_CLOSURE_TAG(const StgClosure * p)
 {
     return (StgWord)p & TAG_MASK;
 }
 
-static inline StgClosure *
-UNTAG_CLOSURE(StgClosure * p)
+EXTERN_INLINE StgClosure *UNTAG_CLOSURE(StgClosure * p);
+EXTERN_INLINE StgClosure *UNTAG_CLOSURE(StgClosure * p)
 {
     return (StgClosure*)((StgWord)p & ~TAG_MASK);
 }
 
-static inline const StgClosure *
-UNTAG_CONST_CLOSURE(const StgClosure * p)
+EXTERN_INLINE const StgClosure *UNTAG_CONST_CLOSURE(const StgClosure * p);
+EXTERN_INLINE const StgClosure *UNTAG_CONST_CLOSURE(const StgClosure * p)
 {
     return (const StgClosure*)((StgWord)p & ~TAG_MASK);
 }
 
-static inline StgClosure *
-TAG_CLOSURE(StgWord tag,StgClosure * p)
+EXTERN_INLINE StgClosure *TAG_CLOSURE(StgWord tag,StgClosure * p);
+EXTERN_INLINE StgClosure *TAG_CLOSURE(StgWord tag,StgClosure * p)
 {
     return (StgClosure*)((StgWord)p | tag);
 }
@@ -253,18 +270,21 @@ TAG_CLOSURE(StgWord tag,StgClosure * p)
    make sense...
    -------------------------------------------------------------------------- */
 
-INLINE_HEADER bool LOOKS_LIKE_INFO_PTR_NOT_NULL (StgWord p)
+EXTERN_INLINE bool LOOKS_LIKE_INFO_PTR_NOT_NULL (StgWord p);
+EXTERN_INLINE bool LOOKS_LIKE_INFO_PTR_NOT_NULL (StgWord p)
 {
     StgInfoTable *info = INFO_PTR_TO_STRUCT((StgInfoTable *)p);
     return info->type != INVALID_OBJECT && info->type < N_CLOSURE_TYPES;
 }
 
-INLINE_HEADER bool LOOKS_LIKE_INFO_PTR (StgWord p)
+EXTERN_INLINE bool LOOKS_LIKE_INFO_PTR (StgWord p);
+EXTERN_INLINE bool LOOKS_LIKE_INFO_PTR (StgWord p)
 {
     return p && (IS_FORWARDING_PTR(p) || LOOKS_LIKE_INFO_PTR_NOT_NULL(p));
 }
 
-INLINE_HEADER bool LOOKS_LIKE_CLOSURE_PTR (const void *p)
+EXTERN_INLINE bool LOOKS_LIKE_CLOSURE_PTR (const void *p);
+EXTERN_INLINE bool LOOKS_LIKE_CLOSURE_PTR (const void *p)
 {
     const StgInfoTable *info = RELAXED_LOAD(&UNTAG_CONST_CLOSURE((const StgClosure *) (p))->header.info);
     return LOOKS_LIKE_INFO_PTR((StgWord) info);
@@ -285,6 +305,10 @@ EXTERN_INLINE StgOffset AP_sizeW   ( uint32_t n_args )
 EXTERN_INLINE StgOffset AP_STACK_sizeW ( uint32_t size );
 EXTERN_INLINE StgOffset AP_STACK_sizeW ( uint32_t size )
 { return sizeofW(StgAP_STACK) + size; }
+
+EXTERN_INLINE StgWord CONTINUATION_sizeW(StgWord stack_size);
+EXTERN_INLINE StgWord CONTINUATION_sizeW(StgWord stack_size)
+{ return sizeofW(StgContinuation) + stack_size; }
 
 EXTERN_INLINE StgOffset CONSTR_sizeW( uint32_t p, uint32_t np );
 EXTERN_INLINE StgOffset CONSTR_sizeW( uint32_t p, uint32_t np )
@@ -325,6 +349,10 @@ EXTERN_INLINE StgOffset ap_sizeW( StgAP* x )
 EXTERN_INLINE StgOffset pap_sizeW( StgPAP* x );
 EXTERN_INLINE StgOffset pap_sizeW( StgPAP* x )
 { return PAP_sizeW(x->n_args); }
+
+EXTERN_INLINE StgWord continuation_sizeW(StgContinuation *x);
+EXTERN_INLINE StgWord continuation_sizeW(StgContinuation *x)
+{ return CONTINUATION_sizeW(x->stack_size); }
 
 EXTERN_INLINE StgWord arr_words_words( StgArrBytes* x);
 EXTERN_INLINE StgWord arr_words_words( StgArrBytes* x)
@@ -405,20 +433,23 @@ EXTERN_INLINE StgWord stack_frame_sizeW( StgClosure *frame )
    -------------------------------------------------------------------------- */
 
 // The number of card bytes needed
-INLINE_HEADER W_ mutArrPtrsCards (W_ elems)
+EXTERN_INLINE W_ mutArrPtrsCards (W_ elems);
+EXTERN_INLINE W_ mutArrPtrsCards (W_ elems)
 {
     return (W_)((elems + (1 << MUT_ARR_PTRS_CARD_BITS) - 1)
                            >> MUT_ARR_PTRS_CARD_BITS);
 }
 
 // The number of words in the card table
-INLINE_HEADER W_ mutArrPtrsCardTableSize (W_ elems)
+EXTERN_INLINE W_ mutArrPtrsCardTableSize (W_ elems);
+EXTERN_INLINE W_ mutArrPtrsCardTableSize (W_ elems)
 {
     return ROUNDUP_BYTES_TO_WDS(mutArrPtrsCards(elems));
 }
 
 // The address of the card for a particular card number
-INLINE_HEADER StgWord8 *mutArrPtrsCard (StgMutArrPtrs *a, W_ n)
+EXTERN_INLINE StgWord8 *mutArrPtrsCard (StgMutArrPtrs *a, W_ n);
+EXTERN_INLINE StgWord8 *mutArrPtrsCard (StgMutArrPtrs *a, W_ n)
 {
     return ((StgWord8 *)&(a->payload[a->ptrs]) + n);
 }
@@ -488,12 +519,16 @@ void LDV_recordDead (const StgClosure *c, uint32_t size);
 RTS_PRIVATE bool isInherentlyUsed ( StgHalfWord closure_type );
 #endif
 
-INLINE_HEADER void
-zeroSlop (StgClosure *p,
-          uint32_t offset,    /*< offset to start zeroing at, in words */
-          uint32_t size,      /*< total closure size, in words */
-          bool known_mutable  /*< is this a closure who's slop we can always zero? */
-         )
+EXTERN_INLINE void
+zeroSlop (
+    StgClosure *p,
+    uint32_t offset, /*< offset to start zeroing at, in words */
+    uint32_t size,   /*< total closure size, in words */
+    bool known_mutable /*< is this a closure who's slop we can always zero? */
+    );
+
+EXTERN_INLINE void
+zeroSlop (StgClosure *p, uint32_t offset, uint32_t size, bool known_mutable)
 {
     // see Note [zeroing slop when overwriting closures], also #8402
 
@@ -508,7 +543,7 @@ zeroSlop (StgClosure *p,
 
     const bool can_zero_immutable_slop =
         // Only if we're running single threaded.
-        getNumCapabilities() == 1
+        RTS_DEREF(RtsFlags).ParFlags.nCapabilities <= 1
         && !RTS_DEREF(RtsFlags).GcFlags.useNonmoving; // see #23170
 
     const bool zero_slop_immutable =
@@ -542,10 +577,8 @@ zeroSlop (StgClosure *p,
     }
 }
 
-// N.B. the stg_* variants of the utilities below are only for calling from
-// Cmm. The INLINE_HEADER functions should be used when in C.
-void stg_overwritingClosure (StgClosure *p);
-INLINE_HEADER void overwritingClosure (StgClosure *p)
+EXTERN_INLINE void overwritingClosure (StgClosure *p);
+EXTERN_INLINE void overwritingClosure (StgClosure *p)
 {
     W_ size = closure_sizeW(p);
 #if defined(PROFILING)
@@ -555,13 +588,15 @@ INLINE_HEADER void overwritingClosure (StgClosure *p)
     zeroSlop(p, sizeofW(StgThunkHeader), size, /*known_mutable=*/false);
 }
 
-
 // Version of 'overwritingClosure' which overwrites only a suffix of a
 // closure.  The offset is expressed in words relative to 'p' and shall
 // be less than or equal to closure_sizeW(p), and usually at least as
 // large as the respective thunk header.
-void stg_overwritingMutableClosureOfs (StgClosure *p, uint32_t offset);
-INLINE_HEADER void overwritingMutableClosureOfs (StgClosure *p, uint32_t offset)
+EXTERN_INLINE void
+overwritingMutableClosureOfs (StgClosure *p, uint32_t offset);
+
+EXTERN_INLINE void
+overwritingMutableClosureOfs (StgClosure *p, uint32_t offset)
 {
     // Since overwritingClosureOfs is only ever called by:
     //
@@ -570,7 +605,7 @@ INLINE_HEADER void overwritingMutableClosureOfs (StgClosure *p, uint32_t offset)
     //   - shrinkSmallMutableArray# (SMALL_MUT_ARR_PTRS)
     //
     // we can safely omit the Ldv_recordDead call. Since these closures are
-    // considered inherenlty used we don't need to track their destruction.
+    // considered inherently used we don't need to track their destruction.
 #if defined(PROFILING)
     ASSERT(isInherentlyUsed(get_itbl(p)->type) == true);
 #endif
@@ -578,8 +613,8 @@ INLINE_HEADER void overwritingMutableClosureOfs (StgClosure *p, uint32_t offset)
 }
 
 // Version of 'overwritingClosure' which takes closure size as argument.
-void stg_OverwritingClosureSize (StgClosure *p, uint32_t size /* in words */);
-INLINE_HEADER void overwritingClosureSize (StgClosure *p, uint32_t size)
+EXTERN_INLINE void overwritingClosureSize (StgClosure *p, uint32_t size /* in words */);
+EXTERN_INLINE void overwritingClosureSize (StgClosure *p, uint32_t size)
 {
     // This function is only called from stg_AP_STACK so we can assume it's not
     // inherently used.

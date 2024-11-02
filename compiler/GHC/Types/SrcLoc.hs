@@ -16,6 +16,7 @@ module GHC.Types.SrcLoc (
 
         -- ** Constructing SrcLoc
         mkSrcLoc, mkRealSrcLoc, mkGeneralSrcLoc,
+        leftmostColumn,
 
         noSrcLoc,               -- "I'm sorry, I haven't a clue"
         generatedSrcLoc,        -- Code generated within the compiler
@@ -61,7 +62,7 @@ module GHC.Types.SrcLoc (
 
         -- ** Predicates on SrcSpan
         isGoodSrcSpan, isOneLineSpan, isZeroWidthSpan,
-        containsSpan,
+        containsSpan, isNoSrcSpan,
 
         -- * StringBuffer locations
         BufPos(..),
@@ -69,6 +70,7 @@ module GHC.Types.SrcLoc (
         BufSpan(..),
         getBufSpan,
         removeBufSpan,
+        combineBufSpans,
 
         -- * Located
         Located,
@@ -85,9 +87,6 @@ module GHC.Types.SrcLoc (
         pprLocated,
         pprLocatedAlways,
 
-        -- ** Modifying Located
-        mapLoc,
-
         -- ** Combining and comparing Located values
         eqLocated, cmpLocated, cmpBufSpan,
         combineLocs, addCLoc,
@@ -95,8 +94,6 @@ module GHC.Types.SrcLoc (
         spans, isSubspanOf, isRealSubspanOf,
         sortLocated, sortRealLocated,
         lookupSrcLoc, lookupSrcSpan,
-
-        liftL,
 
         -- * Parser locations
         PsLoc(..),
@@ -109,11 +106,6 @@ module GHC.Types.SrcLoc (
         mkSrcSpanPs,
         combineRealSrcSpans,
         psLocatedToLocated,
-
-        -- * Layout information
-        LayoutInfo(..),
-        leftmostColumn
-
     ) where
 
 import GHC.Prelude
@@ -126,12 +118,11 @@ import GHC.Data.FastString
 import qualified GHC.Data.Strict as Strict
 
 import Control.DeepSeq
-import Control.Applicative (liftA2)
 import Data.Data
 import Data.List (sortBy, intercalate)
 import Data.Function (on)
 import qualified Data.Map as Map
-import qualified Data.Semigroup
+import qualified Data.Semigroup as S
 
 {-
 ************************************************************************
@@ -162,7 +153,7 @@ data RealSrcLoc
 --
 -- The parser guarantees that 'BufPos' are monotonic. See #17632. This means
 -- that syntactic constructs that appear later in the 'StringBuffer' are guaranteed to
--- have a higher 'BufPos'. Constrast that with 'RealSrcLoc', which does *not* make the
+-- have a higher 'BufPos'. Contrast that with 'RealSrcLoc', which does *not* make the
 -- analogous guarantee about higher line/column numbers.
 --
 -- This is due to #line and {-# LINE ... #-} pragmas that can arbitrarily
@@ -246,6 +237,10 @@ mkSrcLoc x line col = RealSrcLoc (mkRealSrcLoc x line col) Strict.Nothing
 
 mkRealSrcLoc :: FastString -> Int -> Int -> RealSrcLoc
 mkRealSrcLoc x line col = SrcLoc (LexicalFastString x) line col
+
+-- | Indentation level is 1-indexed, so the leftmost column is 1.
+leftmostColumn :: Int
+leftmostColumn = 1
 
 getBufPos :: SrcLoc -> Strict.Maybe BufPos
 getBufPos (RealSrcLoc _ mbpos) = mbpos
@@ -453,6 +448,10 @@ isGeneratedSrcSpan :: SrcSpan -> Bool
 isGeneratedSrcSpan (UnhelpfulSpan UnhelpfulGenerated) = True
 isGeneratedSrcSpan _                                  = False
 
+isNoSrcSpan :: SrcSpan -> Bool
+isNoSrcSpan (UnhelpfulSpan UnhelpfulNoLocationInfo) = True
+isNoSrcSpan _                                       = False
+
 -- | Create a "bad" 'SrcSpan' that has not location information
 mkGeneralSrcSpan :: FastString -> SrcSpan
 mkGeneralSrcSpan = UnhelpfulSpan . UnhelpfulOther
@@ -639,9 +638,7 @@ srcSpanToRealSrcSpan _ = Nothing
 -- We want to order RealSrcSpans first by the start point, then by the
 -- end point.
 instance Ord RealSrcSpan where
-  a `compare` b =
-     (realSrcSpanStart a `compare` realSrcSpanStart b) `thenCmp`
-     (realSrcSpanEnd   a `compare` realSrcSpanEnd   b)
+  compare = on compare realSrcSpanStart S.<> on compare realSrcSpanEnd
 
 instance Show RealSrcLoc where
   show (SrcLoc filename row col)
@@ -738,12 +735,11 @@ pprUserRealSpan show_path (RealSrcSpan' src_path sline scol eline ecol)
 -- | We attach SrcSpans to lots of things, so let's have a datatype for it.
 data GenLocated l e = L l e
   deriving (Eq, Ord, Show, Data, Functor, Foldable, Traversable)
+instance (NFData l, NFData e) => NFData (GenLocated l e) where
+  rnf (L l e) = rnf l `seq` rnf e
 
 type Located = GenLocated SrcSpan
 type RealLocated = GenLocated RealSrcSpan
-
-mapLoc :: (a -> b) -> GenLocated l a -> GenLocated l b
-mapLoc = fmap
 
 unLoc :: GenLocated l e -> e
 unLoc (L _ e) = e
@@ -823,10 +819,8 @@ pprLocatedAlways (L l e) =
 leftmost_smallest, leftmost_largest, rightmost_smallest :: SrcSpan -> SrcSpan -> Ordering
 rightmost_smallest = compareSrcSpanBy (flip compare)
 leftmost_smallest = compareSrcSpanBy compare
-leftmost_largest = compareSrcSpanBy $ \a b ->
-  (realSrcSpanStart a `compare` realSrcSpanStart b)
-    `thenCmp`
-  (realSrcSpanEnd b `compare` realSrcSpanEnd a)
+leftmost_largest = compareSrcSpanBy $
+  on compare realSrcSpanStart S.<> flip (on compare realSrcSpanEnd)
 
 compareSrcSpanBy :: (RealSrcSpan -> RealSrcSpan -> Ordering) -> SrcSpan -> SrcSpan -> Ordering
 compareSrcSpanBy cmp (RealSrcSpan a _) (RealSrcSpan b _) = cmp a b
@@ -855,11 +849,6 @@ isRealSubspanOf src parent
     | srcSpanFile parent /= srcSpanFile src = False
     | otherwise = realSrcSpanStart parent <= realSrcSpanStart src &&
                   realSrcSpanEnd parent   >= realSrcSpanEnd src
-
-liftL :: Monad m => (a -> m b) -> GenLocated l a -> m (GenLocated l b)
-liftL f (L loc a) = do
-  a' <- f a
-  return $ L loc a'
 
 getRealSrcSpan :: RealLocated a -> RealSrcSpan
 getRealSrcSpan (L l _) = l
@@ -900,33 +889,3 @@ psSpanEnd (PsSpan r b) = PsLoc (realSrcSpanEnd r) (bufSpanEnd b)
 
 mkSrcSpanPs :: PsSpan -> SrcSpan
 mkSrcSpanPs (PsSpan r b) = RealSrcSpan r (Strict.Just b)
-
--- | Layout information for declarations.
-data LayoutInfo =
-
-    -- | Explicit braces written by the user.
-    --
-    -- @
-    -- class C a where { foo :: a; bar :: a }
-    -- @
-    ExplicitBraces
-  |
-    -- | Virtual braces inserted by the layout algorithm.
-    --
-    -- @
-    -- class C a where
-    --   foo :: a
-    --   bar :: a
-    -- @
-    VirtualBraces
-      !Int -- ^ Layout column (indentation level, begins at 1)
-  |
-    -- | Empty or compiler-generated blocks do not have layout information
-    -- associated with them.
-    NoLayoutInfo
-
-  deriving (Eq, Ord, Show, Data)
-
--- | Indentation level is 1-indexed, so the leftmost column is 1.
-leftmostColumn :: Int
-leftmostColumn = 1

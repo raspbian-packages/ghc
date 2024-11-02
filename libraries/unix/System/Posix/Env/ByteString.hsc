@@ -42,7 +42,9 @@ import System.Posix.Env ( clearEnv )
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as BC
 import Data.ByteString (ByteString)
-import Data.ByteString.Internal (ByteString (PS), memcpy)
+import Data.ByteString.Internal (ByteString (PS))
+
+import qualified System.Posix.Env.Internal as Internal
 
 -- |'getEnv' looks up a variable in the environment.
 
@@ -52,7 +54,7 @@ getEnv ::
 getEnv name = do
   litstring <- B.useAsCString name c_getenv
   if litstring /= nullPtr
-     then liftM Just $ B.packCString litstring
+     then Just <$> B.packCString litstring
      else return Nothing
 
 -- |'getEnvDefault' is a wrapper around 'getEnv' where the
@@ -63,31 +65,13 @@ getEnvDefault ::
   ByteString    {- ^ variable name                    -} ->
   ByteString    {- ^ fallback value                   -} ->
   IO ByteString {- ^ variable value or fallback value -}
-getEnvDefault name fallback = liftM (fromMaybe fallback) (getEnv name)
+getEnvDefault name fallback = fromMaybe fallback <$> getEnv name
 
 foreign import ccall unsafe "getenv"
    c_getenv :: CString -> IO CString
 
 getEnvironmentPrim :: IO [ByteString]
-getEnvironmentPrim = do
-  c_environ <- getCEnviron
-  arr <- peekArray0 nullPtr c_environ
-  mapM B.packCString arr
-
-getCEnviron :: IO (Ptr CString)
-#if HAVE__NSGETENVIRON
--- You should not access @char **environ@ directly on Darwin in a bundle/shared library.
--- See #2458 and http://developer.apple.com/library/mac/#documentation/Darwin/Reference/ManPages/man7/environ.7.html
-getCEnviron = nsGetEnviron >>= peek
-
-foreign import ccall unsafe "_NSGetEnviron"
-   nsGetEnviron :: IO (Ptr (Ptr CString))
-#else
-getCEnviron = peek c_environ_p
-
-foreign import ccall unsafe "&environ"
-   c_environ_p :: Ptr (Ptr CString)
-#endif
+getEnvironmentPrim = Internal.getEnvironmentPrim >>= mapM B.packCString
 
 -- |'getEnvironment' retrieves the entire environment as a
 -- list of @(key,value)@ pairs.
@@ -104,7 +88,7 @@ getEnvironment = do
 -- |'setEnvironment' resets the entire environment to the given list of
 -- @(key,value)@ pairs.
 --
--- @since 2.7.3
+-- @since 2.8.0.0
 setEnvironment ::
   [(ByteString,ByteString)] {- ^ @[(key,value)]@ -} ->
   IO ()
@@ -149,7 +133,7 @@ putEnv (PS fp o l) = withForeignPtr fp $ \p -> do
   --
   -- hence we must not free the buffer
   buf <- mallocBytes (l+1)
-  memcpy buf (p `plusPtr` o) l
+  copyBytes buf (p `plusPtr` o) l
   pokeByteOff buf l (0::Word8)
   throwErrnoIfMinus1_ "putenv" (c_putenv (castPtr buf))
 
@@ -199,7 +183,7 @@ getArgs =
   alloca $ \ p_argc ->
   alloca $ \ p_argv -> do
    getProgArgv p_argc p_argv
-   p    <- fromIntegral `liftM` peek p_argc
+   p    <- fromIntegral <$> peek p_argc
    argv <- peek p_argv
    peekArray (p - 1) (advancePtr argv 1) >>= mapM B.packCString
 

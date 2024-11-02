@@ -186,22 +186,63 @@ shutdownThread(void)
   pthread_exit(NULL);
 }
 
+struct ThreadDesc {
+    OSThreadProc *startProc;
+    void *param;
+    char *name;
+};
+
+// N.B. Darwin's pthread_setname_np only allows the name of the
+// calling thread to be set. Consequently we must use this
+// trampoline.
+static void *
+start_thread (void *param)
+{
+    struct ThreadDesc *desc = (struct ThreadDesc *) param;
+    OSThreadProc *startProc = desc->startProc;
+    void *startParam = desc->param;
+
+#if defined(HAVE_PTHREAD_SET_NAME_NP)
+    pthread_set_name_np(pthread_self(), desc->name);
+#elif defined(HAVE_PTHREAD_SETNAME_NP)
+    pthread_setname_np(pthread_self(), desc->name);
+#elif defined(HAVE_PTHREAD_SETNAME_NP_DARWIN)
+    pthread_setname_np(desc->name);
+#elif defined(HAVE_PTHREAD_SETNAME_NP_NETBSD)
+    pthread_setname_np(pthread_self(), "%s", desc->name);
+#endif
+
+    stgFree(desc->name);
+    stgFree(desc);
+
+    return startProc(startParam);
+}
+
 int
-createOSThread (OSThreadId* pId, char *name STG_UNUSED,
+createOSThread (OSThreadId* pId, const char *name,
                 OSThreadProc *startProc, void *param)
 {
-  int result = pthread_create(pId, NULL, startProc, param);
+  int result = createAttachedOSThread(pId, name, startProc, param);
   if (!result) {
     pthread_detach(*pId);
-#if defined(HAVE_PTHREAD_SET_NAME_NP)
-    pthread_set_name_np(*pId, name);
-#elif defined(HAVE_PTHREAD_SETNAME_NP)
-    pthread_setname_np(*pId, name);
-#elif defined(HAVE_PTHREAD_SETNAME_NP_DARWIN)
-    pthread_setname_np(name);
-#elif defined(HAVE_PTHREAD_SETNAME_NP_NETBSD)
-    pthread_setname_np(*pId, "%s", name);
-#endif
+  }
+  return result;
+}
+
+int
+createAttachedOSThread (OSThreadId *pId, const char *name,
+                        OSThreadProc *startProc, void *param)
+{
+  struct ThreadDesc *desc = stgMallocBytes(sizeof(struct ThreadDesc), "createAttachedOSThread");
+  desc->startProc = startProc;
+  desc->param = param;
+  desc->name = stgMallocBytes(strlen(name) + 1, "createAttachedOSThread");
+  strcpy(desc->name, name);
+
+  int result = pthread_create(pId, NULL, start_thread, desc);
+  if (result) {
+      stgFree(desc->name);
+      stgFree(desc);
   }
   return result;
 }
@@ -404,7 +445,7 @@ setThreadAffinity (uint32_t n, uint32_t m)
 #elif defined(darwin_HOST_OS) && defined(THREAD_AFFINITY_POLICY)
 // Schedules the current thread in the affinity set identified by tag n.
 void
-setThreadAffinity (uint32_t n, uint32_t m GNUC3_ATTRIBUTE(__unused__))
+setThreadAffinity (uint32_t n, uint32_t m STG_UNUSED)
 {
     thread_affinity_policy_data_t policy;
 

@@ -4,6 +4,9 @@
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE AllowAmbiguousTypes #-}
+{-# LANGUAGE TypeApplications #-}
 
 module GHC.Types.Error
    ( -- * Messages
@@ -23,6 +26,7 @@ module GHC.Types.Error
    , MessageClass (..)
    , Severity (..)
    , Diagnostic (..)
+   , UnknownDiagnostic (..)
    , DiagnosticMessage (..)
    , DiagnosticReason (..)
    , DiagnosticHint (..)
@@ -30,6 +34,8 @@ module GHC.Types.Error
    , mkPlainError
    , mkDecoratedDiagnostic
    , mkDecoratedError
+
+   , NoDiagnosticOpts(..)
 
    -- * Hints and refactoring actions
    , GhcHint (..)
@@ -54,7 +60,7 @@ module GHC.Types.Error
 
    , pprMessageBag
    , mkLocMessage
-   , mkLocMessageAnn
+   , mkLocMessageWarningGroups
    , getCaretDiagnostic
    -- * Queries
    , isIntrinsicErrorMessage
@@ -65,6 +71,9 @@ module GHC.Types.Error
    , partitionMessages
    , errorsFound
    , errorsOrFatalWarningsFound
+
+   -- * Diagnostic codes
+   , DiagnosticCode(..)
    )
 where
 
@@ -77,13 +86,19 @@ import GHC.IO (catchException)
 import GHC.Utils.Outputable as Outputable
 import qualified GHC.Utils.Ppr.Colour as Col
 import GHC.Types.SrcLoc as SrcLoc
+import GHC.Types.Hint
 import GHC.Data.FastString (unpackFS)
 import GHC.Data.StringBuffer (atLine, hGetStringBuffer, len, lexemeToString)
 import GHC.Utils.Json
+import GHC.Utils.Panic
 
 import Data.Bifunctor
 import Data.Foldable    ( fold )
-import GHC.Types.Hint
+import qualified Data.List.NonEmpty as NE
+import Data.List ( intercalate )
+import Data.Typeable ( Typeable )
+import Numeric.Natural ( Natural )
+import Text.Printf ( printf )
 
 {-
 Note [Messages]
@@ -191,39 +206,6 @@ mapDecoratedSDoc :: (SDoc -> SDoc) -> DecoratedSDoc -> DecoratedSDoc
 mapDecoratedSDoc f (Decorated s1) =
   Decorated (map f s1)
 
-{-
-Note [Rendering Messages]
-~~~~~~~~~~~~~~~~~~~~~~~~~
-
-Turning 'Messages' into something that renders nicely for the user is one of
-the last steps, and it happens typically at the application's boundaries (i.e.
-from the 'Driver' upwards).
-
-For now (see #18516) this class has few instance, but the idea is that as the
-more domain-specific types are defined, the more instances we would get. For
-example, given something like:
-
-  data TcRnDiagnostic
-    = TcRnOutOfScope ..
-    | ..
-
-  newtype TcRnMessage = TcRnMessage (DiagnosticMessage TcRnDiagnostic)
-
-We could then define how a 'TcRnDiagnostic' is displayed to the user. Rather
-than scattering pieces of 'SDoc' around the codebase, we would write once for
-all:
-
-  instance Diagnostic TcRnDiagnostic where
-    diagnosticMessage (TcRnMessage msg) = case diagMessage msg of
-      TcRnOutOfScope .. -> Decorated [text "Out of scope error ..."]
-      ...
-
-This way, we can easily write generic rendering functions for errors that all
-they care about is the knowledge that a given type 'e' has a 'Diagnostic'
-constraint.
-
--}
-
 -- | A class identifying a diagnostic.
 -- Dictionary.com defines a diagnostic as:
 --
@@ -232,16 +214,59 @@ constraint.
 --
 -- A 'Diagnostic' carries the /actual/ description of the message (which, in
 -- GHC's case, it can be an error or a warning) and the /reason/ why such
--- message was generated in the first place. See also Note [Rendering
--- Messages].
+-- message was generated in the first place.
 class Diagnostic a where
-  diagnosticMessage :: a -> DecoratedSDoc
+
+  -- | Type of configuration options for the diagnostic.
+  type DiagnosticOpts a
+  defaultDiagnosticOpts :: DiagnosticOpts a
+
+  -- | Extract the error message text from a 'Diagnostic'.
+  diagnosticMessage :: DiagnosticOpts a -> a -> DecoratedSDoc
+
+  -- | Extract the reason for this diagnostic. For warnings,
+  -- a 'DiagnosticReason' includes the warning flag.
   diagnosticReason  :: a -> DiagnosticReason
+
+  -- | Extract any hints a user might use to repair their
+  -- code to avoid this diagnostic.
   diagnosticHints   :: a -> [GhcHint]
 
-pprDiagnostic :: Diagnostic e => e -> SDoc
+  -- | Get the 'DiagnosticCode' associated with this 'Diagnostic'.
+  -- This can return 'Nothing' for at least two reasons:
+  --
+  -- 1. The message might be from a plugin that does not supply codes.
+  -- 2. The message might not yet have been assigned a code. See the
+  --    'Diagnostic' instance for 'DiagnosticMessage'.
+  --
+  -- Ideally, case (2) would not happen, but because
+  -- some errors in GHC still use the old system of just writing the
+  -- error message in-place (instead of using a dedicated error type
+  -- and constructor), we do not have error codes for all errors.
+  -- #18516 tracks our progress toward this goal.
+  diagnosticCode    :: a -> Maybe DiagnosticCode
+
+-- | An existential wrapper around an unknown diagnostic.
+data UnknownDiagnostic where
+  UnknownDiagnostic :: (DiagnosticOpts a ~ NoDiagnosticOpts, Diagnostic a, Typeable a)
+                    => a -> UnknownDiagnostic
+
+instance Diagnostic UnknownDiagnostic where
+  type DiagnosticOpts UnknownDiagnostic = NoDiagnosticOpts
+  defaultDiagnosticOpts = NoDiagnosticOpts
+  diagnosticMessage _ (UnknownDiagnostic diag) = diagnosticMessage NoDiagnosticOpts diag
+  diagnosticReason    (UnknownDiagnostic diag) = diagnosticReason  diag
+  diagnosticHints     (UnknownDiagnostic diag) = diagnosticHints   diag
+  diagnosticCode      (UnknownDiagnostic diag) = diagnosticCode    diag
+
+-- A fallback 'DiagnosticOpts' which can be used when there are no options
+-- for a particular diagnostic.
+data NoDiagnosticOpts = NoDiagnosticOpts
+
+pprDiagnostic :: forall e . Diagnostic e => e -> SDoc
 pprDiagnostic e = vcat [ ppr (diagnosticReason e)
-                       , nest 2 (vcat (unDecorated (diagnosticMessage e))) ]
+                       , nest 2 (vcat (unDecorated (diagnosticMessage opts e))) ]
+  where opts = defaultDiagnosticOpts @e
 
 -- | A generic 'Hint' message, to be used with 'DiagnosticMessage'.
 data DiagnosticHint = DiagnosticHint !SDoc
@@ -261,9 +286,12 @@ data DiagnosticMessage = DiagnosticMessage
   }
 
 instance Diagnostic DiagnosticMessage where
-  diagnosticMessage = diagMessage
+  type DiagnosticOpts DiagnosticMessage = NoDiagnosticOpts
+  defaultDiagnosticOpts = NoDiagnosticOpts
+  diagnosticMessage _ = diagMessage
   diagnosticReason  = diagReason
   diagnosticHints   = diagHints
+  diagnosticCode _  = Nothing
 
 -- | Helper function to use when no hints can be provided. Currently this function
 -- can be used to construct plain 'DiagnosticMessage' and add hints to them, but
@@ -323,7 +351,7 @@ instance Outputable DiagnosticReason where
 data MsgEnvelope e = MsgEnvelope
    { errMsgSpan        :: SrcSpan
       -- ^ The SrcSpan is used for sorting errors into line-number order
-   , errMsgContext     :: PrintUnqualified
+   , errMsgContext     :: NamePprCtx
    , errMsgDiagnostic  :: e
    , errMsgSeverity    :: Severity
    } deriving (Functor, Foldable, Traversable)
@@ -344,7 +372,7 @@ data MessageClass
     -- ^ Log messages intended for end users.
     -- No file\/line\/column stuff.
 
-  | MCDiagnostic Severity DiagnosticReason
+  | MCDiagnostic Severity DiagnosticReason (Maybe DiagnosticCode)
     -- ^ Diagnostics from the compiler. This constructor is very powerful as
     -- it allows the construction of a 'MessageClass' with a completely
     -- arbitrary permutation of 'Severity' and 'DiagnosticReason'. As such,
@@ -353,10 +381,15 @@ data MessageClass
     -- and manipulate diagnostic messages directly, for example inside
     -- 'GHC.Utils.Error'. In all the other circumstances, /especially/ when
     -- emitting compiler diagnostics, use the smart constructor.
-  deriving (Eq, Show)
+    --
+    -- The @Maybe 'DiagnosticCode'@ field carries a code (if available) for
+    -- this diagnostic. If you are creating a message not tied to any
+    -- error-message type, then use Nothing. In the long run, this really
+    -- should always have a 'DiagnosticCode'. See Note [Diagnostic codes].
 
-{- Note [Suppressing Messages]
-
+{-
+Note [Suppressing Messages]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
 The 'SevIgnore' constructor is used to generate messages for diagnostics which
 are meant to be suppressed and not reported to the user: the classic example
 are warnings for which the user didn't enable the corresponding 'WarningFlag',
@@ -410,27 +443,31 @@ instance ToJson MessageClass where
   json MCInteractive = JSString "MCInteractive"
   json MCDump = JSString "MCDump"
   json MCInfo = JSString "MCInfo"
-  json (MCDiagnostic sev reason) =
-    JSString $ renderWithContext defaultSDocContext (ppr $ text "MCDiagnostic" <+> ppr sev <+> ppr reason)
+  json (MCDiagnostic sev reason code) =
+    JSString $ renderWithContext defaultSDocContext (ppr $ text "MCDiagnostic" <+> ppr sev <+> ppr reason <+> ppr code)
 
 instance Show (MsgEnvelope DiagnosticMessage) where
     show = showMsgEnvelope
 
--- | Shows an 'MsgEnvelope'.
-showMsgEnvelope :: Diagnostic a => MsgEnvelope a -> String
+-- | Shows an 'MsgEnvelope'. Only use this for debugging.
+showMsgEnvelope :: forall a . Diagnostic a => MsgEnvelope a -> String
 showMsgEnvelope err =
-  renderWithContext defaultSDocContext (vcat (unDecorated . diagnosticMessage $ errMsgDiagnostic err))
+  renderWithContext defaultSDocContext (vcat (unDecorated . (diagnosticMessage (defaultDiagnosticOpts @a)) $ errMsgDiagnostic err))
 
 pprMessageBag :: Bag SDoc -> SDoc
 pprMessageBag msgs = vcat (punctuate blankLine (bagToList msgs))
 
--- | Make an unannotated error message with location info.
-mkLocMessage :: MessageClass -> SrcSpan -> SDoc -> SDoc
-mkLocMessage = mkLocMessageAnn Nothing
+mkLocMessage
+  :: MessageClass                       -- ^ What kind of message?
+  -> SrcSpan                            -- ^ location
+  -> SDoc                               -- ^ message
+  -> SDoc
+mkLocMessage = mkLocMessageWarningGroups True
 
--- | Make a possibly annotated error message with location info.
-mkLocMessageAnn
-  :: Maybe String                       -- ^ optional annotation
+-- | Make an error message with location info, specifying whether to show
+-- warning groups (if applicable).
+mkLocMessageWarningGroups
+  :: Bool                               -- ^ Print warning groups (if applicable)?
   -> MessageClass                       -- ^ What kind of message?
   -> SrcSpan                            -- ^ location
   -> SDoc                               -- ^ message
@@ -438,41 +475,76 @@ mkLocMessageAnn
   -- Always print the location, even if it is unhelpful.  Error messages
   -- are supposed to be in a standard format, and one without a location
   -- would look strange.  Better to say explicitly "<no location info>".
-mkLocMessageAnn ann msg_class locn msg
+mkLocMessageWarningGroups show_warn_groups msg_class locn msg
     = sdocOption sdocColScheme $ \col_scheme ->
       let locn' = sdocOption sdocErrorSpans $ \case
                      True  -> ppr locn
                      False -> ppr (srcSpanStart locn)
 
-          msgColour = getMessageClassColour msg_class col_scheme
+          msg_colour = getMessageClassColour msg_class col_scheme
+          col = coloured msg_colour . text
 
-          -- Add optional information
-          optAnn = case ann of
-            Nothing -> text ""
-            Just i  -> text " [" <> coloured msgColour (text i) <> text "]"
+          msg_title = coloured msg_colour $
+            case msg_class of
+              MCDiagnostic SevError   _ _ -> text "error"
+              MCDiagnostic SevWarning _ _ -> text "warning"
+              MCFatal                     -> text "fatal"
+              _                           -> empty
+
+          warning_flag_doc =
+            case msg_class of
+              MCDiagnostic sev reason _code
+                | Just msg <- flag_msg sev reason -> brackets msg
+              _                                   -> empty
+
+          code_doc =
+            case msg_class of
+              MCDiagnostic _ _ (Just code) -> brackets (coloured msg_colour $ ppr code)
+              _                            -> empty
+
+          flag_msg :: Severity -> DiagnosticReason -> Maybe SDoc
+          flag_msg SevIgnore _                 = Nothing
+            -- The above can happen when displaying an error message
+            -- in a log file, e.g. with -ddump-tc-trace. It should not
+            -- happen otherwise, though.
+          flag_msg SevError WarningWithoutFlag = Just (col "-Werror")
+          flag_msg SevError (WarningWithFlag wflag) =
+            let name = NE.head (warnFlagNames wflag) in
+            Just $ col ("-W" ++ name) <+> warn_flag_grp wflag
+                                      <> comma
+                                      <+> col ("Werror=" ++ name)
+          flag_msg SevError   ErrorWithoutFlag   = Nothing
+          flag_msg SevWarning WarningWithoutFlag = Nothing
+          flag_msg SevWarning (WarningWithFlag wflag) =
+            let name = NE.head (warnFlagNames wflag) in
+            Just (col ("-W" ++ name) <+> warn_flag_grp wflag)
+          flag_msg SevWarning ErrorWithoutFlag =
+            pprPanic "SevWarning with ErrorWithoutFlag" $
+              vcat [ text "locn:" <+> ppr locn
+                   , text "msg:" <+> ppr msg ]
+
+          warn_flag_grp flag
+              | show_warn_groups =
+                    case smallestWarningGroups flag of
+                        [] -> empty
+                        groups -> text $ "(in " ++ intercalate ", " (map ("-W"++) groups) ++ ")"
+              | otherwise = empty
 
           -- Add prefixes, like    Foo.hs:34: warning:
           --                           <the warning message>
           header = locn' <> colon <+>
-                   coloured msgColour msgText <> optAnn
+                   msg_title <> colon <+>
+                   code_doc <+> warning_flag_doc
 
       in coloured (Col.sMessage col_scheme)
                   (hang (coloured (Col.sHeader col_scheme) header) 4
                         msg)
 
-  where
-    msgText =
-      case msg_class of
-        MCDiagnostic SevError _reason   -> text "error:"
-        MCDiagnostic SevWarning _reason -> text "warning:"
-        MCFatal                         -> text "fatal:"
-        _                               -> empty
-
 getMessageClassColour :: MessageClass -> Col.Scheme -> Col.PprColour
-getMessageClassColour (MCDiagnostic SevError _reason)   = Col.sError
-getMessageClassColour (MCDiagnostic SevWarning _reason) = Col.sWarning
-getMessageClassColour MCFatal                           = Col.sFatal
-getMessageClassColour _                                 = const mempty
+getMessageClassColour (MCDiagnostic SevError _reason _code)   = Col.sError
+getMessageClassColour (MCDiagnostic SevWarning _reason _code) = Col.sWarning
+getMessageClassColour MCFatal                                 = Col.sFatal
+getMessageClassColour _                                       = const mempty
 
 getCaretDiagnostic :: MessageClass -> SrcSpan -> IO SDoc
 getCaretDiagnostic _ (UnhelpfulSpan _) = pure empty
@@ -602,3 +674,29 @@ getErrorMessages (Messages xs) = fst $ partitionBag isIntrinsicErrorMessage xs
 -- warnings, and the second the errors.
 partitionMessages :: Diagnostic e => Messages e -> (Messages e, Messages e)
 partitionMessages (Messages xs) = bimap Messages Messages (partitionBag isWarningMessage xs)
+
+----------------------------------------------------------------
+--                                                            --
+-- Definition of diagnostic codes                             --
+--                                                            --
+----------------------------------------------------------------
+
+-- | A diagnostic code is a namespaced numeric identifier
+-- unique to the given diagnostic (error or warning).
+--
+-- All diagnostic codes defined within GHC are given the
+-- GHC namespace.
+--
+-- See Note [Diagnostic codes] in GHC.Types.Error.Codes.
+data DiagnosticCode =
+  DiagnosticCode
+    { diagnosticCodeNameSpace :: String
+        -- ^ diagnostic code prefix (e.g. "GHC")
+    , diagnosticCodeNumber    :: Natural
+        -- ^ the actual diagnostic code
+    }
+
+instance Outputable DiagnosticCode where
+  ppr (DiagnosticCode prefix c) =
+    text prefix <> text "-" <> text (printf "%05d" c)
+      -- pad the numeric code to have at least 5 digits

@@ -22,17 +22,19 @@ module Data.Array.Byte (
 import Data.Bits ((.&.), unsafeShiftR)
 import Data.Data (mkNoRepType, Data(..), Typeable)
 import qualified Data.Foldable as F
+import Data.Maybe (fromMaybe)
 import Data.Semigroup
-import GHC.Show (intToDigit)
 import GHC.Exts
+import GHC.Num.Integer (Integer(..))
+import GHC.Show (intToDigit)
 import GHC.ST (ST(..), runST)
 import GHC.Word (Word8(..))
 
--- | Boxed wrapper for 'ByteArray#'.
+-- | Lifted wrapper for 'ByteArray#'.
 --
 -- Since 'ByteArray#' is an unlifted type and not a member of kind 'Data.Kind.Type',
 -- things like @[ByteArray#]@ or @IO ByteArray#@ are ill-typed. To work around this
--- inconvenience this module provides a standard boxed wrapper, inhabiting 'Data.Kind.Type'.
+-- inconvenience this module provides a standard lifted wrapper, inhabiting 'Data.Kind.Type'.
 -- Clients are expected to use 'ByteArray' in higher-level APIs,
 -- but wrap and unwrap 'ByteArray' internally as they please
 -- and use functions from "GHC.Exts".
@@ -40,11 +42,11 @@ import GHC.Word (Word8(..))
 -- @since 4.17.0.0
 data ByteArray = ByteArray ByteArray#
 
--- | Boxed wrapper for 'MutableByteArray#'.
+-- | Lifted wrapper for 'MutableByteArray#'.
 --
 -- Since 'MutableByteArray#' is an unlifted type and not a member of kind 'Data.Kind.Type',
 -- things like @[MutableByteArray#]@ or @IO MutableByteArray#@ are ill-typed. To work around this
--- inconvenience this module provides a standard boxed wrapper, inhabiting 'Data.Kind.Type'.
+-- inconvenience this module provides a standard lifted wrapper, inhabiting 'Data.Kind.Type'.
 -- Clients are expected to use 'MutableByteArray' in higher-level APIs,
 -- but wrap and unwrap 'MutableByteArray' internally as they please
 -- and use functions from "GHC.Exts".
@@ -99,32 +101,50 @@ byteArrayToList arr = go 0
 -- | Create a 'ByteArray' from a list of a known length. If the length
 --   of the list does not match the given length, this throws an exception.
 byteArrayFromListN :: Int -> [Word8] -> ByteArray
-byteArrayFromListN n ys = runST $ do
+byteArrayFromListN n ys
+  | n >= 0 = runST $ do
     marr <- newByteArray n
     let go !ix [] = if ix == n
           then return ()
-          else error $ "Data.Array.Byte.byteArrayFromListN: list length less than specified size"
+          else errorWithoutStackTrace $ "Data.Array.Byte.byteArrayFromListN: list length less than specified size"
         go !ix (x : xs) = if ix < n
           then do
             writeByteArray marr ix x
             go (ix + 1) xs
-          else error $ "Data.Array.Byte.byteArrayFromListN: list length greater than specified size"
+          else errorWithoutStackTrace $ "Data.Array.Byte.byteArrayFromListN: list length greater than specified size"
     go 0 ys
     unsafeFreezeByteArray marr
+  | otherwise = errorWithoutStackTrace "Data.Array.Byte.ByteArrayFromListN: specified size is negative"
 
 -- | Copy a slice of an immutable byte array to a mutable byte array.
 --
 -- /Note:/ this function does not do bounds or overlap checking.
-copyByteArray
+unsafeCopyByteArray
   :: MutableByteArray s -- ^ destination array
   -> Int                -- ^ offset into destination array
   -> ByteArray          -- ^ source array
   -> Int                -- ^ offset into source array
   -> Int                -- ^ number of bytes to copy
   -> ST s ()
-{-# INLINE copyByteArray #-}
-copyByteArray (MutableByteArray dst#) (I# doff#) (ByteArray src#) (I# soff#) (I# sz#) =
+{-# INLINE unsafeCopyByteArray #-}
+unsafeCopyByteArray (MutableByteArray dst#) (I# doff#) (ByteArray src#) (I# soff#) (I# sz#) =
   ST (\s# -> case copyByteArray# src# soff# dst# doff# sz# s# of
+    s'# -> (# s'#, () #))
+
+-- | Copy a slice from one mutable byte array to another
+-- or to the same mutable byte array.
+--
+-- /Note:/ this function does not do bounds checking.
+unsafeCopyMutableByteArray
+  :: MutableByteArray s -- ^ destination array
+  -> Int                -- ^ offset into destination array
+  -> MutableByteArray s -- ^ source array
+  -> Int                -- ^ offset into source array
+  -> Int                -- ^ number of bytes to copy
+  -> ST s ()
+{-# INLINE unsafeCopyMutableByteArray #-}
+unsafeCopyMutableByteArray (MutableByteArray dst#) (I# doff#) (MutableByteArray src#) (I# soff#) (I# sz#) =
+  ST (\s# -> case copyMutableByteArray# src# soff# dst# doff# sz# s# of
     s'# -> (# s'#, () #))
 
 -- | @since 4.17.0.0
@@ -167,8 +187,7 @@ compareByteArraysFromBeginning (ByteArray ba1#) (ByteArray ba2#) (I# n#)
 -- | Do two byte arrays share the same pointer?
 sameByteArray :: ByteArray# -> ByteArray# -> Bool
 sameByteArray ba1 ba2 =
-    case reallyUnsafePtrEquality# (unsafeCoerce# ba1 :: ()) (unsafeCoerce# ba2 :: ()) of
-      r -> isTrue# r
+    case sameByteArray# ba1 ba2 of r -> isTrue# r
 
 -- | @since 4.17.0.0
 instance Eq ByteArray where
@@ -188,6 +207,7 @@ instance Eq (MutableByteArray s) where
 -- | Non-lexicographic ordering. This compares the lengths of
 -- the byte arrays first and uses a lexicographic ordering if
 -- the lengths are equal. Subject to change between major versions.
+--
 -- @since 4.17.0.0
 instance Ord ByteArray where
   ba1@(ByteArray ba1#) `compare` ba2@(ByteArray ba2#)
@@ -206,17 +226,23 @@ instance Ord ByteArray where
 
 -- | Append two byte arrays.
 appendByteArray :: ByteArray -> ByteArray -> ByteArray
-appendByteArray a b = runST $ do
-  marr <- newByteArray (sizeofByteArray a + sizeofByteArray b)
-  copyByteArray marr 0 a 0 (sizeofByteArray a)
-  copyByteArray marr (sizeofByteArray a) b 0 (sizeofByteArray b)
+appendByteArray ba1 ba2 = runST $ do
+  let n1 = sizeofByteArray ba1
+      n2 = sizeofByteArray ba2
+      totSz = fromMaybe (sizeOverflowError "appendByteArray")
+                        (checkedIntAdd n1 n2)
+  marr <- newByteArray totSz
+  unsafeCopyByteArray marr 0  ba1 0 n1
+  unsafeCopyByteArray marr n1 ba2 0 n2
   unsafeFreezeByteArray marr
 
 -- | Concatenate a list of 'ByteArray's.
 concatByteArray :: [ByteArray] -> ByteArray
 concatByteArray arrs = runST $ do
-  let len = calcLength arrs 0
-  marr <- newByteArray len
+  let addLen acc arr = fromMaybe (sizeOverflowError "concatByteArray")
+                                 (checkedIntAdd acc (sizeofByteArray arr))
+      totLen = F.foldl' addLen 0 arrs
+  marr <- newByteArray totLen
   pasteByteArrays marr 0 arrs
   unsafeFreezeByteArray marr
 
@@ -224,39 +250,59 @@ concatByteArray arrs = runST $ do
 pasteByteArrays :: MutableByteArray s -> Int -> [ByteArray] -> ST s ()
 pasteByteArrays !_ !_ [] = return ()
 pasteByteArrays !marr !ix (x : xs) = do
-  copyByteArray marr ix x 0 (sizeofByteArray x)
+  unsafeCopyByteArray marr ix x 0 (sizeofByteArray x)
   pasteByteArrays marr (ix + sizeofByteArray x) xs
-
--- | Compute total length of 'ByteArray's, increased by accumulator.
-calcLength :: [ByteArray] -> Int -> Int
-calcLength [] !n = n
-calcLength (x : xs) !n = calcLength xs (sizeofByteArray x + n)
 
 -- | An array of zero length.
 emptyByteArray :: ByteArray
 emptyByteArray = runST (newByteArray 0 >>= unsafeFreezeByteArray)
 
--- | Replicate 'ByteArray' given number of times and concatenate all together.
-replicateByteArray :: Int -> ByteArray -> ByteArray
-replicateByteArray n arr = runST $ do
-  marr <- newByteArray (n * sizeofByteArray arr)
-  let go i = if i < n
-        then do
-          copyByteArray marr (i * sizeofByteArray arr) arr 0 (sizeofByteArray arr)
-          go (i + 1)
-        else return ()
-  go 0
+-- | Concatenates a given number of copies of an input ByteArray.
+stimesPolymorphic :: Integral t => t -> ByteArray -> ByteArray
+{-# INLINABLE stimesPolymorphic #-}
+stimesPolymorphic nRaw !arr = case toInteger nRaw of
+  IS nInt#
+    | isTrue# (nInt# >#  0#) -> stimesPositiveInt (I# nInt#) arr
+    | isTrue# (nInt# >=# 0#) -> emptyByteArray
+      -- This check is redundant for unsigned types like Word.
+      -- Using >=# intead of ==# may make it easier for GHC to notice that.
+    | otherwise -> stimesNegativeErr
+  IP _
+    | sizeofByteArray arr == 0 -> emptyByteArray
+    | otherwise -> stimesOverflowErr
+  IN _ -> stimesNegativeErr
+
+stimesNegativeErr :: ByteArray
+stimesNegativeErr =
+  errorWithoutStackTrace "stimes @ByteArray: negative multiplier"
+
+stimesOverflowErr :: a
+stimesOverflowErr = sizeOverflowError "stimes"
+
+stimesPositiveInt :: Int -> ByteArray -> ByteArray
+{-# NOINLINE stimesPositiveInt #-}
+-- NOINLINE to prevent its duplication in specialisations of stimesPolymorphic
+stimesPositiveInt n arr = runST $ do
+  let inpSz = sizeofByteArray arr
+      tarSz = fromMaybe stimesOverflowErr (checkedIntMultiply n inpSz)
+  marr <- newByteArray tarSz
+  unsafeCopyByteArray marr 0 arr 0 inpSz
+  let
+    halfTarSz = (tarSz - 1) `div` 2
+    go copied
+      | copied <= halfTarSz = do
+          unsafeCopyMutableByteArray marr copied marr 0 copied
+          go (copied + copied)
+      | otherwise = unsafeCopyMutableByteArray marr copied marr 0 (tarSz - copied)
+  go inpSz
   unsafeFreezeByteArray marr
 
 -- | @since 4.17.0.0
 instance Semigroup ByteArray where
   (<>) = appendByteArray
   sconcat = mconcat . F.toList
-  stimes i arr
-    | itgr < 1 = emptyByteArray
-    | itgr <= (fromIntegral (maxBound :: Int)) = replicateByteArray (fromIntegral itgr) arr
-    | otherwise = error "Data.Array.Byte#stimes: cannot allocate the requested amount of memory"
-    where itgr = toInteger i :: Integer
+  {-# INLINE stimes #-}
+  stimes = stimesPolymorphic
 
 -- | @since 4.17.0.0
 instance Monoid ByteArray where
@@ -270,3 +316,23 @@ instance IsList ByteArray where
   toList = byteArrayToList
   fromList xs = byteArrayFromListN (length xs) xs
   fromListN = byteArrayFromListN
+
+
+sizeOverflowError :: String -> a
+sizeOverflowError fun
+  = errorWithoutStackTrace $ "Data.Array.Byte." ++ fun ++ ": size overflow"
+
+
+-- TODO: Export these from a better home.
+
+-- | Adds two @Int@s, returning @Nothing@ if this results in an overflow
+checkedIntAdd :: Int -> Int -> Maybe Int
+checkedIntAdd (I# x#) (I# y#) = case addIntC# x# y# of
+  (# res, 0# #) -> Just (I# res)
+  _ -> Nothing
+
+-- | Multiplies two @Int@s, returning @Nothing@ if this results in an overflow
+checkedIntMultiply :: Int -> Int -> Maybe Int
+checkedIntMultiply (I# x#) (I# y#) = case timesInt2# x# y# of
+  (# 0#, _hi, lo #) -> Just (I# lo)
+  _ -> Nothing

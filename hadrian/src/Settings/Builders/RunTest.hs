@@ -1,5 +1,9 @@
 {-# LANGUAGE TypeApplications #-}
-module Settings.Builders.RunTest (runTestBuilderArgs, runTestGhcFlags, assertSameCompilerArgs) where
+module Settings.Builders.RunTest (runTestBuilderArgs
+                                 , runTestGhcFlags
+                                 , assertSameCompilerArgs
+                                 , outOfTreeCompilerArgs
+                                 , TestCompilerArgs(..) ) where
 
 import Hadrian.Utilities
 import qualified System.FilePath
@@ -13,6 +17,8 @@ import qualified Data.Set    as Set
 import Flavour
 import qualified Context.Type as C
 import System.Directory (findExecutable)
+import Settings.Program
+import qualified Context.Type
 
 getTestSetting :: TestSetting -> Action String
 getTestSetting key = testSetting key
@@ -43,7 +49,7 @@ runTestGhcFlags = do
     -- Take flags to send to the Haskell compiler from test.mk.
     -- See: https://github.com/ghc/ghc/blob/master/testsuite/mk/test.mk#L37
     unwords <$> sequence
-        [ pure " -dcore-lint -dstg-lint -dcmm-lint -no-user-package-db -rtsopts"
+        [ pure " -dcore-lint -dstg-lint -dcmm-lint -no-user-package-db -fno-dump-with-ways -rtsopts"
         , pure ghcOpts
         , pure ghcExtraFlags
         , ifMinGhcVer "711" "-fno-warn-missed-specialisations"
@@ -54,7 +60,6 @@ runTestGhcFlags = do
         , pure "-dno-debug-output"
         ]
 
-
 data TestCompilerArgs = TestCompilerArgs{
     hasDynamicRts, hasThreadedRts :: Bool
  ,   hasDynamic        :: Bool
@@ -62,6 +67,7 @@ data TestCompilerArgs = TestCompilerArgs{
  ,   withNativeCodeGen :: Bool
  ,   withInterpreter   :: Bool
  ,   unregisterised    :: Bool
+ ,   tables_next_to_code :: Bool
  ,   withSMP           :: Bool
  ,   debugAssertions   :: Bool
       -- ^ Whether the compiler has debug assertions enabled,
@@ -83,25 +89,28 @@ inTreeCompilerArgs stg = do
 
 
     (hasDynamicRts, hasThreadedRts) <- do
-      ways <- interpretInContext (Context stg rts vanilla) getRtsWays
+      ways <- interpretInContext (vanillaContext stg rts) getRtsWays
       return (dynamic `elem` ways, threaded `elem` ways)
     -- MP: We should be able to vary if stage1/stage2 is dynamic, ie a dynamic stage1
     -- should be able to built a static stage2?
-    hasDynamic          <- flavour >>= dynamicGhcPrograms
+    hasDynamic          <- (dynamic ==) . Context.Type.way <$> (programContext stg ghc)
     -- LeadingUnderscore is a property of the system so if cross-compiling stage1/stage2 could
     -- have different values? Currently not possible to express.
     leadingUnderscore   <- flag LeadingUnderscore
-    -- MP: This setting seems to only dictate whether we turn on optasm as a compiler
-    -- way, but a lot of tests which use only_ways(optasm) seem to not test the NCG?
-    withNativeCodeGen   <- return True
     withInterpreter     <- ghcWithInterpreter
     unregisterised      <- flag GhcUnregisterised
+    tables_next_to_code <- flag TablesNextToCode
     withSMP             <- targetSupportsSMP
-    debugAssertions     <- ghcDebugAssertions <$> flavour
-    profiled            <- ghcProfiled        <$> flavour
+    debugAssertions     <- ($ succStage stg) . ghcDebugAssertions <$> flavour
+    profiled            <- ghcProfiled        <$> flavour <*> pure stg
 
     os          <- setting HostOs
     arch        <- setting TargetArch
+    let codegen_arches = ["x86_64", "i386", "powerpc", "powerpc64", "powerpc64le", "aarch64", "wasm32"]
+    let withNativeCodeGen
+          | unregisterised = False
+          | arch `elem` codegen_arches = True
+          | otherwise = False
     platform    <- setting TargetPlatform
     wordsize    <- (show @Int . (*8) . read) <$> setting TargetWordSize
 
@@ -111,7 +120,7 @@ inTreeCompilerArgs stg = do
     top         <- topDirectory
 
     pkgConfCacheFile <- System.FilePath.normalise . (top -/-)
-                    <$> (packageDbPath stg <&> (-/- "package.cache"))
+                    <$> (packageDbPath (PackageDbLoc stg Final) <&> (-/- "package.cache"))
     libdir           <- System.FilePath.normalise . (top -/-)
                     <$> stageLibPath stg
 
@@ -136,6 +145,7 @@ outOfTreeCompilerArgs = do
     withNativeCodeGen   <- getBooleanSetting TestGhcWithNativeCodeGen
     withInterpreter     <- getBooleanSetting TestGhcWithInterpreter
     unregisterised      <- getBooleanSetting TestGhcUnregisterised
+    tables_next_to_code <- getBooleanSetting TestGhcTablesNextToCode
     withSMP             <- getBooleanSetting TestGhcWithSMP
     debugAssertions     <- getBooleanSetting TestGhcDebugged
 
@@ -159,7 +169,6 @@ outOfTreeCompilerArgs = do
 -- thing
 assertSameCompilerArgs :: Stage -> Action ()
 assertSameCompilerArgs stg = do
-  test_ghc <- testCompiler <$> userSetting defaultTestArgs
   in_args  <- inTreeCompilerArgs stg
   out_args <- outOfTreeCompilerArgs
   -- The assertion to check we calculated the right thing
@@ -247,6 +256,7 @@ runTestBuilderArgs = builder Testsuite ? do
 
             , arg "-e", arg $ "config.have_interp=" ++ show withInterpreter
             , arg "-e", arg $ "config.unregisterised=" ++ show unregisterised
+            , arg "-e", arg $ "config.tables_next_to_code=" ++ show tables_next_to_code
 
             , arg "-e", arg $ "ghc_compiler_always_flags=" ++ quote ghcFlags
             , arg "-e", arg $ asBool "ghc_with_dynamic_rts="  (hasDynamicRts)

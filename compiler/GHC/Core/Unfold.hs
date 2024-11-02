@@ -47,10 +47,10 @@ import GHC.Core.DataCon
 import GHC.Types.Literal
 import GHC.Builtin.PrimOps
 import GHC.Types.Id.Info
-import GHC.Types.Basic  ( Arity )
+import GHC.Types.RepType ( isZeroBitTy )
+import GHC.Types.Basic  ( Arity, RecFlag(..) )
 import GHC.Core.Type
 import GHC.Builtin.Names
-import GHC.Builtin.Types.Prim ( realWorldStatePrimTy )
 import GHC.Data.Bag
 import GHC.Utils.Logger
 import GHC.Utils.Misc
@@ -431,7 +431,7 @@ sizeExpr opts !bOMB_OUT_SIZE top_args expr
     size_up (Type _)   = sizeZero           -- Types cost nothing
     size_up (Coercion _) = sizeZero
     size_up (Lit lit)  = sizeN (litSize lit)
-    size_up (Var f) | isRealWorldId f = sizeZero
+    size_up (Var f) | isZeroBitId f = sizeZero
                       -- Make sure we get constructor discounts even
                       -- on nullary constructors
                     | otherwise       = size_up_call f [] 0
@@ -439,10 +439,10 @@ sizeExpr opts !bOMB_OUT_SIZE top_args expr
     size_up (App fun arg)
       | isTyCoArg arg = size_up fun
       | otherwise     = size_up arg  `addSizeNSD`
-                        size_up_app fun [arg] (if isRealWorldExpr arg then 1 else 0)
+                        size_up_app fun [arg] (if isZeroBitExpr arg then 1 else 0)
 
     size_up (Lam b e)
-      | isId b && not (isRealWorldId b) = lamScrutDiscount opts (size_up e `addSizeN` 10)
+      | isId b && not (isZeroBitId b) = lamScrutDiscount opts (size_up e `addSizeN` 10)
       | otherwise = size_up e
 
     size_up (Let (NonRec binder rhs) body)
@@ -528,9 +528,9 @@ sizeExpr opts !bOMB_OUT_SIZE top_args expr
           is_inline_scrut scrut
               | (Var f, _) <- collectArgs scrut
                 = case idDetails f of
-                    FCallId fc  -> not (isSafeForeignCall fc)
-                    PrimOpId op -> not (primOpOutOfLine op)
-                    _other      -> False
+                    FCallId fc    -> not (isSafeForeignCall fc)
+                    PrimOpId op _ -> not (primOpOutOfLine op)
+                    _other        -> False
               | otherwise
                 = False
 
@@ -546,7 +546,7 @@ sizeExpr opts !bOMB_OUT_SIZE top_args expr
     -- size_up_app is used when there's ONE OR MORE value args
     size_up_app (App fun arg) args voids
         | isTyCoArg arg                  = size_up_app fun args voids
-        | isRealWorldExpr arg            = size_up_app fun (arg:args) (voids + 1)
+        | isZeroBitExpr arg              = size_up_app fun (arg:args) (voids + 1)
         | otherwise                      = size_up arg  `addSizeNSD`
                                            size_up_app fun (arg:args) voids
     size_up_app (Var fun)     args voids = size_up_call fun args voids
@@ -564,7 +564,7 @@ sizeExpr opts !bOMB_OUT_SIZE top_args expr
        = case idDetails fun of
            FCallId _        -> sizeN (callSize (length val_args) voids)
            DataConWorkId dc -> conSize    dc (length val_args)
-           PrimOpId op      -> primOpSize op (length val_args)
+           PrimOpId op _    -> primOpSize op (length val_args)
            ClassOpId _      -> classOpSize opts top_args val_args
            _                -> funSize opts top_args fun (length val_args) voids
 
@@ -580,10 +580,9 @@ sizeExpr opts !bOMB_OUT_SIZE top_args expr
     ------------
     -- Cost to allocate binding with given binder
     size_up_alloc bndr
-      |  isTyVar bndr                 -- Doesn't exist at runtime
-      || isJoinId bndr                -- Not allocated at all
-      || isUnliftedType (idType bndr) -- Doesn't live in heap
-           -- OK to call isUnliftedType: binders have a fixed RuntimeRep (search for FRRBinder)
+      |  isTyVar bndr                    -- Doesn't exist at runtime
+      || isJoinId bndr                   -- Not allocated at all
+      || not (isBoxedType (idType bndr)) -- Doesn't live in heap
       = 0
       | otherwise
       = 10
@@ -611,12 +610,14 @@ sizeExpr opts !bOMB_OUT_SIZE top_args expr
                                  (xs `unionBags` ys)
                                  d2  -- Ignore d1
 
-    isRealWorldId id = idType id `eqType` realWorldStatePrimTy
+    -- don't count expressions such as State# RealWorld
+    -- exclude join points, because they can be rep-polymorphic
+    -- and typePrimRep will crash
+    isZeroBitId id = not (isJoinId id) && isZeroBitTy (idType id)
 
-    -- an expression of type State# RealWorld must be a variable
-    isRealWorldExpr (Var id)   = isRealWorldId id
-    isRealWorldExpr (Tick _ e) = isRealWorldExpr e
-    isRealWorldExpr _          = False
+    isZeroBitExpr (Var id)   = isZeroBitId id
+    isZeroBitExpr (Tick _ e) = isZeroBitExpr e
+    isZeroBitExpr _          = False
 
 -- | Finds a nominal size of a string literal.
 litSize :: Literal -> Int
@@ -734,7 +735,7 @@ discount of 10, that'll make each alternative RHS cost zero.  We
 charge 10 for each case alternative (see size_up_alt).  If we give a
 bigger discount (say 20) in conSize, we'll make the case expression
 cost *nothing*, and that can make a huge case tree cost nothing. This
-leads to massive, sometimes exponenial inlinings (#18282).  In short,
+leads to massive, sometimes exponential inlinings (#18282).  In short,
 don't give a discount that give a negative size to a sub-expression!
 
 Historical note 2: Much longer ago, Simon M tried a MUCH bigger
@@ -1001,7 +1002,7 @@ nonTriv _       = True
 
 data CallCtxt
   = BoringCtxt
-  | RhsCtxt             -- Rhs of a let-binding; see Note [RHS of lets]
+  | RhsCtxt RecFlag     -- Rhs of a let-binding; see Note [RHS of lets]
   | DiscArgCtxt         -- Argument of a function with non-zero arg discount
   | RuleArgCtxt         -- We are somewhere in the argument of a function with rules
 
@@ -1016,7 +1017,7 @@ instance Outputable CallCtxt where
   ppr CaseCtxt    = text "CaseCtxt"
   ppr ValAppCtxt  = text "ValAppCtxt"
   ppr BoringCtxt  = text "BoringCtxt"
-  ppr RhsCtxt     = text "RhsCtxt"
+  ppr (RhsCtxt ir)= text "RhsCtxt" <> parens (ppr ir)
   ppr DiscArgCtxt = text "DiscArgCtxt"
   ppr RuleArgCtxt = text "RuleArgCtxt"
 
@@ -1170,7 +1171,7 @@ tryUnfolding logger opts !case_depth id lone_variable arg_infos
 
      UnfWhen { ug_arity = uf_arity, ug_unsat_ok = unsat_ok, ug_boring_ok = boring_ok }
         | enough_args && (boring_ok || some_benefit || unfoldingVeryAggressive opts)
-                -- See Note [INLINE for small functions (3)]
+                -- See Note [INLINE for small functions] (3)
         -> traceInline logger opts id str (mk_doc some_benefit empty True) (Just unf_template)
         | otherwise
         -> traceInline logger opts id str (mk_doc some_benefit empty False) Nothing
@@ -1219,7 +1220,7 @@ tryUnfolding logger opts !case_depth id lone_variable arg_infos
              , text "ANSWER =" <+> if yes_or_no then text "YES" else text "NO"]
 
     ctx = log_default_dump_context (logFlags logger)
-    str = "Considering inlining: " ++ renderWithContext ctx (ppr id)
+    str = "Considering inlining: " ++ showSDocOneLine ctx (ppr id)
     n_val_args = length arg_infos
 
            -- some_benefit is used when the RHS is small enough
@@ -1249,21 +1250,17 @@ tryUnfolding logger opts !case_depth id lone_variable arg_infos
           = case cont_info of
               CaseCtxt   -> not (lone_variable && is_exp)  -- Note [Lone variables]
               ValAppCtxt -> True                           -- Note [Cast then apply]
-              RuleArgCtxt -> uf_arity > 0  -- See Note [Unfold info lazy contexts]
+              RuleArgCtxt -> uf_arity > 0  -- See Note [RHS of lets]
               DiscArgCtxt -> uf_arity > 0  -- Note [Inlining in ArgCtxt]
-              RhsCtxt     -> uf_arity > 0  --
+              RhsCtxt NonRecursive
+                          -> uf_arity > 0  -- See Note [RHS of lets]
               _other      -> False         -- See Note [Nested functions]
 
 
-{-
-Note [Unfold into lazy contexts]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Merged into Note [RHS of lets].
-
-Note [RHS of lets]
-~~~~~~~~~~~~~~~~~~
+{- Note [RHS of lets]
+~~~~~~~~~~~~~~~~~~~~~
 When the call is the argument of a function with a RULE, or the RHS of a let,
-we are a little bit keener to inline.  For example
+we are a little bit keener to inline (in tryUnfolding).  For example
      f y = (y,y,y)
      g y = let x = f y in ...(case x of (a,b,c) -> ...) ...
 We'd inline 'f' if the call was in a case context, and it kind-of-is,
@@ -1272,7 +1269,11 @@ only we can't see it.  Also
 could be expensive whereas
      x = case v of (a,b) -> a
 is patently cheap and may allow more eta expansion.
-So we treat the RHS of a let as not-totally-boring.
+
+So, in `interesting_call` in `tryUnfolding`, we treat the RHS of a
+/non-recursive/ let as not-totally-boring.  A /recursive/ let isn't
+going be inlined so there is much less point.  Hence the (only reason
+for the) RecFlag in RhsCtxt
 
 Note [Unsaturated applications]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1312,20 +1313,6 @@ Note [Things to watch]
 *   { x = I# 3; ....f x.... }
     Make sure that x does not inline unconditionally!
     Lest we get extra allocation.
-
-Note [Inlining an InlineRule]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-An InlineRules is used for
-  (a) programmer INLINE pragmas
-  (b) inlinings from worker/wrapper
-
-For (a) the RHS may be large, and our contract is that we *only* inline
-when the function is applied to all the arguments on the LHS of the
-source-code defn.  (The uf_arity in the rule.)
-
-However for worker/wrapper it may be worth inlining even if the
-arity is not satisfied (as we do in the CoreUnfolding case) so we don't
-require saturation.
 
 Note [Nested functions]
 ~~~~~~~~~~~~~~~~~~~~~~~
@@ -1367,8 +1354,11 @@ call is at least CONLIKE.  At least for the cases where we use ArgCtxt
 for the RHS of a 'let', we only profit from the inlining if we get a
 CONLIKE thing (modulo lets).
 
-Note [Lone variables]   See also Note [Interaction of exprIsWorkFree and lone variables]
-~~~~~~~~~~~~~~~~~~~~~   which appears below
+Note [Lone variables]
+~~~~~~~~~~~~~~~~~~~~~
+See also Note [Interaction of exprIsWorkFree and lone variables]
+which appears below
+
 The "lone-variable" case is important.  I spent ages messing about
 with unsatisfactory variants, but this is nice.  The idea is that if a
 variable appears all alone
@@ -1405,8 +1395,8 @@ RULE) so there's no gain.
 However, watch out:
 
  * Consider this:
-        foo = _inline_ (\n. [n])
-        bar = _inline_ (foo 20)
+        foo = \n. [n])  {-# INLINE foo #-}
+        bar = foo 20    {-# INLINE bar #-}
         baz = \n. case bar of { (m:_) -> m + n }
    Here we really want to inline 'bar' so that we can inline 'foo'
    and the whole thing unravels as it should obviously do.  This is
@@ -1414,9 +1404,9 @@ However, watch out:
    structure rather than a list.
 
    So the non-inlining of lone_variables should only apply if the
-   unfolding is regarded as cheap; because that is when exprIsConApp_maybe
-   looks through the unfolding.  Hence the "&& is_wf" in the
-   InlineRule branch.
+   unfolding is regarded as expandable; because that is when
+   exprIsConApp_maybe looks through the unfolding.  Hence the "&&
+   is_exp" in the CaseCtxt branch of interesting_call
 
  * Even a type application or coercion isn't a lone variable.
    Consider

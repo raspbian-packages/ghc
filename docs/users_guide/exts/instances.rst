@@ -45,7 +45,10 @@ Relaxed rules for the instance head
     :shortdesc: Enable type synonyms in instance heads.
       Implied by :extension:`FlexibleInstances`.
 
+    :implied by: :extension:`FlexibleInstances`
     :since: 6.8.1
+
+    :status: Included in :extension:`GHC2021`
 
     Allow definition of type class instances for type synonyms.
 
@@ -54,7 +57,10 @@ Relaxed rules for the instance head
         Implies :extension:`TypeSynonymInstances`.
 
     :implies: :extension:`TypeSynonymInstances`
+
     :since: 6.8.1
+
+    :status: Included in :extension:`GHC2021`
 
     Allow definition of type class instances with arbitrary nested types in the
     instance head.
@@ -174,17 +180,9 @@ syntactically allowed. Some further various observations about this grammar:
 
 .. _instance-rules:
 .. _instance-termination:
-.. _undecidable-instances:
 
 Instance termination rules
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-.. extension:: UndecidableInstances
-    :shortdesc: Enable undecidable instances.
-
-    :since: 6.8.1
-
-    Permit definition of instances which may lead to type-checker non-termination.
 
 Regardless of :extension:`FlexibleInstances` and :extension:`FlexibleContexts`,
 instance declarations must conform to some rules that ensure that
@@ -205,6 +203,9 @@ The rules are these:
    3. The constraint mentions no type functions. A type function
       application can in principle expand to a type of arbitrary size,
       and so are rejected out of hand
+
+   If these three conditions hold we say that the constraint ``(C t1 ... tn)`` is
+   **Paterson-smaller** than the instance head.
 
 2. The Coverage Condition. For each functional dependency,
    ⟨tvs⟩\ :sub:`left` ``->`` ⟨tvs⟩\ :sub:`right`, of the class, every
@@ -312,9 +313,98 @@ indeed the (somewhat strange) definition:
 makes instance inference go into a loop, because it requires the
 constraint ``(Mul a [b] b)``.
 
-The :extension:`UndecidableInstances` extension is also used to lift some of the
-restrictions imposed on type family instances. See
+.. _undecidable-instances:
+
+Undecidable instances and loopy superclasses
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. extension:: UndecidableInstances
+    :shortdesc: Enable undecidable instances.
+
+    :since: 6.8.1
+
+    Permit definition of instances which may lead to type-checker non-termination.
+
+The :extension:`UndecidableInstances` extension  lifts the restrictions on
+on instance declarations described in :ref:`instance-termination`.
+The :extension:`UndecidableInstances` extension also lifts some of the
+restrictions imposed on type family instances; see
 :ref:`type-family-decidability`.
+
+
+With :extension:`UndecidableInstances` it is possible to create a superclass cycle,
+which leads to the program failing to terminate.  To avoid this, GHC imposes
+rules on the way in which superclass constraints are satisfied in an instance
+declaration.  These rules apply even when :extension:`UndecidableInstances` is enabled.
+Consider::
+
+  class C a => D a where ...
+
+  instance Wombat [b] => D [b] where ...
+
+When typechecking this ``instance`` declaration, GHC must ensure that ``D``'s superclass,
+``(C [b])`` is satisfied. We say that ``(C [b])`` is a **Wanted superclass constraint** of the
+instance declaration.
+
+If there is an ``instance blah => C [b]``, which is often the
+case, GHC can use the instance declaration and all is well.  But suppose there is no
+such instance, so GHC can only satisfy the Wanted ``(C [b])`` from the context of the instance,
+namely the Given constraint ``(Wombat [b])``.  Perhaps the declaration of ``Wombat`` looks like this::
+
+  class C a => Wombat a
+
+So the Given ``(Wombat [b])`` has a superclass ``(C [b])``, and it looks as if we can satisfy the
+Wanted ``(C [b])`` constraint from this superclass of ``Wombat``.  But it turns out that
+allowing this can lead to subtle looping dictionaries, and GHC prevents it.
+
+The rule is this: **a Wanted superclass constraint can only be satisfied in one of these three ways:**
+
+.. rst-class:: open
+
+1. *Directly from the context of the instance declaration*.  For example, if the declaration looked like this::
+
+      instance (Wombat [b], C [b]) => D [b] where ...
+
+   we could satisfy the Wanted ``(C [b])`` from the Given ``(C [b])``.
+
+2. *Using another instance declaration*. For example, if we had::
+
+      instance C b => C [b] where ...
+
+   we can satisfy the Wanted superclass constraint ``(C [b])`` using this instance,
+   reducing it to the Wanted constraint ``(C b)`` (which still has to be solved).
+
+3. *Using the immediate superclass of a Given constraint X that is Paterson-smaller than the head of the instance declaration.*
+   The rules for Paterson-smaller are precisely those described in :ref:`instance-rules`:
+
+     - No type variable can occur more often in X than in the instance head.
+
+     - X must have fewer type constructors and variables (taken together and counting repetitions) than the instance head.
+
+     - X must mention no type functions.
+
+Rule (3) is the tricky one.  Here is an example, taken from GHC's own source code::
+
+           class Ord r => UserOfRegs r a where ...
+    (i1)   instance UserOfRegs r a => UserOfRegs r (Maybe a) where
+    (i2)   instance (Ord r, UserOfRegs r CmmReg) => UserOfRegs r CmmExpr where
+
+For ``(i1)`` we can get the ``(Ord r)`` superclass by selection from
+``(UserOfRegs r a)``, since it (i.e. ``UserOfRegs r a``) is Paterson-smaller than the
+head of the instance declaration, namely ``(UserOfRegs r (Maybe a))``.
+
+But for ``(i2)`` that isn't the case: ``(UserOfRegs r CmmReg)`` is not Paterson-smaller
+than the head of the instance ``(UserOfRegs r CmmExpr)``, so we can't use
+the superclasses of the former.  Hence we must instead add an explicit,
+and perhaps surprising, ``(Ord r)`` argument to the instance declaration.
+
+This fix, of simply adding an apparently-redundant constraint to the context
+of an instance declaration, is robust: it always fixes the problem.
+(We considered adding it automatically, but decided that it was better be explicit.)
+
+Fixing this subtle superclass cycle has a long history; if you are interested, read
+``Note [Recursive superclasses]`` and ``Note [Solving superclass constraints]``
+in ``GHC.Tc.TyCl.Instance``.
 
 .. _instance-overlap:
 
@@ -326,6 +416,8 @@ Overlapping instances
 
     :since: 6.8.1
 
+    :status: Deprecated
+
     Deprecated extension to weaken checks intended to ensure instance resolution
     termination.
 
@@ -334,6 +426,8 @@ Overlapping instances
         Implies :extension:`OverlappingInstances`.
 
     :since: 6.8.1
+
+    :status: Deprecated
 
     Deprecated extension to weaken checks intended to ensure instance resolution
     termination.
@@ -577,18 +671,19 @@ Instance signatures: type signatures in instance declarations
 
     :since: 7.6.1
 
+    :status: Included in :extension:`GHC2021`
+
     Allow type signatures for members in instance definitions.
 
-In Haskell, you can't write a type signature in an instance declaration,
-but it is sometimes convenient to do so, and the language extension
-:extension:`InstanceSigs` allows you to do so. For example: ::
+The :extension:`InstanceSigs` extension allows users to give type signatures
+to the class methods in a class instance declaration. For example: ::
 
       data T a = MkT a a
       instance Eq a => Eq (T a) where
-        (==) :: T a -> T a -> Bool   -- The signature
+        (==) :: T a -> T a -> Bool   -- The instance signature
         (==) (MkT x1 x2) (MkTy y1 y2) = x1==y1 && x2==y2
 
-Some details
+Some details:
 
 -  The type signature in the instance declaration must be more
    polymorphic than (or the same as) the one in the class declaration,
@@ -601,10 +696,36 @@ Some details
    Here the signature in the instance declaration is more polymorphic
    than that required by the instantiated class method.
 
+   Note that, to check that the instance signature is more polymorphic,
+   GHC performs a sub-type check, which can solve constraints using available
+   top-level instances.
+   This means that the following instance signature is accepted: ::
+
+      instance Eq (T Int) where
+        (==) :: Eq Int => T Int -> T Int -> Bool
+        (==) (MkT x1 _) (MkT y1 _) = x1 == y1
+
+   The ``Eq Int`` constraint in the instance signature will be solved
+   by the top-level ``Eq Int`` instance, from which it follows that the
+   instance signature is indeed as general as the instantiated class
+   method type ``T Int -> T Int -> Bool``.
+
 -  The code for the method in the instance declaration is typechecked
    against the type signature supplied in the instance declaration, as
    you would expect. So if the instance signature is more polymorphic
    than required, the code must be too.
+
+-  The instance signature is purely local to the class instance
+   declaration. It only affects the typechecking of the method in
+   the instance; it does not affect anything outside the class
+   instance. In this way, it is similar to an inline type signature:
+
+       instance Eq a => Eq (T a) where
+           (==) = (\ x y -> True) :: forall b. b -> b -> Bool
+
+   In particular, adding constraints such as `HasCallStack` to the
+   instance signature will not have an effect; they need to be added
+   to the class instead.
 
 -  One stylistic reason for wanting to write a type signature is simple
    documentation. Another is that you may want to bring scoped type

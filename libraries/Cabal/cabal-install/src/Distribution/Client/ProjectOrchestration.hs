@@ -138,7 +138,6 @@ import qualified Distribution.Client.BuildReports.Anonymous as BuildReports
 import qualified Distribution.Client.BuildReports.Storage as BuildReports
          ( storeLocal )
 
-import           Distribution.Client.Config (getCabalDir)
 import           Distribution.Client.HttpUtils
 import           Distribution.Client.Setup hiding (packageName)
 import           Distribution.Compiler
@@ -162,7 +161,7 @@ import           Distribution.Simple.Flag
 import qualified Distribution.Simple.Setup as Setup
 import           Distribution.Simple.Command (commandShowOptions)
 import           Distribution.Simple.Configure (computeEffectiveProfiling)
-
+import           Distribution.Simple.PackageIndex (InstalledPackageIndex)
 import           Distribution.Simple.Utils
                    ( die', warn, notice, noticeNoWrap, debugNoWrap, createDirectoryIfMissingVerbose, ordNub )
 import           Distribution.Verbosity
@@ -187,11 +186,11 @@ import           System.Posix.Signals (sigKILL, sigSEGV)
 
 -- | Tracks what command is being executed, because we need to hide this somewhere
 -- for cases that need special handling (usually for error reporting).
-data CurrentCommand = InstallCommand | HaddockCommand | OtherCommand
+data CurrentCommand = InstallCommand | HaddockCommand | BuildCommand | ReplCommand | OtherCommand
                     deriving (Show, Eq)
 
 -- | This holds the context of a project prior to solving: the content of the
--- @cabal.project@ and all the local package @.cabal@ files.
+-- @cabal.project@, @cabal/config@ and all the local package @.cabal@ files.
 --
 data ProjectBaseContext = ProjectBaseContext {
        distDirLayout  :: DistDirLayout,
@@ -199,7 +198,8 @@ data ProjectBaseContext = ProjectBaseContext {
        projectConfig  :: ProjectConfig,
        localPackages  :: [PackageSpecifier UnresolvedSourcePackage],
        buildSettings  :: BuildTimeSettings,
-       currentCommand :: CurrentCommand
+       currentCommand :: CurrentCommand,
+       installedPackages :: Maybe InstalledPackageIndex
      }
 
 establishProjectBaseContext
@@ -222,8 +222,6 @@ establishProjectBaseContextWithRoot
     -> CurrentCommand
     -> IO ProjectBaseContext
 establishProjectBaseContextWithRoot verbosity cliConfig projectRoot currentCommand = do
-    cabalDir <- getCabalDir
-
     let distDirLayout  = defaultDistDirLayout projectRoot mdistDirectory
 
     httpTransport <- configureTransport verbosity
@@ -247,9 +245,9 @@ establishProjectBaseContextWithRoot verbosity cliConfig projectRoot currentComma
         mlogsDir = Setup.flagToMaybe projectConfigLogsDir
     mstoreDir <- sequenceA $ makeAbsolute
                  <$> Setup.flagToMaybe projectConfigStoreDir
-    let cabalDirLayout = mkCabalDirLayout cabalDir mstoreDir mlogsDir
+    cabalDirLayout <- mkCabalDirLayout mstoreDir mlogsDir
 
-        buildSettings = resolveBuildTimeSettings
+    let  buildSettings = resolveBuildTimeSettings
                           verbosity cabalDirLayout
                           projectConfig
 
@@ -263,11 +261,13 @@ establishProjectBaseContextWithRoot verbosity cliConfig projectRoot currentComma
       projectConfig,
       localPackages,
       buildSettings,
-      currentCommand
+      currentCommand,
+      installedPackages
     }
   where
     mdistDirectory = Setup.flagToMaybe projectConfigDistDir
     ProjectConfigShared { projectConfigDistDir } = projectConfigShared cliConfig
+    installedPackages = Nothing
 
 
 -- | This holds the context between the pre-build, build and post-build phases.
@@ -312,7 +312,8 @@ withInstallPlan
       distDirLayout,
       cabalDirLayout,
       projectConfig,
-      localPackages
+      localPackages,
+      installedPackages
     }
     action = do
     -- Take the project configuration and make a plan for how to build
@@ -324,6 +325,7 @@ withInstallPlan
                          distDirLayout cabalDirLayout
                          projectConfig
                          localPackages
+                         installedPackages
     action elaboratedPlan elaboratedShared
 
 runProjectPreBuildPhase
@@ -337,7 +339,8 @@ runProjectPreBuildPhase
       distDirLayout,
       cabalDirLayout,
       projectConfig,
-      localPackages
+      localPackages,
+      installedPackages
     }
     selectPlanSubset = do
     -- Take the project configuration and make a plan for how to build
@@ -349,6 +352,7 @@ runProjectPreBuildPhase
                          distDirLayout cabalDirLayout
                          projectConfig
                          localPackages
+                         installedPackages
 
     -- The plan for what to do is represented by an 'ElaboratedInstallPlan'
 
@@ -862,26 +866,26 @@ printPlan verbosity
           ProjectBaseContext {
             buildSettings = BuildTimeSettings{buildSettingDryRun},
             projectConfig = ProjectConfig {
+              projectConfigAllPackages =
+                  PackageConfig {packageConfigOptimization = globalOptimization},
               projectConfigLocalPackages =
-                  PackageConfig {packageConfigOptimization}
-            }
+                  PackageConfig {packageConfigOptimization = localOptimization}
+            },
+            currentCommand
           }
           ProjectBuildContext {
             elaboratedPlanToExecute = elaboratedPlan,
             elaboratedShared,
             pkgsBuildStatus
           }
-
-  | null pkgs
-  = notice verbosity "Up to date"
-
-  | otherwise
-  = noticeNoWrap verbosity $ unlines $
+  | null pkgs && currentCommand == BuildCommand
+    = notice verbosity "Up to date"
+  | not (null pkgs) = noticeNoWrap verbosity $ unlines $
       (showBuildProfile ++ "In order, the following "
        ++ wouldWill ++ " be built"
        ++ ifNormal " (use -v for more details)" ++ ":")
     : map showPkgAndReason pkgs
-
+  | otherwise = return ()
   where
     pkgs = InstallPlan.executionOrder elaboratedPlan
 
@@ -997,7 +1001,7 @@ printPlan verbosity
     showBuildProfile :: String
     showBuildProfile = "Build profile: " ++ unwords [
       "-w " ++ (showCompilerId . pkgConfigCompiler) elaboratedShared,
-      "-O" ++  (case packageConfigOptimization of
+      "-O" ++  (case globalOptimization <> localOptimization of -- if local is not set, read global
                 Setup.Flag NoOptimisation      -> "0"
                 Setup.Flag NormalOptimisation  -> "1"
                 Setup.Flag MaximumOptimisation -> "2"
@@ -1153,7 +1157,7 @@ dieOnBuildFailures verbosity currentCommand plan buildOutcomes
       , [pkg]              <- rootpkgs
       , installedUnitId pkg == pkgid
       , isFailureSelfExplanatory (buildFailureReason failure)
-      , currentCommand /= InstallCommand
+      , currentCommand `notElem` [InstallCommand, BuildCommand, ReplCommand]
       = True
       | otherwise
       = False
@@ -1319,8 +1323,6 @@ establishDummyProjectBaseContext
   -> CurrentCommand
   -> IO ProjectBaseContext
 establishDummyProjectBaseContext verbosity projectConfig distDirLayout localPackages currentCommand = do
-    cabalDir <- getCabalDir
-
     let ProjectConfigBuildOnly {
           projectConfigLogsDir
         } = projectConfigBuildOnly projectConfig
@@ -1331,12 +1333,14 @@ establishDummyProjectBaseContext verbosity projectConfig distDirLayout localPack
 
         mlogsDir = flagToMaybe projectConfigLogsDir
         mstoreDir = flagToMaybe projectConfigStoreDir
-        cabalDirLayout = mkCabalDirLayout cabalDir mstoreDir mlogsDir
 
-        buildSettings :: BuildTimeSettings
+    cabalDirLayout <- mkCabalDirLayout mstoreDir mlogsDir
+
+    let buildSettings :: BuildTimeSettings
         buildSettings = resolveBuildTimeSettings
                           verbosity cabalDirLayout
                           projectConfig
+        installedPackages = Nothing
 
     return ProjectBaseContext {
       distDirLayout,
@@ -1344,7 +1348,8 @@ establishDummyProjectBaseContext verbosity projectConfig distDirLayout localPack
       projectConfig,
       localPackages,
       buildSettings,
-      currentCommand
+      currentCommand,
+      installedPackages
     }
 
 establishDummyDistDirLayout :: Verbosity -> ProjectConfig -> FilePath -> IO DistDirLayout

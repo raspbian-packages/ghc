@@ -13,6 +13,8 @@ module Settings.Default (
     defaultFlavour, defaultBignumBackend
     ) where
 
+import qualified Data.Set as Set
+
 import qualified Hadrian.Builder.Sphinx
 import qualified Hadrian.Builder.Tar
 import Hadrian.Haskell.Cabal.Type
@@ -25,6 +27,7 @@ import Oracles.Setting
 import Packages
 import Settings.Builders.Alex
 import Settings.Builders.DeriveConstants
+import Settings.Builders.GenApply
 import Settings.Builders.Cabal
 import Settings.Builders.Cc
 import Settings.Builders.Configure
@@ -39,6 +42,7 @@ import Settings.Builders.Ar
 import Settings.Builders.Ld
 import Settings.Builders.Make
 import Settings.Builders.MergeObjects
+import Settings.Builders.SplitSections
 import Settings.Builders.RunTest
 import Settings.Builders.Xelatex
 import Settings.Packages
@@ -78,6 +82,7 @@ stage0Packages = do
              , directory
              , process
              , exceptions
+             , filepath
              , ghc
              , runGhc
              , ghcBoot
@@ -96,12 +101,12 @@ stage0Packages = do
              , text
              , transformers
              , unlit
+             , hp2ps
              , if windowsHost then win32 else unix
              ]
           ++ [ terminfo | not windowsHost, not cross ]
           ++ [ timeout  | windowsHost                ]
           ++ [ touchy   | windowsHost                ]
-          ++ [ hp2ps    | cross                      ]
 
 -- | Packages built in 'Stage1' by default. You can change this in "UserSettings".
 stage1Packages :: Action [Package]
@@ -127,7 +132,6 @@ stage1Packages = do
         , containers
         , deepseq
         , exceptions
-        , filepath
         , ghc
         , ghcBignum
         , ghcCompact
@@ -171,7 +175,8 @@ testsuitePackages = return ([ timeout | windowsHost ] ++ [ checkPpr, checkExact,
 -- * We build 'profiling' way when stage > Stage0.
 -- * We build 'dynamic' way when stage > Stage0 and the platform supports it.
 defaultLibraryWays :: Ways
-defaultLibraryWays = mconcat
+defaultLibraryWays = Set.fromList <$>
+    mconcat
     [ pure [vanilla]
     , notStage0 ? pure [profiling]
     , notStage0 ? platformSupportsSharedLibs ? pure [dynamic]
@@ -179,15 +184,18 @@ defaultLibraryWays = mconcat
 
 -- | Default build ways for the RTS.
 defaultRtsWays :: Ways
-defaultRtsWays = mconcat
-  [ pure [vanilla, threaded]
+defaultRtsWays = Set.fromList <$>
+  mconcat
+  [ pure [vanilla]
   , notStage0 ? pure
-      [ profiling, threadedProfiling, debugProfiling, threadedDebugProfiling
-      , debug, threadedDebug
+      [ profiling, debugProfiling
+      , debug
       ]
+  , notStage0 ? targetSupportsThreadedRts ? pure [threaded, threadedProfiling, threadedDebugProfiling, threadedDebug]
   , notStage0 ? platformSupportsSharedLibs ? pure
-      [ dynamic, threadedDynamic, debugDynamic, threadedDebugDynamic
+      [ dynamic, debugDynamic
       ]
+  , notStage0 ? platformSupportsSharedLibs ? targetSupportsThreadedRts ? pure [ threadedDynamic, threadedDebugDynamic ]
   ]
 
 -- TODO: Move C source arguments here
@@ -240,11 +248,12 @@ defaultFlavour = Flavour
     , libraryWays        = defaultLibraryWays
     , rtsWays            = defaultRtsWays
     , dynamicGhcPrograms = defaultDynamicGhcPrograms
-    , ghciWithDebugger   = False
-    , ghcProfiled        = False
-    , ghcDebugged        = False
-    , ghcDebugAssertions = False
-    , ghcThreaded        = True
+    , ghciWithDebugger   = const False
+    , ghcProfiled        = const False
+    , ghcDebugged        = const False
+    , ghcThreaded        = const True
+    , ghcDebugAssertions = const False
+    , ghcSplitSections   = False
     , ghcDocs            = cmdDocsArgs }
 
 -- | Default logic for determining whether to build
@@ -266,6 +275,7 @@ defaultBuilderArgs = mconcat
     , ccBuilderArgs
     , configureBuilderArgs
     , deriveConstantsBuilderArgs
+    , genapplyBuilderArgs
     , genPrimopCodeBuilderArgs
     , ghcBuilderArgs
     , ghcPkgBuilderArgs
@@ -281,6 +291,7 @@ defaultBuilderArgs = mconcat
     , validateBuilderArgs
     , xelatexBuilderArgs
     , win32TarballsArgs
+    , splitSectionsArgs
     -- Generic builders from the Hadrian library:
     , builder (Sphinx HtmlMode ) ? Hadrian.Builder.Sphinx.args HtmlMode
     , builder (Sphinx LatexMode) ? Hadrian.Builder.Sphinx.args LatexMode

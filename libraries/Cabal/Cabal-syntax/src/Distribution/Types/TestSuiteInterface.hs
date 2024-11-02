@@ -21,8 +21,8 @@ data TestSuiteInterface =
 
      -- | Test interface \"exitcode-stdio-1.0\". The test-suite takes the form
      -- of an executable. It returns a zero exit code for success, non-zero for
-     -- failure. The stdout and stderr channels may be logged. It takes no
-     -- command line parameters and nothing on stdin.
+     -- failure. The stdout and stderr channels may be logged. Test tooling may
+     -- pass command line arguments and/or connect the stdin channel to the test.
      --
      TestSuiteExeV10 Version FilePath
 
@@ -35,7 +35,7 @@ data TestSuiteInterface =
      -- the given reason (e.g. unknown test type).
      --
    | TestSuiteUnsupported TestType
-   deriving (Eq, Generic, Read, Show, Typeable, Data)
+   deriving (Eq, Ord, Generic, Read, Show, Typeable, Data)
 
 instance Binary TestSuiteInterface
 instance Structured TestSuiteInterface

@@ -28,7 +28,7 @@ import GHC.Tc.Deriv.Utils
 import GHC.Tc.TyCl.Class( instDeclCtxt3, tcATDefault )
 import GHC.Tc.Utils.Env
 import GHC.Tc.Deriv.Generate
-import GHC.Tc.Validity( allDistinctTyVars, checkValidInstHead )
+import GHC.Tc.Validity( checkValidInstHead )
 import GHC.Core.InstEnv
 import GHC.Tc.Utils.Instantiate
 import GHC.Core.FamInstEnv
@@ -201,7 +201,6 @@ tcDeriving deriv_infos deriv_decls
         ; famInsts2 <- concatMapM genFamInsts infer_specs
         ; let famInsts = famInsts1 ++ famInsts2
 
-        ; dflags <- getDynFlags
         ; logger <- getLogger
 
           -- We must put all the derived type family instances (from both
@@ -229,7 +228,7 @@ tcDeriving deriv_infos deriv_decls
 
         ; let (_, aux_specs, fvs) = unzip3 (given_inst_binds ++ infer_inst_binds)
         ; loc <- getSrcSpanM
-        ; let aux_binds = genAuxBinds dflags loc (unionManyBags aux_specs)
+        ; let aux_binds = genAuxBinds loc (unionManyBags aux_specs)
 
         ; let infer_inst_infos = map fstOf3 infer_inst_binds
         ; let inst_infos = given_inst_infos ++ infer_inst_infos
@@ -289,8 +288,8 @@ renameDeriv inst_infos bagBinds
         -- Bring the extra deriving stuff into scope
         -- before renaming the instances themselves
         ; traceTc "rnd" (vcat (map (\i -> pprInstInfoDetails i $$ text "") inst_infos))
-        ; (aux_binds, aux_sigs) <- mapAndUnzipBagM return bagBinds
-        ; let aux_val_binds = ValBinds NoAnnSortKey aux_binds (bagToList aux_sigs)
+        ; let (aux_binds, aux_sigs) = unzipBag bagBinds
+              aux_val_binds = ValBinds NoAnnSortKey aux_binds (bagToList aux_sigs)
         -- Importantly, we use rnLocalValBindsLHS, not rnTopBindsLHS, to rename
         -- auxiliary bindings as if they were defined locally.
         -- See Note [Auxiliary binders] in GHC.Tc.Deriv.Generate.
@@ -636,8 +635,8 @@ deriveStandalone (L loc (DerivDecl _ deriv_ty mb_lderiv_strat overlap_mode))
                   -- is the case.
                |  Just inst_ty <- lastMaybe inst_tys
                -> do
-               let via_kind     = tcTypeKind via_ty
-                   inst_ty_kind = tcTypeKind inst_ty
+               let via_kind     = typeKind via_ty
+                   inst_ty_kind = typeKind inst_ty
                    mb_match     = tcUnifyTy inst_ty_kind via_kind
 
                checkTc (isJust mb_match)
@@ -645,9 +644,9 @@ deriveStandalone (L loc (DerivDecl _ deriv_ty mb_lderiv_strat overlap_mode))
                           DerivErrDerivingViaWrongKind inst_ty_kind via_ty via_kind)
 
                let Just kind_subst = mb_match
-                   ki_subst_range  = getTCvSubstRangeFVs kind_subst
+                   ki_subst_range  = getSubstRangeTyCoFVs kind_subst
                    -- See Note [Unification of two kind variables in deriving]
-                   unmapped_tkvs = filter (\v -> v `notElemTCvSubst` kind_subst
+                   unmapped_tkvs = filter (\v -> v `notElemSubst` kind_subst
                                         && not (v `elemVarSet` ki_subst_range))
                                           tvs
                    (subst, _)    = substTyVarBndrs kind_subst unmapped_tkvs
@@ -748,7 +747,7 @@ deriveTyData tc tc_args mb_deriv_strat deriv_tvs cls cls_tys cls_arg_kind
                                 -- See Note [tc_args and tycon arity]
               (tc_args_to_keep, args_to_drop)
                               = splitAt n_args_to_keep tc_args
-              inst_ty_kind    = tcTypeKind (mkTyConApp tc tc_args_to_keep)
+              inst_ty_kind    = typeKind (mkTyConApp tc tc_args_to_keep)
 
               -- Match up the kinds, and apply the resulting kind substitution
               -- to the types.  See Note [Unify kinds in deriving]
@@ -757,6 +756,12 @@ deriveTyData tc tc_args mb_deriv_strat deriv_tvs cls cls_tys cls_arg_kind
               enough_args     = n_args_to_keep >= 0
 
         -- Check that the result really is well-kinded
+        ; traceTc "deriveTyData" $
+          vcat [ text "class:" <+> ppr cls <+> dcolon <+> ppr (tyConKind (classTyCon cls))
+               , text "cls_tys:" <+> ppr cls_tys
+               , text "tycon:" <+> ppr tc <+> dcolon <+> ppr (tyConKind tc)
+               , text "cls_arg:" <+> ppr (mkTyConApp tc tc_args_to_keep) <+> dcolon <+> ppr inst_ty_kind
+               , text "cls_arg_kind:" <+> ppr cls_arg_kind ]
         ; checkTc (enough_args && isJust mb_match)
                   (TcRnCannotDeriveInstance cls cls_tys Nothing NoGeneralizedNewtypeDeriving $
                      DerivErrNotWellKinded tc cls_arg_kind n_args_to_keep)
@@ -769,9 +774,9 @@ deriveTyData tc tc_args mb_deriv_strat deriv_tvs cls cls_tys cls_arg_kind
               propagate_subst kind_subst tkvs' cls_tys' tc_args' mb_deriv_strat'
                 = (final_tkvs, final_cls_tys, final_tc_args, final_mb_deriv_strat)
                 where
-                  ki_subst_range  = getTCvSubstRangeFVs kind_subst
+                  ki_subst_range  = getSubstRangeTyCoFVs kind_subst
                   -- See Note [Unification of two kind variables in deriving]
-                  unmapped_tkvs   = filter (\v -> v `notElemTCvSubst` kind_subst
+                  unmapped_tkvs   = filter (\v -> v `notElemSubst` kind_subst
                                          && not (v `elemVarSet` ki_subst_range))
                                            tkvs'
                   (subst, _)           = substTyVarBndrs kind_subst unmapped_tkvs
@@ -798,9 +803,9 @@ deriveTyData tc tc_args mb_deriv_strat deriv_tvs cls cls_tys cls_arg_kind
               -- Perform an additional unification with the kind of the `via`
               -- type and the result of the previous kind unification.
               Just (ViaStrategy via_ty) -> do
-                let via_kind = tcTypeKind via_ty
+                let via_kind = typeKind via_ty
                     inst_ty_kind
-                              = tcTypeKind (mkTyConApp tc tc_args')
+                              = typeKind (mkTyConApp tc tc_args')
                     via_match = tcUnifyTy inst_ty_kind via_kind
 
                 checkTc (isJust via_match)
@@ -1008,7 +1013,7 @@ the type variable binder for c, since its kind is (k2 -> k2 -> *).
 
 We used to accomplish this by doing the following:
 
-    unmapped_tkvs = filter (`notElemTCvSubst` kind_subst) all_tkvs
+    unmapped_tkvs = filter (`notElemSubst` kind_subst) all_tkvs
     (subst, _)    = substTyVarBndrs kind_subst unmapped_tkvs
 
 Where all_tkvs contains all kind variables in the class and instance types (in
@@ -1024,9 +1029,9 @@ in an ill-kinded instance (this caused #11837).
 
 To prevent this, we need to filter out any variable from all_tkvs which either
 
-1. Appears in the domain of kind_subst. notElemTCvSubst checks this.
+1. Appears in the domain of kind_subst. notElemSubst checks this.
 2. Appears in the range of kind_subst. To do this, we compute the free
-   variable set of the range of kind_subst with getTCvSubstRangeFVs, and check
+   variable set of the range of kind_subst with getSubstRangeTyCoFVs, and check
    if a kind variable appears in that set.
 
 Note [Eta-reducing type synonyms]
@@ -1632,7 +1637,7 @@ e.g.    newtype S1 = S1 [T1 ()]
         newtype T1 a = T1 (StateT S1 IO a ) deriving( Monad )
 Remember, too, that type families are currently (conservatively) given
 a recursive flag, so this also allows newtype deriving to work
-for type famillies.
+for type families.
 
 We used to exclude recursive types, because we had a rather simple
 minded way of generating the instance decl:
@@ -1920,13 +1925,13 @@ genFamInsts spec@(DS { ds_tvs = tyvars, ds_mechanism = mechanism
       -- See Note [DeriveAnyClass and default family instances]
       DerivSpecAnyClass -> do
         let mini_env   = mkVarEnv (classTyVars clas `zip` inst_tys)
-            mini_subst = mkTvSubst (mkInScopeSet (mkVarSet tyvars)) mini_env
+            mini_subst = mkTvSubst (mkInScopeSetList tyvars) mini_env
         dflags <- getDynFlags
         tyfam_insts <-
           -- canDeriveAnyClass should ensure that this code can't be reached
           -- unless -XDeriveAnyClass is enabled.
           assertPpr (xopt LangExt.DeriveAnyClass dflags)
-                    (ppr "genFamInsts: bad derived class" <+> ppr clas) $
+                    (text "genFamInsts: bad derived class" <+> ppr clas) $
           mapM (tcATDefault loc mini_subst emptyNameSet)
                (classATItems clas)
         pure $ concat tyfam_insts

@@ -10,11 +10,10 @@ module GHC.Core.LateCC
     ) where
 
 import Control.Applicative
-import GHC.Utils.Monad.State.Strict
 import Control.Monad
+import qualified Data.Set as S
 
 import GHC.Prelude
-import GHC.Driver.Session
 import GHC.Types.CostCentre
 import GHC.Types.CostCentre.State
 import GHC.Types.Name hiding (varName)
@@ -25,14 +24,15 @@ import GHC.Unit.Types
 import GHC.Data.FastString
 import GHC.Core
 import GHC.Core.Opt.Monad
-import GHC.Types.Id
 import GHC.Core.Utils (mkTick)
+import GHC.Types.Id
+import GHC.Driver.Session
 
-import qualified Data.Set as S
 import GHC.Utils.Logger
 import GHC.Utils.Outputable
 import GHC.Utils.Misc
 import GHC.Utils.Error (withTiming)
+import GHC.Utils.Monad.State.Strict
 
 
 {- Note [Collecting late cost centres]
@@ -142,7 +142,7 @@ initLateCCState :: LateCCState
 initLateCCState = LateCCState newCostCentreState mempty
 
 getCCFlavour :: FastString -> M CCFlavour
-getCCFlavour name = LateCC <$> getCCIndex' name
+getCCFlavour name = mkLateCCFlavour <$> getCCIndex' name
 
 getCCIndex' :: FastString -> M CostCentreIndex
 getCCIndex' name = do

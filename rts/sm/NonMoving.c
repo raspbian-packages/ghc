@@ -26,7 +26,6 @@
 #include "NonMovingCensus.h"
 #include "StablePtr.h" // markStablePtrTable
 #include "Sanity.h"
-#include "Schedule.h" // markScheduler
 #include "Weak.h" // scheduleFinalizers
 
 //#define NONCONCURRENT_SWEEP
@@ -826,7 +825,7 @@ void nonmovingCollect(StgWeak **dead_weaks, StgTSO **resurrected_threads, bool c
         nonmoving_write_barrier_enabled = true;
         debugTrace(DEBUG_nonmoving_gc, "Starting concurrent mark thread");
         OSThreadId thread;
-        if (createOSThread(&thread, "nonmoving-mark",
+        if (createOSThread(&thread, "non-moving mark thread",
                            nonmovingConcurrentMark, mark_queue) != 0) {
             barf("nonmovingCollect: failed to spawn mark thread: %s", strerror(errno));
         }
@@ -1080,7 +1079,8 @@ concurrent_marking:
     traceConcSweepEnd();
 #if defined(DEBUG)
     if (RtsFlags.DebugFlags.nonmoving_gc)
-        nonmovingPrintAllocatorCensus(true);
+        // only collect live words if the mutator isn't running.
+        nonmovingPrintAllocatorCensus(!concurrent);
 #endif
 #if defined(TRACING)
     if (RtsFlags.TraceFlags.nonmoving_gc)

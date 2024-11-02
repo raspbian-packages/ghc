@@ -1,6 +1,7 @@
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE DeriveFunctor #-}
 {-# LANGUAGE MultiWayIf #-}
+{-# LANGUAGE RecursiveDo #-}
 
 module GHC.Tc.Solver.Canonical(
      canonicalize,
@@ -53,6 +54,7 @@ import GHC.Data.Pair
 import GHC.Utils.Misc
 import GHC.Data.Bag
 import GHC.Utils.Monad
+import GHC.Utils.Constants( debugIsOn )
 import Control.Monad
 import Data.Maybe ( isJust, isNothing )
 import Data.List  ( zip4 )
@@ -60,7 +62,6 @@ import GHC.Types.Basic
 
 import qualified Data.Semigroup as S
 import Data.Bifunctor ( bimap )
-import Data.Foldable ( traverse_ )
 
 {-
 ************************************************************************
@@ -113,10 +114,9 @@ canonicalize (CIrredCan { cc_ev = ev })
     --    e.g. a ~ [a], where [G] a ~ [Int], can decompose
 
 canonicalize (CDictCan { cc_ev = ev, cc_class  = cls
-                       , cc_tyargs = xis, cc_pend_sc = pend_sc
-                       , cc_fundeps = fds })
+                       , cc_tyargs = xis, cc_pend_sc = pend_sc })
   = {-# SCC "canClass" #-}
-    canClass ev cls xis pend_sc fds
+    canClass ev cls xis pend_sc
 
 canonicalize (CEqCan { cc_ev     = ev
                      , cc_lhs    = lhs
@@ -156,7 +156,7 @@ canClassNC ev cls tys
   | isGiven ev  -- See Note [Eagerly expand given superclasses]
   = do { sc_cts <- mkStrictSuperClasses ev [] [] cls tys
        ; emitWork sc_cts
-       ; canClass ev cls tys False fds }
+       ; canClass ev cls tys False }
 
   | CtWanted { ctev_rewriters = rewriters } <- ev
   , Just ip_name <- isCallStackPred cls tys
@@ -182,20 +182,17 @@ canClassNC ev cls tys
                                   (ctLocSpan loc) (ctEvExpr new_ev)
        ; solveCallStack ev ev_cs
 
-       ; canClass new_ev cls tys
-                  False -- No superclasses
-                  False -- No top level instances for fundeps
+       ; canClass new_ev cls tys False -- No superclasses
        }
 
   | otherwise
-  = canClass ev cls tys (has_scs cls) fds
+  = canClass ev cls tys (has_scs cls)
 
   where
     has_scs cls = not (null (classSCTheta cls))
     loc  = ctEvLoc ev
     orig = ctLocOrigin loc
     pred = ctEvPred ev
-    fds  = classHasFds cls
 
 solveCallStack :: CtEvidence -> EvCallStack -> TcS ()
 -- Also called from GHC.Tc.Solver when defaulting call stacks
@@ -210,11 +207,10 @@ solveCallStack ev ev_cs = do
 canClass :: CtEvidence
          -> Class -> [Type]
          -> Bool            -- True <=> un-explored superclasses
-         -> Bool            -- True <=> unexploited fundep(s)
          -> TcS (StopOrContinue Ct)
 -- Precondition: EvVar is class evidence
 
-canClass ev cls tys pend_sc fds
+canClass ev cls tys pend_sc
   = -- all classes do *nominal* matching
     assertPpr (ctEvRole ev == Nominal) (ppr ev $$ ppr cls $$ ppr tys) $
     do { (redns@(Reductions _ xis), rewriters) <- rewriteArgsNom ev cls_tc tys
@@ -222,8 +218,7 @@ canClass ev cls tys pend_sc fds
              mk_ct new_ev = CDictCan { cc_ev = new_ev
                                      , cc_tyargs = xis
                                      , cc_class = cls
-                                     , cc_pend_sc = pend_sc
-                                     , cc_fundeps = fds }
+                                     , cc_pend_sc = pend_sc }
        ; mb <- rewriteEvidence rewriters ev redn
        ; traceTcS "canClass" (vcat [ ppr ev
                                    , ppr xi, ppr mb ])
@@ -322,7 +317,7 @@ Why do we do this?  Two reasons:
 * To avoid repeated work, by repeatedly expanding the superclasses of
   same constraint,
 
-* To terminate the above loop, at least in the -XNoRecursiveSuperClasses
+* To terminate the above loop, at least in the -XNoUndecidableSuperClasses
   case.  If there are recursive superclasses we could, in principle,
   expand forever, always encountering new constraints.
 
@@ -413,7 +408,7 @@ Examples of how adding superclasses can help:
       instance L (Maybe a) a
 
     When solving the superclasses of the (C (Maybe a) a) instance, we get
-      [G] C a b, and hance by superclasses, [G] G a, [G] L a b
+      [G] C a b, and hence by superclasses, [G] G a, [G] L a b
       [W] G (Maybe a)
     Use the instance decl to get
       [W] C a beta
@@ -536,7 +531,7 @@ mk_strict_superclasses rec_clss (CtGiven { ctev_evar = evar, ctev_loc = loc })
     classSCSelIds cls
   where
     dict_ids  = mkTemplateLocals theta
-    size      = sizeTypes tys
+    this_size = pSizeClassPred cls tys
 
     do_one_given sel_id
       | isUnliftedType sc_pred
@@ -576,37 +571,38 @@ mk_strict_superclasses rec_clss (CtGiven { ctev_evar = evar, ctev_loc = loc })
             `App` (evId evar `mkVarApps` (tvs ++ dict_ids))
             `mkVarApps` sc_tvs
 
-    sc_loc
-       | isCTupleClass cls
-       = loc   -- For tuple predicates, just take them apart, without
-               -- adding their (large) size into the chain.  When we
-               -- get down to a base predicate, we'll include its size.
-               -- #10335
+    sc_loc | isCTupleClass cls
+           = loc   -- For tuple predicates, just take them apart, without
+                   -- adding their (large) size into the chain.  When we
+                   -- get down to a base predicate, we'll include its size.
+                   -- #10335
 
-       |  isEqPredClass cls
-       || cls `hasKey` coercibleTyConKey
-       = loc   -- The only superclasses of ~, ~~, and Coercible are primitive
-               -- equalities, and they don't use the InstSCOrigin mechanism
-               -- detailed in Note [Solving superclass constraints] in
-               -- GHC.Tc.TyCl.Instance. Skip for a tiny performance win.
+           |  isEqPredClass cls || cls `hasKey` coercibleTyConKey
+           = loc   -- The only superclasses of ~, ~~, and Coercible are primitive
+                   -- equalities, and they don't use the GivenSCOrigin mechanism
+                   -- detailed in Note [Solving superclass constraints] in
+                   -- GHC.Tc.TyCl.Instance. Skip for a tiny performance win.
 
-         -- See Note [Solving superclass constraints] in GHC.Tc.TyCl.Instance
-         -- for explantation of InstSCOrigin and Note [Replacement vs keeping] in
-         -- GHC.Tc.Solver.Interact for why we need OtherSCOrigin and depths
-       | otherwise
-       = loc { ctl_origin = new_orig }
-       where
-         new_orig = case ctLocOrigin loc of
-            -- these cases are when we have something that's already a superclass constraint
-           InstSCOrigin  sc_depth n  -> InstSCOrigin  (sc_depth + 1) (n `max` size)
-           OtherSCOrigin sc_depth si -> OtherSCOrigin (sc_depth + 1) si
+           | otherwise
+           = loc { ctl_origin = mk_sc_origin (ctLocOrigin loc) }
 
-            -- these cases do not already have a superclass constraint: depth starts at 1
-           GivenOrigin InstSkol      -> InstSCOrigin  1 size
-           GivenOrigin other_skol    -> OtherSCOrigin 1 other_skol
+    -- See Note [Solving superclass constraints] in GHC.Tc.TyCl.Instance
+    -- for explanation of GivenSCOrigin and Note [Replacement vs keeping] in
+    -- GHC.Tc.Solver.Interact for why we need depths
+    mk_sc_origin :: CtOrigin -> CtOrigin
+    mk_sc_origin (GivenSCOrigin skol_info sc_depth already_blocked)
+      = GivenSCOrigin skol_info (sc_depth + 1)
+                      (already_blocked || newly_blocked skol_info)
 
-           other_orig                -> pprPanic "Given constraint without given origin" $
-                                        ppr evar $$ ppr other_orig
+    mk_sc_origin (GivenOrigin skol_info)
+      = -- These cases do not already have a superclass constraint: depth starts at 1
+        GivenSCOrigin skol_info 1 (newly_blocked skol_info)
+
+    mk_sc_origin other_orig = pprPanic "Given constraint without given origin" $
+                              ppr evar $$ ppr other_orig
+
+    newly_blocked (InstSkol _ head_size) = isJust (this_size `ltPatersonSize` head_size)
+    newly_blocked _                      = False
 
 mk_strict_superclasses rec_clss ev tvs theta cls tys
   | all noFreeVarsOfType tys
@@ -671,7 +667,7 @@ mk_superclasses_of rec_clss ev tvs theta cls tys
 
     this_ct | null tvs, null theta
             = CDictCan { cc_ev = ev, cc_class = cls, cc_tyargs = tys
-                       , cc_pend_sc = loop_found, cc_fundeps = classHasFds cls }
+                       , cc_pend_sc = loop_found }
                  -- NB: If there is a loop, we cut off, so we have not
                  --     added the superclasses, hence cc_pend_sc = True
             | otherwise
@@ -867,16 +863,27 @@ solveForAll ev@(CtWanted { ctev_dest = dest, ctev_rewriters = rewriters, ctev_lo
     -- This setLclEnv is important: the emitImplicationTcS uses that
     -- TcLclEnv for the implication, and that in turn sets the location
     -- for the Givens when solving the constraint (#21006)
-    do { skol_info <- mkSkolemInfo QuantCtxtSkol
-       ; let empty_subst = mkEmptyTCvSubst $ mkInScopeSet $
+    do { let empty_subst = mkEmptySubst $ mkInScopeSet $
                            tyCoVarsOfTypes (pred:theta) `delVarSetList` tvs
-       ; (subst, skol_tvs) <- tcInstSkolTyVarsX skol_info empty_subst tvs
-       ; given_ev_vars <- mapM newEvVar (substTheta subst theta)
+             is_qc = IsQC (ctLocOrigin loc)
 
+         -- rec {..}: see Note [Keeping SkolemInfo inside a SkolemTv]
+         --           in GHC.Tc.Utils.TcType
+         -- Very like the code in tcSkolDFunType
+       ; rec { skol_info <- mkSkolemInfo skol_info_anon
+             ; (subst, skol_tvs) <- tcInstSkolTyVarsX skol_info empty_subst tvs
+             ; let inst_pred  = substTy    subst pred
+                   inst_theta = substTheta subst theta
+                   skol_info_anon = InstSkol is_qc (get_size inst_pred) }
+
+       ; given_ev_vars <- mapM newEvVar inst_theta
        ; (lvl, (w_id, wanteds))
              <- pushLevelNoWorkList (ppr skol_info) $
-                do { wanted_ev <- newWantedEvVarNC loc rewriters $
-                                  substTy subst pred
+                do { let loc' = setCtLocOrigin loc (ScOrigin is_qc NakedSc)
+                         -- Set the thing to prove to have a ScOrigin, so we are
+                         -- careful about its termination checks.
+                         -- See (QC-INV) in Note [Solving a Wanted forall-constraint]
+                   ; wanted_ev <- newWantedEvVarNC loc' rewriters inst_pred
                    ; return ( ctEvEvId wanted_ev
                             , unitBag (mkNonCanonical wanted_ev)) }
 
@@ -888,6 +895,12 @@ solveForAll ev@(CtWanted { ctev_dest = dest, ctev_rewriters = rewriters, ctev_lo
               , et_binds = ev_binds, et_body = w_id }
 
       ; stopWith ev "Wanted forall-constraint" }
+  where
+    -- Getting the size of the head is a bit horrible
+    -- because of the special treament for class predicates
+    get_size pred = case classifyPredType pred of
+                      ClassPred cls tys -> pSizeClassPred cls tys
+                      _                 -> pSizeType pred
 
  -- See Note [Solving a Given forall-constraint]
 solveForAll ev@(CtGiven {}) tvs _theta pred pend_sc
@@ -907,6 +920,23 @@ and discharge df thus:
     df = /\ab. \g1 g2. let <binds> in d
 where <binds> is filled in by solving the implication constraint.
 All the machinery is to hand; there is little to do.
+
+The tricky point is about termination: see #19690.  We want to maintain
+the invariant (QC-INV):
+
+  (QC-INV) Every quantified constraint returns a non-bottom dictionary
+
+just as every top-level instance declaration guarantees to return a non-bottom
+dictionary.  But as #19690 shows, it is possible to get a bottom dicionary
+by superclass selection if we aren't careful.  The situation is very similar
+to that described in Note [Recursive superclasses] in GHC.Tc.TyCl.Instance;
+and we use the same solution:
+
+* Give the Givens a CtOrigin of (GivenOrigin (InstSkol IsQC head_size))
+* Give the Wanted a CtOrigin of (ScOrigin IsQC NakedSc)
+
+Both of these things are done in solveForAll.  Now the mechanism described
+in Note [Solving superclass constraints] in GHC.Tc.TyCl.Instance takes over.
 
 Note [Solving a Given forall-constraint]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -943,23 +973,30 @@ unknown kind. For instance, we may have,
 
     FunTy (a :: k) Int
 
-Where k is a unification variable. So the calls to getRuntimeRep_maybe may
+Where k is a unification variable. So the calls to splitRuntimeRep_maybe may
 fail (returning Nothing).  In that case we'll fall through, zonk, and try again.
 Zonking should fill the variable k, meaning that decomposition will succeed the
 second time around.
 
-Also note that we require the AnonArgFlag to match.  This will stop
+Also note that we require the FunTyFlag to match.  This will stop
 us decomposing
    (Int -> Bool)  ~  (Show a => blah)
-It's as if we treat (->) and (=>) as different type constructors.
+It's as if we treat (->) and (=>) as different type constructors, which
+indeed they are!
 -}
 
 canEqNC :: CtEvidence -> EqRel -> Type -> Type -> TcS (StopOrContinue Ct)
 canEqNC ev eq_rel ty1 ty2
   = do { result <- zonk_eq_types ty1 ty2
        ; case result of
-           Left (Pair ty1' ty2') -> can_eq_nc False ev eq_rel ty1' ty1 ty2' ty2
-           Right ty              -> canEqReflexive ev eq_rel ty }
+           Right ty              -> canEqReflexive ev eq_rel ty
+           Left (Pair ty1' ty2') -> can_eq_nc False ev' eq_rel ty1' ty1' ty2' ty2'
+             where
+               ev' | debugIsOn = setCtEvPredType ev $
+                                 mkPrimEqPredRole (eqRelRole eq_rel) ty1' ty2'
+                   | otherwise = ev
+                   -- ev': satisfy the precondition of can_eq_nc
+       }
 
 can_eq_nc
    :: Bool            -- True => both types are rewritten
@@ -968,6 +1005,11 @@ can_eq_nc
    -> Type -> Type    -- LHS, after and before type-synonym expansion, resp
    -> Type -> Type    -- RHS, after and before type-synonym expansion, resp
    -> TcS (StopOrContinue Ct)
+-- Precondition: in DEBUG mode, the `ctev_pred` of `ev` is (ps_ty1 ~# ps_ty2),
+--               without zonking
+-- This precondition is needed (only in DEBUG) to satisfy the assertions
+--   in mkSelCo, called in canDecomposableTyConAppOK and canDecomposableFunTy
+
 can_eq_nc rewritten ev eq_rel ty1 ps_ty1 ty2 ps_ty2
   = do { traceTcS "can_eq_nc" $
          vcat [ ppr rewritten, ppr ev, ppr eq_rel, ppr ty1, ppr ps_ty1, ppr ty2, ppr ps_ty2 ]
@@ -992,8 +1034,8 @@ can_eq_nc' _flat _rdr_env _envs ev eq_rel ty1@(TyConApp tc1 []) _ps_ty1 (TyConAp
 
 -- Expand synonyms first; see Note [Type synonyms and canonicalization]
 can_eq_nc' rewritten rdr_env envs ev eq_rel ty1 ps_ty1 ty2 ps_ty2
-  | Just ty1' <- tcView ty1 = can_eq_nc' rewritten rdr_env envs ev eq_rel ty1' ps_ty1 ty2  ps_ty2
-  | Just ty2' <- tcView ty2 = can_eq_nc' rewritten rdr_env envs ev eq_rel ty1  ps_ty1 ty2' ps_ty2
+  | Just ty1' <- coreView ty1 = can_eq_nc' rewritten rdr_env envs ev eq_rel ty1' ps_ty1 ty2  ps_ty2
+  | Just ty2' <- coreView ty2 = can_eq_nc' rewritten rdr_env envs ev eq_rel ty1  ps_ty1 ty2' ps_ty2
 
 -- need to check for reflexivity in the ReprEq case.
 -- See Note [Eager reflexivity check]
@@ -1038,14 +1080,8 @@ can_eq_nc' _rewritten _rdr_env _envs ev eq_rel ty1@(LitTy l1) _ (LitTy l2) _
 can_eq_nc' _rewritten _rdr_env _envs ev eq_rel
            (FunTy { ft_mult = am1, ft_af = af1, ft_arg = ty1a, ft_res = ty1b }) _ps_ty1
            (FunTy { ft_mult = am2, ft_af = af2, ft_arg = ty2a, ft_res = ty2b }) _ps_ty2
-  | af1 == af2   -- Don't decompose (Int -> blah) ~ (Show a => blah)
-  , Just ty1a_rep <- getRuntimeRep_maybe ty1a  -- getRutimeRep_maybe:
-  , Just ty1b_rep <- getRuntimeRep_maybe ty1b  -- see Note [Decomposing FunTy]
-  , Just ty2a_rep <- getRuntimeRep_maybe ty2a
-  , Just ty2b_rep <- getRuntimeRep_maybe ty2b
-  = canDecomposableTyConAppOK ev eq_rel funTyCon
-                              [am1, ty1a_rep, ty1b_rep, ty1a, ty1b]
-                              [am2, ty2a_rep, ty2b_rep, ty2a, ty2b]
+  | af1 == af2  -- See Note [Decomposing FunTy]
+  = canDecomposableFunTy ev eq_rel af1 (am1,ty1a,ty1b) (am2,ty2a,ty2b)
 
 -- Decompose type constructor applications
 -- NB: we have expanded type synonyms already
@@ -1062,12 +1098,13 @@ can_eq_nc' _rewritten _rdr_env _envs ev eq_rel ty1 _ ty2 _
 can_eq_nc' _rewritten _rdr_env _envs ev eq_rel
            s1@(ForAllTy (Bndr _ vis1) _) _
            s2@(ForAllTy (Bndr _ vis2) _) _
-  | vis1 `sameVis` vis2 -- Note [ForAllTy and typechecker equality]
+  | vis1 `eqForAllVis` vis2 -- Note [ForAllTy and type equality]
   = can_eq_nc_forall ev eq_rel s1 s2
 
 -- See Note [Canonicalising type applications] about why we require rewritten types
 -- Use tcSplitAppTy, not matching on AppTy, to catch oversaturated type families
--- NB: Only decompose AppTy for nominal equality. See Note [Decomposing equality]
+-- NB: Only decompose AppTy for nominal equality.
+--     See Note [Decomposing AppTy equalities]
 can_eq_nc' True _rdr_env _envs ev NomEq ty1 _ ty2 _
   | Just (t1, s1) <- tcSplitAppTy_maybe ty1
   , Just (t2, s2) <- tcSplitAppTy_maybe ty2
@@ -1079,7 +1116,8 @@ can_eq_nc' True _rdr_env _envs ev NomEq ty1 _ ty2 _
 
 -- No similarity in type structure detected. Rewrite and try again.
 can_eq_nc' False rdr_env envs ev eq_rel _ ps_ty1 _ ps_ty2
-  = do { (redn1@(Reduction _ xi1), rewriters1) <- rewrite ev ps_ty1
+  = -- Rewrite the two types and try again
+    do { (redn1@(Reduction _ xi1), rewriters1) <- rewrite ev ps_ty1
        ; (redn2@(Reduction _ xi2), rewriters2) <- rewrite ev ps_ty2
        ; new_ev <- rewriteEqEvidence (rewriters1 S.<> rewriters2) ev NotSwapped redn1 redn2
        ; can_eq_nc' True rdr_env envs new_ev eq_rel xi1 xi1 xi2 xi2 }
@@ -1120,6 +1158,7 @@ can_eq_nc' True _rdr_env _envs ev eq_rel _ ps_ty1 _ ps_ty2
           -- No need to call canEqFailure/canEqHardFailure because they
           -- rewrite, and the types involved here are already rewritten
 
+
 {- Note [Unsolved equalities]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 If we have an unsolved equality like
@@ -1127,63 +1166,6 @@ If we have an unsolved equality like
 that is not necessarily insoluble!  Maybe 'a' will turn out to be a newtype.
 So we want to make it a potentially-soluble Irred not an insoluble one.
 Missing this point is what caused #15431
-
-Note [ForAllTy and typechecker equality]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Should GHC type-check the following program (adapted from #15740)?
-
-  {-# LANGUAGE PolyKinds, ... #-}
-  data D a
-  type family F :: forall k. k -> Type
-  type instance F = D
-
-Due to the way F is declared, any instance of F must have a right-hand side
-whose kind is equal to `forall k. k -> Type`. The kind of D is
-`forall {k}. k -> Type`, which is very close, but technically uses distinct
-Core:
-
-  -----------------------------------------------------------
-  | Source Haskell    | Core                                |
-  -----------------------------------------------------------
-  | forall  k.  <...> | ForAllTy (Bndr k Specified) (<...>) |
-  | forall {k}. <...> | ForAllTy (Bndr k Inferred)  (<...>) |
-  -----------------------------------------------------------
-
-We could deem these kinds to be unequal, but that would imply rejecting
-programs like the one above. Whether a kind variable binder ends up being
-specified or inferred can be somewhat subtle, however, especially for kinds
-that aren't explicitly written out in the source code (like in D above).
-For now, we decide to not make the specified/inferred status of an invisible
-type variable binder affect GHC's notion of typechecker equality
-(see Note [Typechecker equality vs definitional equality] in
-GHC.Tc.Utils.TcType). That is, we have the following:
-
-  --------------------------------------------------
-  | Type 1            | Type 2            | Equal? |
-  --------------------|-----------------------------
-  | forall k. <...>   | forall k. <...>   | Yes    |
-  |                   | forall {k}. <...> | Yes    |
-  |                   | forall k -> <...> | No     |
-  --------------------------------------------------
-  | forall {k}. <...> | forall k. <...>   | Yes    |
-  |                   | forall {k}. <...> | Yes    |
-  |                   | forall k -> <...> | No     |
-  --------------------------------------------------
-  | forall k -> <...> | forall k. <...>   | No     |
-  |                   | forall {k}. <...> | No     |
-  |                   | forall k -> <...> | Yes    |
-  --------------------------------------------------
-
-We implement this nuance by using the GHC.Types.Var.sameVis function in
-GHC.Tc.Solver.Canonical.canEqNC and GHC.Tc.Utils.TcType.tcEqType, which
-respect typechecker equality. sameVis puts both forms of invisible type
-variable binders into the same equivalence class.
-
-Note that we do /not/ use sameVis in GHC.Core.Type.eqType, which implements
-/definitional/ equality, a slighty more coarse-grained notion of equality
-(see Note [Non-trivial definitional equality] in GHC.Core.TyCo.Rep) that does
-not consider the ArgFlag of ForAllTys at all. That is, eqType would equate all
-of forall k. <...>, forall {k}. <...>, and forall k -> <...>.
 -}
 
 ---------------------------------
@@ -1206,12 +1188,12 @@ can_eq_nc_forall ev eq_rel s1 s2
       ; if not (equalLength bndrs1 bndrs2)
         then do { traceTcS "Forall failure" $
                      vcat [ ppr s1, ppr s2, ppr bndrs1, ppr bndrs2
-                          , ppr (map binderArgFlag bndrs1)
-                          , ppr (map binderArgFlag bndrs2) ]
+                          , ppr (binderFlags bndrs1)
+                          , ppr (binderFlags bndrs2) ]
                 ; canEqHardFailure ev s1 s2 }
         else
    do { traceTcS "Creating implication for polytype equality" $ ppr ev
-      ; let empty_subst1 = mkEmptyTCvSubst $ mkInScopeSet free_tvs
+      ; let empty_subst1 = mkEmptySubst $ mkInScopeSet free_tvs
       ; skol_info <- mkSkolemInfo (UnifyForAllSkol phi1)
       ; (subst1, skol_tvs) <- tcInstSkolTyVarsX skol_info empty_subst1 $
                               binderVars bndrs1
@@ -1219,7 +1201,7 @@ can_eq_nc_forall ev eq_rel s1 s2
       ; let phi1' = substTy subst1 phi1
 
             -- Unify the kinds, extend the substitution
-            go :: [TcTyVar] -> TCvSubst -> [TyVarBinder]
+            go :: [TcTyVar] -> Subst -> [TyVarBinder]
                -> TcS (TcCoercion, Cts)
             go (skol_tv:skol_tvs) subst (bndr2:bndrs2)
               = do { let tv2 = binderVar bndr2
@@ -1230,7 +1212,7 @@ can_eq_nc_forall ev eq_rel s1 s2
                          -- skol_tv is already in the in-scope set, but the
                          -- free vars of kind_co are not; hence "...AndInScope"
                    ; (co, wanteds2) <- go skol_tvs subst' bndrs2
-                   ; return ( mkTcForAllCo skol_tv kind_co co
+                   ; return ( mkForAllCo skol_tv kind_co co
                             , wanteds1 `unionBags` wanteds2 ) }
 
             -- Done: unify phi1 ~ phi2
@@ -1240,7 +1222,7 @@ can_eq_nc_forall ev eq_rel s1 s2
 
             go _ _ _ = panic "cna_eq_nc_forall"  -- case (s:ss) []
 
-            empty_subst2 = mkEmptyTCvSubst (getTCvInScope subst1)
+            empty_subst2 = mkEmptySubst (getSubstInScope subst1)
 
       ; (lvl, (all_co, wanteds)) <- pushLevelNoWorkList (ppr skol_info) $
                                     go skol_tvs empty_subst2 bndrs2
@@ -1260,7 +1242,7 @@ can_eq_nc_forall ev eq_rel s1 s2
     -- than putting it in the work list
     unify loc rewriters role ty1 ty2
       | ty1 `tcEqType` ty2
-      = return (mkTcReflCo role ty1, emptyBag)
+      = return (mkReflCo role ty1, emptyBag)
       | otherwise
       = do { (wanted, co) <- newWantedEq loc rewriters role ty1 ty2
            ; return (co, unitBag (mkNonCanonical wanted)) }
@@ -1296,23 +1278,19 @@ zonk_eq_types = go
     -- so we may run into an unzonked type variable while trying to compute the
     -- RuntimeReps of the argument and result types. This can be observed in
     -- testcase tc269.
-    go ty1 ty2
-      | Just (Scaled w1 arg1, res1) <- split1
-      , Just (Scaled w2 arg2, res2) <- split2
+    go (FunTy af1 w1 arg1 res1) (FunTy af2 w2 arg2 res2)
+      | af1 == af2
       , eqType w1 w2
       = do { res_a <- go arg1 arg2
            ; res_b <- go res1 res2
-           ; return $ combine_rev (mkVisFunTy w1) res_b res_a
-           }
-      | isJust split1 || isJust split2
-      = bale_out ty1 ty2
-      where
-        split1 = tcSplitFunTy_maybe ty1
-        split2 = tcSplitFunTy_maybe ty2
+           ; return $ combine_rev (FunTy af1 w1) res_b res_a }
+
+    go ty1@(FunTy {}) ty2 = bale_out ty1 ty2
+    go ty1 ty2@(FunTy {}) = bale_out ty1 ty2
 
     go ty1 ty2
-      | Just (tc1, tys1) <- tcRepSplitTyConApp_maybe ty1
-      , Just (tc2, tys2) <- tcRepSplitTyConApp_maybe ty2
+      | Just (tc1, tys1) <- splitTyConAppNoView_maybe ty1
+      , Just (tc2, tys2) <- splitTyConAppNoView_maybe ty2
       = if tc1 == tc2 && tys1 `equalLength` tys2
           -- Crucial to check for equal-length args, because
           -- we cannot assume that the two args to 'go' have
@@ -1324,8 +1302,8 @@ zonk_eq_types = go
         else bale_out ty1 ty2
 
     go ty1 ty2
-      | Just (ty1a, ty1b) <- tcRepSplitAppTy_maybe ty1
-      , Just (ty2a, ty2b) <- tcRepSplitAppTy_maybe ty2
+      | Just (ty1a, ty1b) <- tcSplitAppTyNoView_maybe ty1
+      , Just (ty2a, ty2b) <- tcSplitAppTyNoView_maybe ty2
       = do { res_a <- go ty1a ty2a
            ; res_b <- go ty1b ty2b
            ; return $ combine_rev mkAppTy res_b res_a }
@@ -1403,43 +1381,63 @@ zonk_eq_types = go
     combine_rev f (Right tys) (Left elt) = Left (f <$> elt     <*> pure tys)
     combine_rev f (Right tys) (Right ty) = Right (f ty tys)
 
-{- See Note [Unwrap newtypes first]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+{- Note [Unwrap newtypes first]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+See also Note [Decomposing newtype equalities]
+
 Consider
   newtype N m a = MkN (m a)
-Then N will get a conservative, Nominal role for its second parameter 'a',
+N will get a conservative, Nominal role for its second parameter 'a',
 because it appears as an argument to the unknown 'm'. Now consider
   [W] N Maybe a  ~R#  N Maybe b
 
-If we decompose, we'll get
+If we /decompose/, we'll get
   [W] a ~N# b
 
-But if instead we unwrap we'll get
+But if instead we /unwrap/ we'll get
   [W] Maybe a ~R# Maybe b
 which in turn gives us
   [W] a ~R# b
 which is easier to satisfy.
 
-Bottom line: unwrap newtypes before decomposing them!
-c.f. #9123 comment:52,53 for a compelling example.
+Conclusion: we must unwrap newtypes before decomposing them. This happens
+in `can_eq_newtype_nc`
 
-Note [Newtypes can blow the stack]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Suppose we have
+We did flirt with making the /rewriter/ expand newtypes, rather than
+doing it in `can_eq_newtype_nc`.   But with recursive newtypes we want
+to be super-careful about expanding!
 
-  newtype X = MkX (Int -> X)
-  newtype Y = MkY (Int -> Y)
+   newtype A = MkA [A]   -- Recursive!
 
-and now wish to prove
+   f :: A -> [A]
+   f = coerce
 
-  [W] X ~R Y
+We have [W] A ~R# [A].  If we rewrite [A], it'll expand to
+   [[[[[...]]]]]
+and blow the reduction stack.  See Note [Newtypes can blow the stack]
+in GHC.Tc.Solver.Rewrite.  But if we expand only the /top level/ of
+both sides, we get
+   [W] [A] ~R# [A]
+which we can, just, solve by reflexivity.
 
-This Wanted will loop, expanding out the newtypes ever deeper looking
-for a solid match or a solid discrepancy. Indeed, there is something
-appropriate to this looping, because X and Y *do* have the same representation,
-in the limit -- they're both (Fix ((->) Int)). However, no finitely-sized
-coercion will ever witness it. This loop won't actually cause GHC to hang,
-though, because we check our depth when unwrapping newtypes.
+So we simply unwrap, on-demand, at top level, in `can_eq_newtype_nc`.
+
+This is all very delicate. There is a real risk of a loop in the type checker
+with recursive newtypes -- but I think we're doomed to do *something*
+delicate, as we're really trying to solve for equirecursive type
+equality. Bottom line for users: recursive newtypes do not play well with type
+inference for representational equality.  See also Section 5.3.1 and 5.3.4 of
+"Safe Zero-cost Coercions for Haskell" (JFP 2016).
+
+See also Note [Decomposing newtype equalities].
+
+--- Historical side note ---
+
+We flirted with doing /both/ unwrap-at-top-level /and/ rewrite-deeply;
+see #22519.  But that didn't work: see discussion in #22924. Specifically
+we got a loop with a minor variation:
+   f2 :: a -> [A]
+   f2 = coerce
 
 Note [Eager reflexivity check]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1469,6 +1467,24 @@ we do a reflexivity check.
 
 (This would be sound in the nominal case, but unnecessary, and I [Richard
 E.] am worried that it would slow down the common case.)
+
+ Note [Newtypes can blow the stack]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Suppose we have
+
+  newtype X = MkX (Int -> X)
+  newtype Y = MkY (Int -> Y)
+
+and now wish to prove
+
+  [W] X ~R Y
+
+This Wanted will loop, expanding out the newtypes ever deeper looking
+for a solid match or a solid discrepancy. Indeed, there is something
+appropriate to this looping, because X and Y *do* have the same representation,
+in the limit -- they're both (Fix ((->) Int)). However, no finitely-sized
+coercion will ever witness it. This loop won't actually cause GHC to hang,
+though, because we check our depth in `can_eq_newtype_nc`.
 -}
 
 ------------------------
@@ -1484,28 +1500,22 @@ can_eq_newtype_nc ev swapped ty1 ((gres, co1), ty1') ty2 ps_ty2
   = do { traceTcS "can_eq_newtype_nc" $
          vcat [ ppr ev, ppr swapped, ppr co1, ppr gres, ppr ty1', ppr ty2 ]
 
-         -- check for blowing our stack:
+         -- Check for blowing our stack, and increase the depth
          -- See Note [Newtypes can blow the stack]
-       ; checkReductionDepth (ctEvLoc ev) ty1
+       ; let loc = ctEvLoc ev
+             ev' = ev `setCtEvLoc` bumpCtLocDepth loc
+       ; checkReductionDepth loc ty1
 
          -- Next, we record uses of newtype constructors, since coercing
          -- through newtypes is tantamount to using their constructors.
-       ; addUsedGREs gre_list
-         -- If a newtype constructor was imported, don't warn about not
-         -- importing it...
-       ; traverse_ keepAlive $ map greMangledName gre_list
-         -- ...and similarly, if a newtype constructor was defined in the same
-         -- module, don't warn about it being unused.
-         -- See Note [Tracking unused binding and imports] in GHC.Tc.Utils.
+       ; recordUsedGREs gres
 
        ; let redn1 = mkReduction co1 ty1'
 
-       ; new_ev <- rewriteEqEvidence emptyRewriterSet ev swapped
+       ; new_ev <- rewriteEqEvidence emptyRewriterSet ev' swapped
                      redn1
                      (mkReflRedn Representational ps_ty2)
        ; can_eq_nc False new_ev ReprEq ty1' ty1' ty2 ps_ty2 }
-  where
-    gre_list = bagToList gres
 
 ---------
 -- ^ Decompose a type application.
@@ -1518,7 +1528,7 @@ can_eq_app :: CtEvidence       -- :: s1 t1 ~N s2 t2
 
 -- AppTys only decompose for nominal equality, so this case just leads
 -- to an irreducible constraint; see typecheck/should_compile/T10494
--- See Note [Decomposing AppTy at representational role]
+-- See Note [Decomposing AppTy equalities]
 can_eq_app ev s1 t1 s2 t2
   | CtWanted { ctev_dest = dest, ctev_rewriters = rewriters } <- ev
   = do { co_s <- unifyWanted rewriters loc Nominal s1 s2
@@ -1539,9 +1549,9 @@ can_eq_app ev s1 t1 s2 t2
   = canEqHardFailure ev (s1 `mkAppTy` t1) (s2 `mkAppTy` t2)
 
   | CtGiven { ctev_evar = evar } <- ev
-  = do { let co   = mkTcCoVarCo evar
-             co_s = mkTcLRCo CLeft  co
-             co_t = mkTcLRCo CRight co
+  = do { let co   = mkCoVarCo evar
+             co_s = mkLRCo CLeft  co
+             co_t = mkLRCo CRight co
        ; evar_s <- newGivenEvVar loc ( mkTcEqPredLikeEv ev s1 s2
                                      , evCoercion co_s )
        ; evar_t <- newGivenEvVar loc ( mkTcEqPredLikeEv ev t1 t2
@@ -1552,8 +1562,8 @@ can_eq_app ev s1 t1 s2 t2
   where
     loc = ctEvLoc ev
 
-    s1k = tcTypeKind s1
-    s2k = tcTypeKind s2
+    s1k = typeKind s1
+    s2k = typeKind s2
 
     k1 `mismatches` k2
       =  isForAllTy k1 && not (isForAllTy k2)
@@ -1585,8 +1595,10 @@ canTyConApp :: CtEvidence -> EqRel
             -> TyCon -> [TcType]
             -> TyCon -> [TcType]
             -> TcS (StopOrContinue Ct)
--- See Note [Decomposing TyConApps]
--- Neither tc1 nor tc2 is a saturated funTyCon
+-- See Note [Decomposing TyConApp equalities]
+-- See Note [Decomposing Dependent TyCons and Processing Wanted Equalities]
+-- Neither tc1 nor tc2 is a saturated funTyCon, nor a type family
+-- But they can be data families.
 canTyConApp ev eq_rel tc1 tys1 tc2 tys2
   | tc1 == tc2
   , tys1 `equalLength` tys2
@@ -1605,23 +1617,29 @@ canTyConApp ev eq_rel tc1 tys1 tc2 tys2
   | eq_rel == ReprEq && not (isGenerativeTyCon tc1 Representational &&
                              isGenerativeTyCon tc2 Representational)
   = canEqFailure ev eq_rel ty1 ty2
+
   | otherwise
   = canEqHardFailure ev ty1 ty2
   where
     -- Reconstruct the types for error messages. This would do
     -- the wrong thing (from a pretty printing point of view)
-    -- for functions, because we've lost the AnonArgFlag; but
+    -- for functions, because we've lost the FunTyFlag; but
     -- in fact we never call canTyConApp on a saturated FunTyCon
     ty1 = mkTyConApp tc1 tys1
     ty2 = mkTyConApp tc2 tys2
 
-    loc  = ctEvLoc ev
-    pred = ctEvPred ev
-
-     -- See Note [Decomposing equality]
+     -- See Note [Decomposing TyConApp equalities]
+     -- and Note [Decomposing newtype equalities]
     can_decompose inerts
       =  isInjectiveTyCon tc1 (eqRelRole eq_rel)
-      || (ctEvFlavour ev /= Given && isEmptyBag (matchableGivens loc pred inerts))
+      || (assert (eq_rel == ReprEq) $
+          -- assert: isInjectiveTyCon is always True for Nominal except
+          --   for type synonyms/families, neither of which happen here
+          -- Moreover isInjectiveTyCon is True for Representational
+          --   for algebraic data types.  So we are down to newtypes
+          --   and data families.
+          ctEvFlavour ev == Wanted && noGivenNewtypeReprEqs tc1 inerts)
+             -- See Note [Decomposing newtype equalities] (EX2)
 
 {-
 Note [Use canEqFailure in canDecomposableTyConApp]
@@ -1655,219 +1673,364 @@ For example, see typecheck/should_compile/T10493, repeated here:
 That should compile, but only because we use canEqFailure and not
 canEqHardFailure.
 
-Note [Decomposing equality]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~
-If we have a constraint (of any flavour and role) that looks like
-T tys1 ~ T tys2, what can we conclude about tys1 and tys2? The answer,
-of course, is "it depends". This Note spells it all out.
+Note [Fast path when decomposing TyConApps]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+If we see (T s1 t1 ~ T s2 t2), then we can just decompose to
+  (s1 ~ s2, t1 ~ t2)
+and push those back into the work list.  But if
+  s1 = K k1    s2 = K k2
+then we will just decompose s1~s2, and it might be better to
+do so on the spot.  An important special case is where s1=s2,
+and we get just Refl.
 
-In this Note, "decomposition" refers to taking the constraint
-  [fl] (T tys1 ~X T tys2)
-(for some flavour fl and some role X) and replacing it with
-  [fls'] (tys1 ~Xs' tys2)
-where that notation indicates a list of new constraints, where the
-new constraints may have different flavours and different roles.
+So canDecomposableTyConAppOK uses unifyWanted etc to short-cut that work.
+See also Note [Decomposing Dependent TyCons and Processing Wanted Equalities]
 
-The key property to consider is injectivity. When decomposing a Given, the
-decomposition is sound if and only if T is injective in all of its type
-arguments. When decomposing a Wanted, the decomposition is sound (assuming the
-correct roles in the produced equality constraints), but it may be a guess --
-that is, an unforced decision by the constraint solver. Decomposing Wanteds
-over injective TyCons does not entail guessing. But sometimes we want to
-decompose a Wanted even when the TyCon involved is not injective! (See below.)
+Note [Decomposing TyConApp equalities]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Suppose we have
+        [G/W] T ty1 ~r T ty2
+Can we decompose it, and replace it by
+        [G/W] ty1 ~r' ty2
+and if so what role is r'?  (In this Note, all the "~" are primitive
+equalities "~#", but I have dropped the noisy "#" symbols.)  Lots of
+background in the paper "Safe zero-cost coercions for Haskell".
 
-So, in broad strokes, we want this rule:
+This Note covers the topic for
+  * Datatypes
+  * Newtypes
+  * Data families
+For the rest:
+  * Type synonyms: are always expanded
+  * Type families: see Note [Decomposing type family applications]
+  * AppTy:         see Note [Decomposing AppTy equalities].
 
-(*) Decompose a constraint (T tys1 ~X T tys2) if and only if T is injective
-at role X.
+---- Roles of the decomposed constraints ----
+For a start, the role r' will always be defined like this:
+  * If r=N then r' = N
+  * If r=R then r' = role of T's first argument
 
-Pursuing the details requires exploring three axes:
-* Flavour: Given vs. Wanted
-* Role: Nominal vs. Representational
-* TyCon species: datatype vs. newtype vs. data family vs. type family vs. type variable
+For example:
+   data TR a = MkTR a       -- Role of T's first arg is Representational
+   data TN a = MkTN (F a)   -- Role of T's first arg is Nominal
 
-(A type variable isn't a TyCon, of course, but it's convenient to put the AppTy case
-in the same table.)
+The function tyConRolesX :: Role -> TyCon -> [Role] gets the argument
+role r' for a TyCon T at role r.  E.g.
+   tyConRolesX Nominal          TR = [Nominal]
+   tyConRolesX Representational TR = [Representational]
 
-Here is a table (discussion following) detailing where decomposition of
-   (T s1 ... sn) ~r (T t1 .. tn)
-is allowed.  The first four lines (Data types ... type family) refer
-to TyConApps with various TyCons T; the last line is for AppTy, covering
-both where there is a type variable at the head and the case for an over-
-saturated type family.
+---- Soundness and completeness ----
+For Givens, for /soundness/ of decomposition we need, forall ty1,ty2:
+    T ty1 ~r T ty2   ===>    ty1 ~r' ty2
+Here "===>" means "implies".  That is, given evidence for (co1 : T ty1 ~r T co2)
+we can produce evidence for (co2 : ty1 ~r' ty2).  But in the solver we
+/replace/ co1 with co2 in the inert set, and we don't want to lose any proofs
+thereby. So for /completeness/ of decomposition we also need the reverse:
+    ty1 ~r' ty2   ===>    T ty1 ~r T ty2
 
-NOMINAL               GIVEN        WANTED                         WHERE
+For Wanteds, for /soundness/ of decomposition we need:
+    ty1 ~r' ty2   ===>    T ty1 ~r T ty2
+because if we do decompose we'll get evidence (co2 : ty1 ~r' ty2) and
+from that we want to derive evidence (T co2 : T ty1 ~r T ty2).
+For /completeness/ of decomposition we need the reverse implication too,
+else we may decompose to a new proof obligation that is stronger than
+the one we started with.  See Note [Decomposing newtype equalities].
 
-Datatype               YES          YES                           canTyConApp
-Newtype                YES          YES                           canTyConApp
-Data family            YES          YES                           canTyConApp
-Type family            NO{1}        YES, in injective args{1}     canEqCanLHS2
-AppTy                  YES          YES                           can_eq_app
+---- Injectivity ----
+When do these bi-implications hold? In one direction it is easy.
+We /always/ have
+    ty1 ~r'  ty2   ===>    T ty1 ~r T ty2
+This is the CO_TYCONAPP rule of the paper (Fig 5); see also the
+TyConAppCo case of GHC.Core.Lint.lintCoercion.
 
-REPRESENTATIONAL      GIVEN        WANTED
+In the other direction, we have
+    T ty1 ~r T ty2   ==>   ty1 ~r' ty2  if T is /injective at role r/
+This is the very /definition/ of injectivity: injectivity means result
+is the same => arguments are the same, modulo the role shift.
+See comments on GHC.Core.TyCon.isInjectiveTyCon.  This is also
+the CO_NTH rule in Fig 5 of the paper, except in the paper only
+newtypes are non-injective at representation role, so the rule says "H
+is not a newtype".
 
-Datatype               YES          YES                           canTyConApp
-Newtype                NO{2}       MAYBE{2}                canTyConApp(can_decompose)
-Data family            NO{3}       MAYBE{3}                canTyConApp(can_decompose)
-Type family            NO           NO                            canEqCanLHS2
-AppTy                  NO{4}        NO{4}                         can_eq_nc'
+Injectivity is a bit subtle:
+                 Nominal   Representational
+   Datatype        YES        YES
+   Newtype         YES        NO{1}
+   Data family     YES        NO{2}
 
-{1}: Type families can be injective in some, but not all, of their arguments,
-so we want to do partial decomposition. This is quite different than the way
-other decomposition is done, where the decomposed equalities replace the original
-one. We thus proceed much like we do with superclasses, emitting new Wanteds
-when "decomposing" a partially-injective type family Wanted. Injective type
-families have no corresponding evidence of their injectivity, so we cannot
-decompose an injective-type-family Given.
+{1} Consider newtype N a = MkN (F a)   -- Arg has Nominal role
+    Is it true that (N t1) ~R (N t2)   ==>   t1 ~N t2  ?
+    No, absolutely not.  E.g.
+       type instance F Int = Int; type instance F Bool = Char
+       Then (N Int) ~R (N Bool), by unwrapping, but we don't want Int~Char!
 
-{2}: See Note [Decomposing newtypes at representational role]
+    See Note [Decomposing newtype equalities]
 
-{3}: Because of the possibility of newtype instances, we must treat
-data families like newtypes. See also
-Note [Decomposing newtypes at representational role]. See #10534 and
-test case typecheck/should_fail/T10534.
+{2} We must treat data families precisely like newtypes, because of the
+    possibility of newtype instances. See also
+    Note [Decomposing newtype equalities]. See #10534 and
+    test case typecheck/should_fail/T10534.
 
-{4}: See Note [Decomposing AppTy at representational role]
+---- Takeaway summary -----
+For sound and complete decomposition, we simply need injectivity;
+that is for isInjectiveTyCon to be true:
 
-   Because type variables can stand in for newtypes, we conservatively do not
-   decompose AppTys over representational equality. Here are two examples that
-   demonstrate why we can't:
+* At Nominal role, isInjectiveTyCon is True for all the TyCons we are
+  considering in this Note: datatypes, newtypes, and data families.
 
-   4a: newtype Phant a = MkPhant Int
-       [W] alpha Int ~R beta Bool
+* For Givens, injectivity is necessary for soundness; completeness has no
+  side conditions.
 
-   If we eventually solve alpha := Phant and beta := Phant, then we can solve
-   this equality by unwrapping. But it would have been disastrous to decompose
-   the wanted to produce Int ~ Bool, which is definitely insoluble.
+* For Wanteds, soundness has no side conditions; but injectivity is needed
+  for completeness. See Note [Decomposing newtype equalities]
 
-   4b: newtype Age = MkAge Int
-       [W] alpha Age ~R Maybe Int
+This is implemented in `can_decompose` in `canTyConApp`; it looks at
+injectivity, just as specified above.
 
-   First, a question: if we know that ty1 ~R ty2, can we conclude that
-   a ty1 ~R a ty2? Not for all a. This is precisely why we need role annotations
-   on type constructors. So, if we were to decompose, we would need to
-   decompose to [W] alpha ~R Maybe and [W] Age ~ Int. On the other hand, if we
-   later solve alpha := Maybe, then we would decompose to [W] Age ~R Int, and
-   that would be soluble.
 
-In the implementation of can_eq_nc and friends, we don't directly pattern
-match using lines like in the tables above, as those tables don't cover
-all cases (what about PrimTyCon? tuples?). Instead we just ask about injectivity,
-boiling the tables above down to rule (*). The exceptions to rule (*) are for
-injective type families, which are handled separately from other decompositions,
-and the MAYBE entries above.
+Note [Decomposing type family applications]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Supose we have
+   [G/W]  (F ty1) ~r  (F ty2)
+This is handled by the TyFamLHS/TyFamLHS case of canEqCanLHS2.
 
-Note [Decomposing newtypes at representational role]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-This note discusses the 'newtype' line in the REPRESENTATIONAL table
-in Note [Decomposing equality]. (At nominal role, newtypes are fully
-decomposable.)
+We never decompose to
+   [G/W]  ty1 ~r' ty2
 
-Here is a representative example of why representational equality over
-newtypes is tricky:
+Instead
 
-  newtype Nt a = Mk Bool         -- NB: a is not used in the RHS,
-  type role Nt representational  -- but the user gives it an R role anyway
+* For Givens we do nothing. Injective type families have no corresponding
+  evidence of their injectivity, so we cannot decompose an
+  injective-type-family Given.
 
-If we have [W] Nt alpha ~R Nt beta, we *don't* want to decompose to
-[W] alpha ~R beta, because it's possible that alpha and beta aren't
-representationally equal. Here's another example.
+* For Wanteds, for the Nominal role only, we emit new Wanteds rather like
+  functional dependencies, for each injective argument position.
 
-  newtype Nt a = MkNt (Id a)
-  type family Id a where Id a = a
+  E.g type family F a b   -- injective in first arg, but not second
+      [W] (F s1 t1) ~N (F s2 t2)
+  Emit new Wanteds
+      [W] s1 ~N s2
+  But retain the existing, unsolved constraint.
 
-  [W] Nt Int ~R Nt Age
+Note [Decomposing newtype equalities]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+This Note also applies to data families, which we treat like
+newtype in case of 'newtype instance'.
 
-Because of its use of a type family, Nt's parameter will get inferred to have
-a nominal role. Thus, decomposing the wanted will yield [W] Int ~N Age, which
-is unsatisfiable. Unwrapping, though, leads to a solution.
+As Note [Decomposing TyConApp equalities] describes, if N is injective
+at role r, we can do this decomposition?
+   [G/W] (N ty1) ~r (N ty2)    to     [G/W]  ty1 ~r' ty2
 
-Conclusion:
- * Unwrap newtypes before attempting to decompose them.
-   This is done in can_eq_nc'.
+For a Given with r=R, the answer is a solid NO: newtypes are not injective at
+representational role, and we must not decompose, or we lose soundness.
+Example is wrinkle {1} in Note [Decomposing TyConApp equalities].
 
-It all comes from the fact that newtypes aren't necessarily injective
-w.r.t. representational equality.
+For a Wanted with r=R, since newtypes are not injective at representational
+role, decomposition is sound, but we may lose completeness.  Nevertheless,
+if the newtype is abstract (so can't be unwrapped) we can only solve
+the equality by (a) using a Given or (b) decomposition.  If (a) is impossible
+(e.g. no Givens) then (b) is safe albeit potentially incomplete.
 
-Furthermore, as explained in Note [NthCo and newtypes] in GHC.Core.TyCo.Rep, we can't use
-NthCo on representational coercions over newtypes. NthCo comes into play
-only when decomposing givens.
+There are two ways in which decomposing (N ty1) ~r (N ty2) could be incomplete:
 
-Conclusion:
- * Do not decompose [G] N s ~R N t
+* Incompleteness example (EX1): unwrap first
+      newtype Nt a = MkNt (Id a)
+      type family Id a where Id a = a
 
-Is it sensible to decompose *Wanted* constraints over newtypes?  Yes!
-It's the only way we could ever prove (IO Int ~R IO Age), recalling
-that IO is a newtype.
+      [W] Nt Int ~R Nt Age
 
-However we must be careful.  Consider
+  Because of its use of a type family, Nt's parameter will get inferred to
+  have a nominal role. Thus, decomposing the wanted will yield [W] Int ~N Age,
+  which is unsatisfiable. Unwrapping, though, leads to a solution.
 
-  type role Nt representational
+  Conclusion: always unwrap newtypes before attempting to decompose
+  them.  This is done in can_eq_nc'.  Of course, we can't unwrap if the data
+  constructor isn't in scope.  See Note [Unwrap newtypes first].
 
-  [G] Nt a ~R Nt b       (1)
-  [W] NT alpha ~R Nt b   (2)
-  [W] alpha ~ a          (3)
+* Incompleteness example (EX2): available Givens
+      newtype Nt a = Mk Bool         -- NB: a is not used in the RHS,
+      type role Nt representational  -- but the user gives it an R role anyway
 
-If we focus on (3) first, we'll substitute in (2), and now it's
-identical to the given (1), so we succeed.  But if we focus on (2)
-first, and decompose it, we'll get (alpha ~R b), which is not soluble.
-This is exactly like the question of overlapping Givens for class
-constraints: see Note [Instance and Given overlap] in GHC.Tc.Solver.Interact.
+      [G] Nt t1 ~R Nt t2
+      [W] Nt alpha ~R Nt beta
 
-Conclusion:
-  * Decompose [W] N s ~R N t  iff there no given constraint that could
-    later solve it.
+  We *don't* want to decompose to [W] alpha ~R beta, because it's possible
+  that alpha and beta aren't representationally equal.  And if we figure
+  out (elsewhere) that alpha:=t1 and beta:=t2, we can solve the Wanted
+  from the Given.  This is somewhat similar to the question of overlapping
+  Givens for class constraints: see Note [Instance and Given overlap] in
+  GHC.Tc.Solver.Interact.
 
-Note [Decomposing AppTy at representational role]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-We never decompose AppTy at a representational role. For Givens, doing
-so is simply unsound: the LRCo coercion former requires a nominal-roled
-arguments. (See (1) for an example of why.) For Wanteds, decomposing
-would be sound, but it would be a guess, and a non-confluent one at that.
+  Conclusion: don't decompose [W] N s ~R N t, if there are any Given
+  equalities that could later solve it.
 
-Here is an example:
+  But what precisely does it mean to say "any Given equalities that could
+  later solve it"?
+
+  In #22924 we had
+     [G] f a ~R# a     [W] Const (f a) a ~R# Const a a
+  where Const is an abstract newtype.  If we decomposed the newtype, we
+  could solve.  Not-decomposing on the grounds that (f a ~R# a) might turn
+  into (Const (f a) a ~R# Const a a) seems a bit silly.
+
+  In #22331 we had
+     [G] N a ~R# N b   [W] N b ~R# N a
+  (where N is abstract so we can't unwrap). Here we really /don't/ want to
+  decompose, because the /only/ way to solve the Wanted is from that Given
+  (with a Sym).
+
+  In #22519 we had
+     [G] a <= b     [W] IO Age ~R# IO Int
+
+  (where IO is abstract so we can't unwrap, and newtype Age = Int; and (<=)
+  is a type-level comparison on Nats).  Here we /must/ decompose, despite the
+  existence of an Irred Given, or we will simply be stuck.  (Side note: We
+  flirted with deep-rewriting of newtypes (see discussion on #22519 and
+  !9623) but that turned out not to solve #22924, and also makes type
+  inference loop more often on recursive newtypes.)
+
+  The currently-implemented compromise is this:
+
+    we decompose [W] N s ~R# N t unless there is a [G] N s' ~ N t'
+
+  that is, a Given Irred equality with both sides headed with N.
+  See the call to noGivenNewtypeReprEqs in canTyConApp.
+
+  This is not perfect.  In principle a Given like [G] (a b) ~ (c d), or
+  even just [G] c, could later turn into N s ~ N t.  But since the free
+  vars of a Given are skolems, or at least untouchable unification
+  variables, this is extremely unlikely to happen.
+
+  Another worry: there could, just, be a CDictCan with some
+  un-expanded equality superclasses; but only in some very obscure
+  recursive-superclass situations.
+
+   Yet another approach (!) is desribed in
+   Note [Decomposing newtypes a bit more aggressively].
+
+Remember: decomposing Wanteds is always /sound/. This Note is
+only about /completeness/.
+
+Note [Decomposing newtypes a bit more aggressively]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+IMPORTANT: the ideas in this Note are *not* implemented. Instead, the
+current approach is detailed in Note [Decomposing newtype equalities]
+and Note [Unwrap newtypes first].
+For more details about the ideas in this Note see
+  * GHC propoosal: https://github.com/ghc-proposals/ghc-proposals/pull/549
+  * issue #22441
+  * discussion on !9282.
+
+Consider [G] c, [W] (IO Int) ~R (IO Age)
+where IO is abstract, and
+   newtype Age = MkAge Int   -- Not abstract
+With the above rules, if there any Given Irreds,
+the Wanted is insoluble because we can't decompose it.  But in fact,
+if we look at the defn of IO, roughly,
+    newtype IO a = State# -> (State#, a)
+we can see that decomposing [W] (IO Int) ~R (IO Age) to
+    [W] Int ~R Age
+definitely does not lose completeness. Why not? Because the role of
+IO's argment is representational.  Hence:
+
+  DecomposeNewtypeIdea:
+     decompose [W] (N s1 .. sn) ~R (N t1 .. tn)
+     if the roles of all N's arguments are representational
+
+If N's arguments really /are/ representational this will not lose
+completeness.  Here "really are representational" means "if you expand
+all newtypes in N's RHS, we'd infer a representational role for each
+of N's type variables in that expansion".  See Note [Role inference]
+in GHC.Tc.TyCl.Utils.
+
+But the user might /override/ a phantom role with an explicit role
+annotation, and then we could (obscurely) get incompleteness.
+Consider
+
+   module A( silly, T ) where
+     newtype T a = MkT Int
+     type role T representational  -- Override phantom role
+
+     silly :: Coercion (T Int) (T Bool)
+     silly = Coercion  -- Typechecks by unwrapping the newtype
+
+     data Coercion a b where  -- Actually defined in Data.Type.Coercion
+       Coercion :: Coercible a b => Coercion a b
+
+   module B where
+     import A
+     f :: T Int -> T Bool
+     f = case silly of Coercion -> coerce
+
+Here the `coerce` gives [W] (T Int) ~R (T Bool) which, if we decompose,
+we'll get stuck with (Int ~R Bool).  Instead we want to use the
+[G] (T Int) ~R (T Bool), which will be in the Irreds.
+
+Summary: we could adopt (DecomposeNewtypeIdea), at the cost of a very
+obscure incompleteness (above).  But no one is reporting a problem from
+the lack of decompostion, so we'll just leave it for now.  This long
+Note is just to record the thinking for our future selves.
+
+Note [Decomposing AppTy equalities]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+For AppTy all the same questions arise as in
+Note [Decomposing TyConApp equalities]. We have
+
+    s1 ~r s2,  t1 ~N t2   ==>   s1 t1 ~r s2 t2       (rule CO_APP)
+    s1 t1 ~N s2 t2        ==>   s1 ~N s2,  t1 ~N t2  (CO_LEFT, CO_RIGHT)
+
+In the first of these, why do we need Nominal equality in (t1 ~N t2)?
+See {2} below.
+
+For sound and complete solving, we need both directions to decompose. So:
+* At nominal role, all is well: we have both directions.
+* At representational role, decomposition of Givens is unsound (see {1} below),
+  and decomposition of Wanteds is incomplete.
+
+Here is an example of the incompleteness for Wanteds:
 
     [G] g1 :: a ~R b
     [W] w1 :: Maybe b ~R alpha a
-    [W] w2 :: alpha ~ Maybe
+    [W] w2 :: alpha ~N Maybe
 
-Suppose we see w1 before w2. If we were to decompose, we would decompose
-this to become
+Suppose we see w1 before w2. If we decompose, using AppCo to prove w1, we get
 
+    w1 := AppCo w3 w4
     [W] w3 :: Maybe ~R alpha
-    [W] w4 :: b ~ a
+    [W] w4 :: b ~N a
 
 Note that w4 is *nominal*. A nominal role here is necessary because AppCo
-requires a nominal role on its second argument. (See (2) for an example of
-why.) If we decomposed w1 to w3,w4, we would then get stuck, because w4
-is insoluble. On the other hand, if we see w2 first, setting alpha := Maybe,
-all is well, as we can decompose Maybe b ~R Maybe a into b ~R a.
+requires a nominal role on its second argument. (See {2} for an example of
+why.) Now we are stuck, because w4 is insoluble. On the other hand, if we
+see w2 first, setting alpha := Maybe, all is well, as we can decompose
+Maybe b ~R Maybe a into b ~R a.
 
 Another example:
-
     newtype Phant x = MkPhant Int
-
     [W] w1 :: Phant Int ~R alpha Bool
     [W] w2 :: alpha ~ Phant
 
 If we see w1 first, decomposing would be disastrous, as we would then try
 to solve Int ~ Bool. Instead, spotting w2 allows us to simplify w1 to become
-
     [W] w1' :: Phant Int ~R Phant Bool
 
 which can then (assuming MkPhant is in scope) be simplified to Int ~R Int,
 and all will be well. See also Note [Unwrap newtypes first].
 
-Bottom line: never decompose AppTy with representational roles.
+Bottom line:
+* Always decompose AppTy at nominal role: can_eq_app
+* Never decompose AppTy at representational role (neither Given nor Wanted):
+  the lack of an equation in can_eq_nc'
 
-(1) Decomposing a Given AppTy over a representational role is simply
-unsound. For example, if we have co1 :: Phant Int ~R a Bool (for
-the newtype Phant, above), then we surely don't want any relationship
-between Int and Bool, lest we also have co2 :: Phant ~ a around.
+Extra points
+{1}  Decomposing a Given AppTy over a representational role is simply
+     unsound. For example, if we have co1 :: Phant Int ~R a Bool (for
+     the newtype Phant, above), then we surely don't want any relationship
+     between Int and Bool, lest we also have co2 :: Phant ~ a around.
 
-(2) The role on the AppCo coercion is a conservative choice, because we don't
-know the role signature of the function. For example, let's assume we could
-have a representational role on the second argument of AppCo. Then, consider
+{2} The role on the AppCo coercion is a conservative choice, because we don't
+    know the role signature of the function. For example, let's assume we could
+    have a representational role on the second argument of AppCo. Then, consider
 
     data G a where    -- G will have a nominal role, as G is a GADT
       MkG :: G Int
@@ -1877,15 +2040,14 @@ have a representational role on the second argument of AppCo. Then, consider
     co2 :: Age ~R Int    -- by newtype axiom
     co3 = AppCo co1 co2 :: G Age ~R a Int    -- by our broken AppCo
 
-and now co3 can be used to cast MkG to have type G Age, in violation of
-the way GADTs are supposed to work (which is to use nominal equality).
-
+    and now co3 can be used to cast MkG to have type G Age, in violation of
+    the way GADTs are supposed to work (which is to use nominal equality).
 -}
 
 canDecomposableTyConAppOK :: CtEvidence -> EqRel
                           -> TyCon -> [TcType] -> [TcType]
                           -> TcS (StopOrContinue Ct)
--- Precondition: tys1 and tys2 are the same length, hence "OK"
+-- Precondition: tys1 and tys2 are the same finite length, hence "OK"
 canDecomposableTyConAppOK ev eq_rel tc tys1 tys2
   = assert (tys1 `equalLength` tys2) $
     do { traceTcS "canDecomposableTyConAppOK"
@@ -1893,16 +2055,19 @@ canDecomposableTyConAppOK ev eq_rel tc tys1 tys2
        ; case ev of
            CtWanted { ctev_dest = dest, ctev_rewriters = rewriters }
                   -- new_locs and tc_roles are both infinite, so
-                  -- we are guaranteed that cos has the same length
+                  -- we are guaranteed that cos has the same lengthm
                   -- as tys1 and tys2
-             -> do { cos <- zipWith4M (unifyWanted rewriters) new_locs tc_roles tys1 tys2
+                  -- See Note [Fast path when decomposing TyConApps]
+                  -- Caution: unifyWanteds is order sensitive
+                  -- See Note [Decomposing Dependent TyCons and Processing Wanted Equalities]
+             -> do { cos <- unifyWanteds rewriters new_locs tc_roles tys1 tys2
                    ; setWantedEq dest (mkTyConAppCo role tc cos) }
 
            CtGiven { ctev_evar = evar }
              -> do { let ev_co = mkCoVarCo evar
                    ; given_evs <- newGivenEvVars loc $
                                   [ ( mkPrimEqPredRole r ty1 ty2
-                                    , evCoercion $ mkNthCo r i ev_co )
+                                    , evCoercion $ mkSelCo (SelTyCon i r) ev_co )
                                   | (r, ty1, ty2, i) <- zip4 tc_roles tys1 tys2 [0..]
                                   , r /= Phantom
                                   , not (isCoercionTy ty1) && not (isCoercionTy ty2) ]
@@ -1911,11 +2076,11 @@ canDecomposableTyConAppOK ev eq_rel tc tys1 tys2
     ; stopWith ev "Decomposed TyConApp" }
 
   where
-    loc        = ctEvLoc ev
-    role       = eqRelRole eq_rel
+    loc  = ctEvLoc ev
+    role = eqRelRole eq_rel
 
-      -- infinite, as tyConRolesX returns an infinite tail of Nominal
-    tc_roles   = tyConRolesX role tc
+    -- Infinite, to allow for over-saturated TyConApps
+    tc_roles = tyConRoleListX role tc
 
       -- Add nuances to the location during decomposition:
       --  * if the argument is a kind argument, remember this, so that error
@@ -1936,6 +2101,38 @@ canDecomposableTyConAppOK ev eq_rel tc tys1 tys2
                               | otherwise
                               = new_loc0 ]
                ++ repeat loc
+
+canDecomposableFunTy :: CtEvidence -> EqRel -> FunTyFlag
+                     -> (Type,Type,Type)   -- (multiplicity,arg,res)
+                     -> (Type,Type,Type)   -- (multiplicity,arg,res)
+                     -> TcS (StopOrContinue Ct)
+canDecomposableFunTy ev eq_rel af f1@(m1,a1,r1) f2@(m2,a2,r2)
+  = do { traceTcS "canDecomposableFunTy"
+                  (ppr ev $$ ppr eq_rel $$ ppr f1 $$ ppr f2)
+       ; case ev of
+           CtWanted { ctev_dest = dest, ctev_rewriters = rewriters }
+             -> do { mult <- unifyWanted rewriters mult_loc (funRole role SelMult) m1 m2
+                   ; arg  <- unifyWanted rewriters loc      (funRole role SelArg)  a1 a2
+                   ; res  <- unifyWanted rewriters loc      (funRole role SelRes)  r1 r2
+                   ; setWantedEq dest (mkNakedFunCo1 role af mult arg res) }
+
+           CtGiven { ctev_evar = evar }
+             -> do { let ev_co = mkCoVarCo evar
+                   ; given_evs <- newGivenEvVars loc $
+                                  [ ( mkPrimEqPredRole role' ty1 ty2
+                                    , evCoercion $ mkSelCo (SelFun fs) ev_co )
+                                  | (fs, ty1, ty2) <- [(SelMult, m1, m2)
+                                                      ,(SelArg,  a1, a2)
+                                                      ,(SelRes,  r1, r2)]
+                                  , let role' = funRole role fs ]
+                   ; emitWorkNC given_evs }
+
+    ; stopWith ev "Decomposed TyConApp" }
+
+  where
+    loc      = ctEvLoc ev
+    role     = eqRelRole eq_rel
+    mult_loc = updateCtLocOrigin loc toInvisibleOrigin
 
 -- | Call when canonicalizing an equality fails, but if the equality is
 -- representational, there is some hope for the future.
@@ -1961,25 +2158,12 @@ canEqHardFailure :: CtEvidence
 -- See Note [Make sure that insolubles are fully rewritten]
 canEqHardFailure ev ty1 ty2
   = do { traceTcS "canEqHardFailure" (ppr ty1 $$ ppr ty2)
-       ; (redn1, rewriters1) <- rewrite ev ty1
-       ; (redn2, rewriters2) <- rewrite ev ty2
+       ; (redn1, rewriters1) <- rewriteForErrors ev ty1
+       ; (redn2, rewriters2) <- rewriteForErrors ev ty2
        ; new_ev <- rewriteEqEvidence (rewriters1 S.<> rewriters2) ev NotSwapped redn1 redn2
        ; continueWith (mkIrredCt ShapeMismatchReason new_ev) }
 
 {-
-Note [Decomposing TyConApps]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-If we see (T s1 t1 ~ T s2 t2), then we can just decompose to
-  (s1 ~ s2, t1 ~ t2)
-and push those back into the work list.  But if
-  s1 = K k1    s2 = K k2
-then we will just decomopose s1~s2, and it might be better to
-do so on the spot.  An important special case is where s1=s2,
-and we get just Refl.
-
-So canDecomposableTyCon is a fast-path decomposition that uses
-unifyWanted etc to short-cut that work.
-
 Note [Canonicalising type applications]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Given (s1 t1) ~ ty2, how should we proceed?
@@ -2032,6 +2216,14 @@ We want to make sure canEqCanLHS sees [W] a ~R a, after b is rewritten
 and the Id newtype is unwrapped. This is assured by requiring only rewritten
 types in canEqCanLHS *and* having the newtype-unwrapping check above
 the tyvar check in can_eq_nc.
+
+Note that this only applies to saturated applications of newtype TyCons, as
+we can't rewrite an unsaturated application. See for example T22310, where
+we ended up with:
+
+  newtype Compose f g a = ...
+
+  [W] t[tau] ~# Compose Foo Bar
 
 Note [Put touchable variables on the left]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -2099,7 +2291,36 @@ canEqCanLHS ev eq_rel swapped lhs1 ps_xi1 xi2 ps_xi2
 
   where
     k1 = canEqLHSKind lhs1
-    k2 = tcTypeKind xi2
+    k2 = typeKind xi2
+
+
+{-
+Note [Kind Equality Orientation]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+While in theory [W] x ~ y and [W] y ~ x ought to give us the same behaviour, in practice it does not.
+See Note [Fundeps with instances, and equality orientation] where this is discussed at length.
+As a rule of thumb: we keep the newest unification variables on the left of the equality.
+See also Note [Improvement orientation] in GHC.Tc.Solver.Interact.
+
+In particular, `canEqCanLHSHetero` produces the following constraint equalities
+
+[X] (xi1 :: ki1) ~ (xi2 :: ki2)
+  -->  [X] kco :: ki1 ~ ki2
+       [X] co : xi1 :: ki1 ~ (xi2 |> sym kco) :: ki1
+
+Note that the types in the LHS of the new constraints are the ones that were on the LHS of
+the original constraint.
+
+--- Historical note ---
+We prevously used to flip the kco to avoid using a sym in the cast
+
+[X] (xi1 :: ki1) ~ (xi2 :: ki2)
+  -->  [X] kco :: ki2 ~ ki1
+       [X] co : xi1 :: ki1 ~ (xi2 |> kco) :: ki1
+
+But this sent solver in an infinite loop (see #19415).
+-- End of historical note --
+-}
 
 canEqCanLHSHetero :: CtEvidence         -- :: (xi1 :: ki1) ~ (xi2 :: ki2)
                   -> EqRel -> SwapFlag
@@ -2110,48 +2331,52 @@ canEqCanLHSHetero :: CtEvidence         -- :: (xi1 :: ki1) ~ (xi2 :: ki2)
                   -> TcS (StopOrContinue Ct)
 canEqCanLHSHetero ev eq_rel swapped lhs1 ki1 xi2 ki2
   -- See Note [Equalities with incompatible kinds]
-  = do { (kind_ev, kind_co) <- mk_kind_eq   -- :: ki2 ~N ki1
+  -- See Note [Kind Equality Orientation]
+  -- NB: preserve left-to-right orientation!!
+  -- See Note [Fundeps with instances, and equality orientation]
+  --     wrinkle (W2) in GHC.Tc.Solver.Interact
+  = do { (kind_ev, kind_co) <- mk_kind_eq   -- :: ki1 ~N ki2
 
-       ; let  -- kind_co :: (ki2 :: *) ~N (ki1 :: *)   (whether swapped or not)
+       ; let  -- kind_co :: (ki1 :: *) ~N (ki2 :: *)   (whether swapped or not)
              lhs_redn = mkReflRedn role xi1
-             rhs_redn = mkGReflRightRedn role xi2 kind_co
+             rhs_redn = mkGReflRightRedn role xi2 (mkSymCo kind_co)
 
              -- See Note [Equalities with incompatible kinds], Wrinkle (1)
              -- This will be ignored in rewriteEqEvidence if the work item is a Given
              rewriters = rewriterSetFromCo kind_co
 
        ; traceTcS "Hetero equality gives rise to kind equality"
-           (ppr kind_co <+> dcolon <+> sep [ ppr ki2, text "~#", ppr ki1 ])
+           (ppr kind_co <+> dcolon <+> sep [ ppr ki1, text "~#", ppr ki2 ])
        ; type_ev <- rewriteEqEvidence rewriters ev swapped lhs_redn rhs_redn
 
        ; emitWorkNC [type_ev]  -- delay the type equality until after we've finished
                                -- the kind equality, which may unlock things
                                -- See Note [Equalities with incompatible kinds]
 
-       ; canEqNC kind_ev NomEq ki2 ki1 }
+       ; canEqNC kind_ev NomEq ki1 ki2 }
   where
     mk_kind_eq :: TcS (CtEvidence, CoercionN)
     mk_kind_eq = case ev of
       CtGiven { ctev_evar = evar }
-        -> do { let kind_co = maybe_sym $ mkTcKindCo (mkTcCoVarCo evar)  -- :: k2 ~ k1
+        -> do { let kind_co = maybe_sym $ mkKindCo (mkCoVarCo evar) -- :: k1 ~ k2
               ; kind_ev <- newGivenEvVar kind_loc (kind_pty, evCoercion kind_co)
               ; return (kind_ev, ctEvCoercion kind_ev) }
 
       CtWanted { ctev_rewriters = rewriters }
-        -> newWantedEq kind_loc rewriters Nominal ki2 ki1
+        -> newWantedEq kind_loc rewriters Nominal ki1 ki2
 
     xi1      = canEqLHSType lhs1
     loc      = ctev_loc ev
     role     = eqRelRole eq_rel
     kind_loc = mkKindLoc xi1 xi2 loc
-    kind_pty = mkHeteroPrimEqPred liftedTypeKind liftedTypeKind ki2 ki1
+    kind_pty = mkHeteroPrimEqPred liftedTypeKind liftedTypeKind ki1 ki2
 
     maybe_sym = case swapped of
-          IsSwapped  -> id         -- if the input is swapped, then we already
-                                   -- will have k2 ~ k1
-          NotSwapped -> mkTcSymCo
+          IsSwapped  -> mkSymCo         -- if the input is swapped, then we
+                                        -- will have k2 ~ k1, so flip it to k1 ~ k2
+          NotSwapped -> id
 
--- guaranteed that tcTypeKind lhs == tcTypeKind rhs
+-- guaranteed that typeKind lhs == typeKind rhs
 canEqCanLHSHomo :: CtEvidence
                 -> EqRel -> SwapFlag
                 -> CanEqLHS           -- lhs (or, if swapped, rhs)
@@ -2161,7 +2386,7 @@ canEqCanLHSHomo :: CtEvidence
 canEqCanLHSHomo ev eq_rel swapped lhs1 ps_xi1 xi2 ps_xi2
   | (xi2', mco) <- split_cast_ty xi2
   , Just lhs2 <- canEqLHS_maybe xi2'
-  = canEqCanLHS2 ev eq_rel swapped lhs1 ps_xi1 lhs2 (ps_xi2 `mkCastTyMCo` mkTcSymMCo mco) mco
+  = canEqCanLHS2 ev eq_rel swapped lhs1 ps_xi1 lhs2 (ps_xi2 `mkCastTyMCo` mkSymMCo mco) mco
 
   | otherwise
   = canEqCanLHSFinish ev eq_rel swapped lhs1 ps_xi2
@@ -2206,6 +2431,7 @@ canEqCanLHS2 ev eq_rel swapped lhs1 ps_xi1 lhs2 ps_xi2 mco
 
   | TyFamLHS fun_tc1 fun_args1 <- lhs1
   , TyFamLHS fun_tc2 fun_args2 <- lhs2
+  -- See Note [Decomposing type family applications]
   = do { traceTcS "canEqCanLHS2 two type families" (ppr lhs1 $$ ppr lhs2)
 
          -- emit wanted equalities for injective type families
@@ -2278,7 +2504,7 @@ canEqCanLHS2 ev eq_rel swapped lhs1 ps_xi1 lhs2 ps_xi2 mco
   = finish_without_swapping
 
   where
-    sym_mco = mkTcSymMCo mco
+    sym_mco = mkSymMCo mco
 
     do_swap = rewriteCastedEquality ev eq_rel swapped (canEqLHSType lhs1) (canEqLHSType lhs2) mco
     finish_without_swapping = canEqCanLHSFinish ev eq_rel swapped lhs1 (ps_xi2 `mkCastTyMCo` mco)
@@ -2317,7 +2543,7 @@ canEqTyVarFunEq ev eq_rel swapped tv1 ps_xi1 fun_tc2 fun_args2 ps_xi2 mco
                                   (TyFamLHS fun_tc2 fun_args2)
                                   (ps_xi1 `mkCastTyMCo` sym_mco) } }
   where
-    sym_mco = mkTcSymMCo mco
+    sym_mco = mkSymMCo mco
     rhs = ps_xi2 `mkCastTyMCo` mco
 
 -- The RHS here is either not CanEqLHS, or it's one that we
@@ -2340,7 +2566,7 @@ canEqCanLHSFinish ev eq_rel swapped lhs rhs
                                      (mkReflRedn role rhs)
 
      -- by now, (TyEq:K) is already satisfied
-       ; massert (canEqLHSKind lhs `eqType` tcTypeKind rhs)
+       ; massert (canEqLHSKind lhs `eqType` typeKind rhs)
 
      -- by now, (TyEq:N) is already satisfied (if applicable)
        ; assertPprM ty_eq_N_OK $
@@ -2402,15 +2628,17 @@ canEqCanLHSFinish ev eq_rel swapped lhs rhs
 
     lhs_ty = canEqLHSType lhs
 
-    -- This is about (TyEq:N): check that we don't have a newtype
-    -- whose constructor is in scope at the top-level of the RHS.
+    -- This is about (TyEq:N): check that we don't have a saturated application
+    -- of a newtype TyCon at the top level of the RHS, if the constructor
+    -- of the newtype is in scope.
     ty_eq_N_OK :: TcS Bool
     ty_eq_N_OK
       | ReprEq <- eq_rel
-      , Just tc <- tyConAppTyCon_maybe rhs
+      , Just (tc, tc_args) <- splitTyConApp_maybe rhs
       , Just con <- newTyConDataCon_maybe tc
-      -- #21010: only a problem if the newtype constructor is in scope
-      -- yet we didn't rewrite it away.
+      -- #22310: only a problem if the newtype TyCon is saturated.
+      , tc_args `lengthAtLeast` tyConArity tc
+      -- #21010: only a problem if the newtype constructor is in scope.
       = do { rdr_env <- getGlobalRdrEnvTcS
            ; let con_in_scope = isJust $ lookupGRE_Name rdr_env (dataConName con)
            ; return $ not con_in_scope }
@@ -2424,7 +2652,7 @@ canEqReflexive :: CtEvidence    -- ty ~ ty
                -> TcS (StopOrContinue Ct)   -- always Stop
 canEqReflexive ev eq_rel ty
   = do { setEvBindIfWanted ev (evCoercion $
-                               mkTcReflCo (eqRelRole eq_rel) ty)
+                               mkReflCo (eqRelRole eq_rel) ty)
        ; stopWith ev "Solved by reflexivity" }
 
 rewriteCastedEquality :: CtEvidence     -- :: lhs ~ (rhs |> mco), or (rhs |> mco) ~ lhs
@@ -2440,7 +2668,7 @@ rewriteCastedEquality ev eq_rel swapped lhs rhs mco
     lhs_redn = mkGReflRightMRedn role lhs sym_mco
     rhs_redn = mkGReflLeftMRedn  role rhs mco
 
-    sym_mco = mkTcSymMCo mco
+    sym_mco = mkSymMCo mco
     role    = eqRelRole eq_rel
 
 {- Note [Equalities with incompatible kinds]
@@ -2456,8 +2684,8 @@ k2 and use this to cast. To wit, from
 
 (where [X] is [G] or [W]), we go to
 
-  [X] co :: k2 ~ k1
-  [X] (tv :: k1) ~ ((rhs |> co) :: k1)
+  [X] co :: k1 ~ k2
+  [X] (tv :: k1) ~ ((rhs |> sym co) :: k1)
 
 We carry on with the *kind equality*, not the type equality, because
 solving the former may unlock the latter. This choice is made in
@@ -2470,7 +2698,7 @@ Wrinkles:
      for the type-level one. See Note [Wanteds rewrite Wanteds] in GHC.Tc.Types.Constraint.
      This is done in canEqCanLHSHetero.
 
- (2) If we have [W] w :: alpha ~ (rhs |> co_hole), should we unify alpha? No.
+ (2) If we have [W] w :: alpha ~ (rhs |> sym co_hole), should we unify alpha? No.
      The problem is that the wanted w is effectively rewritten by another wanted,
      and unifying alpha effectively promotes this wanted to a given. Doing so
      means we lose track of the rewriter set associated with the wanted.
@@ -2488,8 +2716,8 @@ Wrinkles:
      unifyTest in canEqTyVarFunEq.
 
  (3) Suppose we have [W] (a :: k1) ~ (rhs :: k2). We duly follow the
-     algorithm detailed here, producing [W] co :: k2 ~ k1, and adding
-     [W] (a :: k1) ~ ((rhs |> co) :: k1) to the irreducibles. Some time
+     algorithm detailed here, producing [W] co :: k1 ~ k2, and adding
+     [W] (a :: k1) ~ ((rhs |> sym co) :: k1) to the irreducibles. Some time
      later, we solve co, and fill in co's coercion hole. This kicks out
      the irreducible as described in (2).
      But now, during canonicalization, we see the cast
@@ -2828,7 +3056,7 @@ Details:
  (5) The approach here is inefficient because it replaces every (outermost)
      type family application with a type variable, regardless of whether that
      particular appplication is implicated in the occurs check.  An alternative
-     would be to replce only type-family applications that meantion the offending LHS.
+     would be to replce only type-family applications that mention the offending LHS.
      For instance, we could choose to
      affect only type family applications that mention the offending LHS:
      e.g. in a ~ (F b, G a), we need to replace only G a, not F b. Furthermore,
@@ -2977,7 +3205,7 @@ the rewriter set. We check this with an assertion.
 
 
 rewriteEvidence rewriters old_ev (Reduction co new_pred)
-  | isTcReflCo co -- See Note [Rewriting with Refl]
+  | isReflCo co -- See Note [Rewriting with Refl]
   = assert (isEmptyRewriterSet rewriters) $
     continueWith (setCtEvPredType old_ev new_pred)
 
@@ -2989,7 +3217,7 @@ rewriteEvidence rewriters ev@(CtGiven { ctev_evar = old_evar, ctev_loc = loc })
   where
     -- mkEvCast optimises ReflCo
     new_tm = mkEvCast (evId old_evar)
-                (tcDowngradeRole Representational (ctEvRole ev) co)
+                (downgradeRole Representational (ctEvRole ev) co)
 
 rewriteEvidence new_rewriters
                 ev@(CtWanted { ctev_dest = dest
@@ -2997,10 +3225,10 @@ rewriteEvidence new_rewriters
                              , ctev_rewriters = rewriters })
                 (Reduction co new_pred)
   = do { mb_new_ev <- newWanted loc rewriters' new_pred
-       ; massert (tcCoercionRole co == ctEvRole ev)
+       ; massert (coercionRole co == ctEvRole ev)
        ; setWantedEvTerm dest
             (mkEvCast (getEvExpr mb_new_ev)
-                      (tcDowngradeRole Representational (ctEvRole ev) (mkSymCo co)))
+                      (downgradeRole Representational (ctEvRole ev) (mkSymCo co)))
        ; case mb_new_ev of
             Fresh  new_ev -> continueWith new_ev
             Cached _      -> stopWith ev "Cached wanted" }
@@ -3034,25 +3262,25 @@ rewriteEqEvidence :: RewriterSet        -- New rewriters
 -- It's all a form of rewriteEvidence, specialised for equalities
 rewriteEqEvidence new_rewriters old_ev swapped (Reduction lhs_co nlhs) (Reduction rhs_co nrhs)
   | NotSwapped <- swapped
-  , isTcReflCo lhs_co      -- See Note [Rewriting with Refl]
-  , isTcReflCo rhs_co
+  , isReflCo lhs_co      -- See Note [Rewriting with Refl]
+  , isReflCo rhs_co
   = return (setCtEvPredType old_ev new_pred)
 
   | CtGiven { ctev_evar = old_evar } <- old_ev
-  = do { let new_tm = evCoercion ( mkTcSymCo lhs_co
-                                  `mkTcTransCo` maybeTcSymCo swapped (mkTcCoVarCo old_evar)
-                                  `mkTcTransCo` rhs_co)
-       ; newGivenEvVar loc' (new_pred, new_tm) }
+  = do { let new_tm = evCoercion ( mkSymCo lhs_co
+                                  `mkTransCo` maybeSymCo swapped (mkCoVarCo old_evar)
+                                  `mkTransCo` rhs_co)
+       ; newGivenEvVar loc (new_pred, new_tm) }
 
   | CtWanted { ctev_dest = dest
              , ctev_rewriters = rewriters } <- old_ev
   , let rewriters' = rewriters S.<> new_rewriters
-  = do { (new_ev, hole_co) <- newWantedEq loc' rewriters'
+  = do { (new_ev, hole_co) <- newWantedEq loc rewriters'
                                           (ctEvRole old_ev) nlhs nrhs
-       ; let co = maybeTcSymCo swapped $
+       ; let co = maybeSymCo swapped $
                   lhs_co
                   `mkTransCo` hole_co
-                  `mkTransCo` mkTcSymCo rhs_co
+                  `mkTransCo` mkSymCo rhs_co
        ; setWantedEq dest co
        ; traceTcS "rewriteEqEvidence" (vcat [ ppr old_ev
                                             , ppr nlhs
@@ -3067,12 +3295,7 @@ rewriteEqEvidence new_rewriters old_ev swapped (Reduction lhs_co nlhs) (Reductio
 #endif
   where
     new_pred = mkTcEqPredLikeEv old_ev nlhs nrhs
-
-      -- equality is like a type class. Bumping the depth is necessary because
-      -- of recursive newtypes, where "reducing" a newtype can actually make
-      -- it bigger. See Note [Newtypes can blow the stack].
     loc      = ctEvLoc old_ev
-    loc'     = bumpCtLocDepth loc
 
 {-
 ************************************************************************
@@ -3101,25 +3324,27 @@ unifyWanted :: RewriterSet -> CtLoc
 -- See Note [unifyWanted]
 -- The returned coercion's role matches the input parameter
 unifyWanted rewriters loc Phantom ty1 ty2
-  = do { kind_co <- unifyWanted rewriters loc Nominal (tcTypeKind ty1) (tcTypeKind ty2)
+  = do { kind_co <- unifyWanted rewriters loc Nominal (typeKind ty1) (typeKind ty2)
        ; return (mkPhantomCo kind_co ty1 ty2) }
 
 unifyWanted rewriters loc role orig_ty1 orig_ty2
   = go orig_ty1 orig_ty2
   where
-    go ty1 ty2 | Just ty1' <- tcView ty1 = go ty1' ty2
-    go ty1 ty2 | Just ty2' <- tcView ty2 = go ty1 ty2'
+    go ty1 ty2 | Just ty1' <- coreView ty1 = go ty1' ty2
+    go ty1 ty2 | Just ty2' <- coreView ty2 = go ty1 ty2'
 
-    go (FunTy _ w1 s1 t1) (FunTy _ w2 s2 t2)
+    go (FunTy af1 w1 s1 t1) (FunTy af2 w2 s2 t2)
+      | af1 == af2    -- Important!  See #21530
       = do { co_s <- unifyWanted rewriters loc role s1 s2
            ; co_t <- unifyWanted rewriters loc role t1 t2
            ; co_w <- unifyWanted rewriters loc Nominal w1 w2
-           ; return (mkFunCo role co_w co_s co_t) }
+           ; return (mkNakedFunCo1 role af1 co_w co_s co_t) }
+
     go (TyConApp tc1 tys1) (TyConApp tc2 tys2)
       | tc1 == tc2, tys1 `equalLength` tys2
       , isInjectiveTyCon tc1 role -- don't look under newtypes at Rep equality
       = do { cos <- zipWith3M (unifyWanted rewriters loc)
-                              (tyConRolesX role tc1) tys1 tys2
+                              (tyConRoleListX role tc1) tys1 tys2
            ; return (mkTyConAppCo role tc1 cos) }
 
     go ty1@(TyVarTy tv) ty2
@@ -3139,6 +3364,58 @@ unifyWanted rewriters loc role orig_ty1 orig_ty2
     go ty1 ty2 = bale_out ty1 ty2
 
     bale_out ty1 ty2
-       | ty1 `tcEqType` ty2 = return (mkTcReflCo role ty1)
+       | ty1 `tcEqType` ty2 = return (mkReflCo role ty1)
         -- Check for equality; e.g. a ~ a, or (m a) ~ (m a)
        | otherwise = emitNewWantedEq loc rewriters role orig_ty1 orig_ty2
+
+
+{-
+Note [Decomposing Dependent TyCons and Processing Wanted Equalities]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+When we decompose a dependent tycon we obtain a list of
+mixed wanted type and kind equalities. Ideally we want
+all the kind equalities to get solved first so that we avoid
+generating duplicate kind equalities
+
+For example, consider decomposing a TyCon equality
+
+    (0) [W] T k_fresh (t1::k_fresh) ~ T k1 (t2::k_fresh)
+
+This gives rise to 2 equalities in the solver worklist
+
+    (1) [W] k_fresh ~ k1
+    (2) [W] t1::k_fresh ~ t2::k1
+
+The solver worklist is processed in LIFO order:
+see GHC.Tc.Solver.InertSet.selectWorkItem.
+i.e. (2) is processed _before_ (1). Now, while solving (2)
+we would call `canEqCanLHSHetero` and that would emit a
+wanted kind equality
+
+    (3) [W] k_fresh ~ k1
+
+But (3) is exactly the same as (1)!
+
+To avoid such duplicate wanted constraints from being added to the worklist,
+we ensure that (2) is processed before (1). Since we are processing
+the worklist in a LIFO ordering, we do it by emitting (1) before (2).
+This is exactly what we do in `unifyWanteds`.
+
+NB: This ordering is not needed when we decompose FunTyCons as they are not dependently typed
+-}
+
+-- NB: Length of [CtLoc] and [Roles] may be infinite
+-- but list of RHS [TcType] and LHS [TcType] is finite and both are of equal length
+unifyWanteds :: RewriterSet -> [CtLoc] -> [Role]
+             -> [TcType] -- List of RHS types
+             -> [TcType] -- List of LHS types
+             -> TcS [Coercion]
+unifyWanteds rewriters ctlocs roles rhss lhss = unify_wanteds rewriters $ zip4 ctlocs roles rhss lhss
+  where
+    -- Order is important here
+    -- See Note [Decomposing Dependent TyCons and Processing Wanted Equalities]
+    unify_wanteds _ [] = return []
+    unify_wanteds rewriters ((new_loc, tc_role, ty1, ty2) : rest)
+       = do { cos <- unify_wanteds rewriters rest
+            ; co  <- unifyWanted rewriters new_loc tc_role ty1 ty2
+            ; return (co:cos) }

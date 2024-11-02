@@ -20,7 +20,6 @@ import GHC.Prelude
 import GHC.Platform
 import GHC.Cmm.BlockId
 import GHC.Cmm
-import GHC.Cmm.Ppr.Expr () -- For Outputable instances
 import GHC.Cmm.Dataflow.Block
 import GHC.Cmm.Dataflow.Collections
 import GHC.Cmm.Dataflow
@@ -104,7 +103,7 @@ xferLive platform (BlockCC eNode middle xNode) fBase =
 -----------------------------------------------------------------------------
 -- | Specialization that only retains the keys for local variables.
 --
--- Local variablas are mostly glorified Ints, and some parts of the compiler
+-- Local variables are mostly glorified Ints, and some parts of the compiler
 -- really don't care about anything but the Int part. So we can avoid some
 -- overhead by computing a IntSet instead of a Set LocalReg which (unsurprisingly)
 -- is quite a bit faster.

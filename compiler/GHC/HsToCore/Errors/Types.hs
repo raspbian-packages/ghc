@@ -1,8 +1,8 @@
+{-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE ExistentialQuantification #-}
+{-# LANGUAGE TypeFamilies #-}
 
 module GHC.HsToCore.Errors.Types where
-
-import Data.Typeable
 
 import GHC.Prelude
 
@@ -19,6 +19,8 @@ import GHC.Types.Id
 import GHC.Types.Name (Name)
 import qualified GHC.LanguageExtensions as LangExt
 
+import GHC.Generics (Generic)
+
 newtype MinBound = MinBound Integer
 newtype MaxBound = MaxBound Integer
 type MaxUncoveredPatterns = Int
@@ -27,7 +29,7 @@ type MaxPmCheckModels = Int
 -- | Diagnostics messages emitted during desugaring.
 data DsMessage
   -- | Simply wraps a generic 'Diagnostic' message.
-  = forall a. (Diagnostic a, Typeable a) => DsUnknownMessage a
+  = DsUnknownMessage UnknownDiagnostic
 
     {-| DsEmptyEnumeration is a warning (controlled by the -Wempty-enumerations flag) that is
         emitted if an enumeration is empty.
@@ -122,8 +124,6 @@ data DsMessage
                           !CoreExpr
                           -- ^ The optimised LHS
 
-  | DsMultipleConForNewtype [LocatedN Name]
-
   | DsLazyPatCantBindVarsOfUnliftedType [Var]
 
   | DsNotYetHandledByTH !ThRejectionReason
@@ -145,6 +145,8 @@ data DsMessage
   | DsAnotherRuleMightFireFirst !RuleName
                                 !RuleName -- the \"bad\" rule
                                 !Var
+
+  deriving Generic
 
 -- The positional number of the argument for an expression (first, second, third, etc)
 newtype DsArgNum = DsArgNum Int

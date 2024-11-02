@@ -48,6 +48,9 @@ compilePackage rs = do
       [ root -/- "**/build/S/**/*." ++ wayPat ++ "o"
         | wayPat <- wayPats] |%> compileNonHsObject rs Asm
 
+      [ root -/- "**/build/js/**/*." ++ wayPat ++ "o"
+        | wayPat <- wayPats] |%> compileNonHsObject rs JS
+
       -- All else is haskell.
       -- These come last as they overlap with the above rules' file patterns.
 
@@ -115,11 +118,12 @@ compilePackage rs = do
 -}
 
 -- | Non Haskell source languages that we compile to get object files.
-data SourceLang = Asm | C | Cmm | Cxx deriving (Eq, Show)
+data SourceLang = Asm | C | Cmm | Cxx | JS deriving (Eq, Show)
 
 parseSourceLang :: Parsec.Parsec String () SourceLang
 parseSourceLang = Parsec.choice
-  [ Parsec.char 'c' *> Parsec.choice
+  [ Parsec.string "js" *>  pure JS
+  , Parsec.char 'c' *> Parsec.choice
       [ Parsec.string "mm" *> pure Cmm
       , Parsec.string "pp" *> pure Cxx
       , pure C
@@ -191,7 +195,7 @@ parseBuildObject root = parseBuildPath root parseObject
 
 objectContext :: BuildPath Object -> Context
 objectContext (BuildPath _ stage pkgPath obj) =
-    Context stage (unsafeFindPackageByPath pkgPath) way
+    Context stage (unsafeFindPackageByPath pkgPath) way Inplace
   where
     way = case obj of
         NonHs (NonHsObject _lang _file w)         -> w
@@ -238,6 +242,7 @@ compileNonHsObject rs lang path = do
       C   -> obj2src "c"   (const False)      ctx path
       Cmm -> obj2src "cmm" isGeneratedCmmFile ctx path
       Cxx -> obj2src "cpp" (const False) ctx path
+      JS  -> obj2src "js" (const False) ctx path
   need [src]
   needDependencies lang ctx src (path <.> "d")
   buildWithResources rs $ target ctx (builder stage) [src] [path]

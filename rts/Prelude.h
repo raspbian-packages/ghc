@@ -21,19 +21,18 @@
 
 /* See Note [Wired-in exceptions are not CAFfy] in GHC.Core.Make. */
 PRELUDE_CLOSURE(ghczmprim_GHCziPrimziPanic_absentSumFieldError_closure);
-PRELUDE_CLOSURE(ghczmprim_GHCziPrimziException_raiseUnderflow_closure);
-PRELUDE_CLOSURE(ghczmprim_GHCziPrimziException_raiseOverflow_closure);
-PRELUDE_CLOSURE(ghczmprim_GHCziPrimziException_raiseDivZZero_closure);
 
 /* Define canonical names so we can abstract away from the actual
  * modules these names are defined in.
  */
 
-PRELUDE_CLOSURE(ghczmprim_GHCziTuple_Z0T_closure);
+PRELUDE_CLOSURE(ghczmprim_GHCziTupleziPrim_Z0T_closure);
 PRELUDE_CLOSURE(ghczmprim_GHCziTypes_True_closure);
 PRELUDE_CLOSURE(ghczmprim_GHCziTypes_False_closure);
 PRELUDE_CLOSURE(base_GHCziPack_unpackCString_closure);
+PRELUDE_CLOSURE(base_GHCziPack_unpackCStringUtf8_closure);
 PRELUDE_CLOSURE(base_GHCziWeak_runFinalizzerBatch_closure);
+PRELUDE_CLOSURE(base_GHCziWeakziFinalizze_runFinalizzerBatch_closure);
 
 #if defined(IN_STG_CODE)
 extern W_ ZCMain_main_closure[];
@@ -69,6 +68,7 @@ PRELUDE_CLOSURE(base_GHCziEventziWindows_processRemoteCompletion_closure);
 PRELUDE_CLOSURE(base_GHCziTopHandler_flushStdHandles_closure);
 PRELUDE_CLOSURE(base_GHCziTopHandler_runMainIO_closure);
 
+PRELUDE_INFO(ghczmprim_GHCziCString_unpackCStringzh_info);
 PRELUDE_INFO(ghczmprim_GHCziTypes_Czh_con_info);
 PRELUDE_INFO(ghczmprim_GHCziTypes_Izh_con_info);
 PRELUDE_INFO(ghczmprim_GHCziTypes_Fzh_con_info);
@@ -87,11 +87,11 @@ PRELUDE_INFO(base_GHCziWord_W32zh_con_info);
 PRELUDE_INFO(base_GHCziWord_W64zh_con_info);
 PRELUDE_INFO(base_GHCziStable_StablePtr_con_info);
 
-#define Unit_closure              DLL_IMPORT_DATA_REF(ghczmprim_GHCziTuple_Z0T_closure)
+#define Unit_closure              DLL_IMPORT_DATA_REF(ghczmprim_GHCziTupleziPrim_Z0T_closure)
 #define True_closure              DLL_IMPORT_DATA_REF(ghczmprim_GHCziTypes_True_closure)
 #define False_closure             DLL_IMPORT_DATA_REF(ghczmprim_GHCziTypes_False_closure)
 #define unpackCString_closure     DLL_IMPORT_DATA_REF(base_GHCziPack_unpackCString_closure)
-#define runFinalizerBatch_closure DLL_IMPORT_DATA_REF(base_GHCziWeak_runFinalizzerBatch_closure)
+#define runFinalizerBatch_closure DLL_IMPORT_DATA_REF(base_GHCziWeakziFinalizze_runFinalizzerBatch_closure)
 #define mainIO_closure            (&ZCMain_main_closure)
 
 #define runSparks_closure         DLL_IMPORT_DATA_REF(base_GHCziConcziSync_runSparks_closure)
@@ -118,9 +118,9 @@ PRELUDE_INFO(base_GHCziStable_StablePtr_con_info);
 #define nestedAtomically_closure  DLL_IMPORT_DATA_REF(base_ControlziExceptionziBase_nestedAtomically_closure)
 #define doubleReadException  DLL_IMPORT_DATA_REF(base_GHCziIOPort_doubleReadException_closure)
 #define absentSumFieldError_closure DLL_IMPORT_DATA_REF(ghczmprim_GHCziPrimziPanic_absentSumFieldError_closure)
-#define raiseUnderflowException_closure DLL_IMPORT_DATA_REF(ghczmprim_GHCziPrimziException_raiseUnderflow_closure)
-#define raiseOverflowException_closure DLL_IMPORT_DATA_REF(ghczmprim_GHCziPrimziException_raiseOverflow_closure)
-#define raiseDivZeroException_closure DLL_IMPORT_DATA_REF(ghczmprim_GHCziPrimziException_raiseDivZZero_closure)
+#define underflowException_closure DLL_IMPORT_DATA_REF(base_GHCziExceptionziType_underflowException_closure)
+#define overflowException_closure DLL_IMPORT_DATA_REF(base_GHCziExceptionziType_overflowException_closure)
+#define divZeroException_closure  DLL_IMPORT_DATA_REF(base_GHCziExceptionziType_divZZeroException_closure)
 
 #define blockedOnBadFD_closure    DLL_IMPORT_DATA_REF(base_GHCziEventziThread_blockedOnBadFD_closure)
 

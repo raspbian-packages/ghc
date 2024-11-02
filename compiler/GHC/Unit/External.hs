@@ -1,6 +1,7 @@
 module GHC.Unit.External
    ( ExternalUnitCache (..)
    , initExternalUnitCache
+   , eucEPS
    , ExternalPackageState (..)
    , initExternalPackageState
    , EpsStats(..)
@@ -20,11 +21,10 @@ import GHC.Prelude
 import GHC.Unit
 import GHC.Unit.Module.ModIface
 
-import GHC.Core         ( RuleBase )
 import GHC.Core.FamInstEnv
 import GHC.Core.InstEnv ( InstEnv, emptyInstEnv )
 import GHC.Core.Opt.ConstantFold
-import GHC.Core.Rules (mkRuleBase)
+import GHC.Core.Rules ( RuleBase, mkRuleBase)
 
 import GHC.Types.Annotations ( AnnEnv, emptyAnnEnv )
 import GHC.Types.CompleteMatch
@@ -58,6 +58,9 @@ newtype ExternalUnitCache = ExternalUnitCache
 
 initExternalUnitCache :: IO ExternalUnitCache
 initExternalUnitCache = ExternalUnitCache <$> newIORef initExternalPackageState
+
+eucEPS :: ExternalUnitCache -> IO ExternalPackageState
+eucEPS = readIORef . euc_eps
 
 initExternalPackageState :: ExternalPackageState
 initExternalPackageState = EPS
@@ -151,7 +154,7 @@ data ExternalPackageState
         eps_mod_fam_inst_env :: !(ModuleEnv FamInstEnv), -- ^ The family instances accumulated from external
                                                          -- packages, keyed off the module that declared them
 
-        eps_stats :: !EpsStats                 -- ^ Stastics about what was loaded from external packages
+        eps_stats :: !EpsStats                 -- ^ Statistics about what was loaded from external packages
   }
 
 -- | Accumulated statistics about what we are putting into the 'ExternalPackageState'.

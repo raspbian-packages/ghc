@@ -7,7 +7,8 @@ module Distribution.Client.ProjectConfig.Legacy (
    -- Project config skeletons
     ProjectConfigSkeleton,
     parseProjectSkeleton,
-    instantiateProjectConfigSkeleton,
+    instantiateProjectConfigSkeletonFetchingCompiler,
+    instantiateProjectConfigSkeletonWithCompiler,
     singletonProjectConfigSkeleton,
     projectSkeletonImports,
 
@@ -44,7 +45,7 @@ import Distribution.Client.CmdInstall.ClientInstallFlags
          ( ClientInstallFlags(..), defaultClientInstallFlags
          , clientInstallOptions )
 
-import Distribution.Compat.Lens (view)
+import Distribution.Compat.Lens (view, toListOf)
 
 import Distribution.Solver.Types.ConstraintSource
 
@@ -52,7 +53,7 @@ import Distribution.FieldGrammar
 import Distribution.Package
 import Distribution.Types.SourceRepo (RepoType)
 import Distribution.Types.CondTree
-         ( CondTree (..), CondBranch (..), mapTreeConds, traverseCondTreeC )
+         ( CondTree (..), CondBranch (..), mapTreeConds, traverseCondTreeC, traverseCondTreeV, ignoreConditions )
 import Distribution.PackageDescription
          ( dispFlagAssignment, Condition (..), ConfVar (..), FlagAssignment )
 import Distribution.PackageDescription.Configuration (simplifyWithSysParams)
@@ -66,7 +67,7 @@ import Distribution.Simple.Setup
          , TestFlags(..), testOptions', defaultTestFlags
          , BenchmarkFlags(..), benchmarkOptions', defaultBenchmarkFlags
          , programDbPaths', splitArgs, DumpBuildInfo (NoDumpBuildInfo, DumpBuildInfo)
-         , readPackageDb, showPackageDb
+         , readPackageDb, showPackageDb, installDirsOptions
          )
 import Distribution.Client.NixStyleOptions (NixStyleFlags (..))
 import Distribution.Client.ProjectFlags (ProjectFlags (..), projectFlagsOptions, defaultProjectFlags)
@@ -101,7 +102,7 @@ import Distribution.Deprecated.ParseUtils
 import Distribution.Client.ParseUtils
 import Distribution.Simple.Command
          ( CommandUI(commandOptions), ShowOrParseArgs(..)
-         , OptionField, option, reqArg' )
+         , OptionField(..), option, reqArg' )
 import Distribution.Types.PackageVersionConstraint
          ( PackageVersionConstraint )
 import Distribution.Parsec (ParsecParser, parsecToken)
@@ -116,7 +117,7 @@ import Network.URI (URI (..), parseURI)
 import Distribution.Fields.ConfVar (parseConditionConfVarFromClause)
 
 import Distribution.Client.HttpUtils
-import System.FilePath ((</>), isPathSeparator, makeValid)
+import System.FilePath ((</>), isPathSeparator, makeValid, isAbsolute, takeDirectory)
 import System.Directory (createDirectoryIfMissing)
 
 
@@ -135,8 +136,16 @@ type ProjectConfigImport = String
 singletonProjectConfigSkeleton :: ProjectConfig -> ProjectConfigSkeleton
 singletonProjectConfigSkeleton x = CondNode x mempty mempty
 
-instantiateProjectConfigSkeleton :: OS -> Arch -> CompilerInfo -> FlagAssignment -> ProjectConfigSkeleton -> ProjectConfig
-instantiateProjectConfigSkeleton os arch impl _flags skel = go $ mapTreeConds (fst . simplifyWithSysParams os arch impl) skel
+instantiateProjectConfigSkeletonFetchingCompiler :: Monad m =>  m (OS, Arch, CompilerInfo) -> FlagAssignment -> ProjectConfigSkeleton -> m ProjectConfig
+instantiateProjectConfigSkeletonFetchingCompiler fetch flags skel
+   | null (toListOf traverseCondTreeV skel) = pure $ fst (ignoreConditions skel)
+   | otherwise = do
+       (os, arch, impl) <- fetch
+       pure $ instantiateProjectConfigSkeletonWithCompiler os arch impl flags skel
+
+
+instantiateProjectConfigSkeletonWithCompiler :: OS -> Arch -> CompilerInfo -> FlagAssignment -> ProjectConfigSkeleton -> ProjectConfig
+instantiateProjectConfigSkeletonWithCompiler os arch impl _flags skel = go $ mapTreeConds (fst . simplifyWithSysParams os arch impl) skel
     where
         go :: CondTree
                FlagName
@@ -215,7 +224,8 @@ parseProjectSkeleton cacheDir httpTransport verbosity seenImports source bs = (s
             createDirectoryIfMissing True cacheDir
             _ <- downloadURI httpTransport verbosity uri fp
             BS.readFile fp
-         Nothing -> BS.readFile pci
+         Nothing -> BS.readFile $
+           if isAbsolute pci then pci else takeDirectory source </> pci
 
     modifiesCompiler :: ProjectConfig -> Bool
     modifiesCompiler pc = isSet projectConfigHcFlavor || isSet projectConfigHcPath || isSet projectConfigHcPkg
@@ -346,9 +356,17 @@ commandLineFlagsToProjectConfig globalFlags NixStyleFlags {..} clientInstallFlag
         splitConfig pc = (pc
                          , mempty { packageConfigProgramPaths = packageConfigProgramPaths pc
                                   , packageConfigProgramPathExtra = packageConfigProgramPathExtra pc
-                                  , packageConfigDocumentation = packageConfigDocumentation pc })
 
--- | Convert from the types currently used for the user-wide @~/.cabal/config@
+                                  -- Some flags to haddock should be passed to dependencies
+                                  , packageConfigDocumentation = packageConfigDocumentation pc
+                                  , packageConfigHaddockHoogle = packageConfigHaddockHoogle pc
+                                  , packageConfigHaddockHtml = packageConfigHaddockHtml pc
+                                  , packageConfigHaddockInternal = packageConfigHaddockInternal pc
+                                  , packageConfigHaddockQuickJump = packageConfigHaddockQuickJump pc
+                                  , packageConfigHaddockLinkedSource = packageConfigHaddockLinkedSource pc
+                                  })
+
+-- | Convert from the types currently used for the user-wide Cabal config
 -- file into the 'ProjectConfig' type.
 --
 -- Only a subset of the 'ProjectConfig' can be represented in the user-wide
@@ -484,7 +502,7 @@ convertLegacyAllPackageFlags globalFlags configFlags configExFlags installFlags 
       configHcPath              = projectConfigHcPath,
       configHcPkg               = projectConfigHcPkg,
     --configProgramPathExtra    = projectConfigProgPathExtra DELETE ME
-    --configInstallDirs         = projectConfigInstallDirs,
+      configInstallDirs         = projectConfigInstallDirs,
     --configUserInstall         = projectConfigUserInstall,
       configPackageDBs          = projectConfigPackageDBs
     } = configFlags
@@ -514,6 +532,7 @@ convertLegacyAllPackageFlags globalFlags configFlags configExFlags installFlags 
       installMinimizeConflictSet = projectConfigMinimizeConflictSet,
       installPerComponent       = projectConfigPerComponent,
       installIndependentGoals   = projectConfigIndependentGoals,
+      installPreferOldest       = projectConfigPreferOldest,
     --installShadowPkgs         = projectConfigShadowPkgs,
       installStrongFlags        = projectConfigStrongFlags,
       installAllowBootLibInstalls = projectConfigAllowBootLibInstalls,
@@ -595,7 +614,10 @@ convertLegacyPerPackageFlags configFlags installFlags
       haddockLinkedSource       = packageConfigHaddockLinkedSource,
       haddockQuickJump          = packageConfigHaddockQuickJump,
       haddockHscolourCss        = packageConfigHaddockHscolourCss,
-      haddockContents           = packageConfigHaddockContents
+      haddockContents           = packageConfigHaddockContents,
+      haddockIndex              = packageConfigHaddockIndex,
+      haddockBaseUrl            = packageConfigHaddockBaseUrl,
+      haddockLib                = packageConfigHaddockLib
     } = haddockFlags
 
     TestFlags {
@@ -724,7 +746,8 @@ convertToLegacySharedConfig
     configFlags = mempty {
       configVerbosity     = projectConfigVerbosity,
       configDistPref      = projectConfigDistDir,
-      configPackageDBs    = projectConfigPackageDBs
+      configPackageDBs    = projectConfigPackageDBs,
+      configInstallDirs   = projectConfigInstallDirs
     }
 
     configExFlags = ConfigExFlags {
@@ -756,6 +779,7 @@ convertToLegacySharedConfig
       installFineGrainedConflicts = projectConfigFineGrainedConflicts,
       installMinimizeConflictSet = projectConfigMinimizeConflictSet,
       installIndependentGoals  = projectConfigIndependentGoals,
+      installPreferOldest      = projectConfigPreferOldest,
       installShadowPkgs        = mempty, --projectConfigShadowPkgs,
       installStrongFlags       = projectConfigStrongFlags,
       installAllowBootLibInstalls = projectConfigAllowBootLibInstalls,
@@ -821,7 +845,7 @@ convertToLegacyAllPackageConfig
       configOptimization        = mempty,
       configProgPrefix          = mempty,
       configProgSuffix          = mempty,
-      configInstallDirs         = mempty,
+      configInstallDirs         = projectConfigInstallDirs,
       configScratchDir          = mempty,
       configDistPref            = mempty,
       configCabalFilePath       = mempty,
@@ -956,6 +980,9 @@ convertToLegacyPerPackageConfig PackageConfig {..} =
       haddockKeepTempFiles = mempty,
       haddockVerbosity     = mempty,
       haddockCabalFilePath = mempty,
+      haddockIndex         = packageConfigHaddockIndex,
+      haddockBaseUrl       = packageConfigHaddockBaseUrl,
+      haddockLib           = packageConfigHaddockLib,
       haddockArgs          = mempty
     }
 
@@ -1115,7 +1142,7 @@ legacySharedConfigFieldDescrs constraintSrc = concat
         (Disp.text . showPackageDb) (fmap readPackageDb parsecToken)
         configPackageDBs (\v conf -> conf { configPackageDBs = v })
       ]
-  . filterFields ["verbose", "builddir" ]
+  . filterFields (["verbose", "builddir"] ++ map optionName installDirsOptions)
   . commandOptionsToFields
   $ configureOptions ParseArgs
 
@@ -1165,7 +1192,7 @@ legacySharedConfigFieldDescrs constraintSrc = concat
       , "jobs", "keep-going", "offline", "per-component"
         -- solver flags:
       , "max-backjumps", "reorder-goals", "count-conflicts"
-      , "fine-grained-conflicts" , "minimize-conflict-set", "independent-goals"
+      , "fine-grained-conflicts" , "minimize-conflict-set", "independent-goals", "prefer-oldest"
       , "strong-flags" , "allow-boot-library-installs"
       , "reject-unconstrained-dependencies", "index-state"
       ]
@@ -1275,7 +1302,8 @@ legacyPackageConfigFieldDescrs =
       , "foreign-libraries"
       , "executables", "tests", "benchmarks", "all", "internal", "css"
       , "hyperlink-source", "quickjump", "hscolour-css"
-      , "contents-location", "keep-temp-files"
+      , "contents-location", "index-location", "keep-temp-files", "base-url"
+      , "lib"
       ]
   . commandOptionsToFields
   ) (haddockOptions ParseArgs)
@@ -1310,7 +1338,6 @@ legacyPackageConfigFieldDescrs =
       []
   . commandOptionsToFields
   ) (benchmarkOptions' ParseArgs)
-
 
   where
     overrideFieldCompiler =

@@ -139,7 +139,7 @@ isGUIApp(void)
 }
 #endif
 
-void GNU_ATTRIBUTE(__noreturn__)
+void STG_NORETURN
 rtsFatalInternalErrorFn(const char *s, va_list ap)
 {
 #if defined(mingw32_HOST_OS)
@@ -321,17 +321,11 @@ rtsDebugMsgFn(const char *s, va_list ap)
 }
 
 
-// Used in stg_badAlignment_entry defined in StgStartup.cmm.
-void rtsBadAlignmentBarf(void) GNUC3_ATTRIBUTE(__noreturn__);
-
 void
 rtsBadAlignmentBarf(void)
 {
     barf("Encountered incorrectly aligned pointer. This can't be good.");
 }
-
-// Used by code generator
-void rtsOutOfBoundsAccess(void) GNUC3_ATTRIBUTE(__noreturn__);
 
 void
 rtsOutOfBoundsAccess(void)
@@ -339,11 +333,8 @@ rtsOutOfBoundsAccess(void)
     barf("Encountered out of bounds array access.");
 }
 
-// Used by code generator
-void rtsMemcpyRangeOverlap(void) GNUC3_ATTRIBUTE(__noreturn__);
-
 void
-rtsMemcpyRangeOverlap()
+rtsMemcpyRangeOverlap(void)
 {
     barf("Encountered overlapping source/destination ranges in a memcpy-using op.");
 }

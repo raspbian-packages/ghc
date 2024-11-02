@@ -72,7 +72,11 @@ import Distribution.Client.IndexUtils.IndexState
 import qualified Distribution.Client.Init.Types as IT
 import qualified Distribution.Client.Init.Defaults as IT
 import Distribution.Client.Targets
-         ( UserConstraint, readUserConstraint )
+  ( UserConstraint
+  , readUserConstraint
+  )
+import Distribution.Deprecated.ParseUtils (parseSpaceList, parseTokenQ)
+import Distribution.Deprecated.ReadP (readP_to_E)
 import Distribution.Utils.NubList
          ( NubList, toNubList, fromNubList)
 
@@ -112,7 +116,7 @@ import Distribution.Types.PackageVersionConstraint
 import Distribution.Types.UnqualComponentName
          ( unqualComponentNameToPackageName )
 import Distribution.PackageDescription
-         ( BuildType(..), RepoKind(..), LibraryName(..) )
+         ( BuildType(..), RepoKind(..), LibraryName(..), Dependency )
 import Distribution.System ( Platform )
 import Distribution.ReadE
          ( ReadE(..), succeedReadE, parsecToReadE, parsecToReadEErr, unexpectMsgString )
@@ -127,6 +131,8 @@ import Distribution.Client.GlobalFlags
          )
 import Distribution.Client.ManpageFlags (ManpageFlags, defaultManpageFlags, manpageOptions)
 import Distribution.FieldGrammar.Newtypes (SpecVersion (..))
+import Distribution.Parsec
+         ( parsecCommaList  )
 
 import Data.List
          ( deleteFirstsBy )
@@ -238,41 +244,49 @@ globalCommand commands = CommandUI {
          "Commands:\n"
       ++ unlines (
         [ startGroup "global"
-        , addCmd "update"
-        , addCmd "install"
-        , par
-        , addCmd "help"
-        , addCmd "info"
-        , addCmd "list"
-        , addCmd "fetch"
         , addCmd "user-config"
+        , addCmd "help"
         , par
-        , startGroup "package"
-        , addCmd "get"
-        , addCmd "unpack"
+        , startGroup "package database"
+        , addCmd "update"
+        , addCmd "list"
+        , addCmd "info"
+        , par
+        , startGroup "initialization and download"
         , addCmd "init"
+        , addCmd "fetch"
+        , addCmd "get"
         , par
+        , startGroup "project configuration"
         , addCmd "configure"
+        , addCmd "freeze"
+        , addCmd "gen-bounds"
+        , addCmd "outdated"
+        , par
+        , startGroup "project building and installing"
         , addCmd "build"
+        , addCmd "install"
+        , addCmd "haddock"
+        , addCmd "haddock-project"
         , addCmd "clean"
         , par
-        , addCmd "run"
+        , startGroup "running and testing"
+        , addCmd "list-bin"
         , addCmd "repl"
-        , addCmd "test"
+        , addCmd "run"
         , addCmd "bench"
+        , addCmd "test"
+        , addCmd "exec"
         , par
+        , startGroup "sanity checks and shipping"
         , addCmd "check"
         , addCmd "sdist"
         , addCmd "upload"
         , addCmd "report"
         , par
-        , addCmd "freeze"
-        , addCmd "gen-bounds"
-        , addCmd "outdated"
-        , addCmd "haddock"
+        , startGroup "deprecated"
+        , addCmd "unpack"
         , addCmd "hscolour"
-        , addCmd "exec"
-        , addCmd "list-bin"
         , par
         , startGroup "new-style projects (forwards-compatible aliases)"
         , addCmd "v2-build"
@@ -298,12 +312,8 @@ globalCommand commands = CommandUI {
         , addCmd "v1-bench"
         , addCmd "v1-freeze"
         , addCmd "v1-haddock"
-        , addCmd "v1-exec"
-        , addCmd "v1-update"
         , addCmd "v1-install"
         , addCmd "v1-clean"
-        , addCmd "v1-sdist"
-        , addCmd "v1-doctest"
         , addCmd "v1-copy"
         , addCmd "v1-register"
         , addCmd "v1-reconfigure"
@@ -360,6 +370,11 @@ globalCommand commands = CommandUI {
       ,multiOption "nix"
         globalNix (\v flags -> flags { globalNix = v })
         [
+          optArg' "(True or False)" (maybeToFlag . (readMaybe =<<)) (\case
+            Flag True -> [Just "enable"]
+            Flag False -> [Just "disable"]
+            NoFlag -> []) "" ["nix"] -- Must be empty because we need to return PP.empty from viewAsFieldDescr
+            "Nix integration: run commands through nix-shell if a 'shell.nix' file exists (default is False)",
           noArg (Flag True) [] ["enable-nix"]
           "Enable Nix integration: run commands through nix-shell if a 'shell.nix' file exists",
           noArg (Flag False) [] ["disable-nix"]
@@ -409,7 +424,6 @@ globalCommand commands = CommandUI {
          "Set a location for a cabal.config file for projects without their own cabal.config freeze file."
          globalConstraintsFile (\v flags -> flags {globalConstraintsFile = v})
          (reqArgFlag "FILE")
-
       ]
 
 -- ------------------------------------------------------------
@@ -497,7 +511,7 @@ filterConfigureFlags flags cabalLibVersion
     flags_2_5_0 = flags_3_7_0 {
       -- Cabal < 2.5 does not understand --dependency=pkg:component=cid
       -- (public sublibraries), so we convert it to the legacy
-      -- --dependency=pkg_or_internal_compoent=cid
+      -- --dependency=pkg_or_internal_component=cid
         configDependencies =
           let convertToLegacyInternalDep (GivenComponent _ (LSubLibName cn) cid) =
                 Just $ GivenComponent
@@ -943,6 +957,7 @@ data FetchFlags = FetchFlags {
       fetchFineGrainedConflicts :: Flag FineGrainedConflicts,
       fetchMinimizeConflictSet :: Flag MinimizeConflictSet,
       fetchIndependentGoals :: Flag IndependentGoals,
+      fetchPreferOldest     :: Flag PreferOldest,
       fetchShadowPkgs       :: Flag ShadowPkgs,
       fetchStrongFlags      :: Flag StrongFlags,
       fetchAllowBootLibInstalls :: Flag AllowBootLibInstalls,
@@ -964,6 +979,7 @@ defaultFetchFlags = FetchFlags {
     fetchFineGrainedConflicts = Flag (FineGrainedConflicts True),
     fetchMinimizeConflictSet = Flag (MinimizeConflictSet False),
     fetchIndependentGoals = Flag (IndependentGoals False),
+    fetchPreferOldest     = Flag (PreferOldest False),
     fetchShadowPkgs       = Flag (ShadowPkgs False),
     fetchStrongFlags      = Flag (StrongFlags False),
     fetchAllowBootLibInstalls = Flag (AllowBootLibInstalls False),
@@ -1027,6 +1043,7 @@ fetchCommand = CommandUI {
                          fetchFineGrainedConflicts (\v flags -> flags { fetchFineGrainedConflicts = v })
                          fetchMinimizeConflictSet (\v flags -> flags { fetchMinimizeConflictSet = v })
                          fetchIndependentGoals (\v flags -> flags { fetchIndependentGoals = v })
+                         fetchPreferOldest     (\v flags -> flags { fetchPreferOldest = v })
                          fetchShadowPkgs       (\v flags -> flags { fetchShadowPkgs       = v })
                          fetchStrongFlags      (\v flags -> flags { fetchStrongFlags      = v })
                          fetchAllowBootLibInstalls (\v flags -> flags { fetchAllowBootLibInstalls = v })
@@ -1049,6 +1066,7 @@ data FreezeFlags = FreezeFlags {
       freezeFineGrainedConflicts :: Flag FineGrainedConflicts,
       freezeMinimizeConflictSet :: Flag MinimizeConflictSet,
       freezeIndependentGoals :: Flag IndependentGoals,
+      freezePreferOldest     :: Flag PreferOldest,
       freezeShadowPkgs       :: Flag ShadowPkgs,
       freezeStrongFlags      :: Flag StrongFlags,
       freezeAllowBootLibInstalls :: Flag AllowBootLibInstalls,
@@ -1068,6 +1086,7 @@ defaultFreezeFlags = FreezeFlags {
     freezeFineGrainedConflicts = Flag (FineGrainedConflicts True),
     freezeMinimizeConflictSet = Flag (MinimizeConflictSet False),
     freezeIndependentGoals = Flag (IndependentGoals False),
+    freezePreferOldest     = Flag (PreferOldest False),
     freezeShadowPkgs       = Flag (ShadowPkgs False),
     freezeStrongFlags      = Flag (StrongFlags False),
     freezeAllowBootLibInstalls = Flag (AllowBootLibInstalls False),
@@ -1122,6 +1141,7 @@ freezeCommand = CommandUI {
                          freezeFineGrainedConflicts (\v flags -> flags { freezeFineGrainedConflicts = v })
                          freezeMinimizeConflictSet (\v flags -> flags { freezeMinimizeConflictSet = v })
                          freezeIndependentGoals (\v flags -> flags { freezeIndependentGoals = v })
+                         freezePreferOldest     (\v flags -> flags { freezePreferOldest = v })
                          freezeShadowPkgs       (\v flags -> flags { freezeShadowPkgs       = v })
                          freezeStrongFlags      (\v flags -> flags { freezeStrongFlags      = v })
                          freezeAllowBootLibInstalls (\v flags -> flags { freezeAllowBootLibInstalls = v })
@@ -1264,7 +1284,7 @@ reportCommand = CommandUI {
     commandSynopsis     = "Upload build reports to a remote server.",
     commandDescription  = Nothing,
     commandNotes        = Just $ \_ ->
-         "You can store your Hackage login in the ~/.cabal/config file\n",
+         "You can store your Hackage login in the ~/.config/cabal/config file\n",
     commandUsage        = usageAlternatives "report" ["[FLAGS]"],
     commandDefaultFlags = defaultReportFlags,
     commandOptions      = \_ ->
@@ -1297,6 +1317,7 @@ instance Semigroup ReportFlags where
 
 data GetFlags = GetFlags {
     getDestDir          :: Flag FilePath,
+    getOnlyPkgDescr     :: Flag Bool,
     getPristine         :: Flag Bool,
     getIndexState       :: Flag TotalIndexState,
     getActiveRepos      :: Flag ActiveRepos,
@@ -1307,6 +1328,7 @@ data GetFlags = GetFlags {
 defaultGetFlags :: GetFlags
 defaultGetFlags = GetFlags {
     getDestDir          = mempty,
+    getOnlyPkgDescr     = mempty,
     getPristine         = mempty,
     getIndexState       = mempty,
     getActiveRepos      = mempty,
@@ -1351,6 +1373,16 @@ getCommand = CommandUI {
                                        "(e.g. '2016-09-24T17:47:48Z'), or 'HEAD'")
                                       (toFlag `fmap` parsec))
                           (flagToList . fmap prettyShow))
+
+       , option [] ["only-package-description"]
+           "Unpack only the package description file."
+           getOnlyPkgDescr (\v flags -> flags { getOnlyPkgDescr = v })
+           trueArg
+
+       , option [] ["package-description-only"]
+           "A synonym for --only-package-description."
+           getOnlyPkgDescr (\v flags -> flags { getOnlyPkgDescr = v })
+           trueArg
 
        , option [] ["pristine"]
            ("Unpack the original pristine tarball, rather than updating the "
@@ -1556,6 +1588,7 @@ data InstallFlags = InstallFlags {
     installFineGrainedConflicts :: Flag FineGrainedConflicts,
     installMinimizeConflictSet :: Flag MinimizeConflictSet,
     installIndependentGoals :: Flag IndependentGoals,
+    installPreferOldest     :: Flag PreferOldest,
     installShadowPkgs       :: Flag ShadowPkgs,
     installStrongFlags      :: Flag StrongFlags,
     installAllowBootLibInstalls :: Flag AllowBootLibInstalls,
@@ -1598,6 +1631,7 @@ defaultInstallFlags = InstallFlags {
     installFineGrainedConflicts = Flag (FineGrainedConflicts True),
     installMinimizeConflictSet = Flag (MinimizeConflictSet False),
     installIndependentGoals= Flag (IndependentGoals False),
+    installPreferOldest    = Flag (PreferOldest False),
     installShadowPkgs      = Flag (ShadowPkgs False),
     installStrongFlags     = Flag (StrongFlags False),
     installAllowBootLibInstalls = Flag (AllowBootLibInstalls False),
@@ -1657,7 +1691,7 @@ installCommand = CommandUI {
      ++ " `v1-configure` for a list of commands being affected.\n"
      ++ "\n"
      ++ "Installed executables will by default"
-     ++ " be put into `~/.cabal/bin/`."
+     ++ " be put into `~/.local/bin/`."
      ++ " If you want installed executable to be available globally, make"
      ++ " sure that the PATH environment variable contains that directory.\n"
      ++ "\n",
@@ -1749,7 +1783,7 @@ haddockOptions showOrParseArgs
     , name `elem` ["hoogle", "html", "html-location"
                   ,"executables", "tests", "benchmarks", "all", "internal", "css"
                   ,"hyperlink-source", "quickjump", "hscolour-css"
-                  ,"contents-location", "for-hackage"]
+                  ,"contents-location", "use-index", "for-hackage", "base-url", "lib"]
     ]
 
 testOptions :: ShowOrParseArgs -> [OptionField TestFlags]
@@ -1823,6 +1857,7 @@ installOptions showOrParseArgs =
                         installFineGrainedConflicts (\v flags -> flags { installFineGrainedConflicts = v })
                         installMinimizeConflictSet (\v flags -> flags { installMinimizeConflictSet = v })
                         installIndependentGoals (\v flags -> flags { installIndependentGoals = v })
+                        installPreferOldest     (\v flags -> flags { installPreferOldest = v })
                         installShadowPkgs       (\v flags -> flags { installShadowPkgs       = v })
                         installStrongFlags      (\v flags -> flags { installStrongFlags      = v })
                         installAllowBootLibInstalls (\v flags -> flags { installAllowBootLibInstalls = v })
@@ -1973,51 +2008,77 @@ defaultUploadFlags = UploadFlags {
   }
 
 uploadCommand :: CommandUI UploadFlags
-uploadCommand = CommandUI {
-    commandName         = "upload",
-    commandSynopsis     = "Uploads source packages or documentation to Hackage.",
-    commandDescription  = Nothing,
-    commandNotes        = Just $ \_ ->
-         "You can store your Hackage login in the ~/.cabal/config file\n"
-      ++ relevantConfigValuesText ["username", "password", "password-command"],
-    commandUsage        = \pname ->
-         "Usage: " ++ pname ++ " upload [FLAGS] TARFILES\n",
-    commandDefaultFlags = defaultUploadFlags,
-    commandOptions      = \_ ->
-      [optionVerbosity uploadVerbosity
-       (\v flags -> flags { uploadVerbosity = v })
-
-      ,option [] ["publish"]
-        "Publish the package instead of uploading it as a candidate."
-        uploadCandidate (\v flags -> flags { uploadCandidate = v })
-        (noArg (Flag IsPublished))
-
-      ,option ['d'] ["documentation"]
-        ("Upload documentation instead of a source package. "
-        ++ "By default, this uploads documentation for a package candidate. "
-        ++ "To upload documentation for "
-        ++ "a published package, combine with --publish.")
-        uploadDoc (\v flags -> flags { uploadDoc = v })
-        trueArg
-
-      ,option ['u'] ["username"]
-        "Hackage username."
-        uploadUsername (\v flags -> flags { uploadUsername = v })
-        (reqArg' "USERNAME" (toFlag . Username)
-                            (flagToList . fmap unUsername))
-
-      ,option ['p'] ["password"]
-        "Hackage password."
-        uploadPassword (\v flags -> flags { uploadPassword = v })
-        (reqArg' "PASSWORD" (toFlag . Password)
-                            (flagToList . fmap unPassword))
-
-      ,option ['P'] ["password-command"]
-        "Command to get Hackage password."
-        uploadPasswordCmd (\v flags -> flags { uploadPasswordCmd = v })
-        (reqArg' "PASSWORD" (Flag . words) (fromMaybe [] . flagToMaybe))
-      ]
-  }
+uploadCommand =
+  CommandUI
+    { commandName = "upload"
+    , commandSynopsis = "Uploads source packages or documentation to Hackage."
+    , commandDescription = Nothing
+    , commandNotes = Just $ \_ ->
+        "You can store your Hackage login in the ~/.config/cabal/config file\n"
+          ++ relevantConfigValuesText ["username", "password", "password-command"]
+    , commandUsage = \pname ->
+        "Usage: " ++ pname ++ " upload [FLAGS] TARFILES\n"
+    , commandDefaultFlags = defaultUploadFlags
+    , commandOptions = \_ ->
+        [ optionVerbosity
+            uploadVerbosity
+            (\v flags -> flags{uploadVerbosity = v})
+        , option
+            []
+            ["publish"]
+            "Publish the package instead of uploading it as a candidate."
+            uploadCandidate
+            (\v flags -> flags{uploadCandidate = v})
+            (noArg (Flag IsPublished))
+        , option
+            ['d']
+            ["documentation"]
+            ( "Upload documentation instead of a source package. "
+                ++ "By default, this uploads documentation for a package candidate. "
+                ++ "To upload documentation for "
+                ++ "a published package, combine with --publish."
+            )
+            uploadDoc
+            (\v flags -> flags{uploadDoc = v})
+            trueArg
+        , option
+            ['u']
+            ["username"]
+            "Hackage username."
+            uploadUsername
+            (\v flags -> flags{uploadUsername = v})
+            ( reqArg'
+                "USERNAME"
+                (toFlag . Username)
+                (flagToList . fmap unUsername)
+            )
+        , option
+            ['p']
+            ["password"]
+            "Hackage password."
+            uploadPassword
+            (\v flags -> flags{uploadPassword = v})
+            ( reqArg'
+                "PASSWORD"
+                (toFlag . Password)
+                (flagToList . fmap unPassword)
+            )
+        , option
+            ['P']
+            ["password-command"]
+            "Command to get Hackage password."
+            uploadPasswordCmd
+            (\v flags -> flags{uploadPasswordCmd = v})
+            ( reqArg
+                "COMMAND"
+                ( readP_to_E
+                    ("Cannot parse command: " ++)
+                    (Flag <$> parseSpaceList parseTokenQ)
+                )
+                (flagElim [] (pure . unwords . fmap show))
+            )
+        ]
+    }
 
 instance Monoid UploadFlags where
   mempty = gmempty
@@ -2137,12 +2198,14 @@ initOptions _ =
 
   , option ['x'] ["extra-source-file"]
     "Extra source file to be distributed with tarball."
-    IT.extraSrc (\v flags -> flags { IT.extraSrc = v })
+    IT.extraSrc
+    (\v flags -> flags { IT.extraSrc = mergeListFlag (IT.extraSrc flags) v })
     (reqArg' "FILE" (Flag . (:[]))
                     (fromFlagOrDefault []))
   , option [] ["extra-doc-file"]
     "Extra doc file to be distributed with tarball."
-    IT.extraDoc (\v flags -> flags { IT.extraDoc = v })
+    IT.extraDoc
+    (\v flags -> flags { IT.extraDoc = mergeListFlag (IT.extraDoc flags) v })
     (reqArg' "FILE" (Flag . (:[])) (fromFlagOrDefault []))
 
   , option [] ["lib", "is-library"]
@@ -2170,7 +2233,8 @@ initOptions _ =
 
       , option [] ["test-dir"]
         "Directory containing tests."
-        IT.testDirs (\v flags -> flags { IT.testDirs = v })
+        IT.testDirs (\v flags ->
+          flags { IT.testDirs = mergeListFlag (IT.testDirs flags) v })
         (reqArg' "DIR" (Flag . (:[]))
                        (fromFlagOrDefault []))
 
@@ -2197,7 +2261,8 @@ initOptions _ =
   , option ['o'] ["expose-module"]
     "Export a module from the package."
     IT.exposedModules
-    (\v flags -> flags { IT.exposedModules = v })
+    (\v flags -> flags { IT.exposedModules =
+      mergeListFlag (IT.exposedModules flags) v})
     (reqArg "MODULE" (parsecToReadE ("Cannot parse module name: "++)
                                  (Flag . (:[]) <$> parsec))
                      (flagElim [] (fmap prettyShow)))
@@ -2205,33 +2270,38 @@ initOptions _ =
   , option [] ["extension"]
     "Use a LANGUAGE extension (in the other-extensions field)."
     IT.otherExts
-    (\v flags -> flags { IT.otherExts = v })
+    (\v flags -> flags { IT.otherExts =
+      mergeListFlag (IT.otherExts flags) v })
     (reqArg "EXTENSION" (parsecToReadE ("Cannot parse extension: "++)
                                     (Flag . (:[]) <$> parsec))
                         (flagElim [] (fmap prettyShow)))
 
   , option ['d'] ["dependency"]
-    "Package dependency."
-    IT.dependencies (\v flags -> flags { IT.dependencies = v })
-    (reqArg "PACKAGE" (parsecToReadE ("Cannot parse dependency: "++)
-                                  (Flag . (:[]) <$> parsec))
-                      (flagElim [] (fmap prettyShow)))
+    "Package dependencies. Permits comma separated list of dependencies."
+    IT.dependencies
+    (\v flags -> flags { IT.dependencies =
+      mergeListFlag (IT.dependencies flags) v })
+    (reqArg "DEPENDENCIES" (fmap Flag dependenciesReadE)
+                           (fmap prettyShow . fromFlagOrDefault []))
 
   , option [] ["application-dir"]
     "Directory containing package application executable."
-    IT.applicationDirs (\v flags -> flags { IT.applicationDirs = v})
+    IT.applicationDirs (\v flags -> flags { IT.applicationDirs =
+      mergeListFlag (IT.applicationDirs flags) v})
     (reqArg' "DIR" (Flag . (:[]))
                    (fromFlagOrDefault []))
 
   , option [] ["source-dir", "sourcedir"]
     "Directory containing package library source."
-    IT.sourceDirs (\v flags -> flags { IT.sourceDirs = v })
+    IT.sourceDirs (\v flags -> flags { IT.sourceDirs =
+      mergeListFlag (IT.sourceDirs flags) v })
     (reqArg' "DIR" (Flag. (:[]))
                    (fromFlagOrDefault []))
 
   , option [] ["build-tool"]
     "Required external build tool."
-    IT.buildTools (\v flags -> flags { IT.buildTools = v })
+    IT.buildTools (\v flags -> flags { IT.buildTools =
+      mergeListFlag (IT.buildTools flags) v })
     (reqArg' "TOOL" (Flag . (:[]))
                     (fromFlagOrDefault []))
 
@@ -2243,6 +2313,16 @@ initOptions _ =
 
   , optionVerbosity IT.initVerbosity (\v flags -> flags { IT.initVerbosity = v })
   ]
+  where
+    dependenciesReadE :: ReadE [Dependency]
+    dependenciesReadE =
+      parsecToReadE
+        ("Cannot parse dependencies: " ++)
+        (parsecCommaList parsec)
+
+    mergeListFlag :: Flag [a] -> Flag [a] -> Flag [a]
+    mergeListFlag currentFlags v =
+      Flag $ concat (flagToList currentFlags ++ flagToList v)
 
 -- ------------------------------------------------------------
 -- * Copy and Register
@@ -2333,18 +2413,18 @@ userConfigCommand = CommandUI {
   commandDescription  = Just $ \_ -> wrapText $
        "When upgrading cabal, the set of configuration keys and their default"
     ++ " values may change. This command provides means to merge the existing"
-    ++ " config in ~/.cabal/config"
+    ++ " config in ~/.config/cabal/config"
     ++ " (i.e. all bindings that are actually defined and not commented out)"
     ++ " and the default config of the new version.\n"
     ++ "\n"
-    ++ "init: Creates a new config file at either ~/.cabal/config or as"
+    ++ "init: Creates a new config file at either ~/.config/cabal/config or as"
     ++ " specified by --config-file, if given. An existing file won't be "
     ++ " overwritten unless -f or --force is given.\n"
-    ++ "diff: Shows a pseudo-diff of the user's ~/.cabal/config file and"
+    ++ "diff: Shows a pseudo-diff of the user's ~/.config/cabal/config file and"
     ++ " the default configuration that would be created by cabal if the"
     ++ " config file did not exist.\n"
     ++ "update: Applies the pseudo-diff to the configuration that would be"
-    ++ " created by default, and write the result back to ~/.cabal/config.",
+    ++ " created by default, and write the result back to ~/.config/cabal/config.",
 
   commandNotes        = Nothing,
   commandUsage        = usageAlternatives "user-config" ["init", "diff", "update"],
@@ -2399,13 +2479,14 @@ optionSolverFlags :: ShowOrParseArgs
                   -> (flags -> Flag FineGrainedConflicts) -> (Flag FineGrainedConflicts -> flags -> flags)
                   -> (flags -> Flag MinimizeConflictSet) -> (Flag MinimizeConflictSet -> flags -> flags)
                   -> (flags -> Flag IndependentGoals) -> (Flag IndependentGoals -> flags -> flags)
+                  -> (flags -> Flag PreferOldest) -> (Flag PreferOldest -> flags -> flags)
                   -> (flags -> Flag ShadowPkgs)       -> (Flag ShadowPkgs       -> flags -> flags)
                   -> (flags -> Flag StrongFlags)      -> (Flag StrongFlags      -> flags -> flags)
                   -> (flags -> Flag AllowBootLibInstalls) -> (Flag AllowBootLibInstalls -> flags -> flags)
                   -> (flags -> Flag OnlyConstrained)  -> (Flag OnlyConstrained  -> flags -> flags)
                   -> [OptionField flags]
 optionSolverFlags showOrParseArgs getmbj setmbj getrg setrg getcc setcc
-                  getfgc setfgc getmc setmc getig setig getsip setsip
+                  getfgc setfgc getmc setmc getig setig getpo setpo getsip setsip
                   getstrfl setstrfl getib setib getoc setoc =
   [ option [] ["max-backjumps"]
       ("Maximum number of backjumps allowed while solving (default: " ++ show defaultMaxBackjumps ++ "). Use a negative number to enable unlimited backtracking. Use 0 to disable backtracking completely.")
@@ -2438,6 +2519,11 @@ optionSolverFlags showOrParseArgs getmbj setmbj getrg setrg getcc setcc
       "Treat several goals on the command line as independent. If several goals depend on the same package, different versions can be chosen."
       (fmap asBool . getig)
       (setig . fmap IndependentGoals)
+      (yesNoOpt showOrParseArgs)
+  , option [] ["prefer-oldest"]
+      "Prefer the oldest (instead of the latest) versions of packages available. Useful to determine lower bounds in the build-depends section."
+      (fmap asBool . getpo)
+      (setpo . fmap PreferOldest)
       (yesNoOpt showOrParseArgs)
   , option [] ["shadow-installed-packages"]
       "If multiple package instances of the same version are installed, treat all but one as shadowed."

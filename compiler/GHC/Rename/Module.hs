@@ -4,7 +4,6 @@
 {-# LANGUAGE TypeFamilies        #-}
 
 {-# OPTIONS_GHC -Wno-incomplete-uni-patterns   #-}
-{-# OPTIONS_GHC -Wno-incomplete-record-updates #-}
 
 {-
 (c) The GRASP/AQUA Project, Glasgow University, 1992-1998
@@ -16,7 +15,7 @@ module GHC.Rename.Module (
         rnSrcDecls, addTcgDUs, findSplice, rnWarningTxt
     ) where
 
-import GHC.Prelude
+import GHC.Prelude hiding ( head )
 
 import {-# SOURCE #-} GHC.Rename.Expr( rnLExpr )
 import {-# SOURCE #-} GHC.Rename.Splice ( rnSpliceDecl, rnTopSpliceDecls )
@@ -38,7 +37,7 @@ import GHC.Rename.Utils ( mapFvRn, bindLocalNames
 import GHC.Rename.Unbound ( mkUnboundName, notInScopeErr, WhereLooking(WL_Global) )
 import GHC.Rename.Names
 import GHC.Tc.Errors.Types
-import GHC.Tc.Errors.Ppr (withHsDocContext, pprScopeError )
+import GHC.Tc.Errors.Ppr (pprScopeError)
 import GHC.Tc.Gen.Annotation ( annCtxt )
 import GHC.Tc.Utils.Monad
 
@@ -69,12 +68,14 @@ import GHC.Data.Graph.Directed ( SCC, flattenSCC, flattenSCCs, Node(..)
 import GHC.Types.Unique.Set
 import GHC.Data.OrdList
 import qualified GHC.LanguageExtensions as LangExt
+import GHC.Core.DataCon ( isSrcStrict )
 
 import Control.Monad
 import Control.Arrow ( first )
+import Data.Foldable ( toList )
 import Data.List ( mapAccumL )
 import qualified Data.List.NonEmpty as NE
-import Data.List.NonEmpty ( NonEmpty(..) )
+import Data.List.NonEmpty ( NonEmpty(..), head )
 import Data.Maybe ( isNothing, fromMaybe, mapMaybe )
 import qualified Data.Set as Set ( difference, fromList, toList, null )
 import Data.Function ( on )
@@ -319,12 +320,12 @@ findDupRdrNames = findDupsEq (\ x -> \ y -> rdrNameOcc (unLoc x) == rdrNameOcc (
 -}
 
 rnAnnDecl :: AnnDecl GhcPs -> RnM (AnnDecl GhcRn, FreeVars)
-rnAnnDecl ann@(HsAnnotation _ s provenance expr)
+rnAnnDecl ann@(HsAnnotation (_, s) provenance expr)
   = addErrCtxt (annCtxt ann) $
     do { (provenance', provenance_fvs) <- rnAnnProvenance provenance
        ; (expr', expr_fvs) <- setStage (Splice Untyped) $
                               rnLExpr expr
-       ; return (HsAnnotation noAnn s provenance' expr',
+       ; return (HsAnnotation (noAnn, s) provenance' expr',
                  provenance_fvs `plusFV` expr_fvs) }
 
 rnAnnProvenance :: AnnProvenance GhcPs
@@ -381,7 +382,7 @@ rnHsForeignDecl (ForeignExport { fd_name = name, fd_sig_ty = ty, fd_fe = spec })
        ; (ty', fvs) <- rnHsSigType (ForeignDeclCtx name) TypeLevel ty
        ; return (ForeignExport { fd_e_ext = noExtField
                                , fd_name = name', fd_sig_ty = ty'
-                               , fd_fe = spec }
+                               , fd_fe = (\(CExport x c) -> CExport x c) spec }
                 , fvs `addOneFV` unLoc name') }
         -- NB: a foreign export is an *occurrence site* for name, so
         --     we add it to the free-variable list.  It might, for example,
@@ -392,9 +393,9 @@ rnHsForeignDecl (ForeignExport { fd_name = name, fd_sig_ty = ty, fd_fe = spec })
 --      package, so if they get inlined across a package boundary we'll still
 --      know where they're from.
 --
-patchForeignImport :: Unit -> ForeignImport -> ForeignImport
-patchForeignImport unit (CImport cconv safety fs spec src)
-        = CImport cconv safety fs (patchCImportSpec unit spec) src
+patchForeignImport :: Unit -> (ForeignImport GhcPs) -> (ForeignImport GhcRn)
+patchForeignImport unit (CImport ext cconv safety fs spec)
+        = CImport ext cconv safety fs (patchCImportSpec unit spec)
 
 patchCImportSpec :: Unit -> CImportSpec -> CImportSpec
 patchCImportSpec unit spec
@@ -552,7 +553,7 @@ checkCanonicalInstances cls poly_ty mbinds = do
 
     -- got "lhs = rhs" but expected something different
     addWarnNonCanonicalMethod1 refURL flag lhs rhs = do
-        let dia = TcRnUnknownMessage $
+        let dia = mkTcRnUnknownMessage $
               mkPlainDiagnostic (WarningWithFlag flag) noHints $
                 vcat [ text "Noncanonical" <+>
                        quotes (text (lhs ++ " = " ++ rhs)) <+>
@@ -568,7 +569,7 @@ checkCanonicalInstances cls poly_ty mbinds = do
 
     -- expected "lhs = rhs" but got something else
     addWarnNonCanonicalMethod2 refURL flag lhs rhs = do
-        let dia = TcRnUnknownMessage $
+        let dia = mkTcRnUnknownMessage $
               mkPlainDiagnostic (WarningWithFlag flag) noHints $
                 vcat [ text "Noncanonical" <+>
                        quotes (text lhs) <+>
@@ -616,7 +617,8 @@ rnClsInstDecl (ClsInstDecl { cid_poly_ty = inst_ty, cid_binds = mbinds
                Just (L _ cls) -> Right cls
                Nothing        -> Left
                  ( getLocA head_ty'
-                 , hang (text "Illegal head of an instance declaration:"
+                 , mkTcRnUnknownMessage $ mkPlainError noHints $
+                   hang (text "Illegal head of an instance declaration:"
                            <+> quotes (ppr head_ty'))
                       2 (vcat [ text "Instance heads must be of the form"
                               , nest 2 $ text "C ty_1 ... ty_n"
@@ -679,7 +681,7 @@ rnClsInstDecl (ClsInstDecl { cid_poly_ty = inst_ty, cid_binds = mbinds
     -- reach the typechecker, lest we encounter different errors that are
     -- hopelessly confusing (such as the one in #16114).
     bail_out (l, err_msg) = do
-      addErrAt l $ TcRnUnknownMessage $ mkPlainError noHints (withHsDocContext ctxt err_msg)
+      addErrAt l $ TcRnWithHsDocContext ctxt err_msg
       pure $ mkUnboundName (mkTcOccFS (fsLit "<class>"))
 
 rnFamEqn :: HsDocContext
@@ -843,7 +845,7 @@ rnFamEqn doc atfi extra_kvars
 
     badAssocRhs :: [Name] -> RnM ()
     badAssocRhs ns
-      = addErr $ TcRnUnknownMessage $ mkPlainError noHints $
+      = addErr $ mkTcRnUnknownMessage $ mkPlainError noHints $
            (hang (text "The RHS of an associated type declaration mentions"
                       <+> text "out-of-scope variable" <> plural ns
                       <+> pprWithCommas (quotes . ppr) ns)
@@ -1206,7 +1208,7 @@ rnSrcDerivDecl (DerivDecl _ ty mds overlap)
 
 standaloneDerivErr :: TcRnMessage
 standaloneDerivErr
-  = TcRnUnknownMessage $ mkPlainError noHints $
+  = mkTcRnUnknownMessage $ mkPlainError noHints $
     hang (text "Illegal standalone deriving declaration")
        2 (text "Use StandaloneDeriving to enable this extension")
 
@@ -1219,15 +1221,15 @@ standaloneDerivErr
 -}
 
 rnHsRuleDecls :: RuleDecls GhcPs -> RnM (RuleDecls GhcRn, FreeVars)
-rnHsRuleDecls (HsRules { rds_src = src
+rnHsRuleDecls (HsRules { rds_ext = (_, src)
                        , rds_rules = rules })
   = do { (rn_rules,fvs) <- rnList rnHsRuleDecl rules
-       ; return (HsRules { rds_ext = noExtField
-                         , rds_src = src
+       ; return (HsRules { rds_ext = src
                          , rds_rules = rn_rules }, fvs) }
 
 rnHsRuleDecl :: RuleDecl GhcPs -> RnM (RuleDecl GhcRn, FreeVars)
-rnHsRuleDecl (HsRule { rd_name = rule_name
+rnHsRuleDecl (HsRule { rd_ext  = (_, st)
+                     , rd_name = rule_name
                      , rd_act  = act
                      , rd_tyvs = tyvs
                      , rd_tmvs = tmvs
@@ -1238,13 +1240,13 @@ rnHsRuleDecl (HsRule { rd_name = rule_name
        ; checkDupRdrNamesN rdr_names_w_loc
        ; checkShadowedRdrNames rdr_names_w_loc
        ; names <- newLocalBndrsRn rdr_names_w_loc
-       ; let doc = RuleCtx (snd $ unLoc rule_name)
+       ; let doc = RuleCtx (unLoc rule_name)
        ; bindRuleTyVars doc tyvs $ \ tyvs' ->
          bindRuleTmVars doc tyvs' tmvs names $ \ tmvs' ->
     do { (lhs', fv_lhs') <- rnLExpr lhs
        ; (rhs', fv_rhs') <- rnLExpr rhs
-       ; checkValidRule (snd $ unLoc rule_name) names lhs' fv_lhs'
-       ; return (HsRule { rd_ext  = HsRuleRn fv_lhs' fv_rhs'
+       ; checkValidRule (unLoc rule_name) names lhs' fv_lhs'
+       ; return (HsRule { rd_ext  = (HsRuleRn fv_lhs' fv_rhs', st)
                         , rd_name = rule_name
                         , rd_act  = act
                         , rd_tyvs = tyvs'
@@ -1299,7 +1301,7 @@ with LHSs with a complicated desugaring (and hence unlikely to match);
 (e.g. a case expression is not allowed: too elaborate.)
 
 But there are legitimate non-trivial args ei, like sections and
-lambdas.  So it seems simmpler not to check at all, and that is why
+lambdas.  So it seems simpler not to check at all, and that is why
 check_e is commented out.
 -}
 
@@ -1325,7 +1327,7 @@ validRuleLhs foralls lhs
     check (OpApp _ e1 op e2)              = checkl op `mplus` checkl_e e1
                                                       `mplus` checkl_e e2
     check (HsApp _ e1 e2)                 = checkl e1 `mplus` checkl_e e2
-    check (HsAppType _ e _)               = checkl e
+    check (HsAppType _ e _ _)             = checkl e
     check (HsVar _ lv)
       | (unLoc lv) `notElem` foralls      = Nothing
     check other                           = Just other  -- Failure
@@ -1351,14 +1353,14 @@ validRuleLhs foralls lhs
 
 badRuleVar :: FastString -> Name -> TcRnMessage
 badRuleVar name var
-  = TcRnUnknownMessage $ mkPlainError noHints $
+  = mkTcRnUnknownMessage $ mkPlainError noHints $
     sep [text "Rule" <+> doubleQuotes (ftext name) <> colon,
          text "Forall'd variable" <+> quotes (ppr var) <+>
                 text "does not appear on left hand side"]
 
 badRuleLhsErr :: FastString -> LHsExpr GhcRn -> HsExpr GhcRn -> TcRnMessage
 badRuleLhsErr name lhs bad_e
-  = TcRnUnknownMessage $ mkPlainError noHints $
+  = mkTcRnUnknownMessage $ mkPlainError noHints $
     sep [text "Rule" <+> pprRuleName name <> colon,
          nest 2 (vcat [err,
                        text "in left-hand side:" <+> ppr lhs])]
@@ -1368,8 +1370,7 @@ badRuleLhsErr name lhs bad_e
     err =
       case bad_e of
         HsUnboundVar _ uv ->
-          let rdr = mkRdrUnqual uv
-          in  pprScopeError rdr $ notInScopeErr WL_Global (mkRdrUnqual uv)
+          pprScopeError uv $ notInScopeErr WL_Global uv
         _ -> text "Illegal expression:" <+> ppr bad_e
 
 {- **************************************************************
@@ -1396,7 +1397,7 @@ Note [Dependency analysis of type, class, and instance decls]
 A TyClGroup represents a strongly connected components of
 type/class/instance decls, together with the role annotations for the
 type/class declarations.  The renamer uses strongly connected
-comoponent analysis to build these groups.  We do this for a number of
+component analysis to build these groups.  We do this for a number of
 reasons:
 
 * Improve kind error messages. Consider
@@ -1516,7 +1517,7 @@ rnTyClDecls :: [TyClGroup GhcPs]
             -> RnM ([TyClGroup GhcRn], FreeVars)
 -- Rename the declarations and do dependency analysis on them
 rnTyClDecls tycl_ds
-  = do { -- Rename the type/class, instance, and role declaraations
+  = do { -- Rename the type/class, instance, and role declarations
        ; tycls_w_fvs <- mapM (wrapLocFstMA rnTyClDecl) (tyClGroupTyClDecls tycl_ds)
        ; let tc_names = mkNameSet (map (tcdName . unLoc . fst) tycls_w_fvs)
        ; kisigs_w_fvs <- rnStandaloneKindSignatures tc_names (tyClGroupKindSigs tycl_ds)
@@ -1623,7 +1624,7 @@ rnStandaloneKindSignature tc_names (StandaloneKindSig _ v ki)
         }
   where
     standaloneKiSigErr :: TcRnMessage
-    standaloneKiSigErr = TcRnUnknownMessage $ mkPlainError noHints $
+    standaloneKiSigErr = mkTcRnUnknownMessage $ mkPlainError noHints $
       hang (text "Illegal standalone kind signature")
          2 (text "Did you mean to enable StandaloneKindSignatures?")
 
@@ -1696,7 +1697,7 @@ rnRoleAnnots tc_names role_annots
 
 dupRoleAnnotErr :: NonEmpty (LRoleAnnotDecl GhcPs) -> RnM ()
 dupRoleAnnotErr list
-  = addErrAt (locA loc) $ TcRnUnknownMessage $ mkPlainError noHints $
+  = addErrAt (locA loc) $ mkTcRnUnknownMessage $ mkPlainError noHints $
     hang (text "Duplicate role annotations for" <+>
           quotes (ppr $ roleAnnotDeclName first_decl) <> colon)
        2 (vcat $ map pp_role_annot $ NE.toList sorted_list)
@@ -1711,7 +1712,7 @@ dupRoleAnnotErr list
 
 dupKindSig_Err :: NonEmpty (LStandaloneKindSig GhcPs) -> RnM ()
 dupKindSig_Err list
-  = addErrAt (locA loc) $ TcRnUnknownMessage $ mkPlainError noHints $
+  = addErrAt (locA loc) $ mkTcRnUnknownMessage $ mkPlainError noHints $
     hang (text "Duplicate standalone kind signatures for" <+>
           quotes (ppr $ standaloneKindSigName first_decl) <> colon)
        2 (vcat $ map pp_kisig $ NE.toList sorted_list)
@@ -1819,11 +1820,11 @@ rnTyClDecl (SynDecl { tcdLName = tycon, tcdTyVars = tyvars,
 rnTyClDecl (DataDecl
     { tcdLName = tycon, tcdTyVars = tyvars,
       tcdFixity = fixity,
-      tcdDataDefn = defn@HsDataDefn{ dd_ND = new_or_data
-                                   , dd_kindSig = kind_sig} })
+      tcdDataDefn = defn@HsDataDefn{ dd_cons = cons, dd_kindSig = kind_sig} })
   = do { tycon' <- lookupLocatedTopConstructorRnN tycon
        ; let kvs = extractDataDefnKindVars defn
              doc = TyDataCtx tycon
+             new_or_data = dataDefnConsNewOrData cons
        ; traceRn "rntycl-data" (ppr tycon <+> ppr kvs)
        ; bindHsQTyVars doc Nothing kvs tyvars $ \ tyvars' no_rhs_kvs ->
     do { (defn', fvs) <- rnDataDefn doc defn
@@ -1837,7 +1838,8 @@ rnTyClDecl (DataDecl
                           , tcdDataDefn = defn'
                           , tcdDExt     = rn_info }, fvs) } }
 
-rnTyClDecl (ClassDecl { tcdCtxt = context, tcdLName = lcls,
+rnTyClDecl (ClassDecl { tcdLayout = layout,
+                        tcdCtxt = context, tcdLName = lcls,
                         tcdTyVars = tyvars, tcdFixity = fixity,
                         tcdFDs = fds, tcdSigs = sigs,
                         tcdMeths = mbinds, tcdATs = ats, tcdATDefs = at_defs,
@@ -1891,7 +1893,8 @@ rnTyClDecl (ClassDecl { tcdCtxt = context, tcdLName = lcls,
 
         ; let all_fvs = meth_fvs `plusFV` stuff_fvs `plusFV` fv_at_defs
         ; docs' <- traverse rnLDocDecl docs
-        ; return (ClassDecl { tcdCtxt = context', tcdLName = lcls',
+        ; return (ClassDecl { tcdLayout = rnLayoutInfo layout,
+                              tcdCtxt = context', tcdLName = lcls',
                               tcdTyVars = tyvars', tcdFixity = fixity,
                               tcdFDs = fds', tcdSigs = sigs',
                               tcdMeths = mbinds', tcdATs = ats', tcdATDefs = at_defs',
@@ -1899,6 +1902,11 @@ rnTyClDecl (ClassDecl { tcdCtxt = context, tcdLName = lcls,
                   all_fvs ) }
   where
     cls_doc  = ClassDeclCtx lcls
+
+rnLayoutInfo :: LayoutInfo GhcPs -> LayoutInfo GhcRn
+rnLayoutInfo (ExplicitBraces ob cb) = ExplicitBraces ob cb
+rnLayoutInfo (VirtualBraces n) = VirtualBraces n
+rnLayoutInfo NoLayoutInfo = NoLayoutInfo
 
 -- Does the data type declaration include a CUSK?
 data_decl_has_cusk :: LHsQTyVars (GhcPass p) -> NewOrData -> Bool -> Maybe (LHsKind (GhcPass p')) -> RnM Bool
@@ -1940,13 +1948,16 @@ rnTySyn doc rhs = rnLHsType doc rhs
 
 rnDataDefn :: HsDocContext -> HsDataDefn GhcPs
            -> RnM (HsDataDefn GhcRn, FreeVars)
-rnDataDefn doc (HsDataDefn { dd_ND = new_or_data, dd_cType = cType
-                           , dd_ctxt = context, dd_cons = condecls
+rnDataDefn doc (HsDataDefn { dd_cType = cType, dd_ctxt = context, dd_cons = condecls
                            , dd_kindSig = m_sig, dd_derivs = derivs })
   = do  { -- DatatypeContexts (i.e., stupid contexts) can't be combined with
           -- GADT syntax. See Note [The stupid context] in GHC.Core.DataCon.
           checkTc (h98_style || null (fromMaybeContext context))
                   (badGadtStupidTheta doc)
+
+        -- Check restrictions on "type data" declarations.
+        -- See Note [Type data declarations].
+        ; when (isTypeDataDefnCons condecls) check_type_data
 
         ; (m_sig', sig_fvs) <- case m_sig of
              Just sig -> first Just <$> rnLHsKind doc sig
@@ -1966,17 +1977,14 @@ rnDataDefn doc (HsDataDefn { dd_ND = new_or_data, dd_cType = cType
 
         ; let all_fvs = fvs1 `plusFV` fvs3 `plusFV`
                         con_fvs `plusFV` sig_fvs
-        ; return ( HsDataDefn { dd_ext = noExtField
-                              , dd_ND = new_or_data, dd_cType = cType
+        ; return ( HsDataDefn { dd_ext = noExtField, dd_cType = cType
                               , dd_ctxt = context', dd_kindSig = m_sig'
                               , dd_cons = condecls'
                               , dd_derivs = derivs' }
                  , all_fvs )
         }
   where
-    h98_style = case condecls of  -- Note [Stupid theta]
-                     (L _ (ConDeclGADT {}))                    : _ -> False
-                     _                                             -> True
+    h98_style = not $ anyLConIsGadt condecls  -- Note [Stupid theta]
 
     rn_derivs ds
       = do { deriv_strats_ok <- xoptM LangExt.DerivingStrategies
@@ -1985,6 +1993,202 @@ rnDataDefn doc (HsDataDefn { dd_ND = new_or_data, dd_cType = cType
            ; (ds', fvs) <- mapFvRn (rnLHsDerivingClause doc) ds
            ; return (ds', fvs) }
 
+    -- Given a "type data" declaration, check that the TypeData extension
+    -- is enabled and check restrictions (R1), (R2), (R3) and (R5)
+    -- on the declaration.  See Note [Type data declarations].
+    check_type_data
+      = do { unlessXOptM LangExt.TypeData $ failWith TcRnIllegalTypeData
+           ; unless (null (fromMaybeContext context)) $
+               failWith $ TcRnTypeDataForbids TypeDataForbidsDatatypeContexts
+           ; mapM_ (addLocMA check_type_data_condecl) condecls
+           ; unless (null derivs) $
+               failWith $ TcRnTypeDataForbids TypeDataForbidsDerivingClauses
+           }
+
+    -- Check restrictions (R2) and (R3) on a "type data" constructor.
+    -- See Note [Type data declarations].
+    check_type_data_condecl :: ConDecl GhcPs -> RnM ()
+    check_type_data_condecl condecl
+      = do {
+           ; when (has_labelled_fields condecl) $
+               failWith $ TcRnTypeDataForbids TypeDataForbidsLabelledFields
+           ; when (has_strictness_flags condecl) $
+               failWith $ TcRnTypeDataForbids TypeDataForbidsStrictnessAnnotations
+           }
+
+    has_labelled_fields (ConDeclGADT { con_g_args = RecConGADT _ _ }) = True
+    has_labelled_fields (ConDeclH98 { con_args = RecCon rec })
+      = not (null (unLoc rec))
+    has_labelled_fields _ = False
+
+    has_strictness_flags condecl
+      = any (is_strict . getBangStrictness . hsScaledThing) (con_args condecl)
+
+    is_strict (HsSrcBang _ _ s) = isSrcStrict s
+
+    con_args (ConDeclGADT { con_g_args = PrefixConGADT args }) = args
+    con_args (ConDeclH98 { con_args = PrefixCon _ args }) = args
+    con_args (ConDeclH98 { con_args = InfixCon arg1 arg2 }) = [arg1, arg2]
+    con_args _ = []
+
+{-
+Note [Type data declarations]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+With the TypeData extension (GHC proposal #106), one can write `type data`
+declarations, like
+
+    type data Nat = Zero | Succ Nat
+
+or equivalently in GADT style:
+
+    type data Nat where
+        Zero :: Nat
+        Succ :: Nat -> Nat
+
+This defines the constructors `Zero` and `Succ` in the TcCls namespace
+(type constructors and classes) instead of the Data namespace (data
+constructors).  This contrasts with the DataKinds extension, which
+allows constructors defined in the Data namespace to be promoted to the
+TcCls namespace at the point of use in a type.
+
+Type data declarations have the syntax of `data` declarations (but not
+`newtype` declarations), either ordinary algebraic data types or GADTs,
+preceded by `type`, with the following restrictions:
+
+(R0) 'data' decls only, not 'newtype' decls.  This is checked by
+     the parser.
+
+(R1) There are no data type contexts (even with the DatatypeContexts
+     extension).
+
+(R2) There are no labelled fields.  Perhaps these could be supported
+     using type families, but they are omitted for now.
+
+(R3) There are no strictness flags, because they don't make sense at
+     the type level.
+
+(R4) The types of the constructors contain no constraints other than
+     equality constraints.  (This is the same restriction imposed
+     on constructors to be promoted with the DataKinds extension in
+     dc_theta_illegal_constraint called from GHC.Tc.Gen.HsType.tcTyVar,
+     but in that case the restriction is imposed if and when a data
+     constructor is used in a type, whereas here it is imposed at
+     the point of definition.  See also Note [Constraints in kinds]
+     in GHC.Core.TyCo.Rep.)
+
+(R5) There are no deriving clauses.
+
+The main parts of the implementation are:
+
+* (R0): The parser recognizes `type data` (but not `type newtype`).
+
+* During the initial construction of the AST,
+  GHC.Parser.PostProcess.checkNewOrData sets the `Bool` argument of the
+  `DataTypeCons` inside a `HsDataDefn` to mark a `type data` declaration.
+  It also puts the the constructor names (`Zero` and `Succ` in our
+  example) in the TcCls namespace.
+
+* GHC.Rename.Module.rnDataDefn calls `check_type_data` on these
+  declarations, which checks that the TypeData extension is enabled and
+  checks restrictions (R1), (R2), (R3) and (R5).  They could equally
+  well be checked in the typechecker, but we err on the side of catching
+  imposters early.
+
+* GHC.Tc.TyCl.checkValidDataCon checks restriction (R4) on these declarations.
+
+* When beginning to type check a mutually recursive group of declarations,
+  the `type data` constructors (`Zero` and `Succ` in our example) are
+  added to the type-checker environment as `APromotionErr TyConPE` by
+  GHC.Tc.TyCl.mkPromotionErrorEnv, so they cannot be used within the
+  recursive group.  This mirrors the DataKinds behaviour described
+  at Note [Recursion and promoting data constructors] in GHC.Tc.TyCl.
+  For example, this is rejected:
+
+    type data T f = K (f (K Int)) -- illegal: tycon K is recursively defined
+
+* The `type data` data type, such as `Nat` in our example, is represented
+  by a `TyCon` that is an `AlgTyCon`, but its `AlgTyConRhs` has the
+  `is_type_data` field set.
+
+* The constructors of the data type, `Zero` and `Succ` in our example,
+  are each represented by a `DataCon` as usual.  That `DataCon`'s
+  `dcPromotedField` is a `TyCon` (for `Zero`, say) that you can use
+  in a type.
+
+* After a `type data` declaration has been type-checked, the
+  type-checker environment entry (a `TyThing`) for each constructor
+  (`Zero` and `Succ` in our example) is
+  - just an `ATyCon` for the promoted type constructor,
+  - not the bundle (`ADataCon` for the data con, `AnId` for the work id,
+    wrap id) required for a normal data constructor
+  See GHC.Types.TyThing.implicitTyConThings.
+
+* GHC.Core.TyCon.isDataKindsPromotedDataCon ignores promoted constructors
+  from `type data`, which do not use the distinguishing quote mark added
+  to constructors promoted by DataKinds.
+
+* GHC.Core.TyCon.isDataTyCon ignores types coming from a `type data`
+  declaration (by checking the `is_type_data` field), so that these do
+  not contribute executable code such as constructor wrappers.
+
+* The `is_type_data` field is copied into a Boolean argument
+  of the `IfDataTyCon` constructor of `IfaceConDecls` by
+  GHC.Iface.Make.tyConToIfaceDecl.
+
+* The Template Haskell `Dec` type has an constructor `TypeDataD` for
+  `type data` declarations.  When these are converted back to Hs types
+  in a splice, the constructors are placed in the TcCls namespace.
+
+* A `type data` declaration _never_ generates wrappers for its data
+  constructors, as they only make sense for value-level data constructors.
+  See `wrapped_reqd` in GHC.Types.Id.Make.mkDataConRep` for the place where
+  this check is implemented.
+
+  This includes `type data` declarations implemented as GADTs, such as
+  this example from #22948:
+
+    type data T a where
+      A :: T Int
+      B :: T a
+
+  If `T` were an ordinary `data` declaration, then `A` would have a wrapper
+  to account for the GADT-like equality in its return type. Because `T` is
+  declared as a `type data` declaration, however, the wrapper is omitted.
+
+* Although `type data` data constructors do not exist at the value level,
+  it is still possible to match on a value whose type is headed by a `type data`
+  type constructor, such as this example from #22964:
+
+    type data T a where
+      A :: T Int
+      B :: T a
+
+    f :: T a -> ()
+    f x = case x of {}
+
+  This has two consequences:
+
+  * During checking the coverage of `f`'s pattern matches, we treat `T` as if it
+    were an empty data type so that GHC does not warn the user to match against
+    `A` or `B`. (Otherwise, you end up with the bug reported in #22964.)
+    See GHC.HsToCore.Pmc.Solver.vanillaCompleteMatchTC.
+
+  * In `GHC.Core.Utils.refineDataAlt`, do /not/ fill in the DEFAULT case with
+    the data constructor. See
+    Note [Refine DEFAULT case alternatives] Exception 2, in GHC.Core.Utils.
+
+* To prevent users from conjuring up `type data` values at the term level, we
+  disallow using the tagToEnum# function on a type headed by a `type data`
+  type. For instance, GHC will reject this code:
+
+    type data Letter = A | B | C
+
+    f :: Letter
+    f = tagToEnum# 0#
+
+  See `GHC.Tc.Gen.App.checkTagToEnum`, specifically `check_enumeration`.
+-}
+
 warnNoDerivStrat :: Maybe (LDerivStrategy GhcRn)
                  -> SrcSpan
                  -> RnM ()
@@ -1992,7 +2196,7 @@ warnNoDerivStrat mds loc
   = do { dyn_flags <- getDynFlags
        ; case mds of
            Nothing ->
-             let dia = TcRnUnknownMessage $
+             let dia = mkTcRnUnknownMessage $
                    mkPlainDiagnostic (WarningWithFlag Opt_WarnMissingDerivingStrategies) noHints $
                      (if xopt LangExt.DerivingStrategies dyn_flags
                        then no_strat_warning
@@ -2100,13 +2304,13 @@ rnLDerivStrategy doc mds thing_inside
 
 badGadtStupidTheta :: HsDocContext -> TcRnMessage
 badGadtStupidTheta _
-  = TcRnUnknownMessage $ mkPlainError noHints $
+  = mkTcRnUnknownMessage $ mkPlainError noHints $
     vcat [text "No context is allowed on a GADT-style data declaration",
           text "(You can put a context on each constructor, though.)"]
 
 illegalDerivStrategyErr :: DerivStrategy GhcPs -> TcRnMessage
 illegalDerivStrategyErr ds
-  = TcRnUnknownMessage $ mkPlainError noHints $
+  = mkTcRnUnknownMessage $ mkPlainError noHints $
     vcat [ text "Illegal deriving strategy" <> colon <+> derivStrategyName ds
          , text enableStrategy ]
 
@@ -2120,7 +2324,7 @@ illegalDerivStrategyErr ds
 
 multipleDerivClausesErr :: TcRnMessage
 multipleDerivClausesErr
-  = TcRnUnknownMessage $ mkPlainError noHints $
+  = mkTcRnUnknownMessage $ mkPlainError noHints $
     vcat [ text "Illegal use of multiple, consecutive deriving clauses"
          , text "Use DerivingStrategies to allow this" ]
 
@@ -2186,7 +2390,7 @@ rnFamResultSig doc (TyVarSig _ tvbndr)
           rdr_env <- getLocalRdrEnv
        ;  let resName = hsLTyVarName tvbndr
        ;  when (resName `elemLocalRdrEnv` rdr_env) $
-          addErrAt (getLocA tvbndr) $ TcRnUnknownMessage $ mkPlainError noHints $
+          addErrAt (getLocA tvbndr) $ mkTcRnUnknownMessage $ mkPlainError noHints $
                      (hsep [ text "Type variable", quotes (ppr resName) <> comma
                            , text "naming a type family result,"
                            ] $$
@@ -2260,7 +2464,7 @@ rnInjectivityAnn tvBndrs (L _ (TyVarSig _ resTv))
    -- not-in-scope variables) don't check the validity of injectivity
    -- annotation. This gives better error messages.
    ; when (noRnErrors && not lhsValid) $
-        addErrAt (getLocA injFrom) $ TcRnUnknownMessage $ mkPlainError noHints $
+        addErrAt (getLocA injFrom) $ mkTcRnUnknownMessage $ mkPlainError noHints $
               ( vcat [ text $ "Incorrect type variable on the LHS of "
                            ++ "injectivity condition"
               , nest 5
@@ -2269,7 +2473,7 @@ rnInjectivityAnn tvBndrs (L _ (TyVarSig _ resTv))
 
    ; when (noRnErrors && not (Set.null rhsValid)) $
       do { let errorVars = Set.toList rhsValid
-         ; addErrAt (locA srcSpan) $ TcRnUnknownMessage $ mkPlainError noHints $
+         ; addErrAt (locA srcSpan) $ mkTcRnUnknownMessage $ mkPlainError noHints $
                         ( hsep
                         [ text "Unknown type variable" <> plural errorVars
                         , text "on the RHS of injectivity condition:"
@@ -2312,7 +2516,7 @@ are no data constructors we allow h98_style = True
 ***************************************************** -}
 
 -----------------
-rnConDecls :: [LConDecl GhcPs] -> RnM ([LConDecl GhcRn], FreeVars)
+rnConDecls :: DataDefnCons (LConDecl GhcPs) -> RnM (DataDefnCons (LConDecl GhcRn), FreeVars)
 rnConDecls = mapFvRn (wrapLocFstMA rnConDecl)
 
 rnConDecl :: ConDecl GhcPs -> RnM (ConDecl GhcRn, FreeVars)
@@ -2350,6 +2554,7 @@ rnConDecl decl@(ConDeclH98 { con_name = name, con_ex_tvs = ex_tvs
                   all_fvs) }}
 
 rnConDecl (ConDeclGADT { con_names   = names
+                       , con_dcolon  = dcol
                        , con_bndrs   = L l outer_bndrs
                        , con_mb_cxt  = mcxt
                        , con_g_args  = args
@@ -2369,7 +2574,7 @@ rnConDecl (ConDeclGADT { con_names   = names
                 extractConDeclGADTDetailsTyVars args        $
                 extractHsTysRdrTyVars [res_ty] []
 
-        ; let ctxt = ConDeclCtx new_names
+        ; let ctxt = ConDeclCtx (toList new_names)
 
         ; bindHsOuterTyVarBndrs ctxt Nothing implicit_bndrs outer_bndrs $ \outer_bndrs' ->
     do  { (new_cxt, fvs1)    <- rnMbContext ctxt mcxt
@@ -2388,6 +2593,7 @@ rnConDecl (ConDeclGADT { con_names   = names
             (ppr names $$ ppr outer_bndrs')
         ; new_mb_doc <- traverse rnLHsDoc mb_doc
         ; return (ConDeclGADT { con_g_ext = noAnn, con_names = new_names
+                              , con_dcolon = dcol
                               , con_bndrs = L l outer_bndrs', con_mb_cxt = new_cxt
                               , con_g_args = new_args, con_res_ty = new_res_ty
                               , con_doc = new_mb_doc },
@@ -2543,15 +2749,15 @@ add gp loc (SpliceD _ splice@(SpliceDecl _ _ flag)) ds
   = do { -- We've found a top-level splice.  If it is an *implicit* one
          -- (i.e. a naked top level expression)
          case flag of
-           ExplicitSplice -> return ()
-           ImplicitSplice -> do { th_on <- xoptM LangExt.TemplateHaskell
+           DollarSplice -> return ()
+           BareSplice -> do { th_on <- xoptM LangExt.TemplateHaskell
                                 ; unless th_on $ setSrcSpan (locA loc) $
                                   failWith badImplicitSplice }
 
        ; return (gp, Just (splice, ds)) }
   where
     badImplicitSplice :: TcRnMessage
-    badImplicitSplice = TcRnUnknownMessage $ mkPlainError noHints $
+    badImplicitSplice = mkTcRnUnknownMessage $ mkPlainError noHints $
                         text "Parse error: module header, import declaration"
                      $$ text "or top-level declaration expected."
                      -- The compiler should suggest the above, and not using

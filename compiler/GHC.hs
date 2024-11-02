@@ -27,7 +27,8 @@ module GHC (
         handleSourceError,
 
         -- * Flags and settings
-        DynFlags(..), GeneralFlag(..), Severity(..), Backend(..), gopt,
+        DynFlags(..), GeneralFlag(..), Severity(..), Backend, gopt,
+        ncgBackend, llvmBackend, viaCBackend, interpreterBackend, noBackend,
         GhcMode(..), GhcLink(..),
         parseDynamicFlags, parseTargetFiles,
         getSessionDynFlags,
@@ -96,12 +97,12 @@ module GHC (
         modInfoSafe,
         lookupGlobalName,
         findGlobalAnns,
-        mkPrintUnqualifiedForModule,
+        mkNamePprCtxForModule,
         ModIface, ModIface_(..),
         SafeHaskellMode(..),
 
         -- * Printing
-        PrintUnqualified, alwaysQualify,
+        NamePprCtx, alwaysQualify,
 
         -- * Interactive evaluation
 
@@ -118,7 +119,7 @@ module GHC (
         setGHCiMonad, getGHCiMonad,
 
         -- ** Inspecting the current context
-        getBindings, getInsts, getPrintUnqual,
+        getBindings, getInsts, getNamePprCtx,
         findModule, lookupModule,
         findQualifiedModule, lookupQualifiedModule,
         renamePkgQualM, renameRawPkgQualM,
@@ -175,7 +176,6 @@ module GHC (
 
         -- ** Modules
         Module, mkModule, pprModule, moduleName, moduleUnit,
-        ModuleName, mkModuleName, moduleNameString,
 
         -- ** Names
         Name,
@@ -197,7 +197,7 @@ module GHC (
         TyCon,
         tyConTyVars, tyConDataCons, tyConArity,
         isClassTyCon, isTypeSynonymTyCon, isTypeFamilyTyCon, isNewTyCon,
-        isPrimTyCon, isFunTyCon,
+        isPrimTyCon,
         isFamilyTyCon, isOpenFamilyTyCon, isOpenTypeFamilyTyCon,
         tyConClass_maybe,
         synTyConRhs_maybe, synTyConDefn_maybe, tyConKind,
@@ -352,9 +352,6 @@ import GHC.Tc.Utils.Instantiate
 import GHC.Tc.Instance.Family
 
 import GHC.Utils.TmpFs
-import GHC.SysTools
-import GHC.SysTools.BaseDir
-
 import GHC.Utils.Error
 import GHC.Utils.Monad
 import GHC.Utils.Misc
@@ -370,8 +367,7 @@ import GHC.Core.TyCon
 import GHC.Core.TyCo.Ppr   ( pprForAll )
 import GHC.Core.Class
 import GHC.Core.DataCon
-import GHC.Core.FVs        ( orphNamesOfFamInst )
-import GHC.Core.FamInstEnv ( FamInst, famInstEnvElts )
+import GHC.Core.FamInstEnv ( FamInst, famInstEnvElts, orphNamesOfFamInst )
 import GHC.Core.InstEnv
 import GHC.Core
 
@@ -561,57 +557,16 @@ withCleanupSession ghc = ghc `MC.finally` cleanup
 -- <http://hackage.haskell.org/package/ghc-paths>.
 
 initGhcMonad :: GhcMonad m => Maybe FilePath -> m ()
-initGhcMonad mb_top_dir
-  = do { -- The call to c_keepCAFsForGHCi must not be optimized away. Even in non-debug builds.
-         -- So we can't use assertM here.
-         -- See Note [keepCAFsForGHCi] in keepCAFsForGHCi.c for details about why.
-         !keep_cafs <- liftIO $ c_keepCAFsForGHCi
-       ; massert keep_cafs
-       ; env <- liftIO $
-                do { top_dir <- findTopDir mb_top_dir
-                   ; mySettings <- initSysTools top_dir
-                   ; myLlvmConfig <- lazyInitLlvmConfig top_dir
-                   ; dflags <- initDynFlags (defaultDynFlags mySettings myLlvmConfig)
-                   ; hsc_env <- newHscEnv dflags
-                   ; checkBrokenTablesNextToCode (hsc_logger hsc_env) dflags
-                   ; setUnsafeGlobalDynFlags dflags
-                      -- c.f. DynFlags.parseDynamicFlagsFull, which
-                      -- creates DynFlags and sets the UnsafeGlobalDynFlags
-                   ; return hsc_env }
-       ; setSession env }
-
--- | The binutils linker on ARM emits unnecessary R_ARM_COPY relocations which
--- breaks tables-next-to-code in dynamically linked modules. This
--- check should be more selective but there is currently no released
--- version where this bug is fixed.
--- See https://sourceware.org/bugzilla/show_bug.cgi?id=16177 and
--- https://gitlab.haskell.org/ghc/ghc/issues/4210#note_78333
-checkBrokenTablesNextToCode :: MonadIO m => Logger -> DynFlags -> m ()
-checkBrokenTablesNextToCode logger dflags
-  = do { broken <- checkBrokenTablesNextToCode' logger dflags
-       ; when broken
-         $ do { _ <- liftIO $ throwIO $ mkApiErr dflags invalidLdErr
-              ; liftIO $ fail "unsupported linker"
-              }
-       }
-  where
-    invalidLdErr = text "Tables-next-to-code not supported on ARM" <+>
-                   text "when using binutils ld (please see:" <+>
-                   text "https://sourceware.org/bugzilla/show_bug.cgi?id=16177)"
-
-checkBrokenTablesNextToCode' :: MonadIO m => Logger -> DynFlags -> m Bool
-checkBrokenTablesNextToCode' logger dflags
-  | not (isARM arch)               = return False
-  | ways dflags `hasNotWay` WayDyn = return False
-  | not tablesNextToCode           = return False
-  | otherwise                      = do
-    linkerInfo <- liftIO $ getLinkerInfo logger dflags
-    case linkerInfo of
-      GnuLD _  -> return True
-      _        -> return False
-  where platform = targetPlatform dflags
-        arch = platformArch platform
-        tablesNextToCode = platformTablesNextToCode platform
+initGhcMonad mb_top_dir = setSession =<< liftIO ( do
+    -- The call to c_keepCAFsForGHCi must not be optimized away. Even in non-debug builds.
+    -- So we can't use assertM here.
+    -- See Note [keepCAFsForGHCi] in keepCAFsForGHCi.c for details about why.
+-- #if MIN_VERSION_GLASGOW_HASKELL(9,7,0,0)
+    !keep_cafs <- c_keepCAFsForGHCi
+    massert keep_cafs
+-- #endif
+    initHscEnv mb_top_dir
+  )
 
 -- %************************************************************************
 -- %*                                                                      *
@@ -640,7 +595,7 @@ checkBrokenTablesNextToCode' logger dflags
 -- 'setSessionDynFlags' sets both @DynFlags@, and 'getSessionDynFlags'
 -- retrieves the program @DynFlags@ (for backwards compatibility).
 
--- This is a compatability function which sets dynflags for the top session
+-- This is a compatibility function which sets dynflags for the top session
 -- as well as the unit.
 setSessionDynFlags :: (HasCallStack, GhcMonad m) => DynFlags -> m ()
 setSessionDynFlags dflags0 = do
@@ -651,7 +606,7 @@ setSessionDynFlags dflags0 = do
   case S.toList all_uids of
     [uid] -> do
       setUnitDynFlagsNoCheck uid dflags
-      modifySession (hscSetActiveUnitId (homeUnitId_ dflags))
+      modifySession (hscUpdateLoggerFlags . hscSetActiveUnitId (homeUnitId_ dflags))
       dflags' <- getDynFlags
       setTopSessionDynFlags dflags'
     [] -> panic "nohue"
@@ -983,7 +938,8 @@ checkNewDynFlags logger dflags = do
   -- See Note [DynFlags consistency]
   let (dflags', warnings) = makeDynFlagsConsistent dflags
   let diag_opts = initDiagOpts dflags
-  liftIO $ handleFlagWarnings logger diag_opts (map (Warn WarningWithoutFlag) warnings)
+      print_config = initPrintConfig dflags
+  liftIO $ handleFlagWarnings logger print_config diag_opts (map (Warn WarningWithoutFlag) warnings)
   return dflags'
 
 checkNewInteractiveDynFlags :: MonadIO m => Logger -> DynFlags -> m DynFlags
@@ -993,7 +949,8 @@ checkNewInteractiveDynFlags logger dflags0 = do
   if xopt LangExt.StaticPointers dflags0
   then do
     let diag_opts = initDiagOpts dflags0
-    liftIO $ printOrThrowDiagnostics logger diag_opts $ singleMessage
+        print_config = initPrintConfig dflags0
+    liftIO $ printOrThrowDiagnostics logger print_config diag_opts $ singleMessage
       $ fmap GhcDriverMessage
       $ mkPlainMsgEnvelope diag_opts interactiveSrcSpan DriverStaticPointersNotSupported
     return $ xopt_unset dflags0 LangExt.StaticPointers
@@ -1174,7 +1131,7 @@ instance TypecheckedMod DesugaredModule where
 instance DesugaredMod DesugaredModule where
   coreModule m = dm_core_module m
 
-type ParsedSource      = Located HsModule
+type ParsedSource      = Located (HsModule GhcPs)
 type RenamedSource     = (HsGroup GhcRn, [LImportDecl GhcRn], Maybe [(LIE GhcRn, Avails)],
                           Maybe (LHsDoc GhcRn))
 type TypecheckedSource = LHsBinds GhcTc
@@ -1398,9 +1355,9 @@ getInsts = withSession $ \hsc_env ->
     let (inst_env, fam_env) = ic_instances (hsc_IC hsc_env)
     in return (instEnvElts inst_env, fam_env)
 
-getPrintUnqual :: GhcMonad m => m PrintUnqualified
-getPrintUnqual = withSession $ \hsc_env -> do
-  return $ icPrintUnqual (hsc_unit_env hsc_env) (hsc_IC hsc_env)
+getNamePprCtx :: GhcMonad m => m NamePprCtx
+getNamePprCtx = withSession $ \hsc_env -> do
+  return $ icNamePprCtx (hsc_unit_env hsc_env) (hsc_IC hsc_env)
 
 -- | Container for information about a 'Module'.
 data ModuleInfo = ModuleInfo {
@@ -1494,12 +1451,14 @@ modInfoInstances = minf_instances
 modInfoIsExportedName :: ModuleInfo -> Name -> Bool
 modInfoIsExportedName minf name = elemNameSet name (availsToNameSet (minf_exports minf))
 
-mkPrintUnqualifiedForModule :: GhcMonad m =>
-                               ModuleInfo
-                            -> m (Maybe PrintUnqualified) -- XXX: returns a Maybe X
-mkPrintUnqualifiedForModule minf = withSession $ \hsc_env -> do
-  let mk_print_unqual = mkPrintUnqualified (hsc_unit_env hsc_env)
-  return (fmap mk_print_unqual (minf_rdr_env minf))
+mkNamePprCtxForModule ::
+  GhcMonad m =>
+  ModuleInfo ->
+  m (Maybe NamePprCtx) -- XXX: returns a Maybe X
+mkNamePprCtxForModule minf = withSession $ \hsc_env -> do
+  let mk_name_ppr_ctx = mkNamePprCtx ptc (hsc_unit_env hsc_env)
+      ptc = initPromotionTickContext (hsc_dflags hsc_env)
+  return (fmap mk_name_ppr_ctx (minf_rdr_env minf))
 
 modInfoLookupName :: GhcMonad m =>
                      ModuleInfo -> Name
@@ -1523,9 +1482,7 @@ modInfoModBreaks :: ModuleInfo -> ModBreaks
 modInfoModBreaks = minf_modBreaks
 
 isDictonaryId :: Id -> Bool
-isDictonaryId id
-  = case tcSplitSigmaTy (idType id) of {
-      (_tvs, _theta, tau) -> isDictTy tau }
+isDictonaryId id = isDictTy (idType id)
 
 -- | Looks up a global name: that is, any top-level name in any
 -- visible module.  Unlike 'lookupName', lookupGlobalName does not use
@@ -1835,7 +1792,7 @@ lookupName name =
 parser :: String         -- ^ Haskell module source text (full Unicode is supported)
        -> DynFlags       -- ^ the flags
        -> FilePath       -- ^ the filename (for source locations)
-       -> (WarningMessages, Either ErrorMessages (Located HsModule))
+       -> (WarningMessages, Either ErrorMessages (Located (HsModule GhcPs)))
 
 parser str dflags filename =
    let
@@ -2000,5 +1957,7 @@ instance Exception GhcApiError
 mkApiErr :: DynFlags -> SDoc -> GhcApiError
 mkApiErr dflags msg = GhcApiError (showSDoc dflags msg)
 
+--
 foreign import ccall unsafe "keepCAFsForGHCi"
     c_keepCAFsForGHCi   :: IO Bool
+

@@ -115,6 +115,10 @@ Lexical syntax
      varid       →   small {idchar} ⟨reservedid⟩
      conid       →   large {idchar}
 
+- GHC allows redundant parantheses around the function name in the `funlhs` part of declarations.
+  That is GHC will succeed in parsing a declaration like `((f)) x = <rhs>` for any number
+  of parantheses around `f`.
+
 .. _infelicities-syntax:
 
 Context-free syntax
@@ -142,6 +146,8 @@ Context-free syntax
       its enclosing context.
 
     :since: 7.2.1
+
+    :status: Included in :extension:`Haskell98`
 
     Allow nested contexts to be at the same indentation level as
     its enclosing context.
@@ -687,6 +693,12 @@ Bugs in GHC
 
 -  Because of a toolchain limitation we are unable to support full Unicode paths
    on Windows. On Windows we support up to Latin-1. See :ghc-ticket:`12971` for more.
+
+- ``-Wincomplete-record-updates`` does not warn about record updates for records with
+  partial record fields since GHC 9.6.1. See :ghc-ticket:`23520` for more details.
+
+- ``-fasm-shortcutting`` may result in unsound optimisations and result in incorrect
+  runtime results. See :ghc-ticket:`24507` for more details.
 
 .. _bugs-ghci:
 

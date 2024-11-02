@@ -19,7 +19,6 @@ import GHC.CmmToLlvm.Regs
 import GHC.Cmm.BlockId
 import GHC.Cmm.CLabel
 import GHC.Cmm
-import GHC.Cmm.Ppr as PprCmm
 import GHC.Cmm.Utils
 import GHC.Cmm.Switch
 import GHC.Cmm.Dataflow.Block
@@ -760,7 +759,7 @@ castVars signage vars = do
                 let (vars', stmts) = unzip done
                 return (vars', toOL stmts)
 
--- | Cast an LLVM variable to a specific type, panicing if it can't be done.
+-- | Cast an LLVM variable to a specific type, panicking if it can't be done.
 castVar :: Signage -> LlvmVar -> LlvmType -> LlvmM (LlvmVar, LlvmStatement)
 castVar signage v t | getVarType v == t
             = return (v, Nop)
@@ -1205,10 +1204,10 @@ genStore_slow addr val alignment meta = do
 
         other ->
             pprPanic "genStore: ptr not right type!"
-                    (PprCmm.pprExpr platform addr <+> text (
-                        "Size of Ptr: "   ++ show (llvmPtrBits platform) ++
-                        ", Size of var: " ++ show (llvmWidthInBits platform other) ++
-                        ", Var: "         ++ renderWithContext (llvmCgContext cfg) (ppVar cfg vaddr)))
+                    (pdoc platform addr $$
+                     text "Size of Ptr:" <+> ppr (llvmPtrBits platform) $$
+                     text "Size of var:" <+> ppr (llvmWidthInBits platform other) $$
+                     text "Var:"         <+> ppVar cfg vaddr)
 
 mkStore :: LlvmVar -> LlvmVar -> AlignmentSpec -> LlvmStatement
 mkStore vval vptr alignment =
@@ -1257,7 +1256,7 @@ genExpectLit expLit expTy var = do
     lit = LMLitVar $ LMIntLit expLit expTy
 
     llvmExpectName
-      | isInt expTy = fsLit $ "llvm.expect." ++ renderWithContext (llvmCgContext cfg) (ppr expTy)
+      | isInt expTy = fsLit $ "llvm.expect." ++ showSDocOneLine (llvmCgContext cfg) (ppr expTy)
       | otherwise   = panic "genExpectedLit: Type not an int!"
 
   (llvmExpect, stmts, top) <-
@@ -1453,7 +1452,6 @@ genMachOp _ op [x] = case op of
     MO_S_MulMayOflo _ -> panicOp
     MO_S_Quot _       -> panicOp
     MO_S_Rem _        -> panicOp
-    MO_U_MulMayOflo _ -> panicOp
     MO_U_Quot _       -> panicOp
     MO_U_Rem _        -> panicOp
 
@@ -1635,8 +1633,6 @@ genMachOp_slow opt op [x, y] = case op of
     MO_Sub _ -> genBinMach LM_MO_Sub
     MO_Mul _ -> genBinMach LM_MO_Mul
 
-    MO_U_MulMayOflo _ -> panic "genMachOp: MO_U_MulMayOflo unsupported!"
-
     MO_S_MulMayOflo w -> isSMulOK w x y
 
     MO_S_Quot _ -> genBinMach LM_MO_SDiv
@@ -1707,7 +1703,6 @@ genMachOp_slow opt op [x, y] = case op of
 
     where
         binLlvmOp ty binOp allow_y_cast = do
-          cfg      <- getConfig
           platform <- getPlatform
           runExprData $ do
             vx <- exprToVarW x
@@ -1723,13 +1718,7 @@ genMachOp_slow opt op [x, y] = case op of
                     doExprW (ty vx) $ binOp vx vy'
 
                | otherwise
-               -> do
-                    -- Error. Continue anyway so we can debug the generated ll file.
-                    let render   = renderWithContext (llvmCgContext cfg)
-                        cmmToStr = (lines . render . PprCmm.pprExpr platform)
-                    statement $ Comment $ map fsLit $ cmmToStr x
-                    statement $ Comment $ map fsLit $ cmmToStr y
-                    doExprW (ty vx) $ binOp vx vy
+               -> pprPanic "binLlvmOp types" (pdoc platform x $$ pdoc platform y)
 
         binCastLlvmOp ty binOp = runExprData $ do
             vx <- exprToVarW x
@@ -1883,10 +1872,10 @@ genLoad_slow atomic e ty align meta = do
                     doExprW (cmmToLlvmType ty) (MExpr meta $ mkLoad atomic ptr align)
 
         other -> pprPanic "exprToVar: CmmLoad expression is not right type!"
-                     (PprCmm.pprExpr platform e <+> text (
-                         "Size of Ptr: "   ++ show (llvmPtrBits platform) ++
-                         ", Size of var: " ++ show (llvmWidthInBits platform other) ++
-                         ", Var: " ++ renderWithContext (llvmCgContext cfg) (ppVar cfg iptr)))
+                     (pdoc platform e $$
+                      text "Size of Ptr:" <+> ppr (llvmPtrBits platform) $$
+                      text "Size of var:" <+> ppr (llvmWidthInBits platform other) $$
+                      text "Var:" <+> (ppVar cfg iptr))
 
 {-
 Note [Alignment of vector-typed values]

@@ -301,7 +301,7 @@ has a number of other effects:
 GHC ensures that inlining cannot go on forever: every mutually-recursive
 group is cut by one or more *loop breakers* that is never inlined (see
 `Secrets of the GHC inliner, JFP 12(4) July
-2002 <https://research.microsoft.com/%7Esimonpj/Papers/inlining/index.htm>`__).
+2002 <https://simonmar.github.io/bib/papers/inline.pdf>`__).
 GHC tries not to select a function with an ``INLINE`` pragma as a loop
 breaker, but when there is no choice even an INLINE function can be
 selected, in which case the ``INLINE`` pragma is ignored. For example, for a
@@ -845,8 +845,14 @@ flattening the pair. Multi-level unpacking is also supported: ::
 will store two unboxed ``Int#``\ s directly in the ``T`` constructor.
 The unpacker can see through newtypes, too.
 
+Since 9.6.1, data types with multiple constructors can also be unpacked, effectively
+transforming the field into an unboxed sum of the unpackings of each
+constructor (see :extension:`UnboxedSums`).
+
 See also the :ghc-flag:`-funbox-strict-fields` flag, which essentially has the
-effect of adding ``{-# UNPACK #-}`` to every strict constructor field.
+effect of adding ``{-# UNPACK #-}`` to every strict constructor field which is
+of a single-constructor data type. Sum types won't be unpacked automatically
+by this though, only with the explicit pragma.
 
 .. [1]
    In fact, :pragma:`UNPACK` has no effect without :ghc-flag:`-O`, for technical

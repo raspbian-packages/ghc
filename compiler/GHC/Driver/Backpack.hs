@@ -20,6 +20,7 @@ module GHC.Driver.Backpack (doBackpack) where
 
 import GHC.Prelude
 
+import GHC.Driver.Backend
 -- In a separate module because it hooks into the parser.
 import GHC.Driver.Backpack.Syntax
 import GHC.Driver.Config.Finder (initFinderOpts)
@@ -105,8 +106,9 @@ doBackpack [src_filename] = do
                         -- Not doing so caused #20396.
     -- Cribbed from: preprocessFile / GHC.Driver.Pipeline
     liftIO $ checkProcessArgsResult unhandled_flags
-    liftIO $ printOrThrowDiagnostics logger (initDiagOpts dflags) (GhcPsMessage <$> p_warns)
-    liftIO $ handleFlagWarnings logger (initDiagOpts dflags) warns
+    let print_config = initPrintConfig dflags
+    liftIO $ printOrThrowDiagnostics logger print_config (initDiagOpts dflags) (GhcPsMessage <$> p_warns)
+    liftIO $ handleFlagWarnings logger print_config (initDiagOpts dflags) warns
     -- TODO: Preprocessing not implemented
 
     buf <- liftIO $ hGetStringBuffer src_filename
@@ -188,7 +190,7 @@ withBkpSession cid insts deps session_type do_this = do
           hscUpdateFlags (\dflags -> mk_temp_dflags (hsc_units hsc_env) dflags) hsc_env
         mk_temp_dflags unit_state dflags = dflags
             { backend = case session_type of
-                            TcSession -> NoBackend
+                            TcSession -> noBackend
                             _         -> backend dflags
             , ghcLink = case session_type of
                             TcSession -> NoLink
@@ -214,7 +216,7 @@ withBkpSession cid insts deps session_type do_this = do
                 -- Make sure to write interfaces when we are type-checking
                 -- indefinite packages.
                 TcSession
-                  | backend dflags /= NoBackend
+                  | backendSupportsInterfaceWriting $ backend dflags
                   -> EnumSet.insert Opt_WriteInterface (generalFlags dflags)
                 _ -> generalFlags dflags
 
@@ -339,7 +341,7 @@ buildUnit session cid insts lunit = do
         -- Compile relevant only
         hsc_env <- getSession
         let home_mod_infos = eltsUDFM (hsc_HPT hsc_env)
-            linkables = map (expectJust "bkp link" . hm_linkable)
+            linkables = map (expectJust "bkp link" . homeModInfoObject)
                       . filter ((==HsSrcFile) . mi_hsc_src . hm_iface)
                       $ home_mod_infos
             getOfiles LM{ linkableUnlinked = us } = map nameOfObject (filter isObject us)
@@ -595,7 +597,9 @@ backpackStyle =
     mkUserStyle
         (QueryQualify neverQualifyNames
                       alwaysQualifyModules
-                      neverQualifyPackages) AllTheWay
+                      neverQualifyPackages
+                      alwaysPrintPromTick)
+        AllTheWay
 
 -- | Message when we initially process a Backpack unit.
 msgTopPackage :: (Int,Int) -> HsComponentId -> BkpM ()
@@ -794,14 +798,16 @@ summariseRequirement pn mod_name = do
         ms_ghc_prim_import = False,
         ms_parsed_mod = Just (HsParsedModule {
                 hpm_module = L loc (HsModule {
-                        hsmodAnn = noAnn,
-                        hsmodLayout = NoLayoutInfo,
+                        hsmodExt = XModulePs {
+                            hsmodAnn = noAnn,
+                            hsmodLayout = NoLayoutInfo,
+                            hsmodDeprecMessage = Nothing,
+                            hsmodHaddockModHeader = Nothing
+                                             },
                         hsmodName = Just (L (noAnnSrcSpan loc) mod_name),
                         hsmodExports = Nothing,
                         hsmodImports = [],
-                        hsmodDecls = [],
-                        hsmodDeprecMessage = Nothing,
-                        hsmodHaddockModHeader = Nothing
+                        hsmodDecls = []
                     }),
                 hpm_src_files = []
             }),
@@ -815,7 +821,7 @@ summariseRequirement pn mod_name = do
 summariseDecl :: PackageName
               -> HscSource
               -> Located ModuleName
-              -> Located HsModule
+              -> Located (HsModule GhcPs)
               -> [NodeKey]
               -> BkpM ModuleGraphNode
 summariseDecl pn hsc_src (L _ modname) hsmod home_keys = hsModuleToModSummary home_keys pn hsc_src modname hsmod
@@ -829,7 +835,7 @@ hsModuleToModSummary :: [NodeKey]
                      -> PackageName
                      -> HscSource
                      -> ModuleName
-                     -> Located HsModule
+                     -> Located (HsModule GhcPs)
                      -> BkpM ModuleGraphNode
 hsModuleToModSummary home_keys pn hsc_src modname
                      hsmod = do
@@ -935,4 +941,4 @@ hsModuleToModSummary home_keys pn hsc_src modname
 newUnitId :: UnitId -> Maybe FastString -> UnitId
 newUnitId uid mhash = case mhash of
    Nothing   -> uid
-   Just hash -> UnitId (unitIdFS uid `appendFS` mkFastString "+" `appendFS` hash)
+   Just hash -> UnitId (concatFS [unitIdFS uid, fsLit "+", hash])

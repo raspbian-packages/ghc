@@ -7,9 +7,6 @@
 {-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE BangPatterns #-}
 
-{-# OPTIONS_GHC -Wno-incomplete-uni-patterns   #-}
-{-# OPTIONS_GHC -Wno-incomplete-record-updates #-}
-
 -- | GHC.Core holds all the main data types for use by for the Glasgow Haskell Compiler midsection
 module GHC.Core (
         -- * Main data types
@@ -42,9 +39,11 @@ module GHC.Core (
 
         -- ** Simple 'Expr' access functions and predicates
         bindersOf, bindersOfBinds, rhssOfBind, rhssOfAlts,
+        foldBindersOfBindStrict, foldBindersOfBindsStrict,
         collectBinders, collectTyBinders, collectTyAndValBinders,
-        collectNBinders,
+        collectNBinders, collectNValBinders_maybe,
         collectArgs, stripNArgs, collectArgsTicks, flattenBinds,
+        collectFunSimple,
 
         exprToType,
         wrapLamBody,
@@ -64,7 +63,8 @@ module GHC.Core (
         maybeUnfoldingTemplate, otherCons,
         isValueUnfolding, isEvaldUnfolding, isCheapUnfolding,
         isExpandableUnfolding, isConLikeUnfolding, isCompulsoryUnfolding,
-        isStableUnfolding, isInlineUnfolding, isBootUnfolding,
+        isStableUnfolding, isStableUserUnfolding, isStableSystemUnfolding,
+        isInlineUnfolding, isBootUnfolding,
         hasCoreUnfolding, hasSomeUnfolding,
         canUnfold, neverUnfoldGuidance, isStableSource,
 
@@ -82,9 +82,8 @@ module GHC.Core (
         IsOrphan(..), isOrphan, notOrphan, chooseOrphanAnchor,
 
         -- * Core rule data types
-        CoreRule(..), RuleBase,
-        RuleName, RuleFun, IdUnfoldingFun, InScopeEnv,
-        RuleEnv(..), RuleOpts(..), mkRuleEnv, emptyRuleEnv,
+        CoreRule(..),
+        RuleName, RuleFun, IdUnfoldingFun, InScopeEnv(..), RuleOpts,
 
         -- ** Operations on 'CoreRule's
         ruleArity, ruleName, ruleIdName, ruleActivation,
@@ -99,9 +98,9 @@ import GHC.Types.Var.Env( InScopeSet )
 import GHC.Types.Var
 import GHC.Core.Type
 import GHC.Core.Coercion
+import GHC.Core.Rules.Config ( RuleOpts )
 import GHC.Types.Name
 import GHC.Types.Name.Set
-import GHC.Types.Name.Env( NameEnv )
 import GHC.Types.Literal
 import GHC.Types.Tickish
 import GHC.Core.DataCon
@@ -175,7 +174,6 @@ These data types are the heart of the compiler
 -- *  Primitive literals
 --
 -- *  Applications: note that the argument may be a 'Type'.
---    See Note [Core let/app invariant]
 --    See Note [Representation polymorphism invariants]
 --
 -- *  Lambda abstraction
@@ -186,7 +184,7 @@ These data types are the heart of the compiler
 --    bound and then executing the sub-expression.
 --
 --    See Note [Core letrec invariant]
---    See Note [Core let/app invariant]
+--    See Note [Core let-can-float invariant]
 --    See Note [Representation polymorphism invariants]
 --    See Note [Core type and coercion invariant]
 --
@@ -383,6 +381,25 @@ for the meaning of "lifted" vs. "unlifted").
 
 For the non-top-level, non-recursive case see Note [Core let-can-float invariant].
 
+Note [Compilation plan for top-level string literals]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Here is a summary on how top-level string literals are handled by various
+parts of the compilation pipeline.
+
+* In the source language, there is no way to bind a primitive string literal
+  at the top level.
+
+* In Core, we have a special rule that permits top-level Addr# bindings. See
+  Note [Core top-level string literals]. Core-to-core passes may introduce
+  new top-level string literals.
+
+* In STG, top-level string literals are explicitly represented in the syntax
+  tree.
+
+* A top-level string literal may end up exported from a module. In this case,
+  in the object file, the content of the exported literal is given a label with
+  the _bytes suffix.
+
 Note [Core let-can-float invariant]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 The let-can-float invariant:
@@ -478,47 +495,6 @@ parts of the compilation pipeline.
 * A top-level string literal may end up exported from a module. In this case,
   in the object file, the content of the exported literal is given a label with
   the _bytes suffix.
-
-Note [NON-BOTTOM-DICTS invariant]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-It is a global invariant (not checkable by Lint) that
-
-This means that the let can be floated around
-without difficulty. For example, this is OK:
-
-   y::Int# = x +# 1#
-
-But this is not, as it may affect termination if the
-expression is floated out:
-
-   y::Int# = fac 4#
-
-In this situation you should use @case@ rather than a @let@. The function
-'GHC.Core.Utils.needsCaseBinding' can help you determine which to generate, or
-alternatively use 'GHC.Core.Make.mkCoreLet' rather than this constructor directly,
-which will generate a @case@ if necessary
-
-The let/app invariant is initially enforced by mkCoreLet and mkCoreApp in
-GHC.Core.Make.
-
-* A superclass selection from some other dictionary. This is harder to guarantee:
-  see Note [Recursive superclasses] and Note [Solving superclass constraints]
-  in GHC.Tc.TyCl.Instance.
-
-A bad Core-to-Core pass could invalidate this reasoning, but that's too bad.
-It's still an invariant of Core programs generated by GHC from Haskell, and
-Core-to-Core passes maintain it.
-
-Why is it useful to know that dictionaries are non-bottom?
-
-1. It justifies the use of `-XDictsStrict`;
-   see `GHC.Core.Types.Demand.strictifyDictDmd`
-
-2. It means that (eq_sel d) is ok-for-speculation and thus
-     case (eq_sel d) of _ -> blah
-   can be discarded by the Simplifier.  See these Notes:
-   Note [exprOkForSpeculation and type classes] in GHC.Core.Utils
-   Note[Speculative evaluation] in GHC.CoreToStg.Prep
 
 Note [Case expression invariants]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -797,18 +773,18 @@ Join points must follow these invariants:
          the binder.  Reason: if we want to push a continuation into
          the RHS we must push it into the unfolding as well.
 
-     2b. The Arity (in the IdInfo) of a join point is the number of value
-         binders in the top n lambdas, where n is the join arity.
+     2b. The Arity (in the IdInfo) of a join point varies independently of the
+         join-arity. For example, we could have
+             j x = case x of { T -> \y.y; F -> \y.3 }
+         Its join-arity is 1, but its idArity is 2; and we do not eta-expand
+         join points: see Note [Do not eta-expand join points] in
+                          GHC.Core.Opt.Simplify.Utils.
 
-         So arity <= join arity; the former counts only value binders
-         while the latter counts all binders.
-         e.g. Suppose $j has join arity 1
-               let j = \x y. e in case x of { A -> j 1; B -> j 2 }
-         Then its ordinary arity is also 1, not 2.
+         Allowing the idArity to be bigger than the join-arity is
+         important in arityType; see GHC.Core.Opt.Arity
+         Note [Arity for recursive join bindings]
 
-         The arity of a join point isn't very important; but short of setting
-         it to zero, it is helpful to have an invariant.  E.g. #17294.
-         See also Note [Do not eta-expand join points] in GHC.Core.Opt.Simplify.Utils.
+         Historical note: see #17294.
 
   3. If the binding is recursive, then all other bindings in the recursive group
      must also be join points.
@@ -819,11 +795,11 @@ Join points must follow these invariants:
 However, join points have simpler invariants in other ways
 
   5. A join point can have an unboxed type without the RHS being
-     ok-for-speculation (i.e. drop the let/app invariant)
+     ok-for-speculation (i.e. drop the let-can-float invariant)
      e.g.  let j :: Int# = factorial x in ...
 
   6. The RHS of join point is not required to have a fixed runtime representation,
-     e.g.  let j :: r :: TYPE l = fail void# in ...
+     e.g.  let j :: r :: TYPE l = fail (##) in ...
      This happened in an intermediate program #13394
 
 Examples:
@@ -1111,6 +1087,12 @@ has two major consequences
    M.  But it's painful, because it means we need to keep track of all
    the orphan modules below us.
 
+ * The "visible orphan modules" are all the orphan module in the transitive
+   closure of the imports of this module.
+
+ * During instance lookup, we filter orphan instances depending on
+   whether or not the instance is in a visible orphan module.
+
  * A non-orphan is not finger-printed separately.  Instead, for
    fingerprinting purposes it is treated as part of the entity it
    mentions on the LHS.  For example
@@ -1125,12 +1107,20 @@ has two major consequences
 
 Orphan-hood is computed
   * For class instances:
-      when we make a ClsInst
-    (because it is needed during instance lookup)
+    when we make a ClsInst in GHC.Core.InstEnv.mkLocalInstance
+      (because it is needed during instance lookup)
+    See Note [When exactly is an instance decl an orphan?]
+        in GHC.Core.InstEnv
 
-  * For rules and family instances:
-       when we generate an IfaceRule (GHC.Iface.Make.coreRuleToIfaceRule)
-                     or IfaceFamInst (GHC.Iface.Make.instanceToIfaceInst)
+  * For rules
+    when we generate a CoreRule (GHC.Core.Rules.mkRule)
+
+  * For family instances:
+    when we generate an IfaceFamInst (GHC.Iface.Make.instanceToIfaceInst)
+
+Orphan-hood is persisted into interface files, in ClsInst, FamInst,
+and CoreRules.
+
 -}
 
 {-
@@ -1145,49 +1135,6 @@ GHC.Core.FVs, GHC.Core.Subst, GHC.Core.Ppr, GHC.Core.Tidy also inspect the
 representation.
 -}
 
--- | Gathers a collection of 'CoreRule's. Maps (the name of) an 'Id' to its rules
-type RuleBase = NameEnv [CoreRule]
-        -- The rules are unordered;
-        -- we sort out any overlaps on lookup
-
--- | A full rule environment which we can apply rules from.  Like a 'RuleBase',
--- but it also includes the set of visible orphans we use to filter out orphan
--- rules which are not visible (even though we can see them...)
-data RuleEnv
-    = RuleEnv { re_base          :: [RuleBase] -- See Note [Why re_base is a list]
-              , re_visible_orphs :: ModuleSet
-              }
-
-mkRuleEnv :: RuleBase -> [Module] -> RuleEnv
-mkRuleEnv rules vis_orphs = RuleEnv [rules] (mkModuleSet vis_orphs)
-
-emptyRuleEnv :: RuleEnv
-emptyRuleEnv = RuleEnv [] emptyModuleSet
-
-{-
-Note [Why re_base is a list]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-In Note [Overall plumbing for rules], it is explained that the final
-RuleBase which we must consider is combined from 4 different sources.
-
-During simplifier runs, the fourth source of rules is constantly being updated
-as new interfaces are loaded into the EPS. Therefore just before we check to see
-if any rules match we get the EPS RuleBase and combine it with the existing RuleBase
-and then perform exactly 1 lookup into the new map.
-
-It is more efficient to avoid combining the environments and store the uncombined
-environments as we can instead perform 1 lookup into each environment and then combine
-the results.
-
-Essentially we use the identity:
-
-> lookupNameEnv n (plusNameEnv_C (++) rb1 rb2)
->   = lookupNameEnv n rb1 ++ lookupNameEnv n rb2
-
-The latter being more efficient as we don't construct an intermediate
-map.
--}
 
 -- | A 'CoreRule' is:
 --
@@ -1203,7 +1150,7 @@ data CoreRule
 
         -- Rough-matching stuff
         -- see comments with InstEnv.ClsInst( is_cls, is_rough )
-        ru_fn    :: Name,               -- ^ Name of the 'GHC.Types.Id.Id' at the head of this rule
+        ru_fn    :: !Name,               -- ^ Name of the 'GHC.Types.Id.Id' at the head of this rule
         ru_rough :: [Maybe Name],       -- ^ Name at the head of each argument to the left hand side
 
         -- Proper-matching stuff
@@ -1254,18 +1201,11 @@ data CoreRule
     }
                 -- See Note [Extra args in the target] in GHC.Core.Rules
 
--- | Rule options
-data RuleOpts = RuleOpts
-   { roPlatform                :: !Platform -- ^ Target platform
-   , roNumConstantFolding      :: !Bool     -- ^ Enable more advanced numeric constant folding
-   , roExcessRationalPrecision :: !Bool     -- ^ Cut down precision of Rational values to that of Float/Double if disabled
-   , roBignumRules             :: !Bool     -- ^ Enable rules for bignums
-   }
+type RuleFun = RuleOpts -> InScopeEnv -> Id -> [CoreExpr] -> Maybe CoreExpr
 
 -- | The 'InScopeSet' in the 'InScopeEnv' is a /superset/ of variables that are
 -- currently in scope. See Note [The InScopeSet invariant].
-type RuleFun = RuleOpts -> InScopeEnv -> Id -> [CoreExpr] -> Maybe CoreExpr
-type InScopeEnv = (InScopeSet, IdUnfoldingFun)
+data InScopeEnv = ISE InScopeSet IdUnfoldingFun
 
 type IdUnfoldingFun = Id -> Unfolding
 -- A function that embodies how to unfold an Id if you need
@@ -1361,16 +1301,19 @@ data Unfolding
         df_args  :: [CoreExpr]  -- Args of the data con: types, superclasses and methods,
     }                           -- in positional order
 
-  | CoreUnfolding {             -- An unfolding for an Id with no pragma,
-                                -- or perhaps a NOINLINE pragma
-                                -- (For NOINLINE, the phase, if any, is in the
-                                -- InlinePragInfo for this Id.)
-        uf_tmpl       :: CoreExpr,        -- Template; occurrence info is correct
-        uf_src        :: UnfoldingSource, -- Where the unfolding came from
-        uf_is_top     :: Bool,          -- True <=> top level binding
-        uf_cache      :: UnfoldingCache,        -- Cache of flags computable from the expr
-                                                -- See Note [Tying the 'CoreUnfolding' knot]
-        uf_guidance   :: UnfoldingGuidance      -- Tells about the *size* of the template.
+  | CoreUnfolding { -- An unfolding for an Id with no pragma,
+                    -- or perhaps a NOINLINE pragma
+                    -- (For NOINLINE, the phase, if any, is in the
+                    -- InlinePragInfo for this Id.)
+        uf_tmpl     :: CoreExpr,         -- The unfolding itself (aka "template")
+                                         -- Always occ-analysed;
+                                         -- See Note [OccInfo in unfoldings and rules]
+
+        uf_src      :: UnfoldingSource,  -- Where the unfolding came from
+        uf_is_top   :: Bool,             -- True <=> top level binding
+        uf_cache    :: UnfoldingCache,   -- Cache of flags computable from the expr
+                                         -- See Note [Tying the 'CoreUnfolding' knot]
+        uf_guidance :: UnfoldingGuidance -- Tells about the *size* of the template.
     }
   -- ^ An unfolding with redundant cached information. Parameters:
   --
@@ -1387,36 +1330,6 @@ data Unfolding
   --     Basically this is a cached version of 'exprIsWorkFree'
   --
   --  uf_guidance:  Tells us about the /size/ of the unfolding template
-
-
-------------------------------------------------
-data UnfoldingSource
-  = -- See also Note [Historical note: unfoldings for wrappers]
-
-    InlineRhs          -- The current rhs of the function
-                       -- Replace uf_tmpl each time around
-
-  | InlineStable       -- From an INLINE or INLINABLE pragma
-                       --   INLINE     if guidance is UnfWhen
-                       --   INLINABLE  if guidance is UnfIfGoodArgs/UnfoldNever
-                       -- (well, technically an INLINABLE might be made
-                       -- UnfWhen if it was small enough, and then
-                       -- it will behave like INLINE outside the current
-                       -- module, but that is the way automatic unfoldings
-                       -- work so it is consistent with the intended
-                       -- meaning of INLINABLE).
-                       --
-                       -- uf_tmpl may change, but only as a result of
-                       -- gentle simplification, it doesn't get updated
-                       -- to the current RHS during compilation as with
-                       -- InlineRhs.
-                       --
-                       -- See Note [InlineStable]
-
-  | InlineCompulsory   -- Something that *has* no binding, so you *must* inline it
-                       -- Only a few primop-like things have this property
-                       -- (see "GHC.Types.Id.Make", calls to mkCompulsoryUnfolding).
-                       -- Inline absolutely always, however boring the context.
 
 
 -- | Properties of a 'CoreUnfolding' that could be computed on-demand from its template.
@@ -1555,18 +1468,12 @@ bootUnfolding = BootUnfolding
 mkOtherCon :: [AltCon] -> Unfolding
 mkOtherCon = OtherCon
 
-isStableSource :: UnfoldingSource -> Bool
--- Keep the unfolding template
-isStableSource InlineCompulsory   = True
-isStableSource InlineStable       = True
-isStableSource InlineRhs          = False
-
 -- | Retrieves the template of an unfolding: panics if none is known
 unfoldingTemplate :: Unfolding -> CoreExpr
 unfoldingTemplate = uf_tmpl
 
 -- | Retrieves the template of an unfolding if possible
--- maybeUnfoldingTemplate is used mainly wnen specialising, and we do
+-- maybeUnfoldingTemplate is used mainly when specialising, and we do
 -- want to specialise DFuns, so it's important to return a template
 -- for DFunUnfoldings
 maybeUnfoldingTemplate :: Unfolding -> Maybe CoreExpr
@@ -1588,6 +1495,7 @@ otherCons _               = []
 isValueUnfolding :: Unfolding -> Bool
         -- Returns False for OtherCon
 isValueUnfolding (CoreUnfolding { uf_cache = cache }) = uf_is_value cache
+isValueUnfolding (DFunUnfolding {})                   = True
 isValueUnfolding _                                    = False
 
 -- | Determines if it possibly the case that the unfolding will
@@ -1595,9 +1503,10 @@ isValueUnfolding _                                    = False
 -- for 'OtherCon'
 isEvaldUnfolding :: Unfolding -> Bool
         -- Returns True for OtherCon
-isEvaldUnfolding (OtherCon _)                               = True
+isEvaldUnfolding (OtherCon _)                         = True
+isEvaldUnfolding (DFunUnfolding {})                   = True
 isEvaldUnfolding (CoreUnfolding { uf_cache = cache }) = uf_is_value cache
-isEvaldUnfolding _                                          = False
+isEvaldUnfolding _                                    = False
 
 -- | @True@ if the unfolding is a constructor application, the application
 -- of a CONLIKE function or 'OtherCon'
@@ -1625,8 +1534,8 @@ expandUnfolding_maybe (CoreUnfolding { uf_cache = cache, uf_tmpl = rhs })
 expandUnfolding_maybe _ = Nothing
 
 isCompulsoryUnfolding :: Unfolding -> Bool
-isCompulsoryUnfolding (CoreUnfolding { uf_src = InlineCompulsory }) = True
-isCompulsoryUnfolding _                                             = False
+isCompulsoryUnfolding (CoreUnfolding { uf_src = src }) = isCompulsorySource src
+isCompulsoryUnfolding _                                = False
 
 isStableUnfolding :: Unfolding -> Bool
 -- True of unfoldings that should not be overwritten
@@ -1634,6 +1543,16 @@ isStableUnfolding :: Unfolding -> Bool
 isStableUnfolding (CoreUnfolding { uf_src = src }) = isStableSource src
 isStableUnfolding (DFunUnfolding {})               = True
 isStableUnfolding _                                = False
+
+isStableUserUnfolding :: Unfolding -> Bool
+-- True of unfoldings that arise from an INLINE or INLINEABLE pragma
+isStableUserUnfolding (CoreUnfolding { uf_src = src }) = isStableUserSource src
+isStableUserUnfolding _                                = False
+
+isStableSystemUnfolding :: Unfolding -> Bool
+-- True of unfoldings that arise from an INLINE or INLINEABLE pragma
+isStableSystemUnfolding (CoreUnfolding { uf_src = src }) = isStableSystemSource src
+isStableSystemUnfolding _                                = False
 
 isInlineUnfolding :: Unfolding -> Bool
 -- ^ True of a /stable/ unfolding that is
@@ -1691,8 +1610,8 @@ ones are
 
 We consider even a StableUnfolding as fragile, because it needs substitution.
 
-Note [InlineStable]
-~~~~~~~~~~~~~~~~~
+Note [Stable unfoldings]
+~~~~~~~~~~~~~~~~~~~~~~~~
 When you say
       {-# INLINE f #-}
       f x = <rhs>
@@ -1702,10 +1621,11 @@ with it.  Meanwhile, we can optimise <rhs> to our heart's content,
 leaving the original unfolding intact in Unfolding of 'f'. For example
         all xs = foldr (&&) True xs
         any p = all . map p  {-# INLINE any #-}
-We optimise any's RHS fully, but leave the InlineRule saying "all . map p",
-which deforests well at the call site.
+We optimise any's RHS fully, but leave the stable unfolding for `any`
+saying "all . map p", which deforests well at the call site.
 
-So INLINE pragma gives rise to an InlineRule, which captures the original RHS.
+So INLINE pragma gives rise to a stable unfolding, which captures the
+original RHS.
 
 Moreover, it's only used when 'f' is applied to the
 specified number of arguments; that is, the number of argument on
@@ -1719,19 +1639,39 @@ on the left, thus
 it'd only inline when applied to three arguments.  This slightly-experimental
 change was requested by Roman, but it seems to make sense.
 
-See also Note [Inlining an InlineRule] in GHC.Core.Unfold.
-
-
 Note [OccInfo in unfoldings and rules]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-In unfoldings and rules, we guarantee that the template is occ-analysed,
-so that the occurrence info on the binders is correct.  This is important,
-because the Simplifier does not re-analyse the template when using it. If
-the occurrence info is wrong
-  - We may get more simplifier iterations than necessary, because
-    once-occ info isn't there
-  - More seriously, we may get an infinite loop if there's a Rec
-    without a loop breaker marked
+In unfoldings and rules, we guarantee that the template is occ-analysed, so
+that the occurrence info on the binders is correct. That way, when the
+Simplifier inlines an unfolding, it doesn't need to occ-analysis it first.
+(The Simplifier is designed to simplify occ-analysed expressions.)
+
+Given this decision it's vital that we do *always* do it.
+
+* If we don't, we may get more simplifier iterations than necessary,
+  because once-occ info isn't there
+
+* More seriously, we may get an infinite loop if there's a Rec without a
+  loop breaker marked.
+
+* Or we may get code that mentions variables not in scope: #22761
+  e.g. Suppose we have a stable unfolding : \y. let z = p+1 in 3
+  Then the pre-simplifier occ-anal will occ-anal the unfolding
+  (redundantly perhaps, but we need its free vars); this will not report
+  the use of `p`; so p's binding will be discarded, and yet `p` is still
+  mentioned.
+
+  Better to occ-anal the unfolding at birth, which will drop the
+  z-binding as dead code.  (Remember, it's the occurrence analyser that
+  drops dead code.)
+
+* Another example is #8892:
+    \x -> letrec { f = ...g...; g* = f } in body
+  where g* is (for some strange reason) the loop breaker.  If we don't
+  occ-anal it when reading it in, we won't mark g as a loop breaker, and we
+  may inline g entirely in body, dropping its binding, and leaving the
+  occurrence in f out of scope. This happened in #8892, where the unfolding
+  in question was a DFun unfolding.
 
 
 ************************************************************************
@@ -1953,8 +1893,8 @@ mkDoubleLit       d = Lit (mkLitDouble d)
 mkDoubleLitDouble d = Lit (mkLitDouble (toRational d))
 
 -- | Bind all supplied binding groups over an expression in a nested let expression. Assumes
--- that the rhs satisfies the let/app invariant.  Prefer to use 'GHC.Core.Make.mkCoreLets' if
--- possible, which does guarantee the invariant
+-- that the rhs satisfies the let-can-float invariant.  Prefer to use
+-- 'GHC.Core.Make.mkCoreLets' if possible, which does guarantee the invariant
 mkLets        :: [Bind b] -> Expr b -> Expr b
 -- | Bind all supplied binders over an expression in a nested lambda expression. Prefer to
 -- use 'GHC.Core.Make.mkCoreLams' if possible
@@ -2036,6 +1976,21 @@ bindersOf (Rec pairs)       = [binder | (binder, _) <- pairs]
 bindersOfBinds :: [Bind b] -> [b]
 bindersOfBinds binds = foldr ((++) . bindersOf) [] binds
 
+-- We inline this to avoid unknown function calls.
+{-# INLINE foldBindersOfBindStrict #-}
+foldBindersOfBindStrict :: (a -> b -> a) -> a -> Bind b -> a
+foldBindersOfBindStrict f
+  = \z bind -> case bind of
+      NonRec b _rhs -> f z b
+      Rec pairs -> foldl' f z $ map fst pairs
+
+{-# INLINE foldBindersOfBindsStrict #-}
+foldBindersOfBindsStrict :: (a -> b -> a) -> a -> [Bind b] -> a
+foldBindersOfBindsStrict f = \z binds -> foldl' fold_bind z binds
+  where
+    fold_bind = (foldBindersOfBindStrict f)
+
+
 rhssOfBind :: Bind b -> [Expr b]
 rhssOfBind (NonRec _ rhs) = [rhs]
 rhssOfBind (Rec pairs)    = [rhs | (_,rhs) <- pairs]
@@ -2057,9 +2012,11 @@ collectBinders         :: Expr b   -> ([b],     Expr b)
 collectTyBinders       :: CoreExpr -> ([TyVar], CoreExpr)
 collectValBinders      :: CoreExpr -> ([Id],    CoreExpr)
 collectTyAndValBinders :: CoreExpr -> ([TyVar], [Id], CoreExpr)
--- | Strip off exactly N leading lambdas (type or value). Good for use with
--- join points.
-collectNBinders        :: Int -> Expr b -> ([b], Expr b)
+
+-- | Strip off exactly N leading lambdas (type or value).
+-- Good for use with join points.
+-- Panic if there aren't enough
+collectNBinders :: JoinArity -> Expr b -> ([b], Expr b)
 
 collectBinders expr
   = go [] expr
@@ -2092,6 +2049,18 @@ collectNBinders orig_n orig_expr
     go n bs (Lam b e) = go (n-1) (b:bs) e
     go _ _  _         = pprPanic "collectNBinders" $ int orig_n
 
+-- | Strip off exactly N leading value lambdas
+-- returning all the binders found up to that point
+-- Return Nothing if there aren't enough
+collectNValBinders_maybe :: Arity -> CoreExpr -> Maybe ([Var], CoreExpr)
+collectNValBinders_maybe orig_n orig_expr
+  = go orig_n [] orig_expr
+  where
+    go 0 bs expr      = Just (reverse bs, expr)
+    go n bs (Lam b e) | isId b    = go (n-1) (b:bs) e
+                      | otherwise = go n     (b:bs) e
+    go _ _  _         = Nothing
+
 -- | Takes a nested application expression and returns the function
 -- being applied and the arguments to which it is applied
 collectArgs :: Expr b -> (Expr b, [Arg b])
@@ -2100,6 +2069,19 @@ collectArgs expr
   where
     go (App f a) as = go f (a:as)
     go e         as = (e, as)
+
+-- | Takes a nested application expression and returns the function
+-- being applied. Looking through casts and ticks to find it.
+collectFunSimple :: Expr b -> Expr b
+collectFunSimple expr
+  = go expr
+  where
+    go expr' =
+      case expr' of
+        App f _a    -> go f
+        Tick _t e   -> go e
+        Cast e _co  -> go e
+        e           -> e
 
 -- | fmap on the body of a lambda.
 --   wrapLamBody f (\x -> body) == (\x -> f body)

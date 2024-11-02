@@ -14,12 +14,11 @@ types that
 \end{itemize}
 -}
 
+{-# OPTIONS_GHC -Wno-orphans #-} -- Outputable PromotionFlag, Binary PromotionFlag, Outputable Boxity, Binay Boxity
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
-
-{-# OPTIONS_GHC -Wno-incomplete-record-updates #-}
 
 module GHC.Types.Basic (
         LeftOrRight(..),
@@ -48,7 +47,8 @@ module GHC.Types.Basic (
 
         CbvMark(..), isMarkedCbv,
 
-        PprPrec(..), topPrec, sigPrec, opPrec, funPrec, starPrec, appPrec,
+        PprPrec(..), topPrec, sigPrec, opPrec, funPrec,
+        starPrec, appPrec, maxPrec,
         maybeParen,
 
         TupleSort(..), tupleSortBoxity, boxityTupleSort,
@@ -97,17 +97,17 @@ module GHC.Types.Basic (
         setInlinePragmaActivation, setInlinePragmaRuleMatchInfo,
         pprInline, pprInlineDebug,
 
+        UnfoldingSource(..), isStableSource, isStableUserSource,
+        isStableSystemSource, isCompulsorySource,
+
         SuccessFlag(..), succeeded, failed, successIf,
 
         IntWithInf, infinity, treatZeroAsInf, subWithInf, mkIntWithInf, intGtLimit,
 
-        SpliceExplicitFlag(..),
-
         TypeOrKind(..), isTypeLevel, isKindLevel,
 
         Levity(..), mightBeLifted, mightBeUnlifted,
-
-        ExprOrPat(..),
+        TypeOrConstraint(..),
 
         NonStandardDefaultingStrategy(..),
         DefaultingStrategy(..), defaultNonStandardTyVars,
@@ -126,14 +126,14 @@ import GHC.Types.SourceText
 import qualified GHC.LanguageExtensions as LangExt
 import Data.Data
 import qualified Data.Semigroup as Semi
+import {-# SOURCE #-} Language.Haskell.Syntax.Type (PromotionFlag(..), isPromoted)
+import Language.Haskell.Syntax.Basic (Boxity(..), isBoxed, ConTag)
 
-{-
-************************************************************************
+{- *********************************************************************
 *                                                                      *
           Binary choice
 *                                                                      *
-************************************************************************
--}
+********************************************************************* -}
 
 data LeftOrRight = CLeft | CRight
                  deriving( Eq, Data )
@@ -198,12 +198,6 @@ type FullArgCount = Int
 *                                                                      *
 ************************************************************************
 -}
-
--- | A *one-index* constructor tag
---
--- Type of the tags associated with each constructor possibility or superclass
--- selector
-type ConTag = Int
 
 -- | A *zero-indexed* constructor tag
 type ConTagZ = Int
@@ -289,14 +283,14 @@ Moving parts:
      f g x = Just (case g x of { ... })
 
   Here 'f' is lazy in 'g', but it guarantees to call it no
-  more than once.  So g will get a C1(U) usage demand.
+  more than once.  So g will get a C(1,U) usage demand.
 
 * Occurrence analysis propagates this usage information
   (in the demand signature of a function) to its calls.
   Example, given 'f' above
      f (\x.e) blah
 
-  Since f's demand signature says it has a C1(U) usage demand on its
+  Since f's demand signature says it has a C(1,U) usage demand on its
   first argument, the occurrence analyser sets the \x to be one-shot.
   This is done via the occ_one_shots field of OccEnv.
 
@@ -364,7 +358,7 @@ bestOneShot NoOneShotInfo os         = os
 bestOneShot OneShotLam    _          = OneShotLam
 
 pprOneShotInfo :: OneShotInfo -> SDoc
-pprOneShotInfo NoOneShotInfo = empty
+pprOneShotInfo NoOneShotInfo = text "NoOS"
 pprOneShotInfo OneShotLam    = text "OneShot"
 
 instance Outputable OneShotInfo where
@@ -404,16 +398,6 @@ unSwap IsSwapped  f a b = f b a
            Promotion flag
 *                                                                      *
 ********************************************************************* -}
-
--- | Is a TyCon a promoted data constructor or just a normal type constructor?
-data PromotionFlag
-  = NotPromoted
-  | IsPromoted
-  deriving ( Eq, Data )
-
-isPromoted :: PromotionFlag -> Bool
-isPromoted IsPromoted  = True
-isPromoted NotPromoted = False
 
 instance Outputable PromotionFlag where
   ppr NotPromoted = text "NotPromoted"
@@ -501,15 +485,6 @@ instance Outputable TopLevelFlag where
 *                                                                      *
 ************************************************************************
 -}
-
-data Boxity
-  = Boxed
-  | Unboxed
-  deriving( Eq, Data )
-
-isBoxed :: Boxity -> Bool
-isBoxed Boxed   = True
-isBoxed Unboxed = False
 
 instance Outputable Boxity where
   ppr Boxed   = text "Boxed"
@@ -621,7 +596,7 @@ instance Outputable Origin where
 -}
 
 -- | The semantics allowed for overlapping instances for a particular
--- instance. See Note [Safe Haskell isSafeOverlap] (in "GHC.Core.InstEnv") for a
+-- instance. See Note [Safe Haskell isSafeOverlap] in GHC.Core.InstEnv for a
 -- explanation of the `isSafeOverlap` field.
 --
 -- - 'GHC.Parser.Annotation.AnnKeywordId' :
@@ -771,16 +746,17 @@ pprSafeOverlap False = empty
 newtype PprPrec = PprPrec Int deriving (Eq, Ord, Show)
 -- See Note [Precedence in types]
 
-topPrec, sigPrec, funPrec, opPrec, starPrec, appPrec :: PprPrec
-topPrec = PprPrec 0 -- No parens
-sigPrec = PprPrec 1 -- Explicit type signatures
-funPrec = PprPrec 2 -- Function args; no parens for constructor apps
-                    -- See [Type operator precedence] for why both
-                    -- funPrec and opPrec exist.
-opPrec  = PprPrec 2 -- Infix operator
+topPrec, sigPrec, funPrec, opPrec, starPrec, appPrec, maxPrec :: PprPrec
+topPrec  = PprPrec 0 -- No parens
+sigPrec  = PprPrec 1 -- Explicit type signatures
+funPrec  = PprPrec 2 -- Function args; no parens for constructor apps
+                     -- See [Type operator precedence] for why both
+                     -- funPrec and opPrec exist.
+opPrec   = PprPrec 2 -- Infix operator
 starPrec = PprPrec 3 -- Star syntax for the type of types, i.e. the * in (* -> *)
                      -- See Note [Star kind precedence]
 appPrec  = PprPrec 4 -- Constructor args; no parens for atomic
+maxPrec  = appPrec   -- Maximum precendence
 
 maybeParen :: PprPrec -> PprPrec -> SDoc -> SDoc
 maybeParen ctxt_prec inner_prec pretty
@@ -1367,7 +1343,7 @@ isAlwaysActive AlwaysActive = True
 isAlwaysActive _            = False
 
 competesWith :: Activation -> Activation -> Bool
--- See Note [Activation competition]
+-- See Note [Competing activations]
 competesWith AlwaysActive      _                = True
 
 competesWith NeverActive       _                = False
@@ -1459,7 +1435,7 @@ If you write nothing at all, you get defaultInlinePragma:
 It's not possible to get that combination by *writing* something, so
 if an Id has defaultInlinePragma it means the user didn't specify anything.
 
-If inl_inline = Inline or Inlineable, then the Id should have an InlineRule unfolding.
+If inl_inline = Inline or Inlineable, then the Id should have a stable unfolding.
 
 If you want to know where InlinePragmas take effect: Look in GHC.HsToCore.Binds.makeCorePair
 
@@ -1773,9 +1749,11 @@ inlinePragmaName (NoInline          _)  = text "NOINLINE"
 inlinePragmaName (Opaque            _)  = text "OPAQUE"
 inlinePragmaName NoUserInlinePrag       = empty
 
+-- | Pretty-print without displaying the user-specified 'InlineSpec'.
 pprInline :: InlinePragma -> SDoc
 pprInline = pprInline' True
 
+-- | Pretty-print including the user-specified 'InlineSpec'.
 pprInlineDebug :: InlinePragma -> SDoc
 pprInlineDebug = pprInline' False
 
@@ -1802,6 +1780,62 @@ pprInline' emptyInline (InlinePragma
               | otherwise      = ppr info
 
 
+{- *********************************************************************
+*                                                                      *
+                 UnfoldingSource
+*                                                                      *
+********************************************************************* -}
+
+data UnfoldingSource
+  = -- See also Note [Historical note: unfoldings for wrappers]
+    VanillaSrc         -- The current rhs of the function
+                       -- Replace uf_tmpl each time around
+
+  -- See Note [Stable unfoldings] in GHC.Core
+  | StableUserSrc   -- From a user-specified INLINE or INLINABLE pragma
+  | StableSystemSrc -- From a wrapper, or system-generated unfolding
+
+  | CompulsorySrc   -- Something that *has* no binding, so you *must* inline it
+                    -- Only a few primop-like things have this property
+                    -- (see "GHC.Types.Id.Make", calls to mkCompulsoryUnfolding).
+                    -- Inline absolutely always, however boring the context.
+
+isStableUserSource :: UnfoldingSource -> Bool
+isStableUserSource StableUserSrc = True
+isStableUserSource _             = False
+
+isStableSystemSource :: UnfoldingSource -> Bool
+isStableSystemSource StableSystemSrc = True
+isStableSystemSource _               = False
+
+isCompulsorySource :: UnfoldingSource -> Bool
+isCompulsorySource CompulsorySrc = True
+isCompulsorySource _             = False
+
+isStableSource :: UnfoldingSource -> Bool
+isStableSource CompulsorySrc   = True
+isStableSource StableSystemSrc = True
+isStableSource StableUserSrc   = True
+isStableSource VanillaSrc      = False
+
+instance Binary UnfoldingSource where
+    put_ bh CompulsorySrc   = putByte bh 0
+    put_ bh StableUserSrc   = putByte bh 1
+    put_ bh StableSystemSrc = putByte bh 2
+    put_ bh VanillaSrc      = putByte bh 3
+    get bh = do
+        h <- getByte bh
+        case h of
+            0 -> return CompulsorySrc
+            1 -> return StableUserSrc
+            2 -> return StableSystemSrc
+            _ -> return VanillaSrc
+
+instance Outputable UnfoldingSource where
+  ppr CompulsorySrc     = text "Compulsory"
+  ppr StableUserSrc     = text "StableUser"
+  ppr StableSystemSrc   = text "StableSystem"
+  ppr VanillaSrc        = text "<vanilla>"
 
 {-
 ************************************************************************
@@ -1877,11 +1911,6 @@ treatZeroAsInf n = Int n
 mkIntWithInf :: Int -> IntWithInf
 mkIntWithInf = Int
 
-data SpliceExplicitFlag
-          = ExplicitSplice | -- ^ <=> $(f x y)
-            ImplicitSplice   -- ^ <=> f x y,  i.e. a naked top level expression
-    deriving Data
-
 {- *********************************************************************
 *                                                                      *
                         Types vs Kinds
@@ -1906,9 +1935,16 @@ isKindLevel KindLevel = True
 
 {- *********************************************************************
 *                                                                      *
-                     Levity information
+                 Levity and TypeOrConstraint
 *                                                                      *
 ********************************************************************* -}
+
+{- The types `Levity` and `TypeOrConstraint` are internal to GHC.
+   They have the same shape as the eponymous types in the library
+      ghc-prim:GHC.Types
+   but they aren't the same types -- after all, they are defined in a
+   different module.
+-}
 
 data Levity
   = Lifted
@@ -1927,24 +1963,10 @@ mightBeUnlifted :: Maybe Levity -> Bool
 mightBeUnlifted (Just Lifted) = False
 mightBeUnlifted _             = True
 
-{- *********************************************************************
-*                                                                      *
-                     Expressions vs Patterns
-*                                                                      *
-********************************************************************* -}
+data TypeOrConstraint
+  = TypeLike | ConstraintLike
+  deriving( Eq, Ord, Data )
 
--- | Are we dealing with an expression or a pattern?
---
--- Used only for the textual output of certain error messages;
--- see the 'FRRDataConArg' constructor of 'FixedRuntimeRepContext'.
-data ExprOrPat
-  = Expression
-  | Pattern
-  deriving Eq
-
-instance Outputable ExprOrPat where
-  ppr Expression = text "expression"
-  ppr Pattern    = text "pattern"
 
 {- *********************************************************************
 *                                                                      *

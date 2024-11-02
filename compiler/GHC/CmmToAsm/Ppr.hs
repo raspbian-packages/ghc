@@ -27,7 +27,6 @@ import GHC.Cmm.CLabel
 import GHC.Cmm
 import GHC.CmmToAsm.Config
 import GHC.Utils.Outputable as SDoc
-import qualified GHC.Utils.Ppr as Pretty
 import GHC.Utils.Panic
 import GHC.Platform
 
@@ -89,7 +88,7 @@ doubleToBytes d = runST $ do
 -- Print as a string and escape non-printable characters.
 -- This is similar to charToC in GHC.Utils.Misc
 
-pprASCII :: ByteString -> SDoc
+pprASCII :: forall doc. IsLine doc => ByteString -> doc
 pprASCII str
   -- Transform this given literal bytestring to escaped string and construct
   -- the literal SDoc directly.
@@ -98,19 +97,19 @@ pprASCII str
   --
   -- We work with a `Doc` instead of an `SDoc` because there is no need to carry
   -- an `SDocContext` that we don't use. It leads to nicer (STG) code.
-  = docToSDoc (BS.foldr f Pretty.empty str)
+  = BS.foldr f empty str
     where
-       f :: Word8 -> Pretty.Doc -> Pretty.Doc
-       f w s = do1 w Pretty.<> s
+       f :: Word8 -> doc -> doc
+       f w s = do1 w <> s
 
-       do1 :: Word8 -> Pretty.Doc
-       do1 w | 0x09 == w = Pretty.text "\\t"
-             | 0x0A == w = Pretty.text "\\n"
-             | 0x22 == w = Pretty.text "\\\""
-             | 0x5C == w = Pretty.text "\\\\"
+       do1 :: Word8 -> doc
+       do1 w | 0x09 == w = text "\\t"
+             | 0x0A == w = text "\\n"
+             | 0x22 == w = text "\\\""
+             | 0x5C == w = text "\\\\"
                -- ASCII printable characters range
-             | w >= 0x20 && w <= 0x7E = Pretty.char (chr' w)
-             | otherwise = Pretty.sizedText 4 xs
+             | w >= 0x20 && w <= 0x7E = char (chr' w)
+             | otherwise = text xs
                 where
                  !xs = [ '\\', x0, x1, x2] -- octal
                  !x0 = chr' (ord0 + (w `unsafeShiftR` 6) .&. 0x07)
@@ -122,20 +121,25 @@ pprASCII str
        -- so we bypass the check in "chr"
        chr' :: Word8 -> Char
        chr' (W8# w#) = C# (chr# (word2Int# (word8ToWord# w#)))
-
+{-# SPECIALIZE pprASCII :: ByteString -> SDoc #-}
+{-# SPECIALIZE pprASCII :: ByteString -> HLine #-} -- see Note [SPECIALIZE to HDoc] in GHC.Utils.Outputable
 
 -- | Emit a ".string" directive
-pprString :: ByteString -> SDoc
+pprString :: IsLine doc => ByteString -> doc
 pprString bs = text "\t.string " <> doubleQuotes (pprASCII bs)
+{-# SPECIALIZE pprString :: ByteString -> SDoc #-}
+{-# SPECIALIZE pprString :: ByteString -> HLine #-} -- see Note [SPECIALIZE to HDoc] in GHC.Utils.Outputable
 
 -- | Emit a ".incbin" directive
 --
 -- A NULL byte is added after the binary data.
-pprFileEmbed :: FilePath -> SDoc
+pprFileEmbed :: IsLine doc => FilePath -> doc
 pprFileEmbed path
    = text "\t.incbin "
      <> pprFilePathString path -- proper escape (see #16389)
      <> text "\n\t.byte 0"
+{-# SPECIALIZE pprFileEmbed :: FilePath -> SDoc #-}
+{-# SPECIALIZE pprFileEmbed :: FilePath -> HLine #-} -- see Note [SPECIALIZE to HDoc] in GHC.Utils.Outputable
 
 {-
 Note [Embedding large binary blobs]
@@ -193,14 +197,16 @@ string in source code. See #14741 for profiling results.
 -- identical strings in the linker. With -split-sections each string also gets
 -- a unique section to allow strings from unused code to be GC'd.
 
-pprSectionHeader :: NCGConfig -> Section -> SDoc
+pprSectionHeader :: IsLine doc => NCGConfig -> Section -> doc
 pprSectionHeader config (Section t suffix) =
  case platformOS (ncgPlatform config) of
    OSAIX     -> pprXcoffSectionHeader t
    OSDarwin  -> pprDarwinSectionHeader t
    _         -> pprGNUSectionHeader config t suffix
+{-# SPECIALIZE pprSectionHeader :: NCGConfig -> Section -> SDoc #-}
+{-# SPECIALIZE pprSectionHeader :: NCGConfig -> Section -> HLine #-} -- see Note [SPECIALIZE to HDoc] in GHC.Utils.Outputable
 
-pprGNUSectionHeader :: NCGConfig -> SectionType -> CLabel -> SDoc
+pprGNUSectionHeader :: IsLine doc => NCGConfig -> SectionType -> CLabel -> doc
 pprGNUSectionHeader config t suffix =
   hcat [text ".section ", header, subsection, flags]
   where
@@ -210,7 +216,7 @@ pprGNUSectionHeader config t suffix =
     platform      = ncgPlatform config
     splitSections = ncgSplitSections config
     subsection
-      | splitSections = sep <> pdoc platform suffix
+      | splitSections = sep <> pprAsmLabel platform suffix
       | otherwise     = empty
     header = case t of
       Text -> text ".text"
@@ -224,9 +230,6 @@ pprGNUSectionHeader config t suffix =
                                           -> text ".rdata$rel.ro"
                               | otherwise -> text ".data.rel.ro"
       UninitialisedData -> text ".bss"
-      ReadOnlyData16 | OSMinGW32 <- platformOS platform
-                                 -> text ".rdata$cst16"
-                     | otherwise -> text ".rodata.cst16"
       InitArray
         | OSMinGW32 <- platformOS platform
                     -> text ".ctors"
@@ -242,34 +245,43 @@ pprGNUSectionHeader config t suffix =
       OtherSection _ ->
         panic "PprBase.pprGNUSectionHeader: unknown section type"
     flags = case t of
+      Text
+        | OSMinGW32 <- platformOS platform, splitSections
+                    -> text ",\"xr\""
+        | splitSections
+                    -> text ",\"ax\"," <> sectionType platform "progbits"
       CString
         | OSMinGW32 <- platformOS platform
                     -> empty
         | otherwise -> text ",\"aMS\"," <> sectionType platform "progbits" <> text ",1"
       _ -> empty
+{-# SPECIALIZE pprGNUSectionHeader :: NCGConfig -> SectionType -> CLabel -> SDoc #-}
+{-# SPECIALIZE pprGNUSectionHeader :: NCGConfig -> SectionType -> CLabel -> HLine #-} -- see Note [SPECIALIZE to HDoc] in GHC.Utils.Outputable
 
 -- XCOFF doesn't support relocating label-differences, so we place all
 -- RO sections into .text[PR] sections
-pprXcoffSectionHeader :: SectionType -> SDoc
+pprXcoffSectionHeader :: IsLine doc => SectionType -> doc
 pprXcoffSectionHeader t = case t of
   Text                    -> text ".csect .text[PR]"
   Data                    -> text ".csect .data[RW]"
   ReadOnlyData            -> text ".csect .text[PR] # ReadOnlyData"
   RelocatableReadOnlyData -> text ".csect .text[PR] # RelocatableReadOnlyData"
-  ReadOnlyData16          -> text ".csect .text[PR] # ReadOnlyData16"
   CString                 -> text ".csect .text[PR] # CString"
   UninitialisedData       -> text ".csect .data[BS]"
   _                       -> panic "pprXcoffSectionHeader: unknown section type"
+{-# SPECIALIZE pprXcoffSectionHeader :: SectionType -> SDoc #-}
+{-# SPECIALIZE pprXcoffSectionHeader :: SectionType -> HLine #-} -- see Note [SPECIALIZE to HDoc] in GHC.Utils.Outputable
 
-pprDarwinSectionHeader :: SectionType -> SDoc
+pprDarwinSectionHeader :: IsLine doc => SectionType -> doc
 pprDarwinSectionHeader t = case t of
   Text                    -> text ".text"
   Data                    -> text ".data"
   ReadOnlyData            -> text ".const"
   RelocatableReadOnlyData -> text ".const_data"
   UninitialisedData       -> text ".data"
-  ReadOnlyData16          -> text ".const"
   InitArray               -> text ".section\t__DATA,__mod_init_func,mod_init_funcs"
   FiniArray               -> panic "pprDarwinSectionHeader: fini not supported"
   CString                 -> text ".section\t__TEXT,__cstring,cstring_literals"
   OtherSection _          -> panic "pprDarwinSectionHeader: unknown section type"
+{-# SPECIALIZE pprDarwinSectionHeader :: SectionType -> SDoc #-}
+{-# SPECIALIZE pprDarwinSectionHeader :: SectionType -> HLine #-} -- see Note [SPECIALIZE to HDoc] in GHC.Utils.Outputable

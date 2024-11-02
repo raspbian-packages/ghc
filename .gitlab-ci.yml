@@ -2,7 +2,7 @@ variables:
   GIT_SSL_NO_VERIFY: "1"
 
   # Commit of ghc/ci-images repository from which to pull Docker images
-  DOCKER_REV: 58d08589371e78829a3279c6f8b1241e155d7f70
+  DOCKER_REV: 572353e0644044fe3a5465bba4342a9a0b0eb60e
 
   # Sequential version number of all cached things.
   # Bump to invalidate GitLab CI cache.
@@ -17,7 +17,10 @@ variables:
   # Overridden by individual jobs
   CONFIGURE_ARGS: ""
 
-  GIT_SUBMODULE_STRATEGY: "recursive"
+  # Overridden by individual jobs
+  CONFIGURE_WRAPPER: ""
+
+  GIT_SUBMODULE_STRATEGY: "normal"
 
   # Makes ci.sh isolate CABAL_DIR
   HERMETIC: "YES"
@@ -79,9 +82,9 @@ workflow:
 # which versions of GHC to allow bootstrap with
 .bootstrap_matrix : &bootstrap_matrix
   matrix:
-    - GHC_VERSION: 9.0.2
-      DOCKER_IMAGE: "registry.gitlab.haskell.org/ghc/ci-images/x86_64-linux-deb10-ghc9_0:$DOCKER_REV"
-    - GHC_VERSION: 9.2.2
+    - GHC_VERSION: 9.2.5
+      DOCKER_IMAGE: "registry.gitlab.haskell.org/ghc/ci-images/x86_64-linux-deb10-ghc9_2:$DOCKER_REV"
+    - GHC_VERSION: 9.4.3
       DOCKER_IMAGE: "registry.gitlab.haskell.org/ghc/ci-images/x86_64-linux-deb10:$DOCKER_REV"
 
 # Allow linters to fail on draft MRs.
@@ -163,7 +166,9 @@ not-interruptible:
   stage: not-interruptible
   script: "true"
   interruptible: false
-  image: "registry.gitlab.haskell.org/ghc/ci-images/x86_64-linux-deb10:$DOCKER_REV"
+  image: "debian:10"
+  variables:
+    GIT_STRATEGY: none
   tags:
     - lint
   rules:
@@ -259,26 +264,20 @@ lint-author:
     - *drafts-can-fail-lint
 
 lint-ci-config:
-  image: "nixos/nix:2.8.0"
+  image: nixos/nix:2.12.0
   extends: .lint
+  # We don't need history/submodules in this job
   variables:
-    BUILD_FLAVOUR: default
+    GIT_DEPTH: 1
+    GIT_SUBMODULE_STRATEGY: none
   before_script:
-    - mkdir -p ~/.cabal
-    - cp -Rf cabal-cache/* ~/.cabal || true
+    - echo "experimental-features = nix-command flakes" >> /etc/nix/nix.conf
+    - nix-channel --update
   script:
-    - nix shell --extra-experimental-features nix-command --extra-experimental-features flakes nixpkgs#cabal-install nixpkgs#ghc -c cabal update
     - .gitlab/generate_jobs
-        # 1 if .gitlab/generate_jobs changed the output of the generated config
-    - nix shell --extra-experimental-features nix-command --extra-experimental-features flakes nixpkgs#git -c git diff --exit-code
-  after_script:
-    - rm -Rf cabal-cache
-    - cp -Rf ~/.cabal cabal-cache
+    # 1 if .gitlab/generate_jobs changed the output of the generated config
+    - nix shell nixpkgs#git -c git diff --exit-code
   dependencies: []
-  cache:
-    key: lint-ci-$CACHE_REV
-    paths:
-      - cabal-cache
 
 lint-submods:
   extends: .lint-submods
@@ -287,6 +286,9 @@ lint-submods:
   rules:
     - if: '$CI_MERGE_REQUEST_LABELS =~ /.*marge_bot_batch_merge_job.*/'
       allow_failure: false
+    # Don't run on nightly because the program needs a base commit to check.
+    - if: $NIGHTLY
+      when: never
     - allow_failure: true
 
 lint-submods-branch:
@@ -344,7 +346,10 @@ hlint-ghc-and-base:
 
 hadrian-ghc-in-ghci:
   stage: quick-build
-  needs: [lint-linters, lint-submods]
+  needs:
+    - job: lint-linters
+    - job: lint-submods
+      optional: true
   image: "registry.gitlab.haskell.org/ghc/ci-images/x86_64-linux-deb10:$DOCKER_REV"
   before_script:
     # workaround for docker permissions
@@ -362,6 +367,57 @@ hadrian-ghc-in-ghci:
   after_script:
     - .gitlab/ci.sh save_cache
     - cat ci-timings
+  cache:
+    key: hadrian-ghci-$CACHE_REV
+    paths:
+      - cabal-cache
+
+############################################################
+# Hadrian Multi-Repl
+############################################################
+
+hadrian-multi:
+  stage: testing
+  needs:
+    - job: x86_64-linux-fedora33-release
+      optional: true
+    - job: nightly-x86_64-linux-fedora33-release
+      optional: true
+    - job: release-x86_64-linux-fedora33-release
+      optional: true
+  dependencies: null
+  image: "registry.gitlab.haskell.org/ghc/ci-images/x86_64-linux-fedora33:$DOCKER_REV"
+  before_script:
+    # workaround for docker permissions
+    - sudo chown ghc:ghc -R .
+  variables:
+    GHC_FLAGS: "-Werror -Wwarn=deprecations"
+    CONFIGURE_ARGS: --enable-bootstrap-with-devel-snapshot
+  tags:
+    - x86_64-linux
+  script:
+    - export BOOT_HC=$GHC
+    - root=$(pwd)/ghc
+    - ls
+    - |
+      mkdir tmp
+      tar -xf ghc-x86_64-linux-fedora33-release.tar.xz -C tmp
+      pushd tmp/ghc-*/
+      ./configure --prefix=$root
+      make install
+      popd
+      rm -Rf tmp
+    - export HC=$root/bin/ghc
+    # This GHC means, use this GHC to configure with
+    - export GHC=$root/bin/ghc
+    - .gitlab/ci.sh setup
+    - .gitlab/ci.sh configure
+    # Now GHC means, use this GHC for hadrian
+    - export GHC=$BOOT_HC
+    # Load hadrian-multi then immediately exit and check the modules loaded
+    - echo ":q" | hadrian/ghci-multi -j`mk/detect-cpu-count.sh`| tail -n2 | grep "Ok,"
+  after_script:
+    - .gitlab/ci.sh save_cache
   cache:
     key: hadrian-ghci-$CACHE_REV
     paths:
@@ -393,6 +449,33 @@ test-cabal-reinstall-x86_64-linux-deb10:
     REINSTALL_GHC: "yes"
     BUILD_FLAVOUR: validate
     TEST_ENV: "x86_64-linux-deb10-cabal-install"
+  rules:
+    - if: $NIGHTLY
+    - if: '$CI_MERGE_REQUEST_LABELS =~ /.*test-reinstall.*/'
+
+########################################
+# Testing ABI is invariant across builds
+########################################
+
+abi-test-nightly:
+  stage: full-build
+  needs:
+    - job: nightly-x86_64-linux-fedora33-release-hackage
+    - job: nightly-x86_64-linux-fedora33-release
+  tags:
+    - x86_64-linux
+  image: "registry.gitlab.haskell.org/ghc/ci-images/x86_64-linux-fedora33:$DOCKER_REV"
+  dependencies: null
+  before_script:
+    - mkdir -p normal
+    - mkdir -p hackage
+    - tar -xf ghc-x86_64-linux-fedora33-release.tar.xz -C normal/
+    - tar -xf ghc-x86_64-linux-fedora33-release-hackage_docs.tar.xz -C hackage/
+  script:
+    - .gitlab/ci.sh compare_interfaces_of "normal/ghc-*" "hackage/ghc-*"
+  artifacts:
+    paths:
+      - out
   rules:
     - if: $NIGHTLY
 
@@ -456,8 +539,6 @@ doc-tarball:
 hackage-doc-tarball:
   stage: packaging
   needs:
-    - job: x86_64-linux-fedora33-release-hackage
-      optional: true
     - job: nightly-x86_64-linux-fedora33-release-hackage
       optional: true
     - job: release-x86_64-linux-fedora33-release-hackage
@@ -480,7 +561,7 @@ hackage-doc-tarball:
     - tar -xf ghc-x86_64-linux-fedora33-release.tar.xz -C ghc*/
   script:
     - cd ghc*/
-    - mv .gitlab/upload_ghc_libs.py .
+    - mv .gitlab/rel_eng/upload_ghc_libs.py .
     - .gitlab/ci.sh setup
     - .gitlab/ci.sh configure
     - ./upload_ghc_libs.py prepare --bindist ghc*linux/
@@ -499,6 +580,7 @@ source-tarball:
     paths:
       - ghc-*.tar.xz
   script:
+    - sudo chown ghc:ghc -R .
     - ./boot
     - ./configure
     - ./hadrian/build source-dist
@@ -552,6 +634,7 @@ test-bootstrap:
   parallel: *bootstrap_matrix
   dependencies: null
   script:
+    - sudo chown ghc:ghc -R .
     - mkdir test-bootstrap
     - tar -xf ghc-*[0-9]-src.tar.xz -C test-bootstrap
     - tar -xf ghc-*-testsuite.tar.xz -C test-bootstrap
@@ -592,19 +675,21 @@ test-bootstrap:
 # access to an unprivileged access token with the ability to query the ghc/ghc
 # project such that it can find the job ID of the fedora33 job for the current
 # pipeline.
+#
+# hackage-lint: Can be triggered on any MR, normal validate pipeline or nightly build.
+#               Runs head.hackage with -dlint and a slow-validate bindist
+#
+# hackage-label-lint: Trigged on MRs with "user-facing" label, runs the slow-validate
+#                     head.hackage build with -dlint.
+#
+# nightly-hackage-lint: Runs automatically on nightly pipelines with slow-validate + dlint config.
+#
+# nightly-hackage-perf: Runs automaticaly on nightly pipelines with release build and eventlogging enabled.
+#
+# release-hackage-lint: Runs automatically on release pipelines with -dlint on a release bindist.
 
 .hackage:
   stage: testing
-  needs:
-    - job: x86_64-linux-fedora33-release
-      optional: true
-      artifacts: false
-    - job: nightly-x86_64-linux-fedora33-release
-      optional: true
-      artifacts: false
-    - job: release-x86_64-linux-fedora33-release
-      optional: true
-      artifacts: false
   variables:
     UPSTREAM_PROJECT_PATH: "$CI_PROJECT_PATH"
     UPSTREAM_PROJECT_ID: "$CI_PROJECT_ID"
@@ -612,34 +697,60 @@ test-bootstrap:
     RELEASE_JOB: "$RELEASE_JOB"
   trigger:
     project: "ghc/head.hackage"
-    branch: "master"
+    branch: "upstream-testing"
     strategy: "depend"
 
 hackage-lint:
+  needs:
+    - job: x86_64-linux-deb10-numa-slow-validate
+      optional: true
+      artifacts: false
+    - job: nightly-x86_64-linux-deb10-numa-slow-validate
+      optional: true
+      artifacts: false
   extends: .hackage
   variables:
-    EXTRA_HC_OPTS: "-dcore-lint"
+    SLOW_VALIDATE: 1
+    EXTRA_HC_OPTS: "-dlint"
+  # No for release jobs because there isn't a slow-valdate bindist. There is an
+  # automatic pipeline for release bindists (see release-hackage-lint)
+  rules:
+    - if: '$RELEASE_JOB != "yes"'
   when: manual
 
 hackage-label-lint:
+  needs:
+    - job: x86_64-linux-deb10-numa-slow-validate
+      optional: true
+      artifacts: false
   extends: .hackage
   variables:
-    EXTRA_HC_OPTS: "-dcore-lint"
+    SLOW_VALIDATE: 1
+    EXTRA_HC_OPTS: "-dlint"
   rules:
     - if: '$CI_MERGE_REQUEST_LABELS =~ /.*user-facing.*/'
 
-# The head.hackage job is split into two jobs because enabling `-dcore-lint`
+# The head.hackage job is split into two jobs because enabling `-dlint`
 # affects the total allocation numbers for the simplifier portion significantly.
 nightly-hackage-lint:
+  needs:
+    - job: nightly-x86_64-linux-deb10-numa-slow-validate
+      optional: true
+      artifacts: false
   rules:
     - if: $NIGHTLY
       variables:
         NIGHTLY: "$NIGHTLY"
   extends: .hackage
   variables:
-    EXTRA_HC_OPTS: "-dcore-lint"
+    SLOW_VALIDATE: 1
+    EXTRA_HC_OPTS: "-dlint"
 
 nightly-hackage-perf:
+  needs:
+    - job: nightly-x86_64-linux-fedora33-release
+      optional: true
+      artifacts: false
   rules:
     - if: $NIGHTLY
       variables:
@@ -648,9 +759,28 @@ nightly-hackage-perf:
   variables:
     # Generate logs for nightly builds which include timing information.
     EXTRA_HC_OPTS: "-ddump-timings"
+    # Ask head.hackage to generate eventlogs
+    EVENTLOGGING: 1
+
+release-hackage-lint:
+  needs:
+    - job: release-x86_64-linux-fedora33-release
+      optional: true
+      artifacts: false
+  rules:
+    - if: '$RELEASE_JOB == "yes"'
+  extends: .hackage
+  # The ghcup metadata pipeline requires all prior jobs to
+  # pass. The hackage job can easily fail due to API changes
+  # or similar - so we allow it to fail.
+  allow_failure: true
+  variables:
+    # No slow-validate bindist on release pipeline
+    EXTRA_HC_OPTS: "-dlint"
 
 ############################################################
 # Nofib testing
+# (Disabled: See #21859)
 ############################################################
 
 perf-nofib:
@@ -668,9 +798,11 @@ perf-nofib:
       optional: true
   image: "registry.gitlab.haskell.org/ghc/ci-images/x86_64-linux-fedora33:$DOCKER_REV"
   rules:
+    - when: never
     - if: $CI_MERGE_REQUEST_ID
     - if: '$CI_COMMIT_BRANCH == "master"'
     - if: '$CI_COMMIT_BRANCH =~ /ghc-[0.9]+\.[0-9]+/'
+    - if: '$CI_MERGE_REQUEST_LABELS !~ /.*fast-ci.*/'
   tags:
     - x86_64-linux
   before_script:
@@ -696,8 +828,6 @@ perf-nofib:
     when: always
     paths:
       - nofib/nofib.log
-  rules:
-    - if: '$CI_MERGE_REQUEST_LABELS !~ /.*fast-ci.*/'
 
 ############################################################
 # Ad-hoc performance testing
@@ -741,6 +871,46 @@ perf:
   rules:
     - if: '$CI_MERGE_REQUEST_LABELS !~ /.*fast-ci.*/'
 
+############################################################
+# ABI testing
+############################################################
+
+abi-test:
+  stage: testing
+  needs:
+    - job: x86_64-linux-fedora33-release
+      optional: true
+    - job: nightly-x86_64-linux-fedora33-release
+      optional: true
+    - job: release-x86_64-linux-fedora33-release
+      optional: true
+  dependencies: null
+  image: "registry.gitlab.haskell.org/ghc/ci-images/x86_64-linux-fedora33:$DOCKER_REV"
+  rules:
+    - if: $CI_MERGE_REQUEST_ID
+    - if: '$CI_COMMIT_BRANCH == "master"'
+    - if: '$CI_COMMIT_BRANCH =~ /ghc-[0.9]+\.[0-9]+/'
+  tags:
+    - x86_64-linux
+  script:
+    - root=$(pwd)/ghc
+    - |
+      mkdir tmp
+      tar -xf ghc-x86_64-linux-fedora33-release.tar.xz -C tmp
+      pushd tmp/ghc-*/
+      ./configure --prefix=$root
+      make install
+      popd
+      rm -Rf tmp
+    - export BOOT_HC=$(which ghc)
+    - export HC=$root/bin/ghc
+    - .gitlab/ci.sh abi_test
+  artifacts:
+    paths:
+      - out
+  rules:
+    - if: '$CI_MERGE_REQUEST_LABELS !~ /.*fast-ci.*/'
+
 
 ############################################################
 # Documentation deployment via GitLab Pages
@@ -757,7 +927,8 @@ pages:
     - x86_64-linux
   script:
     - mkdir -p public/doc
-    - tar -xf haddock.html.tar.xz -C public/doc
+    # haddock docs are not in the hadrian produce doc tarballs at the moment
+    # - tar -xf haddock.html.tar.xz -C public/doc
     - tar -xf libraries.html.tar.xz -C public/doc
     - tar -xf users_guide.html.tar.xz -C public/doc
     - |
@@ -771,6 +942,145 @@ pages:
     # N.B. only run this on ghc/ghc since the deployed pages are quite large
     # and we only serve GitLab Pages for ghc/ghc.
     - if: '$CI_COMMIT_BRANCH == "master" && $CI_PROJECT_NAMESPACE == "ghc"'
+    - if: '$CI_MERGE_REQUEST_LABELS =~ /.*publish-docs.*/'
+
   artifacts:
     paths:
       - public
+
+#############################################################
+# Generation of GHCUp metadata
+#############################################################
+
+
+project-version:
+  stage: packaging
+  image: "registry.gitlab.haskell.org/ghc/ci-images/x86_64-linux-deb10:$DOCKER_REV"
+  tags:
+    - x86_64-linux
+  variables:
+    BUILD_FLAVOUR: default
+  script:
+    # Calculate the project version
+    - sudo chown ghc:ghc -R .
+    - .gitlab/ci.sh setup
+    - .gitlab/ci.sh configure
+    - echo "ProjectVersion=$(cat VERSION)" > version.sh
+
+  needs: []
+  dependencies: []
+  artifacts:
+    paths:
+      - version.sh
+  rules:
+    - if: '$NIGHTLY'
+    - if: '$RELEASE_JOB == "yes"'
+
+.ghcup-metadata:
+  stage: deploy
+  image: "nixos/nix:2.12.0"
+  dependencies: null
+  tags:
+    - x86_64-linux
+  variables:
+    BUILD_FLAVOUR: default
+    GIT_SUBMODULE_STRATEGY: "none"
+  before_script:
+    - echo "experimental-features = nix-command flakes" >> /etc/nix/nix.conf
+    - nix-channel --update
+    - cat version.sh
+    # Calculate the project version
+    - . ./version.sh
+
+    # Download existing ghcup metadata
+    - nix shell --extra-experimental-features nix-command --extra-experimental-features flakes nixpkgs#wget -c wget "https://raw.githubusercontent.com/haskell/ghcup-metadata/develop/ghcup-0.0.7.yaml"
+
+    - .gitlab/generate_job_metadata
+
+  artifacts:
+    paths:
+      - metadata_test.yaml
+      - version.sh
+
+ghcup-metadata-nightly:
+  extends: .ghcup-metadata
+  # Explicit needs for validate pipeline because we only need certain bindists
+  needs:
+    - job: nightly-x86_64-linux-fedora33-release
+      artifacts: false
+    - job: nightly-x86_64-linux-centos7-validate
+      artifacts: false
+    - job: nightly-x86_64-linux-ubuntu20_04-validate
+      artifacts: false
+    - job: nightly-x86_64-linux-ubuntu18_04-validate
+      artifacts: false
+    - job: nightly-x86_64-linux-rocky8-validate
+      artifacts: false
+    - job: nightly-x86_64-darwin-validate
+      artifacts: false
+    - job: nightly-aarch64-darwin-validate
+      artifacts: false
+    - job: nightly-x86_64-windows-validate
+      artifacts: false
+    - job: nightly-x86_64-linux-alpine3_12-validate
+      artifacts: false
+    - job: nightly-x86_64-linux-deb9-validate
+      artifacts: false
+    - job: nightly-i386-linux-deb9-validate
+      artifacts: false
+    - job: nightly-x86_64-linux-deb10-validate
+      artifacts: false
+    - job: nightly-aarch64-linux-deb10-validate
+      artifacts: false
+    - job: nightly-x86_64-linux-deb11-validate
+      artifacts: false
+    - job: source-tarball
+      artifacts: false
+    - job: project-version
+  script:
+    - nix shell --extra-experimental-features nix-command -f .gitlab/rel_eng -c ghcup-metadata --metadata ghcup-0.0.7.yaml --pipeline-id="$CI_PIPELINE_ID" --version="$ProjectVersion" > "metadata_test.yaml"
+  rules:
+    - if: $NIGHTLY
+
+ghcup-metadata-release:
+  # No explicit needs for release pipeline as we assume we need everything and everything will pass.
+  extends: .ghcup-metadata
+  script:
+    - nix shell --extra-experimental-features nix-command -f .gitlab/rel_eng -c ghcup-metadata --release-mode --metadata ghcup-0.0.7.yaml --pipeline-id="$CI_PIPELINE_ID" --version="$ProjectVersion" > "metadata_test.yaml"
+  rules:
+    - if: '$RELEASE_JOB == "yes"'
+
+.ghcup-metadata-testing:
+  stage: deploy
+  variables:
+    UPSTREAM_PROJECT_PATH: "$CI_PROJECT_PATH"
+    UPSTREAM_PROJECT_ID: "$CI_PROJECT_ID"
+    UPSTREAM_PIPELINE_ID: "$CI_PIPELINE_ID"
+    RELEASE_JOB: "$RELEASE_JOB"
+  trigger:
+    project: "ghc/ghcup-ci"
+    branch: "upstream-testing"
+    strategy: "depend"
+
+ghcup-metadata-testing-nightly:
+  needs:
+    - job: ghcup-metadata-nightly
+      artifacts: false
+  extends: .ghcup-metadata-testing
+  variables:
+      NIGHTLY: "$NIGHTLY"
+      UPSTREAM_JOB_NAME: "ghcup-metadata-nightly"
+  rules:
+    - if: '$NIGHTLY == "1"'
+
+ghcup-metadata-testing-release:
+  needs:
+    - job: ghcup-metadata-release
+      artifacts: false
+  extends: .ghcup-metadata-testing
+  variables:
+      UPSTREAM_JOB_NAME: "ghcup-metadata-release"
+  rules:
+    - if: '$RELEASE_JOB == "yes"'
+  when: manual
+

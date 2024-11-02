@@ -25,7 +25,6 @@
 #include "ForeignExports.h"
 #include "Profiling.h"
 #include "sm/OSMem.h"
-#include "GetEnv.h"
 #include "linker/util.h"
 #include "linker/elf_util.h"
 
@@ -133,6 +132,11 @@
 
 */
 
+#if defined(SHN_XINDEX)
+/* global variable which address is used to signal an uninitialised shndx_table */
+Elf_Word shndx_table_uninit_label = 0;
+#endif
+
 static Elf_Word elf_shnum(Elf_Ehdr* ehdr)
 {
    Elf_Shdr* shdr = (Elf_Shdr*) ((char*)ehdr + ehdr->e_shoff);
@@ -155,16 +159,22 @@ static Elf_Word elf_shstrndx(Elf_Ehdr* ehdr)
 
 #if defined(SHN_XINDEX)
 static Elf_Word*
-get_shndx_table(Elf_Ehdr* ehdr)
+get_shndx_table(ObjectCode* oc)
 {
+   if (RTS_LIKELY(oc->shndx_table != SHNDX_TABLE_UNINIT)) {
+      return oc->shndx_table;
+   }
+
    Elf_Word  i;
-   char*     ehdrC    = (char*)ehdr;
+   char*     ehdrC    = oc->image;
+   Elf_Ehdr* ehdr     = (Elf_Ehdr*)ehdrC;
    Elf_Shdr* shdr     = (Elf_Shdr*) (ehdrC + ehdr->e_shoff);
    const Elf_Word shnum = elf_shnum(ehdr);
 
    for (i = 0; i < shnum; i++) {
      if (shdr[i].sh_type == SHT_SYMTAB_SHNDX) {
-       return (Elf32_Word*)(ehdrC + shdr[i].sh_offset);
+       oc->shndx_table = (Elf32_Word*)(ehdrC + shdr[i].sh_offset);
+       return oc->shndx_table;
      }
    }
    return NULL;
@@ -194,6 +204,10 @@ ocInit_ELF(ObjectCode * oc)
 
     oc->n_sections = elf_shnum(oc->info->elfHeader);
 
+    ElfRelocationTable *relTableLast = NULL;
+    ElfRelocationATable *relaTableLast = NULL;
+    ElfSymbolTable *symbolTablesLast = NULL;
+
     /* get the symbol table(s) */
     for(int i=0; i < oc->n_sections; i++) {
         if(SHT_REL  == oc->info->sectionHeader[i].sh_type) {
@@ -211,12 +225,12 @@ ocInit_ELF(ObjectCode * oc)
 
             relTab->sectionHeader      = &oc->info->sectionHeader[i];
 
-            if(oc->info->relTable == NULL) {
+            if(relTableLast == NULL) {
                 oc->info->relTable = relTab;
+                relTableLast = relTab;
             } else {
-                ElfRelocationTable * tail = oc->info->relTable;
-                while(tail->next != NULL) tail = tail->next;
-                tail->next = relTab;
+                relTableLast->next = relTab;
+                relTableLast = relTab;
             }
 
         } else if(SHT_RELA == oc->info->sectionHeader[i].sh_type) {
@@ -234,12 +248,12 @@ ocInit_ELF(ObjectCode * oc)
 
             relTab->sectionHeader      = &oc->info->sectionHeader[i];
 
-            if(oc->info->relaTable == NULL) {
+            if(relaTableLast == NULL) {
                 oc->info->relaTable = relTab;
+                relaTableLast = relTab;
             } else {
-                ElfRelocationATable * tail = oc->info->relaTable;
-                while(tail->next != NULL) tail = tail->next;
-                tail->next = relTab;
+                relaTableLast->next = relTab;
+                relaTableLast = relTab;
             }
 
         } else if(SHT_SYMTAB == oc->info->sectionHeader[i].sh_type) {
@@ -280,12 +294,12 @@ ocInit_ELF(ObjectCode * oc)
             }
 
             /* append the ElfSymbolTable */
-            if(oc->info->symbolTables == NULL) {
+            if(symbolTablesLast == NULL) {
                 oc->info->symbolTables = symTab;
+                symbolTablesLast = symTab;
             } else {
-                ElfSymbolTable * tail = oc->info->symbolTables;
-                while(tail->next != NULL) tail = tail->next;
-                tail->next = symTab;
+                symbolTablesLast->next = symTab;
+                symbolTablesLast = symTab;
             }
         }
     }
@@ -330,6 +344,9 @@ ocDeinit_ELF(ObjectCode * oc)
 
         stgFree(oc->info);
         oc->info = NULL;
+#if defined(SHN_XINDEX)
+        oc->shndx_table = SHNDX_TABLE_UNINIT;
+#endif
     }
 }
 
@@ -415,6 +432,12 @@ ocVerifyImage_ELF ( ObjectCode* oc )
 #if defined(EM_RISCV)
       case EM_RISCV:  IF_DEBUG(linker,debugBelch( "riscv" ));
           errorBelch("%s: RTS linker not implemented on riscv",
+                     oc->fileName);
+          return 0;
+#endif
+#if defined(EM_LOONGARCH)
+      case EM_LOONGARCH:  IF_DEBUG(linker,debugBelch( "loongarch64" ));
+          errorBelch("%s: RTS linker not implemented on loongarch64",
                      oc->fileName);
           return 0;
 #endif
@@ -527,7 +550,7 @@ ocVerifyImage_ELF ( ObjectCode* oc )
       IF_DEBUG(linker_verbose,debugBelch("   no normal string tables (potentially, but not necessarily a problem)\n"));
    }
 #if defined(SHN_XINDEX)
-   Elf_Word* shndxTable = get_shndx_table(ehdr);
+   Elf_Word* shndxTable = get_shndx_table(oc);
 #endif
    nsymtabs = 0;
    IF_DEBUG(linker_verbose,debugBelch( "Symbol tables\n" ));
@@ -678,13 +701,13 @@ ocGetNames_ELF ( ObjectCode* oc )
    Elf_Shdr* shdr     = (Elf_Shdr*) (ehdrC + ehdr->e_shoff);
    Section * sections;
 #if defined(SHN_XINDEX)
-   Elf_Word* shndxTable = get_shndx_table(ehdr);
+   Elf_Word* shndxTable = get_shndx_table(oc);
 #endif
    const Elf_Word shnum = elf_shnum(ehdr);
 
    ASSERT(symhash != NULL);
 
-   sections = (Section*)stgCallocBytes(sizeof(Section), shnum,
+   sections = (Section*)stgCallocBytes(shnum, sizeof(Section),
                                        "ocGetNames_ELF(sections)");
    oc->sections = sections;
    oc->n_sections = shnum;
@@ -710,6 +733,66 @@ ocGetNames_ELF ( ObjectCode* oc )
       StgWord size = shdr[i].sh_size;
       StgWord offset = shdr[i].sh_offset;
       StgWord align = shdr[i].sh_addralign;
+      const char *sh_name = oc->info->sectionHeaderStrtab + shdr[i].sh_name;
+
+      /*
+       * Identify initializer and finalizer lists
+       *
+       * See Note [Initializers and finalizers (ELF)].
+       */
+      if (kind == SECTIONKIND_CODE_OR_RODATA
+            && 0 == memcmp(".init", sh_name, 5)) {
+          addInitFini(&oc->info->init, &oc->sections[i], INITFINI_INIT, 0);
+      } else if (kind == SECTIONKIND_CODE_OR_RODATA
+            && 0 == memcmp(".fini", sh_name, 5)) {
+          addInitFini(&oc->info->fini, &oc->sections[i], INITFINI_FINI, 0);
+      } else if (kind == SECTIONKIND_INIT_ARRAY
+            || 0 == memcmp(".init_array", sh_name, 11)) {
+          uint32_t prio;
+          if (sscanf(sh_name, ".init_array.%d", &prio) != 1) {
+              // Sections without an explicit priority are run last
+              prio = 0;
+          }
+          prio += 0x10000; // .init_arrays run after .ctors
+          addInitFini(&oc->info->init, &oc->sections[i], INITFINI_INIT_ARRAY, prio);
+          kind = SECTIONKIND_INIT_ARRAY;
+      } else if (kind == SECTIONKIND_FINI_ARRAY
+            || 0 == memcmp(".fini_array", sh_name, 11)) {
+          uint32_t prio;
+          if (sscanf(sh_name, ".fini_array.%d", &prio) != 1) {
+              // Sections without an explicit priority are run last
+              prio = 0;
+          }
+          prio += 0x10000; // .fini_arrays run before .dtors
+          addInitFini(&oc->info->fini, &oc->sections[i], INITFINI_FINI_ARRAY, prio);
+          kind = SECTIONKIND_FINI_ARRAY;
+
+      /* N.B. a compilation unit may have more than one .ctor section; we
+       * must run them all. See #21618 for a case where this happened */
+      } else if (0 == memcmp(".ctors", sh_name, 6)) {
+          uint32_t prio;
+          if (sscanf(sh_name, ".ctors.%d", &prio) != 1) {
+              // Sections without an explicit priority are run last
+              prio = 0;
+          }
+          // .ctors/.dtors are executed in reverse order: higher numbers are
+          // executed first
+          prio = 0xffff - prio;
+          addInitFini(&oc->info->init, &oc->sections[i], INITFINI_CTORS, prio);
+          kind = SECTIONKIND_INIT_ARRAY;
+      } else if (0 == memcmp(".dtors", sh_name, 6)) {
+          uint32_t prio;
+          if (sscanf(sh_name, ".dtors.%d", &prio) != 1) {
+              // Sections without an explicit priority are run last
+              prio = 0;
+          }
+          // .ctors/.dtors are executed in reverse order: higher numbers are
+          // executed first
+          prio = 0xffff - prio;
+          addInitFini(&oc->info->fini, &oc->sections[i], INITFINI_DTORS, prio);
+          kind = SECTIONKIND_FINI_ARRAY;
+      }
+
 
       if (is_bss && size > 0) {
          /* This is a non-empty .bss section.  Allocate zeroed space for
@@ -850,12 +933,8 @@ ocGetNames_ELF ( ObjectCode* oc )
           oc->sections[i].info->stub_size = 0;
           oc->sections[i].info->stubs = NULL;
       }
-      oc->sections[i].info->name          = oc->info->sectionHeaderStrtab
-                                            + shdr[i].sh_name;
+      oc->sections[i].info->name          = sh_name;
       oc->sections[i].info->sectionHeader = &shdr[i];
-
-
-
 
       if (shdr[i].sh_type != SHT_SYMTAB) continue;
 
@@ -1190,7 +1269,11 @@ do_Elf_Rel_relocations ( ObjectCode* oc, char* ehdrC,
        IF_DEBUG(linker_verbose,
                 debugBelch("Reloc: P = %p   S = %p   A = %p   type=%d\n",
                            (void*)P, (void*)S, (void*)A, reloc_type ));
+#if defined(DEBUG)
        checkProddableBlock ( oc, pP, sizeof(Elf_Word) );
+#else
+       (void) pP; /* suppress unused varialbe warning in non-debug build */
+#endif
 
 #if defined(i386_HOST_ARCH)
        value = S + A;
@@ -1494,7 +1577,7 @@ do_Elf_Rela_relocations ( ObjectCode* oc, char* ehdrC,
    int strtab_shndx = shdr[symtab_shndx].sh_link;
    int target_shndx = shdr[shnum].sh_info;
 #if defined(SHN_XINDEX)
-   Elf_Word* shndx_table = get_shndx_table((Elf_Ehdr*)ehdrC);
+   Elf_Word* shndx_table = get_shndx_table(oc);
 #endif
 #if defined(DEBUG) || defined(powerpc_HOST_ARCH) || defined(x86_64_HOST_ARCH)
    /* This #if def only serves to avoid unused-var warnings. */
@@ -1596,7 +1679,7 @@ do_Elf_Rela_relocations ( ObjectCode* oc, char* ehdrC,
          IF_DEBUG(linker_verbose,debugBelch("`%s' resolves to %p\n", symbol, (void*)S));
       }
 
-#if defined(DEBUG) || defined(powerpc_HOST_ARCH) || defined(x86_64_HOST_ARCH)
+#if defined(DEBUG)
       IF_DEBUG(linker_verbose,debugBelch("Reloc: P = %p   S = %p   A = %p\n",
                                          (void*)P, (void*)S, (void*)A ));
       checkProddableBlock(oc, (void*)P, sizeof(Elf_Word));
@@ -1859,7 +1942,7 @@ ocResolve_ELF ( ObjectCode* oc )
    const Elf_Word shnum = elf_shnum(ehdr);
 
 #if defined(SHN_XINDEX)
-    Elf_Word* shndxTable = get_shndx_table(ehdr);
+    Elf_Word* shndxTable = get_shndx_table(oc);
 #endif
 
     /* resolve section symbols
@@ -1973,61 +2056,10 @@ ocResolve_ELF ( ObjectCode* oc )
 // See Note [Initializers and finalizers (ELF)].
 int ocRunInit_ELF( ObjectCode *oc )
 {
-   Elf_Word i;
-   char*     ehdrC = (char*)(oc->image);
-   Elf_Ehdr* ehdr  = (Elf_Ehdr*) ehdrC;
-   Elf_Shdr* shdr  = (Elf_Shdr*) (ehdrC + ehdr->e_shoff);
-   char* sh_strtab = ehdrC + shdr[elf_shstrndx(ehdr)].sh_offset;
-   int argc, envc;
-   char **argv, **envv;
-
-   getProgArgv(&argc, &argv);
-   getProgEnvv(&envc, &envv);
-
-   // XXX Apparently in some archs .init may be something
-   // special!  See DL_DT_INIT_ADDRESS macro in glibc
-   // as well as ELF_FUNCTION_PTR_IS_SPECIAL.  We've not handled
-   // it here, please file a bug report if it affects you.
-   for (i = 0; i < elf_shnum(ehdr); i++) {
-      init_t *init_start, *init_end, *init;
-      char *sh_name = sh_strtab + shdr[i].sh_name;
-      int is_bss = false;
-      SectionKind kind = getSectionKind_ELF(&shdr[i], &is_bss);
-
-      if (kind == SECTIONKIND_CODE_OR_RODATA
-       && 0 == memcmp(".init", sh_name, 5)) {
-          init_t init_f = (init_t)(oc->sections[i].start);
-          init_f(argc, argv, envv);
-      }
-
-      // Note [GCC 6 init/fini section workaround]
-      if (kind == SECTIONKIND_INIT_ARRAY
-          || 0 == memcmp(".init_array", sh_name, 11)) {
-         char *init_startC = oc->sections[i].start;
-         init_start = (init_t*)init_startC;
-         init_end = (init_t*)(init_startC + shdr[i].sh_size);
-         for (init = init_start; init < init_end; init++) {
-            CHECK(0x0 != *init);
-            (*init)(argc, argv, envv);
-         }
-      }
-
-      // XXX could be more strict and assert that it's
-      // SECTIONKIND_RWDATA; but allowing RODATA seems harmless enough.
-      if ((kind == SECTIONKIND_RWDATA || kind == SECTIONKIND_CODE_OR_RODATA)
-       && 0 == memcmp(".ctors", sh_strtab + shdr[i].sh_name, 6)) {
-         char *init_startC = oc->sections[i].start;
-         init_start = (init_t*)init_startC;
-         init_end = (init_t*)(init_startC + shdr[i].sh_size);
-         // ctors run in reverse
-         for (init = init_end - 1; init >= init_start; init--) {
-            (*init)(argc, argv, envv);
-         }
-      }
-   }
-
-   freeProgEnvv(envc, envv);
-   return 1;
+    if (oc && oc->info && oc->info->init) {
+        return runInit(&oc->info->init);
+    }
+    return true;
 }
 
 // Run the finalizers of an ObjectCode.
@@ -2035,46 +2067,10 @@ int ocRunInit_ELF( ObjectCode *oc )
 // See Note [Initializers and finalizers (ELF)].
 int ocRunFini_ELF( ObjectCode *oc )
 {
-   char*     ehdrC = (char*)(oc->image);
-   Elf_Ehdr* ehdr  = (Elf_Ehdr*) ehdrC;
-   Elf_Shdr* shdr  = (Elf_Shdr*) (ehdrC + ehdr->e_shoff);
-   char* sh_strtab = ehdrC + shdr[elf_shstrndx(ehdr)].sh_offset;
-
-   for (Elf_Word i = 0; i < elf_shnum(ehdr); i++) {
-      char *sh_name = sh_strtab + shdr[i].sh_name;
-      int is_bss = false;
-      SectionKind kind = getSectionKind_ELF(&shdr[i], &is_bss);
-
-      if (kind == SECTIONKIND_CODE_OR_RODATA && 0 == memcmp(".fini", sh_strtab + shdr[i].sh_name, 5)) {
-         fini_t fini_f = (fini_t)(oc->sections[i].start);
-         fini_f();
-      }
-
-      // Note [GCC 6 init/fini section workaround]
-      if (kind == SECTIONKIND_FINI_ARRAY
-          || 0 == memcmp(".fini_array", sh_name, 11)) {
-         fini_t *fini_start, *fini_end, *fini;
-         char *fini_startC = oc->sections[i].start;
-         fini_start = (fini_t*)fini_startC;
-         fini_end = (fini_t*)(fini_startC + shdr[i].sh_size);
-         for (fini = fini_start; fini < fini_end; fini++) {
-            CHECK(0x0 != *fini);
-            (*fini)();
-         }
-      }
-
-      if (kind == SECTIONKIND_CODE_OR_RODATA && 0 == memcmp(".dtors", sh_strtab + shdr[i].sh_name, 6)) {
-         char *fini_startC = oc->sections[i].start;
-         fini_t *fini_start = (fini_t*)fini_startC;
-         fini_t *fini_end = (fini_t*)(fini_startC + shdr[i].sh_size);
-         for (fini_t *fini = fini_start; fini < fini_end; fini++) {
-            CHECK(0x0 != *fini);
-            (*fini)();
-         }
-      }
-   }
-
-   return 1;
+    if (oc && oc->info && oc->info->fini) {
+        return runFini(&oc->info->fini);
+    }
+    return true;
 }
 
 /*
@@ -2088,7 +2084,7 @@ struct piterate_cb_info {
 };
 
 static int loadNativeObjCb_(struct dl_phdr_info *info,
-    size_t _size GNUC3_ATTRIBUTE(__unused__), void *data) {
+    size_t _size STG_UNUSED, void *data) {
   struct piterate_cb_info *s = (struct piterate_cb_info *) data;
 
   // This logic mimicks _dl_addr_inside_object from glibc

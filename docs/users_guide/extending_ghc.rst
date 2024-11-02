@@ -268,7 +268,6 @@ option. The list of enabled plugins can be reset with the
     the command line is not possible. Instead ``:set -fclear-plugins`` can be
     used.
 
-
 As an example, in order to load the plugin exported by ``Foo.Plugin`` in
 the package ``foo-ghc-plugin``, and give it the parameter "baz", we
 would invoke GHC like this:
@@ -285,6 +284,19 @@ would invoke GHC like this:
     ...
     Linking Test ...
     $
+
+
+Plugins can be also be loaded from libraries directly. It allows plugins to be
+loaded in cross-compilers (as a workaround for #14335).
+
+.. ghc-flag:: -fplugin-library=⟨file-path⟩;⟨unit-id⟩;⟨module⟩;⟨args⟩
+    :shortdesc: Load a pre-compiled static plugin from an external library
+    :type: dynamic
+    :category: plugins
+
+    Arguments are specified in a list form, so a plugin specified to
+    :ghc-flag:`-fplugin-library=⟨file-path⟩;⟨unit-id⟩;⟨module⟩;⟨args⟩` will look
+    like ``'path/to/plugin;package-123;Plugin.Module;["Argument","List"]'``.
 
 Alternatively, core plugins can be specified with Template Haskell.
 
@@ -652,7 +664,7 @@ The key component of a typechecker plugin is a function of type
 
 ::
 
-    solve :: EvBindsVar -> [Ct] -> [Ct] -> TcPluginM TcPluginResult
+    solve :: EvBindsVar -> [Ct] -> [Ct] -> TcPluginM TcPluginSolveResult
     solve binds givens wanteds = ...
 
 This function will be invoked in two different ways:
@@ -1369,18 +1381,36 @@ Defaulting plugins have a single access point in the `GHC.Tc.Types` module
        -- ^ Clean up after the plugin, when exiting the type-checker.
       }
 
+The plugin has type ``WantedConstraints -> [DefaultingProposal]``.
 
-The plugin gets a combination of wanted constraints which can be most easily
-broken down into simple wanted constraints with ``approximateWC``. The result of
-running the plugin should be a ``DefaultingPluginResult``, a list of types that
-should be attempted for a given type variable that is ambiguous in a given
-context. GHC will check if one of the proposals is acceptable in the given
-context and then default to it. The most robust context to provide is the list
-of all wanted constraints that mention the variable you are defaulting. If you
-leave out a constraint, the default will be accepted, and then potentially
-result in a type checker error if it is incompatible with one of the constraints
-you left out. This can be a useful way of forcing a default and reporting errors
-to the user.
+* It is given the currently unsolved constraints.
+* It returns a list of independent "defaulting proposals".
+* Each proposal of type ``DefaultingProposal`` specifies:
+  * ``deProposals``: specifies a list,
+    in priority order, of sets of type variable assignments
+  * ``deProposalCts :: [Ct]`` gives a set of constraints (always a
+    subset of the incoming ``WantedConstraints``) to use as a
+    criterion for acceptance
+
+After calling the plugin, GHC executes each ``DefaultingProposal`` in
+turn.  To "execute" a proposal, GHC tries each of the proposed type
+assignments in ``deProposals`` in turn:
+
+* It assigns the proposed types to the type variables, and then tries to
+  solve ``deProposalCts``
+* If those constraints are completely solved by the assignment, GHC
+  accepts the assignment and moves on to the next ``DefaultingProposal``
+* If not, GHC tries the next assignment in ``deProposals``.
+
+The plugin can assume that the incoming constraints are fully
+"zonked" (see :ghc-wiki:`the Wiki page on zonking <zonking>`).
+
+The most robust ``deProposalCts`` to provide is the list of all wanted
+constraints that mention the variable you are defaulting. If you leave
+out a constraint, the default may be accepted, and then potentially
+result in a type checker error if it is incompatible with one of the
+constraints you left out. This can be a useful way of forcing a
+default and reporting errors to the user.
 
 There is an example of defaulting lifted types in the GHC test suite. In the
 `testsuite/tests/plugins/` directory see `defaulting-plugin/` for the
@@ -1585,3 +1615,116 @@ you cannot from a ``DynFlags`` plugin register other plugins by just adding them
 to the ``plugins`` field of ``DynFlags``. In order to achieve this, you would
 have to load them yourself and store the result into the ``cachedPlugins``
 field of ``DynFlags``.
+
+
+Referring to back ends
+----------------------
+
+In versions of GHC numbered up to and including 9.4, a back end is
+referred to by name: type ``Backend``, from module
+``GHC.Driver.Backend``, is a simple enumeration type. In versions of GHC
+numbered 9.6 and higher, ``Backend`` is an abstract type. The module
+specifies predicates and functions associated with a back end.
+
+This change in representation requires changes in client code.
+
+Client code that only names back ends
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Suppose your client uses ``Backend`` only to mention back ends by name.
+That is, it never discriminates between back ends in a ``case``
+expression, function definition, or equality comparison. Then the
+simplest way for you to migrate your code is to replace each value
+constructor from version 9.4 with the corresponding value from 9.6:
+
++-----------------+------------------------+
+| Old value       | New value              |
++=================+========================+
+| ``NCG``         | ``ncgBackend``         |
++-----------------+------------------------+
+| ``LLVM``        | ``llvmBackend``        |
++-----------------+------------------------+
+| ``ViaC``        | ``viaCBackend``        |
++-----------------+------------------------+
+| ``Interpreter`` | ``interpreterBackend`` |
++-----------------+------------------------+
+| ``NoBackend``   | ``noBackend``          |
++-----------------+------------------------+
+
+Client code that discriminates among back ends
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Suppose your code makes decisions based on the value of an expression of
+type ``Backend``. Then the simplest way for you to migrate your
+decision-making code depends on the code’s form.
+
+-  If your decision-making is driven by an equality or inequality
+   predicate, an equivalent predicate may already be defined in module
+   ``GHC.Driver.Backend``. For example, if your client wants to be
+   sure that optimization levels above ``-O0`` are permitted, it might
+   have originally compared ``backend /= Interpreter``. But now there is
+   a predicate for that: it is
+   ``not (backendForcesOptimization0 backend)``.
+
+   If the predicate you want is not already defined, you will have to
+   fall back on the more general strategy defined below.
+
+-  If your decision-making is still driven by a predicate, but the
+   implementation of the predicate inspects the form of ``Backend``, you
+   may still be in luck. For example, if your client needs to know
+   whether the ``Backend`` wishes to write files to disk, it can query
+   ``backendWritesFiles backend``. In version 9.4, this predicate holds
+   for the NCG, LLVM, and Via-C back ends, but not for the interpreter
+   or for ``NoBackend``.
+
+-  In the general case, for any function definition, case expression, or
+   equality test that discriminates among back ends, you can use the
+   general migration strategy described below.
+
+General migration strategy for client code
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+From version 9.6 onward, each back end may be
+queried for its name:
+
+::
+
+   backendName :: Backend -> BackendName
+
+The ``BackendName`` type must be imported from module ``GHC.Driver.Backend.Internal``.
+It is defined to look the same as the old
+``Backend`` type:
+
+::
+
+   data BackendName
+      = NCG
+      | LLVM
+      | ViaC
+      | Interpreter
+      | NoBackend
+
+This type is also an instance of the ``Eq`` and ``Show`` classes.
+
+
+If your existing code discriminates among existing back ends using a
+``case`` expression, you need to apply ``backendName`` to the scrutinee.
+
+::
+
+   case backend dflags of  -- code using the 9.4 interface
+     NCG -> ...
+     LLVM -> ...
+     ...
+
+can become
+
+::
+
+   case backendName $ backend dflags of  -- code using the 9.6 interface
+     NCG -> ...
+     LLVM -> ...
+     ...
+
+Only the scrutinee changes, not the pattern matches. And if your pattern
+matches were complete before, they are still complete.

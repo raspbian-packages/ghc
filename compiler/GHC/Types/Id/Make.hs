@@ -17,7 +17,7 @@ have a standard form, namely:
 {-# OPTIONS_GHC -Wno-incomplete-uni-patterns #-}
 
 module GHC.Types.Id.Make (
-        mkDictFunId, mkDictFunTy, mkDictSelId, mkDictSelRhs,
+        mkDictFunId, mkDictSelId, mkDictSelRhs,
 
         mkFCallId,
 
@@ -25,6 +25,7 @@ module GHC.Types.Id.Make (
         DataConBoxer(..), vanillaDataConBoxer,
         mkDataConRep, mkDataConWorkId,
         DataConBangOpts (..), BangOpts (..),
+        unboxedUnitExpr,
 
         -- And some particular Ids; see below for why they are wired in
         wiredInIds, ghcPrimIds,
@@ -32,7 +33,10 @@ module GHC.Types.Id.Make (
         voidPrimId, voidArgId,
         nullAddrId, seqId, lazyId, lazyIdKey,
         coercionTokenId, coerceId,
-        proxyHashId, noinlineId, noinlineIdName,
+        proxyHashId,
+        nospecId, nospecIdName,
+        noinlineId, noinlineIdName,
+        noinlineConstraintId, noinlineConstraintIdName,
         coerceName, leftSectionName, rightSectionName,
     ) where
 
@@ -43,6 +47,7 @@ import GHC.Builtin.Types
 import GHC.Builtin.Names
 
 import GHC.Core
+import GHC.Core.Opt.Arity( typeOneShot )
 import GHC.Core.Type
 import GHC.Core.Multiplicity
 import GHC.Core.TyCo.Rep
@@ -51,7 +56,7 @@ import GHC.Core.Coercion
 import GHC.Core.Reduction
 import GHC.Core.Make
 import GHC.Core.FVs     ( mkRuleInfo )
-import GHC.Core.Utils   ( exprType, mkCast, mkDefaultCase )
+import GHC.Core.Utils   ( exprType, mkCast, mkDefaultCase, coreAltsType )
 import GHC.Core.Unfold.Make
 import GHC.Core.SimpleOpt
 import GHC.Core.TyCon
@@ -69,7 +74,7 @@ import GHC.Types.Demand
 import GHC.Types.Cpr
 import GHC.Types.Unique.Supply
 import GHC.Types.Basic       hiding ( SuccessFlag(..) )
-import GHC.Types.Var (VarBndr(Bndr))
+import GHC.Types.Var (VarBndr(Bndr), visArgConstraintLike)
 
 import GHC.Tc.Utils.TcType as TcType
 
@@ -80,7 +85,7 @@ import GHC.Utils.Panic.Plain
 
 import GHC.Data.FastString
 import GHC.Data.List.SetOps
-
+import Data.List        ( zipWith4 )
 
 {-
 ************************************************************************
@@ -159,7 +164,7 @@ wiredInIds
   ++ errorIds           -- Defined in GHC.Core.Make
 
 magicIds :: [Id]    -- See Note [magicIds]
-magicIds = [lazyId, oneShotId, noinlineId]
+magicIds = [lazyId, oneShotId, noinlineId, noinlineConstraintId, nospecId]
 
 ghcPrimIds :: [Id]  -- See Note [ghcPrimIds (aka pseudoops)]
 ghcPrimIds
@@ -307,14 +312,15 @@ for symmetry with the way data instances are handled.
 
 Note [Newtype datacons]
 ~~~~~~~~~~~~~~~~~~~~~~~
-The "data constructor" for a newtype should always be vanilla.  At one
-point this wasn't true, because the newtype arising from
+The "data constructor" for a newtype should have no existentials. It's
+not quite a "vanilla" data constructor, because the newtype arising from
      class C a => D a
-looked like
-       newtype T:D a = D:D (C a)
-so the data constructor for T:C had a single argument, namely the
-predicate (C a).  But now we treat that as an ordinary argument, not
-part of the theta-type, so all is well.
+looks like
+       newtype T:D a = C:D (C a)
+so the data constructor for T:C has a single argument, namely the
+predicate (C a).  That ends up in the dcOtherTheta for the data con,
+which makes it not vanilla.  So the assert just tests for existentials.
+The rest is checked by having a singleton arg_tys.
 
 Note [Newtype workers]
 ~~~~~~~~~~~~~~~~~~~~~~
@@ -356,7 +362,7 @@ effect whether a wrapper is present or not:
     We'd like 'map Age' to match the LHS. For this to happen, Age
     must be unfolded, otherwise we'll be stuck. This is tested in T16208.
 
-It also allows for the posssibility of representation-polymorphic newtypes
+It also allows for the possibility of representation-polymorphic newtypes
 with wrappers (with -XUnliftedNewtypes):
 
   newtype N (a :: TYPE r) = MkN a
@@ -471,20 +477,19 @@ mkDictSelId name clas
     val_index      = assoc "MkId.mkDictSelId" (sel_names `zip` [0..]) name
 
     sel_ty = mkInvisForAllTys tyvars $
-             mkInvisFunTyMany (mkClassPred clas (mkTyVarTys (binderVars tyvars))) $
+             mkFunctionType ManyTy (mkClassPred clas (mkTyVarTys (binderVars tyvars))) $
              scaledThing (getNth arg_tys val_index)
                -- See Note [Type classes and linear types]
 
     base_info = noCafIdInfo
-                `setArityInfo`          1
-                `setDmdSigInfo`     strict_sig
-                `setCprSigInfo`            topCprSig
-                `setLevityInfoWithType` sel_ty
+                `setArityInfo`  1
+                `setDmdSigInfo` strict_sig
+                `setCprSigInfo` topCprSig
 
     info | new_tycon
          = base_info `setInlinePragInfo` alwaysInlinePragma
-                     `setUnfoldingInfo`  mkInlineUnfoldingWithArity 1
-                                           defaultSimpleOpts
+                     `setUnfoldingInfo`  mkInlineUnfoldingWithArity defaultSimpleOpts
+                                           StableSystemSrc 1
                                            (mkDictSelRhs clas val_index)
                    -- See Note [Single-method classes] in GHC.Tc.TyCl.Instance
                    -- for why alwaysInlinePragma
@@ -492,8 +497,8 @@ mkDictSelId name clas
          | otherwise
          = base_info `setRuleInfo` mkRuleInfo [rule]
                      `setInlinePragInfo` neverInlinePragma
-                     `setUnfoldingInfo`  mkInlineUnfoldingWithArity 1
-                                           defaultSimpleOpts
+                     `setUnfoldingInfo`  mkInlineUnfoldingWithArity defaultSimpleOpts
+                                           StableSystemSrc 1
                                            (mkDictSelRhs clas val_index)
                    -- Add a magic BuiltinRule, but no unfolding
                    -- so that the rule is always available to fire.
@@ -585,26 +590,25 @@ mkDataConWorkId wkr_name data_con
                    `setInlinePragInfo`     wkr_inline_prag
                    `setUnfoldingInfo`      evaldUnfolding  -- Record that it's evaluated,
                                                            -- even if arity = 0
-                   `setLevityInfoWithType` wkr_ty
-                     -- NB: unboxed tuples have workers, so we can't use
-                     -- setNeverRepPoly
+          -- No strictness: see Note [Data-con worker strictness] in GHC.Core.DataCon
 
     wkr_inline_prag = defaultInlinePragma { inl_rule = ConLike }
     wkr_arity = dataConRepArity data_con
+
     ----------- Workers for newtypes --------------
     univ_tvs = dataConUnivTyVars data_con
+    ex_tcvs  = dataConExTyCoVars data_con
     arg_tys  = dataConRepArgTys  data_con  -- Should be same as dataConOrigArgTys
     nt_work_info = noCafIdInfo          -- The NoCaf-ness is set by noCafIdInfo
                   `setArityInfo` 1      -- Arity 1
                   `setInlinePragInfo`     dataConWrapperInlinePragma
                   `setUnfoldingInfo`      newtype_unf
-                  `setLevityInfoWithType` wkr_ty
     id_arg1      = mkScaledTemplateLocal 1 (head arg_tys)
     res_ty_args  = mkTyCoVarTys univ_tvs
-    newtype_unf  = assertPpr (isVanillaDataCon data_con && isSingleton arg_tys)
-                             (ppr data_con) $
+    newtype_unf  = assertPpr (null ex_tcvs && isSingleton arg_tys)
+                             (ppr data_con)
                               -- Note [Newtype datacons]
-                   mkCompulsoryUnfolding defaultSimpleOpts $
+                   mkCompulsoryUnfolding $
                    mkLams univ_tvs $ Lam id_arg1 $
                    wrapNewTypeBody tycon res_ty_args (Var id_arg1)
 
@@ -621,7 +625,7 @@ mkDataConWorkId wkr_name data_con
 type Unboxer = Var -> UniqSM ([Var], CoreExpr -> CoreExpr)
   -- Unbox: bind rep vars by decomposing src var
 
-data Boxer = UnitBox | Boxer (TCvSubst -> UniqSM ([Var], CoreExpr))
+data Boxer = UnitBox | Boxer (Subst -> UniqSM ([Var], CoreExpr))
   -- Box:   build src arg using these rep vars
 
 -- | Data Constructor Boxer
@@ -684,8 +688,10 @@ mkDataConRep dc_bang_opts fam_envs wrap_name data_con
 
   | otherwise
   = do { wrap_args <- mapM (newLocal (fsLit "conrep")) wrap_arg_tys
-       ; wrap_body <- mk_rep_app (wrap_args `zip` dropList eq_spec unboxers)
+       ; wrap_body <- mk_rep_app (dropList stupid_theta wrap_args `zip` dropList eq_spec unboxers)
                                  initial_wrap_app
+                        -- Drop the stupid theta arguments, as per
+                        -- Note [Instantiating stupid theta] in GHC.Core.DataCon.
 
        ; let wrap_id = mkGlobalId (DataConWrapId data_con) wrap_name wrap_ty wrap_info
              wrap_info = noCafIdInfo
@@ -698,8 +704,9 @@ mkDataConRep dc_bang_opts fam_envs wrap_name data_con
                              -- We need to get the CAF info right here because GHC.Iface.Tidy
                              -- does not tidy the IdInfo of implicit bindings (like the wrapper)
                              -- so it not make sure that the CAF info is sane
-                         `setLevityInfoWithType` wrap_ty
 
+             -- The signature is purely for passes like the Simplifier, not for
+             -- DmdAnal itself; see Note [DmdAnal for DataCon wrappers].
              wrap_sig = mkClosedDmdSig wrap_arg_dmds topDiv
 
              wrap_arg_dmds =
@@ -722,9 +729,9 @@ mkDataConRep dc_bang_opts fam_envs wrap_name data_con
              -- See Note [Inline partially-applied constructor wrappers]
              -- Passing Nothing here allows the wrapper to inline when
              -- unsaturated.
-             wrap_unf | isNewTyCon tycon = mkCompulsoryUnfolding defaultSimpleOpts wrap_rhs
+             wrap_unf | isNewTyCon tycon = mkCompulsoryUnfolding wrap_rhs
                         -- See Note [Compulsory newtype unfolding]
-                      | otherwise        = mkInlineUnfolding defaultSimpleOpts wrap_rhs
+                      | otherwise        = mkDataConUnfolding wrap_rhs
              wrap_rhs = mkLams wrap_tvs $
                         mkLams wrap_args $
                         wrapFamInstBody tycon res_ty_args $
@@ -740,9 +747,10 @@ mkDataConRep dc_bang_opts fam_envs wrap_name data_con
 
   where
     (univ_tvs, ex_tvs, eq_spec, theta, orig_arg_tys, _orig_res_ty)
-      = dataConFullSig data_con
+                 = dataConFullSig data_con
+    stupid_theta = dataConStupidTheta data_con
     wrap_tvs     = dataConUserTyVars data_con
-    res_ty_args  = substTyVars (mkTvSubstPrs (map eqSpecPair eq_spec)) univ_tvs
+    res_ty_args  = dataConResRepTyArgs data_con
 
     tycon        = dataConTyCon data_con       -- The representation TyCon (not family)
     wrap_ty      = dataConWrapperType data_con
@@ -751,7 +759,7 @@ mkDataConRep dc_bang_opts fam_envs wrap_name data_con
     ev_ibangs    = map (const HsLazy) ev_tys
     orig_bangs   = dataConSrcBangs data_con
 
-    wrap_arg_tys = (map unrestricted theta) ++ orig_arg_tys
+    wrap_arg_tys = (map unrestricted $ stupid_theta ++ theta) ++ orig_arg_tys
     wrap_arity   = count isCoVar ex_tvs + length wrap_arg_tys
              -- The wrap_args are the arguments *other than* the eq_spec
              -- Because we are going to apply the eq_spec args manually in the
@@ -776,20 +784,44 @@ mkDataConRep dc_bang_opts fam_envs wrap_name data_con
     (unboxers, boxers) = unzip wrappers
     (rep_tys, rep_strs) = unzip (concat rep_tys_w_strs)
 
+    -- This is True if the data constructor or class dictionary constructor
+    -- needs a wrapper. This wrapper is injected into the program later in the
+    -- CoreTidy pass. See Note [Injecting implicit bindings] in GHC.Iface.Tidy,
+    -- along with the accompanying implementation in getTyConImplicitBinds.
     wrapper_reqd =
         (not new_tycon
                      -- (Most) newtypes have only a worker, with the exception
-                     -- of some newtypes written with GADT syntax. See below.
-         && (any isBanged (ev_ibangs ++ arg_ibangs)
+                     -- of some newtypes written with GADT syntax.
+                     -- See dataConUserTyVarsNeedWrapper below.
+         && (any isBanged (ev_ibangs ++ arg_ibangs)))
                      -- Some forcing/unboxing (includes eq_spec)
-             || (not $ null eq_spec))) -- GADT
       || isFamInstTyCon tycon -- Cast result
-      || dataConUserTyVarsArePermuted data_con
+      || (dataConUserTyVarsNeedWrapper data_con
                      -- If the data type was written with GADT syntax and
                      -- orders the type variables differently from what the
                      -- worker expects, it needs a data con wrapper to reorder
                      -- the type variables.
                      -- See Note [Data con wrappers and GADT syntax].
+                     --
+                     -- NB: All GADTs return true from this function, but there
+                     -- is one exception that we must check below.
+         && not (isTypeDataTyCon tycon))
+                     -- An exception to this rule is `type data` declarations.
+                     -- Their data constructors only live at the type level and
+                     -- therefore do not need wrappers.
+                     -- See Note [Type data declarations] in GHC.Rename.Module.
+                     --
+                     -- Note that the other checks in this definition will
+                     -- return False for `type data` declarations, as:
+                     --
+                     -- - They cannot be newtypes
+                     -- - They cannot have strict fields
+                     -- - They cannot be data family instances
+                     -- - They cannot have datatype contexts
+      || not (null stupid_theta)
+                     -- If the data constructor has a datatype context,
+                     -- we need a wrapper in order to drop the stupid arguments.
+                     -- See Note [Instantiating stupid theta] in GHC.Core.DataCon.
 
     initial_wrap_app = Var (dataConWorkId data_con)
                        `mkTyApps`  res_ty_args
@@ -976,8 +1008,7 @@ newLocal :: FastString   -- ^ a string which will form part of the 'Var'\'s name
          -> Scaled Type  -- ^ the type of the 'Var'
          -> UniqSM Var
 newLocal name_stem (Scaled w ty) =
-    do { uniq <- getUniqueM
-       ; return (mkSysLocalOrCoVar name_stem uniq w ty) }
+    mkSysLocalOrCoVarM name_stem w ty
          -- We should not have "OrCoVar" here, this is a bug (#17545)
 
 
@@ -1012,27 +1043,21 @@ dataConSrcToImplBang bang_opts fam_envs arg_ty
   = HsLazy  -- For !Int#, say, use HsLazy
             -- See Note [Data con wrappers and unlifted types]
 
-  | not (bang_opt_unbox_disable bang_opts) -- Don't unpack if disabled
-  , let mb_co   = topNormaliseType_maybe fam_envs (scaledThing arg_ty)
+  | let mb_co   = topNormaliseType_maybe fam_envs (scaledThing arg_ty)
                      -- Unwrap type families and newtypes
         arg_ty' = case mb_co of
                     { Just redn -> scaledSet arg_ty (reductionReducedType redn)
                     ; Nothing   -> arg_ty }
-  , isUnpackableType bang_opts fam_envs (scaledThing arg_ty')
-  , (rep_tys, _) <- dataConArgUnpack arg_ty'
-  , case unpk_prag of
-      NoSrcUnpack ->
-        bang_opt_unbox_strict bang_opts
-            || (bang_opt_unbox_small bang_opts
-                && rep_tys `lengthAtMost` 1) -- See Note [Unpack one-wide fields]
-      srcUnpack -> isSrcUnpacked srcUnpack
-  = case mb_co of
-      Nothing   -> HsUnpack Nothing
-      Just redn -> HsUnpack (Just $ reductionCoercion redn)
+  , shouldUnpackArgTy bang_opts unpk_prag fam_envs arg_ty'
+  = if bang_opt_unbox_disable bang_opts
+    then HsStrict True -- Not unpacking because of -O0
+                       -- See Note [Detecting useless UNPACK pragmas] in GHC.Core.DataCon
+    else case mb_co of
+           Nothing   -> HsUnpack Nothing
+           Just redn -> HsUnpack (Just $ reductionCoercion redn)
 
   | otherwise -- Record the strict-but-no-unpack decision
-  = HsStrict
-
+  = HsStrict False
 
 -- | Wrappers/Workers and representation following Unpack/Strictness
 -- decisions
@@ -1045,12 +1070,11 @@ dataConArgRep
 dataConArgRep arg_ty HsLazy
   = ([(arg_ty, NotMarkedStrict)], (unitUnboxer, unitBoxer))
 
-dataConArgRep arg_ty HsStrict
+dataConArgRep arg_ty (HsStrict _)
   = ([(arg_ty, MarkedStrict)], (seqUnboxer, unitBoxer))
 
 dataConArgRep arg_ty (HsUnpack Nothing)
-  | (rep_tys, wrappers) <- dataConArgUnpack arg_ty
-  = (rep_tys, wrappers)
+  = dataConArgUnpack arg_ty
 
 dataConArgRep (Scaled w _) (HsUnpack (Just co))
   | let co_rep_ty = coercionRKind co
@@ -1087,93 +1111,327 @@ unitBoxer :: Boxer
 unitBoxer = UnitBox
 
 -------------------------
+
+{- Note [UNPACK for sum types]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Suppose we have a data type D, for example:
+    data D = D1 [Int] [Bool]
+           | D2
+
+and another data type which unpacks a field of type D:
+    data U a = MkU {-# UNPACK #-} !D
+                   {-# UNPACK #-} !(a,a)
+                   {-# UNPACK #-} !D
+
+Then the wrapper and worker for MkU have these types
+
+  -- Wrapper
+  $WMkU :: D -> (a,a) -> D -> U a
+
+  -- Worker
+  MkU :: (# (# [Int],[Bool] #) | (# #) #)
+      -> a
+      -> a
+      -> (# (# [Int],[Bool] #) | (# #) #)
+      -> U a
+
+For each unpacked /sum/-type argument, the worker gets one argument.
+But for each unpacked /product/-type argument, the worker gets N
+arguments (here two).
+
+Why treat them differently?  See Note [Why sums and products are treated differently].
+
+The wrapper $WMkU looks like this:
+
+  $WMkU :: D -> (a,a) -> D -> U a
+  $WMkU x1 y x2
+    = case (case x1 of {
+              D1 a b -> (# (# a,b #) | #)
+              D2     -> (# | (# #) #) }) of { x1_ubx ->
+      case y of { (y1, y2) ->
+      case (case x2 of {
+              D1 a b -> (# (# a,b #) | #)
+              D2     -> (# | (# #) #) }) of { x2_ubx ->
+      MkU x1_ubx y1 y2 x2_ubx
+
+Notice the nested case needed for sums.
+
+This different treatment for sums and product is implemented in
+dataConArgUnpackSum and dataConArgUnpackProduct respectively.
+
+Note [Why sums and products are treated differently]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Can we handle sums like products, with each wrapper argument
+occupying multiple argument slots in the worker?  No: for a sum
+type the number of argument slots varies, and that's exactly what
+unboxed sums are designed for.
+
+Can we handle products like sums, with each wrapper argument occupying
+exactly one argument slot (and unboxed tuple) in the worker?  Yes,
+we could.  For example
+   data P = MkP {-# UNPACK #-} !Q
+   data Q = MkQ {-# NOUNPACK #-} !Int
+                {-# NOUNPACK #-} Int
+
+Currently could unpack P thus, taking two slots in the worker
+   $WMkP :: Q -> P
+   $WMkP x = case x of { MkQ a b -> MkP a b }
+   MkP :: Int -> Int -> P  -- Worker
+
+We could instead do this (uniformly with sums)
+
+   $WMkP1 :: Q -> P
+   $WMkP1 x = case (case x of { MkQ a b -> (# a, b #) }) of ubx_x
+              MkP1 ubx_x
+   MkP1 :: (# Int, Int #) -> P  -- Worker
+
+The representation of MkP and MkP1 would be identical (a constructor
+with two fields).
+
+BUT, with MkP (as with every data constructor) we record its argument
+strictness as a bit-vector, actually [StrictnessMark]
+   MkP strictness:  SL
+This information is used in Core to record which fields are sure to
+be evaluated.  (Look for calls to dataConRepStrictness.)  E.g. in Core
+    case v of MkP x y -> ....<here x is known to be evald>....
+
+Alas, with MkP1 this information is hidden by the unboxed pair,
+In Core there will be an auxiliary case expression to take apart the pair:
+    case v of MkP1 xy -> case xy of (# x,y #) -> ...
+And now we have no easy way to know that x is evaluated in the "...".
+
+Fixing this might be possible, but it'd be tricky.  So we avoid the
+problem entirely by treating sums and products differently here.
+-}
+
 dataConArgUnpack
    :: Scaled Type
    ->  ( [(Scaled Type, StrictnessMark)]   -- Rep types
        , (Unboxer, Boxer) )
-
-dataConArgUnpack (Scaled arg_mult arg_ty)
+dataConArgUnpack scaledTy@(Scaled _ arg_ty)
   | Just (tc, tc_args) <- splitTyConApp_maybe arg_ty
-  , Just con <- tyConSingleAlgDataCon_maybe tc
-      -- NB: check for an *algebraic* data type
-      -- A recursive newtype might mean that
-      -- 'arg_ty' is a newtype
-  , let rep_tys = map (scaleScaled arg_mult) $ dataConInstArgTys con tc_args
-  = assert (null (dataConExTyCoVars con))
-      -- Note [Unpacking GADTs and existentials]
-    ( rep_tys `zip` dataConRepStrictness con
-    ,( \ arg_id ->
-       do { rep_ids <- mapM (newLocal (fsLit "unbx")) rep_tys
-          ; let r_mult = idMult arg_id
-          ; let rep_ids' = map (scaleIdBy r_mult) rep_ids
-          ; let unbox_fn body
-                  = mkSingleAltCase (Var arg_id) arg_id
-                             (DataAlt con) rep_ids' body
-          ; return (rep_ids, unbox_fn) }
-     , Boxer $ \ subst ->
-       do { rep_ids <- mapM (newLocal (fsLit "bx") . TcType.substScaledTyUnchecked subst) rep_tys
-          ; return (rep_ids, Var (dataConWorkId con)
-                             `mkTyApps` (substTysUnchecked subst tc_args)
-                             `mkVarApps` rep_ids ) } ) )
+  = assert (not (isNewTyCon tc)) $
+    case tyConDataCons tc of
+      [con] -> dataConArgUnpackProduct scaledTy tc_args con
+      cons  -> dataConArgUnpackSum scaledTy tc_args cons
   | otherwise
   = pprPanic "dataConArgUnpack" (ppr arg_ty)
     -- An interface file specified Unpacked, but we couldn't unpack it
 
-isUnpackableType :: BangOpts -> FamInstEnvs -> Type -> Bool
--- True if we can unpack the UNPACK the argument type
+dataConArgUnpackProduct
+  :: Scaled Type
+  -> [Type]
+  -> DataCon
+  -> ( [(Scaled Type, StrictnessMark)]   -- Rep types
+     , (Unboxer, Boxer) )
+dataConArgUnpackProduct (Scaled arg_mult _) tc_args con =
+  assert (null (dataConExTyCoVars con)) $
+    -- Note [Unpacking GADTs and existentials]
+  let rep_tys = map (scaleScaled arg_mult) $ dataConInstArgTys con tc_args
+  in ( rep_tys `zip` dataConRepStrictness con
+     , ( \ arg_id ->
+         do { rep_ids <- mapM (newLocal (fsLit "unbx")) rep_tys
+            ; let r_mult = idMult arg_id
+            ; let rep_ids' = map (scaleIdBy r_mult) rep_ids
+            ; let unbox_fn body
+                    = mkSingleAltCase (Var arg_id) arg_id
+                               (DataAlt con) rep_ids' body
+            ; return (rep_ids, unbox_fn) }
+       , Boxer $ \ subst ->
+         do { rep_ids <- mapM (newLocal (fsLit "bx") . TcType.substScaledTyUnchecked subst) rep_tys
+            ; return (rep_ids, Var (dataConWorkId con)
+                               `mkTyApps` (substTysUnchecked subst tc_args)
+                               `mkVarApps` rep_ids ) } ) )
+
+dataConArgUnpackSum
+  :: Scaled Type
+  -> [Type]
+  -> [DataCon]
+  -> ( [(Scaled Type, StrictnessMark)]   -- Rep types
+     , (Unboxer, Boxer) )
+dataConArgUnpackSum (Scaled arg_mult arg_ty) tc_args cons =
+  ( [ (sum_ty, MarkedStrict) ] -- The idea: Unpacked variant will
+                               -- be one field only, and the type of the
+                               -- field will be an unboxed sum.
+  , ( unboxer, boxer ) )
+  where
+    !ubx_sum_arity = length cons
+    src_tys = map (\con -> map scaledThing $ dataConInstArgTys con tc_args) cons
+    sum_alt_tys = map mkUbxSumAltTy src_tys
+    sum_ty_unscaled = mkSumTy sum_alt_tys
+    sum_ty = Scaled arg_mult sum_ty_unscaled
+    newLocal' fs = newLocal fs . Scaled arg_mult
+
+    -- See Note [UNPACK for sum types]
+    unboxer :: Unboxer
+    unboxer arg_id = do
+      con_arg_binders <- mapM (mapM (newLocal' (fsLit "unbx"))) src_tys
+      ubx_sum_bndr <- newLocal (fsLit "unbx") sum_ty
+
+      let
+        mk_ubx_sum_alt :: Int -> DataCon -> [Var] -> CoreAlt
+        mk_ubx_sum_alt alt con [bndr] = Alt (DataAlt con) [bndr]
+            (mkCoreUnboxedSum ubx_sum_arity alt sum_alt_tys (Var bndr))
+
+        mk_ubx_sum_alt alt con bndrs =
+          let tuple = mkCoreUnboxedTuple (map Var bndrs)
+           in Alt (DataAlt con) bndrs (mkCoreUnboxedSum ubx_sum_arity alt sum_alt_tys tuple )
+
+        ubx_sum :: CoreExpr
+        ubx_sum =
+          let alts = zipWith3 mk_ubx_sum_alt [ 1 .. ] cons con_arg_binders
+           in Case (Var arg_id) arg_id (coreAltsType alts) alts
+
+        unbox_fn :: CoreExpr -> CoreExpr
+        unbox_fn body =
+          mkSingleAltCase ubx_sum ubx_sum_bndr DEFAULT [] body
+
+      return ([ubx_sum_bndr], unbox_fn)
+
+    boxer :: Boxer
+    boxer = Boxer $ \ subst -> do
+              unboxed_field_id <- newLocal' (fsLit "bx") (TcType.substTy subst sum_ty_unscaled)
+              tuple_bndrs <- mapM (newLocal' (fsLit "bx") . TcType.substTy subst) sum_alt_tys
+
+              let tc_args' = substTys subst tc_args
+                  arg_ty' = substTy subst arg_ty
+
+              con_arg_binders <-
+                mapM (mapM (newLocal' (fsLit "bx")) . map (TcType.substTy subst)) src_tys
+
+              let mk_sum_alt :: Int -> DataCon -> Var -> [Var] -> CoreAlt
+                  mk_sum_alt alt con _ [datacon_bndr] =
+                    ( Alt (DataAlt (sumDataCon alt ubx_sum_arity)) [datacon_bndr]
+                      (Var (dataConWorkId con) `mkTyApps`  tc_args'
+                                              `mkVarApps` [datacon_bndr] ))
+
+                  mk_sum_alt alt con tuple_bndr datacon_bndrs =
+                    ( Alt (DataAlt (sumDataCon alt ubx_sum_arity)) [tuple_bndr] (
+                      Case (Var tuple_bndr) tuple_bndr arg_ty'
+                        [ Alt (DataAlt (tupleDataCon Unboxed (length datacon_bndrs))) datacon_bndrs
+                            (Var (dataConWorkId con) `mkTyApps`  tc_args'
+                                                    `mkVarApps` datacon_bndrs ) ] ))
+
+              return ( [unboxed_field_id],
+                       Case (Var unboxed_field_id) unboxed_field_id arg_ty'
+                            (zipWith4 mk_sum_alt [ 1 .. ] cons tuple_bndrs con_arg_binders) )
+
+-- | Every alternative of an unboxed sum has exactly one field, and we use
+-- unboxed tuples when we need more than one field. This generates an unboxed
+-- tuple when necessary, to be used in unboxed sum alts.
+mkUbxSumAltTy :: [Type] -> Type
+mkUbxSumAltTy [ty] = ty
+mkUbxSumAltTy tys  = mkTupleTy Unboxed tys
+
+shouldUnpackArgTy :: BangOpts -> SrcUnpackedness -> FamInstEnvs -> Scaled Type -> Bool
+-- True if we ought to unpack the UNPACK the argument type
 -- See Note [Recursive unboxing]
 -- We look "deeply" inside rather than relying on the DataCons
 -- we encounter on the way, because otherwise we might well
 -- end up relying on ourselves!
-isUnpackableType bang_opts fam_envs ty
-  | Just data_con <- unpackable_type ty
-  = ok_con_args emptyNameSet data_con
+shouldUnpackArgTy bang_opts prag fam_envs arg_ty
+  | Just data_cons <- unpackable_type_datacons (scaledThing arg_ty)
+  , all ok_con data_cons                -- Returns True only if we can't get a
+                                        -- loop involving these data cons
+  , should_unpack prag arg_ty data_cons -- ...hence the call to dataConArgUnpack in
+                                        --    should_unpack won't loop
+       -- See Wrinkle (W1b) of Note [Recursive unboxing] for this loopy stuff
+  = True
+
   | otherwise
   = False
   where
-    ok_con_args dcs con
-       | dc_name `elemNameSet` dcs
-       = False
-       | otherwise
-       = all (ok_arg dcs')
-             (dataConOrigArgTys con `zip` dataConSrcBangs con)
-          -- NB: dataConSrcBangs gives the *user* request;
-          -- We'd get a black hole if we used dataConImplBangs
+    ok_con :: DataCon -> Bool      -- True <=> OK to unpack
+    ok_con top_con                 -- False <=> not safe
+      = ok_args emptyNameSet top_con
        where
-         dc_name = getName con
-         dcs' = dcs `extendNameSet` dc_name
+         top_con_name = getName top_con
 
-    ok_arg dcs (Scaled _ ty, bang)
-      = not (attempt_unpack bang) || ok_ty dcs norm_ty
+         ok_args dcs con
+           = all (ok_arg dcs) $
+             (dataConOrigArgTys con `zip` dataConSrcBangs con)
+             -- NB: dataConSrcBangs gives the *user* request;
+             -- We'd get a black hole if we used dataConImplBangs
+
+         ok_arg :: NameSet -> (Scaled Type, HsSrcBang) -> Bool
+         ok_arg dcs (Scaled _ ty, HsSrcBang _ unpack_prag str_prag)
+           | strict_field str_prag
+           , Just data_cons <- unpackable_type_datacons (topNormaliseType fam_envs ty)
+           , should_unpack_conservative unpack_prag data_cons  -- Wrinkle (W3)
+           = all (ok_rec_con dcs) data_cons                    --  of Note [Recursive unboxing]
+           | otherwise
+           = True        -- NB True here, in contrast to False at top level
+
+         -- See Note [Recursive unboxing]
+         --   * Do not look at the HsImplBangs to `con`; see Wrinkle (W1a)
+         --   * For the "at the root" comments see Wrinkle (W2)
+         ok_rec_con dcs con
+           | dc_name == top_con_name   = False  -- Recursion at the root
+           | dc_name `elemNameSet` dcs = True   -- Not at the root
+           | otherwise                 = ok_args (dcs `extendNameSet` dc_name) con
+           where
+             dc_name = getName con
+
+    strict_field :: SrcStrictness -> Bool
+    -- True <=> strict field
+    strict_field NoSrcStrict = bang_opt_strict_data bang_opts
+    strict_field SrcStrict   = True
+    strict_field SrcLazy     = False
+
+    -- Determine whether we ought to unpack a field,
+    -- based on user annotations if present.
+    -- A conservative version of should_unpack that doesn't look at how
+    -- many fields the field would unpack to... because that leads to a loop.
+    -- "Conservative" = err on the side of saying "yes".
+    should_unpack_conservative :: SrcUnpackedness -> [DataCon] -> Bool
+    should_unpack_conservative SrcNoUnpack _   = False  -- {-# NOUNPACK #-}
+    should_unpack_conservative SrcUnpack   _   = True   -- {-# NOUNPACK #-}
+    should_unpack_conservative NoSrcUnpack dcs = not (is_sum dcs)
+        -- is_sum: we never unpack sums without a pragma; otherwise be conservative
+
+    -- Determine whether we ought to unpack a field,
+    -- based on user annotations if present, and heuristics if not.
+    should_unpack :: SrcUnpackedness -> Scaled Type -> [DataCon] -> Bool
+    should_unpack prag arg_ty data_cons =
+      case prag of
+        SrcNoUnpack -> False -- {-# NOUNPACK #-}
+        SrcUnpack   -> True  -- {-# UNPACK #-}
+        NoSrcUnpack -- No explicit unpack pragma, so use heuristics
+          | is_sum data_cons
+          -> False -- Don't unpack sum types automatically, but they can
+                   -- be unpacked with an explicit source UNPACK.
+          | otherwise   -- Wrinkle (W4) of Note [Recursive unboxing]
+          -> bang_opt_unbox_strict bang_opts
+             || (bang_opt_unbox_small bang_opts
+                 && rep_tys `lengthAtMost` 1)  -- See Note [Unpack one-wide fields]
       where
-        norm_ty = topNormaliseType fam_envs ty
+        (rep_tys, _) = dataConArgUnpack arg_ty
 
-    ok_ty dcs ty
-      | Just data_con <- unpackable_type ty
-      = ok_con_args dcs data_con
-      | otherwise
-      = True        -- NB True here, in contrast to False at top level
+    is_sum :: [DataCon] -> Bool
+    -- We never unpack sum types automatically
+    -- (Product types, we do. Empty types are weeded out by unpackable_type_datacons.)
+    is_sum (_:_:_) = True
+    is_sum _       = False
 
-    attempt_unpack (HsSrcBang _ SrcUnpack NoSrcStrict)
-      = bang_opt_strict_data bang_opts
-    attempt_unpack (HsSrcBang _ SrcUnpack SrcStrict)
-      = True
-    attempt_unpack (HsSrcBang _  NoSrcUnpack SrcStrict)
-      = True  -- Be conservative
-    attempt_unpack (HsSrcBang _  NoSrcUnpack NoSrcStrict)
-      = bang_opt_strict_data bang_opts -- Be conservative
-    attempt_unpack _ = False
-
-    unpackable_type :: Type -> Maybe DataCon
-    -- Works just on a single level
-    unpackable_type ty
-      | Just (tc, _) <- splitTyConApp_maybe ty
-      , Just data_con <- tyConSingleAlgDataCon_maybe tc
-      , null (dataConExTyCoVars data_con)
-          -- See Note [Unpacking GADTs and existentials]
-      = Just data_con
-      | otherwise
-      = Nothing
+-- Given a type already assumed to have been normalized by topNormaliseType,
+-- unpackable_type_datacons ty = Just datacons
+-- iff ty is of the form
+--     T ty1 .. tyn
+-- and T is an algebraic data type (not newtype), in which no data
+-- constructors have existentials, and datacons is the list of data
+-- constructors of T.
+unpackable_type_datacons :: Type -> Maybe [DataCon]
+unpackable_type_datacons ty
+  | Just (tc, _) <- splitTyConApp_maybe ty
+  , not (isNewTyCon tc)  -- Even though `ty` has been normalised, it could still
+                         -- be a /recursive/ newtype, so we must check for that
+  , Just cons <- tyConDataCons_maybe tc
+  , not (null cons)      -- Don't upack nullary sums; no need.
+                         -- They already take zero bits
+  , all (null . dataConExTyCoVars) cons
+  = Just cons -- See Note [Unpacking GADTs and existentials]
+  | otherwise
+  = Nothing
 
 {-
 Note [Unpacking GADTs and existentials]
@@ -1225,20 +1483,74 @@ But be careful not to try to unbox this!
         data T = MkT {-# UNPACK #-} !T Int
 Because then we'd get an infinite number of arguments.
 
-Here is a more complicated case:
-        data S = MkS {-# UNPACK #-} !T Int
-        data T = MkT {-# UNPACK #-} !S Int
-Each of S and T must decide independently whether to unpack
-and they had better not both say yes. So they must both say no.
-
-Also behave conservatively when there is no UNPACK pragma
-        data T = MkS !T Int
-with -funbox-strict-fields or -funbox-small-strict-fields
-we need to behave as if there was an UNPACK pragma there.
-
-But it's the *argument* type that matters. This is fine:
+Note that it's the *argument* type that matters. This is fine:
         data S = MkS S !Int
 because Int is non-recursive.
+
+Wrinkles:
+
+(W1a) We have to be careful that the compiler doesn't go into a loop!
+      First, we must not look at the HsImplBang decisions of data constructors
+      in the same mutually recursive group.  E.g.
+         data S = MkS {-# UNPACK #-} !T Int
+         data T = MkT {-# UNPACK #-} !S Int
+      Each of S and T must decide /independently/ whether to unpack
+      and they had better not both say yes. So they must both say no.
+      (We could detect when we leave the group, and /then/ we can rely on
+      HsImplBangs; but that requires more plumbing.)
+
+(W1b) Here is another way the compiler might go into a loop (test T23307b):
+         data data T = MkT !S Int
+         data S = MkS !T
+     Suppose we call `shouldUnpackArgTy` on the !S arg of `T`.  In `should_unpack`
+     we ask if the number of fields that `MkS` unpacks to is small enough
+     (via rep_tys `lengthAtMost` 1).  But how many field /does/ `MkS` unpack
+     to?  Well it depends on the unpacking decision we make for `MkS`, which
+     in turn depends on `MkT`, which we are busy deciding. Black holes beckon.
+
+     So we /first/ call `ok_con` on `MkS` (and `ok_con` is conservative;
+     see `should_unpack_conservative`), and only /then/ call `should_unpack`.
+     Tricky!
+
+(W2) As #23307 shows,  we /do/ want to unpack the second arg of the Yes
+     data constructor in this example, despite the recursion in List:
+       data Stream a   = Cons a !(Stream a)
+       data Unconsed a = Unconsed a !(Stream a)
+       data MUnconsed a = No | Yes {-# UNPACK #-} !(Unconsed a)
+     When looking at
+       {-# UNPACK #-} (Unconsed a)
+     we can take Unconsed apart, but then get into a loop with Stream.
+     That's fine: we can still take Unconsed apart.  It's only if we
+     have a loop /at the root/ that we must not unpack.
+
+(W3) Moreover (W2) can apply even if there is a recursive loop:
+       data List a = Nil | Cons {-# UNPACK #-} !(Unconsed a)
+       data Unconsed a = Unconsed a !(List a)
+     Here there is mutual recursion between `Unconsed` and `List`; and yet
+     we can unpack the field of `Cons` because we will not unpack the second
+     field of `Unconsed`: we never unpack a sum type without an explicit
+     pragma (see should_unpack).
+
+(W4) Consider
+        data T = MkT !Wombat
+        data Wombat = MkW {-# UNPACK #-} !S Int
+        data S = MkS {-# NOUNPACK #-} !Wombat Int
+     Suppose we are deciding whether to unpack the first field of MkT, by
+     calling (shouldUnpackArgTy Wombat).  Then we'll try to unpack the !S field
+     of MkW, and be stopped by the {-# NOUNPACK #-}, and all is fine; we can
+     unpack MkT.
+
+     If that NOUNPACK had been a UNPACK, though, we'd get a loop, and would
+     decide not to unpack the Wombat field of MkT.
+
+     But what if there was no pragma in `data S`?  Then we /still/ decide not
+     to unpack the Wombat field of MkT (at least when auto-unpacking is on),
+     because we don't know for sure which decision will be taken for the
+     Wombat field of MkS.
+
+     TL;DR when there is no pragma, behave as if there was a UNPACK, at least
+     when auto-unpacking is on.  See `should_unpack` in `shouldUnpackArgTy`.
+
 
 ************************************************************************
 *                                                                      *
@@ -1317,17 +1629,16 @@ mkFCallId uniq fcall ty
     -- The "occurrence name" of a ccall is the full info about the
     -- ccall; it is encoded, but may have embedded spaces etc!
 
-    name = mkFCallName uniq occ_str
+    name = mkFCallName uniq (mkFastString occ_str)
 
     info = noCafIdInfo
-           `setArityInfo`          arity
-           `setDmdSigInfo`     strict_sig
-           `setCprSigInfo`            topCprSig
-           `setLevityInfoWithType` ty
+           `setArityInfo`  arity
+           `setDmdSigInfo` strict_sig
+           `setCprSigInfo` topCprSig
 
     (bndrs, _) = tcSplitPiTys ty
-    arity      = count isAnonTyCoBinder bndrs
-    strict_sig = mkClosedDmdSig (replicate arity topDmd) topDiv
+    arity      = count isAnonPiTyBinder bndrs
+    strict_sig = mkVanillaDmdSig arity topDiv
     -- the call does not claim to be strict in its arguments, since they
     -- may be lifted (foreign import prim) and the called code doesn't
     -- necessarily force them. See #11076.
@@ -1362,11 +1673,7 @@ mkDictFunId dfun_name tvs theta clas tys
                       dfun_ty
   where
     is_nt = isNewTyCon (classTyCon clas)
-    dfun_ty = mkDictFunTy tvs theta clas tys
-
-mkDictFunTy :: [TyVar] -> ThetaType -> Class -> [Type] -> Type
-mkDictFunTy tvs theta clas tys
- = mkSpecSigmaTy tvs theta (mkClassPred clas tys)
+    dfun_ty = TcType.tcMkDFunSigmaTy tvs theta (mkClassPred clas tys)
 
 {-
 ************************************************************************
@@ -1402,23 +1709,22 @@ leftSectionName   = mkWiredInIdName gHC_PRIM  (fsLit "leftSection")    leftSecti
 rightSectionName  = mkWiredInIdName gHC_PRIM  (fsLit "rightSection")   rightSectionKey    rightSectionId
 
 -- Names listed in magicIds; see Note [magicIds]
-lazyIdName, oneShotName, noinlineIdName :: Name
+lazyIdName, oneShotName, nospecIdName :: Name
 lazyIdName        = mkWiredInIdName gHC_MAGIC (fsLit "lazy")           lazyIdKey          lazyId
 oneShotName       = mkWiredInIdName gHC_MAGIC (fsLit "oneShot")        oneShotKey         oneShotId
-noinlineIdName    = mkWiredInIdName gHC_MAGIC (fsLit "noinline")       noinlineIdKey      noinlineId
+nospecIdName      = mkWiredInIdName gHC_MAGIC (fsLit "nospec")         nospecIdKey        nospecId
 
 ------------------------------------------------
 proxyHashId :: Id
 proxyHashId
   = pcMiscPrelId proxyName ty
-       (noCafIdInfo `setUnfoldingInfo` evaldUnfolding -- Note [evaldUnfoldings]
-                    `setNeverRepPoly`  ty)
+       (noCafIdInfo `setUnfoldingInfo` evaldUnfolding) -- Note [evaldUnfoldings]
   where
     -- proxy# :: forall {k} (a:k). Proxy# k a
     --
     -- The visibility of the `k` binder is Inferred to match the type of the
     -- Proxy data constructor (#16293).
-    [kv,tv] = mkTemplateKiTyVars [liftedTypeKind] id
+    [kv,tv] = mkTemplateKiTyVar liftedTypeKind (\x -> [x])
     kv_ty   = mkTyVarTy kv
     tv_ty   = mkTyVarTy tv
     ty      = mkInfForAllTy kv $ mkSpecForAllTy tv $ mkProxyPrimTy kv_ty tv_ty
@@ -1431,15 +1737,14 @@ nullAddrId :: Id
 nullAddrId = pcMiscPrelId nullAddrName addrPrimTy info
   where
     info = noCafIdInfo `setInlinePragInfo` alwaysInlinePragma
-                       `setUnfoldingInfo`  mkCompulsoryUnfolding defaultSimpleOpts (Lit nullAddrLit)
-                       `setNeverRepPoly`   addrPrimTy
+                       `setUnfoldingInfo`  mkCompulsoryUnfolding (Lit nullAddrLit)
 
 ------------------------------------------------
 seqId :: Id     -- See Note [seqId magic]
 seqId = pcMiscPrelId seqName ty info
   where
     info = noCafIdInfo `setInlinePragInfo` inline_prag
-                       `setUnfoldingInfo`  mkCompulsoryUnfolding defaultSimpleOpts rhs
+                       `setUnfoldingInfo`  mkCompulsoryUnfolding rhs
                        `setArityInfo`      arity
 
     inline_prag
@@ -1466,20 +1771,42 @@ seqId = pcMiscPrelId seqName ty info
 lazyId :: Id    -- See Note [lazyId magic]
 lazyId = pcMiscPrelId lazyIdName ty info
   where
-    info = noCafIdInfo `setNeverRepPoly` ty
+    info = noCafIdInfo
     ty  = mkSpecForAllTys [alphaTyVar] (mkVisFunTyMany alphaTy alphaTy)
+
+------------------------------------------------
+noinlineIdName, noinlineConstraintIdName :: Name
+noinlineIdName           = mkWiredInIdName gHC_MAGIC (fsLit "noinline")
+                                           noinlineIdKey noinlineId
+noinlineConstraintIdName = mkWiredInIdName gHC_MAGIC (fsLit "noinlineConstraint")
+                                           noinlineConstraintIdKey noinlineConstraintId
 
 noinlineId :: Id -- See Note [noinlineId magic]
 noinlineId = pcMiscPrelId noinlineIdName ty info
   where
-    info = noCafIdInfo `setNeverRepPoly` ty
+    info = noCafIdInfo
+    ty  = mkSpecForAllTys [alphaTyVar] $
+          mkVisFunTyMany alphaTy alphaTy
+
+noinlineConstraintId :: Id -- See Note [noinlineId magic]
+noinlineConstraintId = pcMiscPrelId noinlineConstraintIdName ty info
+  where
+    info = noCafIdInfo
+    ty   = mkSpecForAllTys [alphaConstraintTyVar] $
+           mkFunTy visArgConstraintLike ManyTy alphaTy alphaConstraintTy
+
+------------------------------------------------
+nospecId :: Id -- See Note [nospecId magic]
+nospecId = pcMiscPrelId nospecIdName ty info
+  where
+    info = noCafIdInfo
     ty  = mkSpecForAllTys [alphaTyVar] (mkVisFunTyMany alphaTy alphaTy)
 
 oneShotId :: Id -- See Note [The oneShot function]
 oneShotId = pcMiscPrelId oneShotName ty info
   where
     info = noCafIdInfo `setInlinePragInfo` alwaysInlinePragma
-                       `setUnfoldingInfo`  mkCompulsoryUnfolding defaultSimpleOpts rhs
+                       `setUnfoldingInfo`  mkCompulsoryUnfolding rhs
                        `setArityInfo`      arity
     ty  = mkInfForAllTys  [ runtimeRep1TyVar, runtimeRep2TyVar ] $
           mkSpecForAllTys [ openAlphaTyVar, openBetaTyVar ]      $
@@ -1497,11 +1824,11 @@ oneShotId = pcMiscPrelId oneShotName ty info
 {- Note [Wired-in Ids for rebindable syntax]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 The functions leftSectionId, rightSectionId are
-wired in here ONLY because they are use in a representation-polymorphic way
+wired in here ONLY because they are used in a representation-polymorphic way
 by the rebindable syntax mechanism. See GHC.Rename.Expr
 Note [Handling overloaded and rebindable constructs].
 
-Alas, we can't currenly give Haskell definitions for
+Alas, we can't currently give Haskell definitions for
 representation-polymorphic functions.
 
 They have Compulsory unfoldings, so that the representation polymorphism
@@ -1520,7 +1847,7 @@ leftSectionId :: Id
 leftSectionId = pcMiscPrelId leftSectionName ty info
   where
     info = noCafIdInfo `setInlinePragInfo` alwaysInlinePragma
-                       `setUnfoldingInfo`  mkCompulsoryUnfolding defaultSimpleOpts rhs
+                       `setUnfoldingInfo`  mkCompulsoryUnfolding rhs
                        `setArityInfo`      arity
     ty  = mkInfForAllTys  [runtimeRep1TyVar,runtimeRep2TyVar, multiplicityTyVar1] $
           mkSpecForAllTys [openAlphaTyVar,  openBetaTyVar]    $
@@ -1545,7 +1872,7 @@ rightSectionId :: Id
 rightSectionId = pcMiscPrelId rightSectionName ty info
   where
     info = noCafIdInfo `setInlinePragInfo` alwaysInlinePragma
-                       `setUnfoldingInfo`  mkCompulsoryUnfolding defaultSimpleOpts rhs
+                       `setUnfoldingInfo`  mkCompulsoryUnfolding rhs
                        `setArityInfo`      arity
     ty  = mkInfForAllTys  [runtimeRep1TyVar,runtimeRep2TyVar,runtimeRep3TyVar
                           , multiplicityTyVar1, multiplicityTyVar2 ] $
@@ -1554,8 +1881,8 @@ rightSectionId = pcMiscPrelId rightSectionName ty info
     mult1 = mkTyVarTy multiplicityTyVar1
     mult2 = mkTyVarTy multiplicityTyVar2
 
-    [f,x,y] = mkTemplateLocals [ mkVisFunTys [ Scaled mult1 openAlphaTy
-                                             , Scaled mult2 openBetaTy ] openGammaTy
+    [f,x,y] = mkTemplateLocals [ mkScaledFunTys [ Scaled mult1 openAlphaTy
+                                                , Scaled mult2 openBetaTy ] openGammaTy
                                , openAlphaTy, openBetaTy ]
     xmult = setIdMult x mult1
     ymult = setIdMult y mult2
@@ -1571,14 +1898,14 @@ coerceId :: Id
 coerceId = pcMiscPrelId coerceName ty info
   where
     info = noCafIdInfo `setInlinePragInfo` alwaysInlinePragma
-                       `setUnfoldingInfo`  mkCompulsoryUnfolding defaultSimpleOpts rhs
+                       `setUnfoldingInfo`  mkCompulsoryUnfolding rhs
                        `setArityInfo`      2
     eqRTy     = mkTyConApp coercibleTyCon  [ tYPE_r,         a, b ]
     eqRPrimTy = mkTyConApp eqReprPrimTyCon [ tYPE_r, tYPE_r, a, b ]
     ty        = mkInvisForAllTys [ Bndr rv InferredSpec
                                  , Bndr av SpecifiedSpec
                                  , Bndr bv SpecifiedSpec ] $
-                mkInvisFunTyMany eqRTy $
+                mkInvisFunTy eqRTy $
                 mkVisFunTyMany a b
 
     bndrs@[rv,av,bv] = mkTemplateKiTyVar runtimeRepTy
@@ -1715,20 +2042,44 @@ But actually we give 'noinline' a wired-in name for three distinct reasons:
      noinline foo x xs
    where x::Int, will naturally desugar to
       noinline @Int (foo @Int dEqInt) x xs
-   But now it's entirely possible htat (foo @Int dEqInt) will inline foo,
+   But now it's entirely possible that (foo @Int dEqInt) will inline foo,
    since 'foo' is no longer a lone variable -- see #18995
 
    Solution: in the desugarer, rewrite
       noinline (f x y)  ==>  noinline f x y
    This is done in GHC.HsToCore.Utils.mkCoreAppDs.
+   This is only needed for noinlineId, not noInlineConstraintId (wrinkle
+   (W1) below), because the latter never shows up in user code.
 
-Note that noinline as currently implemented can hide some simplifications since
-it hides strictness from the demand analyser. Specifically, the demand analyser
-will treat 'noinline f x' as lazy in 'x', even if the demand signature of 'f'
-specifies that it is strict in its argument. We considered fixing this this by adding a
-special case to the demand analyser to address #16588. However, the special
-case seemed like a large and expensive hammer to address a rare case and
-consequently we rather opted to use a more minimal solution.
+Wrinkles
+
+(W1) Sometimes case (2) above needs to apply `noinline` to a type of kind
+     Constraint; e.g.
+                    noinline @(Eq Int) $dfEqInt
+     We don't have type-or-kind polymorphism, so we simply have two `inline`
+     Ids, namely `noinlineId` and `noinlineConstraintId`.
+
+(W2) Note that noinline as currently implemented can hide some simplifications
+     since it hides strictness from the demand analyser. Specifically, the
+     demand analyser will treat 'noinline f x' as lazy in 'x', even if the
+     demand signature of 'f' specifies that it is strict in its argument. We
+     considered fixing this this by adding a special case to the demand
+     analyser to address #16588. However, the special case seemed like a large
+     and expensive hammer to address a rare case and consequently we rather
+     opted to use a more minimal solution.
+
+Note [nospecId magic]
+~~~~~~~~~~~~~~~~~~~~~
+The 'nospec' magic Id is used to ensure to make a value opaque to the typeclass
+specialiser. In CorePrep, we inline 'nospec', turning (nospec e) into e.
+Note that this happens *after* unfoldings are exposed in the interface file.
+This is crucial: otherwise, we could import an unfolding in which
+'nospec' has been inlined (= erased), and we would lose the benefit.
+
+'nospec' is used in the implementation of 'withDict': we insert 'nospec'
+so that the typeclass specialiser doesn't assume any two evidence terms
+of the same type are equal. See Note [withDict] in GHC.Tc.Instance.Class,
+and see test case T21575b for an example.
 
 Note [The oneShot function]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1782,10 +2133,11 @@ inlined.
 -}
 
 realWorldPrimId :: Id   -- :: State# RealWorld
-realWorldPrimId = pcMiscPrelId realWorldName realWorldStatePrimTy
+realWorldPrimId = pcMiscPrelId realWorldName id_ty
                      (noCafIdInfo `setUnfoldingInfo` evaldUnfolding    -- Note [evaldUnfoldings]
-                                  `setOneShotInfo`   stateHackOneShot
-                                  `setNeverRepPoly`  realWorldStatePrimTy)
+                                  `setOneShotInfo`   typeOneShot id_ty)
+   where
+     id_ty = realWorldStatePrimTy
 
 voidPrimId :: Id     -- Global constant :: Void#
                      -- The type Void# is now the same as (# #) (ticket #18441),
@@ -1794,13 +2146,13 @@ voidPrimId :: Id     -- Global constant :: Void#
                      -- We cannot define it in normal Haskell, since it's
                      -- a top-level unlifted value.
 voidPrimId  = pcMiscPrelId voidPrimIdName unboxedUnitTy
-                (noCafIdInfo `setUnfoldingInfo` mkCompulsoryUnfolding defaultSimpleOpts rhs
-                             `setNeverRepPoly`  unboxedUnitTy)
-    where rhs = Var (dataConWorkId unboxedUnitDataCon)
+                (noCafIdInfo `setUnfoldingInfo` mkCompulsoryUnfolding unboxedUnitExpr)
 
+unboxedUnitExpr :: CoreExpr
+unboxedUnitExpr = Var (dataConWorkId unboxedUnitDataCon)
 
 voidArgId :: Id       -- Local lambda-bound :: Void#
-voidArgId = mkSysLocal (fsLit "void") voidArgIdKey Many unboxedUnitTy
+voidArgId = mkSysLocal (fsLit "void") voidArgIdKey ManyTy unboxedUnitTy
 
 coercionTokenId :: Id         -- :: () ~# ()
 coercionTokenId -- See Note [Coercion tokens] in "GHC.CoreToStg"

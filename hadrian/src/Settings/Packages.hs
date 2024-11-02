@@ -6,6 +6,7 @@ import Oracles.Setting
 import Oracles.Flag
 import Packages
 import Settings
+import Oracles.Flavour
 import Settings.Builders.Common (wayCcArgs)
 
 -- | Package-specific command-line arguments.
@@ -13,7 +14,6 @@ packageArgs :: Args
 packageArgs = do
     stage        <- getStage
     path         <- getBuildPath
-    root         <- getBuildRoot
     compilerPath <- expr $ buildPath (vanillaContext stage compiler)
 
     let -- Do not bind the result to a Boolean: this forces the configure rule
@@ -29,7 +29,10 @@ packageArgs = do
     cursesLibraryDir <- getSetting CursesLibDir
     ffiIncludeDir  <- getSetting FfiIncludeDir
     ffiLibraryDir  <- getSetting FfiLibDir
-    debugAssertions  <- ghcDebugAssertions <$> expr flavour
+    debugAssertions  <- ( `ghcDebugAssertions` (succStage stage) ) <$> expr flavour
+      -- NB: in this function, "stage" is the stage of the compiler we are
+      -- using to build, but ghcDebugAssertions wants the stage of the compiler
+      -- we are building, which we get using succStage.
 
     mconcat
         --------------------------------- base ---------------------------------
@@ -52,7 +55,7 @@ packageArgs = do
           [ builder Alex ? arg "--latin1"
 
           , builder (Ghc CompileHs) ? mconcat
-            [ debugAssertions ? notStage0 ? arg "-DDEBUG"
+            [ debugAssertions ? arg "-DDEBUG"
 
             , inputs ["**/GHC.hs", "**/GHC/Driver/Make.hs"] ? arg "-fprof-auto"
             , input "**/Parser.hs" ?
@@ -69,8 +72,7 @@ packageArgs = do
           , builder (Cabal Setup) ? mconcat
             [ arg "--disable-library-for-ghci"
             , anyTargetOs ["openbsd"] ? arg "--ld-options=-E"
-            , ghcProfiled <$> flavour ?
-              notStage0 ? arg "--ghc-pkg-option=--force" ]
+            , (getStage >>= expr . askGhcProfiled) ? arg "--ghc-pkg-option=--force" ]
 
           , builder (Cabal Flags) ? mconcat
             [ andM [expr ghcWithInterpreter, notStage0] `cabalFlag` "internal-interpreter"
@@ -84,11 +86,10 @@ packageArgs = do
         , package ghc ? mconcat
           [ builder Ghc ? mconcat
              [ arg ("-I" ++ compilerPath)
-             , debugAssertions ? notStage0 ? arg "-DDEBUG" ]
+             , debugAssertions ? arg "-DDEBUG" ]
 
           , builder (Cabal Flags) ? mconcat
             [ andM [expr ghcWithInterpreter, notStage0] `cabalFlag` "internal-interpreter"
-            , notM cross `cabalFlag` "terminfo"
             , ifM stage0
                   -- We build a threaded stage 1 if the bootstrapping compiler
                   -- supports it.
@@ -96,7 +97,7 @@ packageArgs = do
 
                   -- We build a threaded stage N, N>1 if the configuration calls
                   -- for it.
-                  ((ghcThreaded <$> expr flavour) `cabalFlag` "threaded")
+                  ((ghcThreaded <$> expr flavour <*> getStage ) `cabalFlag` "threaded")
             ]
           ]
 
@@ -191,10 +192,6 @@ packageArgs = do
         , package hsc2hs ?
           builder (Cabal Flags) ? arg "in-ghc-tree"
 
-        -------------------------------- genapply --------------------------------
-        -- TODO: The logic here needs to come first, so it's hacked into
-        -- Settings.Builder.Ghc instead.
-
         ------------------------------ ghc-bignum ------------------------------
         , ghcBignumArgs
 
@@ -214,11 +211,6 @@ packageArgs = do
         , package hpcBin
           ? builder (Cabal Flags) ? arg "-build-tool-depends"
 
-        --------------------------------- template-haskell ----------------------------------
-
-        , package templateHaskell
-            ? mconcat [ builder (Cabal Flags) ? notStage0 ? arg "+vendor-filepath"
-                      , builder Ghc ? notStage0 ? arg ("-i" <> (root </> pkgPath filepath)) ]
         ]
 
 ghcBignumArgs :: Args
@@ -300,6 +292,7 @@ rtsPackageArgs = package rts ? do
           -- Set the namespace for the rts fs functions
           , arg $ "-DFS_NAMESPACE=rts"
           , arg $ "-DCOMPILING_RTS"
+          , notM targetSupportsSMP           ? arg "-DNOSMP"
           , way `elem` [debug, debugDynamic] ? pure [ "-DTICKY_TICKY"
                                                     , "-optc-DTICKY_TICKY"]
           , Profiling `wayUnit` way          ? arg "-DPROFILING"
@@ -318,7 +311,6 @@ rtsPackageArgs = package rts ? do
           -- provide non-inlined alternatives and hence needs the function to
           -- be inlined. See https://github.com/snowleopard/hadrian/issues/90.
           , arg "-O2"
-          , arg "-g"
 
           , arg "-Irts"
           , arg $ "-I" ++ path
@@ -353,45 +345,45 @@ rtsPackageArgs = package rts ? do
 
           -- We're after pur performance here. So make sure fast math and
           -- vectorization is enabled.
-          , input "**/Hash.c" ? pure
-            [ "-O3" ]
+          , input "**/Hash.c" ? pure [ "-O3" ]
 
-            , inputs ["**/Evac.c", "**/Evac_thr.c"] ? arg "-funroll-loops"
+          , inputs ["**/Evac.c", "**/Evac_thr.c"] ? arg "-funroll-loops"
 
-            , speedHack ?
-              inputs [ "**/Evac.c", "**/Evac_thr.c"
-                     , "**/Scav.c", "**/Scav_thr.c"
-                     , "**/Compact.c", "**/GC.c" ] ? arg "-fno-PIC"
-            -- @-static@ is necessary for these bits, as otherwise the NCG
-            -- generates dynamic references.
-            , speedHack ?
-              inputs [ "**/Updates.c", "**/StgMiscClosures.c"
-                     , "**/PrimOps.c", "**/Apply.c"
-                     , "**/AutoApply.c" ] ? pure ["-fno-PIC", "-static"]
+          , speedHack ?
+            inputs [ "**/Evac.c", "**/Evac_thr.c"
+                   , "**/Scav.c", "**/Scav_thr.c"
+                   , "**/Compact.c", "**/GC.c" ] ? arg "-fno-PIC"
+          -- @-static@ is necessary for these bits, as otherwise the NCG
+          -- generates dynamic references.
+          , speedHack ?
+            inputs [ "**/Updates.c", "**/StgMiscClosures.c"
+                   , "**/PrimOps.c", "**/Apply.c"
+                   , "**/AutoApply.c" ] ? pure ["-fno-PIC", "-static"]
 
-            -- inlining warnings happen in Compact
-            , inputs ["**/Compact.c"] ? arg "-Wno-inline"
+          -- inlining warnings happen in Compact
+          , inputs ["**/Compact.c"] ? arg "-Wno-inline"
 
-            -- emits warnings about call-clobbered registers on x86_64
-            , inputs [ "**/StgCRun.c"
-                     , "**/win32/ConsoleHandler.c", "**/win32/ThrIOManager.c"] ? arg "-w"
-            -- The above warning suppression flags are a temporary kludge.
-            -- While working on this module you are encouraged to remove it and fix
-            -- any warnings in the module. See:
-            -- https://gitlab.haskell.org/ghc/ghc/wikis/working-conventions#Warnings
+          -- emits warnings about call-clobbered registers on x86_64
+          , inputs [ "**/StgCRun.c"
+                   , "**/win32/ConsoleHandler.c", "**/win32/ThrIOManager.c"] ? arg "-w"
+          -- The above warning suppression flags are a temporary kludge.
+          -- While working on this module you are encouraged to remove it and fix
+          -- any warnings in the module. See:
+          -- https://gitlab.haskell.org/ghc/ghc/wikis/working-conventions#Warnings
 
-            , (not <$> flag CcLlvmBackend) ?
-              inputs ["**/Compact.c"] ? arg "-finline-limit=2500"
+          , (not <$> flag CcLlvmBackend) ?
+            inputs ["**/Compact.c"] ? arg "-finline-limit=2500"
 
-            , input "**/RetainerProfile.c" ? flag CcLlvmBackend ?
-              arg "-Wno-incompatible-pointer-types"
-            ]
+          , input "**/RetainerProfile.c" ? flag CcLlvmBackend ?
+            arg "-Wno-incompatible-pointer-types"
+          ]
 
     mconcat
         [ builder (Cabal Flags) ? mconcat
           [ any (wayUnit Profiling) rtsWays `cabalFlag` "profiling"
           , any (wayUnit Debug) rtsWays     `cabalFlag` "debug"
           , any (wayUnit Dynamic) rtsWays   `cabalFlag` "dynamic"
+          , any (wayUnit Threaded) rtsWays  `cabalFlag` "threaded"
           , useSystemFfi                    `cabalFlag` "use-system-libffi"
           , useLibffiForAdjustors           `cabalFlag` "libffi-adjustors"
           , Debug `wayUnit` way             `cabalFlag` "find-ptr"
@@ -410,8 +402,7 @@ rtsPackageArgs = package rts ? do
         , builder HsCpp ? pure
           [ "-DTOP="             ++ show top ]
 
-        , builder HsCpp ? flag WithLibdw ? arg "-DUSE_LIBDW"
-        ]
+        , builder HsCpp ? flag UseLibdw ? arg "-DUSE_LIBDW" ]
 
 -- Compile various performance-critical pieces *without* -fPIC -dynamic
 -- even when building a shared library.  If we don't do this, then the

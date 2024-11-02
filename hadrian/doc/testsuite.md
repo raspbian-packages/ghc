@@ -17,6 +17,24 @@ built GHC before, this will also build a stage 2 GHC in
 the default flavour along with many libraries and programs
 needed by the tests.
 
+NOTE: The only build flavours which are expected to pass the testsuite are those
+tested in CI. If you use an untested flavour such as "Quick" then you run the
+risk that not all tests will pass. In particular you can rely on the `validate`
+and `perf` flavours being tested but no others.
+
+## Building just the dependencies needed for the testsuite
+
+By default the testsuite is queried to work out what specific dependencies need to
+be built for tests. For example, some linter tests don't require anything to be built.
+If you wish to build all the targets for the testsuite before running any tests there is
+a special meta-target which builds all the dependencies you might need when running the testsuite.
+
+```
+build test:all_deps
+```
+
+
+
 ## Running only a subset of the testsuite
 
 ### Specific tests

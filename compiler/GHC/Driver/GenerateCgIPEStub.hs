@@ -1,37 +1,40 @@
-{-# LANGUAGE GADTs #-}
+{-# LANGUAGE GADTs         #-}
 
-module GHC.Driver.GenerateCgIPEStub (generateCgIPEStub) where
+module GHC.Driver.GenerateCgIPEStub (generateCgIPEStub, lookupEstimatedTicks) where
 
+import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (catMaybes, listToMaybe)
+import Data.Semigroup ((<>))
 import GHC.Cmm
-import GHC.Cmm.CLabel (CLabel)
-import GHC.Cmm.Dataflow (Block, C, O)
+import GHC.Cmm.CLabel (CLabel, mkAsmTempLabel)
+import GHC.Cmm.Dataflow (O)
 import GHC.Cmm.Dataflow.Block (blockSplit, blockToList)
-import GHC.Cmm.Dataflow.Collections (mapToList)
+import GHC.Cmm.Dataflow.Collections
 import GHC.Cmm.Dataflow.Label (Label)
 import GHC.Cmm.Info.Build (emptySRT)
 import GHC.Cmm.Pipeline (cmmPipeline)
-import GHC.Cmm.Utils (toBlockList)
-import GHC.Data.Maybe (firstJusts)
 import GHC.Data.Stream (Stream, liftIO)
 import qualified GHC.Data.Stream as Stream
-import GHC.Driver.Env (hsc_dflags)
+import GHC.Driver.Env (hsc_dflags, hsc_logger)
 import GHC.Driver.Env.Types (HscEnv)
-import GHC.Driver.Flags (GeneralFlag (Opt_InfoTableMap))
+import GHC.Driver.Flags (GeneralFlag (..), DumpFlag(Opt_D_ipe_stats))
 import GHC.Driver.Session (gopt, targetPlatform)
 import GHC.Driver.Config.StgToCmm
+import GHC.Driver.Config.Cmm
 import GHC.Prelude
 import GHC.Runtime.Heap.Layout (isStackRep)
-import GHC.Settings (Platform, platformUnregisterised)
+import GHC.Settings (platformTablesNextToCode)
 import GHC.StgToCmm.Monad (getCmm, initC, runC, initFCodeState)
 import GHC.StgToCmm.Prof (initInfoTableProv)
 import GHC.StgToCmm.Types (CmmCgInfos (..), ModuleLFInfos)
+import GHC.StgToCmm.Utils
 import GHC.Types.IPE (InfoTableProvMap (provInfoTables), IpeSourceLocation)
 import GHC.Types.Name.Set (NonCaffySet)
 import GHC.Types.Tickish (GenTickish (SourceNote))
-import GHC.Unit.Types (Module)
-import GHC.Utils.Misc
+import GHC.Unit.Types (Module, moduleName)
+import GHC.Unit.Module (moduleNameString)
+import qualified GHC.Utils.Logger as Logger
+import GHC.Utils.Outputable (ppr)
 
 {-
 Note [Stacktraces from Info Table Provenance Entries (IPE based stack unwinding)]
@@ -41,7 +44,7 @@ Stacktraces can be created from return frames as they are pushed to stack for ev
 But to make them readable / meaningful, one needs to know the source location of each return frame.
 
 Every return frame has a distinct info table and thus a distinct code pointer (for tables next to
-code) or at least a distict address itself. Info Table Provernance Entries (IPE) are searchable by
+code) or at least a distinct address itself. Info Table Provenance Entries (IPEs) are searchable by
 this pointer and contain a source location.
 
 The info table / info table code pointer to source location map is described in:
@@ -52,13 +55,19 @@ by `generateCgIPEStub`.
 
 This leads to the question: How to figure out the source location of a return frame?
 
-While the lookup algorithms for registerised and unregisterised builds differ in details, they have in
-common that we want to lookup the `CmmNode.CmmTick` (containing a `SourceNote`) that is nearest
-(before) the usage of the return frame's label. (Which label and label type is used differs between
-these two use cases.)
+The algorithm for determining source locations for stack info tables is implemented in
+`lookupEstimatedTicks` as two passes over every 'CmmGroupSRTs'. The first pass generates estimated
+source locations for any labels potentially corresponding to stack info tables in the Cmm code. The
+second pass walks over the Cmm decls and creates an entry in the IPE map for every info table,
+looking up source locations for stack info tables in the map generated during the first pass.
 
-Registerised
-~~~~~~~~~~~~~
+The rest of this note will document exactly how the first pass generates the map from labels to
+estimated source positions. The algorithms are different depending on whether tables-next-to-code
+is on or off. Both algorithms have in common that we are looking for a `CmmNode.CmmTick`
+(containing a `SourceNote`) that is near what we estimate to be the label of a return stack frame.
+
+With tables-next-to-code
+~~~~~~~~~~~~~~~~~~~~~~~~
 
 Let's consider this example:
 ```
@@ -107,20 +116,20 @@ for a detailed explanation.
 Here we use the fact, that calls (represented by `CmmNode.CmmCall`) are always closed on exit
 (`CmmNode O C`, `O` means open, `C` closed). In other words, they are always at the end of a block.
 
-So, given a stack represented info table (likely representing a return frame, but this isn't completely
-sure as there are e.g. update frames, too) with it's label (`c18g` in the example above) and a `CmmGraph`:
-  - Look at the end of every block, if it's a `CmmNode.CmmCall` returning to the continuation with the
-    label of the return frame.
-  - If there's such a call, lookup the nearest `CmmNode.CmmTick` by traversing the middle part of the block
-    backwards (from end to beginning).
-  - Take the first `CmmNode.CmmTick` that contains a `Tickish.SourceNote` and return it's payload as
-    `IpeSourceLocation`. (There are other `Tickish` constructors like `ProfNote` or `HpcTick`, these are
-    ignored.)
+So, given a `CmmGraph`:
+  - Look at the end of every block: If it is a `CmmNode.CmmCall` returning to some label, lookup
+    the nearest `CmmNode.CmmTick` by traversing the middle part of the block backwards (from end to
+    beginning).
+  - Take the first `CmmNode.CmmTick` that contains a `Tickish.SourceNote` and map the label we
+    found to it's payload as an `IpeSourceLocation`. (There are other `Tickish` constructors like
+    `ProfNote` or `HpcTick`, these are ignored.)
 
-Unregisterised
-~~~~~~~~~~~~~
+See `labelsToSourcesWithTNTC` for the implementation of this algorithm.
 
-In unregisterised builds there is no return frame / continuation label in calls. The continuation (i.e. return
+Without tables-next-to-code
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+When tables-next-to-code is off, there is no return frame / continuation label in calls. The continuation (i.e. return
 frame) is set in an explicit Cmm assignment. Thus the tick lookup algorithm has to be slightly different.
 
 ```
@@ -170,98 +179,197 @@ In this example we have to lookup `//tick src<Main.hs:20:9-13>` for the return f
 Notice, that this cannot be done with the `Label` `c18M`, but with the `CLabel` `block_c18M_info`
 (`label: block_c18M_info` is actually a `CLabel`).
 
-The find the tick:
-  - Every `Block` is checked from top (first) to bottom (last) node for an assignment like
-   `I64[Sp - 24] = block_c18M_info;`. The lefthand side is actually ignored.
-  - If such an assignment is found the search is over, because the payload (content of
-    `Tickish.SourceNote`, represented as `IpeSourceLocation`) of last visited tick is always
-    remembered in a `Maybe`.
+Given a `CmmGraph`:
+  - Check every `CmmBlock` from top (first) to bottom (last).
+  - If a `CmmTick` holding a `SourceNote` is found, remember the source location in the tick.
+  - If an assignment of the form `... = block_c18M_info;` (a `CmmStore` whose RHS is a
+    `CmmLit (CmmLabel l)`) is found, map that label to the most recently visited source note's
+    location.
+
+See `labelsToSourcesSansTNTC` for the implementation of this algorithm.
 -}
 
-generateCgIPEStub :: HscEnv -> Module -> InfoTableProvMap -> Stream IO CmmGroupSRTs (NonCaffySet, ModuleLFInfos) -> Stream IO CmmGroupSRTs CmmCgInfos
-generateCgIPEStub hsc_env this_mod denv s = do
+generateCgIPEStub
+  :: HscEnv
+  -> Module
+  -> InfoTableProvMap
+  -> ( NonCaffySet
+     , ModuleLFInfos
+     , Map CmmInfoTable (Maybe IpeSourceLocation)
+     , IPEStats
+     )
+  -> Stream IO CmmGroupSRTs CmmCgInfos
+generateCgIPEStub hsc_env this_mod denv (nonCaffySet, moduleLFInfos, infoTablesWithTickishes, initStats) = do
   let dflags   = hsc_dflags hsc_env
       platform = targetPlatform dflags
+      logger   = hsc_logger hsc_env
       fstate   = initFCodeState platform
+      cmm_cfg  = initCmmConfig dflags
   cgState <- liftIO initC
 
-  -- Collect info tables, but only if -finfo-table-map is enabled, otherwise labeledInfoTablesWithTickishes is empty.
-  let collectFun = if gopt Opt_InfoTableMap dflags then collect platform else collectNothing
-  (labeledInfoTablesWithTickishes, (nonCaffySet, moduleLFInfos)) <- Stream.mapAccumL_ collectFun [] s
-
   -- Yield Cmm for Info Table Provenance Entries (IPEs)
-  let denv' = denv {provInfoTables = Map.fromList (map (\(_, i, t) -> (cit_lbl i, t)) labeledInfoTablesWithTickishes)}
-      ((ipeStub, ipeCmmGroup), _) = runC (initStgToCmmConfig dflags this_mod) fstate cgState $ getCmm (initInfoTableProv (map sndOf3 labeledInfoTablesWithTickishes) denv')
+  let denv' = denv {provInfoTables = Map.mapKeys cit_lbl infoTablesWithTickishes}
+      ((mIpeStub, ipeCmmGroup), _) = runC (initStgToCmmConfig dflags this_mod) fstate cgState $ getCmm (initInfoTableProv initStats (Map.keys infoTablesWithTickishes) denv')
 
-  (_, ipeCmmGroupSRTs) <- liftIO $ cmmPipeline hsc_env (emptySRT this_mod) ipeCmmGroup
+  (_, ipeCmmGroupSRTs) <- liftIO $ cmmPipeline logger cmm_cfg (emptySRT this_mod) ipeCmmGroup
   Stream.yield ipeCmmGroupSRTs
 
+  ipeStub <-
+    case mIpeStub of
+      Just (stats, stub) -> do
+        -- Print ipe stats if requested
+        liftIO $
+          Logger.putDumpFileMaybe logger
+            Opt_D_ipe_stats
+            ("IPE Stats for module " ++ (moduleNameString $ moduleName this_mod))
+            Logger.FormatText
+            (ppr stats)
+        return stub
+      Nothing -> return mempty
+
   return CmmCgInfos {cgNonCafs = nonCaffySet, cgLFInfos = moduleLFInfos, cgIPEStub = ipeStub}
+
+-- | Given:
+--   * an initial mapping from info tables to possible source locations,
+--   * initial 'IPEStats',
+--   * a 'CmmGroupSRTs',
+--
+-- map every info table listed in the 'CmmProc's of the group to their possible
+-- source locations and update 'IPEStats' for skipped stack info tables (in case
+-- both -finfo-table-map and -fno-info-table-map-with-stack were given). See:
+-- Note [Stacktraces from Info Table Provenance Entries (IPE based stack unwinding)]
+--
+-- Note: While it would be cleaner if we could keep the recursion and
+-- accumulation internal to this function, this cannot be done without
+-- separately traversing stream of 'CmmGroupSRTs' in 'GHC.Driver.Main'. The
+-- initial implementation of this logic did such a thing, and code generation
+-- performance suffered considerably as a result (see #23103).
+lookupEstimatedTicks
+  :: HscEnv
+  -> Map CmmInfoTable (Maybe IpeSourceLocation)
+  -> IPEStats
+  -> CmmGroupSRTs
+  -> IO (Map CmmInfoTable (Maybe IpeSourceLocation), IPEStats)
+lookupEstimatedTicks hsc_env ipes stats cmm_group_srts =
+    -- Pass 2: Create an entry in the IPE map for every info table listed in
+    -- this CmmGroupSRTs. If the info table is a stack info table and
+    -- -finfo-table-map-with-stack is enabled, look up its estimated source
+    -- location in the map generate during Pass 1. If the info table is a stack
+    -- info table and -finfo-table-map-with-stack is not enabled, skip the table
+    -- and note it as skipped in the IPE stats. If the info table is not a stack
+    -- info table, insert into the IPE map with no source location information
+    -- (for now; see `convertInfoProvMap` in GHC.StgToCmm.Utils to see how source
+    -- locations for these tables get filled in)
+    pure $ foldl' collectInfoTables (ipes, stats) cmm_group_srts
   where
-    collect :: Platform -> [(Label, CmmInfoTable, Maybe IpeSourceLocation)] -> CmmGroupSRTs -> IO ([(Label, CmmInfoTable, Maybe IpeSourceLocation)], CmmGroupSRTs)
-    collect platform acc cmmGroupSRTs = do
-      let labelsToInfoTables = collectInfoTables cmmGroupSRTs
-          labelsToInfoTablesToTickishes = map (\(l, i) -> (l, i, lookupEstimatedTick platform cmmGroupSRTs l i)) labelsToInfoTables
-      return (acc ++ labelsToInfoTablesToTickishes, cmmGroupSRTs)
+    dflags = hsc_dflags hsc_env
+    platform = targetPlatform dflags
 
-    collectNothing :: [a] -> CmmGroupSRTs -> IO ([a], CmmGroupSRTs)
-    collectNothing _ cmmGroupSRTs = pure ([], cmmGroupSRTs)
+    -- Pass 1: Map every label meeting the conditions described in Note
+    -- [Stacktraces from Info Table Provenance Entries (IPE based stack
+    -- unwinding)] to the estimated source location (also as described in the
+    -- aformentioned note)
+    --
+    -- Note: It's important that this remains a thunk so we do not compute this
+    -- map if -fno-info-table-with-stack is given
+    labelsToSources :: Map CLabel IpeSourceLocation
+    labelsToSources =
+      if platformTablesNextToCode platform then
+        foldl' labelsToSourcesWithTNTC Map.empty cmm_group_srts
+      else
+        foldl' labelsToSourcesSansTNTC Map.empty cmm_group_srts
 
-    collectInfoTables :: CmmGroupSRTs -> [(Label, CmmInfoTable)]
-    collectInfoTables cmmGroup = concat $ catMaybes $ map extractInfoTables cmmGroup
-
-    extractInfoTables :: GenCmmDecl RawCmmStatics CmmTopInfo CmmGraph -> Maybe [(Label, CmmInfoTable)]
-    extractInfoTables (CmmProc h _ _ _) = Just $ mapToList (info_tbls h)
-    extractInfoTables _ = Nothing
-
-    lookupEstimatedTick :: Platform -> CmmGroupSRTs -> Label -> CmmInfoTable -> Maybe IpeSourceLocation
-    lookupEstimatedTick platform cmmGroup infoTableLabel infoTable = do
-      -- All return frame info tables are stack represented, though not all stack represented info
-      -- tables have to be return frames.
-      if (isStackRep . cit_rep) infoTable
-        then do
-          let findFun =
-                if platformUnregisterised platform
-                  then findCmmTickishForForUnregistered (cit_lbl infoTable)
-                  else findCmmTickishForRegistered infoTableLabel
-              blocks = concatMap toBlockList (graphs cmmGroup)
-          firstJusts $ map findFun blocks
-        else Nothing
-    graphs :: CmmGroupSRTs -> [CmmGraph]
-    graphs = foldl' go []
+    collectInfoTables
+      :: (Map CmmInfoTable (Maybe IpeSourceLocation), IPEStats)
+      -> GenCmmDecl RawCmmStatics CmmTopInfo CmmGraph
+      -> (Map CmmInfoTable (Maybe IpeSourceLocation), IPEStats)
+    collectInfoTables (!acc, !stats) (CmmProc h _ _ _) =
+        mapFoldlWithKey go (acc, stats) (info_tbls h)
       where
-        go :: [CmmGraph] -> GenCmmDecl d h CmmGraph -> [CmmGraph]
-        go acc (CmmProc _ _ _ g) = g : acc
-        go acc _ = acc
+        go :: (Map CmmInfoTable (Maybe IpeSourceLocation), IPEStats)
+           -> Label
+           -> CmmInfoTable
+           -> (Map CmmInfoTable (Maybe IpeSourceLocation), IPEStats)
+        go (!acc, !stats) lbl' tbl =
+          let
+            lbl =
+              if platformTablesNextToCode platform then
+                -- TNTC case, the mapped CLabel will be the result of
+                -- mkAsmTempLabel on the info table label
+                mkAsmTempLabel lbl'
+              else
+                -- Non-TNTC case, the mapped CLabel will be the CLabel of the
+                -- info table itself
+                cit_lbl tbl
+          in
+            if (isStackRep . cit_rep) tbl then
+              if gopt Opt_InfoTableMapWithStack dflags then
+                -- This is a stack info table and we DO want to put it in the
+                -- info table map
+                (Map.insert tbl (Map.lookup lbl labelsToSources) acc, stats)
+              else
+                -- This is a stack info table but we DO NOT want to put it in
+                -- the info table map (-fno-info-table-map-with-stack was
+                -- given), track it as skipped
+                (acc, stats <> skippedIpeStats)
+            else
+              -- This is not a stack info table, so put it in the map with no
+              -- source location (for now)
+              (Map.insert tbl Nothing acc, stats)
+    collectInfoTables (!acc, !stats) _ = (acc, stats)
 
-    findCmmTickishForRegistered :: Label -> Block CmmNode C C -> Maybe IpeSourceLocation
-    findCmmTickishForRegistered label block = do
-      let (_, middleBlock, endBlock) = blockSplit block
-
-      isCallWithReturnFrameLabel endBlock label
-      lastTickInBlock middleBlock
+-- | See Note [Stacktraces from Info Table Provenance Entries (IPE based stack unwinding)]
+labelsToSourcesWithTNTC
+  :: Map CLabel IpeSourceLocation
+  -> GenCmmDecl RawCmmStatics CmmTopInfo CmmGraph
+  -> Map CLabel IpeSourceLocation
+labelsToSourcesWithTNTC acc (CmmProc _ _ _ cmm_graph) =
+    foldl' go acc (toBlockList cmm_graph)
+  where
+    go :: Map CLabel IpeSourceLocation -> CmmBlock -> Map CLabel IpeSourceLocation
+    go acc block =
+        case (,) <$> returnFrameLabel <*> lastTickInBlock of
+          Just (clabel, src_loc) -> Map.insert clabel src_loc acc
+          Nothing -> acc
       where
-        isCallWithReturnFrameLabel :: CmmNode O C -> Label -> Maybe ()
-        isCallWithReturnFrameLabel (CmmCall _ (Just l) _ _ _ _) clabel | l == clabel = Just ()
-        isCallWithReturnFrameLabel _ _ = Nothing
+        (_, middleBlock, endBlock) = blockSplit block
 
-        lastTickInBlock block =
-          listToMaybe $
-            catMaybes $
-              map maybeTick $ (reverse . blockToList) block
+        returnFrameLabel :: Maybe CLabel
+        returnFrameLabel =
+          case endBlock of
+            (CmmCall _ (Just l) _ _ _ _) -> Just $ mkAsmTempLabel l
+            _ -> Nothing
 
-        maybeTick :: CmmNode O O -> Maybe IpeSourceLocation
-        maybeTick (CmmTick (SourceNote span name)) = Just (span, name)
-        maybeTick _ = Nothing
+        lastTickInBlock = foldr maybeTick Nothing (blockToList middleBlock)
 
-    findCmmTickishForForUnregistered :: CLabel -> Block CmmNode C C -> Maybe IpeSourceLocation
-    findCmmTickishForForUnregistered cLabel block = do
-      let (_, middleBlock, _) = blockSplit block
-      find cLabel (blockToList middleBlock) Nothing
+        maybeTick :: CmmNode O O -> Maybe IpeSourceLocation -> Maybe IpeSourceLocation
+        maybeTick _ s@(Just _) = s
+        maybeTick (CmmTick (SourceNote span name)) Nothing = Just (span, name)
+        maybeTick _ _ = Nothing
+labelsToSourcesWithTNTC acc _ = acc
+
+-- | See Note [Stacktraces from Info Table Provenance Entries (IPE based stack unwinding)]
+labelsToSourcesSansTNTC
+  :: Map CLabel IpeSourceLocation
+  -> GenCmmDecl RawCmmStatics CmmTopInfo CmmGraph
+  -> Map CLabel IpeSourceLocation
+labelsToSourcesSansTNTC acc (CmmProc _ _ _ cmm_graph) =
+    foldl' go acc (toBlockList cmm_graph)
+  where
+    go :: Map CLabel IpeSourceLocation -> CmmBlock -> Map CLabel IpeSourceLocation
+    go acc block = fst $ foldl' collectLabels (acc, Nothing) (blockToList middleBlock)
       where
-        find :: CLabel -> [CmmNode O O] -> Maybe IpeSourceLocation -> Maybe IpeSourceLocation
-        find label (b : blocks) lastTick = case b of
-          (CmmStore _ (CmmLit (CmmLabel l)) _) -> if label == l then lastTick else find label blocks lastTick
-          (CmmTick (SourceNote span name)) -> find label blocks $ Just (span, name)
-          _ -> find label blocks lastTick
-        find _ [] _ = Nothing
+        (_, middleBlock, _) = blockSplit block
+
+        collectLabels
+          :: (Map CLabel IpeSourceLocation, Maybe IpeSourceLocation)
+          -> CmmNode O O
+          -> (Map CLabel IpeSourceLocation, Maybe IpeSourceLocation)
+        collectLabels (!acc, lastTick) b =
+          case (b, lastTick) of
+            (CmmStore _ (CmmLit (CmmLabel l)) _, Just src_loc) ->
+              (Map.insert l src_loc acc, Nothing)
+            (CmmTick (SourceNote span name), _) ->
+              (acc, Just (span, name))
+            _ -> (acc, lastTick)
+labelsToSourcesSansTNTC acc _ = acc

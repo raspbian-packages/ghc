@@ -29,6 +29,7 @@ module GHC.Unit.Module.Graph
 
    , NodeKey(..)
    , nodeKeyUnitId
+   , nodeKeyModName
    , ModNodeKey
    , mkNodeKey
    , msKey
@@ -41,6 +42,7 @@ module GHC.Unit.Module.Graph
 where
 
 import GHC.Prelude
+import GHC.Platform
 
 import qualified GHC.LanguageExtensions as LangExt
 
@@ -48,7 +50,6 @@ import GHC.Data.Maybe
 import GHC.Data.Graph.Directed
 
 import GHC.Driver.Backend
-import GHC.Driver.Ppr
 import GHC.Driver.Session
 
 import GHC.Types.SourceFile ( hscSourceString )
@@ -125,6 +126,10 @@ nodeKeyUnitId :: NodeKey -> UnitId
 nodeKeyUnitId (NodeKey_Unit iu)   = instUnitInstanceOf iu
 nodeKeyUnitId (NodeKey_Module mk) = mnkUnitId mk
 nodeKeyUnitId (NodeKey_Link uid)  = uid
+
+nodeKeyModName :: NodeKey -> Maybe ModuleName
+nodeKeyModName (NodeKey_Module mk) = Just (gwib_mod $ mnkModuleName mk)
+nodeKeyModName _ = Nothing
 
 data ModNodeKeyWithUid = ModNodeKeyWithUid { mnkModuleName :: !ModuleNameWithIsBoot
                                            , mnkUnitId     :: !UnitId } deriving (Eq, Ord)
@@ -258,7 +263,8 @@ showModMsg dflags _ (LinkNode {}) =
                           _ -> False
 
           platform  = targetPlatform dflags
-          exe_file  = exeFileName platform staticLink (outputFile_ dflags)
+          arch_os   = platformArchOS platform
+          exe_file  = exeFileName arch_os staticLink (outputFile_ dflags)
       in text exe_file
 showModMsg _ _ (InstantiationNode _uid indef_unit) =
   ppr $ instUnitInstanceOf indef_unit
@@ -273,17 +279,16 @@ showModMsg dflags recomp (ModuleNode _ mod_summary) =
 
   where
     op       = normalise
-    mod      = moduleName (ms_mod mod_summary)
-    mod_str  = showPpr dflags mod ++ hscSourceString (ms_hsc_src mod_summary)
+    mod_str  = moduleNameString (moduleName (ms_mod mod_summary)) ++
+               hscSourceString (ms_hsc_src mod_summary)
     dyn_file = op $ msDynObjFilePath mod_summary
     obj_file = op $ msObjFilePath mod_summary
-    message = case backend dflags of
-                Interpreter | recomp -> text "interpreted"
-                NoBackend            -> text "nothing"
-                _                    ->
-                  if gopt Opt_BuildDynamicToo  dflags
-                    then text obj_file <> comma <+> text dyn_file
-                    else text obj_file
+    files    = [ obj_file ]
+               ++ [ dyn_file | gopt Opt_BuildDynamicToo dflags ]
+               ++ [ "interpreted" | gopt Opt_ByteCodeAndObjectCode dflags ]
+    message = case backendSpecialModuleSource (backend dflags) recomp of
+                Just special -> text special
+                Nothing -> foldr1 (\ofile rest -> ofile <> comma <+> rest) (map text files)
 
 
 

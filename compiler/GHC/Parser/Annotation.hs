@@ -51,7 +51,7 @@ module GHC.Parser.Annotation (
   la2na, na2la, n2l, l2n, l2l, la2la,
   reLoc, reLocA, reLocL, reLocC, reLocN,
 
-  la2r, realSrcSpan,
+  srcSpan2e, la2e, realSrcSpan,
 
   -- ** Building up annotations
   extraToAnnList, reAnn,
@@ -95,7 +95,6 @@ import GHC.Data.FastString
 import GHC.Types.Name
 import GHC.Types.SrcLoc
 import GHC.Hs.DocString
-import GHC.Utils.Binary
 import GHC.Utils.Outputable hiding ( (<>) )
 import GHC.Utils.Panic
 import qualified GHC.Data.Strict as Strict
@@ -202,7 +201,6 @@ https://gitlab.haskell.org/ghc/ghc/wikis/api-annotations
 data AnnKeywordId
     = AnnAnyclass
     | AnnAs
-    | AnnAt
     | AnnBang  -- ^ '!'
     | AnnBackquote -- ^ '`'
     | AnnBy
@@ -405,7 +403,7 @@ data AddEpAnn = AddEpAnn AnnKeywordId EpaLocation deriving (Data,Eq)
 -- in the @'EpaDelta'@ variant captures any comments between the prior
 -- output and the thing being marked here, since we cannot otherwise
 -- sort the relative order.
-data EpaLocation = EpaSpan !RealSrcSpan
+data EpaLocation = EpaSpan !RealSrcSpan !(Strict.Maybe BufSpan)
                  | EpaDelta !DeltaPos ![LEpaComment]
                deriving (Data,Eq)
 
@@ -413,6 +411,9 @@ data EpaLocation = EpaSpan !RealSrcSpan
 -- generated code (e.g. by TH).
 data TokenLocation = NoTokenLoc | TokenLoc !EpaLocation
                deriving (Data,Eq)
+
+instance Outputable a => Outputable (GenLocated TokenLocation a) where
+  ppr (L _ x) = ppr x
 
 -- | Spacing between output items when exact printing.  It captures
 -- the spacing from the current print position on the page to the
@@ -446,15 +447,15 @@ getDeltaLine (DifferentLine r _) = r
 -- 'EpaLocation'. The parser will never insert a 'DeltaPos', so the
 -- partial function is safe.
 epaLocationRealSrcSpan :: EpaLocation -> RealSrcSpan
-epaLocationRealSrcSpan (EpaSpan r) = r
+epaLocationRealSrcSpan (EpaSpan r _) = r
 epaLocationRealSrcSpan (EpaDelta _ _) = panic "epaLocationRealSrcSpan"
 
 epaLocationFromSrcAnn :: SrcAnn ann -> EpaLocation
-epaLocationFromSrcAnn (SrcSpanAnn EpAnnNotUsed l) = EpaSpan (realSrcSpan l)
-epaLocationFromSrcAnn (SrcSpanAnn (EpAnn anc _ _) _) = EpaSpan (anchor anc)
+epaLocationFromSrcAnn (SrcSpanAnn EpAnnNotUsed l) = EpaSpan (realSrcSpan l) Strict.Nothing
+epaLocationFromSrcAnn (SrcSpanAnn (EpAnn anc _ _) _) = EpaSpan (anchor anc) Strict.Nothing
 
 instance Outputable EpaLocation where
-  ppr (EpaSpan r) = text "EpaSpan" <+> ppr r
+  ppr (EpaSpan r _) = text "EpaSpan" <+> ppr r
   ppr (EpaDelta d cs) = text "EpaDelta" <+> ppr d <+> ppr cs
 
 instance Outputable AddEpAnn where
@@ -545,7 +546,7 @@ realSpanAsAnchor s  = Anchor s UnchangedAnchor
 -- element, and print them together with the element, interleaving
 -- them into the output stream.  But when editing the AST to move
 -- fragments around it is useful to be able to first separate the
--- comments into those occuring before the AST element and those
+-- comments into those occurring before the AST element and those
 -- following it.  The 'EpaCommentsBalanced' constructor is used to do
 -- this. The GHC parser will only insert the 'EpaComments' form.
 data EpAnnComments = EpaComments
@@ -631,7 +632,7 @@ meaning we can have type LocatedN RdrName
 -- Annotations for items in a list
 -- ---------------------------------------------------------------------
 
--- | Captures the location of punctuation occuring between items,
+-- | Captures the location of punctuation occurring between items,
 -- normally in a list.  It is captured as a trailing annotation.
 data TrailingAnn
   = AddSemiAnn EpaLocation    -- ^ Trailing ';'
@@ -915,8 +916,12 @@ realSrcSpan _ = mkRealSrcSpan l l -- AZ temporary
   where
     l = mkRealSrcLoc (fsLit "foo") (-1) (-1)
 
-la2r :: SrcSpanAnn' a -> RealSrcSpan
-la2r l = realSrcSpan (locA l)
+srcSpan2e :: SrcSpan -> EpaLocation
+srcSpan2e (RealSrcSpan s mb) = EpaSpan s mb
+srcSpan2e span = EpaSpan (realSrcSpan span) Strict.Nothing
+
+la2e :: SrcSpanAnn' a -> EpaLocation
+la2e = srcSpan2e . locA
 
 extraToAnnList :: AnnList -> [AddEpAnn] -> AnnList
 extraToAnnList (AnnList a o c e t) as = AnnList a o c (e++as) t
@@ -975,7 +980,7 @@ widenSpan :: SrcSpan -> [AddEpAnn] -> SrcSpan
 widenSpan s as = foldl combineSrcSpans s (go as)
   where
     go [] = []
-    go (AddEpAnn _ (EpaSpan s):rest) = RealSrcSpan s Strict.Nothing : go rest
+    go (AddEpAnn _ (EpaSpan s mb):rest) = RealSrcSpan s mb : go rest
     go (AddEpAnn _ (EpaDelta _ _):rest) = go rest
 
 -- | The annotations need to all come after the anchor.  Make sure
@@ -984,7 +989,7 @@ widenRealSpan :: RealSrcSpan -> [AddEpAnn] -> RealSrcSpan
 widenRealSpan s as = foldl combineRealSrcSpans s (go as)
   where
     go [] = []
-    go (AddEpAnn _ (EpaSpan s):rest) = s : go rest
+    go (AddEpAnn _ (EpaSpan s _):rest) = s : go rest
     go (AddEpAnn _ (EpaDelta _ _):rest) =     go rest
 
 widenAnchor :: Anchor -> [AddEpAnn] -> Anchor
@@ -1246,17 +1251,6 @@ instance Outputable AnnSortKey where
 
 instance Outputable IsUnicodeSyntax where
   ppr = text . show
-
-instance Binary a => Binary (LocatedL a) where
-  -- We do not serialise the annotations
-    put_ bh (L l x) = do
-            put_ bh (locA l)
-            put_ bh x
-
-    get bh = do
-            l <- get bh
-            x <- get bh
-            return (L (noAnnSrcSpan l) x)
 
 instance (Outputable a) => Outputable (SrcSpanAnn' a) where
   ppr (SrcSpanAnn a l) = text "SrcSpanAnn" <+> ppr a <+> ppr l

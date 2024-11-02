@@ -1,3 +1,15 @@
+# 3.10.3.0 [Hécate](mailto:hecate+github@glitchbra.in) January 2024
+* See https://github.com/haskell/cabal/blob/master/release-notes/Cabal-3.10.3.0.md
+
+# 3.10.2.1 [Hécate](mailto:hecate+github@glitchbra.in) October 2023
+* See https://github.com/haskell/cabal/blob/master/release-notes/Cabal-3.10.2.1.md
+
+# 3.10.2.0 [Hécate](mailto:hecate+github@glitchbra.in) August 2023
+* See https://github.com/haskell/cabal/blob/master/release-notes/Cabal-3.10.2.0.md
+
+# 3.10.1.0 [Mikolaj Konarski](mailto:mikolaj@well-typed.com) March 2023
+* See https://github.com/haskell/cabal/blob/master/release-notes/Cabal-3.10.1.0.md
+
 # 3.8.1.0 [Mikolaj Konarski](mailto:mikolaj@well-typed.com) August 2022
   * See https://github.com/haskell/cabal/blob/master/release-notes/Cabal-3.8.1.0.md
 

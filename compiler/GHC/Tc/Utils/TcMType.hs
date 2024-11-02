@@ -1,4 +1,3 @@
-
 {-# LANGUAGE MultiWayIf      #-}
 {-# LANGUAGE RecursiveDo     #-}
 {-# LANGUAGE TupleSections   #-}
@@ -113,9 +112,9 @@ import GHC.Driver.Session
 import qualified GHC.LanguageExtensions as LangExt
 
 import GHC.Tc.Types.Origin
-import GHC.Tc.Utils.Monad        -- TcType, amongst others
 import GHC.Tc.Types.Constraint
 import GHC.Tc.Types.Evidence
+import GHC.Tc.Utils.Monad        -- TcType, amongst others
 import GHC.Tc.Utils.TcType
 import GHC.Tc.Errors.Types
 import GHC.Tc.Errors.Ppr
@@ -151,11 +150,11 @@ import GHC.Utils.Outputable
 import GHC.Utils.Panic
 import GHC.Utils.Panic.Plain
 import GHC.Utils.Constants (debugIsOn)
-import GHC.Utils.Trace
 
 import Control.Monad
 import GHC.Data.Maybe
 import qualified Data.Semigroup as Semi
+import GHC.Types.Name.Reader
 
 {-
 ************************************************************************
@@ -194,7 +193,7 @@ newEvVars theta = mapM newEvVar theta
 newEvVar :: TcPredType -> TcRnIf gbl lcl EvVar
 -- Creates new *rigid* variables for predicates
 newEvVar ty = do { name <- newSysName (predTypeOccName ty)
-                 ; return (mkLocalIdOrCoVar name Many ty) }
+                 ; return (mkLocalIdOrCoVar name ManyTy ty) }
 
 -- | Create a new Wanted constraint with the given 'CtLoc'.
 newWantedWithLoc :: CtLoc -> PredType -> TcM CtEvidence
@@ -303,7 +302,7 @@ emitWantedEvVars :: CtOrigin -> [TcPredType] -> TcM [EvVar]
 emitWantedEvVars orig = mapM (emitWantedEvVar orig)
 
 -- | Emit a new wanted expression hole
-emitNewExprHole :: OccName         -- of the hole
+emitNewExprHole :: RdrName         -- of the hole
                 -> Type -> TcM HoleExprRef
 emitNewExprHole occ ty
   = do { u <- newUnique
@@ -322,7 +321,7 @@ emitNewExprHole occ ty
 newDict :: Class -> [TcType] -> TcM DictId
 newDict cls tys
   = do { name <- newSysName (mkDictOcc (getOccName cls))
-       ; return (mkLocalId name Many (mkClassPred cls tys)) }
+       ; return (mkLocalId name ManyTy (mkClassPred cls tys)) }
 
 predTypeOccName :: PredType -> OccName
 predTypeOccName ty = case classifyPredType ty of
@@ -633,7 +632,7 @@ ensureMonoType :: TcType -> TcM ()
 -- Assuming that the argument type is of kind (TYPE r),
 -- ensure that it is a /monotype/
 -- If it is not a monotype we can see right away (since unification
--- varibles and type-function applications stand for monotypes), but
+-- variables and type-function applications stand for monotypes), but
 -- we emit a Wanted equality just to delay the error message until later
 ensureMonoType res_ty
   | isTauTy res_ty   -- isTauTy doesn't need zonking or anything
@@ -663,7 +662,7 @@ promoteTcType :: TcLevel -> TcType -> TcM (TcCoercionN, TcType)
 promoteTcType dest_lvl ty
   = do { cur_lvl <- getTcLevel
        ; if (cur_lvl `sameDepthAs` dest_lvl)
-         then return (mkTcNomReflCo ty, ty)
+         then return (mkNomReflCo ty, ty)
          else promote_it }
   where
     promote_it :: TcM (TcCoercion, TcType)
@@ -765,7 +764,7 @@ skolems.  They are used in two places:
 
 1. In kind signatures, see GHC.Tc.TyCl
       Note [Inferring kinds for type declarations]
-   and Note [Kind checking for GADTs]
+   and Note [Using TyVarTvs for kind-checking GADTs]
 
 2. In partial type signatures.  See GHC.Tc.Types
    Note [Quantified variables in partial type signatures]
@@ -998,13 +997,11 @@ writeMetaTyVarRef tyvar ref ty
        -- Zonk kinds to allow the error check to work
        ; zonked_tv_kind <- zonkTcType tv_kind
        ; zonked_ty      <- zonkTcType ty
-       ; let zonked_ty_kind = tcTypeKind zonked_ty
+       ; let zonked_ty_kind = typeKind zonked_ty
              zonked_ty_lvl  = tcTypeLevel zonked_ty
              level_check_ok  = not (zonked_ty_lvl `strictlyDeeperThan` tv_lvl)
              level_check_msg = ppr zonked_ty_lvl $$ ppr tv_lvl $$ ppr tyvar $$ ppr ty
              kind_check_ok = zonked_ty_kind `eqType` zonked_tv_kind
-             -- Hack alert! eqType, not tcEqType. see:
-             -- Note [coreView vs tcView] in GHC.Core.Type
              -- Note [Extra-constraint holes in partial type signatures] in GHC.Tc.Gen.HsType
 
              kind_msg = hang (text "Ill-kinded update to meta tyvar")
@@ -1097,35 +1094,35 @@ newOpenBoxedTypeKind
        ; let rr = mkTyConApp boxedRepDataConTyCon [lev]
        ; return (mkTYPEapp rr) }
 
-newMetaTyVars :: [TyVar] -> TcM (TCvSubst, [TcTyVar])
+newMetaTyVars :: [TyVar] -> TcM (Subst, [TcTyVar])
 -- Instantiate with META type variables
 -- Note that this works for a sequence of kind, type, and coercion variables
 -- variables.  Eg    [ (k:*), (a:k->k) ]
 --             Gives [ (k7:*), (a8:k7->k7) ]
-newMetaTyVars = newMetaTyVarsX emptyTCvSubst
-    -- emptyTCvSubst has an empty in-scope set, but that's fine here
+newMetaTyVars = newMetaTyVarsX emptySubst
+    -- emptySubst has an empty in-scope set, but that's fine here
     -- Since the tyvars are freshly made, they cannot possibly be
     -- captured by any existing for-alls.
 
-newMetaTyVarsX :: TCvSubst -> [TyVar] -> TcM (TCvSubst, [TcTyVar])
+newMetaTyVarsX :: Subst -> [TyVar] -> TcM (Subst, [TcTyVar])
 -- Just like newMetaTyVars, but start with an existing substitution.
 newMetaTyVarsX subst = mapAccumLM newMetaTyVarX subst
 
-newMetaTyVarX :: TCvSubst -> TyVar -> TcM (TCvSubst, TcTyVar)
+newMetaTyVarX :: Subst -> TyVar -> TcM (Subst, TcTyVar)
 -- Make a new unification variable tyvar whose Name and Kind come from
 -- an existing TyVar. We substitute kind variables in the kind.
 newMetaTyVarX = new_meta_tv_x TauTv
 
-newMetaTyVarTyVarX :: TCvSubst -> TyVar -> TcM (TCvSubst, TcTyVar)
+newMetaTyVarTyVarX :: Subst -> TyVar -> TcM (Subst, TcTyVar)
 -- Just like newMetaTyVarX, but make a TyVarTv
 newMetaTyVarTyVarX = new_meta_tv_x TyVarTv
 
-newWildCardX :: TCvSubst -> TyVar -> TcM (TCvSubst, TcTyVar)
+newWildCardX :: Subst -> TyVar -> TcM (Subst, TcTyVar)
 newWildCardX subst tv
   = do { new_tv <- newAnonMetaTyVar TauTv (substTy subst (tyVarKind tv))
        ; return (extendTvSubstWithClone subst tv new_tv, new_tv) }
 
-new_meta_tv_x :: MetaInfo -> TCvSubst -> TyVar -> TcM (TCvSubst, TcTyVar)
+new_meta_tv_x :: MetaInfo -> Subst -> TyVar -> TcM (Subst, TcTyVar)
 new_meta_tv_x info subst tv
   = do  { new_tv <- cloneAnonMetaTyVar info tv substd_kind
         ; let subst1 = extendTvSubstWithClone subst tv new_tv
@@ -1535,24 +1532,24 @@ collect_cand_qtvs_co :: TcType -- original type at top of recursion; for errors
                      -> TcM CandidatesQTvs
 collect_cand_qtvs_co orig_ty bound = go_co
   where
-    go_co dv (Refl ty)             = collect_cand_qtvs orig_ty True bound dv ty
-    go_co dv (GRefl _ ty mco)      = do dv1 <- collect_cand_qtvs orig_ty True bound dv ty
-                                        go_mco dv1 mco
-    go_co dv (TyConAppCo _ _ cos)  = foldlM go_co dv cos
-    go_co dv (AppCo co1 co2)       = foldlM go_co dv [co1, co2]
-    go_co dv (FunCo _ w co1 co2)   = foldlM go_co dv [w, co1, co2]
-    go_co dv (AxiomInstCo _ _ cos) = foldlM go_co dv cos
-    go_co dv (AxiomRuleCo _ cos)   = foldlM go_co dv cos
-    go_co dv (UnivCo prov _ t1 t2) = do dv1 <- go_prov dv prov
-                                        dv2 <- collect_cand_qtvs orig_ty True bound dv1 t1
-                                        collect_cand_qtvs orig_ty True bound dv2 t2
-    go_co dv (SymCo co)            = go_co dv co
-    go_co dv (TransCo co1 co2)     = foldlM go_co dv [co1, co2]
-    go_co dv (NthCo _ _ co)        = go_co dv co
-    go_co dv (LRCo _ co)           = go_co dv co
-    go_co dv (InstCo co1 co2)      = foldlM go_co dv [co1, co2]
-    go_co dv (KindCo co)           = go_co dv co
-    go_co dv (SubCo co)            = go_co dv co
+    go_co dv (Refl ty)               = collect_cand_qtvs orig_ty True bound dv ty
+    go_co dv (GRefl _ ty mco)        = do dv1 <- collect_cand_qtvs orig_ty True bound dv ty
+                                          go_mco dv1 mco
+    go_co dv (TyConAppCo _ _ cos)    = foldlM go_co dv cos
+    go_co dv (AppCo co1 co2)         = foldlM go_co dv [co1, co2]
+    go_co dv (FunCo _ _ _ w co1 co2) = foldlM go_co dv [w, co1, co2]
+    go_co dv (AxiomInstCo _ _ cos)   = foldlM go_co dv cos
+    go_co dv (AxiomRuleCo _ cos)     = foldlM go_co dv cos
+    go_co dv (UnivCo prov _ t1 t2)   = do dv1 <- go_prov dv prov
+                                          dv2 <- collect_cand_qtvs orig_ty True bound dv1 t1
+                                          collect_cand_qtvs orig_ty True bound dv2 t2
+    go_co dv (SymCo co)              = go_co dv co
+    go_co dv (TransCo co1 co2)       = foldlM go_co dv [co1, co2]
+    go_co dv (SelCo _ co)            = go_co dv co
+    go_co dv (LRCo _ co)             = go_co dv co
+    go_co dv (InstCo co1 co2)        = foldlM go_co dv [co1, co2]
+    go_co dv (KindCo co)             = go_co dv co
+    go_co dv (SubCo co)              = go_co dv co
 
     go_co dv (HoleCo hole)
       = do m_co <- unpackCoercionHole_maybe hole
@@ -1768,12 +1765,6 @@ quantifyTyVars skol_info ns_strat dvs
       = return Nothing   -- this can happen for a covar that's associated with
                          -- a coercion hole. Test case: typecheck/should_compile/T2494
 
--- Omit: no TyVars now
---      | not (isTcTyVar tkv)
---      = return (Just tkv)  -- For associated types in a class with a standalone
---                           -- kind signature, we have the class variables in
---                           -- scope, and they are TyVars not TcTyVars
-
       | otherwise
       = Just <$> skolemiseQuantifiedTyVar skol_info tkv
 
@@ -1818,12 +1809,18 @@ skolemiseQuantifiedTyVar :: SkolemInfo -> TcTyVar -> TcM TcTyVar
 
 skolemiseQuantifiedTyVar skol_info tv
   = case tcTyVarDetails tv of
-      SkolemTv {} -> do { kind <- zonkTcType (tyVarKind tv)
-                        ; return (setTyVarKind tv kind) }
-        -- It might be a skolem type variable,
-        -- for example from a user type signature
-
       MetaTv {} -> skolemiseUnboundMetaTyVar skol_info tv
+
+      SkolemTv _ lvl _  -- It might be a skolem type variable,
+                        -- for example from a user type signature
+        -- But it might also be a shared meta-variable across several
+        -- type declarations, each with its own skol_info. The first
+        -- will skolemise it, but the other uses must update its
+        -- skolem info (#22379)
+        -> do { kind <- zonkTcType (tyVarKind tv)
+              ; let details = SkolemTv skol_info lvl False
+                    name = tyVarName tv
+              ; return (mkTcTyVar name kind details) }
 
       _other -> pprPanic "skolemiseQuantifiedTyVar" (ppr tv) -- RuntimeUnk
 
@@ -1889,7 +1886,7 @@ defaultTyVar def_strat tv
            ; writeMetaTyVar kv liftedTypeKind
            ; return True }
       | otherwise
-      = do { addErr $ TcRnUnknownMessage $ mkPlainError noHints $
+      = do { addErr $ mkTcRnUnknownMessage $ mkPlainError noHints $
                (vcat [ text "Cannot default kind variable" <+> quotes (ppr kv')
                      , text "of kind:" <+> ppr (tyVarKind kv')
                      , text "Perhaps enable PolyKinds or add a kind signature" ])
@@ -2013,7 +2010,7 @@ What do do?
  D. We could error.
 
 We choose (D), as described in #17567, and implement this choice in
-doNotQuantifyTyVars.  Dicsussion of alternativs A-C is below.
+doNotQuantifyTyVars.  Discussion of alternativs A-C is below.
 
 NB: this is all rather similar to, but sadly not the same as
     Note [Naughty quantification candidates]
@@ -2109,7 +2106,7 @@ doNotQuantifyTyVars dvs where_found
        ; unless (null leftover_metas) $
          do { let (tidy_env1, tidied_tvs) = tidyOpenTyCoVars emptyTidyEnv leftover_metas
             ; (tidy_env2, where_doc) <- where_found tidy_env1
-            ; let msg = TcRnUnknownMessage            $
+            ; let msg = mkTcRnUnknownMessage            $
                         mkPlainError noHints          $
                         pprWithExplicitKindsWhen True $
                     vcat [ text "Uninferrable type variable"
@@ -2531,9 +2528,9 @@ zonkTcTyCon :: TcTyCon -> TcM TcTyCon
 -- A non-poly TcTyCon may have unification
 -- variables that need zonking, but poly ones cannot
 zonkTcTyCon tc
- | tcTyConIsPoly tc = return tc
- | otherwise        = do { tck' <- zonkTcType (tyConKind tc)
+ | isMonoTcTyCon tc = do { tck' <- zonkTcType (tyConKind tc)
                          ; return (setTcTyConKind tc tck') }
+ | otherwise        = return tc
 
 zonkTcTyVar :: TcTyVar -> TcM TcType
 -- Simply look through all Flexis
@@ -2565,7 +2562,7 @@ zonkTcTyVarsToTcTyVars = mapM zonkTcTyVarToTcTyVar
 zonkTcTyVarToTcTyVar :: HasDebugCallStack => TcTyVar -> TcM TcTyVar
 zonkTcTyVarToTcTyVar tv
   = do { ty <- zonkTcTyVar tv
-       ; let tv' = case tcGetTyVar_maybe ty of
+       ; let tv' = case getTyVar_maybe ty of
                      Just tv' -> tv'
                      Nothing  -> pprPanic "zonkTcTyVarToTcTyVar"
                                           (ppr tv $$ ppr ty)
@@ -2625,10 +2622,10 @@ zonkTidyOrigin env (GivenOrigin skol_info)
   = do { skol_info1 <- zonkSkolemInfoAnon skol_info
        ; let skol_info2 = tidySkolemInfoAnon env skol_info1
        ; return (env, GivenOrigin skol_info2) }
-zonkTidyOrigin env (OtherSCOrigin sc_depth skol_info)
+zonkTidyOrigin env (GivenSCOrigin skol_info sc_depth blocked)
   = do { skol_info1 <- zonkSkolemInfoAnon skol_info
        ; let skol_info2 = tidySkolemInfoAnon env skol_info1
-       ; return (env, OtherSCOrigin sc_depth skol_info2) }
+       ; return (env, GivenSCOrigin skol_info2 sc_depth blocked) }
 zonkTidyOrigin env orig@(TypeEqOrigin { uo_actual   = act
                                       , uo_expected = exp })
   = do { (env1, act') <- zonkTidyTcType env  act
@@ -2779,7 +2776,7 @@ naughtyQuantification orig_ty tv escapees
 
              orig_ty'   = tidyType env orig_ty1
              ppr_tidied = pprTyVars . map (tidyTyCoVarOcc env)
-             msg = TcRnUnknownMessage $ mkPlainError noHints $
+             msg = mkTcRnUnknownMessage $ mkPlainError noHints $
                    pprWithExplicitKindsWhen True $
                    vcat [ sep [ text "Cannot generalise type; skolem" <> plural escapees'
                               , quotes $ ppr_tidied escapees'

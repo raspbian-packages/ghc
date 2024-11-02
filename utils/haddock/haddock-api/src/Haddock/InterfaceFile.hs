@@ -75,7 +75,7 @@ mkPackageInterfaces :: Visibility -> InterfaceFile -> PackageInterfaces
 mkPackageInterfaces piVisibility
                     InterfaceFile { ifPackageInfo
                                   , ifInstalledIfaces
-                                  } = 
+                                  } =
   PackageInterfaces { piPackageInfo = ifPackageInfo
                     , piVisibility
                     , piInstalledInterfaces = ifInstalledIfaces
@@ -123,8 +123,8 @@ binaryInterfaceMagic = 0xD0Cface
 -- (2) set `binaryInterfaceVersionCompatibility` to [binaryInterfaceVersion]
 --
 binaryInterfaceVersion :: Word16
-#if MIN_VERSION_ghc(9,4,0) && !MIN_VERSION_ghc(9,5,0)
-binaryInterfaceVersion = 41
+#if MIN_VERSION_ghc(9,6,0) && !MIN_VERSION_ghc(9,7,0)
+binaryInterfaceVersion = 42
 
 binaryInterfaceVersionCompatibility :: [Word16]
 binaryInterfaceVersionCompatibility = [binaryInterfaceVersion]

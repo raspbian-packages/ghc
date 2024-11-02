@@ -15,6 +15,7 @@ when compiling the `compiler` library, and `hsGhc` when compiling/linking the GH
 <table>
   <tr>
     <th rowspan="3">Flavour</th>
+    <th rowspan="3">Split Sections</th>
     <th colspan="8">Extra arguments</th>
   </tr>
   <tr>
@@ -35,6 +36,7 @@ when compiling the `compiler` library, and `hsGhc` when compiling/linking the GH
   </tr>
   <tr>
     <th>default<br></td>
+    <td> </td>
     <td>-O<br>-H32m<br></td>
     <td>-O2<br>-H32m</td>
     <td></td>
@@ -46,6 +48,7 @@ when compiling the `compiler` library, and `hsGhc` when compiling/linking the GH
   </tr>
   <tr>
     <th>quick</td>
+    <td> </td>
     <td>-O0<br>-H64m</td>
     <td>-O0<br>-H64m</td>
     <td></td>
@@ -57,6 +60,7 @@ when compiling the `compiler` library, and `hsGhc` when compiling/linking the GH
   </tr>
   <tr>
     <th>quick-validate</td>
+    <td></td>
     <td>-O0<br>-H64m<br>-Werror</td>
     <td>-O0<br>-H64m<br>-Werror</td>
     <td></td>
@@ -68,6 +72,7 @@ when compiling the `compiler` library, and `hsGhc` when compiling/linking the GH
   </tr>
   <tr>
     <th>quick-debug</td>
+    <td></td>
     <td>-O0<br>-H64m</td>
     <td>-O0<br>-H64m</td>
     <td></td>
@@ -79,6 +84,7 @@ when compiling the `compiler` library, and `hsGhc` when compiling/linking the GH
   </tr>
   <tr>
     <th>quickest</td>
+    <td></td>
     <td>-O0<br>-H64m</td>
     <td>-O0<br>-H64m</td>
     <td></td>
@@ -90,17 +96,6 @@ when compiling the `compiler` library, and `hsGhc` when compiling/linking the GH
   </tr>
   <tr>
     <th>perf</td>
-    <td>-O<br>-H64m</td>
-    <td>-O<br>-H64m</td>
-    <td></td>
-    <td>-O2</td>
-    <td>-O2</td>
-    <td>-O2</td>
-    <td>-O</td>
-    <td>-O2</td>
-  </tr>
-  <tr>
-    <th>release (same as perf with -haddock)</td>
     <td> Yes (on supported platforms) </td>
     <td>-O<br>-H64m</td>
     <td>-O<br>-H64m</td>
@@ -112,7 +107,19 @@ when compiling the `compiler` library, and `hsGhc` when compiling/linking the GH
     <td>-O2</td>
   </tr>
   <tr>
+    <th>release (same as perf with -haddock)</td>
+    <td>-O<br>-H64m</td>
+    <td>-O<br>-H64m</td>
+    <td></td>
+    <td>-O2</td>
+    <td>-O2</td>
+    <td>-O2</td>
+    <td>-O</td>
+    <td>-O2</td>
+  </tr>
+  <tr>
     <th>bench</td>
+    <td></td>
     <td>-O<br>-H64m</td>
     <td>-O<br>-H64m</td>
     <td></td>
@@ -124,6 +131,7 @@ when compiling the `compiler` library, and `hsGhc` when compiling/linking the GH
   </tr>
   <tr>
     <th>devel1</td>
+    <td></td>
     <td>-O<br>-H64m</td>
     <td>-O<br>-H64m</td>
     <td></td>
@@ -135,6 +143,7 @@ when compiling the `compiler` library, and `hsGhc` when compiling/linking the GH
   </tr>
   <tr>
     <th>devel2</td>
+    <td></td>
     <td>-O<br>-H64m</td>
     <td>-O<br>-H64m</td>
     <td></td>
@@ -146,8 +155,9 @@ when compiling the `compiler` library, and `hsGhc` when compiling/linking the GH
   </tr>
   <tr>
     <th>validate</td>
+    <td></td>
     <td>-O0<br>-H64m</td>
-    <td>-fllvm-fill-undef-with-garbage</td>
+    <td>-fllvm-fill-undef-with-garbage<br>-fcheck-prim-bounds</td>
     <td></td>
     <td>-O<br>-dcore-lint<br>-dno-debug-output</td>
     <td>-O2<br>-DDEBUG</td>
@@ -157,6 +167,7 @@ when compiling the `compiler` library, and `hsGhc` when compiling/linking the GH
   </tr>
   <tr>
     <th>slow-validate</td>
+    <td></td>
     <td>-O0<br>-H64m</td>
     <td>-fllvm-fill-undef-with-garbage</td>
     <td></td>
@@ -168,6 +179,7 @@ when compiling the `compiler` library, and `hsGhc` when compiling/linking the GH
   </tr>
   <tr>
     <th>static</td>
+    <td></td>
     <td>-O<br>-H64m<br>-fPIC -static</td>
     <td>-O<br>-H64m<br>-fPIC -static</td>
     <td></td>
@@ -218,6 +230,10 @@ The supported transformers are listed below:
             library due to the long linking times that this causes).</td>
     </tr>
     <tr>
+        <td><code>no_split_sections</code></td>
+        <td>Disable section splitting for all libraries.</td>
+    </tr>
+    <tr>
         <td><code>thread_sanitizer</code></td>
         <td>Build the runtime system with ThreadSanitizer support</td>
     </tr>
@@ -231,15 +247,23 @@ The supported transformers are listed below:
             It is recommended that you use this in conjunction with `no_dynamic_ghc` since
             GHC does not support loading of profiled libraries with the
             dynamic linker. You should use a flavour that builds profiling libs and rts,
-            i.e. not <code>quick</code>.
-
-            This flag adds cost centres with the -fprof-late flag. </td>
+            i.e. not <code>quick</code>. <br>
+            This flag adds cost centres with the -fprof-late flag.</td>
     </tr>
     <tr>
         <td><code>no_dynamic_ghc</code></td>
         <td>Linked GHC against the statically-linked RTS. This causes GHC to
             default to loading static rather than dynamic library when,
             e.g., loading libraries during TemplateHaskell evaluations.</td>
+    </tr>
+    <tr>
+        <td><code>no_dynamic_libs</code></td>
+        <td>Just like `no_dynamic_ghc`, this transformer ensures statically-linked libraries
+        </td>
+    </tr>
+    <tr>
+        <td><code>native_bignum</code></td>
+        <td>Use the native <code>ghc-bignum</code> backend.</td>
     </tr>
     <tr>
         <td><code>no_profiled_libs</code></td>
@@ -255,6 +279,14 @@ The supported transformers are listed below:
         <td>Build the stage2 libraries with IPE debugging information for use with -hi profiling.</td>
     </tr>
     <tr>
+        <td><code>debug_ghc</code></td>
+        <td>Build the stage2 compiler linked against the debug rts</td>
+    </tr>
+    <tr>
+        <td><code>debug_stage1_ghc</code></td>
+        <td>Build the stage1 compiler linked against the debug rts</td>
+    </tr>
+    <tr>
         <td><code>assertions</code></td>
         <td>Build the stage2 compiler with assertions enabled. </td>
     </tr>
@@ -266,6 +298,23 @@ The supported transformers are listed below:
         <td><code>collect_timings</code></td>
         <td>Collects timings while building the stage2+ compiler by adding the
         flags <code>-ddump-to-file -ddump-timings</code>.</td>
+    </tr>
+    <tr>
+        <td><code>lint</code></td>
+        <td>Enable Core, STG, and C-- linting in all compilation with the stage1
+        compiler.</td>
+    </tr>
+    <tr>
+        <td><code>haddock</code></td>
+        <td>Emit haddock documentation into the interface files via <code>-haddock</code>.</td>
+    </tr>
+    <tr>
+        <td><code>hi_core</code></td>
+        <td>Emit whole Core bindings into the interface files via <code>-fwrite-if-simplified-core</code>.</td>
+    </tr>
+    <tr>
+        <td><code>late_ccs</code></td>
+        <td>Enable <code>-fprof-late</code> in profiled libraries.</td>
     </tr>
 </table>
 

@@ -206,6 +206,8 @@ osElfTarget OSHaiku     = True
 osElfTarget OSQNXNTO    = False
 osElfTarget OSAIX       = False
 osElfTarget OSHurd      = True
+osElfTarget OSWasi      = False
+osElfTarget OSGhcjs     = False
 osElfTarget OSUnknown   = False
  -- Defaulting to False is safe; it means don't rely on any
  -- ELF-specific functionality.  It is important to have a default for
@@ -262,6 +264,7 @@ platformCConvNeedsExtension platform = case platformArch platform of
   ArchPPC_64 _ -> True
   ArchS390X    -> True
   ArchRISCV64  -> True
+  ArchLoongArch64 -> True
   ArchAArch64
       -- Apple's AArch64 ABI requires that the caller sign-extend
       -- small integer arguments. See

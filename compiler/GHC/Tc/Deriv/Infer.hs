@@ -16,16 +16,6 @@ where
 
 import GHC.Prelude
 
-import GHC.Data.Bag
-import GHC.Types.Basic
-import GHC.Core.Class
-import GHC.Core.DataCon
-import GHC.Utils.Error
-import GHC.Utils.Outputable
-import GHC.Utils.Panic
-import GHC.Utils.Panic.Plain
-import GHC.Data.Pair
-import GHC.Builtin.Names
 import GHC.Tc.Deriv.Utils
 import GHC.Tc.Utils.Env
 import GHC.Tc.Deriv.Generate
@@ -35,24 +25,40 @@ import GHC.Tc.Utils.TcMType
 import GHC.Tc.Utils.Monad
 import GHC.Tc.Types.Origin
 import GHC.Tc.Types.Constraint
-import GHC.Core.Predicate
 import GHC.Tc.Utils.TcType
-import GHC.Core.TyCon
-import GHC.Core.TyCo.Ppr (pprTyVars)
-import GHC.Core.Type
 import GHC.Tc.Solver
 import GHC.Tc.Solver.Monad ( runTcS )
 import GHC.Tc.Validity (validDerivPred)
 import GHC.Tc.Utils.Unify (buildImplicationFor)
-import GHC.Builtin.Types (typeToTypeKind)
+
+import GHC.Core.Class
+import GHC.Core.DataCon
+import GHC.Core.TyCon
+import GHC.Core.TyCo.Ppr (pprTyVars)
+import GHC.Core.Type
+import GHC.Core.Predicate
 import GHC.Core.Unify (tcUnifyTy)
+
+import GHC.Data.Pair
+import GHC.Builtin.Names
+import GHC.Builtin.Types (typeToTypeKind)
+
+import GHC.Utils.Error
+import GHC.Utils.Outputable
+import GHC.Utils.Panic
+import GHC.Utils.Panic.Plain
 import GHC.Utils.Misc
+
+import GHC.Types.Basic
 import GHC.Types.Var
-import GHC.Types.Var.Set
+
+import GHC.Data.Bag
 
 import Control.Monad
 import Control.Monad.Trans.Class  (lift)
 import Control.Monad.Trans.Reader (ask)
+import Data.Function              (on)
+import Data.Functor.Classes       (liftEq)
 import Data.List                  (sortBy)
 import Data.Maybe
 
@@ -179,7 +185,7 @@ inferConstraintsStock dit@(DerivInstTys { dit_cls_tys     = cls_tys
              :: ([TyVar] -> CtOrigin
                          -> TypeOrKind
                          -> Type
-                         -> [(ThetaSpec, Maybe TCvSubst)])
+                         -> [(ThetaSpec, Maybe Subst)])
              -> (ThetaSpec, [TyVar], [TcType], DerivInstTys)
            con_arg_constraints get_arg_constraints
              = let -- Constraints from the fields of each data constructor.
@@ -217,8 +223,8 @@ inferConstraintsStock dit@(DerivInstTys { dit_cls_tys     = cls_tys
                    -- kinds with (* -> *).
                    -- See Note [Inferring the instance context]
                    subst        = foldl' composeTCvSubst
-                                         emptyTCvSubst (catMaybes mbSubsts)
-                   unmapped_tvs = filter (\v -> v `notElemTCvSubst` subst
+                                         emptySubst (catMaybes mbSubsts)
+                   unmapped_tvs = filter (\v -> v `notElemSubst` subst
                                              && not (v `isInScope` subst)) tvs
                    (subst', _)  = substTyVarBndrs subst unmapped_tvs
                    stupid_theta_origin = mkDirectThetaSpec
@@ -234,7 +240,7 @@ inferConstraintsStock dit@(DerivInstTys { dit_cls_tys     = cls_tys
            is_generic  = main_cls `hasKey` genClassKey
            is_generic1 = main_cls `hasKey` gen1ClassKey
            -- is_functor_like: see Note [Inferring the instance context]
-           is_functor_like = tcTypeKind inst_ty `tcEqKind` typeToTypeKind
+           is_functor_like = typeKind inst_ty `tcEqKind` typeToTypeKind
                           || is_generic1
 
            get_gen1_constraints ::
@@ -242,7 +248,7 @@ inferConstraintsStock dit@(DerivInstTys { dit_cls_tys     = cls_tys
              -> [TyVar] -- The universally quantified type variables for the
                         -- data constructor
              -> CtOrigin -> TypeOrKind -> Type
-             -> [(ThetaSpec, Maybe TCvSubst)]
+             -> [(ThetaSpec, Maybe Subst)]
            get_gen1_constraints functor_cls dc_univs orig t_or_k ty
               = mk_functor_like_constraints orig t_or_k functor_cls $
                 get_gen1_constrained_tys last_dc_univ ty
@@ -257,7 +263,7 @@ inferConstraintsStock dit@(DerivInstTys { dit_cls_tys     = cls_tys
                 [TyVar] -- The universally quantified type variables for the
                         -- data constructor
              -> CtOrigin -> TypeOrKind -> Type
-             -> [(ThetaSpec, Maybe TCvSubst)]
+             -> [(ThetaSpec, Maybe Subst)]
            get_std_constrained_tys dc_univs orig t_or_k ty
                | is_functor_like
                = mk_functor_like_constraints orig t_or_k main_cls $
@@ -273,7 +279,7 @@ inferConstraintsStock dit@(DerivInstTys { dit_cls_tys     = cls_tys
 
            mk_functor_like_constraints :: CtOrigin -> TypeOrKind
                                        -> Class -> [Type]
-                                       -> [(ThetaSpec, Maybe TCvSubst)]
+                                       -> [(ThetaSpec, Maybe Subst)]
            -- 'cls' is usually main_cls (Functor or Traversable etc), but if
            -- main_cls = Generic1, then 'cls' can be Functor; see
            -- get_gen1_constraints
@@ -286,7 +292,7 @@ inferConstraintsStock dit@(DerivInstTys { dit_cls_tys     = cls_tys
            -- message which points out the kind mismatch.
            -- See Note [Inferring the instance context]
            mk_functor_like_constraints orig t_or_k cls
-              = map $ \ty -> let ki = tcTypeKind ty in
+              = map $ \ty -> let ki = typeKind ty in
                              ( [ mk_cls_pred orig t_or_k cls ty
                                , SimplePredSpec
                                    { sps_pred = mkPrimEqPred ki typeToTypeKind
@@ -307,7 +313,7 @@ inferConstraintsStock dit@(DerivInstTys { dit_cls_tys     = cls_tys
            --         and we need the Data constraints to typecheck the method
            extra_constraints
                  | main_cls `hasKey` dataClassKey
-                 , all (isLiftedTypeKind . tcTypeKind) rep_tc_args
+                 , all (isLiftedTypeKind . typeKind) rep_tc_args
                  = [ mk_cls_pred deriv_origin t_or_k main_cls ty
                    | (t_or_k, ty) <- zip t_or_ks rep_tc_args]
                  | otherwise
@@ -694,7 +700,7 @@ simplifyInstanceContexts infer_specs
                                     current_solns infer_specs
            ; new_solns <- checkNoErrs $
                           extendLocalInstEnv inst_specs $
-                          mapM gen_soln infer_specs
+                          mapM simplifyDeriv infer_specs
 
            ; if (current_solns `eqSolution` new_solns) then
                 return [ setDerivSpecTheta soln spec
@@ -702,28 +708,10 @@ simplifyInstanceContexts infer_specs
              else
                 iterate_deriv (n+1) new_solns }
 
-    eqSolution a b = eqListBy (eqListBy eqType) (canSolution a) (canSolution b)
+    eqSolution = (liftEq . liftEq) eqType `on` canSolution
        -- Canonicalise for comparison
        -- See Note [Deterministic simplifyInstanceContexts]
     canSolution = map (sortBy nonDetCmpType)
-    ------------------------------------------------------------------
-    gen_soln :: DerivSpec ThetaSpec -> TcM ThetaType
-    gen_soln (DS { ds_loc = loc, ds_tvs = tyvars
-                 , ds_cls = clas, ds_tys = inst_tys, ds_theta = deriv_rhs
-                 , ds_skol_info = skol_info, ds_user_ctxt = user_ctxt })
-      = setSrcSpan loc  $
-        addErrCtxt (derivInstCtxt the_pred) $
-        do { theta <- simplifyDeriv skol_info user_ctxt tyvars deriv_rhs
-                -- checkValidInstance tyvars theta clas inst_tys
-                -- Not necessary; see Note [Exotic derived instance contexts]
-
-           ; traceTc "GHC.Tc.Deriv" (ppr deriv_rhs $$ ppr theta)
-                -- Claim: the result instance declaration is guaranteed valid
-                -- Hence no need to call:
-                --   checkValidInstance tyvars theta clas inst_tys
-           ; return theta }
-      where
-        the_pred = mkClassPred clas inst_tys
 
 derivInstCtxt :: PredType -> SDoc
 derivInstCtxt pred
@@ -737,29 +725,27 @@ derivInstCtxt pred
 ***********************************************************************************
 -}
 
+
 -- | Given @instance (wanted) => C inst_ty@, simplify 'wanted' as much
 -- as possible. Fail if not possible.
-simplifyDeriv :: SkolemInfo -- ^ The 'SkolemInfo' used to skolemise the
-                            -- 'TcTyVar' arguments
-              -> UserTypeCtxt -- ^ Used to inform error messages as to whether
-                              -- we are in a @deriving@ clause or a standalone
-                              -- @deriving@ declaration
-              -> [TcTyVar]  -- ^ The tyvars bound by @inst_ty@.
-              -> ThetaSpec -- ^ The constraints to solve and simplify
+simplifyDeriv :: DerivSpec ThetaSpec
               -> TcM ThetaType -- ^ Needed constraints (after simplification),
                                -- i.e. @['PredType']@.
-simplifyDeriv skol_info user_ctxt tvs theta
-  = do { let skol_set = mkVarSet tvs
-
+simplifyDeriv (DS { ds_loc = loc, ds_tvs = tvs
+                  , ds_cls = clas, ds_tys = inst_tys, ds_theta = deriv_rhs
+                  , ds_skol_info = skol_info, ds_user_ctxt = user_ctxt })
+  = setSrcSpan loc  $
+    addErrCtxt (derivInstCtxt (mkClassPred clas inst_tys)) $
+    do {
        -- See [STEP DAC BUILD]
        -- Generate the implication constraints, one for each method, to solve
        -- with the skolemized variables.  Start "one level down" because
        -- we are going to wrap the result in an implication with tvs,
        -- in step [DAC RESIDUAL]
-       ; (tc_lvl, wanteds) <- captureThetaSpecConstraints user_ctxt theta
+       ; (tc_lvl, wanteds) <- captureThetaSpecConstraints user_ctxt deriv_rhs
 
        ; traceTc "simplifyDeriv inputs" $
-         vcat [ pprTyVars tvs $$ ppr theta $$ ppr wanteds, ppr skol_info ]
+         vcat [ pprTyVars tvs $$ ppr deriv_rhs $$ ppr wanteds, ppr skol_info ]
 
        -- See [STEP DAC SOLVE]
        -- Simplify the constraints, starting at the same level at which
@@ -776,6 +762,7 @@ simplifyDeriv skol_info user_ctxt tvs theta
        -- From the simplified constraints extract a subset 'good' that will
        -- become the context 'min_theta' for the derived instance.
        ; let residual_simple = approximateWC True solved_wanteds
+             head_size       = pSizeClassPred clas inst_tys
              good = mapMaybeBag get_good residual_simple
 
              -- Returns @Just p@ (where @p@ is the type of the Ct) if a Ct is
@@ -784,10 +771,8 @@ simplifyDeriv skol_info user_ctxt tvs theta
              -- See Note [Exotic derived instance contexts] for what
              -- constitutes an exotic constraint.
              get_good :: Ct -> Maybe PredType
-             get_good ct | validDerivPred skol_set p
-                         = Just p
-                         | otherwise
-                         = Nothing
+             get_good ct | validDerivPred head_size p = Just p
+                         | otherwise                  = Nothing
                where p = ctPred ct
 
        ; traceTc "simplifyDeriv outputs" $
@@ -816,6 +801,13 @@ simplifyDeriv skol_info user_ctxt tvs theta
        -- See also Note [Exotic derived instance contexts], which are caught
        -- in this line of code.
        ; simplifyTopImplic leftover_implic
+
+       ; traceTc "GHC.Tc.Deriv" (ppr deriv_rhs $$ ppr min_theta)
+
+         -- Claim: the result instance declaration is guaranteed valid
+         -- Hence no need to call:
+         --     checkValidInstance tyvars theta clas inst_tys
+         -- See Note [Exotic derived instance contexts]
 
        ; return min_theta }
 

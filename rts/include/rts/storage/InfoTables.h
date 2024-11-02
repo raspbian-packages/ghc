@@ -62,6 +62,7 @@ typedef struct {
 #define _UPT (1<<5)  /* unpointed?           */
 #define _SRT (1<<6)  /* has an SRT?          */
 #define _IND (1<<7)  /* is an indirection?   */
+#define _FRM (1<<8)  /* is a stack frame?    */
 
 #define isMUTABLE(flags)   ((flags) &_MUT)
 #define isBITMAP(flags)    ((flags) &_BTM)
@@ -69,7 +70,7 @@ typedef struct {
 #define isUNPOINTED(flags) ((flags) &_UPT)
 #define hasSRT(flags)      ((flags) &_SRT)
 
-extern StgWord16 closure_flags[];
+extern const StgWord16 closure_flags[];
 
 #define closureFlags(c)         (closure_flags[get_itbl \
                                     (UNTAG_CONST_CLOSURE(c))->type])
@@ -95,6 +96,7 @@ extern StgWord16 closure_flags[];
 #define ip_UNPOINTED(ip)         (  ipFlags(ip) & _UPT)
 #define ip_SRT(ip)               (  ipFlags(ip) & _SRT)
 #define ip_IND(ip)               (  ipFlags(ip) & _IND)
+#define ip_STACK_FRAME(ip)       (  ipFlags(ip) & _FRM)
 
 /* -----------------------------------------------------------------------------
    Bitmaps
@@ -154,16 +156,12 @@ typedef union {
 } StgClosureInfo;
 
 
-#if defined(x86_64_HOST_ARCH)
-#define SMALL_MEMORY_MODEL
-#endif
-
 // This is where we choose how to represent the SRT location in the info
 // table.  See the section "Referring to an SRT from the info table" in
 // Note [SRTs] in GHC.Cmm.Info.Build.
 //
 // Specifically we define one of the following:
-#if WORD_SIZE_IN_BITS == 64 && defined(SMALL_MEMORY_MODEL) && defined(TABLES_NEXT_TO_CODE)
+#if WORD_SIZE_IN_BITS == 64 && defined(TABLES_NEXT_TO_CODE)
 // On 64-bit platforms using the small memory model we can fit a pointer
 // offset in half a word, so put the SRT offset in the info->srt field
 // directly.

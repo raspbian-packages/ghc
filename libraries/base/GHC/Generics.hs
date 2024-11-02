@@ -746,7 +746,7 @@ import GHC.Types
 import GHC.Ix      ( Ix )
 import GHC.Base    ( Alternative(..), Applicative(..), Functor(..)
                    , Monad(..), MonadPlus(..), NonEmpty(..), String, coerce
-                   , Semigroup(..), Monoid(..) )
+                   , Semigroup(..), Monoid(..), Void )
 import GHC.Classes ( Eq(..), Ord(..) )
 import GHC.Enum    ( Bounded, Enum )
 import GHC.Read    ( Read(..) )
@@ -1480,6 +1480,15 @@ type    Generically1 :: forall k. (k -> Type) -> (k -> Type)
 newtype Generically1 f a where
   Generically1 :: forall {k} f a. f a -> Generically1 @k f a
 
+-- | @since 4.18.0.0
+instance (Generic1 f, Eq (Rep1 f a)) => Eq (Generically1 f a) where
+   Generically1 x == Generically1 y = from1 x == from1 y
+   Generically1 x /= Generically1 y = from1 x /= from1 y
+
+-- | @since 4.18.0.0
+instance (Generic1 f, Ord (Rep1 f a)) => Ord (Generically1 f a) where
+   Generically1 x `compare` Generically1 y = from1 x `compare` from1 y
+
 -- | @since 4.17.0.0
 instance (Generic1 f, Functor (Rep1 f)) => Functor (Generically1 f) where
   fmap :: (a -> a') -> (Generically1 f a -> Generically1 f a')
@@ -1543,6 +1552,9 @@ data Meta = MetaData Symbol Symbol Symbol Bool
 --------------------------------------------------------------------------------
 -- Derived instances
 --------------------------------------------------------------------------------
+
+-- | @since 4.8.0.0
+deriving instance Generic Void
 
 -- | @since 4.6.0.0
 deriving instance Generic [a]

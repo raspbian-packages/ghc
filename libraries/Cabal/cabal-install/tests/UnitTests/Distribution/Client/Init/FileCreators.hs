@@ -18,7 +18,7 @@ import Distribution.Simple.Flag
 import Distribution.Simple.PackageIndex
 import Distribution.Verbosity
 
-tests 
+tests
     :: Verbosity
     -> InitFlags
     -> Compiler
@@ -44,7 +44,9 @@ tests _v _initFlags comp pkgIx srcDb =
               }
             inputs =
               -- createProject stuff
-              [ "True"
+              [ "Foobar"
+              , "foobar@qux.com"
+              , "True"
               , "[\"quxTest/Main.hs\"]"
               -- writeProject stuff
               -- writeLicense
@@ -82,6 +84,6 @@ tests _v _initFlags comp pkgIx srcDb =
 
           Left (BreakException ex) -> assertFailure $ show ex
           Right _ -> return ()
-        
+
 
     ]

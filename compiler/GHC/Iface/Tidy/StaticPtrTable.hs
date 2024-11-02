@@ -144,6 +144,7 @@ import GHC.Linker.Types
 import GHC.Types.Id
 import GHC.Types.ForeignStubs
 import GHC.Data.Maybe
+import GHC.Data.FastString
 
 import Control.Monad.Trans.State.Strict
 import Data.List (intercalate)
@@ -239,28 +240,33 @@ sptCreateStaticBinds opts this_mod binds = do
 -- @fps@ is a list associating each binding corresponding to a static entry with
 -- its fingerprint.
 sptModuleInitCode :: Platform -> Module -> [SptEntry] -> CStub
-sptModuleInitCode _        _        [] = mempty
-sptModuleInitCode platform this_mod entries =
+sptModuleInitCode platform this_mod entries
+    -- no CStub if there is no entry
+  | [] <- entries                           = mempty
+    -- no CStub for the JS backend: it deals with it directly during JS code
+    -- generation
+  | ArchJavaScript <- platformArch platform = mempty
+  | otherwise =
     initializerCStub platform init_fn_nm empty init_fn_body `mappend`
     finalizerCStub platform fini_fn_nm empty fini_fn_body
   where
-    init_fn_nm = mkInitializerStubLabel this_mod "spt"
+    init_fn_nm = mkInitializerStubLabel this_mod (fsLit "spt")
     init_fn_body = vcat
         [  text "static StgWord64 k" <> int i <> text "[2] = "
            <> pprFingerprint fp <> semi
         $$ text "extern StgPtr "
-           <> (pdoc platform $ mkClosureLabel (idName n) (idCafInfo n)) <> semi
+           <> (pprCLabel platform $ mkClosureLabel (idName n) (idCafInfo n)) <> semi
         $$ text "hs_spt_insert" <> parens
              (hcat $ punctuate comma
                 [ char 'k' <> int i
-                , char '&' <> pdoc platform (mkClosureLabel (idName n) (idCafInfo n))
+                , char '&' <> pprCLabel platform (mkClosureLabel (idName n) (idCafInfo n))
                 ]
              )
         <> semi
         |  (i, SptEntry n fp) <- zip [0..] entries
         ]
 
-    fini_fn_nm = mkFinalizerStubLabel this_mod "spt"
+    fini_fn_nm = mkFinalizerStubLabel this_mod (fsLit "spt")
     fini_fn_body = vcat
         [  text "StgWord64 k" <> int i <> text "[2] = "
            <> pprFingerprint fp <> semi

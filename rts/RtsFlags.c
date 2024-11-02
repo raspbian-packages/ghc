@@ -119,7 +119,7 @@ static bool read_heap_profiling_flag(const char *arg);
 static void read_trace_flags(const char *arg);
 #endif
 
-static void errorUsage (void) GNU_ATTRIBUTE(__noreturn__);
+static void errorUsage (void) STG_NORETURN;
 
 #if defined(mingw32_HOST_OS)
 static char** win32_full_utf8_argv;
@@ -205,6 +205,7 @@ void initRtsFlagsDefaults(void)
     RtsFlags.DebugFlags.sparks          = false;
     RtsFlags.DebugFlags.numa            = false;
     RtsFlags.DebugFlags.compact         = false;
+    RtsFlags.DebugFlags.continuation    = false;
 
 #if defined(PROFILING)
     RtsFlags.CcFlags.doCostCentres      = COST_CENTRES_NONE;
@@ -243,7 +244,8 @@ void initRtsFlagsDefaults(void)
     RtsFlags.TraceFlags.nullWriter = false;
 #endif
 
-#if defined(PROFILING)
+// See Note [No timer on wasm32]
+#if defined(PROFILING) && !defined(wasm32_HOST_ARCH)
     // When profiling we want a lot more ticks
     RtsFlags.MiscFlags.tickInterval     = USToTime(1000);  // 1ms
 #else
@@ -378,6 +380,7 @@ usage_text[] = {
 "                 T = closure type",
 "                 d = closure description",
 "                 y = type description",
+"                 i = info table",
 "                 r = retainer",
 "                 b = biography (LAG,DRAG,VOID,USE)",
 "  A subset of closures may be selected thusly:",
@@ -400,6 +403,7 @@ usage_text[] = {
 #else /* PROFILING */
 "  -h       Heap residency profile (output file <program>.hp)",
 "  -hT      Produce a heap profile grouped by closure type",
+"  -hi      Produce a heap profile grouped by info table address",
 "  -po<file>  Override profiling output file name prefix (program name by default)",
 #endif /* PROFILING */
 
@@ -473,6 +477,7 @@ usage_text[] = {
 "  -Dc  DEBUG: program coverage",
 "  -Dr  DEBUG: sparks",
 "  -DC  DEBUG: compact",
+"  -Dk  DEBUG: continuation",
 "",
 "     NOTE: DEBUG events are sent to stderr by default; add -l to create a",
 "     binary event log file instead.",
@@ -803,7 +808,7 @@ void setupRtsFlags (int *argc, char *argv[], RtsConfig rts_config)
  * procRtsOpts: Process rts_argv between rts_argc0 and rts_argc.
  * -------------------------------------------------------------------------- */
 
-#if defined(HAVE_UNISTD_H) && defined(HAVE_SYS_TYPES_H) && !defined(mingw32_HOST_OS)
+#if defined(HAVE_UNISTD_H) && defined(HAVE_SYS_TYPES_H) && !defined(mingw32_HOST_OS) && defined(HAVE_GETUID)
 static void checkSuid(RtsOptsEnabledEnum enabled)
 {
     if (enabled == RtsOptsSafeOnly) {
@@ -1851,7 +1856,7 @@ static void normaliseRtsOpts (void)
                     RtsFlags.MiscFlags.tickInterval);
     }
 
-    if (RtsFlags.ConcFlags.ctxtSwitchTime > 0) {
+    if (RtsFlags.ConcFlags.ctxtSwitchTime > 0 && RtsFlags.MiscFlags.tickInterval != 0) {
         RtsFlags.ConcFlags.ctxtSwitchTicks =
             RtsFlags.ConcFlags.ctxtSwitchTime /
             RtsFlags.MiscFlags.tickInterval;
@@ -1859,7 +1864,7 @@ static void normaliseRtsOpts (void)
         RtsFlags.ConcFlags.ctxtSwitchTicks = 0;
     }
 
-    if (RtsFlags.ProfFlags.heapProfileInterval > 0) {
+    if (RtsFlags.ProfFlags.heapProfileInterval > 0 && RtsFlags.MiscFlags.tickInterval != 0) {
         RtsFlags.ProfFlags.heapProfileIntervalTicks =
             RtsFlags.ProfFlags.heapProfileInterval /
             RtsFlags.MiscFlags.tickInterval;
@@ -1867,7 +1872,7 @@ static void normaliseRtsOpts (void)
         RtsFlags.ProfFlags.heapProfileIntervalTicks = 0;
     }
 
-    if (RtsFlags.TraceFlags.eventlogFlushTime > 0) {
+    if (RtsFlags.TraceFlags.eventlogFlushTime > 0 && RtsFlags.MiscFlags.tickInterval != 0) {
         RtsFlags.TraceFlags.eventlogFlushTicks =
             RtsFlags.TraceFlags.eventlogFlushTime /
             RtsFlags.MiscFlags.tickInterval;
@@ -2187,6 +2192,9 @@ static void read_debug_flags(const char* arg)
         case 'C':
             RtsFlags.DebugFlags.compact = true;
             break;
+        case 'k':
+            RtsFlags.DebugFlags.continuation = true;
+            break;
         default:
             bad_option( arg );
         }
@@ -2371,6 +2379,10 @@ static void read_trace_flags(const char *arg)
             RtsFlags.TraceFlags.sparks_sampled = enabled;
             RtsFlags.TraceFlags.sparks_full    = enabled;
             RtsFlags.TraceFlags.user           = enabled;
+            RtsFlags.TraceFlags.nonmoving_gc   = enabled;
+#if defined(TICKY_TICKY)
+            RtsFlags.TraceFlags.ticky          = enabled;
+#endif
             enabled = true;
             break;
 
@@ -2419,7 +2431,7 @@ static void read_trace_flags(const char *arg)
 }
 #endif
 
-static void GNU_ATTRIBUTE(__noreturn__)
+static void STG_NORETURN
 bad_option(const char *s)
 {
   errorBelch("bad RTS option: %s", s);
@@ -2611,7 +2623,7 @@ overwrite files. This would be bad in the context of CGI scripts or
 setuid binaries. So we introduced a system where +RTS processing is more
 or less disabled unless you pass the -rtsopts flag at link time.
 
-This scheme is safe enough but it also really annoyes users. They have
+This scheme is safe enough but it also really annoys users. They have
 to use -rtsopts in many circumstances: with -threaded to use -N, with
 -eventlog to use -l, with -prof to use any of the profiling flags. Many
 users just set -rtsopts globally or in project .cabal files. Apart from

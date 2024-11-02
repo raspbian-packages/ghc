@@ -74,9 +74,7 @@
 #  include <sys/timers.h>
 # endif
 #endif
-#if HAVE_TIME_H
 #include <time.h>
-#endif
 #if HAVE_SYS_TIMEB_H && !defined(__FreeBSD__)
 #include <sys/timeb.h>
 #endif
@@ -132,7 +130,6 @@
 #if HAVE_VFORK_H
 #include <vfork.h>
 #endif
-#include "WCsubst.h"
 
 #if defined(_WIN32)
 /* in Win32Utils.c */
@@ -465,7 +462,7 @@ INLINE int __hscore_sig_setmask( void )
 #endif
 }
 
-#if !defined(_WIN32)
+#if !defined(_WIN32) && defined(HAVE_SIGNAL_H)
 INLINE size_t __hscore_sizeof_siginfo_t (void)
 {
     return sizeof(siginfo_t);

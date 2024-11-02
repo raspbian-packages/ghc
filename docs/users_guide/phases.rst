@@ -130,13 +130,6 @@ given compilation phase:
     GHC installation. See ``-fno-embed-manifest`` in
     :ref:`options-linker`.
 
-.. ghc-flag:: -pgmlibtool ⟨cmd⟩
-    :shortdesc: Use ⟨cmd⟩ as the command for libtool (with :ghc-flag:`-staticlib` only).
-    :type: dynamic
-    :category: phase-programs
-
-    Use ⟨cmd⟩ as the libtool command (when using :ghc-flag:`-staticlib` only).
-
 .. ghc-flag:: -pgmi ⟨cmd⟩
     :shortdesc: Use ⟨cmd⟩ as the external interpreter command.
     :type: dynamic
@@ -400,9 +393,12 @@ defined by your local GHC installation, the following trick is useful:
 ``__GLASGOW_HASKELL_FULL_VERSION__``
     .. index::
        single: __GLASGOW_HASKELL_FULL_VERSION__
-       This macro exposes the full version string.
-       For instance: ``__GLASGOW_HASKELL_FULL_VERSION__==8.11.0.20200319``.
-       Its value comes from the ``ProjectVersion`` Autotools variable.
+
+    This macro exposes the full version string.
+    For instance: ``__GLASGOW_HASKELL_FULL_VERSION__==8.11.0.20200319``.
+    Its value comes from the ``ProjectVersion`` Autotools variable.
+
+    Added in GHC 9.0.1
 
 ``__GLASGOW_HASKELL_PATCHLEVEL1__``; \ ``__GLASGOW_HASKELL_PATCHLEVEL2__``
     .. index::
@@ -583,13 +579,13 @@ Options affecting a Haskell pre-processor
     .. code-block:: sh
 
         #!/bin/sh
-        ( echo "{-# LINE 1 \"$2\" #-}" ; iconv -f l1 -t utf-8 $2 ) > $3
+        ( echo "{-# LINE 1 \"$1\" #-}" ; iconv -f l1 -t utf-8 $2 ) > $3
 
     and pass ``-F -pgmF convert.sh`` to GHC. The ``-f l1`` option tells
     iconv to convert your Latin-1 file, supplied in argument ``$2``,
     while the "-t utf-8" options tell iconv to return a UTF-8 encoded
     file. The result is redirected into argument ``$3``. The
-    ``echo "{-# LINE 1 \"$2\" #-}"`` just makes sure that your error
+    ``echo "{-# LINE 1 \"$1\" #-}"`` just makes sure that your error
     positions are reported as in the original source file.
 
 .. _options-codegen:
@@ -632,6 +628,11 @@ Options affecting code generation
     Omit code generation (and all later phases) altogether. This is
     useful if you're only interested in type checking code.
 
+    If a module contains a Template Haskell splice then in ``--make`` mode, code
+    generation will be automatically turned on for all dependencies. By default
+    object files are generated but if ghc-flag:`-fprefer-byte-code` is enable then
+    byte-code will be generated instead.
+
 .. ghc-flag:: -fwrite-interface
     :shortdesc: Always write interface files
     :type: dynamic
@@ -643,6 +644,19 @@ Options affecting code generation
     useful if you want to type check over multiple runs of GHC without
     compiling dependencies.
 
+.. ghc-flag:: -fwrite-if-simplified-core
+    :shortdesc: Write an interface file containing the simplified core of the module.
+    :type: dynamic
+    :category: codegen
+
+    The interface file will contain all the bindings for a module. From
+    this interface file we can restart code generation to produce byte-code.
+
+    The definition of bindings which are included in this
+    depend on the optimisation level. Any definitions which are already included in
+    an interface file (via an unfolding for an exported identifier) are reused.
+
+
 .. ghc-flag:: -fobject-code
     :shortdesc: Generate object code
     :type: dynamic
@@ -650,7 +664,7 @@ Options affecting code generation
 
     Generate object code. This is the default outside of GHCi, and can
     be used with GHCi to cause object code to be generated in preference
-    to bytecode.
+    to byte-code. Therefore this flag disables :ghc-flag:`-fbyte-code-and-object-code`.
 
 .. ghc-flag:: -fbyte-code
     :shortdesc: Generate byte-code
@@ -661,6 +675,19 @@ Options affecting code generation
     GHCi. Byte-code can currently only be used in the interactive
     interpreter, not saved to disk. This option is only useful for
     reversing the effect of :ghc-flag:`-fobject-code`.
+
+.. ghc-flag:: -fbyte-code-and-object-code
+    :shortdesc: Generate object code and byte-code
+    :type: dynamic
+    :category: codegen
+
+    Generate object code and byte-code. This is useful with the flags
+    :ghc-flag:`-fprefer-byte-code` and :ghc-flag:`-fwrite-if-simplified-core`.
+
+    This flag implies :ghc-flag:`-fwrite-if-simplified-core`.
+
+    :ghc-flag:`-fbyte-code` and :ghc-flag:`-fobject-code` disable this flag as
+    they specify that GHC should *only* write object code or byte-code respectively.
 
 .. ghc-flag:: -fPIC
     :shortdesc: Generate position-independent code (where available)
@@ -753,6 +780,24 @@ Options affecting code generation
     suppresses all non-global symbol table entries, resulting in smaller object
     file sizes at the expense of debuggability.
 
+
+.. ghc-flag:: -fprefer-byte-code
+    :shortdesc: Use byte-code if it is available to evaluate TH splices
+    :type: dynamic
+    :category: codegen
+
+    If a home package module has byte-code available then use that instead of
+    and object file (if that's available) to evaluate and run TH splices.
+
+    This is useful with flags such as :ghc-flag:`-fbyte-code-and-object-code`, which
+    tells the compiler to generate byte-code, and :ghc-flag:`-fwrite-if-simplified-core` which
+    allows byte-code to be generated from an interface file.
+
+    This flag also interacts with :ghc-flag:`-fno-code`, if this flag is enabled
+    then any modules which are required to be compiled for Template Haskell evaluation
+    will generate byte-code rather than object code.
+
+
 .. _options-linker:
 
 Options affecting linking
@@ -787,13 +832,6 @@ for example).
 
     You can use an external main function if you initialize the RTS manually
     and pass ``-no-hs-main``. See also :ref:`using-own-main`.
-
-.. ghc-flag:: -no-link
-    :shortdesc: Stop after generating object (``.o``) file
-    :type: mode
-    :category: linking
-
-    Omits the link step.
 
 .. ghc-flag:: -c
     :shortdesc: Stop after generating object (``.o``) file
@@ -874,10 +912,12 @@ for example).
     option for Apple's Linker (``-F`` already means something else for
     GHC).
 
-.. ghc-flag:: -split-sections
+.. ghc-flag:: -fsplit-sections
+              -split-sections
     :shortdesc: Split sections for link-time dead-code stripping
     :type: dynamic
     :category: linking
+    :reverse: -fno-split-sections
 
     Place each generated function or data item into its own section in the
     output file if the target supports arbitrary sections. The name of the

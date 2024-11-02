@@ -1,4 +1,5 @@
 {-# LANGUAGE DeriveDataTypeable #-}
+{-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE UndecidableInstances #-}
@@ -29,6 +30,7 @@ import GHC.Utils.Binary
 import Language.Haskell.Syntax.Extension
 
 import Data.Data
+import GHC.Generics ( Generic )
 
 -- | Warning Text
 --
@@ -40,6 +42,7 @@ data WarningTxt pass
    | DeprecatedTxt
       (Located SourceText)
       [Located (WithHsDocIdentifiers StringLiteral pass)]
+  deriving Generic
 
 deriving instance Eq (IdP pass) => Eq (WarningTxt pass)
 deriving instance (Data pass, Data (IdP pass)) => Data (WarningTxt pass)
@@ -58,21 +61,21 @@ instance Outputable (WarningTxt pass) where
 instance Binary (WarningTxt GhcRn) where
     put_ bh (WarningTxt s w) = do
             putByte bh 0
-            put_ bh s
-            put_ bh w
+            put_ bh $ unLoc s
+            put_ bh $ unLoc <$> w
     put_ bh (DeprecatedTxt s d) = do
             putByte bh 1
-            put_ bh s
-            put_ bh d
+            put_ bh $ unLoc s
+            put_ bh $ unLoc <$> d
 
     get bh = do
             h <- getByte bh
             case h of
-              0 -> do s <- get bh
-                      w <- get bh
+              0 -> do s <- noLoc <$> get bh
+                      w <- fmap noLoc  <$> get bh
                       return (WarningTxt s w)
-              _ -> do s <- get bh
-                      d <- get bh
+              _ -> do s <- noLoc <$> get bh
+                      d <- fmap noLoc <$> get bh
                       return (DeprecatedTxt s d)
 
 

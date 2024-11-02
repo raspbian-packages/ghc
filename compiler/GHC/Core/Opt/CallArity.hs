@@ -150,7 +150,7 @@ The interesting cases of the analysis:
    any useful co-call information.
    Return (fv e)²
  * Case alternatives alt₁,alt₂,...:
-   Only one can be execuded, so
+   Only one can be executed, so
    Return (alt₁ ∪ alt₂ ∪...)
  * App e₁ e₂ (and analogously Case scrut alts), with non-trivial e₂:
    We get the results from both sides, with the argument evaluated at most once.
@@ -277,7 +277,7 @@ together with what other functions.
 Note [Analysis type signature]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-The work-hourse of the analysis is the function `callArityAnal`, with the
+The workhorse of the analysis is the function `callArityAnal`, with the
 following type:
 
     type CallArityRes = (UnVarGraph, VarEnv Arity)
@@ -377,15 +377,14 @@ a body representing “all external calls”, which returns a pessimistic
 CallArityRes (the co-call graph is the complete graph, all arityies 0).
 
 Note [Trimming arity]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
+~~~~~~~~~~~~~~~~~~~~~
 In the Call Arity papers, we are working on an untyped lambda calculus with no
 other id annotations, where eta-expansion is always possible. But this is not
 the case for Core!
  1. We need to ensure the invariant
       callArity e <= typeArity (exprType e)
     for the same reasons that exprArity needs this invariant (see Note
-    [exprArity invariant] in GHC.Core.Opt.Arity).
+    [typeArity invariants] in GHC.Core.Opt.Arity).
 
     If we are not doing that, a too-high arity annotation will be stored with
     the id, confusing the simplifier later on.
@@ -544,7 +543,7 @@ callArityAnal arity int (Let bind e)
 -- Which bindings should we look at?
 -- See Note [Which variables are interesting]
 isInteresting :: Var -> Bool
-isInteresting v = not $ null (typeArity (idType v))
+isInteresting v = typeArity (idType v) > 0
 
 interestingBinds :: CoreBind -> [Var]
 interestingBinds = filter isInteresting . bindersOf
@@ -700,7 +699,7 @@ callArityRecEnv any_boring ae_rhss ae_body
 trimArity :: Id -> Arity -> Arity
 trimArity v a = minimum [a, max_arity_by_type, max_arity_by_strsig]
   where
-    max_arity_by_type = length (typeArity (idType v))
+    max_arity_by_type = typeArity (idType v)
     max_arity_by_strsig
         | isDeadEndDiv result_info = length demands
         | otherwise = a
@@ -729,7 +728,7 @@ resDel :: Var -> CallArityRes -> CallArityRes
 resDel v (!g, !ae) = (g `delNode` v, ae `delVarEnv` v)
 
 domRes :: CallArityRes -> UnVarSet
-domRes (_, ae) = varEnvDom ae
+domRes (_, ae) = varEnvDomain ae
 
 -- In the result, find out the minimum arity and whether the variable is called
 -- at most once.

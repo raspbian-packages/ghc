@@ -638,6 +638,7 @@ ac_subst_files=''
 ac_user_opts='
 enable_option_checking
 with_curses_libraries
+with_curses_library
 '
       ac_precious_vars='build_alias
 host_alias
@@ -1267,6 +1268,9 @@ Optional Packages:
   --with-PACKAGE[=ARG]    use PACKAGE [ARG=yes]
   --without-PACKAGE       do not use PACKAGE (same as --with-PACKAGE=no)
   --with-curses-libraries directory containing curses library
+  --with-curses-library   the curses library to link against (tinfow, tinfo,
+                          ncursesw, ncurses, curses, ...); default is
+                          autodetect.
 
 Some influential environment variables:
   CC          C compiler command
@@ -1803,12 +1807,21 @@ fi
 
 
 
+# Check whether --with-curses-library was given.
+if test "${with_curses_library+set}" = set; then :
+  withval=$with_curses_library; curses_library=$withval
+else
+  curses_library=NONE
+fi
+
+
 TERMINFO_LIB_DIRS=
 if test "x$curses_libraries" != "xNONE"; then
   LDFLAGS="-L$curses_libraries $LDFLAGS"
   TERMINFO_LIB_DIRS=$curses_libraries
 fi
 
+if test "x$curses_library" == "xNONE"; then
 ac_ext=c
 ac_cpp='$CPP $CPPFLAGS'
 ac_compile='$CC -c $CFLAGS $CPPFLAGS conftest.$ac_ext >&5'
@@ -2678,6 +2691,45 @@ $as_echo "$ac_cv_lib_tinfo_setupterm" >&6; }
 if test "x$ac_cv_lib_tinfo_setupterm" = xyes; then :
   HaveLibCurses=YES; LibCurses=tinfo
 else
+  { $as_echo "$as_me:${as_lineno-$LINENO}: checking for setupterm in -lterminfo" >&5
+$as_echo_n "checking for setupterm in -lterminfo... " >&6; }
+if ${ac_cv_lib_terminfo_setupterm+:} false; then :
+  $as_echo_n "(cached) " >&6
+else
+  ac_check_lib_save_LIBS=$LIBS
+LIBS="-lterminfo  $LIBS"
+cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+/* end confdefs.h.  */
+
+/* Override any GCC internal prototype to avoid an error.
+   Use char because int might match the return type of a GCC
+   builtin and then its argument prototype would still apply.  */
+#ifdef __cplusplus
+extern "C"
+#endif
+char setupterm ();
+int
+main ()
+{
+return setupterm ();
+  ;
+  return 0;
+}
+_ACEOF
+if ac_fn_c_try_link "$LINENO"; then :
+  ac_cv_lib_terminfo_setupterm=yes
+else
+  ac_cv_lib_terminfo_setupterm=no
+fi
+rm -f core conftest.err conftest.$ac_objext \
+    conftest$ac_exeext conftest.$ac_ext
+LIBS=$ac_check_lib_save_LIBS
+fi
+{ $as_echo "$as_me:${as_lineno-$LINENO}: result: $ac_cv_lib_terminfo_setupterm" >&5
+$as_echo "$ac_cv_lib_terminfo_setupterm" >&6; }
+if test "x$ac_cv_lib_terminfo_setupterm" = xyes; then :
+  HaveLibCurses=YES; LibCurses=terminfo
+else
   { $as_echo "$as_me:${as_lineno-$LINENO}: checking for setupterm in -lncursesw" >&5
 $as_echo_n "checking for setupterm in -lncursesw... " >&6; }
 if ${ac_cv_lib_ncursesw_setupterm+:} false; then :
@@ -2806,6 +2858,8 @@ fi
 
 fi
 
+fi
+
 
 if test "x$HaveLibCurses" = "xNO" ; then
     { { $as_echo "$as_me:${as_lineno-$LINENO}: error: in \`$ac_pwd':" >&5
@@ -2816,6 +2870,9 @@ else
     TERMINFO_LIB=$LibCurses
 fi
 
+else
+    TERMINFO_LIB=$curses_library
+fi
 
 
 

@@ -18,7 +18,7 @@ module GHC.Unit.Module
     ( module GHC.Unit.Types
 
       -- * The ModuleName type
-    , module GHC.Unit.Module.Name
+    , module Language.Haskell.Syntax.Module.Name
 
       -- * The ModLocation type
     , module GHC.Unit.Module.Location
@@ -47,10 +47,12 @@ import GHC.Prelude
 
 import GHC.Types.Unique.DSet
 import GHC.Unit.Types
-import GHC.Unit.Module.Name
 import GHC.Unit.Module.Location
 import GHC.Unit.Module.Env
-import GHC.Utils.Misc
+
+import Language.Haskell.Syntax.Module.Name
+
+import Data.Semigroup
 
 -- | A 'Module' is definite if it has no free holes.
 moduleIsDefinite :: Module -> Bool
@@ -68,9 +70,7 @@ moduleStableString Module{..} =
 -- gives an ordering based on the 'Unique's of the components, which may
 -- not be stable from run to run of the compiler.
 stableModuleCmp :: Module -> Module -> Ordering
-stableModuleCmp (Module p1 n1) (Module p2 n2)
-   = (p1 `stableUnitCmp`  p2) `thenCmp`
-     (n1 `stableModuleNameCmp` n2)
+stableModuleCmp (Module p1 n1) (Module p2 n2) = stableUnitCmp p1 p2 <> stableModuleNameCmp n1 n2
 
 class ContainsModule t where
     extractModule :: t -> Module

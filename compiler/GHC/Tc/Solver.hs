@@ -58,7 +58,7 @@ import GHC.Tc.Utils.TcType
 import GHC.Core.Type
 import GHC.Core.Ppr
 import GHC.Core.TyCon    ( TyConBinder, isTypeFamilyTyCon )
-import GHC.Builtin.Types ( liftedRepTy, manyDataConTy, liftedDataConTy )
+import GHC.Builtin.Types ( liftedRepTy, liftedDataConTy )
 import GHC.Core.Unify    ( tcMatchTyKi )
 import GHC.Utils.Misc
 import GHC.Utils.Panic
@@ -73,7 +73,7 @@ import Control.Monad
 import Data.Foldable      ( toList )
 import Data.List          ( partition )
 import Data.List.NonEmpty ( NonEmpty(..) )
-import GHC.Data.Maybe     ( mapMaybe )
+import GHC.Data.Maybe     ( mapMaybe, isJust )
 
 {-
 *********************************************************************************
@@ -438,7 +438,7 @@ Our solution is this:
 
 
 We re-emit the implication rather than reporting the errors right now,
-so that the error mesages are improved by other solving and defaulting.
+so that the error messages are improved by other solving and defaulting.
 e.g. we prefer
     Cannot match 'Type->Type' with 'Type'
 to  Cannot match 'Type->Type' with 'TYPE r0'
@@ -1013,7 +1013,7 @@ We could do more than once but we'd have to have /some/ limit: in the
 the recursive case, we would go on forever in the common case where
 the constraints /are/ satisfiable (#10592 comment:12!).
 
-For stratightforard situations without type functions the try_harder
+For straightforward situations without type functions the try_harder
 step does nothing.
 
 Note [tcNormalise]
@@ -1199,10 +1199,12 @@ simplifyInfer rhs_tclvl infer_mode sigs name_taus wanteds
        -- NB: bound_theta are constraints we want to quantify over,
        --     including the psig_theta, which we always quantify over
        -- NB: bound_theta are fully zonked
+       -- rec {..}: see Note [Keeping SkolemInfo inside a SkolemTv]
+       --           in GHC.Tc.Utils.TcType
        ; rec { (qtvs, bound_theta, co_vars) <- decideQuantification skol_info infer_mode rhs_tclvl
                                                      name_taus partial_sigs
                                                      quant_pred_candidates
-             ;  bound_theta_vars <- mapM TcM.newEvVar bound_theta
+             ; bound_theta_vars <- mapM TcM.newEvVar bound_theta
 
              ; let full_theta = map idType bound_theta_vars
              ; skol_info <- mkSkolemInfo (InferSkol [ (name, mkSigmaTy [] full_theta ty)
@@ -1668,13 +1670,13 @@ We will ultimately quantify f over (Eq a, C a, <diff>), where
 At least for single functions we would like to quantify f over
 precisely the same theta as <quant-theta>, so that we get to take
 the short-cut path in GHC.Tc.Gen.Bind.mkExport, and avoid calling
-tcSubTypeSigma for impedence matching. Why avoid?  Because it falls
+tcSubTypeSigma for impedance matching. Why avoid?  Because it falls
 over for ambiguous types (#20921).
 
 We can get precisely the same theta by using the same algorithm,
 findInferredDiff.
 
-All of this goes wrong if we have (a) mutual recursion, (b) mutiple
+All of this goes wrong if we have (a) mutual recursion, (b) multiple
 partial type signatures, (c) with different constraints, and (d)
 ambiguous types.  Something like
     f :: forall a. Eq a => F a -> _
@@ -1848,7 +1850,7 @@ defaultTyVarsAndSimplify rhs_tclvl mono_tvs candidates
           -- NB: only pass 'DefaultKindVars' when we know we're dealing with a kind variable.
           tv
 
-       -- this common case (no inferred contraints) should be fast
+       -- this common case (no inferred constraints) should be fast
     simplify_cand [] = return []
        -- see Note [Unconditionally resimplify constraints when quantifying]
     simplify_cand candidates
@@ -2490,18 +2492,7 @@ setImplicationStatus implic@(Implic { ic_status     = status
 
       ; bad_telescope <- checkBadTelescope implic
 
-      ; let (used_givens, unused_givens)
-              | warnRedundantGivens info
-              = partition (`elemVarSet` need_inner) givens
-              | otherwise = (givens, [])   -- None to report
-
-            minimal_used_givens = mkMinimalBySCs evVarPred used_givens
-            is_minimal = (`elemVarSet` mkVarSet minimal_used_givens)
-
-            warn_givens
-              | not (null unused_givens) = unused_givens
-              | warnRedundantGivens info = filterOut is_minimal used_givens
-              | otherwise                = []
+      ; let warn_givens = findUnnecessaryGivens info need_inner givens
 
             discard_entire_implication  -- Can we discard the entire implication?
               =  null warn_givens           -- No warning from this implication
@@ -2540,6 +2531,67 @@ setImplicationStatus implic@(Implic { ic_status     = status
      = False       -- Tnen we don't need to keep it
      | otherwise
      = True        -- Otherwise, keep it
+
+findUnnecessaryGivens :: SkolemInfoAnon -> VarSet -> [EvVar] -> [EvVar]
+findUnnecessaryGivens info need_inner givens
+  | not (warnRedundantGivens info)   -- Don't report redundant constraints at all
+  = []
+
+  | not (null unused_givens)         -- Some givens are literally unused
+  = unused_givens
+
+   | otherwise                       -- All givens are used, but some might
+   = redundant_givens                -- still be redundant e.g. (Eq a, Ord a)
+
+  where
+    in_instance_decl = case info of { InstSkol {} -> True; _ -> False }
+                       -- See Note [Redundant constraints in instance decls]
+
+    unused_givens = filterOut is_used givens
+
+    is_used given =   is_type_error given
+                  ||  (given `elemVarSet` need_inner)
+                  ||  (in_instance_decl && is_improving (idType given))
+
+    minimal_givens = mkMinimalBySCs evVarPred givens
+    is_minimal = (`elemVarSet` mkVarSet minimal_givens)
+    redundant_givens
+      | in_instance_decl = []
+      | otherwise        = filterOut is_minimal givens
+
+    -- See #15232
+    is_type_error = isJust . userTypeError_maybe . idType
+
+    is_improving pred -- (transSuperClasses p) does not include p
+      = any isImprovementPred (pred : transSuperClasses pred)
+
+{- Note [Redundant constraints in instance decls]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Instance declarations are special in two ways:
+
+* We don't report unused givens if they can give rise to improvement.
+  Example (#10100):
+    class Add a b ab | a b -> ab, a ab -> b
+    instance Add Zero b b
+    instance Add a b ab => Add (Succ a) b (Succ ab)
+  The context (Add a b ab) for the instance is clearly unused in terms
+  of evidence, since the dictionary has no fields.  But it is still
+  needed!  With the context, a wanted constraint
+     Add (Succ Zero) beta (Succ Zero)
+  we will reduce to (Add Zero beta Zero), and thence we get beta := Zero.
+  But without the context we won't find beta := Zero.
+
+  This only matters in instance declarations.
+
+* We don't report givens that are a superclass of another given. E.g.
+       class Ord r => UserOfRegs r a where ...
+       instance (Ord r, UserOfRegs r CmmReg) => UserOfRegs r CmmExpr where
+  The (Ord r) is not redundant, even though it is a superclass of
+  (UserOfRegs r CmmReg).  See Note [Recursive superclasses] in GHC.Tc.TyCl.Instance.
+
+  Again this is specific to instance declarations.
+-}
+
 
 checkBadTelescope :: Implication -> TcS Bool
 -- True <=> the skolems form a bad telescope
@@ -2689,7 +2741,7 @@ code, but:
 
    Moreover, if we simplify this implication more than once
    (e.g. because we can't solve it completely on the first iteration
-   of simpl_looop), we'll generate all the same bindings AGAIN!
+   of simpl_loop), we'll generate all the same bindings AGAIN!
 
 Easy solution: take advantage of the work we are doing to track dead
 (unused) Givens, and use it to prune the Given bindings too.  This is
@@ -2772,39 +2824,54 @@ others).
 
 ----- How tracking works
 
-* When two Givens are the same, we drop the evidence for the one
+(RC1) When two Givens are the same, we drop the evidence for the one
   that requires more superclass selectors. This is done
-  according to Note [Replacement vs keeping] in GHC.Tc.Solver.Interact.
+  according to 2(c) of Note [Replacement vs keeping] in GHC.Tc.Solver.InertSet.
 
-* The ic_need fields of an Implic records in-scope (given) evidence
+(RC2) The ic_need fields of an Implic records in-scope (given) evidence
   variables bound by the context, that were needed to solve this
   implication (so far).  See the declaration of Implication.
 
-* When the constraint solver finishes solving all the wanteds in
+(RC3) setImplicationStatus:
+  When the constraint solver finishes solving all the wanteds in
   an implication, it sets its status to IC_Solved
 
   - The ics_dead field, of IC_Solved, records the subset of this
     implication's ic_given that are redundant (not needed).
 
-* We compute which evidence variables are needed by an implication
-  in setImplicationStatus.  A variable is needed if
+  - We compute which evidence variables are needed by an implication
+    in setImplicationStatus.  A variable is needed if
     a) it is free in the RHS of a Wanted EvBind,
     b) it is free in the RHS of an EvBind whose LHS is needed, or
     c) it is in the ics_need of a nested implication.
 
-* After computing which variables are needed, we then look at the
-  remaining variables for internal redundancies. This is case (b)
-  from above. This is also done in setImplicationStatus.
-  Note that we only look for case (b) if case (a) shows up empty,
-  as exemplified below.
+  - After computing which variables are needed, we then look at the
+    remaining variables for internal redundancies. This is case (b)
+    from above. This is also done in setImplicationStatus.
+    Note that we only look for case (b) if case (a) shows up empty,
+    as exemplified below.
 
-* We need to be careful not to discard an implication
-  prematurely, even one that is fully solved, because we might
-  thereby forget which variables it needs, and hence wrongly
-  report a constraint as redundant.  But we can discard it once
-  its free vars have been incorporated into its parent; or if it
-  simply has no free vars. This careful discarding is also
-  handled in setImplicationStatus.
+  - We need to be careful not to discard an implication
+    prematurely, even one that is fully solved, because we might
+    thereby forget which variables it needs, and hence wrongly
+    report a constraint as redundant.  But we can discard it once
+    its free vars have been incorporated into its parent; or if it
+    simply has no free vars. This careful discarding is also
+    handled in setImplicationStatus.
+
+(RC4) We do not want to report redundant constraints for implications
+  that come from quantified constraints.  Example #23323:
+     data T a
+     instance Show (T a) where ...  -- No context!
+     foo :: forall f c. (forall a. c a => Show (f a)) => Proxy c -> f Int -> Int
+     bar = foo @T @Eq
+
+  The call to `foo` gives us
+    [W] d : (forall a. Eq a => Show (T a))
+  To solve this, GHC.Tc.Solver.Solve.solveForAll makes an implication constraint:
+    forall a. Eq a =>  [W] ds : Show (T a)
+  and because of the degnerate instance for `Show (T a)`, we don't need the `Eq a`
+  constraint.  But we don't want to report it as redundant!
 
 * Examples:
 
@@ -2895,7 +2962,7 @@ defaultTyVarTcS the_tv
        ; return True }
   | isMultiplicityVar the_tv
   = do { traceTcS "defaultTyVarTcS Multiplicity" (ppr the_tv)
-       ; unifyTyVar the_tv manyDataConTy
+       ; unifyTyVar the_tv ManyTy
        ; return True }
   | otherwise
   = return False  -- the common case
@@ -2996,7 +3063,7 @@ to ensure that instance declarations match.  For example consider
      foo x = show (\_ -> True)
 
 Then we'll get a constraint (Show (p ->q)) where p has kind (TYPE r),
-and that won't match the tcTypeKind (*) in the instance decl.  See tests
+and that won't match the typeKind (*) in the instance decl.  See tests
 tc217 and tc175.
 
 We look only at touchable type variables. No further constraints
@@ -3072,6 +3139,48 @@ beta! Concrete example is in indexed_types/should_fail/ExtraTcsUntch.hs:
 *                          Defaulting and disambiguation                        *
 *                                                                               *
 *********************************************************************************
+
+Note [Defaulting plugins]
+~~~~~~~~~~~~~~~~~~~~~~~~~
+Defaulting plugins enable extending or overriding the defaulting
+behaviour. In `applyDefaulting`, before the built-in defaulting
+mechanism runs, the loaded defaulting plugins are passed the
+`WantedConstraints` and get a chance to propose defaulting assignments
+based on them.
+
+Proposals are represented as `[DefaultingProposal]` with each proposal
+consisting of a type variable to fill-in, the list of defaulting types to
+try in order, and a set of constraints to check at each try. This is
+the same representation (albeit in a nicely packaged-up data type) as
+the candidates generated by the built-in defaulting mechanism, so the
+actual trying of proposals is done by the same `disambigGroup` function.
+
+Wrinkle (DP1): The role of `WantedConstraints`
+
+  Plugins are passed `WantedConstraints` that can perhaps be
+  progressed on by defaulting. But a defaulting plugin is not a solver
+  plugin, its job is to provide defaulting proposals, i.e. mappings of
+  type variable to types. How do plugins know which type variables
+  they are supposed to default?
+
+  The `WantedConstraints` passed to the defaulting plugin are zonked
+  beforehand to ensure all remaining metavariables are unfilled. Thus,
+  the `WantedConstraints` serve a dual purpose: they are both the
+  constraints of the given context that can act as hints to the
+  defaulting, as well as the containers of the type variables under
+  consideration for defaulting.
+
+Wrinkle (DP2): Interactions between defaulting mechanisms
+
+  In the general case, we have multiple defaulting plugins loaded and
+  there is also the built-in defaulting mechanism. In this case, we
+  have to be careful to keep the `WantedConstraints` passed to the
+  plugins up-to-date by zonking between successful defaulting
+  rounds. Otherwise, two plugins might come up with a defaulting
+  proposal for the same metavariable; if the first one is accepted by
+  `disambigGroup` (thus the meta gets filled), the second proposal
+  becomes invalid (see #23821 for an example).
+
 -}
 
 applyDefaultingRules :: WantedConstraints -> TcS Bool
@@ -3088,12 +3197,14 @@ applyDefaultingRules wanteds
        ; tcg_env <- TcS.getGblEnv
        ; let plugins = tcg_defaulting_plugins tcg_env
 
-       ; plugin_defaulted <- if null plugins then return [] else
+       -- Run any defaulting plugins
+       -- See Note [Defaulting plugins] for an overview
+       ; (wanteds, plugin_defaulted) <- if null plugins then return (wanteds, []) else
            do {
              ; traceTcS "defaultingPlugins {" (ppr wanteds)
-             ; defaultedGroups <- mapM (run_defaulting_plugin wanteds) plugins
+             ; (wanteds, defaultedGroups) <- mapAccumLM run_defaulting_plugin wanteds plugins
              ; traceTcS "defaultingPlugins }" (ppr defaultedGroups)
-             ; return defaultedGroups
+             ; return (wanteds, defaultedGroups)
              }
 
        ; let groups = findDefaultableGroups info wanteds
@@ -3117,8 +3228,14 @@ applyDefaultingRules wanteds
                     groups
                ; traceTcS "defaultingPlugin " $ ppr defaultedGroups
                ; case defaultedGroups of
-                 [] -> return False
-                 _  -> return True
+                 [] -> return (wanteds, False)
+                 _  -> do
+                     -- If a defaulting plugin solves any tyvars, some of the wanteds
+                     -- will have filled-in metavars by now (see wrinkle DP2 of
+                     -- Note [Defaulting plugins]). So we re-zonk to make sure later
+                     -- defaulting doesn't try to solve the same metavars.
+                     wanteds' <- TcS.zonkWC wanteds
+                     return (wanteds', True)
                }
 
 
@@ -3153,7 +3270,7 @@ findDefaultableGroups (default_tys, (ovl_strings, extended_defaults)) wanteds
         | Just (cls,tys)   <- getClassPredTys_maybe (ctPred cc)
         , [ty] <- filterOutInvisibleTypes (classTyCon cls) tys
               -- Ignore invisible arguments for this purpose
-        , Just tv <- tcGetTyVar_maybe ty
+        , Just tv <- getTyVar_maybe ty
         , isMetaTyVar tv  -- We might have runtime-skolems in GHCi, and
                           -- we definitely don't want to try to assign to those!
         = Left (cc, cls, tv)

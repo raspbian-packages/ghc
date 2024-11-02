@@ -19,19 +19,20 @@ core expression with (hopefully) improved usage information.
 module GHC.Core.Opt.OccurAnal (
     occurAnalysePgm,
     occurAnalyseExpr,
-    zapLambdaBndrs
+    zapLambdaBndrs, scrutBinderSwap_maybe
   ) where
 
-import GHC.Prelude
+import GHC.Prelude hiding ( head, init, last, tail )
 
 import GHC.Core
 import GHC.Core.FVs
 import GHC.Core.Utils   ( exprIsTrivial, isDefaultAlt, isExpandableApp,
-                          stripTicksTopE, mkTicks )
-import GHC.Core.Opt.Arity   ( joinRhsArity )
+                          mkCastMCo, mkTicks )
+import GHC.Core.Opt.Arity   ( joinRhsArity, isOneShotBndr )
 import GHC.Core.Coercion
+import GHC.Core.Predicate   ( isDictId )
 import GHC.Core.Type
-import GHC.Core.TyCo.FVs( tyCoVarsOfMCo )
+import GHC.Core.TyCo.FVs    ( tyCoVarsOfMCo )
 
 import GHC.Data.Maybe( isJust, orElse )
 import GHC.Data.Graph.Directed ( SCC(..), Node(..)
@@ -53,12 +54,13 @@ import GHC.Utils.Outputable
 import GHC.Utils.Panic
 import GHC.Utils.Panic.Plain
 import GHC.Utils.Misc
-import GHC.Utils.Trace
 
 import GHC.Builtin.Names( runRWKey )
 import GHC.Unit.Module( Module )
 
 import Data.List (mapAccumL, mapAccumR)
+import Data.List.NonEmpty (NonEmpty (..), nonEmpty)
+import qualified Data.List.NonEmpty as NE
 
 {-
 ************************************************************************
@@ -363,6 +365,12 @@ Solution:
     then just glom all the bindings into a single Rec, so that
     the *next* iteration of the occurrence analyser will sort
     them all out.   This part happens in occurAnalysePgm.
+
+This is a legitimate situation where the need for glomming doesn't
+point to any problems. However, when GHC is compiled with -DDEBUG, we
+produce a warning addressed to the GHC developers just in case we
+require glomming due to an out-of-order reference that is caused by
+some earlier transformation stage misbehaving.
 -}
 
 {-
@@ -613,7 +621,7 @@ both j's RHS and in its stable unfolding.  We want to discover
 j2 as a join point.  So we must do the adjustRhsUsage thing
 on j's RHS.  That's why we pass mb_join_arity to calcUnfolding.
 
-Aame with rules. Suppose we have:
+Same with rules. Suppose we have:
 
   let j :: Int -> Int
       j y = 2 * y
@@ -625,7 +633,7 @@ Aame with rules. Suppose we have:
 We identify k as a join point, and we want j to be a join point too.
 Without the RULE it would be, and we don't want the RULE to mess it
 up.  So provided the join-point arity of k matches the args of the
-rule we can allow the tail-cal info from the RHS of the rule to
+rule we can allow the tail-call info from the RHS of the rule to
 propagate.
 
 * Wrinkle for Rec case. In the recursive case we don't know the
@@ -782,7 +790,7 @@ occAnalNonRecBind !env lvl imp_rule_edges bndr rhs body_usage
          --     h = ...
          --     g = ...
          --     RULE map g = h
-         -- Then we want to ensure that h is in scope everwhere
+         -- Then we want to ensure that h is in scope everywhere
          -- that g is (since the RULE might turn g into h), so
          -- we make g mention h.
 
@@ -952,7 +960,7 @@ And now the Simplifer will try to use PreInlineUnconditionally on lvl1
 (which occurs just once), but because it is last we won't actually
 substitute in lvl2.  Sigh.
 
-To avoid this possiblity, we include edges from lvl2 to /both/ its
+To avoid this possibility, we include edges from lvl2 to /both/ its
 stable unfolding /and/ its RHS.  Hence the defn of inl_fvs in
 makeNode.  Maybe we could be more clever, but it's very much a corner
 case.
@@ -1216,7 +1224,7 @@ more likely.  Here's a real example from #1969:
         $s$dm2 = \x. op dBool }
 The RULES stuff means that we can't choose $dm as a loop breaker
 (Note [Choosing loop breakers]), so we must choose at least (say)
-opInt *and* opBool, and so on.  The number of loop breakders is
+opInt *and* opBool, and so on.  The number of loop breakers is
 linear in the number of instance declarations.
 
 Note [Loop breakers and INLINE/INLINABLE pragmas]
@@ -1749,7 +1757,7 @@ lambda and casts, e.g.
 
 * Why do we take care to account for intervening casts? Answer:
   currently we don't do eta-expansion and cast-swizzling in a stable
-  unfolding (see Note [Eta-expansion in stable unfoldings]).
+  unfolding (see Historical-note [Eta-expansion in stable unfoldings]).
   So we can get
     f = \x. ((\y. ...x...y...) |> co)
   Now, since the lambdas aren't together, the occurrence analyser will
@@ -1851,7 +1859,8 @@ occAnalLam env (Cast expr co)
          -- usage3: you might think this was not necessary, because of
          -- the markAllNonTail in adjustRhsUsage; but not so!  For a
          -- join point, adjustRhsUsage doesn't do this; yet if there is
-         -- a cast, we must!
+         -- a cast, we must!  Also: why markAllNonTail?  See
+         -- GHC.Core.Lint: Note Note [Join points and casts]
          usage3 = markAllNonTail usage2
 
     in WithUsageDetails usage3 (Cast expr' co)
@@ -1861,7 +1870,7 @@ occAnalLam env expr = occAnal env expr
 {- Note [Occ-anal and cast worker/wrapper]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Consider   y = e; x = y |> co
-If we mark y as used-once, we'll inline y into x, and the the Cast
+If we mark y as used-once, we'll inline y into x, and the Cast
 worker/wrapper transform will float it straight back out again.  See
 Note [Cast worker/wrapper] in GHC.Core.Opt.Simplify.
 
@@ -2036,6 +2045,17 @@ produce a new tree.
 So we have a fast-path that keeps the old tree if the occ_bs_env is
 empty.   This just saves a bit of allocation and reconstruction; not
 a big deal.
+
+This fast path exposes a tricky cornder, though (#22761). Supose we have
+    Unfolding = \x. let y = foo in x+1
+which includes a dead binding for `y`. In occAnalUnfolding we occ-anal
+the unfolding and produce /no/ occurrences of `foo` (since `y` is
+dead).  But if we discard the occ-analysed syntax tree (which we do on
+our fast path), and use the old one, we still /have/ an occurrence of
+`foo` -- and that can lead to out-of-scope variables (#22761).
+
+Solution: always keep occ-analysed trees in unfoldings and rules, so they
+have no dead code.  See Note [OccInfo in unfoldings and rules] in GHC.Core.
 
 Note [Cascading inlines]
 ~~~~~~~~~~~~~~~~~~~~~~~~
@@ -2362,7 +2382,7 @@ A:  Saturated applications:  eg   f e1 .. en
     f's strictness signature into e1 .. en, but /only/ if n is enough to
     saturate the strictness signature. A strictness signature like
 
-          f :: C1(C1(L))LS
+          f :: C(1,C(1,L))LS
 
     means that *if f is applied to three arguments* then it will guarantee to
     call its first argument at most once, and to call the result of that at
@@ -2398,10 +2418,10 @@ A': Non-obviously saturated applications: eg    build (f (\x y -> expensive))
 B:  Let-bindings:  eg   let f = \c. let ... in \n -> blah
                         in (build f, build f)
 
-    Propagate one-shot info from the demanand-info on 'f' to the
+    Propagate one-shot info from the demand-info on 'f' to the
     lambdas in its RHS (which may not be syntactically at the top)
 
-    This information must have come from a previous run of the demanand
+    This information must have come from a previous run of the demand
     analyser.
 
 Previously, the demand analyser would *also* set the one-shot information, but
@@ -2456,9 +2476,9 @@ data OccEnv
 
            -- See Note [The binder-swap substitution]
            -- If  x :-> (y, co)  is in the env,
-           -- then please replace x by (y |> sym mco)
-           -- Invariant of course: idType x = exprType (y |> sym mco)
-           , occ_bs_env  :: !(VarEnv (OutId, MCoercion))
+           -- then please replace x by (y |> mco)
+           -- Invariant of course: idType x = exprType (y |> mco)
+           , occ_bs_env  :: !(IdEnv (OutId, MCoercion))
                    -- Domain is Global and Local Ids
                    -- Range is just Local Ids
            , occ_bs_rng  :: !VarSet
@@ -2665,7 +2685,7 @@ The binder-swap is implemented by the occ_bs_env field of OccEnv.
 There are two main pieces:
 
 * Given    case x |> co of b { alts }
-  we add [x :-> (b, co)] to the occ_bs_env environment; this is
+  we add [x :-> (b, sym co)] to the occ_bs_env environment; this is
   done by addBndrSwap.
 
 * Then, at an occurrence of a variable, we look up in the occ_bs_env
@@ -2737,8 +2757,135 @@ Some tricky corners:
 (BS5) We have to apply the occ_bs_env substitution uniformly,
       including to (local) rules and unfoldings.
 
-Historical note
----------------
+(BS6) We must be very careful with dictionaries.
+      See Note [Care with binder-swap on dictionaries]
+
+Note [Case of cast]
+~~~~~~~~~~~~~~~~~~~
+Consider        case (x `cast` co) of b { I# ->
+                ... (case (x `cast` co) of {...}) ...
+We'd like to eliminate the inner case.  That is the motivation for
+equation (2) in Note [Binder swap].  When we get to the inner case, we
+inline x, cancel the casts, and away we go.
+
+Note [Care with binder-swap on dictionaries]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+This Note explains why we need isDictId in scrutBinderSwap_maybe.
+Consider this tricky example (#21229, #21470):
+
+  class Sing (b :: Bool) where sing :: Bool
+  instance Sing 'True  where sing = True
+  instance Sing 'False where sing = False
+
+  f :: forall a. Sing a => blah
+
+  h = \ @(a :: Bool) ($dSing :: Sing a)
+      let the_co =  Main.N:Sing[0] <a> :: Sing a ~R# Bool
+      case ($dSing |> the_co) of wild
+        True  -> f @'True (True |> sym the_co)
+        False -> f @a     dSing
+
+Now do a binder-swap on the case-expression:
+
+  h = \ @(a :: Bool) ($dSing :: Sing a)
+      let the_co =  Main.N:Sing[0] <a> :: Sing a ~R# Bool
+      case ($dSing |> the_co) of wild
+        True  -> f @'True (True |> sym the_co)
+        False -> f @a     (wild |> sym the_co)
+
+And now substitute `False` for `wild` (since wild=False in the False branch):
+
+  h = \ @(a :: Bool) ($dSing :: Sing a)
+      let the_co =  Main.N:Sing[0] <a> :: Sing a ~R# Bool
+      case ($dSing |> the_co) of wild
+        True  -> f @'True (True  |> sym the_co)
+        False -> f @a     (False |> sym the_co)
+
+And now we have a problem.  The specialiser will specialise (f @a d)a (for all
+vtypes a and dictionaries d!!) with the dictionary (False |> sym the_co), using
+Note [Specialising polymorphic dictionaries] in GHC.Core.Opt.Specialise.
+
+The real problem is the binder-swap.  It swaps a dictionary variable $dSing
+(of kind Constraint) for a term variable wild (of kind Type).  And that is
+dangerous: a dictionary is a /singleton/ type whereas a general term variable is
+not.  In this particular example, Bool is most certainly not a singleton type!
+
+Conclusion:
+  for a /dictionary variable/ do not perform
+  the clever cast version of the binder-swap
+
+Hence the subtle isDictId in scrutBinderSwap_maybe.
+
+Note [Zap case binders in proxy bindings]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+From the original
+     case x of cb(dead) { p -> ...x... }
+we will get
+     case x of cb(live) { p -> ...cb... }
+
+Core Lint never expects to find an *occurrence* of an Id marked
+as Dead, so we must zap the OccInfo on cb before making the
+binding x = cb.  See #5028.
+
+NB: the OccInfo on /occurrences/ really doesn't matter much; the simplifier
+doesn't use it. So this is only to satisfy the perhaps-over-picky Lint.
+
+-}
+
+addBndrSwap :: OutExpr -> Id -> OccEnv -> OccEnv
+-- See Note [The binder-swap substitution]
+addBndrSwap scrut case_bndr
+            env@(OccEnv { occ_bs_env = swap_env, occ_bs_rng = rng_vars })
+  | Just (scrut_var, mco) <- scrutBinderSwap_maybe scrut
+  , scrut_var /= case_bndr
+      -- Consider: case x of x { ... }
+      -- Do not add [x :-> x] to occ_bs_env, else lookupBndrSwap will loop
+  = env { occ_bs_env = extendVarEnv swap_env scrut_var (case_bndr', mco)
+        , occ_bs_rng = rng_vars `extendVarSet` case_bndr'
+                       `unionVarSet` tyCoVarsOfMCo mco }
+
+  | otherwise
+  = env
+  where
+    case_bndr' = zapIdOccInfo case_bndr
+                 -- See Note [Zap case binders in proxy bindings]
+
+scrutBinderSwap_maybe :: OutExpr -> Maybe (OutVar, MCoercion)
+-- If (scrutBinderSwap_maybe e = Just (v, mco), then
+--    v = e |> mco
+-- See Note [Case of cast]
+-- See Note [Care with binder-swap on dictionaries]
+--
+-- We use this same function in SpecConstr, and Simplify.Iteration,
+-- when something binder-swap-like is happening
+scrutBinderSwap_maybe (Var v)    = Just (v, MRefl)
+scrutBinderSwap_maybe (Cast (Var v) co)
+  | not (isDictId v)             = Just (v, MCo (mkSymCo co))
+        -- Cast: see Note [Case of cast]
+        -- isDictId: see Note [Care with binder-swap on dictionaries]
+        -- The isDictId rejects a Constraint/Constraint binder-swap, perhaps
+        -- over-conservatively. But I have never seen one, so I'm leaving
+        -- the code as simple as possible. Losing the binder-swap in a
+        -- rare case probably has very low impact.
+scrutBinderSwap_maybe (Tick _ e) = scrutBinderSwap_maybe e  -- Drop ticks
+scrutBinderSwap_maybe _          = Nothing
+
+lookupBndrSwap :: OccEnv -> Id -> (CoreExpr, Id)
+-- See Note [The binder-swap substitution]
+-- Returns an expression of the same type as Id
+lookupBndrSwap env@(OccEnv { occ_bs_env = bs_env })  bndr
+  = case lookupVarEnv bs_env bndr of {
+       Nothing           -> (Var bndr, bndr) ;
+       Just (bndr1, mco) ->
+
+    -- Why do we iterate here?
+    -- See (BS2) in Note [The binder-swap substitution]
+    case lookupBndrSwap env bndr1 of
+      (fun, fun_id) -> (mkCastMCo fun mco, fun_id) }
+
+
+{- Historical note [Proxy let-bindings]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 We used to do the binder-swap transformation by introducing
 a proxy let-binding, thus;
 
@@ -2762,30 +2909,8 @@ But that had two problems:
 
 Doing a substitution (via occ_bs_env) is much better.
 
-Note [Case of cast]
-~~~~~~~~~~~~~~~~~~~
-Consider        case (x `cast` co) of b { I# ->
-                ... (case (x `cast` co) of {...}) ...
-We'd like to eliminate the inner case.  That is the motivation for
-equation (2) in Note [Binder swap].  When we get to the inner case, we
-inline x, cancel the casts, and away we go.
-
-Note [Zap case binders in proxy bindings]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-From the original
-     case x of cb(dead) { p -> ...x... }
-we will get
-     case x of cb(live) { p -> ...cb... }
-
-Core Lint never expects to find an *occurrence* of an Id marked
-as Dead, so we must zap the OccInfo on cb before making the
-binding x = cb.  See #5028.
-
-NB: the OccInfo on /occurrences/ really doesn't matter much; the simplifier
-doesn't use it. So this is only to satisfy the perhaps-over-picky Lint.
-
 Historical Note [no-case-of-case]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 We *used* to suppress the binder-swap in case expressions when
 -fno-case-of-case is on.  Old remarks:
     "This happens in the first simplifier pass,
@@ -2844,53 +2969,8 @@ binder-swap in OccAnal:
 It's fixed by doing the binder-swap in OccAnal because we can do the
 binder-swap unconditionally and still get occurrence analysis
 information right.
--}
 
-addBndrSwap :: OutExpr -> Id -> OccEnv -> OccEnv
--- See Note [The binder-swap substitution]
-addBndrSwap scrut case_bndr
-            env@(OccEnv { occ_bs_env = swap_env, occ_bs_rng = rng_vars })
-  | Just (scrut_var, mco) <- get_scrut_var (stripTicksTopE (const True) scrut)
-  , scrut_var /= case_bndr
-      -- Consider: case x of x { ... }
-      -- Do not add [x :-> x] to occ_bs_env, else lookupBndrSwap will loop
-  = env { occ_bs_env = extendVarEnv swap_env scrut_var (case_bndr', mco)
-        , occ_bs_rng = rng_vars `extendVarSet` case_bndr'
-                       `unionVarSet` tyCoVarsOfMCo mco }
 
-  | otherwise
-  = env
-  where
-    get_scrut_var :: OutExpr -> Maybe (OutVar, MCoercion)
-    get_scrut_var (Var v)           = Just (v, MRefl)
-    get_scrut_var (Cast (Var v) co) = Just (v, MCo co) -- See Note [Case of cast]
-    get_scrut_var _                 = Nothing
-
-    case_bndr' = zapIdOccInfo case_bndr
-                 -- See Note [Zap case binders in proxy bindings]
-
-lookupBndrSwap :: OccEnv -> Id -> (CoreExpr, Id)
--- See Note [The binder-swap substitution]
--- Returns an expression of the same type as Id
-lookupBndrSwap env@(OccEnv { occ_bs_env = bs_env })  bndr
-  = case lookupVarEnv bs_env bndr of {
-       Nothing           -> (Var bndr, bndr) ;
-       Just (bndr1, mco) ->
-
-    -- Why do we iterate here?
-    -- See (BS2) in Note [The binder-swap substitution]
-    case lookupBndrSwap env bndr1 of
-      (fun, fun_id) -> (add_cast fun mco, fun_id) }
-
-  where
-    add_cast fun MRefl    = fun
-    add_cast fun (MCo co) = Cast fun (mkSymCo co)
-    -- We must switch that 'co' to 'sym co';
-    -- see the comment with occ_bs_env
-    -- No need to test for isReflCo, because 'co' came from
-    -- a (Cast e co) and hence is unlikely to be Refl
-
-{-
 ************************************************************************
 *                                                                      *
 \subsection[OccurAnal-types]{OccEnv}
@@ -3129,7 +3209,7 @@ tagNonRecBinder :: TopLevelFlag           -- At top level?
 tagNonRecBinder lvl usage binder
  = let
      occ     = lookupDetails usage binder
-     will_be_join = decideJoinPointHood lvl usage [binder]
+     will_be_join = decideJoinPointHood lvl usage (NE.singleton binder)
      occ'    | will_be_join = -- must already be marked AlwaysTailCalled
                               assert (isAlwaysTailCalled occ) occ
              | otherwise    = markNonTail occ
@@ -3154,7 +3234,11 @@ tagRecBinders lvl body_uds details_s
      -- 1. Determine join-point-hood of whole group, as determined by
      --    the *unadjusted* usage details
      unadj_uds     = foldr andUDs body_uds rhs_udss
-     will_be_joins = decideJoinPointHood lvl unadj_uds bndrs
+
+     -- This is only used in `mb_join_arity`, to adjust each `Details` in `details_s`, thus,
+     -- when `bndrs` is non-empty. So, we only write `maybe False` as `decideJoinPointHood`
+     -- takes a `NonEmpty CoreBndr`; the default value `False` won't affect program behavior.
+     will_be_joins = maybe False (decideJoinPointHood lvl unadj_uds) (nonEmpty bndrs)
 
      -- 2. Adjust usage details of each RHS, taking into account the
      --    join-point-hood decision
@@ -3210,12 +3294,12 @@ setBinderOcc occ_info bndr
 --
 -- See Note [Invariants on join points] in "GHC.Core".
 decideJoinPointHood :: TopLevelFlag -> UsageDetails
-                    -> [CoreBndr]
+                    -> NonEmpty CoreBndr
                     -> Bool
 decideJoinPointHood TopLevel _ _
   = False
 decideJoinPointHood NotTopLevel usage bndrs
-  | isJoinId (head bndrs)
+  | isJoinId (NE.head bndrs)
   = warnPprTrace (not all_ok)
                  "OccurAnal failed to rediscover join point(s)" (ppr bndrs)
                  all_ok

@@ -32,24 +32,27 @@ module GHC.Core.InstEnv (
         isOverlappable, isOverlapping, isIncoherent
     ) where
 
-import GHC.Prelude
+import GHC.Prelude hiding ( head, init, last, tail )
 
 import GHC.Tc.Utils.TcType -- InstEnv is really part of the type checker,
               -- and depends on TcType in many ways
 import GHC.Core ( IsOrphan(..), isOrphan, chooseOrphanAnchor )
 import GHC.Core.RoughMap
+import GHC.Core.Class
+import GHC.Core.Unify
+
 import GHC.Unit.Module.Env
 import GHC.Unit.Types
-import GHC.Core.Class
 import GHC.Types.Var
 import GHC.Types.Unique.DSet
 import GHC.Types.Var.Set
 import GHC.Types.Name
 import GHC.Types.Name.Set
-import GHC.Core.Unify
 import GHC.Types.Basic
 import GHC.Types.Id
 import Data.Data        ( Data )
+import Data.List.NonEmpty ( NonEmpty (..), nonEmpty )
+import qualified Data.List.NonEmpty as NE
 import Data.Maybe       ( isJust )
 
 import GHC.Utils.Outputable
@@ -229,10 +232,8 @@ pprInstances ispecs = vcat (map pprInstance ispecs)
 
 instanceHead :: ClsInst -> ([TyVar], Class, [Type])
 -- Returns the head, using the fresh tyvars from the ClsInst
-instanceHead (ClsInst { is_tvs = tvs, is_tys = tys, is_dfun = dfun })
+instanceHead (ClsInst { is_tvs = tvs, is_cls = cls, is_tys = tys })
    = (tvs, cls, tys)
-   where
-     (_, _, cls, _) = tcSplitDFunTy (idType dfun)
 
 -- | Collects the names of concrete types and type constructors that make
 -- up the head of a class instance. For instance, given `class Foo a b`:
@@ -280,16 +281,18 @@ mkLocalInstance dfun oflag tvs cls tys
 
     -- See Note [When exactly is an instance decl an orphan?]
     orph | is_local cls_name   = NotOrphan (nameOccName cls_name)
-         | all notOrphan mb_ns = assert (not (null mb_ns)) $ head mb_ns
+         | all notOrphan mb_ns = NE.head mb_ns
          | otherwise           = IsOrphan
 
     notOrphan NotOrphan{} = True
     notOrphan _ = False
 
-    mb_ns :: [IsOrphan]    -- One for each fundep; a locally-defined name
-                           -- that is not in the "determined" arguments
-    mb_ns | null fds   = [choose_one arg_names]
-          | otherwise  = map do_one fds
+    mb_ns :: NonEmpty IsOrphan
+    -- One for each fundep; a locally-defined name
+    -- that is not in the "determined" arguments
+    mb_ns = case nonEmpty fds of
+        Nothing -> NE.singleton (choose_one arg_names)
+        Just fds -> fmap do_one fds
     do_one (_ltvs, rtvs) = choose_one [ns | (tv,ns) <- cls_tvs `zip` arg_names
                                             , not (tv `elem` rtvs)]
 
@@ -319,7 +322,9 @@ mkImportedInstance cls_nm mb_tcs dfun_name dfun oflag orphan
 {-
 Note [When exactly is an instance decl an orphan?]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-  (see GHC.Iface.Make.instanceToIfaceInst, which implements this)
+(See GHC.Iface.Make.instanceToIfaceInst, which implements this.)
+See Note [Orphans] in GHC.Core
+
 Roughly speaking, an instance is an orphan if its head (after the =>)
 mentions nothing defined in this module.
 
@@ -965,7 +970,7 @@ lookupInstEnv check_overlap_safe
                     (m:_) | isIncoherent (fst m) -> NoUnifiers
                     _                            -> all_unifs
 
-    -- NOTE [Safe Haskell isSafeOverlap]
+    -- Note [Safe Haskell isSafeOverlap]
     -- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     -- We restrict code compiled in 'Safe' mode from overriding code
     -- compiled in any other mode. The rationale is that code compiled
@@ -1059,7 +1064,7 @@ that overrides it) but might still be useful for eliminating other instances
       A2. M is not overlapping,
       A3. G is overlapping.
 
-    This means that we eliminate G from the set of matches (it is overriden by M),
+    This means that we eliminate G from the set of matches (it is overridden by M),
     but we keep it around until we are done with instance resolution because
     it might still be useful to eliminate other matches.
 
@@ -1067,7 +1072,7 @@ that overrides it) but might still be useful for eliminating other instances
 
     There are two situations in which guards can eliminate a match:
 
-      B1. We want to add a new instance, but it is overriden by a guard.
+      B1. We want to add a new instance, but it is overridden by a guard.
           We can immediately discard the instance.
 
           Example for B1:
@@ -1080,7 +1085,7 @@ that overrides it) but might still be useful for eliminating other instances
 
           Processing them in order: we add J1 as a match, then J2 as a guard.
           Now, when we come across J3, we can immediately discard it because
-          it is overriden by the guard J2.
+          it is overridden by the guard J2.
 
       B2. We have found a new guard. We must use it to discard matches
           we have already found. This is necessary because we must obtain
@@ -1096,7 +1101,7 @@ that overrides it) but might still be useful for eliminating other instances
 
             We start by considering K1 and K2. Neither has any overlapping flag set,
             so we end up with two matches, {K1, K2}.
-            Next we look at K3: it is overriden by K1, but as K1 is not
+            Next we look at K3: it is overridden by K1, but as K1 is not
             overlapping this means K3 should function as a guard.
             We must then ensure we eliminate K2 from the list of matches,
             as K3 guards against it.

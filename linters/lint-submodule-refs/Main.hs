@@ -18,12 +18,12 @@ import           System.Exit
 -- text
 import qualified Data.Text    as T
 import qualified Data.Text.IO as T
-  ( putStrLn )
+  ( putStrLn, putStr )
 
 -- linters-common
 import           Linters.Common
   ( GitType(..)
-  , gitBranchesContain, gitCatCommit, gitDiffTree, gitNormCid
+  , gitBranchesContain, gitIsTagged, gitCatCommit, gitDiffTree, gitNormCid
   )
 
 --------------------------------------------------------------------------------
@@ -51,27 +51,36 @@ main = do
               exitWith (ExitFailure 1)
 
           bad <- fmap or $ forM smDeltas $ \(smPath,smCid) -> do
-              T.putStrLn $ " - " <> smPath <> " => " <> smCid
+              T.putStr $ " - " <> smPath <> " => " <> smCid
 
               let smAbsPath = dir ++ "/" ++ T.unpack smPath
               remoteBranches <- gitBranchesContain smAbsPath smCid
+              isTagged <- gitIsTagged smAbsPath smCid
 
               let (wip, nonWip) = partition ("wip/" `T.isPrefixOf`) originBranches
                   originBranches = mapMaybe isOriginTracking remoteBranches
                   isOriginTracking = T.stripPrefix "origin/"
-              let bad = null nonWip
-              when bad $ do
+              case (nonWip ++ isTagged) of
+                [] -> do
+                  T.putStrLn " ... BAD"
                   T.putStrLn $     "   *FAIL* commit not found in submodule repo"
                   T.putStrLn       "          or not reachable from persistent branches"
                   T.putStrLn       ""
                   when (not $ null wip) $ do
                     T.putStrLn     "     Found the following non-mirrored WIP branches:"
                     forM_ wip $ \branch -> do
-                      commit <- gitNormCid smAbsPath branch
+                      commit <- gitNormCid smAbsPath ("origin/" <> branch)
                       T.putStrLn $ "      - " <> branch <> " -> " <> commit
                     T.putStrLn ""
-              pure bad
+                  return True
+                (b:bs) -> do
+                  let more = case bs of
+                                [] -> ")"
+                                rest -> " and " <> T.pack (show (length rest)) <> " more)"
+                  T.putStrLn $ "... OK (" <>  b <> more
+                  return False
 
           if bad
             then exitWith (ExitFailure 1)
-            else T.putStrLn " OK"
+            else T.putStrLn "OK"
+

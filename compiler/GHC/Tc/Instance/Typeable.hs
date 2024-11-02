@@ -13,7 +13,7 @@ module GHC.Tc.Instance.Typeable(mkTypeableBinds, tyConIsTypeable) where
 import GHC.Prelude
 import GHC.Platform
 
-import GHC.Types.Basic ( Boxity(..), neverInlinePragma )
+import GHC.Types.Basic ( Boxity(..), TypeOrConstraint(..), neverInlinePragma )
 import GHC.Types.SourceText ( SourceText(..) )
 import GHC.Iface.Env( newGlobalBinder )
 import GHC.Core.TyCo.Rep( Type(..), TyLit(..) )
@@ -106,7 +106,7 @@ There are many wrinkles:
 * GHC.Prim doesn't have any associated object code, so we need to put the
   representations for types defined in this module elsewhere. We chose this
   place to be GHC.Types. GHC.Tc.Instance.Typeable.mkPrimTypeableBinds is responsible for
-  injecting the bindings for the GHC.Prim representions when compiling
+  injecting the bindings for the GHC.Prim representations when compiling
   GHC.Types.
 
 * TyCon.tyConRepModOcc is responsible for determining where to find
@@ -190,7 +190,7 @@ mkModIdBindings :: TcM TcGblEnv
 mkModIdBindings
   = do { mod <- getModule
        ; loc <- getSrcSpanM
-       ; mod_nm        <- newGlobalBinder mod (mkVarOcc "$trModule") loc
+       ; mod_nm        <- newGlobalBinder mod (mkVarOccFS (fsLit "$trModule")) loc
        ; trModuleTyCon <- tcLookupTyCon trModuleTyConName
        ; let mod_id = mkExportedVanillaId mod_nm (mkTyConApp trModuleTyCon [])
        ; mod_bind      <- mkVarBind mod_id <$> mkModIdRHS mod
@@ -330,9 +330,11 @@ mkPrimTypeableTodos
 
                      -- Build TypeRepTodos for built-in KindReps
                    ; todo1 <- todoForExportedKindReps builtInKindReps
+
                      -- Build TypeRepTodos for types in GHC.Prim
                    ; todo2 <- todoForTyCons gHC_PRIM ghc_prim_module_id
                                             ghcPrimTypeableTyCons
+
                    ; tcg_env <- getGblEnv
                    ; let mod_id = case tcg_tr_module tcg_env of  -- Should be set by now
                                    Just mod_id -> mod_id
@@ -419,7 +421,7 @@ mkTyConRepBinds :: TypeableStuff -> TypeRepTodo
                 -> TypeableTyCon -> KindRepM (LHsBinds GhcTc)
 mkTyConRepBinds stuff todo (TypeableTyCon {..})
   = do -- Make a KindRep
-       let (bndrs, kind) = splitForAllTyCoVarBinders (tyConKind tycon)
+       let (bndrs, kind) = splitForAllForAllTyBinders (tyConKind tycon)
        liftTc $ traceTc "mkTyConKindRepBinds"
                         (ppr tycon $$ ppr (tyConKind tycon) $$ ppr kind)
        let ctx = mkDeBruijnContext (map binderVar bndrs)
@@ -433,9 +435,8 @@ mkTyConRepBinds stuff todo (TypeableTyCon {..})
 -- | Is a particular 'TyCon' representable by @Typeable@?. These exclude type
 -- families and polytypes.
 tyConIsTypeable :: TyCon -> Bool
-tyConIsTypeable tc =
-       isJust (tyConRepName_maybe tc)
-    && kindIsTypeable (dropForAlls $ tyConKind tc)
+tyConIsTypeable tc = isJust (tyConRepName_maybe tc)
+                  && kindIsTypeable (dropForAlls $ tyConKind tc)
 
 -- | Is a particular 'Kind' representable by @Typeable@? Here we look for
 -- polytypes and types containing casts (which may be, for instance, a type
@@ -477,12 +478,14 @@ newtype KindRepM a = KindRepM { unKindRepM :: StateT KindRepEnv TcRn a }
 liftTc :: TcRn a -> KindRepM a
 liftTc = KindRepM . lift
 
--- | We generate @KindRep@s for a few common kinds in @GHC.Types@ so that they
+-- | We generate `KindRep`s for a few common kinds, so that they
 -- can be reused across modules.
+-- These definitions are generated in `ghc-prim:GHC.Types`.
 builtInKindReps :: [(Kind, Name)]
 builtInKindReps =
-    [ (star, starKindRepName)
-    , (mkVisFunTyMany star star, starArrStarKindRepName)
+    [ (star,                              starKindRepName)
+    , (constraintKind,                    constraintKindRepName)
+    , (mkVisFunTyMany star star,          starArrStarKindRepName)
     , (mkVisFunTysMany [star, star] star, starArrStarArrStarKindRepName)
     ]
   where
@@ -494,6 +497,7 @@ initialKindRepEnv = foldlM add_kind_rep emptyTypeMap builtInKindReps
     add_kind_rep acc (k,n) = do
         id <- tcLookupId n
         return $! extendTypeMap acc k (id, Nothing)
+        -- The TypeMap looks through type synonyms
 
 -- | Performed while compiling "GHC.Types" to generate the built-in 'KindRep's.
 mkExportedKindReps :: TypeableStuff
@@ -509,6 +513,7 @@ mkExportedKindReps stuff = mapM_ kindrep_binding
         -- since the latter would find the built-in 'KindRep's in the
         -- 'KindRepEnv' (by virtue of being in 'initialKindRepEnv').
         rhs <- mkKindRepRhs stuff empty_scope kind
+        liftTc (traceTc "mkExport" (ppr kind $$ ppr rep_bndr $$ ppr rhs))
         addKindRepBind empty_scope kind rep_bndr rhs
 
 addKindRepBind :: CmEnv -> Kind -> Id -> LHsExpr GhcTc -> KindRepM ()
@@ -541,10 +546,8 @@ getKindRep stuff@(Stuff {..}) in_scope = go
 
     go' :: Kind -> KindRepEnv -> TcRn (LHsExpr GhcTc, KindRepEnv)
     go' k env
-        -- Look through type synonyms
-      | Just k' <- tcView k = go' k' env
-
         -- We've already generated the needed KindRep
+        -- This lookup looks through synonyms
       | Just (id, _) <- lookupTypeMapWithScope env in_scope k
       = return (nlHsVar id, env)
 
@@ -553,7 +556,7 @@ getKindRep stuff@(Stuff {..}) in_scope = go
       = do -- Place a NOINLINE pragma on KindReps since they tend to be quite
            -- large and bloat interface files.
            rep_bndr <- (`setInlinePragma` neverInlinePragma)
-                   <$> newSysLocalId (fsLit "$krep") Many (mkTyConTy kindRepTyCon)
+                   <$> newSysLocalId (fsLit "$krep") ManyTy (mkTyConTy kindRepTyCon)
 
            -- do we need to tie a knot here?
            flip runStateT env $ unKindRepM $ do
@@ -573,24 +576,27 @@ mkKindRepRhs stuff@(Stuff {..}) in_scope = new_kind_rep_shortcut
         -- We handle (TYPE LiftedRep) etc separately to make it
         -- clear to consumers (e.g. serializers) that there is
         -- a loop here (as TYPE :: RuntimeRep -> TYPE 'LiftedRep)
-      | not (tcIsConstraintKind k)
+      | Just (TypeLike, rep) <- sORTKind_maybe k
               -- Typeable respects the Constraint/Type distinction
               -- so do not follow the special case here
-      , Just arg <- kindRep_maybe k
-      = case splitTyConApp_maybe arg of
-          Just (tc, [])
+      = -- Here k = TYPE <something>
+        case splitTyConApp_maybe rep of
+          Just (tc, [])         -- TYPE IntRep, TYPE FloatRep etc
             | Just dc <- isPromotedDataCon_maybe tc
               -> return $ nlHsDataCon kindRepTYPEDataCon `nlHsApp` nlHsDataCon dc
 
-          Just (rep, [levArg])
-            | Just dcRep <- isPromotedDataCon_maybe rep
-            , Just (lev, []) <- splitTyConApp_maybe levArg
-            , Just dcLev <- isPromotedDataCon_maybe lev
+          Just (rep_tc, [levArg])  -- TYPE (BoxedRep lev)
+            | Just dcRep <- isPromotedDataCon_maybe rep_tc
+            , Just (lev_tc, []) <- splitTyConApp_maybe levArg
+            , Just dcLev <- isPromotedDataCon_maybe lev_tc
               -> return $ nlHsDataCon kindRepTYPEDataCon `nlHsApp` (nlHsDataCon dcRep `nlHsApp` nlHsDataCon dcLev)
 
           _   -> new_kind_rep k
       | otherwise = new_kind_rep k
 
+    new_kind_rep ki  -- Expand synonyms
+      | Just ki' <- coreView ki
+      = new_kind_rep ki'
 
     new_kind_rep (TyVarTy v)
       | Just idx <- lookupCME in_scope v
@@ -662,7 +668,7 @@ mkTyConRepTyConRHS (Stuff {..}) todo tycon kind_rep
   where
     n_kind_vars = length $ filter isNamedTyConBinder (tyConBinders tycon)
     tycon_str = add_tick (occNameString (getOccName tycon))
-    add_tick s | isPromotedDataCon tycon = '\'' : s
+    add_tick s | isDataKindsPromotedDataCon tycon = '\'' : s
                | otherwise               = s
 
     -- This must match the computation done in

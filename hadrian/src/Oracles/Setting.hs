@@ -11,12 +11,14 @@ module Oracles.Setting (
 
     -- ** Target platform things
     anyTargetPlatform, anyTargetOs, anyTargetArch, anyHostOs,
-    isElfTarget, isOsxTarget, isWinTarget,
+    isElfTarget, isOsxTarget, isWinTarget, isJsTarget,
     ArmVersion(..),
     targetArmVersion,
     ghcWithInterpreter
     ) where
 
+import System.Directory
+import System.Info.Extra
 import Hadrian.Expression
 import Hadrian.Oracles.TextFile
 import Hadrian.Oracles.Path
@@ -65,6 +67,7 @@ data Setting = BuildArch
              | ProjectName
              | ProjectVersion
              | ProjectVersionInt
+             | ProjectVersionMunged
              | ProjectPatchLevel
              | ProjectPatchLevel1
              | ProjectPatchLevel2
@@ -123,7 +126,6 @@ data SettingsFileSetting
     | SettingsFileSetting_InstallNameToolCommand
     | SettingsFileSetting_DllWrapCommand
     | SettingsFileSetting_WindresCommand
-    | SettingsFileSetting_LibtoolCommand
     | SettingsFileSetting_TouchCommand
     | SettingsFileSetting_ClangCommand
     | SettingsFileSetting_LlcCommand
@@ -166,6 +168,7 @@ setting key = lookupSystemConfig $ case key of
     ProjectGitCommitId -> "project-git-commit-id"
     ProjectName        -> "project-name"
     ProjectVersion     -> "project-version"
+    ProjectVersionMunged -> "project-version-munged"
     ProjectVersionInt  -> "project-version-int"
     ProjectPatchLevel  -> "project-patch-level"
     ProjectPatchLevel1 -> "project-patch-level1"
@@ -221,7 +224,6 @@ settingsFileSetting key = lookupSystemConfig $ case key of
     SettingsFileSetting_InstallNameToolCommand -> "settings-install_name_tool-command"
     SettingsFileSetting_DllWrapCommand -> "settings-dll-wrap-command"
     SettingsFileSetting_WindresCommand -> "settings-windres-command"
-    SettingsFileSetting_LibtoolCommand -> "settings-libtool-command"
     SettingsFileSetting_TouchCommand -> "settings-touch-command"
     SettingsFileSetting_ClangCommand -> "settings-clang-command"
     SettingsFileSetting_LlcCommand -> "settings-llc-command"
@@ -257,6 +259,9 @@ anyTargetOs = matchSetting TargetOs
 isWinTarget :: Action Bool
 isWinTarget = anyTargetOs ["mingw32"]
 
+isJsTarget :: Action Bool
+isJsTarget = anyTargetArch ["javascript"]
+
 isOsxTarget :: Action Bool
 isOsxTarget = anyTargetOs ["darwin"]
 
@@ -273,7 +278,7 @@ anyHostOs = matchSetting HostOs
 isElfTarget :: Action Bool
 isElfTarget = anyTargetOs
     [ "linux", "freebsd", "dragonfly", "openbsd", "netbsd", "solaris2", "kfreebsdgnu"
-    , "haiku", "linux-android"
+    , "gnu", "haiku", "linux-android"
     ]
 
 -- | Check whether the host OS supports the @-rpath@ linker option when
@@ -282,7 +287,7 @@ isElfTarget = anyTargetOs
 -- TODO: Windows supports lazy binding (but GHC doesn't currently support
 --       dynamic way on Windows anyways).
 hostSupportsRPaths :: Action Bool
-hostSupportsRPaths = anyHostOs ["linux", "darwin", "freebsd"]
+hostSupportsRPaths = anyHostOs ["linux", "darwin", "freebsd", "gnu"]
 
 -- | Check whether the target supports GHCi.
 ghcWithInterpreter :: Action Bool
@@ -312,9 +317,14 @@ ghcCanonVersion = do
     let leadingZero = [ '0' | length ghcMinorVersion == 1 ]
     return $ ghcMajorVersion ++ leadingZero ++ ghcMinorVersion
 
--- | Path to the GHC source tree.
+-- | Absolute path to the GHC source tree.
 topDirectory :: Action FilePath
-topDirectory = fixAbsolutePathOnWindows =<< setting GhcSourcePath
+topDirectory = do
+    x <- fixAbsolutePathOnWindows =<< setting GhcSourcePath
+    canonicalize x
+  where
+    -- We must canonicalize as the source directory may be accessed via a symlink. See #22451.
+    canonicalize = if isWindows then return else liftIO . canonicalizePath
 
 ghcVersionStage :: Stage -> Action String
 ghcVersionStage (Stage0 {}) = setting GhcVersion

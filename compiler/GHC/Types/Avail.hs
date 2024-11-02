@@ -48,13 +48,15 @@ import GHC.Utils.Binary
 import GHC.Data.List.SetOps
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
-import GHC.Utils.Misc
 import GHC.Utils.Constants (debugIsOn)
 
+import Control.DeepSeq
 import Data.Data ( Data )
 import Data.Either ( partitionEithers )
+import Data.Functor.Classes ( liftCompare )
 import Data.List ( find )
 import Data.Maybe
+import qualified Data.Semigroup as S
 
 -- -----------------------------------------------------------------------------
 -- The AvailInfo type
@@ -166,8 +168,7 @@ See also Note [GreNames] in GHC.Types.Name.Reader.
 stableAvailCmp :: AvailInfo -> AvailInfo -> Ordering
 stableAvailCmp (Avail c1)     (Avail c2)     = c1 `stableGreNameCmp` c2
 stableAvailCmp (Avail {})     (AvailTC {})   = LT
-stableAvailCmp (AvailTC n ns) (AvailTC m ms) = (n `stableNameCmp` m) `thenCmp`
-                                               (cmpList stableGreNameCmp ns ms)
+stableAvailCmp (AvailTC n ns) (AvailTC m ms) = stableNameCmp n m S.<> liftCompare stableGreNameCmp ns ms
 stableAvailCmp (AvailTC {})   (Avail {})     = GT
 
 stableGreNameCmp :: GreName -> GreName -> Ordering
@@ -272,9 +273,16 @@ instance Outputable GreName where
   ppr (NormalGreName n) = ppr n
   ppr (FieldGreName fl) = ppr fl
 
+instance NFData GreName where
+  rnf (NormalGreName n) = rnf n
+  rnf (FieldGreName f) = rnf f
+
 instance HasOccName GreName where
   occName (NormalGreName n) = occName n
   occName (FieldGreName fl) = occName fl
+
+instance Ord GreName where
+  compare = stableGreNameCmp
 
 -- | A 'Name' for internal use, but not for output to the user.  For fields, the
 -- 'OccName' will be the selector.  See Note [GreNames] in GHC.Types.Name.Reader.
@@ -315,10 +323,10 @@ plusAvail (AvailTC _ [])     a2@(AvailTC {})   = a2
 plusAvail a1@(AvailTC {})       (AvailTC _ []) = a1
 plusAvail (AvailTC n1 (s1:ss1)) (AvailTC n2 (s2:ss2))
   = case (NormalGreName n1==s1, NormalGreName n2==s2) of  -- Maintain invariant the parent is first
-       (True,True)   -> AvailTC n1 (s1 : (ss1 `unionLists` ss2))
-       (True,False)  -> AvailTC n1 (s1 : (ss1 `unionLists` (s2:ss2)))
-       (False,True)  -> AvailTC n1 (s2 : ((s1:ss1) `unionLists` ss2))
-       (False,False) -> AvailTC n1 ((s1:ss1) `unionLists` (s2:ss2))
+       (True,True)   -> AvailTC n1 (s1 : (ss1 `unionListsOrd` ss2))
+       (True,False)  -> AvailTC n1 (s1 : (ss1 `unionListsOrd` (s2:ss2)))
+       (False,True)  -> AvailTC n1 (s2 : ((s1:ss1) `unionListsOrd` ss2))
+       (False,False) -> AvailTC n1 ((s1:ss1) `unionListsOrd` (s2:ss2))
 plusAvail a1 a2 = pprPanic "GHC.Rename.Env.plusAvail" (hsep [ppr a1,ppr a2])
 
 -- | trims an 'AvailInfo' to keep only a single name
@@ -363,7 +371,7 @@ pprAvail :: AvailInfo -> SDoc
 pprAvail (Avail n)
   = ppr n
 pprAvail (AvailTC n ns)
-  = ppr n <> braces (fsep (punctuate comma (map ppr ns)))
+  = ppr n <> braces (pprWithCommas ppr ns)
 
 instance Binary AvailInfo where
     put_ bh (Avail aa) = do
@@ -382,6 +390,10 @@ instance Binary AvailInfo where
                       ac <- get bh
                       return (AvailTC ab ac)
 
+instance NFData AvailInfo where
+  rnf (Avail n) = rnf n
+  rnf (AvailTC a b) = rnf a `seq` rnf b
+
 instance Binary GreName where
     put_ bh (NormalGreName aa) = do
             putByte bh 0
@@ -396,3 +408,4 @@ instance Binary GreName where
                       return (NormalGreName aa)
               _ -> do ab <- get bh
                       return (FieldGreName ab)
+

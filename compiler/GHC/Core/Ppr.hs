@@ -315,8 +315,10 @@ ppr_expr add_par (Let bind expr)
 
 ppr_expr add_par (Tick tickish expr)
   = sdocOption sdocSuppressTicks $ \case
-      True  -> ppr_expr add_par expr
-      False -> add_par (sep [ppr tickish, pprCoreExpr expr])
+      -- Only hide non-runtime relevant ticks.
+      True
+        | not (tickishIsCode tickish) -> ppr_expr add_par expr
+      _ -> add_par (sep [ppr tickish, pprCoreExpr expr])
 
 pprCoreAlt :: OutputableBndr a => Alt a -> SDoc
 pprCoreAlt (Alt con args rhs)
@@ -615,11 +617,6 @@ instance Outputable UnfoldingGuidance where
                brackets (hsep (map int cs)),
                int size,
                int discount ]
-
-instance Outputable UnfoldingSource where
-  ppr InlineCompulsory  = text "Compulsory"
-  ppr InlineStable      = text "InlineStable"
-  ppr InlineRhs         = text "<vanilla>"
 
 instance Outputable Unfolding where
   ppr NoUnfolding                = text "No unfolding"

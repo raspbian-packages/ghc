@@ -335,6 +335,9 @@ instance  Real Float  where
 --
 -- >>> 0/0 * (recip 0/0 :: Float)
 -- NaN
+--
+-- Additionally, because of @NaN@ this instance does not obey the left-inverse
+-- law for 'toRational'/'fromRational'.
 instance  Fractional Float  where
     (/) x y             =  divideFloat x y
     {-# INLINE fromRational #-}
@@ -342,7 +345,8 @@ instance  Fractional Float  where
     recip x             =  1.0 / x
 
 rationalToFloat :: Integer -> Integer -> Float
-{-# NOINLINE [1] rationalToFloat #-}
+{-# NOINLINE [0] rationalToFloat #-}
+-- Re NOINLINE pragma, see Note [realToFrac natural-to-float]
 rationalToFloat n 0
     | n == 0        = 0/0
     | n < 0         = (-1)/0
@@ -564,6 +568,9 @@ instance  Real Double  where
 --
 -- >>> 0/0 * (recip 0/0 :: Double)
 -- NaN
+--
+-- Additionally, because of @NaN@ this instance does not obey the left-inverse
+-- law for 'toRational'/'fromRational'.
 instance  Fractional Double  where
     (/) x y             =  divideDouble x y
     {-# INLINE fromRational #-}
@@ -571,7 +578,8 @@ instance  Fractional Double  where
     recip x             =  1.0 / x
 
 rationalToDouble :: Integer -> Integer -> Double
-{-# NOINLINE [1] rationalToDouble #-}
+{-# NOINLINE [0] rationalToDouble #-}
+-- Re NOINLINE pragma, see Note [realToFrac natural-to-float]
 rationalToDouble n 0
     | n == 0        = 0/0
     | n < 0         = (-1)/0
@@ -1482,6 +1490,25 @@ with the native backend, and 0.143 seconds with the C backend.
 
 A few more details in #2251, and the patch message
 "Add RULES for realToFrac from Int".
+
+Note [realToFrac natural-to-float]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Consider (realToFrac @Natural @Float ..dicts.. (NS lit#))
+We want to constant-fold this.  For many types this is guaranteed
+by a RULE for realToFrac: eg. RULE "realToFrac/Float->Double" above.
+
+In case there is a similar rule, we do not inline realToFrac in stage 2.
+But for whatever reason, there is no such RULE for Natural.  So in stage 1
+we end up with
+    rationalToFloat (integerFromNatural (NS lit))
+and that turns into
+    rationalToFloat (IS lit#) (IS 1#)
+
+Now we'd have a BUILTIN constant folding rule for rationalToFloat; but
+to allow that rule to fire reliably we should delay inlining rationalToFloat
+until stage 0.  (It may get an inlining from CPR analysis.)
+
+Hence the NOINLINE[0] rationalToFloat, and similarly rationalToDouble.
 -}
 
 -- Utils
@@ -1613,3 +1640,22 @@ foreign import prim "stg_doubleToWord64zh"
 
 "Word# -> Natural -> Double#"
   forall x. naturalToDouble# (NS x) = word2Double# x #-}
+
+-- We don't have word64ToFloat/word64ToDouble primops (#23908), only
+-- word2Float/word2Double, so we can only perform these transformations when
+-- word-size is 64-bit.
+#if WORD_SIZE_IN_BITS == 64
+{-# RULES
+
+"Int64# -> Integer -> Float#"
+  forall x. integerToFloat# (integerFromInt64# x) = int2Float# (int64ToInt# x)
+
+"Int64# -> Integer -> Double#"
+  forall x. integerToDouble# (integerFromInt64# x) = int2Double# (int64ToInt# x)
+
+"Word64# -> Integer -> Float#"
+  forall x. integerToFloat# (integerFromWord64# x) = word2Float# (word64ToWord# x)
+
+"Word64# -> Integer -> Double#"
+  forall x. integerToDouble# (integerFromWord64# x) = word2Double# (word64ToWord# x) #-}
+#endif

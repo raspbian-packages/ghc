@@ -55,6 +55,7 @@
 #include "NonMoving.h"
 #include "Ticky.h"
 
+#include <stdalign.h>
 #include <string.h> // for memset()
 #include <unistd.h>
 
@@ -445,6 +446,11 @@ GarbageCollect (struct GcConfig config,
   memInventory(DEBUG_gc);
 #endif
 
+  // Defer all free calls for the megablock allocator to avoid quadratic runtime
+  // explosion when freeing a lot of memory in a single GC
+  // (https://gitlab.haskell.org/ghc/ghc/-/issues/19897).
+  deferMBlockFreeing();
+
   // do this *before* we start scavenging
   collectFreshWeakPtrs();
 
@@ -532,8 +538,6 @@ GarbageCollect (struct GcConfig config,
       markCapability(mark_root, gct, cap, true/*don't mark sparks*/);
   }
 
-  markScheduler(mark_root, gct);
-
   // Mark the weak pointer list, and prepare to detect dead weak pointers.
   markWeakPtrList();
   initWeakForGC();
@@ -572,8 +576,8 @@ GarbageCollect (struct GcConfig config,
 
 #if defined(THREADED_RTS)
   // See Note [Pruning the spark pool]
-  if (gc_sparks_all_caps) {
-      for (n = 0; n < getNumCapabilities(); n++) {
+  if(gc_sparks_all_caps) {
+      for (n = 0; n < n_capabilities; n++) {
           pruneSparkQueue(false, getCapability(n));
       }
   } else {
@@ -836,12 +840,9 @@ GarbageCollect (struct GcConfig config,
     live_blocks += genLiveBlocks(gen);
 
     // add in the partial blocks in the gen_workspaces
-    {
-        uint32_t i;
-        for (i = 0; i < getNumCapabilities(); i++) {
-            live_words  += gcThreadLiveWords(i, gen->no);
-            live_blocks += gcThreadLiveBlocks(i, gen->no);
-        }
+    for (uint32_t i = 0; i < getNumCapabilities(); i++) {
+        live_words  += gcThreadLiveWords(i, gen->no);
+        live_blocks += gcThreadLiveBlocks(i, gen->no);
     }
   } // for all generations
 
@@ -990,6 +991,11 @@ GarbageCollect (struct GcConfig config,
   resurrectThreads(resurrected_threads);
   ACQUIRE_SM_LOCK;
 
+  // Finally free the deferred mblocks by sorting the deferred free list and
+  // merging it into the actual sorted free list. This needs to happen here so
+  // that the `returnMemoryToOS` call down below can successfully free memory.
+  commitMBlockFreeing();
+
   if (major_gc) {
       W_ need_prealloc, need_live, need, got;
       uint32_t i;
@@ -1057,6 +1063,13 @@ GarbageCollect (struct GcConfig config,
           returned = returnMemoryToOS(got - need);
       }
       traceEventMemReturn(cap, got, need, returned);
+
+      // Ensure that we've returned enough mblocks to place us under maxHeapSize.
+      // This may fail for instance due to block fragmentation.
+      W_ after = got - returned;
+      if (RtsFlags.GcFlags.maxHeapSize != 0 && after > BLOCKS_TO_MBLOCKS(RtsFlags.GcFlags.maxHeapSize)) {
+        heapOverflow();
+      }
   }
 
   // extra GC trace info
@@ -1197,8 +1210,9 @@ initGcThreads (uint32_t from USED_IF_THREADS, uint32_t to USED_IF_THREADS)
 
     for (i = from; i < to; i++) {
         gc_threads[i] =
-            stgMallocBytes(sizeof(gc_thread) +
+            stgMallocAlignedBytes(sizeof(gc_thread) +
                            RtsFlags.GcFlags.generations * sizeof(gen_workspace),
+                           alignof(gc_thread),
                            "alloc_gc_threads");
 
         new_gc_thread(i, gc_threads[i]);
@@ -1223,7 +1237,7 @@ freeGcThreads (void)
             {
                 freeWSDeque(gc_threads[i]->gens[g].todo_q);
             }
-            stgFree (gc_threads[i]);
+            stgFreeAligned (gc_threads[i]);
         }
         closeCondition(&gc_running_cv);
         closeMutex(&gc_running_mutex);
@@ -2268,7 +2282,7 @@ bool doIdleGCWork(Capability *cap STG_UNUSED, bool all)
  * usage when the live data size is much more reasonable (for example ghcide)
  *
  * Therefore we have a new (2021) strategy which starts by retaining up to 4 * live_bytes
- * of blocks before gradually returning uneeded memory back to the OS on subsequent
+ * of blocks before gradually returning unneeded memory back to the OS on subsequent
  * major GCs which are NOT caused by a heap overflow.
  *
  * Each major GC which is NOT caused by heap overflow increases the consec_idle_gcs
@@ -2302,3 +2316,81 @@ bool doIdleGCWork(Capability *cap STG_UNUSED, bool all)
  * place, so we always keep that much. If using compacting or nonmoving then we need a lower number,
  * so we just retain at least `1.2 * live_bytes` for some protection.
  */
+
+/* Note [-Fd and thrashing]
+ * ~~~~~~~~~~~~~~~~~~~~~~~~
+ *
+ * See the discussion on #21483 and how low we should scale memory usage and whether
+ * the current behaviour will result in thrashing.
+ *
+ >  The post is correct to say that we need 2L memory to do copying collection
+ >  when there is L live bytes. But it seems to ignore the fact that we don't
+ >  collect until the heap has grown to F*L bytes (where F=2 by default), which
+ >  means that in a steady state of L live bytes we actually need (1+F)L bytes
+ >  (plus the nursery). This is where the original default of returning memory
+ >  above (2+F)L came from: we know we need (1+F)L, plus a bit for the nursery,
+ >  plus we add on another L so that we don't thrash.
+
+ >  If I'm understanding the way -Fd works, it will return memory until we're
+ >  below the 3L value, which will definitely lead to thrashing because we'll
+ >  reallocate the memory to get back to 3L at the next major GC, assuming L
+ >  remains constant.
+
+ >  I think you would want to decay from (2+F)L to (1+F)L, but no lower than
+ >  that. Also, saying that we're "scaling F" is not really the right way to
+ >  think about it, since F is not actually changing, it's the fudge factor we
+ >  want to change.
+
+ * The situation where -Fd kicks in is when the process is idle (ie not
+ * allocating at all), if a process is idle then the memory usage returns down to
+ * a minimal baseline (2L) over quite an extended period by default. Which I
+ * think is what you want because if your program memory usage was increasing,
+ * this is the state you would get into during an idle period. The expectation is
+ * that the amount of program the RTS retains is related to the actual live bytes
+ * rather than the historical memory usage of the program.
+
+ * You are then right, that if after this idle period then we start allocating
+ * again then we will need to get more memory from the OS but this is on the scale
+ * of 10s of minutes rather than milliseconds or seconds (due to the delay
+ * factor).
+ *
+ * It seems in your reply you assume that there will certainly be a major GC due
+ * to allocation in the near future -- but this isn't true. I am often leaving a
+ * high memory consumption Haskell process idle for periods of days/weeks on my
+ * machine and so if that retained 3*L bytes then I would certainly notice!
+ *
+ *
+ * > True enough, I was mainly thinking about programs that allocate continuously.
+ * >
+ * > So let's be a bit more precise
+ * >
+ * >     At the next major GC, the program will need (1+F)L
+ * >     Until the next major GC, it needs from L up to FL bytes
+ * >
+ * > (ignoring the nursery and other things, for simplicity)
+ * >
+ * > if you expect to be in state (2) for a long time, then you could free as
+ * > much memory as you like. Indeed you could free everything except the nursery
+ * > and L after a major GC. Gradually freeing memory instead is a way to say "if
+ * > I've already been idle for a while, then I'm likely to be idle for a while
+ * > longer", which might be true (but it's a hypothesis, like the generational
+ * > hypothesis).
+ * > So if we're hypothesising that the program is idle, why stop freeing at 2L, why not go further?
+ *
+ * Because to my understanding when you are idle you are going to do an idle
+ * major collection which will require 2L so if you free below that you will
+ * get thrashing.
+ *
+ * > But why would you do an idle GC at all in that case? If the program is
+ * > mostly idle, and we think it's going to be mostly idle in the future, and
+ * > we've already free'd all the memory, then there's no reason to do any more
+ * > idle GCs.
+ *
+ * I think it's rare for programs to be completely idle for long periods. Even
+ * during "idle" periods, there is probably still a small amount of allocation
+ * happening before each idle period (hence the reason for flags like -Iw which
+ * prevent many idle collections happening in close succession during periods
+ * of "idleness".
+ *
+
+*/

@@ -4,6 +4,8 @@ module Settings.Flavours.Quick
    )
 where
 
+import qualified Data.Set as Set
+
 import Expression
 import Flavour
 import Oracles.Flag
@@ -14,15 +16,20 @@ quickFlavour :: Flavour
 quickFlavour = defaultFlavour
     { name        = "quick"
     , args        = defaultBuilderArgs <> quickArgs <> defaultPackageArgs
-    , libraryWays = mconcat
+    , libraryWays = Set.fromList <$>
+                    mconcat
                     [ pure [vanilla]
                     , notStage0 ? platformSupportsSharedLibs ? pure [dynamic] ]
-    , rtsWays     = mconcat
+    , rtsWays     = Set.fromList <$>
+                    mconcat
                     [ pure
-                      [ vanilla, threaded, debug
-                      , threadedDebug, threaded ]
+                      [ vanilla, debug ]
+                    , targetSupportsThreadedRts ? pure [ threaded, threadedDebug ]
                     , notStage0 ? platformSupportsSharedLibs ? pure
-                      [ dynamic, debugDynamic, threadedDynamic, threadedDebugDynamic ]
+                      [ dynamic, debugDynamic ]
+                    , notStage0 ? platformSupportsSharedLibs ? targetSupportsThreadedRts ? pure [
+                      threadedDynamic, threadedDebugDynamic
+                    ]
                     ] }
 
 quickArgs :: Args
@@ -35,5 +42,5 @@ quickArgs = sourceArgs SourceArgs
 quickDebugFlavour :: Flavour
 quickDebugFlavour = quickFlavour
     { name = "quick-debug"
-    , ghcDebugged = True
+    , ghcDebugged = (>= Stage1)
     }

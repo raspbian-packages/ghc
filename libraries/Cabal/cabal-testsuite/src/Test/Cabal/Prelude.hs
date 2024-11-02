@@ -28,7 +28,7 @@ import Distribution.Simple.PackageDescription (readGenericPackageDescription)
 import Distribution.Simple.Program.Types
 import Distribution.Simple.Program.Db
 import Distribution.Simple.Program
-import Distribution.System (OS(Windows,Linux,OSX), buildOS)
+import Distribution.System (OS(Windows,Linux,OSX), Arch(JavaScript), buildOS, buildArch)
 import Distribution.Simple.Utils
     ( withFileContents, withTempDirectory, tryFindPackageDesc )
 import Distribution.Simple.Configure
@@ -62,7 +62,7 @@ import System.Exit (ExitCode (..))
 import System.FilePath ((</>), takeExtensions, takeDrive, takeDirectory, normalise, splitPath, joinPath, splitFileName, (<.>), dropTrailingPathSeparator)
 import Control.Concurrent (threadDelay)
 import qualified Data.Char as Char
-import System.Directory (getTemporaryDirectory, getCurrentDirectory, canonicalizePath, copyFile, copyFile, doesDirectoryExist, doesFileExist, createDirectoryIfMissing, getDirectoryContents)
+import System.Directory (getTemporaryDirectory, getCurrentDirectory, canonicalizePath, copyFile, copyFile, doesDirectoryExist, doesFileExist, createDirectoryIfMissing, getDirectoryContents, listDirectory)
 import Control.Retry (exponentialBackoff, limitRetriesByCumulativeDelay)
 import Network.Wait (waitTcpVerbose)
 
@@ -170,7 +170,7 @@ setup'' prefix cmd args = do
     defaultRecordMode RecordMarked $ do
     recordHeader ["Setup", cmd]
 
-    -- We test `cabal act-act-setup` when running cabal-tests.
+    -- We test `cabal act-as-setup` when running cabal-tests.
     --
     -- `cabal` and `Setup.hs` do have different interface.
     --
@@ -258,9 +258,11 @@ packageDBParams dbs = "--package-db=clear"
 ------------------------------------------------------------------------
 -- * Running cabal
 
+-- cabal cmd args
 cabal :: String -> [String] -> TestM ()
 cabal cmd args = void (cabal' cmd args)
 
+-- cabal cmd args
 cabal' :: String -> [String] -> TestM Result
 cabal' = cabalG' []
 
@@ -287,9 +289,11 @@ cabalGArgs global_args cmd args input = do
               , "man"
               , "v1-freeze"
               , "check"
+              , "gen-bounds"
               , "get", "unpack"
               , "info"
               , "init"
+              , "haddock-project"
               ]
           = [ ]
 
@@ -641,7 +645,7 @@ withRemoteRepo repoDir m = do
           (\_ -> do
             -- wait for the python webserver to come up with a exponential
             -- backoff starting from 50ms, up to a maximum wait of 60s
-            waitTcpVerbose putStrLn (limitRetriesByCumulativeDelay 60000000 $ exponentialBackoff 50000) "localhost" "8000"
+            _ <- waitTcpVerbose putStrLn (limitRetriesByCumulativeDelay 60000000 $ exponentialBackoff 50000) "localhost" "8000"
             runReaderT m (env { testHaveRepo = True }))
 
 
@@ -838,7 +842,7 @@ getScriptCacheDirectory :: FilePath -> TestM FilePath
 getScriptCacheDirectory script = do
     cabalDir <- testCabalDir `fmap` getTestEnv
     hashinput <- liftIO $ canonicalizePath script
-    let hash = C.unpack . Base16.encode . SHA256.hash . C.pack $ hashinput
+    let hash = C.unpack . Base16.encode . C.take 26 . SHA256.hash . C.pack $ hashinput
     return $ cabalDir </> "script-builds" </> hash
 
 ------------------------------------------------------------------------
@@ -886,7 +890,13 @@ skipUnlessGhcVersion :: String -> TestM ()
 skipUnlessGhcVersion range = skipUnless ("needs ghc " ++ range) =<< isGhcVersion range
 
 skipIfGhcVersion :: String -> TestM ()
-skipIfGhcVersion range = skipUnless ("incompatible with ghc " ++ range) =<< isGhcVersion range
+skipIfGhcVersion range = skipIf ("incompatible with ghc " ++ range) =<< isGhcVersion range
+
+skipUnlessJavaScript :: TestM ()
+skipUnlessJavaScript = skipUnless "needs the JavaScript backend" =<< isJavaScript
+
+skipIfJavaScript :: TestM ()
+skipIfJavaScript = skipIf "incompatible with the JavaScript backend" =<< isJavaScript
 
 isWindows :: TestM Bool
 isWindows = return (buildOS == Windows)
@@ -896,6 +906,11 @@ isOSX = return (buildOS == OSX)
 
 isLinux :: TestM Bool
 isLinux = return (buildOS == Linux)
+
+isJavaScript :: TestM Bool
+isJavaScript = return (buildArch == JavaScript)
+  -- should probably be `hostArch` but Cabal doesn't distinguish build platform
+  -- and host platform
 
 skipIfWindows :: TestM ()
 skipIfWindows = skipIf "Windows" =<< isWindows
@@ -1130,3 +1145,21 @@ withShorterPathForNewBuildStore test = do
              then takeDrive `fmap` getCurrentDirectory
              else getTemporaryDirectory
   withTempDirectory normal tempDir "cabal-test-store" test
+
+-- | Find where a package locates in the store dir. This works only if there is exactly one 1 ghc version
+-- and exactly 1 directory for the given package in the store dir.
+findDependencyInStore :: FilePath -- ^store dir
+                      -> String -- ^package name prefix
+                      -> IO FilePath -- ^package dir
+findDependencyInStore storeDir pkgName = do
+    storeDirForGhcVersion <- head <$> listDirectory storeDir
+    packageDirs <- listDirectory (storeDir </> storeDirForGhcVersion)
+    -- Ideally, we should call 'hashedInstalledPackageId' from 'Distribution.Client.PackageHash'.
+    -- But 'PackageHashInputs', especially 'PackageHashConfigInputs', is too hard to construct.
+    let pkgName' =
+            if buildOS == OSX
+            then filter (not . flip elem "aeiou") pkgName
+                -- simulates the way 'hashedInstalledPackageId' uses to compress package name
+            else pkgName
+    let libDir = head $ filter (pkgName' `isPrefixOf`) packageDirs
+    pure (storeDir </> storeDirForGhcVersion </> libDir)

@@ -22,12 +22,14 @@ module Distribution.Client.Config (
     showConfigWithComments,
     parseConfig,
 
-    getCabalDir,
     defaultConfigFile,
     defaultCacheDir,
+    defaultScriptBuildsDir,
+    defaultStoreDir,
     defaultCompiler,
     defaultInstallPath,
     defaultLogsDir,
+    defaultReportsDir,
     defaultUserInstall,
 
     baseSavedConfig,
@@ -46,6 +48,7 @@ module Distribution.Client.Config (
     postProcessRepo,
   ) where
 
+import Distribution.Compat.Environment (lookupEnv)
 import Distribution.Client.Compat.Prelude
 import Prelude ()
 
@@ -90,7 +93,7 @@ import Distribution.Simple.Setup
          , Flag(..), toFlag, flagToMaybe, fromFlagOrDefault )
 import Distribution.Simple.InstallDirs
          ( InstallDirs(..), defaultInstallDirs
-         , PathTemplate, toPathTemplate )
+         , PathTemplate, toPathTemplate)
 import Distribution.Deprecated.ParseUtils
          ( FieldDescr(..), liftField, runP
          , ParseResult(..), PError(..), PWarning(..)
@@ -130,7 +133,7 @@ import Text.PrettyPrint
 import Text.PrettyPrint.HughesPJ
          ( text, Doc )
 import System.Directory
-         ( createDirectoryIfMissing, getAppUserDataDirectory, renameFile )
+         ( createDirectoryIfMissing, getHomeDirectory, getXdgDirectory, XdgDirectory(XdgCache, XdgConfig, XdgState), renameFile, getAppUserDataDirectory, doesDirectoryExist, doesFileExist )
 import Network.URI
          ( URI(..), URIAuth(..), parseURI )
 import System.FilePath
@@ -138,7 +141,7 @@ import System.FilePath
 import System.IO.Error
          ( isDoesNotExistError )
 import Distribution.Compat.Environment
-         ( getEnvironment, lookupEnv )
+         ( getEnvironment )
 import qualified Data.Map as M
 import qualified Data.ByteString as BS
 
@@ -302,6 +305,7 @@ instance Semigroup SavedConfig where
         installFineGrainedConflicts  = combine installFineGrainedConflicts,
         installMinimizeConflictSet   = combine installMinimizeConflictSet,
         installIndependentGoals      = combine installIndependentGoals,
+        installPreferOldest          = combine installPreferOldest,
         installShadowPkgs            = combine installShadowPkgs,
         installStrongFlags           = combine installStrongFlags,
         installAllowBootLibInstalls  = combine installAllowBootLibInstalls,
@@ -487,6 +491,9 @@ instance Semigroup SavedConfig where
         haddockKeepTempFiles = combine haddockKeepTempFiles,
         haddockVerbosity     = combine haddockVerbosity,
         haddockCabalFilePath = combine haddockCabalFilePath,
+        haddockIndex         = combine haddockIndex,
+        haddockBaseUrl       = combine haddockBaseUrl,
+        haddockLib           = combine haddockLib,
         haddockArgs          = lastNonEmpty haddockArgs
         }
         where
@@ -535,7 +542,7 @@ instance Semigroup SavedConfig where
 --
 baseSavedConfig :: IO SavedConfig
 baseSavedConfig = do
-  userPrefix <- getCabalDir
+  userPrefix <- defaultInstallPrefix
   cacheDir   <- defaultCacheDir
   logsDir    <- defaultLogsDir
   return mempty {
@@ -561,62 +568,125 @@ baseSavedConfig = do
 --
 initialSavedConfig :: IO SavedConfig
 initialSavedConfig = do
-  cacheDir    <- defaultCacheDir
-  logsDir     <- defaultLogsDir
-  extraPath   <- defaultExtraPath
+  cacheDir <- defaultCacheDir
+  logsDir <- defaultLogsDir
   installPath <- defaultInstallPath
-  return mempty {
-    savedGlobalFlags     = mempty {
-      globalCacheDir     = toFlag cacheDir,
-      globalRemoteRepos  = toNubList [defaultRemoteRepo]
-    },
-    savedConfigureFlags  = mempty {
-      configProgramPathExtra = toNubList extraPath
-    },
-    savedInstallFlags    = mempty {
-      installSummaryFile = toNubList [toPathTemplate (logsDir </> "build.log")],
-      installBuildReports= toFlag NoReports,
-      installNumJobs     = toFlag Nothing
-    },
-    savedClientInstallFlags = mempty {
-      cinstInstalldir = toFlag installPath
-    }
-  }
+  return
+    mempty
+      { savedGlobalFlags =
+          mempty
+            { globalCacheDir = toFlag cacheDir
+            , globalRemoteRepos = toNubList [defaultRemoteRepo]
+            }
+      , savedInstallFlags =
+          mempty
+            { installSummaryFile = toNubList [toPathTemplate (logsDir </> "build.log")]
+            , installBuildReports = toFlag NoReports
+            , installNumJobs = toFlag Nothing
+            }
+      , savedClientInstallFlags =
+          mempty
+            { cinstInstalldir = toFlag installPath
+            }
+      }
 
-defaultCabalDir :: IO FilePath
-defaultCabalDir = getAppUserDataDirectory "cabal"
+-- | Issue a warning if both @$XDG_CONFIG_HOME/cabal/config@ and
+-- @~/.cabal@ exists.
+warnOnTwoConfigs :: Verbosity -> IO ()
+warnOnTwoConfigs verbosity = do
+  defaultDir <- getAppUserDataDirectory "cabal"
+  xdgCfgDir <- getXdgDirectory XdgConfig "cabal"
+  when (defaultDir /= xdgCfgDir) $ do
+    dotCabalExists <- doesDirectoryExist defaultDir
+    let xdgCfg = xdgCfgDir </> "config"
+    xdgCfgExists <- doesFileExist xdgCfg
+    when (dotCabalExists && xdgCfgExists) $
+      warn verbosity $
+        "Both "
+          <> defaultDir
+          <> " and "
+          <> xdgCfg
+          <> " exist - ignoring the former.\n"
+          <> "It is advisable to remove one of them. In that case, we will use the remaining one by default (unless '$CABAL_DIR' is explicitly set)."
 
-getCabalDir :: IO FilePath
-getCabalDir = do
+-- | If @CABAL\_DIR@ is set, return @Just@ its value. Otherwise, if
+-- @~/.cabal@ exists and @$XDG_CONFIG_HOME/cabal/config@ does not
+-- exist, return @Just "~/.cabal"@.  Otherwise, return @Nothing@.  If
+-- this function returns Nothing, then it implies that we are not
+-- using a single directory for everything, but instead use XDG paths.
+-- Fundamentally, this function is used to implement transparent
+-- backwards compatibility with pre-XDG versions of cabal-install.
+maybeGetCabalDir :: IO (Maybe FilePath)
+maybeGetCabalDir = do
   mDir <- lookupEnv "CABAL_DIR"
   case mDir of
-    Nothing -> defaultCabalDir
-    Just dir -> return dir
+    Just dir -> return $ Just dir
+    Nothing -> do
+      defaultDir <- getAppUserDataDirectory "cabal"
+      dotCabalExists <- doesDirectoryExist defaultDir
+      xdgCfg <- getXdgDirectory XdgConfig ("cabal" </> "config")
+      xdgCfgExists <- doesFileExist xdgCfg
+      if dotCabalExists && not xdgCfgExists
+        then return $ Just defaultDir
+        else return Nothing
+
+-- | The default behaviour of cabal-install is to use the XDG
+-- directory standard.  However, if @CABAL_DIR@ is set, we instead use
+-- that directory as a single store for everything cabal-related, like
+-- the old @~/.cabal@ behaviour.  Also, for backwards compatibility,
+-- if @~/.cabal@ exists we treat that as equivalent to @CABAL_DIR@
+-- being set.  This function abstracts that decision-making.
+getDefaultDir :: XdgDirectory -> FilePath -> IO FilePath
+getDefaultDir xdg subdir = do
+  mDir <- maybeGetCabalDir
+  case mDir of
+    Just dir -> return $ dir </> subdir
+    Nothing -> getXdgDirectory xdg $ "cabal" </> subdir
+
+-- | The default prefix used for installation.
+defaultInstallPrefix :: IO FilePath
+defaultInstallPrefix = do
+  mDir <- maybeGetCabalDir
+  case mDir of
+    Just dir ->
+      return dir
+    Nothing -> do
+      dir <- getHomeDirectory
+      return $ dir </> ".local"
 
 defaultConfigFile :: IO FilePath
-defaultConfigFile = do
-  dir <- getCabalDir
-  return $ dir </> "config"
+defaultConfigFile =
+  getDefaultDir XdgConfig "config"
 
 defaultCacheDir :: IO FilePath
-defaultCacheDir = do
-  dir <- getCabalDir
-  return $ dir </> "packages"
+defaultCacheDir =
+  getDefaultDir XdgCache "packages"
+
+defaultScriptBuildsDir :: IO FilePath
+defaultScriptBuildsDir =
+  getDefaultDir XdgCache "script-builds"
+
+defaultStoreDir :: IO FilePath
+defaultStoreDir =
+  getDefaultDir XdgState "store"
 
 defaultLogsDir :: IO FilePath
-defaultLogsDir = do
-  dir <- getCabalDir
-  return $ dir </> "logs"
+defaultLogsDir =
+  getDefaultDir XdgCache "logs"
 
-defaultExtraPath :: IO [FilePath]
-defaultExtraPath = do
-  dir <- getCabalDir
-  return [dir </> "bin"]
+defaultReportsDir :: IO FilePath
+defaultReportsDir =
+  getDefaultDir XdgCache "reports"
 
 defaultInstallPath :: IO FilePath
 defaultInstallPath = do
-  dir <- getCabalDir
-  return (dir </> "bin")
+  mDir <- maybeGetCabalDir
+  case mDir of
+    Just dir ->
+      return $ dir </> "bin"
+    Nothing -> do
+      dir <- getHomeDirectory
+      return $ dir </> ".local" </> "bin"
 
 defaultCompiler :: CompilerFlavor
 defaultCompiler = fromMaybe GHC defaultCompilerFlavor
@@ -632,7 +702,7 @@ defaultRemoteRepo = RemoteRepo name uri Nothing [] 0 False
     str  = "hackage.haskell.org"
     name = RepoName str
     uri  = URI "http:" (Just (URIAuth "" str "")) "/" "" ""
-    -- Note that lots of old ~/.cabal/config files will have the old url
+    -- Note that lots of old config files will have the old url
     -- http://hackage.haskell.org/packages/archive
     -- but new config files can use the new url (without the /packages/archive)
     -- and avoid having to do a http redirect
@@ -679,12 +749,29 @@ addInfoForKnownRepos other = other
 --
 defaultHackageRemoteRepoKeys :: [String]
 defaultHackageRemoteRepoKeys =
-    [ "fe331502606802feac15e514d9b9ea83fee8b6ffef71335479a2e68d84adc6b0",
-      "1ea9ba32c526d1cc91ab5e5bd364ec5e9e8cb67179a471872f6e26f0ae773d42",
-      "2c6c3627bd6c982990239487f1abd02e08a02e6cf16edb105a8012d444d870c3",
-      "0a5c7ea47cd1b15f01f5f51a33adda7e655bc0f0b0615baa8e271f4c3351e21d",
-      "51f0161b906011b52c6613376b1ae937670da69322113a246a09f807c62f6921"
-    ]
+  -- Key owners and public keys are provided as a convenience to readers.
+  -- The canonical source for this mapping data is the hackage-root-keys
+  -- repository and Hackage's root.json file.
+  --
+  -- Links:
+  --  * https://github.com/haskell-infra/hackage-root-keys
+  --  * https://hackage.haskell.org/root.json
+  -- Please consult root.json on Hackage to map key IDs to public keys,
+  -- and the hackage-root-keys repository to map public keys to their
+  -- owners.
+  [ -- Adam Gundry (uRPdSiL3/MNsk50z6NB55ABo0OrrNDXigtCul4vtzmw=)
+    "fe331502606802feac15e514d9b9ea83fee8b6ffef71335479a2e68d84adc6b0"
+  , -- Gershom Bazerman (bYoUXXQ9TtX10UriaMiQtTccuXPGnmldP68djzZ7cLo=)
+    "1ea9ba32c526d1cc91ab5e5bd364ec5e9e8cb67179a471872f6e26f0ae773d42"
+  , -- John Wiegley (zazm5w480r+zPO6Z0+8fjGuxZtb9pAuoVmQ+VkuCvgU=)
+    "0a5c7ea47cd1b15f01f5f51a33adda7e655bc0f0b0615baa8e271f4c3351e21d"
+  , -- Norman Ramsey (ZI8di3a9Un0s2RBrt5GwVRvfOXVuywADfXGPZfkiDb0=)
+    "51f0161b906011b52c6613376b1ae937670da69322113a246a09f807c62f6921"
+  , -- Mathieu Boespflug (ydN1nGGQ79K1Q0nN+ul+Ln8MxikTB95w0YdGd3v3kmg=)
+    "be75553f3c7ba1dbe298da81f1d1b05c9d39dd8ed2616c9bddf1525ca8c03e48"
+  , -- Joachim Breitner (5iUgwqZCWrCJktqMx0bBMIuoIyT4A1RYGozzchRN9rA=)
+    "d26e46f3b631aae1433b89379a6c68bd417eb5d1c408f0643dcc07757fece522"
+  ]
 
 -- | The required threshold of root key signatures for hackage.haskell.org
 --
@@ -701,6 +788,7 @@ defaultHackageRemoteRepoKeyThreshold = 3
 --
 loadConfig :: Verbosity -> Flag FilePath -> IO SavedConfig
 loadConfig verbosity configFileFlag = do
+  warnOnTwoConfigs verbosity
   config <- loadRawConfig verbosity configFileFlag
   extendToEffectiveConfig config
 
@@ -842,7 +930,8 @@ commentSavedConfig = do
   globalInstallDirs <- defaultInstallDirs defaultCompiler False True
   let conf0 = mempty {
         savedGlobalFlags       = defaultGlobalFlags {
-            globalRemoteRepos = toNubList [defaultRemoteRepo]
+            globalRemoteRepos = toNubList [defaultRemoteRepo],
+            globalNix         = mempty
             },
         savedInitFlags       = mempty {
             IT.interactive     = toFlag False,
@@ -1191,6 +1280,14 @@ parseConfig src initial = \str -> do
                    , configConfigureArgs      = splitMultiPath
                                                 (configConfigureArgs scf)
                }
+       , savedGlobalFlags =
+           let sgf = savedGlobalFlags conf
+           in sgf {
+                    globalProgPathExtra =
+                      toNubList $
+                        splitMultiPath
+                          (fromNubList $ globalProgPathExtra sgf)
+               }
       }
 
     parse = parseFields (configFieldDescriptions src
@@ -1426,7 +1523,7 @@ parseExtraLines verbosity extraLines =
       unlines (map (showPWarning "Error parsing additional config lines") ws)
 
 -- | Get the differences (as a pseudo code diff) between the user's
--- '~/.cabal/config' and the one that cabal would generate if it didn't exist.
+-- config file and the one that cabal would generate if it didn't exist.
 userConfigDiff :: Verbosity -> GlobalFlags -> [String] -> IO [String]
 userConfigDiff verbosity globalFlags extraLines = do
   userConfig <- loadRawConfig normal (globalConfigFile globalFlags)
@@ -1473,7 +1570,7 @@ userConfigDiff verbosity globalFlags extraLines = do
         in (topAndTail left, topAndTail (drop 1 right))
 
 
--- | Update the user's ~/.cabal/config' keeping the user's customizations.
+-- | Update the user's config file keeping the user's customizations.
 userConfigUpdate :: Verbosity -> GlobalFlags -> [String] -> IO ()
 userConfigUpdate verbosity globalFlags extraLines = do
   userConfig  <- loadRawConfig normal (globalConfigFile globalFlags)

@@ -48,6 +48,7 @@ module GHC.CmmToAsm.X86.Regs (
 where
 
 import GHC.Prelude
+import GHC.Data.FastString
 
 import GHC.Platform.Regs
 import GHC.Platform.Reg
@@ -55,7 +56,6 @@ import GHC.Platform.Reg.Class
 
 import GHC.Cmm
 import GHC.Cmm.CLabel           ( CLabel )
-import GHC.Utils.Outputable
 import GHC.Utils.Panic
 import GHC.Platform
 
@@ -111,15 +111,15 @@ data Imm
   = ImmInt      Int
   | ImmInteger  Integer     -- Sigh.
   | ImmCLbl     CLabel      -- AbstractC Label (with baggage)
-  | ImmLit      SDoc        -- Simple string
+  | ImmLit      FastString
   | ImmIndex    CLabel Int
   | ImmFloat    Rational
   | ImmDouble   Rational
   | ImmConstantSum Imm Imm
   | ImmConstantDiff Imm Imm
 
-strImmLit :: String -> Imm
-strImmLit s = ImmLit (text s)
+strImmLit :: FastString -> Imm
+strImmLit s = ImmLit s
 
 
 litToImm :: CmmLit -> Imm

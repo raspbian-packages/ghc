@@ -44,6 +44,17 @@ Dumping out compiler intermediate structures
     ``-ddump-file-prefix=Foo`` will cause the output from
     :ghc-flag:`-ddump-simpl` to be dumped to :file:`Foo.dump-simpl`.
 
+.. ghc-flag:: -fdump-with-ways
+    :shortdesc: Include the tag of the enabled ways in the extension of dump files.
+    :type: dynamic
+
+    :default: enabled
+
+
+    When compiling Main.hs with profiling and without this will now produce
+    ``Main.p.dump-simpl`` and ``Main.dump-simpl`` instead of overwriting the
+    output of one way with the output of another.
+
 .. ghc-flag:: -ddump-json
     :shortdesc: Dump error messages as JSON documents
     :type: dynamic
@@ -65,6 +76,15 @@ Dumping out compiler intermediate structures
     denote the beginning of a compilation phase whereas those starting with
     ``!!!`` mark the end of a pass and are accompanied by allocation and
     runtime statistics.
+
+.. ghc-flag:: -dipe-stats
+    :shortdesc: Show statistics about IPE information
+    :type: dynamic
+
+    For each module, show some simple statistics about which info tables have
+    IPE information, and how many info tables with IPE information each closure
+    type has. This is useful, for example, for verifying that ``STACK`` info
+    tables are being appropriately omitted or included from the info table map.
 
 .. ghc-flag:: -dfaststring-stats
     :shortdesc: Show statistics for fast string usage when finished
@@ -540,6 +560,13 @@ These flags dump various phases of GHC's C-\\- pipeline.
 
     Dump the results of the C-\\- control flow optimisation pass.
 
+.. ghc-flag:: -ddump-cmm-thread-sanitizer
+    :shortdesc: Dump the results of the C-\\- ThreadSanitizer elaboration pass.
+    :type: dynamic
+
+    Dump the results of the C-\\- pass responsible for adding instrumentation
+    added by :ghc-flag:`-fcmm-thread-sanitizer`.
+
 .. ghc-flag:: -ddump-cmm-cbe
     :shortdesc: Dump the results of common block elimination
     :type: dynamic
@@ -697,6 +724,12 @@ assembler.
     :type: dynamic
 
     Dump the final assembly produced by the native code generator.
+
+.. ghc-flag:: -ddump-js
+    :shortdesc: Dump final JavaScript code
+    :type: dynamic
+
+    Dump the final JavaScript code produced by the JavaScript code generator.
 
 
 Miscellaneous backend dumps
@@ -979,8 +1012,8 @@ Checking for consistency
     :type: dynamic
 
     Turn on linearity checking in GHC. Currently, some optimizations
-    in GHC might not preserve linearity and they valid programs might
-    fail Linear Core Lint.
+    in GHC might not preserve linearity and there are valid programs
+    that fail Linear Core Lint.
     In the near future, this option will be removed and folded into
     normal Core Lint.
 
@@ -1057,6 +1090,15 @@ Checking for consistency
 
     Note that this is only intended to be used as a debugging measure, not as
     the primary means of catching out-of-bounds accesses.
+
+.. ghc-flag:: -fcmm-thread-sanitizer
+    :shortdesc: Enable ThreadSanitizer instrumentation of memory accesses.
+    :type: dynamic
+
+    This enables generation of `ThreadSanitizer
+    <https://github.com/google/sanitizers/wiki/ThreadSanitizerCppManual>`
+    instrumentation of memory accesses. Requires use of ``-fsanitize=thread``
+    or similar when compiling and linking.
 
 .. _checking-determinism:
 

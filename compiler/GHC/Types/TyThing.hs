@@ -183,15 +183,31 @@ implicitTyConThings tc
     implicitCoTyCon tc ++
 
       -- for each data constructor in order,
-      --   the constructor, worker, and (possibly) wrapper
-    [ thing | dc    <- tyConDataCons tc
-            , thing <- AConLike (RealDataCon dc) : dataConImplicitTyThings dc ]
+      --   the constructor and associated implicit 'Id's
+    datacon_stuff
       -- NB. record selectors are *not* implicit, they have fully-fledged
       -- bindings that pass through the compilation pipeline as normal.
   where
     class_stuff = case tyConClass_maybe tc of
         Nothing -> []
         Just cl -> implicitClassThings cl
+
+    -- For each data constructor in order,
+    --   the constructor, worker, and (possibly) wrapper
+    --
+    -- If the data constructor is in a "type data" declaration,
+    -- promote it to the type level now.
+    -- See Note [Type data declarations] in GHC.Rename.Module.
+    datacon_stuff :: [TyThing]
+    datacon_stuff
+      | isTypeDataTyCon tc = [ATyCon (promoteDataCon dc) | dc <- cons]
+      | otherwise
+      = [ty_thing | dc <- cons,
+                    ty_thing <- AConLike (RealDataCon dc) :
+                                dataConImplicitTyThings dc]
+
+    cons :: [DataCon]
+    cons = tyConDataCons tc
 
 -- For newtypes and closed type families (only) add the implicit coercion tycon
 implicitCoTyCon :: TyCon -> [TyThing]
@@ -223,9 +239,19 @@ tyThingParent_maybe :: TyThing -> Maybe TyThing
 tyThingParent_maybe (AConLike cl) = case cl of
     RealDataCon dc  -> Just (ATyCon (dataConTyCon dc))
     PatSynCon{}     -> Nothing
-tyThingParent_maybe (ATyCon tc)   = case tyConAssoc_maybe tc of
-                                      Just tc -> Just (ATyCon tc)
-                                      Nothing -> Nothing
+tyThingParent_maybe (ATyCon tc)
+  | -- Special case for `type data` data constructors.  They appear as an
+    -- ATyCon (not ADataCon) but we want to display them here as if they were
+    -- a DataCon (i.e. with the parent declaration) (#22817).
+    -- See Note [Type data declarations] in GHC.Rename.Module.
+    Just dc <- isPromotedDataCon_maybe tc
+  , let parent_tc = dataConTyCon dc
+  , isTypeDataTyCon parent_tc
+  = Just (ATyCon parent_tc)
+  | Just tc <- tyConAssoc_maybe tc
+  = Just (ATyCon tc)
+  | otherwise
+  = Nothing
 tyThingParent_maybe (AnId id)     = case idDetails id of
                                       RecSelId { sel_tycon = RecSelData tc } ->
                                           Just (ATyCon tc)

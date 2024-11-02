@@ -1,8 +1,8 @@
 
 {-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE ViewPatterns #-}
 
 {-# OPTIONS_GHC -Wno-incomplete-uni-patterns   #-}
-{-# OPTIONS_GHC -Wno-incomplete-record-updates #-}
 
 {-
 (c) The University of Glasgow 2006
@@ -32,7 +32,6 @@ import GHC.HsToCore.Pmc ( addTyCs, pmcGRHSs )
 import GHC.HsToCore.Errors.Types
 import GHC.Types.SourceText
 import GHC.Types.Name
-import GHC.Types.Name.Env
 import GHC.Core.FamInstEnv( topNormaliseType )
 import GHC.HsToCore.Quote
 import GHC.Hs
@@ -44,7 +43,6 @@ import GHC.Tc.Types.Evidence
 import GHC.Tc.Utils.Monad
 import GHC.Core.Type
 import GHC.Core.TyCo.Rep
-import GHC.Core.Multiplicity
 import GHC.Core
 import GHC.Core.Utils
 import GHC.Core.Make
@@ -53,14 +51,12 @@ import GHC.Driver.Session
 import GHC.Types.CostCentre
 import GHC.Types.Id
 import GHC.Types.Id.Make
-import GHC.Types.Var.Env
 import GHC.Unit.Module
 import GHC.Core.ConLike
 import GHC.Core.DataCon
 import GHC.Builtin.Types
 import GHC.Builtin.Names
 import GHC.Types.Basic
-import GHC.Data.Maybe
 import GHC.Types.SrcLoc
 import GHC.Types.Tickish
 import GHC.Utils.Misc
@@ -70,6 +66,7 @@ import GHC.Utils.Panic
 import GHC.Utils.Panic.Plain
 import GHC.Core.PatSyn
 import Control.Monad
+import GHC.HsToCore.Ticks (stripTicksTopHsExpr)
 
 {-
 ************************************************************************
@@ -190,8 +187,8 @@ dsUnliftedBind (XHsBindsLR (AbsBinds { abs_tvs = [], abs_ev_vars = []
 
 dsUnliftedBind (FunBind { fun_id = L l fun
                         , fun_matches = matches
-                        , fun_ext = co_fn
-                        , fun_tick = tick }) body
+                        , fun_ext = (co_fn, tick)
+                        }) body
                -- Can't be a bang pattern (that looks like a PatBind)
                -- so must be simply unboxed
   = do { (args, rhs) <- matchWrapper (mkPrefixFunRhs (L l $ idName fun)) Nothing matches
@@ -201,7 +198,7 @@ dsUnliftedBind (FunBind { fun_id = L l fun
        ; return (bindNonRec fun rhs' body) }
 
 dsUnliftedBind (PatBind {pat_lhs = pat, pat_rhs = grhss
-                        , pat_ext = ty }) body
+                        , pat_ext = (ty, _) }) body
   =     -- let C x# y# = rhs in body
         -- ==> case rhs of C x# y# -> body
     do { match_nablas <- pmcGRHSs PatBindGuards grhss
@@ -210,7 +207,7 @@ dsUnliftedBind (PatBind {pat_lhs = pat, pat_rhs = grhss
              eqn = EqnInfo { eqn_pats = [upat],
                              eqn_orig = FromSource,
                              eqn_rhs = cantFailMatchResult body }
-       ; var    <- selectMatchVar Many upat
+       ; var    <- selectMatchVar ManyTy upat
                     -- `var` will end up in a let binder, so the multiplicity
                     -- doesn't matter.
        ; result <- matchEquations PatBindRhs [var] [eqn] (exprType body)
@@ -284,14 +281,18 @@ dsExpr e@(XExpr ext_expr_tc)
             mkBinaryTickBox ixT ixF e2
           }
 
+-- Strip ticks due to #21701, need to be invariant about warnings we produce whether
+-- this is enabled or not.
 dsExpr (NegApp _ (L loc
-                    (HsOverLit _ lit@(OverLit { ol_val = HsIntegral i})))
-                neg_expr)
+                    (stripTicksTopHsExpr -> (ts, (HsOverLit _ lit@(OverLit { ol_val = HsIntegral i})))))
+              neg_expr)
   = do { expr' <- putSrcSpanDsA loc $ do
           { warnAboutOverflowedOverLit
+                -- See Note [Checking "negative literals"]
               (lit { ol_val = HsIntegral (negateIntegralLit i) })
           ; dsOverLit lit }
-       ; dsSyntaxExpr neg_expr [expr'] }
+       ;
+       ; dsSyntaxExpr neg_expr [mkTicks ts expr'] }
 
 dsExpr (NegApp _ expr neg_expr)
   = do { expr' <- dsLExpr expr
@@ -311,6 +312,27 @@ dsExpr e@(HsApp _ fun arg)
 dsExpr e@(HsAppType {}) = dsHsWrapped e
 
 {-
+Note [Checking "negative literals"]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+As observed in #13257 it's desirable to warn about overflowing negative literals
+in some situations where the user thinks they are writing a negative literal (ie -1)
+but without `-XNegativeLiterals` enabled.
+
+This catches cases such as (-1 :: Word8) which overflow, because (negate 1 == 255) but
+which we desugar to `negate (fromIntegral 1)`.
+
+Notice it's crucial we still desugar to the correct (negate (fromIntegral ...)) despite
+performing the negation in order to check whether the application of negate will overflow.
+For a user written Integer instance we can't predict the interaction of negate and fromIntegral.
+
+Also note that this works for detecting the right result for `-128 :: Int8`.. which is
+in-range for Int8 but the correct result is achieved via two overflows.
+
+negate (fromIntegral 128 :: Int8)
+= negate (-128 :: Int8)
+= -128 :: Int8
+
 Note [Desugaring vars]
 ~~~~~~~~~~~~~~~~~~~~~~
 In one situation we can get a *coercion* variable in a HsVar, namely
@@ -346,7 +368,7 @@ dsExpr (ExplicitTuple _ tup_args boxity)
                         -- See Note [Don't flatten tuples from HsSyn] in GHC.Core.Make
 
 dsExpr (ExplicitSum types alt arity expr)
-  = mkCoreUbxSum arity alt types <$> dsLExpr expr
+  = mkCoreUnboxedSum arity alt types <$> dsLExpr expr
 
 dsExpr (HsPragE _ prag expr) =
   ds_prag_expr prag expr
@@ -445,12 +467,12 @@ For record construction we do this (assuming T has three arguments)
 \begin{verbatim}
         T { op2 = e }
 ==>
-        let err = /\a -> recConErr a
-        T (recConErr t1 "M.hs/230/op1")
+        let err = /\a -> recConError a
+        T (recConError t1 "M.hs/230/op1")
           e
-          (recConErr t1 "M.hs/230/op3")
+          (recConError t1 "M.hs/230/op3")
 \end{verbatim}
-@recConErr@ then converts its argument string into a proper message
+@recConError@ then converts its argument string into a proper message
 before printing it as
 \begin{verbatim}
         M.hs, line 230: missing field op1 was evaluated
@@ -484,270 +506,17 @@ dsExpr (RecordCon { rcon_con  = L _ con_like
 
        ; return (mkCoreApps con_expr' con_args) }
 
-{-
-Record update is a little harder. Suppose we have the decl:
-\begin{verbatim}
-        data T = T1 {op1, op2, op3 :: Int}
-               | T2 {op4, op2 :: Int}
-               | T3
-\end{verbatim}
-Then we translate as follows:
-\begin{verbatim}
-        r { op2 = e }
-===>
-        let op2 = e in
-        case r of
-          T1 op1 _ op3 -> T1 op1 op2 op3
-          T2 op4 _     -> T2 op4 op2
-          other        -> recUpdError "M.hs/230"
-\end{verbatim}
-It's important that we use the constructor Ids for @T1@, @T2@ etc on the
-RHSs, and do not generate a Core constructor application directly, because the constructor
-might do some argument-evaluation first; and may have to throw away some
-dictionaries.
-
-Note [Update for GADTs]
-~~~~~~~~~~~~~~~~~~~~~~~
-Consider
-   data T a b where
-     MkT :: { foo :: a } -> T a Int
-
-   upd :: T s t -> s -> T s t
-   upd z y = z { foo = y}
-
-We need to get this:
-   $WMkT :: a -> T a Int
-   MkT   :: (b ~# Int) => a -> T a b
-
-   upd = /\s t. \(z::T s t) (y::s) ->
-         case z of
-            MkT (co :: t ~# Int) _ -> $WMkT @s y |> T (Refl s) (Sym co)
-
-Note the final cast
-   T (Refl s) (Sym co) :: T s Int ~ T s t
-which uses co, bound by the GADT match.  This is the wrap_co coercion
-in wrapped_rhs. How do we produce it?
-
-* Start with raw materials
-    tc, the tycon:                                       T
-    univ_tvs, the universally quantified tyvars of MkT:  a,b
-  NB: these are in 1-1 correspondence with the tyvars of tc
-
-* Form univ_cos, a coercion for each of tc's args: (Refl s) (Sym co)
-  We replaced
-     a  by  (Refl s)    since 's' instantiates 'a'
-     b  by  (Sym co)   since 'b' is in the data-con's EqSpec
-
-* Then form the coercion T (Refl s) (Sym co)
-
-It gets more complicated when data families are involved (#18809).
-Consider
-    data family F x
-    data instance F (a,b) where
-      MkF :: { foo :: Int } -> F (Int,b)
-
-    bar :: F (s,t) -> Int -> F (s,t)
-    bar z y = z { foo = y}
-
-We have
-    data R:FPair a b where
-      MkF :: { foo :: Int } -> R:FPair Int b
-
-    $WMkF :: Int -> F (Int,b)
-    MkF :: forall a b. (a ~# Int) => Int -> R:FPair a b
-
-    bar :: F (s,t) -> Int -> F (s,t)
-    bar = /\s t. \(z::F (s,t)) \(y::Int) ->
-         case z |> co1 of
-            MkF (co2::s ~# Int) _ -> $WMkF @t y |> co3
-
-(Side note: here (z |> co1) is built by typechecking the scrutinee, so
-we ignore it here.  In general the scrutinee is an arbitrary expression.)
-
-The question is: what is co3, the cast for the RHS?
-      co3 :: F (Int,t) ~ F (s,t)
-Again, we can construct it using co2, bound by the GADT match.
-We do /exactly/ the same as the non-family case up to building
-univ_cos.  But that gives us
-     rep_tc:   R:FPair
-     univ_cos: (Sym co2)   (Refl t)
-But then we use mkTcFamilyTyConAppCo to "lift" this to the coercion
-we want, namely
-     F (Sym co2, Refl t) :: F (Int,t) ~ F (s,t)
-
--}
-
-dsExpr RecordUpd { rupd_flds = Right _} =
-  -- Not possible due to elimination in the renamer. See Note
-  -- [Handling overloaded and rebindable constructs]
-  panic "The impossible happened"
-dsExpr expr@(RecordUpd { rupd_expr = record_expr, rupd_flds = Left fields
-                       , rupd_ext = RecordUpdTc
-                           { rupd_cons = cons_to_upd
-                           , rupd_in_tys = in_inst_tys
-                           , rupd_out_tys = out_inst_tys
-                           , rupd_wrap = dict_req_wrap }} )
-  | null fields
-  = dsLExpr record_expr
-  | otherwise
-  = assertPpr (notNull cons_to_upd) (ppr expr) $
-
-    do  { record_expr' <- dsLExpr record_expr
-        ; field_binds' <- mapM ds_field fields
-        ; let upd_fld_env :: NameEnv Id -- Maps field name to the LocalId of the field binding
-              upd_fld_env = mkNameEnv [(f,l) | (f,l,_) <- field_binds']
-
-        -- It's important to generate the match with matchWrapper,
-        -- and the right hand sides with applications of the wrapper Id
-        -- so that everything works when we are doing fancy unboxing on the
-        -- constructor arguments.
-        ; alts <- mapM (mk_alt upd_fld_env) cons_to_upd
-        ; ([discrim_var], matching_code)
-                <- matchWrapper RecUpd (Just [record_expr]) -- See Note [Scrutinee in Record updates]
-                                      (MG { mg_alts = noLocA alts
-                                          , mg_ext = MatchGroupTc [unrestricted in_ty] out_ty
-                                          , mg_origin = FromSource
-                                          })
-                                     -- FromSource is not strictly right, but we
-                                     -- want incomplete pattern-match warnings
-
-        ; return (add_field_binds field_binds' $
-                  bindNonRec discrim_var record_expr' matching_code) }
-  where
-    ds_field :: LHsRecUpdField GhcTc -> DsM (Name, Id, CoreExpr)
-      -- Clone the Id in the HsRecField, because its Name is that
-      -- of the record selector, and we must not make that a local binder
-      -- else we shadow other uses of the record selector
-      -- Hence 'lcl_id'.  Cf #2735
-    ds_field (L _ rec_field)
-      = do { rhs <- dsLExpr (hfbRHS rec_field)
-           ; let fld_id = unLoc (hsRecUpdFieldId rec_field)
-           ; lcl_id <- newSysLocalDs (idMult fld_id) (idType fld_id)
-           ; return (idName fld_id, lcl_id, rhs) }
-
-    add_field_binds [] expr = expr
-    add_field_binds ((_,b,r):bs) expr = bindNonRec b r (add_field_binds bs expr)
-
-        -- Awkwardly, for families, the match goes
-        -- from instance type to family type
-    (in_ty, out_ty) =
-      case (head cons_to_upd) of
-        RealDataCon data_con ->
-          let tycon = dataConTyCon data_con in
-          (mkTyConApp tycon in_inst_tys, mkFamilyTyConApp tycon out_inst_tys)
-        PatSynCon pat_syn ->
-          ( patSynInstResTy pat_syn in_inst_tys
-          , patSynInstResTy pat_syn out_inst_tys)
-    mk_alt upd_fld_env con
-      = do { let (univ_tvs, ex_tvs, eq_spec,
-                  prov_theta, _req_theta, arg_tys, _) = conLikeFullSig con
-                 arg_tys' = map (scaleScaled Many) arg_tys
-                   -- Record updates consume the source record with multiplicity
-                   -- Many. Therefore all the fields need to be scaled thus.
-                 user_tvs  = binderVars $ conLikeUserTyVarBinders con
-
-                 in_subst :: TCvSubst
-                 in_subst  = extendTCvInScopeList (zipTvSubst univ_tvs in_inst_tys) ex_tvs
-                   -- The in_subst clones the universally quantified type
-                   -- variables. It will be used to substitute into types that
-                   -- contain existentials, however, so make sure to extend the
-                   -- in-scope set with ex_tvs (#20278).
-
-                 out_tv_env :: TvSubstEnv
-                 out_tv_env = zipTyEnv univ_tvs out_inst_tys
-
-                -- I'm not bothering to clone the ex_tvs
-           ; eqs_vars   <- mapM newPredVarDs (substTheta in_subst (eqSpecPreds eq_spec))
-           ; theta_vars <- mapM newPredVarDs (substTheta in_subst prov_theta)
-           ; arg_ids    <- newSysLocalsDs (substScaledTysUnchecked in_subst arg_tys')
-           ; let field_labels = conLikeFieldLabels con
-                 val_args = zipWithEqual "dsExpr:RecordUpd" mk_val_arg
-                                         field_labels arg_ids
-                 mk_val_arg fl pat_arg_id
-                     = nlHsVar (lookupNameEnv upd_fld_env (flSelector fl) `orElse` pat_arg_id)
-
-                 inst_con = noLocA $ mkHsWrap wrap (mkConLikeTc con)
-                        -- Reconstruct with the WrapId so that unpacking happens
-                 wrap = mkWpEvVarApps theta_vars                                <.>
-                        dict_req_wrap                                           <.>
-                        mkWpTyApps    [ lookupVarEnv out_tv_env tv
-                                          `orElse` mkTyVarTy tv
-                                      | tv <- user_tvs ]
-                          -- Be sure to use user_tvs (which may be ordered
-                          -- differently than `univ_tvs ++ ex_tvs) above.
-                          -- See Note [DataCon user type variable binders]
-                          -- in GHC.Core.DataCon.
-                 rhs = foldl' (\a b -> nlHsApp a b) inst_con val_args
-
-                        -- Tediously wrap the application in a cast
-                        -- Note [Update for GADTs]
-                 wrapped_rhs =
-                  case con of
-                    RealDataCon data_con
-                      | null eq_spec -> rhs
-                      | otherwise    -> mkLHsWrap (mkWpCastN wrap_co) rhs
-                                     -- This wrap is the punchline: Note [Update for GADTs]
-                      where
-                        rep_tc   = dataConTyCon data_con
-                        wrap_co  = mkTcFamilyTyConAppCo rep_tc univ_cos
-                        univ_cos = zipWithEqual "dsExpr:upd" mk_univ_co univ_tvs out_inst_tys
-
-                        mk_univ_co :: TyVar   -- Universal tyvar from the DataCon
-                                   -> Type    -- Corresponding instantiating type
-                                   -> Coercion
-                        mk_univ_co univ_tv inst_ty
-                          = case lookupVarEnv eq_spec_env univ_tv of
-                               Just co -> co
-                               Nothing -> mkTcNomReflCo inst_ty
-
-                        eq_spec_env :: VarEnv Coercion
-                        eq_spec_env = mkVarEnv [ (eqSpecTyVar spec, mkTcSymCo (mkTcCoVarCo eqs_var))
-                                               | (spec,eqs_var) <- zipEqual "dsExpr:upd2" eq_spec eqs_vars ]
-
-                    -- eq_spec is always null for a PatSynCon
-                    PatSynCon _ -> rhs
-
-
-                 req_wrap = dict_req_wrap <.> mkWpTyApps in_inst_tys
-
-                 pat = noLocA $ ConPat { pat_con = noLocA con
-                                       , pat_args = PrefixCon [] $ map nlVarPat arg_ids
-                                       , pat_con_ext = ConPatTc
-                                         { cpt_tvs = ex_tvs
-                                         , cpt_dicts = eqs_vars ++ theta_vars
-                                         , cpt_binds = emptyTcEvBinds
-                                         , cpt_arg_tys = in_inst_tys
-                                         , cpt_wrap = req_wrap
-                                         }
-                                       }
-           ; return (mkSimpleMatch RecUpd [pat] wrapped_rhs) }
-
-{- Note [Scrutinee in Record updates]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Consider #17783:
-
-  data PartialRec = No
-                  | Yes { a :: Int, b :: Bool }
-  update No = No
-  update r@(Yes {}) = r { b = False }
-
-In the context of pattern-match checking, the occurrence of @r@ in
-@r { b = False }@ is to be treated as if it was a scrutinee, as can be seen by
-the following desugaring:
-
-  r { b = False } ==> case r of Yes a b -> Yes a False
-
-Thus, we pass @r@ as the scrutinee expression to @matchWrapper@ above.
--}
+dsExpr (RecordUpd x _ _) = dataConCantHappen x
 
 -- Here is where we desugar the Template Haskell brackets and escapes
 
 -- Template Haskell stuff
 -- See Note [The life cycle of a TH quotation]
 
-dsExpr (HsTypedBracket   (HsBracketTc q _ hs_wrapper ps) _) = dsBracket hs_wrapper q ps
-dsExpr (HsUntypedBracket (HsBracketTc q _ hs_wrapper ps) _) = dsBracket hs_wrapper q ps
-dsExpr (HsSpliceE _ s) = pprPanic "dsExpr:splice" (ppr s)
+dsExpr (HsTypedBracket   bracket_tc _) = dsBracket bracket_tc
+dsExpr (HsUntypedBracket bracket_tc _) = dsBracket bracket_tc
+dsExpr (HsTypedSplice   _   s) = pprPanic "dsExpr:typed splice" (pprTypedSplice Nothing s)
+dsExpr (HsUntypedSplice ext _) = dataConCantHappen ext
 
 -- Arrow notation extension
 dsExpr (HsProc _ pat cmd) = dsProcExpr pat cmd
@@ -756,20 +525,20 @@ dsExpr (HsProc _ pat cmd) = dsProcExpr pat cmd
 -- HsSyn constructs that just shouldn't be here, because
 -- the renamer removed them.  See GHC.Rename.Expr.
 -- Note [Handling overloaded and rebindable constructs]
-dsExpr (HsOverLabel x _) = dataConCantHappen x
-dsExpr (OpApp x _ _ _)   = dataConCantHappen x
-dsExpr (SectionL x _ _)  = dataConCantHappen x
-dsExpr (SectionR x _ _)  = dataConCantHappen x
+dsExpr (HsOverLabel x _ _) = dataConCantHappen x
+dsExpr (OpApp x _ _ _)     = dataConCantHappen x
+dsExpr (SectionL x _ _)    = dataConCantHappen x
+dsExpr (SectionR x _ _)    = dataConCantHappen x
 
 ds_prag_expr :: HsPragE GhcTc -> LHsExpr GhcTc -> DsM CoreExpr
-ds_prag_expr (HsPragSCC _ _ cc) expr = do
+ds_prag_expr (HsPragSCC _ cc) expr = do
     dflags <- getDynFlags
     if sccProfilingEnabled dflags && gopt Opt_ProfManualCcs dflags
       then do
         mod_name <- getModule
         count <- goptM Opt_ProfCountEntries
         let nm = sl_fs cc
-        flavour <- ExprCC <$> getCCIndexDsM nm
+        flavour <- mkExprCCFlavour <$> getCCIndexDsM nm
         Tick (ProfNote (mkUserCC nm mod_name (getLocA expr) flavour) count True)
                <$> dsLExpr expr
       else dsLExpr expr
@@ -822,7 +591,7 @@ beneficial. This is a bit of a trade-off,
 
 At the moment we use a simple heuristic to determine whether build will be
 fruitful: for small lists we assume the benefits of fusion will be worthwhile;
-for long lists we assume that the benefits will be outweighted by the cost of
+for long lists we assume that the benefits will be outweighed by the cost of
 code duplication. This magic length threshold is @maxBuildLength@. Also, fusion
 won't work at all if rewrite rules are disabled, so we don't use the build-based
 desugaring in this case.
@@ -946,7 +715,7 @@ dsDo ctx stmts
 
            ; let match_args (pat, fail_op) (vs,body)
                    = putSrcSpanDs (getLocA pat) $
-                     do { var   <- selectSimpleMatchVarL Many pat
+                     do { var   <- selectSimpleMatchVarL ManyTy pat
                         ; match <- matchSinglePatVar var Nothing (StmtCtxt (HsDoStmt ctx)) pat
                                    body_ty (cantFailMatchResult body)
                         ; match_code <- dsHandleMonadicFailure ctx pat match fail_op
@@ -972,10 +741,10 @@ dsDo ctx stmts
       where
         new_bind_stmt = L loc $ BindStmt
           XBindStmtTc
-            { xbstc_bindOp = bind_op
+            { xbstc_bindOp          = bind_op
             , xbstc_boundResultType = bind_ty
-            , xbstc_boundResultMult = Many
-            , xbstc_failOp = Nothing -- Tuple cannot fail
+            , xbstc_boundResultMult = ManyTy
+            , xbstc_failOp          = Nothing -- Tuple cannot fail
             }
           (mkBigLHsPatTupId later_pats)
           mfix_app
@@ -990,8 +759,8 @@ dsDo ctx stmts
                            (MG { mg_alts = noLocA [mkSimpleMatch
                                                     LambdaExpr
                                                     [mfix_pat] body]
-                               , mg_ext = MatchGroupTc [unrestricted tup_ty] body_ty
-                               , mg_origin = Generated })
+                               , mg_ext = MatchGroupTc [unrestricted tup_ty] body_ty Generated
+                               })
         mfix_pat     = noLocA $ LazyPat noExtField $ mkBigLHsPatTupId rec_tup_pats
         body         = noLocA $ HsDo body_ty
                                 ctx (noLocA (rec_stmts ++ [ret_stmt]))
@@ -1026,28 +795,26 @@ dsHsConLike (PatSynCon ps)
   = do { builder_id <- dsLookupGlobalId builder_name
        ; return (if add_void
                  then mkCoreApp (text "dsConLike" <+> ppr ps)
-                                (Var builder_id) (Var voidPrimId)
+                                (Var builder_id) unboxedUnitExpr
                  else Var builder_id) }
   | otherwise
   = pprPanic "dsConLike" (ppr ps)
 
-dsConLike :: ConLike -> [TcTyVar] -> [Scaled Type] -> DsM CoreExpr
--- This function desugars ConLikeTc
+-- | This function desugars 'ConLikeTc': it eta-expands
+-- data constructors to make linear types work.
+--
 -- See Note [Typechecking data constructors] in GHC.Tc.Gen.Head
---     for what is going on here
+dsConLike :: ConLike -> [TcTyVar] -> [Scaled Type] -> DsM CoreExpr
 dsConLike con tvs tys
   = do { ds_con <- dsHsConLike con
        ; ids    <- newSysLocalsDs tys
-                   -- newSysLocalDs: /can/ be lev-poly; see
+           -- NB: these 'Id's may be representation-polymorphic;
+           -- see Wrinkle [Representation-polymorphic lambda] in
+           -- Note [Typechecking data constructors] in GHC.Tc.Gen.Head.
        ; return (mkLams tvs $
                  mkLams ids $
                  ds_con `mkTyApps` mkTyVarTys tvs
-                        `mkVarApps` drop_stupid ids) }
-  where
-
-    drop_stupid = dropList (conLikeStupidTheta con)
-    -- drop_stupid: see Note [Instantiating stupid theta]
-    --              in GHC.Tc.Gen.Head
+                        `mkVarApps` ids) }
 
 {-
 ************************************************************************
@@ -1101,7 +868,7 @@ dsHsWrapped orig_hs_expr
        = go wrap hs_e
     go wrap1 (XExpr (WrapExpr (HsWrap wrap2 hs_e)))
        = go (wrap1 <.> wrap2) hs_e
-    go wrap (HsAppType ty (L _ hs_e) _)
+    go wrap (HsAppType ty (L _ hs_e) _ _)
        = go (wrap <.> WpTyApp ty) hs_e
 
     go wrap (HsVar _ (L _ var))

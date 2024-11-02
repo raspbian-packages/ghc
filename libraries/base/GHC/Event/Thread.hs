@@ -1,7 +1,13 @@
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE Trustworthy #-}
 {-# LANGUAGE BangPatterns, NoImplicitPrelude #-}
 
+#include <ghcplatform.h>
+
 module GHC.Event.Thread
+#if defined(javascript_HOST_ARCH)
+    ( ) where
+#else
     ( getSystemEventManager
     , getSystemTimerManager
     , ensureIOManagerIsRunning
@@ -15,6 +21,8 @@ module GHC.Event.Thread
     , registerDelay
     , blockedOnBadFD -- used by RTS
     ) where
+
+
 -- TODO: Use new Windows I/O manager
 import Control.Exception (finally, SomeException, toException)
 import Data.Foldable (forM_, mapM_, sequence_)
@@ -55,6 +63,10 @@ import System.Posix.Types (Fd)
 -- There is no guarantee that the thread will be rescheduled promptly
 -- when the delay has expired, but the thread will never continue to
 -- run /earlier/ than specified.
+--
+-- Be careful not to exceed @maxBound :: Int@, which on 32-bit machines is only
+-- 2147483647 μs, less than 36 minutes.
+--
 threadDelay :: Int -> IO ()
 threadDelay usecs = mask_ $ do
   mgr <- getSystemTimerManager
@@ -64,6 +76,9 @@ threadDelay usecs = mask_ $ do
 
 -- | Set the value of returned TVar to True after a given number of
 -- microseconds. The caveats associated with threadDelay also apply.
+--
+-- Be careful not to exceed @maxBound :: Int@, which on 32-bit machines is only
+-- 2147483647 μs, less than 36 minutes.
 --
 registerDelay :: Int -> IO (TVar Bool)
 registerDelay usecs = do
@@ -414,9 +429,19 @@ ioManagerCapabilitiesChanged =
               tid <- restartPollLoop mgr i
               writeIOArray eventManagerArray i (Just (tid,mgr))
 
+#if defined(wasm32_HOST_ARCH)
+c_setIOManagerControlFd :: CUInt -> CInt -> IO ()
+c_setIOManagerControlFd _ _ = pure ()
+
+c_setTimerManagerControlFd :: CInt -> IO ()
+c_setTimerManagerControlFd _ = pure ()
+#else
 -- Used to tell the RTS how it can send messages to the I/O manager.
 foreign import ccall unsafe "setIOManagerControlFd"
    c_setIOManagerControlFd :: CUInt -> CInt -> IO ()
 
 foreign import ccall unsafe "setTimerManagerControlFd"
    c_setTimerManagerControlFd :: CInt -> IO ()
+#endif
+
+#endif

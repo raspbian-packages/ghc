@@ -46,7 +46,7 @@ hiModuleNameMismatchWarn requested_mod read_mod
   -- are the same
   withPprStyle (mkUserStyle alwaysQualify AllTheWay) $
     -- we want the Modules below to be qualified with package names,
-    -- so reset the PrintUnqualified setting.
+    -- so reset the NamePprCtx setting.
     hsep [ text "Something is amiss; requested module "
          , ppr requested_mod
          , text "differs from name found in the interface file"
@@ -289,9 +289,10 @@ cantFindErr using_cabal cannot_find _ unit_env profile tried_these mod_name find
     mod_hidden pkg =
         text "it is a hidden module in the package" <+> quotes (ppr pkg)
 
-    unusable (pkg, reason)
-      = text "It is a member of the package"
-      <+> quotes (ppr pkg)
+    unusable (UnusableUnit unit reason reexport)
+      = text "It is " <> (if reexport then text "reexported from the package"
+                                      else text "a member of the package")
+      <+> quotes (ppr unit)
       $$ pprReason (text "which is") reason
 
     pp_suggestions :: [ModuleSuggestion] -> SDoc

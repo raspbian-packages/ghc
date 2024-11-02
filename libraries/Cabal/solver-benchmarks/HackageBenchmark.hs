@@ -213,14 +213,14 @@ runCabal timeoutSeconds cabalUnderTest cabal flags = do
   putStrLn $ "Cabal directory (for " ++ cabal ++ ") " ++ cabalDir
   createDirectoryIfMissing True cabalDir
 
-  -- shell enviroment
+  -- shell environment
   currEnv <- Map.fromList <$>  getEnvironment
   let thisEnv :: [(String, String)]
       thisEnv = Map.toList $ currEnv
           & Map.insert "CABAL_CONFIG" (cabalDir </> "config")
           & Map.insert "CABAL_DIR"     cabalDir
 
-  -- Run cabal update, 
+  -- Run cabal update,
   putStrLn $ "Running cabal update (using " ++ cabal ++ ") ..."
   (ec, uout, uerr) <- readCreateProcessWithExitCode (proc cabal ["update"])
       { cwd = Just cabalDir

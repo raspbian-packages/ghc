@@ -1,4 +1,4 @@
-ghc (9.4.7-2+rpi1) trixie-staging; urgency=medium
+ghc (9.6.6-2+rpi1) trixie-staging; urgency=medium
 
   [changes brought forward from 7.6.3-21+rpi1 by Peter Michael Green <plugwash@raspbian.org> at Sun, 19 Apr 2015 14:00:16 +0000]
   * Change compiler defaults for armv6
@@ -12,7 +12,141 @@ ghc (9.4.7-2+rpi1) trixie-staging; urgency=medium
   [changes introduced in 9.4.7-2+rpi1 by Peter Michael Green]
   * replace dmb instruction with coprocessor barrier instruction.
 
- -- Peter Michael Green <plugwash@raspbian.org>  Fri, 22 Dec 2023 05:25:33 +0000
+ -- Raspbian forward porter <root@raspbian.org>  Sat, 02 Nov 2024 06:04:23 +0000
+
+ghc (9.6.6-2) unstable; urgency=medium
+
+  * Update 'hadrian-enable-interpreter' patch to re-enable GHCi
+    on all architectures (Closes: #1081883)
+
+ -- Ilias Tsitsimpis <iliastsi@debian.org>  Mon, 16 Sep 2024 00:17:25 +0300
+
+ghc (9.6.6-1) unstable; urgency=medium
+
+  * Upload to unstable
+  * Declare compliance with Debian policy 4.7.0
+  * Use libnuma-dev only on architectures where it's available
+  * Don't run tests on crossbuild (Closes: #1081069)
+
+ -- Ilias Tsitsimpis <iliastsi@debian.org>  Wed, 11 Sep 2024 15:16:54 +0300
+
+ghc (9.6.6-1~exp5) experimental; urgency=medium
+
+  * Use gold on arm{el,hf}
+  * Drop redundant build-dep on devscripts
+  * Add missing build-dep on libnuma-dev
+  * Add missing dependency on libstdc++-X-dev library
+
+ -- Ilias Tsitsimpis <iliastsi@debian.org>  Mon, 26 Aug 2024 17:37:05 +0300
+
+ghc (9.6.6-1~exp4) experimental; urgency=medium
+
+  * Bump hadrian dependency
+  * Bump required LLVM version to 18
+  * Backport upstream patch to fix incorrect use of word-sized types on
+    32-bit systems
+  * Use system's default linker (bfd) instead of gold (Closes: #1079099)
+
+ -- Ilias Tsitsimpis <iliastsi@debian.org>  Mon, 26 Aug 2024 11:31:53 +0300
+
+ghc (9.6.6-1~exp3) experimental; urgency=medium
+
+  [ Peng Fan <fanpeng@loongson.cn> ]
+  * Add loong64 support (Closes: #1071151)
+
+ -- Gianfranco Costamagna <locutusofborg@debian.org>  Tue, 13 Aug 2024 14:17:49 +0200
+
+ghc (9.6.6-1~exp2) experimental; urgency=medium
+
+  * Set llvm-version back to 17, FBTFS
+
+ -- Gianfranco Costamagna <locutusofborg@debian.org>  Wed, 17 Jul 2024 08:51:18 +0200
+
+ghc (9.6.6-1~exp1) experimental; urgency=medium
+
+  * New upstream release.
+
+ -- Gianfranco Costamagna <locutusofborg@debian.org>  Mon, 15 Jul 2024 14:17:29 +0200
+
+ghc (9.6.5-1~exp2) experimental; urgency=medium
+
+  [ John Paul Adrian Glaubitz ]
+  * Pass --disable-ld-override in EXTRA_INSTALL_CONFIGURE_FLAGS
+    (Closes: #1073159)
+
+  [ Gianfranco Costamagna ]
+  * Bump required llvm-version to 18
+
+ -- Gianfranco Costamagna <locutusofborg@debian.org>  Mon, 15 Jul 2024 13:58:17 +0200
+
+ghc (9.6.5-1~exp1) experimental; urgency=medium
+
+  * New upstream release
+  * Backport patch to use newer LLVM versions
+  * Use LLVM 17
+  * Build registerised on loong64
+  * Add hadrian bootstrap plan for GHC v9.6.5
+
+ -- Ilias Tsitsimpis <iliastsi@debian.org>  Fri, 03 May 2024 10:15:54 +0300
+
+ghc (9.6.4-1~exp1) experimental; urgency=medium
+
+  * New upstream release
+  * Build unregisterised on loong64 since llvm-15 is not available
+  * Build unregisterised on powerpc (Closes: #1060196)
+  * Do not error out when cross building, let it fail instead
+
+ -- Ilias Tsitsimpis <iliastsi@debian.org>  Sat, 13 Jan 2024 16:22:36 +0200
+
+ghc (9.6.3-1~exp2) experimental; urgency=medium
+
+  * Backport upstream patch to fix build on armel/armhf
+  * Depend on LLVM for loong64
+
+ -- Ilias Tsitsimpis <iliastsi@debian.org>  Tue, 26 Dec 2023 10:08:47 +0200
+
+ghc (9.6.3-1~exp1) experimental; urgency=medium
+
+  [ Gianfranco Costamagna ]
+  * New upstream release (Closes: #1053588)
+  * drop patches now upstream
+    - newer-llvm
+    - fix-cross-compilation
+    - fix-hs_cmpxchg64
+    - fix-32-bit-unreg
+
+  [ Ilias Tsitsimpis ]
+  * Backport upstream fixes
+  * Bump hadrian dependency
+  * Patch Cabal and add support for sparc64.
+    Thanks to John Paul Adrian Glaubitz for the fix (Closes: #1056033).
+  * Add support for hurd-i386.
+    Thanks to Samuel Thibault for the fix (Closes: #1056305).
+  * Update d/rules to work with newer version
+
+ -- Ilias Tsitsimpis <iliastsi@debian.org>  Thu, 21 Dec 2023 09:21:59 +0200
+
+ghc (9.4.7-5) unstable; urgency=medium
+
+  * Backport upstream patches to fix issues with 64-bit time_t (Closes:
+    #1068586)
+  * Build unregisterised on powerpc (Closes: #1060196)
+
+ -- Ilias Tsitsimpis <iliastsi@debian.org>  Wed, 10 Apr 2024 14:24:01 +0300
+
+ghc (9.4.7-4) unstable; urgency=medium
+
+  * Backport upstream patch to fix compilation with GCC 14 (Closes: #1068179)
+
+ -- Ilias Tsitsimpis <iliastsi@debian.org>  Sat, 06 Apr 2024 10:34:53 +0300
+
+ghc (9.4.7-3) unstable; urgency=medium
+
+  * debian/patches/dfe1c3540e4b519b62b862b5966dfec5cae9ece1.patch:
+    - cherry-pick upstream fix for misaligned objects in the data section with
+      llvm-based builds. (LP: #2052696)
+
+ -- Gianfranco Costamagna <locutusofborg@debian.org>  Mon, 19 Feb 2024 17:12:25 +0100
 
 ghc (9.4.7-2) unstable; urgency=medium
 

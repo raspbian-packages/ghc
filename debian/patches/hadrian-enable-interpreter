@@ -6,7 +6,7 @@ Index: b/hadrian/src/Oracles/Setting.hs
 ===================================================================
 --- a/hadrian/src/Oracles/Setting.hs
 +++ b/hadrian/src/Oracles/Setting.hs
-@@ -287,13 +287,8 @@ hostSupportsRPaths = anyHostOs ["linux",
+@@ -292,13 +292,8 @@ hostSupportsRPaths = anyHostOs ["linux",
  -- | Check whether the target supports GHCi.
  ghcWithInterpreter :: Action Bool
  ghcWithInterpreter = do
@@ -22,3 +22,18 @@ Index: b/hadrian/src/Oracles/Setting.hs
  
  -- | Variants of the ARM architecture.
  data ArmVersion = ARMv5 | ARMv6 | ARMv7
+Index: b/hadrian/bindist/config.mk.in
+===================================================================
+--- a/hadrian/bindist/config.mk.in
++++ b/hadrian/bindist/config.mk.in
+@@ -140,8 +140,8 @@ GhcWithSMP := $(strip $(if $(filter YESN
+ 
+ # Whether to include GHCi in the compiler.  Depends on whether the RTS linker
+ # has support for this OS/ARCH combination.
+-OsSupportsGHCi=$(strip $(patsubst $(TargetOS_CPP), YES, $(findstring $(TargetOS_CPP), mingw32 linux solaris2 freebsd dragonfly netbsd openbsd darwin kfreebsdgnu)))
+-ArchSupportsGHCi=$(strip $(patsubst $(TargetArch_CPP), YES, $(findstring $(TargetArch_CPP), i386 x86_64 powerpc powerpc64 powerpc64le sparc sparc64 arm aarch64)))
++OsSupportsGHCi=YES
++ArchSupportsGHCi=YES
+ 
+ ifeq "$(OsSupportsGHCi)$(ArchSupportsGHCi)" "YESYES"
+ GhcWithInterpreter=YES

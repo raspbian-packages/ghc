@@ -116,7 +116,9 @@ trivColorable platform virtualRegSqueeze realRegSqueeze RcInteger conflicts excl
                             ArchMipsel    -> panic "trivColorable ArchMipsel"
                             ArchS390X     -> panic "trivColorable ArchS390X"
                             ArchRISCV64   -> panic "trivColorable ArchRISCV64"
+                            ArchLoongArch64->panic "trivColorable ArchLoongArch64"
                             ArchJavaScript-> panic "trivColorable ArchJavaScript"
+                            ArchWasm32    -> panic "trivColorable ArchWasm32"
                             ArchUnknown   -> panic "trivColorable ArchUnknown")
         , count2        <- accSqueeze 0 cALLOCATABLE_REGS_INTEGER
                                 (virtualRegSqueeze RcInteger)
@@ -140,7 +142,7 @@ trivColorable platform virtualRegSqueeze realRegSqueeze RcFloat conflicts exclus
                             ArchPPC       -> 0
                             ArchPPC_64 _  -> 0
                             ArchARM _ _ _ -> panic "trivColorable ArchARM"
-                            -- we can in princple address all the float regs as
+                            -- we can in principle address all the float regs as
                             -- segments. So we could have 64 Float regs. Or
                             -- 128 Half regs, or even 256 Byte regs.
                             ArchAArch64   -> 0
@@ -149,7 +151,9 @@ trivColorable platform virtualRegSqueeze realRegSqueeze RcFloat conflicts exclus
                             ArchMipsel    -> panic "trivColorable ArchMipsel"
                             ArchS390X     -> panic "trivColorable ArchS390X"
                             ArchRISCV64   -> panic "trivColorable ArchRISCV64"
+                            ArchLoongArch64->panic "trivColorable ArchLoongArch64"
                             ArchJavaScript-> panic "trivColorable ArchJavaScript"
+                            ArchWasm32    -> panic "trivColorable ArchWasm32"
                             ArchUnknown   -> panic "trivColorable ArchUnknown")
         , count2        <- accSqueeze 0 cALLOCATABLE_REGS_FLOAT
                                 (virtualRegSqueeze RcFloat)
@@ -181,7 +185,9 @@ trivColorable platform virtualRegSqueeze realRegSqueeze RcDouble conflicts exclu
                             ArchMipsel    -> panic "trivColorable ArchMipsel"
                             ArchS390X     -> panic "trivColorable ArchS390X"
                             ArchRISCV64   -> panic "trivColorable ArchRISCV64"
+                            ArchLoongArch64->panic "trivColorable ArchLoongArch64"
                             ArchJavaScript-> panic "trivColorable ArchJavaScript"
+                            ArchWasm32    -> panic "trivColorable ArchWasm32"
                             ArchUnknown   -> panic "trivColorable ArchUnknown")
         , count2        <- accSqueeze 0 cALLOCATABLE_REGS_DOUBLE
                                 (virtualRegSqueeze RcDouble)

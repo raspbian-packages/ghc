@@ -51,6 +51,25 @@ Note that there are variety of places in the native code generator where we
 assume that the code produced for a MachOp does not introduce new blocks.
 -}
 
+-- Note [MO_S_MulMayOflo significant width]
+-- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+--
+-- There are two interpretations in the code about what a multiplication
+-- overflow exactly means:
+--
+-- 1. The result does not fit into the specified width (of type Width.)
+-- 2. The result does not fit into a register.
+--
+-- (2) has some flaws: A following MO_Mul has a width, too. So MO_S_MulMayOflo
+-- may signal no overflow, while MO_Mul truncates the result. There are
+-- architectures with several register widths and it might be hard to decide
+-- what's an overflow and what not. Both attributes can easily lead to subtle
+-- bugs.
+--
+-- (1) has the benefit that its interpretation is completely independent of the
+-- architecture. So, the mid-term plan is to migrate to this
+-- interpretation/sematics.
+
 data MachOp
   -- Integer operations (insensitive to signed/unsigned)
   = MO_Add Width
@@ -60,13 +79,13 @@ data MachOp
   | MO_Mul Width                -- low word of multiply
 
   -- Signed multiply/divide
-  | MO_S_MulMayOflo Width       -- nonzero if signed multiply overflows
+  | MO_S_MulMayOflo Width       -- nonzero if signed multiply overflows. See
+                                -- Note [MO_S_MulMayOflo significant width]
   | MO_S_Quot Width             -- signed / (same semantics as IntQuotOp)
   | MO_S_Rem  Width             -- signed % (same semantics as IntRemOp)
   | MO_S_Neg  Width             -- unary -
 
   -- Unsigned multiply/divide
-  | MO_U_MulMayOflo Width       -- nonzero if unsigned multiply overflows
   | MO_U_Quot Width             -- unsigned / (same semantics as WordQuotOp)
   | MO_U_Rem  Width             -- unsigned % (same semantics as WordRemOp)
 
@@ -252,7 +271,6 @@ isCommutableMachOp mop =
         MO_Ne _                 -> True
         MO_Mul _                -> True
         MO_S_MulMayOflo _       -> True
-        MO_U_MulMayOflo _       -> True
         MO_And _                -> True
         MO_Or _                 -> True
         MO_Xor _                -> True
@@ -380,7 +398,6 @@ machOpResultType platform mop tys =
     MO_S_Quot r         -> cmmBits r
     MO_S_Rem  r         -> cmmBits r
     MO_S_Neg  r         -> cmmBits r
-    MO_U_MulMayOflo r   -> cmmBits r
     MO_U_Quot r         -> cmmBits r
     MO_U_Rem  r         -> cmmBits r
 
@@ -474,7 +491,6 @@ machOpArgReps platform op =
     MO_S_Quot r         -> [r,r]
     MO_S_Rem  r         -> [r,r]
     MO_S_Neg  r         -> [r]
-    MO_U_MulMayOflo r   -> [r,r]
     MO_U_Quot r         -> [r,r]
     MO_U_Rem  r         -> [r,r]
 

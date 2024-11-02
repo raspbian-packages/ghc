@@ -1,4 +1,3 @@
-
 {-# LANGUAGE PatternSynonyms #-}
 
 {-# OPTIONS_GHC -Wno-incomplete-uni-patterns #-}
@@ -52,17 +51,6 @@
   The simplifier tries to get rid of occurrences of x, in favour of wild,
   in the hope that there will only be one remaining occurrence of x, namely
   the scrutinee of the case, and we can inline it.
-
-  This can only work if @wild@ is an unrestricted binder. Indeed, even with the
-  extended typing rule (in the linter) for case expressions, if
-       case x of wild % 1 { p -> e}
-  is well-typed, then
-       case x of wild % 1 { p -> e[wild\x] }
-  is only well-typed if @e[wild\x] = e@ (that is, if @wild@ is not used in @e@
-  at all). In which case, it is, of course, pointless to do the substitution
-  anyway. So for a linear binder (and really anything which isn't unrestricted),
-  doing this substitution would either produce ill-typed terms or be the
-  identity.
 -}
 
 module GHC.Core.Opt.SetLevels (
@@ -83,18 +71,17 @@ import GHC.Core.Utils   ( exprType, exprIsHNF
                         , exprOkForSpeculation
                         , exprIsTopLevelBindable
                         , collectMakeStaticArgs
-                        , mkLamTypes
+                        , mkLamTypes, extendInScopeSetBndrs
                         )
-import GHC.Core.Opt.Arity   ( exprBotStrictness_maybe )
+import GHC.Core.Opt.Arity   ( exprBotStrictness_maybe, isOneShotBndr )
 import GHC.Core.FVs     -- all of it
 import GHC.Core.Subst
 import GHC.Core.Make    ( sortQuantVars )
-import GHC.Core.Type    ( Type, splitTyConApp_maybe, tyCoVarsOfType
+import GHC.Core.Type    ( Type, tyCoVarsOfType
                         , mightBeUnliftedType, closeOverKindsDSet
                         , typeHasFixedRuntimeRep
                         )
-import GHC.Core.Multiplicity     ( pattern Many )
-import GHC.Core.DataCon ( dataConOrigResTy )
+import GHC.Core.Multiplicity     ( pattern ManyTy )
 
 import GHC.Types.Id
 import GHC.Types.Id.Info
@@ -104,10 +91,10 @@ import GHC.Types.Unique.Set   ( nonDetStrictFoldUniqSet )
 import GHC.Types.Unique.DSet  ( getUniqDSet )
 import GHC.Types.Var.Env
 import GHC.Types.Literal      ( litIsTrivial )
-import GHC.Types.Demand       ( DmdSig, Demand, isStrUsedDmd, splitDmdSig, prependArgsDmdSig )
-import GHC.Types.Cpr          ( mkCprSig, botCpr )
+import GHC.Types.Demand       ( DmdSig, prependArgsDmdSig )
+import GHC.Types.Cpr          ( CprSig, prependArgsCprSig )
 import GHC.Types.Name         ( getOccName, mkSystemVarName )
-import GHC.Types.Name.Occurrence ( occNameString )
+import GHC.Types.Name.Occurrence ( occNameFS )
 import GHC.Types.Unique       ( hasKey )
 import GHC.Types.Tickish      ( tickishIsCode )
 import GHC.Types.Unique.Supply
@@ -120,12 +107,10 @@ import GHC.Builtin.Names      ( runRWKey )
 import GHC.Data.FastString
 
 import GHC.Utils.FV
-import GHC.Utils.Monad  ( mapAccumLM )
 import GHC.Utils.Misc
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
 import GHC.Utils.Panic.Plain
-import GHC.Utils.Trace
 
 import Data.Maybe
 
@@ -364,7 +349,7 @@ don't want @lvlExpr@ to turn the scrutinee of the @case@ into an MFE
 If there were another lambda in @r@'s rhs, it would get level-2 as well.
 -}
 
-lvlExpr env (_, AnnType ty)     = return (Type (GHC.Core.Subst.substTy (le_subst env) ty))
+lvlExpr env (_, AnnType ty)     = return (Type (substTyUnchecked (le_subst env) ty))
 lvlExpr env (_, AnnCoercion co) = return (Coercion (substCo (le_subst env) co))
 lvlExpr env (_, AnnVar v)       = return (lookupVar env v)
 lvlExpr _   (_, AnnLit lit)     = return (Lit lit)
@@ -440,20 +425,12 @@ lvlApp env orig_expr ((_,AnnVar fn), args)
         ; return (foldl' App lapp' rargs') }
 
   | otherwise
-  = do { (_, args') <- mapAccumLM lvl_arg stricts args
-            -- Take account of argument strictness; see
-            -- Note [Floating to the top]
+  = do { args' <- mapM (lvlMFE env False) args
+                  -- False: see "Arguments" in Note [Floating to the top]
        ; return (foldl' App (lookupVar env fn) args') }
   where
     n_val_args = count (isValArg . deAnnotate) args
     arity      = idArity fn
-
-    stricts :: [Demand]   -- True for strict /value/ arguments
-    stricts = case splitDmdSig (idDmdSig fn) of
-                (arg_ds, _) | arg_ds `lengthExceeds` n_val_args
-                            -> []
-                            | otherwise
-                            -> arg_ds
 
     -- Separate out the PAP that we are floating from the extra
     -- arguments, by traversing the spine until we have collected
@@ -465,19 +442,6 @@ lvlApp env orig_expr ((_,AnnVar fn), args)
        | isValArg (deAnnotate a) = left (n-1) f (a:rargs)
        | otherwise               = left n     f (a:rargs)
     left _ _ _                   = panic "GHC.Core.Opt.SetLevels.lvlExpr.left"
-
-    is_val_arg :: CoreExprWithFVs -> Bool
-    is_val_arg (_, AnnType {}) = False
-    is_val_arg _               = True
-
-    lvl_arg :: [Demand] -> CoreExprWithFVs -> LvlM ([Demand], LevelledExpr)
-    lvl_arg strs arg | (str1 : strs') <- strs
-                     , is_val_arg arg
-                     = do { arg' <- lvlMFE env (isStrUsedDmd str1) arg
-                          ; return (strs', arg') }
-                     | otherwise
-                     = do { arg' <- lvlMFE env False arg
-                          ; return (strs, arg') }
 
 lvlApp env _ (fun, args)
   =  -- No PAPs that we can float: just carry on with the
@@ -499,7 +463,7 @@ lvlCase env scrut_fvs scrut' case_bndr ty alts
   , exprIsHNF (deTagExpr scrut')  -- See Note [Check the output scrutinee for exprIsHNF]
   , not (isTopLvl dest_lvl)       -- Can't have top-level cases
   , not (floatTopLvlOnly env)     -- Can float anywhere
-  , Many <- idMult case_bndr     -- See Note [Floating linear case]
+  , ManyTy <- idMult case_bndr     -- See Note [Floating linear case]
   =     -- Always float the case if possible
         -- Unlike lets we don't insist that it escapes a value lambda
     do { (env1, (case_bndr' : bs')) <- cloneCaseBndrs env dest_lvl (case_bndr : bs)
@@ -514,7 +478,7 @@ lvlCase env scrut_fvs scrut' case_bndr ty alts
        ; alts' <- mapM (lvl_alt alts_env) alts
        ; return (Case scrut' case_bndr' ty' alts') }
   where
-    ty' = substTy (le_subst env) ty
+    ty' = substTyUnchecked (le_subst env) ty
 
     incd_lvl = incMinorLvl (le_ctxt_lvl env)
     dest_lvl = maxFvLevel (const True) env scrut_fvs
@@ -645,7 +609,7 @@ lvlMFE ::  LevelEnv             -- Level of in-scope names/tyvars
 -- the expression, so that it can itself be floated.
 
 lvlMFE env _ (_, AnnType ty)
-  = return (Type (GHC.Core.Subst.substTy (le_subst env) ty))
+  = return (Type (substTyUnchecked (le_subst env) ty))
 
 -- No point in floating out an expression wrapped in a coercion or note
 -- If we do we'll transform  lvl = e |> co
@@ -682,9 +646,7 @@ lvlMFE env strict_ctxt ann_expr
          -- No wrapping needed if the type is lifted, or is a literal string
          -- or if we are wrapping it in one or more value lambdas
   = do { expr1 <- lvlFloatRhs abs_vars dest_lvl rhs_env NonRecursive
-                              (isJust mb_bot_str)
-                              join_arity_maybe
-                              ann_expr
+                              is_bot_lam join_arity_maybe ann_expr
                   -- Treat the expr just like a right-hand side
        ; var <- newLvlVar expr1 join_arity_maybe is_mk_static
        ; let var2 = annotateBotStr var float_n_lams mb_bot_str
@@ -698,21 +660,20 @@ lvlMFE env strict_ctxt ann_expr
   | escapes_value_lam
   , not expr_ok_for_spec -- Boxing/unboxing isn't worth it for cheap expressions
                          -- See Note [Test cheapness with exprOkForSpeculation]
-  , Just (tc, _) <- splitTyConApp_maybe expr_ty
-  , Just dc <- boxingDataCon_maybe tc
-  , let dc_res_ty = dataConOrigResTy dc  -- No free type variables
-        [bx_bndr, ubx_bndr] = mkTemplateLocals [dc_res_ty, expr_ty]
+  , BI_Box { bi_data_con = box_dc, bi_inst_con = boxing_expr
+           , bi_boxed_type = box_ty } <- boxingDataCon expr_ty
+  , let [bx_bndr, ubx_bndr] = mkTemplateLocals [box_ty, expr_ty]
   = do { expr1 <- lvlExpr rhs_env ann_expr
        ; let l1r       = incMinorLvlFrom rhs_env
              float_rhs = mkLams abs_vars_w_lvls $
-                         Case expr1 (stayPut l1r ubx_bndr) dc_res_ty
-                             [Alt DEFAULT [] (mkConApp dc [Var ubx_bndr])]
+                         Case expr1 (stayPut l1r ubx_bndr) box_ty
+                             [Alt DEFAULT [] (App boxing_expr (Var ubx_bndr))]
 
        ; var <- newLvlVar float_rhs Nothing is_mk_static
        ; let l1u      = incMinorLvlFrom env
              use_expr = Case (mkVarApps (Var var) abs_vars)
                              (stayPut l1u bx_bndr) expr_ty
-                             [Alt (DataAlt dc) [stayPut l1u ubx_bndr] (Var ubx_bndr)]
+                             [Alt (DataAlt box_dc) [stayPut l1u ubx_bndr] (Var ubx_bndr)]
        ; return (Let (NonRec (TB var (FloatMe dest_lvl)) float_rhs)
                      use_expr) }
 
@@ -724,14 +685,16 @@ lvlMFE env strict_ctxt ann_expr
     expr_ty      = exprType expr
     fvs          = freeVarsOf ann_expr
     fvs_ty       = tyCoVarsOfType expr_ty
-    is_bot       = isBottomThunk mb_bot_str
+    is_bot_lam   = isJust mb_bot_str   -- True of bottoming thunks too!
     is_function  = isFunction ann_expr
     mb_bot_str   = exprBotStrictness_maybe expr
                            -- See Note [Bottoming floats]
                            -- esp Bottoming floats (2)
     expr_ok_for_spec = exprOkForSpeculation expr
-    dest_lvl     = destLevel env fvs fvs_ty is_function is_bot False
-    abs_vars     = abstractVars dest_lvl env fvs
+    abs_vars = abstractVars dest_lvl env fvs
+    dest_lvl = destLevel env fvs fvs_ty is_function is_bot_lam False
+               -- NB: is_bot_lam not is_bot; see (3) in
+               --     Note [Bottoming floats]
 
     -- float_is_new_lam: the floated thing will be a new value lambda
     -- replacing, say (g (x+4)) by (lvl x).  No work is saved, nor is
@@ -763,7 +726,9 @@ lvlMFE env strict_ctxt ann_expr
     -- See Note [Floating to the top]
     saves_alloc =  isTopLvl dest_lvl
                 && floatConsts env
-                && (not strict_ctxt || is_bot || exprIsHNF expr)
+                && (   not strict_ctxt                     -- (a)
+                    || exprIsHNF expr                      -- (b)
+                    || (is_bot_lam && escapes_value_lam))  -- (c)
 
 hasFreeJoin :: LevelEnv -> DVarSet -> Bool
 -- Has a free join point which is not being floated to top level.
@@ -773,61 +738,72 @@ hasFreeJoin :: LevelEnv -> DVarSet -> Bool
 hasFreeJoin env fvs
   = not (maxFvLevel isJoinId env fvs == tOP_LEVEL)
 
-isBottomThunk :: Maybe (Arity, s) -> Bool
--- See Note [Bottoming floats] (2)
-isBottomThunk (Just (0, _)) = True   -- Zero arity
-isBottomThunk _             = False
-
 {- Note [Floating to the top]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-We are keen to float something to the top level, even if it does not
-escape a value lambda (and hence save work), for two reasons:
+Suppose saves_work is False, i.e.
+ - 'e' does not escape a value lambda (escapes_value_lam), or
+ - 'e' would have added value lambdas if floated (float_is_new_lam)
+Then we may still be keen to float a sub-expression 'e' to the top level,
+for two reasons:
 
-  * Doing so makes the function smaller, by floating out
-    bottoming expressions, or integer or string literals.  That in
-    turn makes it easier to inline, with less duplication.
+ (i) Doing so makes the function smaller, by floating out
+     bottoming expressions, or integer or string literals.  That in
+     turn makes it easier to inline, with less duplication.
+     This only matters if the floated sub-expression is inside a
+     value-lambda, which in turn may be easier to inline.
 
-  * (Minor) Doing so may turn a dynamic allocation (done by machine
-    instructions) into a static one. Minor because we are assuming
-    we are not escaping a value lambda.
+ (ii) (Minor) Doing so may turn a dynamic allocation (done by machine
+      instructions) into a static one. Minor because we are assuming
+      we are not escaping a value lambda.
 
-But do not so if:
-     - the context is a strict, and
-     - the expression is not a HNF, and
-     - the expression is not bottoming
+But only do so if (saves_alloc):
+     (a) the context is lazy (so we get allocation), or
+     (b) the expression is a HNF (so we get allocation), or
+     (c) the expression is bottoming and (i) applies
+         (NB: if the expression is a lambda, (b) will apply;
+              so this case only catches bottoming thunks)
 
-Exammples:
+Examples:
 
-* Bottoming
+* (a) Strict.  Case scrutinee
+      f = case g True of ....
+  Don't float (g True) to top level; then we have the admin of a
+  top-level thunk to worry about, with zero gain.
+
+* (a) Strict.  Case alternative
+      h = case y of
+             True  -> g True
+             False -> False
+  Don't float (g True) to the top level
+
+* (b) HNF
+      f = case y of
+            True  -> p:q
+            False -> blah
+  We may as well float the (p:q) so it becomes a static data structure.
+
+* (c) Bottoming expressions; see also Note [Bottoming floats]
       f x = case x of
               0 -> error <big thing>
               _ -> x+1
   Here we want to float (error <big thing>) to top level, abstracting
   over 'x', so as to make f's RHS smaller.
 
-* HNF
-      f = case y of
-            True  -> p:q
-            False -> blah
-  We may as well float the (p:q) so it becomes a static data structure.
-
-* Case scrutinee
-      f = case g True of ....
-  Don't float (g True) to top level; then we have the admin of a
-  top-level thunk to worry about, with zero gain.
-
-* Case alternative
-      h = case y of
-             True  -> g True
-             False -> False
-  Don't float (g True) to the top level
+  But (#22494) if it's more like
+       foo = case error <thing> of { ... }
+  then there is no point in floating; we are never going to inline
+  'foo' anyway.  So float bottoming things only if they escape
+  a lambda.
 
 * Arguments
      t = f (g True)
-  If f is lazy, we /do/ float (g True) because then we can allocate
-  the thunk statically rather than dynamically.  But if f is strict
-  we don't (see the use of idDmdSig in lvlApp).  It's not clear
-  if this test is worth the bother: it's only about CAFs!
+  Prior to Apr 22 we didn't float (g True) to the top if f was strict.
+  But (a) this only affected CAFs, because if it escapes a value lambda
+          we'll definitely float it; so the complication of working out
+          argument strictness doesn't seem worth it.
+      (b) floating to the top helps SpecContr; see GHC.Core.Opt.SpecConstr
+          Note [Specialising on dictionaries].
+  So now we don't use strictness to affect argument floating.
 
 It's controlled by a flag (floatConsts), because doing this too
 early loses opportunities for RULES which (needless to say) are
@@ -912,15 +888,15 @@ Note [Test cheapness with exprOkForSpeculation]
 We don't want to float very cheap expressions by boxing and unboxing.
 But we use exprOkForSpeculation for the test, not exprIsCheap.
 Why?  Because it's important /not/ to transform
-     f (a /# 3)
+     let x = a /# 3
 to
-     f (case bx of I# a -> a /# 3)
-and float bx = I# (a /# 3), because the application of f no
-longer obeys the let/app invariant.  But (a /# 3) is ok-for-spec
+     let x = case bx of I# a -> a /# 3
+because the let binding no
+longer obeys the let-can-float invariant.  But (a /# 3) is ok-for-spec
 due to a special hack that says division operators can't fail
 when the denominator is definitely non-zero.  And yet that
 same expression says False to exprIsCheap.  Simplest way to
-guarantee the let/app invariant is to use the same function!
+guarantee the let-can-float invariant is to use the same function!
 
 If an expression is okay for speculation, we could also float it out
 *without* boxing and unboxing, since evaluating it early is okay.
@@ -947,7 +923,7 @@ But, as ever, we need to be careful:
 (1) We want to float a bottoming
     expression even if it has free variables:
         f = \x. g (let v = h x in error ("urk" ++ v))
-    Then we'd like to abstract over 'x' can float the whole arg of g:
+    Then we'd like to abstract over 'x', and float the whole arg of g:
         lvl = \x. let v = h x in error ("urk" ++ v)
         f = \x. g (lvl x)
     To achieve this we pass is_bot to destLevel
@@ -956,6 +932,12 @@ But, as ever, we need to be careful:
     bottom.  Instead we treat the /body/ of such a function specially,
     via point (1).  For example:
         f = \x. ....(\y z. if x then error y else error z)....
+    If we float the whole lambda thus
+        lvl = \x. \y z. if x then error y else error z
+        f = \x. ...(lvl x)...
+    we may well end up eta-expanding that PAP to
+        f = \x. ...(\y z. lvl x y z)...
+
     ===>
         lvl = \x z y. if b then error y else error z
         f = \x. ...(\y z. lvl x z y)...
@@ -966,7 +948,7 @@ But, as ever, we need to be careful:
     Example:
        ... let { v = \y. error (show x ++ show y) } in ...
     We want to abstract over x and float the whole thing to top:
-       lvl = \xy. errror (show x ++ show y)
+       lvl = \xy. error (show x ++ show y)
        ...let {v = lvl x} in ...
 
     Then of course we don't want to separately float the body (error ...)
@@ -997,16 +979,6 @@ Id, *immediately*, for three reasons:
     thing is based on the cheap-and-cheerful exprIsDeadEnd, I'm not sure
     that it'll nail all such cases.
 
-Note [Bottoming floats: eta expansion] c.f Note [Bottoming floats]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Tiresomely, though, the simplifier has an invariant that the manifest
-arity of the RHS should be the same as the arity; but we can't call
-etaExpand during GHC.Core.Opt.SetLevels because it works over a decorated form of
-CoreExpr.  So we do the eta expansion later, in GHC.Core.Opt.FloatOut.
-But we should only eta-expand if the RHS doesn't already have the right
-exprArity, otherwise we get unnecessary top-level bindings if the RHS was
-trivial after the next run of the Simplifier.
-
 Note [Case MFEs]
 ~~~~~~~~~~~~~~~~
 We don't float a case expression as an MFE from a strict context.  Why not?
@@ -1028,17 +1000,18 @@ answer.
 
 -}
 
-annotateBotStr :: Id -> Arity -> Maybe (Arity, DmdSig) -> Id
+annotateBotStr :: Id -> Arity -> Maybe (Arity, DmdSig, CprSig) -> Id
 -- See Note [Bottoming floats] for why we want to add
 -- bottoming information right now
 --
 -- n_extra are the number of extra value arguments added during floating
-annotateBotStr id n_extra mb_str
-  = case mb_str of
-      Nothing           -> id
-      Just (arity, sig) -> id `setIdArity`      (arity + n_extra)
-                              `setIdDmdSig` (prependArgsDmdSig n_extra sig)
-                              `setIdCprSig`    mkCprSig (arity + n_extra) botCpr
+annotateBotStr id n_extra mb_bot_str
+  | Just (arity, str_sig, cpr_sig) <- mb_bot_str
+  = id `setIdArity`  (arity + n_extra)
+       `setIdDmdSig` prependArgsDmdSig n_extra str_sig
+       `setIdCprSig` prependArgsCprSig n_extra cpr_sig
+  | otherwise
+  = id
 
 notWorthFloating :: CoreExpr -> [Var] -> Bool
 -- Returns True if the expression would be replaced by
@@ -1147,7 +1120,7 @@ lvlBind env (AnnNonRec bndr rhs)
           -- bit brutal, but unlifted bindings aren't expensive either
 
   = -- No float
-    do { rhs' <- lvlRhs env NonRecursive is_bot mb_join_arity rhs
+    do { rhs' <- lvlRhs env NonRecursive is_bot_lam mb_join_arity rhs
        ; let  bind_lvl        = incMinorLvl (le_ctxt_lvl env)
               (env', [bndr']) = substAndLvlBndrs NonRecursive env bind_lvl [bndr]
        ; return (NonRec bndr' rhs', env') }
@@ -1156,7 +1129,7 @@ lvlBind env (AnnNonRec bndr rhs)
   | null abs_vars
   = do {  -- No type abstraction; clone existing binder
          rhs' <- lvlFloatRhs [] dest_lvl env NonRecursive
-                             is_bot mb_join_arity rhs
+                             is_bot_lam mb_join_arity rhs
        ; (env', [bndr']) <- cloneLetVars NonRecursive env dest_lvl [bndr]
        ; let bndr2 = annotateBotStr bndr' 0 mb_bot_str
        ; return (NonRec (TB bndr2 (FloatMe dest_lvl)) rhs', env') }
@@ -1164,7 +1137,7 @@ lvlBind env (AnnNonRec bndr rhs)
   | otherwise
   = do {  -- Yes, type abstraction; create a new binder, extend substitution, etc
          rhs' <- lvlFloatRhs abs_vars dest_lvl env NonRecursive
-                             is_bot mb_join_arity rhs
+                             is_bot_lam mb_join_arity rhs
        ; (env', [bndr']) <- newPolyBndrs dest_lvl env abs_vars [bndr]
        ; let bndr2 = annotateBotStr bndr' n_extra mb_bot_str
        ; return (NonRec (TB bndr2 (FloatMe dest_lvl)) rhs', env') }
@@ -1175,11 +1148,12 @@ lvlBind env (AnnNonRec bndr rhs)
     rhs_fvs    = freeVarsOf rhs
     bind_fvs   = rhs_fvs `unionDVarSet` dIdFreeVars bndr
     abs_vars   = abstractVars dest_lvl env bind_fvs
-    dest_lvl   = destLevel env bind_fvs ty_fvs (isFunction rhs) is_bot is_join
+    dest_lvl   = destLevel env bind_fvs ty_fvs (isFunction rhs) is_bot_lam is_join
 
     deann_rhs  = deAnnotate rhs
     mb_bot_str = exprBotStrictness_maybe deann_rhs
-    is_bot     = isJust mb_bot_str
+    is_bot_lam = isJust mb_bot_str
+        -- is_bot_lam: looks like (\xy. bot), maybe zero lams
         -- NB: not isBottomThunk!  See Note [Bottoming floats] point (3)
 
     n_extra    = count isId abs_vars
@@ -1281,7 +1255,7 @@ lvlBind env (AnnRec pairs)
 profitableFloat :: LevelEnv -> Level -> Bool
 profitableFloat env dest_lvl
   =  (dest_lvl `ltMajLvl` le_ctxt_lvl env)  -- Escapes a value lambda
-  || isTopLvl dest_lvl                      -- Going all the way to top level
+  || (isTopLvl dest_lvl && floatConsts env) -- Going all the way to top level
 
 
 ----------------------------------------------------
@@ -1403,9 +1377,11 @@ lvlLamBndrs env lvl bndrs
     new_lvl | any is_major bndrs = incMajorLvl lvl
             | otherwise          = incMinorLvl lvl
 
-    is_major bndr = isId bndr && not (isProbablyOneShotLambda bndr)
-       -- The "probably" part says "don't float things out of a
-       -- probable one-shot lambda"
+    is_major bndr = not (isOneShotBndr bndr)
+       -- Only non-one-shot lambdas bump a major level, which in
+       -- turn triggers floating.  NB: isOneShotBndr is always
+       -- true of a type variable -- there is no point in floating
+       -- out of a big lambda.
        -- See Note [Computing one-shot info] in GHC.Types.Demand
 
 lvlJoinBndrs :: LevelEnv -> Level -> RecFlag -> [OutVar]
@@ -1443,7 +1419,7 @@ destLevel :: LevelEnv
           -> TyCoVarSet -- Free in the /type/ of the term
                         -- (a subset of the previous argument)
           -> Bool   -- True <=> is function
-          -> Bool   -- True <=> is bottom
+          -> Bool   -- True <=> looks like \x1..xn.bottom (n>=0)
           -> Bool   -- True <=> is a join point
           -> Level
 -- INVARIANT: if is_join=True then result >= join_ceiling
@@ -1460,7 +1436,7 @@ destLevel env fvs fvs_ty is_function is_bot is_join
 
   | is_bot              -- Send bottoming bindings to the top
   = as_far_as_poss      -- regardless; see Note [Bottoming floats]
-                        -- Esp Bottoming floats (1)
+                        -- Esp Bottoming floats (1) and (3)
 
   | Just n_args <- floatLams env
   , n_args > 0  -- n=0 case handled uniformly by the 'otherwise' case
@@ -1593,7 +1569,7 @@ initialEnv float_lams binds
        , le_subst     = mkEmptySubst in_scope_toplvl
        , le_env       = emptyVarEnv }
   where
-    in_scope_toplvl = emptyInScopeSet `extendInScopeSetList` bindersOfBinds binds
+    in_scope_toplvl = emptyInScopeSet `extendInScopeSetBndrs` binds
       -- The Simplifier (see Note [Glomming] in GHC.Core.Opt.OccurAnal) and
       -- the specialiser (see Note [Top level scope] in GHC.Core.Opt.Specialise)
       -- may both produce top-level bindings where an early binding refers
@@ -1629,7 +1605,9 @@ extendCaseBndrEnv :: LevelEnv
                   -> LevelEnv
 extendCaseBndrEnv le@(LE { le_subst = subst, le_env = id_env })
                   case_bndr (Var scrut_var)
-    | Many <- varMult case_bndr
+  -- We could use OccurAnal. scrutBinderSwap_maybe here, and perhaps
+  -- get a bit more floating.  But we didn't in the past and it's
+  -- an unforced change, so I'm leaving it.
   = le { le_subst   = extendSubstWithVar subst case_bndr scrut_var
        , le_env     = add_id id_env (case_bndr, scrut_var) }
 extendCaseBndrEnv env _ _ = env
@@ -1733,10 +1711,10 @@ newPolyBndrs dest_lvl
 
     mk_poly_bndr bndr uniq = transferPolyIdInfo bndr abs_vars $ -- Note [transferPolyIdInfo] in GHC.Types.Id
                              transfer_join_info bndr $
-                             mkSysLocal (mkFastString str) uniq (idMult bndr) poly_ty
+                             mkSysLocal str uniq (idMult bndr) poly_ty
                            where
-                             str     = "poly_" ++ occNameString (getOccName bndr)
-                             poly_ty = mkLamTypes abs_vars (GHC.Core.Subst.substTy subst (idType bndr))
+                             str     = fsLit "poly_" `appendFS` occNameFS (getOccName bndr)
+                             poly_ty = mkLamTypes abs_vars (substTyUnchecked subst (idType bndr))
 
     -- If we are floating a join point to top level, it stops being
     -- a join point.  Otherwise it continues to be a join point,
@@ -1768,7 +1746,7 @@ newLvlVar lvld_rhs join_arity_maybe is_mk_static
       = mkExportedVanillaId (mkSystemVarName uniq (mkFastString "static_ptr"))
                             rhs_ty
       | otherwise
-      = mkSysLocal (mkFastString "lvl") uniq Many rhs_ty
+      = mkSysLocal (mkFastString "lvl") uniq ManyTy rhs_ty
 
 -- | Clone the binders bound by a single-alternative case.
 cloneCaseBndrs :: LevelEnv -> Level -> [Var] -> LvlM (LevelEnv, [Var])

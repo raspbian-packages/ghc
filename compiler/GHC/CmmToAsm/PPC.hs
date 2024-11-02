@@ -28,7 +28,8 @@ ncgPPC config = NcgImpl
    , canShortcut               = PPC.canShortcut
    , shortcutStatics           = PPC.shortcutStatics
    , shortcutJump              = PPC.shortcutJump
-   , pprNatCmmDecl             = PPC.pprNatCmmDecl config
+   , pprNatCmmDeclH            = PPC.pprNatCmmDecl config
+   , pprNatCmmDeclS            = PPC.pprNatCmmDecl config
    , maxSpillSlots             = PPC.maxSpillSlots config
    , allocatableRegs           = PPC.allocatableRegs platform
    , ncgAllocMoreStack         = PPC.allocMoreStack platform
@@ -45,6 +46,7 @@ instance Instruction PPC.Instr where
    patchRegsOfInstr    = PPC.patchRegsOfInstr
    isJumpishInstr      = PPC.isJumpishInstr
    jumpDestsOfInstr    = PPC.jumpDestsOfInstr
+   canFallthroughTo    = PPC.canFallthroughTo
    patchJumpInstr      = PPC.patchJumpInstr
    mkSpillInstr        = PPC.mkSpillInstr
    mkLoadInstr         = PPC.mkLoadInstr

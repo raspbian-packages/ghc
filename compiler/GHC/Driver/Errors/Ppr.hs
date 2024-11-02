@@ -1,8 +1,13 @@
+{-# LANGUAGE DataKinds #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE TypeApplications #-}
 {-# OPTIONS_GHC -fno-warn-orphans #-} -- instance Diagnostic {DriverMessage, GhcMessage}
 
-module GHC.Driver.Errors.Ppr where
+module GHC.Driver.Errors.Ppr (
+  -- This module only exports Diagnostic instances.
+  ) where
 
 import GHC.Prelude
 
@@ -13,6 +18,7 @@ import GHC.HsToCore.Errors.Ppr ()
 import GHC.Parser.Errors.Ppr ()
 import GHC.Tc.Errors.Ppr ()
 import GHC.Types.Error
+import GHC.Types.Error.Codes ( constructorCode )
 import GHC.Unit.Types
 import GHC.Utils.Outputable
 import GHC.Unit.Module
@@ -22,6 +28,8 @@ import GHC.Types.SrcLoc
 import Data.Version
 
 import Language.Haskell.Syntax.Decls (RuleDecl(..))
+import GHC.Tc.Errors.Types (TcRnMessage)
+import GHC.HsToCore.Errors.Types (DsMessage)
 
 --
 -- Suggestions
@@ -32,19 +40,23 @@ suggestInstantiatedWith :: ModuleName -> GenInstantiations UnitId -> [Instantiat
 suggestInstantiatedWith pi_mod_name insts =
   [ InstantiationSuggestion k v | (k,v) <- ((pi_mod_name, mkHoleModule pi_mod_name) : insts) ]
 
-
 instance Diagnostic GhcMessage where
-  diagnosticMessage = \case
+  type DiagnosticOpts GhcMessage = GhcMessageOpts
+  defaultDiagnosticOpts = GhcMessageOpts (defaultDiagnosticOpts @PsMessage)
+                                         (defaultDiagnosticOpts @TcRnMessage)
+                                         (defaultDiagnosticOpts @DsMessage)
+                                         (defaultDiagnosticOpts @DriverMessage)
+  diagnosticMessage opts = \case
     GhcPsMessage m
-      -> diagnosticMessage m
+      -> diagnosticMessage (psMessageOpts opts) m
     GhcTcRnMessage m
-      -> diagnosticMessage m
+      -> diagnosticMessage (tcMessageOpts opts) m
     GhcDsMessage m
-      -> diagnosticMessage m
+      -> diagnosticMessage (dsMessageOpts opts) m
     GhcDriverMessage m
-      -> diagnosticMessage m
-    GhcUnknownMessage m
-      -> diagnosticMessage m
+      -> diagnosticMessage (driverMessageOpts opts) m
+    GhcUnknownMessage (UnknownDiagnostic @e m)
+      -> diagnosticMessage (defaultDiagnosticOpts @e) m
 
   diagnosticReason = \case
     GhcPsMessage m
@@ -70,12 +82,16 @@ instance Diagnostic GhcMessage where
     GhcUnknownMessage m
       -> diagnosticHints m
 
+  diagnosticCode = constructorCode
+
 instance Diagnostic DriverMessage where
-  diagnosticMessage = \case
-    DriverUnknownMessage m
-      -> diagnosticMessage m
+  type DiagnosticOpts DriverMessage = DriverMessageOpts
+  defaultDiagnosticOpts = DriverMessageOpts (defaultDiagnosticOpts @PsMessage)
+  diagnosticMessage opts = \case
+    DriverUnknownMessage (UnknownDiagnostic @e m)
+      -> diagnosticMessage (defaultDiagnosticOpts @e) m
     DriverPsHeaderMessage m
-      -> diagnosticMessage m
+      -> diagnosticMessage (psDiagnosticOpts opts) m
     DriverMissingHomeModules uid missing buildingCabalPackage
       -> let msg | buildingCabalPackage == YesBuildingCabalPackage
                  = hang
@@ -148,8 +164,8 @@ instance Diagnostic DriverMessage where
       -> mkSimpleDecorated (text "module" <+> ppr modname <+> text "was not found")
     DriverUserDefinedRuleIgnored (HsRule { rd_name = n })
       -> mkSimpleDecorated $
-            text "Rule \"" <> ftext (snd $ unLoc n) <> text "\" ignored" $+$
-            text "User defined rules are disabled under Safe Haskell"
+            text "Rule \"" <> ftext (unLoc n) <> text "\" ignored" $+$
+            text "Defining user rules is disabled under Safe Haskell"
     DriverMixedSafetyImport modName
       -> mkSimpleDecorated $
            text "Module" <+> ppr modName <+> text ("is imported both as a safe and unsafe import!")
@@ -312,3 +328,5 @@ instance Diagnostic DriverMessage where
       -> noHints
     DriverHomePackagesNotClosed {}
       -> noHints
+
+  diagnosticCode = constructorCode

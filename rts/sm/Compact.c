@@ -20,7 +20,6 @@
 #include "BlockAlloc.h"
 #include "GC.h"
 #include "Compact.h"
-#include "Schedule.h"
 #include "Apply.h"
 #include "Trace.h"
 #include "Weak.h"
@@ -451,6 +450,13 @@ thread_AP_STACK (StgAP_STACK *ap)
     return (P_)ap + sizeofW(StgAP_STACK) + ap->size;
 }
 
+STATIC_INLINE P_
+thread_continuation(StgContinuation *cont)
+{
+    thread_stack(cont->stack, cont->stack + cont->stack_size);
+    return (P_)cont + continuation_sizeW(cont);
+}
+
 static P_
 thread_TSO (StgTSO *tso)
 {
@@ -469,6 +475,10 @@ thread_TSO (StgTSO *tso)
     thread_(&tso->bq);
 
     thread_(&tso->trec);
+
+    if (tso->label != NULL) {
+        thread_((StgClosure **)&tso->label);
+    }
 
     thread_(&tso->stackobj);
     return (P_)tso + sizeofW(StgTSO);
@@ -609,6 +619,10 @@ update_fwd_large( bdescr *bd )
         }
         continue;
     }
+
+    case CONTINUATION:
+        thread_continuation((StgContinuation *)p);
+        continue;
 
     default:
       barf("update_fwd_large: unknown/strange object  %d", (int)(info->type));
@@ -796,6 +810,9 @@ thread_obj (const StgInfoTable *info, P_ p)
         return p + sizeofW(StgTRecChunk);
     }
 
+    case CONTINUATION:
+        return thread_continuation((StgContinuation *)p);
+
     default:
         barf("update_fwd: unknown/strange object  %d", (int)(info->type));
         return NULL;
@@ -962,8 +979,6 @@ compact(StgClosure *static_objects,
 {
     // 1. thread the roots
     markCapabilities((evac_fn)thread_root, NULL);
-
-    markScheduler((evac_fn)thread_root, NULL);
 
     // the weak pointer lists...
     for (W_ g = 0; g < RtsFlags.GcFlags.generations; g++) {

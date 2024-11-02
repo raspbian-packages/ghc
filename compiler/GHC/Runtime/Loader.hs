@@ -2,7 +2,7 @@
 
 -- | Dynamically lookup up values from modules and loading them.
 module GHC.Runtime.Loader (
-        initializePlugins,
+        initializePlugins, initializeSessionPlugins,
         -- * Loading plugins
         loadFrontendPlugin,
 
@@ -21,11 +21,13 @@ module GHC.Runtime.Loader (
     ) where
 
 import GHC.Prelude
+import GHC.Data.FastString
 
 import GHC.Driver.Session
 import GHC.Driver.Ppr
 import GHC.Driver.Hooks
 import GHC.Driver.Plugins
+import GHC.Driver.Plugins.External
 
 import GHC.Linker.Loader       ( loadModule, loadName )
 import GHC.Runtime.Interpreter ( wormhole )
@@ -37,15 +39,16 @@ import GHC.Rename.Names ( gresFromAvails )
 import GHC.Builtin.Names ( pluginTyConName, frontendPluginTyConName )
 
 import GHC.Driver.Env
-import GHCi.RemoteTypes  ( HValue )
-import GHC.Core.Type     ( Type, eqType, mkTyConTy )
-import GHC.Core.TyCon    ( TyCon )
+import GHCi.RemoteTypes     ( HValue )
+import GHC.Core.Type        ( Type, mkTyConTy )
+import GHC.Core.TyCo.Compare( eqType )
+import GHC.Core.TyCon       ( TyCon )
 
 import GHC.Types.SrcLoc        ( noSrcSpan )
 import GHC.Types.Name    ( Name, nameModule_maybe )
 import GHC.Types.Id      ( idType )
 import GHC.Types.TyThing
-import GHC.Types.Name.Occurrence ( OccName, mkVarOcc )
+import GHC.Types.Name.Occurrence ( OccName, mkVarOccFS )
 import GHC.Types.Name.Reader   ( RdrName, ImportSpec(..), ImpDeclSpec(..)
                                , ImpItemSpec(..), mkGlobalRdrEnv, lookupGRE_RdrName
                                , greMangledName, mkRdrQual )
@@ -68,6 +71,11 @@ import Unsafe.Coerce     ( unsafeCoerce )
 import GHC.Linker.Types
 import GHC.Types.Unique.DFM
 import Data.List (unzip4)
+import GHC.Driver.Monad
+
+-- | Initialise plugins specified by the current DynFlags and update the session.
+initializeSessionPlugins :: GhcMonad m => m ()
+initializeSessionPlugins = getSession >>= liftIO . initializePlugins >>= setSession
 
 -- | Loads the plugins specified in the pluginModNames field of the dynamic
 -- flags. Should be called after command line arguments are parsed, but before
@@ -75,22 +83,48 @@ import Data.List (unzip4)
 -- pluginModNames or pluginModNameOpts changes.
 initializePlugins :: HscEnv -> IO HscEnv
 initializePlugins hsc_env
-    -- plugins not changed
+    -- check that plugin specifications didn't change
+
+    -- dynamic plugins
   | loaded_plugins <- loadedPlugins (hsc_plugins hsc_env)
   , map lpModuleName loaded_plugins == reverse (pluginModNames dflags)
-   -- arguments not changed
   , all same_args loaded_plugins
-  = return hsc_env -- no need to reload plugins FIXME: doesn't take static plugins into account
+
+    -- external plugins
+  , external_plugins <- externalPlugins (hsc_plugins hsc_env)
+  , check_external_plugins external_plugins (externalPluginSpecs dflags)
+
+    -- FIXME: we should check static plugins too
+
+  = return hsc_env -- no change, no need to reload plugins
+
   | otherwise
   = do (loaded_plugins, links, pkgs) <- loadPlugins hsc_env
-       let plugins' = (hsc_plugins hsc_env) { loadedPlugins = loaded_plugins, loadedPluginDeps = (links, pkgs) }
+       external_plugins <- loadExternalPlugins (externalPluginSpecs dflags)
+       let plugins' = (hsc_plugins hsc_env) { staticPlugins    = staticPlugins (hsc_plugins hsc_env)
+                                            , externalPlugins  = external_plugins
+                                            , loadedPlugins    = loaded_plugins
+                                            , loadedPluginDeps = (links, pkgs)
+                                            }
        let hsc_env' = hsc_env { hsc_plugins = plugins' }
        withPlugins (hsc_plugins hsc_env') driverPlugin hsc_env'
   where
+    dflags = hsc_dflags hsc_env
+    -- dynamic plugins
     plugin_args = pluginModNameOpts dflags
     same_args p = paArguments (lpPlugin p) == argumentsForPlugin p plugin_args
     argumentsForPlugin p = map snd . filter ((== lpModuleName p) . fst)
-    dflags = hsc_dflags hsc_env
+    -- external plugins
+    check_external_plugin p spec = and
+      [ epUnit                p  == esp_unit_id spec
+      , epModule              p  == esp_module spec
+      , paArguments (epPlugin p) == esp_args spec
+      ]
+    check_external_plugins eps specs = case (eps,specs) of
+      ([]  , [])  -> True
+      (_   , [])  -> False -- some external plugin removed
+      ([]  , _ )  -> False -- some external plugin added
+      (p:ps,s:ss) -> check_external_plugin p s && check_external_plugins ps ss
 
 loadPlugins :: HscEnv -> IO ([LoadedPlugin], [Linkable], PkgsLoaded)
 loadPlugins hsc_env
@@ -109,14 +143,14 @@ loadPlugins hsc_env
       where
         options = [ option | (opt_mod_nm, option) <- pluginModNameOpts dflags
                             , opt_mod_nm == mod_nm ]
-    loadPlugin = loadPlugin' (mkVarOcc "plugin") pluginTyConName hsc_env
+    loadPlugin = loadPlugin' (mkVarOccFS (fsLit "plugin")) pluginTyConName hsc_env
 
 
 loadFrontendPlugin :: HscEnv -> ModuleName -> IO (FrontendPlugin, [Linkable], PkgsLoaded)
 loadFrontendPlugin hsc_env mod_name = do
     checkExternalInterpreter hsc_env
     (plugin, _iface, links, pkgs)
-      <- loadPlugin' (mkVarOcc "frontendPlugin") frontendPluginTyConName
+      <- loadPlugin' (mkVarOccFS (fsLit "frontendPlugin")) frontendPluginTyConName
            hsc_env mod_name
     return (plugin, links, pkgs)
 

@@ -17,6 +17,8 @@ module GHC.Plugins
    , module GHC.Types.Id.Info
    , module GHC.Types.PkgQual
    , module GHC.Core.Opt.Monad
+   , module GHC.Core.Opt.Pipeline.Types
+   , module GHC.Core.Opt.Stats
    , module GHC.Core
    , module GHC.Types.Literal
    , module GHC.Core.DataCon
@@ -83,6 +85,8 @@ import GHC.Types.Id.Info
 
 -- Core
 import GHC.Core.Opt.Monad
+import GHC.Core.Opt.Pipeline.Types
+import GHC.Core.Opt.Stats
 import GHC.Core
 import GHC.Types.Literal
 import GHC.Core.DataCon
@@ -193,7 +197,7 @@ thNameToGhcName th_name = do
 -- For now, the easiest and recommended way to ensure a consistent
 -- 'NameCache' is used it to retrieve the preexisting one from an active
 -- 'HscEnv'. A single 'HscEnv' is created per GHC "session", and this
--- ensures everything in that sesssion will getthe same name cache.
+-- ensures everything in that session will get the same name cache.
 thNameToGhcNameIO :: NameCache -> TH.Name -> IO (Maybe Name)
 thNameToGhcNameIO cache th_name
   =  do { names <- mapMaybeM lookup (thRdrNameGuesses th_name)

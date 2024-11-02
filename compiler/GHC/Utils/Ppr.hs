@@ -79,7 +79,7 @@ module GHC.Utils.Ppr (
         lparen, rparen, lbrack, rbrack, lbrace, rbrace,
 
         -- ** Wrapping documents in delimiters
-        parens, brackets, braces, quotes, quote, doubleQuotes,
+        parens, brackets, braces, quotes, squotes, quote, doubleQuotes,
         maybeParens,
 
         -- ** Combining documents
@@ -93,6 +93,7 @@ module GHC.Utils.Ppr (
 
         -- * Predicates on documents
         isEmpty,
+        docHead,
 
         -- * Rendering documents
 
@@ -107,11 +108,12 @@ module GHC.Utils.Ppr (
 
         -- ** GHC-specific rendering
         printDoc, printDoc_,
-        bufLeftRender -- performance hack
+        bufLeftRender, printLeftRender -- performance hack
 
   ) where
 
-import GHC.Prelude hiding (error)
+import GHC.Prelude.Basic hiding (error)
+import Control.Applicative ((<|>))
 
 import GHC.Utils.BufHandle
 import GHC.Data.FastString
@@ -350,6 +352,37 @@ isEmpty :: Doc -> Bool
 isEmpty Empty = True
 isEmpty _     = False
 
+-- | Get the first character of a document. We also return a new document,
+-- equivalent to the original one but faster to render. Use it to avoid work
+-- duplication.
+docHead :: Doc -> (Maybe Char, Doc)
+docHead d = (headChar, rdoc)
+  where
+    rdoc = reduceDoc d
+    headChar = go rdoc
+
+    go :: RDoc -> Maybe Char
+    go (Union p q)  = go (first p q)
+    go (Nest _ p)   = go p
+    go Empty        = Nothing
+    go (NilAbove _) = Just '\n'
+    go (TextBeside td _ p) = go_td td <|> go p
+    go NoDoc       = error "docHead: NoDoc"
+    go (Above {})  = error "docHead: Above"
+    go (Beside {}) = error "docHead: Beside"
+
+    go_td :: TextDetails -> Maybe Char
+    go_td (Chr c)  = Just c
+    go_td (Str s)  = go_str s
+    go_td (PStr s) = go_str (unpackFS s) -- O(1) because unpackFS is lazy
+    go_td (ZStr s) = go_str (zStringTakeN 1 s)
+    go_td (LStr s) = go_str (unpackPtrStringTakeN 1 s)
+    go_td (RStr n c) = if n > 0 then Just c else Nothing
+
+    go_str :: String -> Maybe Char
+    go_str []    = Nothing
+    go_str (c:_) = Just c
+
 {-
 Q: What is the reason for negative indentation (i.e. argument to indent
    is < 0) ?
@@ -429,10 +462,12 @@ hex      n = text ('0' : 'x' : padded)
 parens       :: Doc -> Doc -- ^ Wrap document in @(...)@
 brackets     :: Doc -> Doc -- ^ Wrap document in @[...]@
 braces       :: Doc -> Doc -- ^ Wrap document in @{...}@
-quotes       :: Doc -> Doc -- ^ Wrap document in @\'...\'@
+quotes       :: Doc -> Doc -- ^ Wrap document in @\`...\'@
+squotes      :: Doc -> Doc -- ^ Wrap document in @\'...\'@
 quote        :: Doc -> Doc
 doubleQuotes :: Doc -> Doc -- ^ Wrap document in @\"...\"@
 quotes p       = char '`' <> p <> char '\''
+squotes p      = char '\'' <> p <> char '\''
 quote p        = char '\'' <> p
 doubleQuotes p = char '"' <> p <> char '"'
 parens p       = char '(' <> p <> char ')'
@@ -1137,16 +1172,14 @@ bufLeftRender :: BufHandle -> Doc -> IO ()
 bufLeftRender b doc = layLeft b (reduceDoc doc)
 
 layLeft :: BufHandle -> Doc -> IO ()
-layLeft b _ | b `seq` False  = undefined -- make it strict in b
-layLeft _ NoDoc              = error "layLeft: NoDoc"
+layLeft !_ NoDoc             = error "layLeft: NoDoc"
 layLeft b (Union p q)        = layLeft b $! first p q
 layLeft b (Nest _ p)         = layLeft b $! p
 layLeft b Empty              = bPutChar b '\n'
-layLeft b (NilAbove p)       = p `seq` (bPutChar b '\n' >> layLeft b p)
-layLeft b (TextBeside s _ p) = s `seq` (put b s >> layLeft b p)
+layLeft b (NilAbove p)       = bPutChar b '\n' >> layLeft b p
+layLeft b (TextBeside s _ p) = put b s >> layLeft b p
  where
-    put b _ | b `seq` False = undefined
-    put b (Chr c)    = bPutChar b c
+    put !b (Chr c)   = bPutChar b c
     put b (Str s)    = bPutStr  b s
     put b (PStr s)   = bPutFS   b s
     put b (ZStr s)   = bPutFZS  b s

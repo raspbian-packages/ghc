@@ -7,7 +7,7 @@ AC_CONFIG_SRCDIR([include/HsBase.h])
 AC_CONFIG_HEADERS([include/HsBaseConfig.h include/EventConfig.h])
 
 AC_PROG_CC
-dnl make extensions visible to allow feature-tests to detect them lateron
+dnl make extensions visible to allow feature-tests to detect them later on
 AC_USE_SYSTEM_EXTENSIONS
 
 AC_MSG_CHECKING(for WINDOWS platform)
@@ -37,6 +37,7 @@ AC_CHECK_HEADERS([wctype.h], [AC_CHECK_FUNCS(iswspace)])
 AC_CHECK_FUNCS([lstat])
 AC_CHECK_LIB([rt], [clock_gettime])
 AC_CHECK_FUNCS([clock_gettime])
+AC_CHECK_DECLS([CLOCK_PROCESS_CPUTIME_ID], [], [], [[#include <time.h>]])
 AC_CHECK_FUNCS([getclock getrusage times])
 AC_CHECK_FUNCS([_chsize_s ftruncate])
 
@@ -82,6 +83,16 @@ fi
 
 # unsetenv
 AC_CHECK_FUNCS([unsetenv])
+
+AC_CHECK_FUNCS([chmod])
+AC_CHECK_FUNCS([dup])
+AC_CHECK_FUNCS([fork])
+AC_CHECK_FUNCS([getpid])
+AC_CHECK_FUNCS([mkfifo])
+AC_CHECK_FUNCS([pipe])
+AC_CHECK_FUNCS([umask])
+
+AC_CHECK_TYPE([struct rlimit],[AC_DEFINE([HAVE_STRUCT_RLIMIT],[1],[HAVE_STRUCT_RLIMIT])],[],[#include <sys/resource.h>])
 
 ###  POSIX.1003.1 unsetenv returns 0 or -1 (EINVAL), but older implementations
 ###  in common use return void.

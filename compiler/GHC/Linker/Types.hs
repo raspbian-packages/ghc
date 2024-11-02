@@ -5,7 +5,7 @@
 -- (c) The University of Glasgow 2019
 --
 -----------------------------------------------------------------------------
-
+{-# LANGUAGE TypeApplications #-}
 module GHC.Linker.Types
    ( Loader (..)
    , LoaderState (..)
@@ -55,6 +55,7 @@ import Data.Maybe
 import GHC.Unit.Module.Env
 import GHC.Types.Unique.DSet
 import GHC.Types.Unique.DFM
+import GHC.Unit.Module.WholeCoreBindings
 
 
 {- **********************************************************************
@@ -107,7 +108,7 @@ modifyClosureEnv pls f =
     in pls { linker_env = le { closure_env = f ce } }
 
 data LinkerEnv = LinkerEnv
-  { closure_env :: !ClosureEnv
+  { closure_env :: ClosureEnv
       -- ^ Current global mapping from closure Names to their true values
 
   , itbl_env    :: !ItblEnv
@@ -192,6 +193,10 @@ data Unlinked
   = DotO ObjFile       -- ^ An object file (.o)
   | DotA FilePath      -- ^ Static archive file (.a)
   | DotDLL FilePath    -- ^ Dynamically linked library file (.so, .dll, .dylib)
+  | CoreBindings WholeCoreBindings -- ^ Serialised core which we can turn into BCOs (or object files), or used by some other backend
+                       -- See Note [Interface Files with Core Definitions]
+  | LoadedBCOs [Unlinked] -- ^ A list of BCOs, but hidden behind extra indirection to avoid
+                          -- being too strict.
   | BCOs CompiledByteCode
          [SptEntry]    -- ^ A byte-code object, lives only in memory. Also
                        -- carries some static pointer table entries which
@@ -204,6 +209,8 @@ instance Outputable Unlinked where
   ppr (DotA path)   = text "DotA" <+> text path
   ppr (DotDLL path) = text "DotDLL" <+> text path
   ppr (BCOs bcos spt) = text "BCOs" <+> ppr bcos <+> ppr spt
+  ppr (LoadedBCOs{})  = text "LoadedBCOs"
+  ppr (CoreBindings {})       = text "FI"
 
 -- | An entry to be inserted into a module's static pointer table.
 -- See Note [Grand plan for static forms] in "GHC.Iface.Tidy.StaticPtrTable".
@@ -241,6 +248,8 @@ nameOfObject_maybe :: Unlinked -> Maybe FilePath
 nameOfObject_maybe (DotO fn)   = Just fn
 nameOfObject_maybe (DotA fn)   = Just fn
 nameOfObject_maybe (DotDLL fn) = Just fn
+nameOfObject_maybe (CoreBindings {}) = Nothing
+nameOfObject_maybe (LoadedBCOs{}) = Nothing
 nameOfObject_maybe (BCOs {})   = Nothing
 
 -- | Retrieve the filename of the linkable if possible. Panic if it is a byte-code object
@@ -248,8 +257,9 @@ nameOfObject :: Unlinked -> FilePath
 nameOfObject o = fromMaybe (pprPanic "nameOfObject" (ppr o)) (nameOfObject_maybe o)
 
 -- | Retrieve the compiled byte-code if possible. Panic if it is a file-based linkable
-byteCodeOfObject :: Unlinked -> CompiledByteCode
-byteCodeOfObject (BCOs bc _) = bc
+byteCodeOfObject :: Unlinked -> [CompiledByteCode]
+byteCodeOfObject (BCOs bc _) = [bc]
+byteCodeOfObject (LoadedBCOs ul) = concatMap byteCodeOfObject ul
 byteCodeOfObject other       = pprPanic "byteCodeOfObject" (ppr other)
 
 {- **********************************************************************
@@ -280,7 +290,7 @@ data LibrarySpec
    | Framework String   -- Only used for darwin, but does no harm
 
 instance Outputable LibrarySpec where
-  ppr (Objects objs) = text "Objects" <+> ppr objs
+  ppr (Objects objs) = text "Objects" <+> ppr (map (text @SDoc) objs)
   ppr (Archive a) = text "Archive" <+> text a
   ppr (DLL s) = text "DLL" <+> text s
   ppr (DLLPath f) = text "DLLPath" <+> text f

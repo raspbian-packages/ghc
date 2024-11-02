@@ -3,13 +3,13 @@ module Context (
     Context (..), vanillaContext, stageContext,
 
     -- * Expressions
-    getStage, getPackage, getWay, getStagedSettingList, getBuildPath,
+    getStage, getPackage, getWay, getStagedSettingList, getBuildPath, getPackageDbLoc,
 
     -- * Paths
-    contextDir, buildPath, buildDir, pkgInplaceConfig, pkgSetupConfigFile,
+    contextDir, buildPath, buildDir, pkgInplaceConfig, pkgSetupConfigFile, pkgSetupConfigDir,
     pkgHaddockFile, pkgRegisteredLibraryFile, pkgRegisteredLibraryFileName,
     pkgLibraryFile, pkgGhciLibraryFile,
-    pkgConfFile, objectPath, contextPath, getContextPath, libPath, distDir,
+    pkgConfFile, pkgStampFile, resourcePath, objectPath, contextPath, getContextPath, libPath, distDir,
     haddockStatsFilesDir
     ) where
 
@@ -22,7 +22,7 @@ import Oracles.Setting
 
 -- | Most targets are built only one way, hence the notion of 'vanillaContext'.
 vanillaContext :: Stage -> Package -> Context
-vanillaContext s p = Context s p vanilla
+vanillaContext s p = Context s p vanilla Final
 
 -- | Partial context with undefined 'Package' field. Useful for 'Packages'
 -- expressions that only read the environment and current 'Stage'.
@@ -32,6 +32,12 @@ stageContext s = vanillaContext s $ error "stageContext: package not set"
 -- | Get the 'Stage' of the current 'Context'.
 getStage :: Expr Context b Stage
 getStage = stage <$> getContext
+
+getInplace :: Expr Context b Inplace
+getInplace = iplace <$> getContext
+
+getPackageDbLoc :: Expr Context b PackageDbLoc
+getPackageDbLoc = PackageDbLoc <$> getStage <*> getInplace
 
 -- | Get the 'Package' of the current 'Context'.
 getPackage :: Expr Context b Package
@@ -79,9 +85,12 @@ pkgFile context@Context {..} prefix suffix = do
 pkgInplaceConfig :: Context -> Action FilePath
 pkgInplaceConfig context = contextPath context <&> (-/- "inplace-pkg-config")
 
+pkgSetupConfigDir :: Context -> Action FilePath
+pkgSetupConfigDir context = contextPath context
+
 -- | Path to the @setup-config@ of a given 'Context'.
 pkgSetupConfigFile :: Context -> Action FilePath
-pkgSetupConfigFile context = contextPath context <&> (-/- "setup-config")
+pkgSetupConfigFile context = pkgSetupConfigDir context <&> (-/- "setup-config")
 
 -- | Path to the haddock file of a given 'Context', e.g.:
 -- @_build/stage1/libraries/array/doc/html/array/array.haddock@.
@@ -129,8 +138,16 @@ pkgGhciLibraryFile context@Context {..} = do
 pkgConfFile :: Context -> Action FilePath
 pkgConfFile Context {..} = do
     pid  <- pkgIdentifier package
-    dbPath <- packageDbPath stage
+    dbPath <- packageDbPath (PackageDbLoc stage iplace)
     return $ dbPath -/- pid <.> "conf"
+
+-- | Path to the stamp file for a given 'Context'. The stamp file records if
+-- we have built all the objects necessary for a certain way or not.
+pkgStampFile :: Context -> Action FilePath
+pkgStampFile c@Context{..} = do
+    let extension = waySuffix way
+    pkgFile c "stamp-" extension
+
 
 -- | Given a 'Context' and a 'FilePath' to a source file, compute the 'FilePath'
 -- to its object file. For example:
@@ -146,3 +163,10 @@ objectPath context@Context {..} src = do
                | "*hs*" ?== extension = path -/- obj
                | otherwise            = path -/- extension -/- obj
     return result
+
+
+resourcePath :: Context -> FilePath -> Action FilePath
+resourcePath context src = do
+    path <- buildPath context
+    let extension = drop 1 $ takeExtension src
+    return (path -/- extension -/- src)

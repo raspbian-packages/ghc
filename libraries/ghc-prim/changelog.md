@@ -1,7 +1,32 @@
-## 0.9.1 *August 2023*
+## 0.10.0
 
-- Shipped with GHC 9.4.6
-- Restore `mingwex` dependency on Windows (#23309)
+- Shipped with GHC 9.6.1
+
+- The `listThreads#` primop was added, allowing the user to enumerate all
+  threads (running and blocked) in the program:
+  ```haskell
+  listThreads# :: State# RealWorld -> (# State# RealWorld, Array# ThreadId# #)
+  ```
+
+- The type of the `labelThread#` primop was changed from:
+  ```haskell
+  labelThread# :: ThreadId# -> Addr# -> State# RealWorld -> State# RealWorld
+  ```
+  to
+  ```haskell
+  labelThread# :: ThreadId# -> ByteArray# -> State# RealWorld -> State# RealWorld
+  ```
+  Where the `ByteArray#` must contain a UTF-8-encoded string.
+
+- The `threadLabel#` primop was added, allowing the user to query the label of
+  a given `ThreadId#`.
+
+- `isByteArrayPinned#` now only considers an array pinned if it was explicitly pinned
+  by the user. This is required to avoid ghc issue [#22255](https://gitlab.haskell.org/ghc/ghc/-/issues/22255)
+  which showed that the old behaviour could cause segfaults when used in combination
+  with compact regions.
+  We are working on ways to allow users and library authors to get back the
+  performance benefits of the old behaviour where possible.
 
 ## 0.9.0 *August 2022*
 
@@ -10,9 +35,8 @@
 - `magicDict` has been renamed to `withDict` and is now defined in
   `GHC.Magic.Dict` instead of `GHC.Prim`. `withDict` now has the type:
 
-  ```
-  class WithDict cls meth where
-    withDict :: forall {rr :: RuntimeRep} (r :: TYPE rr). meth -> (cls => r) -> r
+  ```haskell
+  withDict :: forall {rr :: RuntimeRep} st dt (r :: TYPE rr). st -> (dt => r) -> r
   ```
 
   Unlike `magicDict`, `withDict` can be used without defining an
@@ -22,10 +46,10 @@
   ```haskell
   withTypeable :: forall k (a :: k) rep (r :: TYPE rep). ()
                => TypeRep a -> (Typeable a => r) -> r
-  withTypeable rep k = withDict @(Typeable a) rep k
+  withTypeable rep k = withDict @(TypeRep a) @(Typeable a) rep k
   ```
 
-  Note that the explicit type application is required, as the call to
+  Note that the explicit type applications are required, as the call to
   `withDict` would be ambiguous otherwise.
 
 - Primitive types and functions which handle boxed values are now levity-polymorphic,

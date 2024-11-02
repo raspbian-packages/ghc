@@ -2,6 +2,7 @@
 {-# LANGUAGE ConstraintKinds #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeApplications #-}
@@ -91,28 +92,32 @@ import GHC.Prelude
 
 import Language.Haskell.Syntax.Type
 
-import {-# SOURCE #-} GHC.Hs.Expr ( pprSplice )
+import {-# SOURCE #-} GHC.Hs.Expr ( pprUntypedSplice, HsUntypedSpliceResult(..) )
 
 import Language.Haskell.Syntax.Extension
+import GHC.Core.DataCon( SrcStrictness(..), SrcUnpackedness(..), HsImplBang(..) )
 import GHC.Hs.Extension
 import GHC.Parser.Annotation
 
 import GHC.Types.Fixity ( LexicalFixity(..) )
 import GHC.Types.Id ( Id )
 import GHC.Types.SourceText
-import GHC.Types.Name( Name, NamedThing(getName) )
+import GHC.Types.Name( Name, NamedThing(getName), tcName, dataName )
 import GHC.Types.Name.Reader ( RdrName )
-import GHC.Types.Var ( VarBndr )
+import GHC.Types.Var ( VarBndr, visArgTypeLike )
 import GHC.Core.TyCo.Rep ( Type(..) )
 import GHC.Builtin.Types( manyDataConName, oneDataConName, mkTupleStr )
 import GHC.Core.Ppr ( pprOccWithTick)
 import GHC.Core.Type
+import GHC.Core.Multiplicity( pprArrowWithMultiplicity )
 import GHC.Hs.Doc
 import GHC.Types.Basic
 import GHC.Types.SrcLoc
 import GHC.Utils.Outputable
+import GHC.Utils.Misc (count)
 
 import Data.Maybe
+import Data.Data (Data)
 
 import qualified Data.Semigroup as S
 
@@ -202,9 +207,17 @@ type instance XHsWC              GhcTc b = [Name]
 
 type instance XXHsWildCardBndrs (GhcPass _) _ = DataConCantHappen
 
-type instance XHsPS GhcPs = EpAnn EpaLocation
+type instance XHsPS GhcPs = EpAnnCO
 type instance XHsPS GhcRn = HsPSRn
 type instance XHsPS GhcTc = HsPSRn
+
+-- | The extension field for 'HsPatSigType', which is only used in the
+-- renamer onwards. See @Note [Pattern signature binders and scoping]@.
+data HsPSRn = HsPSRn
+  { hsps_nwcs    :: [Name] -- ^ Wildcard names
+  , hsps_imp_tvs :: [Name] -- ^ Implicitly bound variable names
+  }
+  deriving Data
 
 type instance XXHsPatSigType (GhcPass _) = DataConCantHappen
 
@@ -251,7 +264,7 @@ mkHsWildCardBndrs :: thing -> HsWildCardBndrs GhcPs thing
 mkHsWildCardBndrs x = HsWC { hswc_body = x
                            , hswc_ext  = noExtField }
 
-mkHsPatSigType :: EpAnn EpaLocation -> LHsType GhcPs -> HsPatSigType GhcPs
+mkHsPatSigType :: EpAnnCO -> LHsType GhcPs -> HsPatSigType GhcPs
 mkHsPatSigType ann x = HsPS { hsps_ext  = ann
                             , hsps_body = x }
 
@@ -302,7 +315,7 @@ type instance XKindSig         (GhcPass _) = EpAnn [AddEpAnn]
 type instance XAppKindTy       (GhcPass _) = SrcSpan -- Where the `@` lives
 
 type instance XSpliceTy        GhcPs = NoExtField
-type instance XSpliceTy        GhcRn = NoExtField
+type instance XSpliceTy        GhcRn = HsUntypedSpliceResult (LHsType GhcRn)
 type instance XSpliceTy        GhcTc = Kind
 
 type instance XDocTy           (GhcPass _) = EpAnn [AddEpAnn]
@@ -325,6 +338,19 @@ type instance XTyLit           (GhcPass _) = NoExtField
 type instance XWildCardTy      (GhcPass _) = NoExtField
 
 type instance XXType         (GhcPass _) = HsCoreTy
+
+-- An escape hatch for tunnelling a Core 'Type' through 'HsType'.
+-- For more details on how this works, see:
+--
+-- * @Note [Renaming HsCoreTys]@ in "GHC.Rename.HsType"
+--
+-- * @Note [Typechecking HsCoreTys]@ in "GHC.Tc.Gen.HsType"
+type HsCoreTy = Type
+
+type instance XNumTy         (GhcPass _) = SourceText
+type instance XStrTy         (GhcPass _) = SourceText
+type instance XCharTy        (GhcPass _) = SourceText
+type instance XXTyLit        (GhcPass _) = DataConCantHappen
 
 
 oneDataConHsTy :: HsType GhcRn
@@ -358,9 +384,9 @@ instance
 
 -- See #18846
 pprHsArrow :: (OutputableBndrId pass) => HsArrow (GhcPass pass) -> SDoc
-pprHsArrow (HsUnrestrictedArrow _) = arrow
-pprHsArrow (HsLinearArrow _) = lollipop
-pprHsArrow (HsExplicitMult _ p _) = mulArrow (ppr p)
+pprHsArrow (HsUnrestrictedArrow _) = pprArrowWithMultiplicity visArgTypeLike (Left False)
+pprHsArrow (HsLinearArrow _)       = pprArrowWithMultiplicity visArgTypeLike (Left True)
+pprHsArrow (HsExplicitMult _ p _)  = pprArrowWithMultiplicity visArgTypeLike (Right (ppr p))
 
 type instance XConDeclField  (GhcPass _) = EpAnn [AddEpAnn]
 type instance XXConDeclField (GhcPass _) = DataConCantHappen
@@ -529,6 +555,66 @@ lhsTypeArgSrcSpan arg = case arg of
   HsValArg  tm    -> getLocA tm
   HsTypeArg at ty -> at `combineSrcSpans` getLocA ty
   HsArgPar  sp    -> sp
+
+--------------------------------
+
+numVisibleArgs :: [HsArg tm ty] -> Arity
+numVisibleArgs = count is_vis
+  where is_vis (HsValArg _) = True
+        is_vis _            = False
+
+--------------------------------
+
+-- | @'pprHsArgsApp' id fixity args@ pretty-prints an application of @id@
+-- to @args@, using the @fixity@ to tell whether @id@ should be printed prefix
+-- or infix. Examples:
+--
+-- @
+-- pprHsArgsApp T Prefix [HsTypeArg Bool, HsValArg Int]                        = T \@Bool Int
+-- pprHsArgsApp T Prefix [HsTypeArg Bool, HsArgPar, HsValArg Int]              = (T \@Bool) Int
+-- pprHsArgsApp (++) Infix [HsValArg Char, HsValArg Double]                    = Char ++ Double
+-- pprHsArgsApp (++) Infix [HsValArg Char, HsValArg Double, HsVarArg Ordering] = (Char ++ Double) Ordering
+-- @
+pprHsArgsApp :: (OutputableBndr id, Outputable tm, Outputable ty)
+             => id -> LexicalFixity -> [HsArg tm ty] -> SDoc
+pprHsArgsApp thing fixity (argl:argr:args)
+  | Infix <- fixity
+  = let pp_op_app = hsep [ ppr_single_hs_arg argl
+                         , pprInfixOcc thing
+                         , ppr_single_hs_arg argr ] in
+    case args of
+      [] -> pp_op_app
+      _  -> ppr_hs_args_prefix_app (parens pp_op_app) args
+
+pprHsArgsApp thing _fixity args
+  = ppr_hs_args_prefix_app (pprPrefixOcc thing) args
+
+-- | Pretty-print a prefix identifier to a list of 'HsArg's.
+ppr_hs_args_prefix_app :: (Outputable tm, Outputable ty)
+                        => SDoc -> [HsArg tm ty] -> SDoc
+ppr_hs_args_prefix_app acc []         = acc
+ppr_hs_args_prefix_app acc (arg:args) =
+  case arg of
+    HsValArg{}  -> ppr_hs_args_prefix_app (acc <+> ppr_single_hs_arg arg) args
+    HsTypeArg{} -> ppr_hs_args_prefix_app (acc <+> ppr_single_hs_arg arg) args
+    HsArgPar{}  -> ppr_hs_args_prefix_app (parens acc) args
+
+-- | Pretty-print an 'HsArg' in isolation.
+ppr_single_hs_arg :: (Outputable tm, Outputable ty)
+                  => HsArg tm ty -> SDoc
+ppr_single_hs_arg (HsValArg tm)    = ppr tm
+ppr_single_hs_arg (HsTypeArg _ ty) = char '@' <> ppr ty
+-- GHC shouldn't be constructing ASTs such that this case is ever reached.
+-- Still, it's possible some wily user might construct their own AST that
+-- allows this to be reachable, so don't fail here.
+ppr_single_hs_arg (HsArgPar{})     = empty
+
+-- | This instance is meant for debug-printing purposes. If you wish to
+-- pretty-print an application of 'HsArg's, use 'pprHsArgsApp' instead.
+instance (Outputable tm, Outputable ty) => Outputable (HsArg tm ty) where
+  ppr (HsValArg tm)     = text "HsValArg"  <+> ppr tm
+  ppr (HsTypeArg sp ty) = text "HsTypeArg" <+> ppr sp <+> ppr ty
+  ppr (HsArgPar sp)     = text "HsArgPar"  <+> ppr sp
 
 --------------------------------
 
@@ -918,6 +1004,42 @@ instance (OutputableBndrId p)
        => Outputable (HsPatSigType (GhcPass p)) where
     ppr (HsPS { hsps_body = ty }) = ppr ty
 
+
+instance (OutputableBndrId p)
+       => Outputable (HsTyLit (GhcPass p)) where
+    ppr = ppr_tylit
+
+instance Outputable HsIPName where
+    ppr (HsIPName n) = char '?' <> ftext n -- Ordinary implicit parameters
+
+instance OutputableBndr HsIPName where
+    pprBndr _ n   = ppr n         -- Simple for now
+    pprInfixOcc  n = ppr n
+    pprPrefixOcc n = ppr n
+
+instance (Outputable tyarg, Outputable arg, Outputable rec)
+         => Outputable (HsConDetails tyarg arg rec) where
+  ppr (PrefixCon tyargs args) = text "PrefixCon:" <+> hsep (map (\t -> text "@" <> ppr t) tyargs) <+> ppr args
+  ppr (RecCon rec)            = text "RecCon:" <+> ppr rec
+  ppr (InfixCon l r)          = text "InfixCon:" <+> ppr [l, r]
+
+instance Outputable (XRec pass RdrName) => Outputable (FieldOcc pass) where
+  ppr = ppr . foLabel
+
+instance (UnXRec pass, OutputableBndr (XRec pass RdrName)) => OutputableBndr (FieldOcc pass) where
+  pprInfixOcc  = pprInfixOcc . unXRec @pass . foLabel
+  pprPrefixOcc = pprPrefixOcc . unXRec @pass . foLabel
+
+instance (UnXRec pass, OutputableBndr (XRec pass RdrName)) => OutputableBndr (GenLocated SrcSpan (FieldOcc pass)) where
+  pprInfixOcc  = pprInfixOcc . unLoc
+  pprPrefixOcc = pprPrefixOcc . unLoc
+
+
+ppr_tylit :: (HsTyLit (GhcPass p)) -> SDoc
+ppr_tylit (HsNumTy source i) = pprWithSourceText source (integer i)
+ppr_tylit (HsStrTy source s) = pprWithSourceText source (text (show s))
+ppr_tylit (HsCharTy source c) = pprWithSourceText source (text (show c))
+
 pprAnonWildCard :: SDoc
 pprAnonWildCard = char '_'
 
@@ -1007,7 +1129,7 @@ ppr_mono_lty :: OutputableBndrId p
              => LHsType (GhcPass p) -> SDoc
 ppr_mono_lty ty = ppr_mono_ty (unLoc ty)
 
-ppr_mono_ty :: (OutputableBndrId p) => HsType (GhcPass p) -> SDoc
+ppr_mono_ty :: forall p. (OutputableBndrId p) => HsType (GhcPass p) -> SDoc
 ppr_mono_ty (HsForAllTy { hst_tele = tele, hst_body = ty })
   = sep [pprHsForAll tele Nothing, ppr_mono_lty ty]
 
@@ -1023,7 +1145,7 @@ ppr_mono_ty (HsTupleTy _ con tys)
     -- `Solo x`, not `(x)`
   | [ty] <- tys
   , BoxedTuple <- std_con
-  = sep [text (mkTupleStr Boxed 1), ppr_mono_lty ty]
+  = sep [text (mkTupleStr Boxed tcName 1), ppr_mono_lty ty]
   | otherwise
   = tupleParens std_con (pprWithCommas ppr tys)
   where std_con = case con of
@@ -1035,15 +1157,20 @@ ppr_mono_ty (HsKindSig _ ty kind)
   = ppr_mono_lty ty <+> dcolon <+> ppr kind
 ppr_mono_ty (HsListTy _ ty)       = brackets (ppr_mono_lty ty)
 ppr_mono_ty (HsIParamTy _ n ty)   = (ppr n <+> dcolon <+> ppr_mono_lty ty)
-ppr_mono_ty (HsSpliceTy _ s)      = pprSplice s
+ppr_mono_ty (HsSpliceTy ext s)    =
+    case ghcPass @p of
+      GhcPs -> pprUntypedSplice True Nothing s
+      GhcRn | HsUntypedSpliceNested n <- ext -> pprUntypedSplice True (Just n) s
+      GhcRn | HsUntypedSpliceTop _ t  <- ext -> ppr t
+      GhcTc -> pprUntypedSplice True Nothing s
 ppr_mono_ty (HsExplicitListTy _ prom tys)
   | isPromoted prom = quote $ brackets (maybeAddSpace tys $ interpp'SP tys)
   | otherwise       = brackets (interpp'SP tys)
 ppr_mono_ty (HsExplicitTupleTy _ tys)
     -- Special-case unary boxed tuples so that they are pretty-printed as
-    -- `'Solo x`, not `'(x)`
+    -- `'MkSolo x`, not `'(x)`
   | [ty] <- tys
-  = quote $ sep [text (mkTupleStr Boxed 1), ppr_mono_lty ty]
+  = quote $ sep [text (mkTupleStr Boxed dataName 1), ppr_mono_lty ty]
   | otherwise
   = quote $ parens (maybeAddSpace tys $ interpp'SP tys)
 ppr_mono_ty (HsTyLit _ t)       = ppr t
@@ -1106,7 +1233,7 @@ hsTypeNeedsParens p = go_hs_ty
     go_hs_ty (HsSpliceTy{})           = False
     go_hs_ty (HsExplicitListTy{})     = False
     -- Special-case unary boxed tuple applications so that they are
-    -- parenthesized as `Proxy ('Solo x)`, not `Proxy 'Solo x` (#18612)
+    -- parenthesized as `Proxy ('MkSolo x)`, not `Proxy 'MkSolo x` (#18612)
     -- See Note [One-tuples] in GHC.Builtin.Types
     go_hs_ty (HsExplicitTupleTy _ [_])
                                       = p >= appPrec

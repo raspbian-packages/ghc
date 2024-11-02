@@ -2,10 +2,8 @@
 
 {-# LANGUAGE DeriveFunctor #-}
 
-{-# OPTIONS_GHC -Wno-incomplete-record-updates #-}
-
 module GHC.Tc.Solver.Rewrite(
-   rewrite, rewriteArgsNom,
+   rewrite, rewriteForErrors, rewriteArgsNom,
    rewriteType
  ) where
 
@@ -40,8 +38,10 @@ import GHC.Data.Maybe
 import GHC.Exts (oneShot)
 import Control.Monad
 import Control.Applicative (liftA3)
-import GHC.Builtin.Types.Prim (tYPETyCon)
+import GHC.Builtin.Types (tYPETyCon)
 import Data.List ( find )
+import GHC.Data.List.Infinite (Infinite)
+import qualified GHC.Data.List.Infinite as Inf
 
 {-
 ************************************************************************
@@ -223,6 +223,22 @@ rewrite ev ty
        ; traceTcS "rewrite }" (ppr $ reductionReducedType redn)
        ; return result }
 
+-- | See Note [Rewriting]
+-- `rewriteForErrors` is a variant of 'rewrite' that rewrites
+-- w.r.t. nominal equality only, as this is better than full rewriting
+-- for error messages. (This was important when we flirted with rewriting
+-- newtypes but perhaps less so now.)
+rewriteForErrors :: CtEvidence -> TcType
+                 -> TcS (Reduction, RewriterSet)
+rewriteForErrors ev ty
+  = do { traceTcS "rewriteForErrors {" (ppr ty)
+       ; result@(redn, rewriters) <-
+           runRewrite (ctEvLoc ev) (ctEvFlavour ev) NomEq (rewrite_one ty)
+       ; traceTcS "rewriteForErrors }" (ppr $ reductionReducedType redn)
+       ; return $ case ctEvEqRel ev of
+           NomEq -> result
+           ReprEq -> (mkSubRedn redn, rewriters) }
+
 -- See Note [Rewriting]
 rewriteArgsNom :: CtEvidence -> TyCon -> [TcType]
                -> TcS (Reductions, RewriterSet)
@@ -275,8 +291,8 @@ rewriteType loc ty
 
 Key invariants:
   (F0) co :: zonk(ty') ~ xi   where zonk(ty') ~ zonk(ty)
-  (F1) tcTypeKind(xi) succeeds and returns a fully zonked kind
-  (F2) tcTypeKind(xi) `eqType` zonk(tcTypeKind(ty))
+  (F1) typeKind(xi) succeeds and returns a fully zonked kind
+  (F2) typeKind(xi) `eqType` zonk(typeKind(ty))
 
 Note that it is rewrite's job to try to reduce *every type function it sees*.
 
@@ -297,14 +313,14 @@ It is for this reason that we occasionally have to explicitly zonk,
 when (co :: ty ~ xi) is important even before we zonk the whole program.
 For example, see the RTRNotFollowed case in rewriteTyVar.
 
-Why have these invariants on rewriting? Because we sometimes use tcTypeKind
+Why have these invariants on rewriting? Because we sometimes use typeKind
 during canonicalisation, and we want this kind to be zonked (e.g., see
 GHC.Tc.Solver.Canonical.canEqCanLHS).
 
 Rewriting is always homogeneous. That is, the kind of the result of rewriting is
 always the same as the kind of the input, modulo zonking. More formally:
 
-  (F2) zonk(tcTypeKind(ty)) `eqType` tcTypeKind(xi)
+  (F2) zonk(typeKind(ty)) `eqType` typeKind(xi)
 
 This invariant means that the kind of a rewritten type might not itself be rewritten.
 
@@ -368,7 +384,7 @@ we skip adding to the cache here.
 {-# INLINE rewrite_args_tc #-}
 rewrite_args_tc
   :: TyCon         -- T
-  -> Maybe [Role]  -- Nothing: ambient role is Nominal; all args are Nominal
+  -> Maybe (Infinite Role)  -- Nothing: ambient role is Nominal; all args are Nominal
                    -- Otherwise: no assumptions; use roles provided
   -> [Type]
   -> RewriteM ArgsReductions -- See the commentary on rewrite_args
@@ -389,16 +405,16 @@ rewrite_args_tc tc = rewrite_args all_bndrs any_named_bndrs inner_ki emptyVarSet
     -- NB: Those bangs there drop allocations in T9872{a,c,d} by 8%.
 
 {-# INLINE rewrite_args #-}
-rewrite_args :: [TyCoBinder] -> Bool -- Binders, and True iff any of them are
+rewrite_args :: [PiTyBinder] -> Bool -- Binders, and True iff any of them are
                                      -- named.
              -> Kind -> TcTyCoVarSet -- function kind; kind's free vars
-             -> Maybe [Role] -> [Type]    -- these are in 1-to-1 correspondence
+             -> Maybe (Infinite Role) -> [Type]    -- these are in 1-to-1 correspondence
                                           -- Nothing: use all Nominal
              -> RewriteM ArgsReductions
 -- This function returns ArgsReductions (Reductions cos xis) res_co
 --   coercions: co_i :: ty_i ~ xi_i, at roles given
 --   types:     xi_i
---   coercion:  res_co :: tcTypeKind(fun tys) ~N tcTypeKind(fun xis)
+--   coercion:  res_co :: typeKind(fun tys) ~N typeKind(fun xis)
 -- That is, the result coercion relates the kind of some function (whose kind is
 -- passed as the first parameter) instantiated at tys to the kind of that
 -- function instantiated at the xis. This is useful in keeping rewriting
@@ -413,7 +429,7 @@ rewrite_args orig_binders
   = case (orig_m_roles, any_named_bndrs) of
       (Nothing, False) -> rewrite_args_fast orig_tys
       _ -> rewrite_args_slow orig_binders orig_inner_ki orig_fvs orig_roles orig_tys
-        where orig_roles = fromMaybe (repeat Nominal) orig_m_roles
+        where orig_roles = fromMaybe (Inf.repeat Nominal) orig_m_roles
 
 {-# INLINE rewrite_args_fast #-}
 -- | fast path rewrite_args, in which none of the binders are named and
@@ -437,11 +453,11 @@ rewrite_args_fast orig_tys
 {-# INLINE rewrite_args_slow #-}
 -- | Slow path, compared to rewrite_args_fast, because this one must track
 -- a lifting context.
-rewrite_args_slow :: [TyCoBinder] -> Kind -> TcTyCoVarSet
-                  -> [Role] -> [Type]
+rewrite_args_slow :: [PiTyBinder] -> Kind -> TcTyCoVarSet
+                  -> Infinite Role -> [Type]
                   -> RewriteM ArgsReductions
 rewrite_args_slow binders inner_ki fvs roles tys
-  = do { rewritten_args <- zipWithM rw roles tys
+  = do { rewritten_args <- zipWithM rw (Inf.toList roles) tys
        ; return (simplifyArgsWorker binders inner_ki fvs roles rewritten_args) }
   where
     {-# INLINE rw #-}
@@ -487,10 +503,8 @@ rewrite_one (TyConApp tc tys)
   | isTypeFamilyTyCon tc
   = rewrite_fam_app tc tys
 
-  -- For * a normal data type application
-  --     * data family application
-  -- we just recursively rewrite the arguments.
-  | otherwise
+  | otherwise -- We just recursively rewrite the arguments.
+              -- See Note [Do not rewrite newtypes]
   = rewrite_ty_con_app tc tys
 
 rewrite_one (FunTy { ft_af = vis, ft_mult = mult, ft_arg = ty1, ft_res = ty2 })
@@ -587,9 +601,9 @@ rewrite_app_ty_args fun_redn@(Reduction fun_co fun_xi) arg_tys
   = do { het_redn <- case tcSplitTyConApp_maybe fun_xi of
            Just (tc, xis) ->
              do { let tc_roles  = tyConRolesRepresentational tc
-                      arg_roles = dropList xis tc_roles
+                      arg_roles = Inf.dropList xis tc_roles
                 ; ArgsReductions (Reductions arg_cos arg_xis) kind_co
-                    <- rewrite_vector (tcTypeKind fun_xi) arg_roles arg_tys
+                    <- rewrite_vector (typeKind fun_xi) arg_roles arg_tys
 
                   -- We start with a reduction of the form
                   --   fun_co :: ty ~ T xi_1 ... xi_n
@@ -606,9 +620,9 @@ rewrite_app_ty_args fun_redn@(Reduction fun_co fun_xi) arg_tys
                       app_co = case eq_rel of
                         NomEq  -> mkAppCos fun_co arg_cos
                         ReprEq -> mkAppCos fun_co (map mkNomReflCo arg_tys)
-                                  `mkTcTransCo`
-                                  mkTcTyConAppCo Representational tc
-                                    (zipWith mkReflCo tc_roles xis ++ arg_cos)
+                                  `mkTransCo`
+                                  mkTyConAppCo Representational tc
+                                    (zipWith mkReflCo (Inf.toList tc_roles) xis ++ arg_cos)
 
                 ; return $
                     mkHetReduction
@@ -616,7 +630,7 @@ rewrite_app_ty_args fun_redn@(Reduction fun_co fun_xi) arg_tys
                       kind_co }
            Nothing ->
              do { ArgsReductions redns kind_co
-                    <- rewrite_vector (tcTypeKind fun_xi) (repeat Nominal) arg_tys
+                    <- rewrite_vector (typeKind fun_xi) (Inf.repeat Nominal) arg_tys
                 ; return $ mkHetReduction (mkAppRedns fun_redn redns) kind_co }
 
        ; role <- getRole
@@ -636,7 +650,7 @@ rewrite_ty_con_app tc tys
 
 -- Rewrite a vector (list of arguments).
 rewrite_vector :: Kind   -- of the function being applied to these arguments
-               -> [Role] -- If we're rewriting w.r.t. ReprEq, what roles do the
+               -> Infinite Role -- If we're rewriting w.r.t. ReprEq, what roles do the
                          -- args have?
                -> [Type] -- the args to rewrite
                -> RewriteM ArgsReductions
@@ -650,7 +664,13 @@ rewrite_vector ki roles tys
     fvs                                = tyCoVarsOfType ki
 {-# INLINE rewrite_vector #-}
 
-{-
+
+{- Note [Do not rewrite newtypes]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+We flirted with unwrapping newtypes in the rewriter -- see GHC.Tc.Solver.Canonical
+Note [Unwrap newtypes first]. But that turned out to be a bad idea because
+of recursive newtypes, as that Note says.  So be careful if you re-add it!
+
 Note [Rewriting synonyms]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
 Not expanding synonyms aggressively improves error messages, and
@@ -1053,7 +1073,7 @@ the new story.
 
 -- | Like 'splitPiTys'' but comes with a 'Bool' which is 'True' iff there is at
 -- least one named binder.
-split_pi_tys' :: Type -> ([TyCoBinder], Type, Bool)
+split_pi_tys' :: Type -> ([PiTyBinder], Type, Bool)
 split_pi_tys' ty = split ty ty
   where
      -- put common cases first
@@ -1064,20 +1084,20 @@ split_pi_tys' ty = split ty ty
   split _       (FunTy { ft_af = af, ft_mult = w, ft_arg = arg, ft_res = res })
                                  = let -- See #19102
                                        !(bs, ty, named) = split res res
-                                   in  (Anon af (mkScaled w arg) : bs, ty, named)
+                                   in  (Anon (mkScaled w arg) af : bs, ty, named)
 
   split orig_ty ty | Just ty' <- coreView ty = split orig_ty ty'
   split orig_ty _                = ([], orig_ty, False)
 {-# INLINE split_pi_tys' #-}
 
--- | Like 'tyConBindersTyCoBinders' but you also get a 'Bool' which is true iff
+-- | Like 'tyConBindersPiTyBinders' but you also get a 'Bool' which is true iff
 -- there is at least one named binder.
-ty_con_binders_ty_binders' :: [TyConBinder] -> ([TyCoBinder], Bool)
+ty_con_binders_ty_binders' :: [TyConBinder] -> ([PiTyBinder], Bool)
 ty_con_binders_ty_binders' = foldr go ([], False)
   where
     go (Bndr tv (NamedTCB vis)) (bndrs, _)
       = (Named (Bndr tv vis) : bndrs, True)
     go (Bndr tv (AnonTCB af))   (bndrs, n)
-      = (Anon af (tymult (tyVarKind tv)) : bndrs, n)
+      = (Anon (tymult (tyVarKind tv)) af : bndrs, n)
     {-# INLINE go #-}
 {-# INLINE ty_con_binders_ty_binders' #-}

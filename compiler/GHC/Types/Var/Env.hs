@@ -9,7 +9,7 @@ module GHC.Types.Var.Env (
 
         -- ** Manipulating these environments
         emptyVarEnv, unitVarEnv, mkVarEnv, mkVarEnv_Directly,
-        elemVarEnv, disjointVarEnv,
+        elemVarEnv, disjointVarEnv, anyVarEnv,
         extendVarEnv, extendVarEnv_C, extendVarEnv_Acc,
         extendVarEnvList,
         plusVarEnv, plusVarEnv_C, plusVarEnv_CD, plusMaybeVarEnv_C,
@@ -23,7 +23,7 @@ module GHC.Types.Var.Env (
         isEmptyVarEnv,
         elemVarEnvByKey,
         filterVarEnv, restrictVarEnv,
-        partitionVarEnv,
+        partitionVarEnv, varEnvDomain,
 
         -- * Deterministic Var environments (maps)
         DVarEnv, DIdEnv, DTyVarEnv,
@@ -47,10 +47,10 @@ module GHC.Types.Var.Env (
         anyDVarEnv,
 
         -- * The InScopeSet type
-        InScopeSet,
+        InScopeSet(..),
 
         -- ** Operations on InScopeSets
-        emptyInScopeSet, mkInScopeSet, delInScopeSet,
+        emptyInScopeSet, mkInScopeSet, mkInScopeSetList, delInScopeSet,
         extendInScopeSet, extendInScopeSetList, extendInScopeSetSet,
         getInScopeVars, lookupInScope, lookupInScope_Directly,
         unionInScope, elemInScopeSet, uniqAway,
@@ -62,7 +62,8 @@ module GHC.Types.Var.Env (
 
         -- ** Operations on RnEnv2s
         mkRnEnv2, rnBndr2, rnBndrs2, rnBndr2_var,
-        rnOccL, rnOccR, inRnEnvL, inRnEnvR, rnOccL_maybe, rnOccR_maybe,
+        rnOccL, rnOccR, inRnEnvL, inRnEnvR,  anyInRnEnvR,
+        rnOccL_maybe, rnOccR_maybe,
         rnBndrL, rnBndrR, nukeRnEnvL, nukeRnEnvR, rnSwap,
         delBndrL, delBndrR, delBndrsL, delBndrsR,
         extendRnInScopeSetList,
@@ -82,6 +83,7 @@ import GHC.Types.Name.Occurrence
 import GHC.Types.Name
 import GHC.Types.Var as Var
 import GHC.Types.Var.Set
+import GHC.Data.Graph.UnVar   -- UnVarSet
 import GHC.Types.Unique.Set
 import GHC.Types.Unique.FM
 import GHC.Types.Unique.DFM
@@ -147,6 +149,9 @@ getInScopeVars (InScope vs) = vs
 
 mkInScopeSet :: VarSet -> InScopeSet
 mkInScopeSet in_scope = InScope in_scope
+
+mkInScopeSetList :: [Var] -> InScopeSet
+mkInScopeSetList vs = InScope (mkVarSet vs)
 
 extendInScopeSet :: InScopeSet -> Var -> InScopeSet
 extendInScopeSet (InScope in_scope) v
@@ -400,6 +405,14 @@ inRnEnvL, inRnEnvR :: RnEnv2 -> Var -> Bool
 inRnEnvL (RV2 { envL = env }) v = v `elemVarEnv` env
 inRnEnvR (RV2 { envR = env }) v = v `elemVarEnv` env
 
+-- | `anyInRnEnvR env set` == `any (inRnEnvR rn_env) (toList set)`
+-- but lazy in the second argument if the right side of the env is empty.
+anyInRnEnvR :: RnEnv2 -> VarSet -> Bool
+anyInRnEnvR (RV2 { envR = env }) vs
+  -- Avoid allocating the predicate if we deal with an empty env.
+  | isEmptyVarEnv env = False
+  | otherwise         = anyVarSet (`elemVarEnv` env) vs
+
 lookupRnInScope :: RnEnv2 -> Var -> Var
 lookupRnInScope env v = lookupInScope (in_scope env) v `orElse` v
 
@@ -493,8 +506,10 @@ extendVarEnv_Acc  :: (a->b->b) -> (a->b) -> VarEnv b -> Var -> a -> VarEnv b
 plusVarEnv        :: VarEnv a -> VarEnv a -> VarEnv a
 plusVarEnvList    :: [VarEnv a] -> VarEnv a
 extendVarEnvList  :: VarEnv a -> [(Var, a)] -> VarEnv a
+varEnvDomain      :: VarEnv elt -> UnVarSet
 
 partitionVarEnv   :: (a -> Bool) -> VarEnv a -> (VarEnv a, VarEnv a)
+-- | Only keep variables contained in the VarSet
 restrictVarEnv    :: VarEnv a -> VarSet -> VarEnv a
 delVarEnvList     :: VarEnv a -> [Var] -> VarEnv a
 delVarEnv         :: VarEnv a -> Var -> VarEnv a
@@ -509,6 +524,7 @@ isEmptyVarEnv     :: VarEnv a -> Bool
 lookupVarEnv      :: VarEnv a -> Var -> Maybe a
 lookupVarEnv_Directly :: VarEnv a -> Unique -> Maybe a
 filterVarEnv      :: (a -> Bool) -> VarEnv a -> VarEnv a
+anyVarEnv         :: (elt -> Bool) -> UniqFM key elt -> Bool
 lookupVarEnv_NF   :: VarEnv a -> Var -> a
 lookupWithDefaultVarEnv :: VarEnv a -> a -> Var -> a
 elemVarEnv        :: Var -> VarEnv a -> Bool
@@ -539,6 +555,7 @@ plusVarEnvList   = plusUFMList
 lookupVarEnv     = lookupUFM
 lookupVarEnv_Directly = lookupUFM_Directly
 filterVarEnv     = filterUFM
+anyVarEnv        = anyUFM
 lookupWithDefaultVarEnv = lookupWithDefaultUFM
 mapVarEnv        = mapUFM
 mkVarEnv         = listToUFM
@@ -546,7 +563,9 @@ mkVarEnv_Directly= listToUFM_Directly
 emptyVarEnv      = emptyUFM
 unitVarEnv       = unitUFM
 isEmptyVarEnv    = isNullUFM
-partitionVarEnv       = partitionUFM
+partitionVarEnv  = partitionUFM
+varEnvDomain     = domUFMUnVarSet
+
 
 restrictVarEnv env vs = filterUFM_Directly keep env
   where
@@ -556,6 +575,7 @@ zipVarEnv tyvars tys   = mkVarEnv (zipEqual "zipVarEnv" tyvars tys)
 lookupVarEnv_NF env id = case lookupVarEnv env id of
                          Just xx -> xx
                          Nothing -> panic "lookupVarEnv_NF: Nothing"
+
 
 {-
 @modifyVarEnv@: Look up a thing in the VarEnv,

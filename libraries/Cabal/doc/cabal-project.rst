@@ -24,7 +24,7 @@ The full configuration of a project is determined by combining the
 following sources (later entries override earlier ones, except for appendable
 options):
 
-1. ``~/.cabal/config`` (the user-wide global configuration)
+1. :ref:`The user-wide global configuration <config-file-discovery>` (default: ``~/.config/cabal/config``)
 
 2. ``cabal.project`` (the project configuration)
 
@@ -63,6 +63,11 @@ freeze files. As a usage example:
 
     import: /absolutepath/some-project.project
 
+Using conditionals will force cabal to find a ghc to derive
+architecture and version information from, which will force some
+commands (update, sdist) to require ghc present where otherwise it
+would not be necessitated.
+
 Specifying the local packages
 -----------------------------
 
@@ -76,7 +81,7 @@ project are:
 
     .. warning::
 
-      The default value ``./*.cabal`` only takes effect if there is no explicit 
+      The default value ``./*.cabal`` only takes effect if there is no explicit
       ``cabal.project`` file.
       If you use such explicit file you *must* fill the field.
 
@@ -122,8 +127,10 @@ project are:
 .. cfg-field:: extra-packages: package list with version bounds (comma separated)
     :synopsis: Adds external packages as local
 
-    [STRIKEOUT:Specifies a list of external packages from Hackage which
-    should be considered local packages.] (Not implemented)
+    Specifies a list of external packages from Hackage, which
+    should be considered local packages. The motivation for
+    :cfg-field:`extra-packages` is making libraries that are not
+    dependencies of any package in the project available for use in ghci.
 
     There is no command line variant of this field.
 
@@ -301,8 +308,8 @@ package, and thus apply globally:
 
     This option cannot be specified via a ``cabal.project`` file.
 
--- option:: --ignore-project
-    
+.. option:: --ignore-project
+
     Ignores the local ``cabal.project`` file and uses the default
     configuration with the local ``foo.cabal`` file. Note that
     if this flag is set while the ``--project-file`` flag is also
@@ -906,7 +913,7 @@ Object code options
 
     :default: False
 
-    If the compiler (e.g., GHC 7.10 and later) supports outputing OS
+    If the compiler (e.g., GHC 7.10 and later) supports outputting OS
     native debug info (e.g., DWARF), setting ``debug-info: True`` will
     instruct it to do so. See the GHC wiki page on :ghc-wiki:`DWARF`
     for more information about this feature.
@@ -1000,7 +1007,7 @@ Executable options
                --program-prefix=prefix
     :synopsis: Prepend prefix to program names.
 
-    [STRIKEOUT:Prepend *prefix* to installed program names.] (Currently
+    :strike:`Prepend *prefix* to installed program names.` (Currently
     implemented in a silly and not useful way. If you need this to work
     give us a shout.)
 
@@ -1014,7 +1021,7 @@ Executable options
                --program-suffix=suffix
     :synopsis: Append refix to program names.
 
-    [STRIKEOUT:Append *suffix* to installed program names.] (Currently
+    :strike:`Append *suffix* to installed program names.` (Currently
     implemented in a silly and not useful way. If you need this to work
     give us a shout.)
 
@@ -1084,7 +1091,7 @@ Dynamic linking options
 
     :default: False
 
-    [STRIKEOUT:Build a package which is relocatable.] (TODO: It is not
+    :strike:`Build a package which is relocatable.` (TODO: It is not
     clear what this actually does, or if it works at all.)
 
     The command line variant of this flag is ``--relocatable``.
@@ -1231,6 +1238,14 @@ Profiling options
         each module, whether top level or local. In GHC specifically,
         this is for non-inline toplevel or where-bound functions or
         values.  Corresponds to ``-fprof-auto``.
+    late-toplevel
+        Like top-level but costs will be assigned to top level definitions after
+        optimization. This lowers profiling overhead massively while giving similar
+        levels of detail as toplevle-functions. However it means functions introduced
+        by GHC during optimization will show up in profiles as well.
+        Corresponds to ``-fprof-late`` if supported and ``-fprof-auto-top`` otherwise.
+    late
+        Currently an alias for late-toplevel
 
     The command line variant of this flag is
     ``--profiling-detail=none``.
@@ -1330,11 +1345,12 @@ Haddock options
     :default: False
 
     Enables building of Haddock documentation.
+    Implied when calling ``cabal haddock``.
 
     The command line variant of this flag is ``--enable-documentation``
     and ``--disable-documentation``.
 
-    `documentation: true` does not imply
+    ``documentation: true`` does not imply
     :cfg-field:`haddock-all`,
     :cfg-field:`haddock-benchmarks`,
     :cfg-field:`haddock-executables`,
@@ -1567,8 +1583,8 @@ Advanced global configuration options
 
     :default: ``~/.cabal/packages``
 
-    [STRIKEOUT:The location where packages downloaded from remote
-    repositories will be cached.] Not implemented yet.
+    :strike:`The location where packages downloaded from remote
+    repositories will be cached.` Not implemented yet.
 
     The command line variant of this flag is
     ``--remote-repo-cache=DIR``.
@@ -1579,7 +1595,7 @@ Advanced global configuration options
 
     :default: ``~/.cabal/logs``
 
-    [STRIKEOUT:The location where build logs for packages are stored.]
+    :strike:`The location where build logs for packages are stored.`
     Not implemented yet.
 
     The command line variant of this flag is ``--logs-dir=DIR``.
@@ -1590,9 +1606,10 @@ Advanced global configuration options
 
     :default: ``~/.cabal/logs/build.log``
 
-    [STRIKEOUT:The file to save build summaries. Valid variables which
-    can be used in the path are ``$pkgid``, ``$compiler``, ``$os`` and
-    ``$arch``.] Not implemented yet.
+    :strike:`The file to save build summaries.` Not implemented yet.
+
+    Valid variables which can be used in the path are ``$pkgid``,
+    ``$compiler``, ``$os`` and ``$arch``.
 
     The command line variant of this flag is
     ``--build-summary=TEMPLATE``.
@@ -1659,7 +1676,7 @@ Most users generally won't need these.
                --fine-grained-conflicts
                --no-fine-grained-conflicts
     :synopsis: Skip a version of a package if it does not resolve any conflicts
-	       encountered in the last version (solver optimization).
+               encountered in the last version (solver optimization).
 
     :default: True
 
@@ -1676,7 +1693,7 @@ Most users generally won't need these.
                --minimize-conflict-set
                --no-minimize-conflict-set
     :synopsis: Try to improve the solver error message when there is no
-	       solution.
+               solution.
 
     :default: False
 
@@ -1725,5 +1742,23 @@ Most users generally won't need these.
 
     The command line variant of this field is
     ``--cabal-lib-version=1.24.0.1``.
+
+.. cfg-field:: prefer-oldest: boolean
+               --prefer-oldest
+               --no-prefer-oldest
+    :synopsis: Prefer the oldest versions of packages available.
+    :since:    3.10
+
+    :default:  False
+
+    By default, when solver has a choice of multiple versions of the same
+    package, it will first try to derive a build plan with the latest
+    version. This flag switches the behaviour, making the solver
+    to prefer the oldest packages available.
+
+    The primary use case is to help users in establishing lower bounds
+    of upstream dependencies.
+
+    The command line variant of this field is ``--(no-)prefer-oldest``.
 
 .. include:: references.inc

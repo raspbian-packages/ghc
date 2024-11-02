@@ -68,18 +68,20 @@ dynLibManifest = dynLibManifest' buildRoot
 -- | Need the (locally built) libffi library.
 needLibffi :: Stage -> Action ()
 needLibffi stage = do
-    manifest <- dynLibManifest stage
-    need [manifest]
+    jsTarget <- isJsTarget
+    unless jsTarget $ do
+        manifest <- dynLibManifest stage
+        need [manifest]
 
 -- | Context for @libffi@.
 libffiContext :: Stage -> Action Context
 libffiContext stage = do
     ways <- interpretInContext
-            (Context stage libffi (error "libffiContext: way not set"))
+            (Context stage libffi (error "libffiContext: way not set") (error "libffiContext: iplace not set"))
             getLibraryWays
-    return . Context stage libffi $ if any (wayUnit Dynamic) ways
+    return $ (\w -> Context stage libffi w Final) (if any (wayUnit Dynamic) ways
         then dynamic
-        else vanilla
+        else vanilla)
 
 -- | The name of the library
 libffiName :: Expr String
@@ -155,7 +157,11 @@ needLibfffiArchive buildPath = do
 libffiRules :: Rules ()
 libffiRules = do
   _ <- addOracleCache $ \ (LibffiDynLibs stage)
-                         -> readFileLines =<< dynLibManifest stage
+                         -> do
+                              jsTarget <- isJsTarget
+                              if jsTarget
+                                then return []
+                                else readFileLines =<< dynLibManifest stage
   forM_ [Stage1, Stage2, Stage3] $ \stage -> do
     root <- buildRootRules
     let path       = root -/- stageString stage

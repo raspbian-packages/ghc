@@ -18,7 +18,6 @@ module GHC.Settings
   , sTopDir
   , sGlobalPackageDatabasePath
   , sLdSupportsCompactUnwind
-  , sLdSupportsBuildId
   , sLdSupportsFilelist
   , sLdIsGnuLd
   , sGccSupportsNoPie
@@ -35,7 +34,6 @@ module GHC.Settings
   , sPgm_dll
   , sPgm_T
   , sPgm_windres
-  , sPgm_libtool
   , sPgm_ar
   , sPgm_otool
   , sPgm_install_name_tool
@@ -88,8 +86,8 @@ data Settings = Settings
 -- platform-specific and platform-agnostic.
 data ToolSettings = ToolSettings
   { toolSettings_ldSupportsCompactUnwind :: Bool
-  , toolSettings_ldSupportsBuildId       :: Bool
   , toolSettings_ldSupportsFilelist      :: Bool
+  , toolSettings_ldSupportsSingleModule  :: Bool
   , toolSettings_ldIsGnuLd               :: Bool
   , toolSettings_ccSupportsNoPie         :: Bool
   , toolSettings_useInplaceMinGW         :: Bool
@@ -110,7 +108,6 @@ data ToolSettings = ToolSettings
   , toolSettings_pgm_dll     :: (String, [Option])
   , toolSettings_pgm_T       :: String
   , toolSettings_pgm_windres :: String
-  , toolSettings_pgm_libtool :: String
   , toolSettings_pgm_ar      :: String
   , toolSettings_pgm_otool   :: String
   , toolSettings_pgm_install_name_tool :: String
@@ -171,7 +168,7 @@ dynLibSuffix :: GhcNameVersion -> String
 dynLibSuffix (GhcNameVersion name ver) = '-':name ++ ver
 
 -----------------------------------------------------------------------------
--- Accessessors from 'Settings'
+-- Accessors from 'Settings'
 
 sProgramName         :: Settings -> String
 sProgramName = ghcNameVersion_programName . sGhcNameVersion
@@ -191,8 +188,6 @@ sGlobalPackageDatabasePath = fileSettings_globalPackageDatabase . sFileSettings
 
 sLdSupportsCompactUnwind :: Settings -> Bool
 sLdSupportsCompactUnwind = toolSettings_ldSupportsCompactUnwind . sToolSettings
-sLdSupportsBuildId :: Settings -> Bool
-sLdSupportsBuildId = toolSettings_ldSupportsBuildId . sToolSettings
 sLdSupportsFilelist :: Settings -> Bool
 sLdSupportsFilelist = toolSettings_ldSupportsFilelist . sToolSettings
 sLdIsGnuLd :: Settings -> Bool
@@ -226,8 +221,6 @@ sPgm_T :: Settings -> String
 sPgm_T = toolSettings_pgm_T . sToolSettings
 sPgm_windres :: Settings -> String
 sPgm_windres = toolSettings_pgm_windres . sToolSettings
-sPgm_libtool :: Settings -> String
-sPgm_libtool = toolSettings_pgm_libtool . sToolSettings
 sPgm_ar :: Settings -> String
 sPgm_ar = toolSettings_pgm_ar . sToolSettings
 sPgm_otool :: Settings -> String

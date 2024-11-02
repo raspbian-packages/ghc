@@ -15,7 +15,6 @@ please rather run `cabal build hadrian .`. or `./hadrian/build`
 
 from enum import Enum
 import hashlib
-import logging
 import json
 from pathlib import Path
 import platform
@@ -24,8 +23,8 @@ import subprocess
 import tempfile
 import sys
 from textwrap import dedent
-from typing import Set, Optional, Dict, List, Tuple, \
-                   NewType, BinaryIO, NamedTuple, TypeVar
+from typing import Optional, Dict, List, Tuple, \
+                   NewType, BinaryIO, NamedTuple
 
 #logging.basicConfig(level=logging.INFO)
 
@@ -34,7 +33,7 @@ BUILDDIR    = Path('_build')
 BINDIR      = BUILDDIR / 'bin'            # binaries go there (--bindir)
 DISTDIR     = BUILDDIR / 'dists'          # --builddir
 UNPACKED    = BUILDDIR / 'unpacked'       # where we unpack final package tarballs
-TARBALLS    = BUILDDIR / 'tarballs'       # where we download tarballks
+TARBALLS    = BUILDDIR / 'tarballs'       # where we download tarballs
 PSEUDOSTORE = BUILDDIR / 'pseudostore'    # where we install packages
 ARTIFACTS   = BUILDDIR / 'artifacts'      # Where we put the archive
 TMPDIR      = BUILDDIR / 'tmp'            #
@@ -87,13 +86,19 @@ class Compiler:
 
         self.ghc_path = ghc_path.resolve()
 
+        exe = ''
+        if platform.system() == 'Windows': exe = '.exe'
+
         info = self._get_ghc_info()
         self.version = info['Project version']
         #self.lib_dir = Path(info['LibDir'])
         #self.ghc_pkg_path = (self.lib_dir / 'bin' / 'ghc-pkg').resolve()
-        self.ghc_pkg_path = (self.ghc_path.parent / 'ghc-pkg').resolve()
+        self.ghc_pkg_path = (self.ghc_path.parent / ('ghc-pkg' + exe)).resolve()
         if not self.ghc_pkg_path.is_file():
             raise TypeError(f'ghc-pkg {self.ghc_pkg_path} is not a file')
+        self.hsc2hs_path = (self.ghc_path.parent / ('hsc2hs' + exe)).resolve()
+        if not self.hsc2hs_path.is_file():
+            raise TypeError(f'hsc2hs {self.hsc2hs_path} is not a file')
 
     def _get_ghc_info(self) -> Dict[str,str]:
         from ast import literal_eval
@@ -117,10 +122,10 @@ class BadTarball(Exception):
         ])
 
 def package_url(package: PackageName, version: Version) -> str:
-    return f'http://hackage.haskell.org/package/{package}-{version}/{package}-{version}.tar.gz'
+    return f'https://hackage.haskell.org/package/{package}-{version}/{package}-{version}.tar.gz'
 
 def package_cabal_url(package: PackageName, version: Version, revision: int) -> str:
-    return f'http://hackage.haskell.org/package/{package}-{version}/revision/{revision}.cabal'
+    return f'https://hackage.haskell.org/package/{package}-{version}/revision/{revision}.cabal'
 
 def verify_sha256(expected_hash: SHA256Hash, f: Path):
     print(f"Verifying {f}...")
@@ -198,6 +203,7 @@ def install_sdist(dist_dir: Path, sdist_dir: Path, ghc: Compiler, flags: List[st
         f'--bindir={BINDIR.resolve()}',
         f'--with-compiler={ghc.ghc_path}',
         f'--with-hc-pkg={ghc.ghc_pkg_path}',
+        f'--with-hsc2hs={ghc.hsc2hs_path}',
         f'--flags={flags_option}',
     ]
 
@@ -292,7 +298,7 @@ def archive_name(version):
 
 def make_archive(hadrian_path):
 
-    print(f'Creating distribution tarball')
+    print('Creating distribution tarball')
 
     # Get bootstrapped hadrian version
     # This also acts as smoke test
@@ -364,6 +370,11 @@ def main() -> None:
                         help='path to GHC')
     parser.add_argument('-s', '--bootstrap-sources', type=Path,
                         help='Path to prefetched bootstrap sources tarball')
+    parser.add_argument('--archive', dest='want_archive', action='store_true',
+                       help='produce a Hadrian distribution archive (default)')
+    parser.add_argument('--no-archive', dest='want_archive', action='store_false',
+                       help='do not produce a Hadrian distribution archive')
+    parser.set_defaults(want_archive=True)
 
     subparsers = parser.add_subparsers(dest="command")
 
@@ -378,16 +389,19 @@ def main() -> None:
 
     ghc = None
 
+    sources_fmt = 'gztar' # The archive format for the bootstrap sources archive.
+    if platform.system() == 'Windows': sources_fmt = 'zip'
+
     if args.deps is None:
       if args.bootstrap_sources is None:
         # find appropriate plan in the same directory as the script
         ghc = find_ghc(args.with_compiler)
         args.deps = Path(sys.path[0]) / f"plan-bootstrap-{ghc.version.replace('.','_')}.json"
         print(f"defaulting bootstrap plan to {args.deps}")
-      # We have a tarball with all the required information, unpack it and use for further 
+      # We have a tarball with all the required information, unpack it and use for further
       elif args.bootstrap_sources is not None and args.command != 'list-sources':
         print(f'Unpacking {args.bootstrap_sources} to {TARBALLS}')
-        shutil.unpack_archive(args.bootstrap_sources.resolve(), TARBALLS, 'gztar')
+        shutil.unpack_archive(args.bootstrap_sources.resolve(), TARBALLS, sources_fmt)
         args.deps = TARBALLS / 'plan-bootstrap.json'
         print(f"using plan-bootstrap.json ({args.deps}) from {args.bootstrap_sources}")
       else:
@@ -412,40 +426,48 @@ def main() -> None:
         else:
           plan = gen_fetch_plan(info)
 
+        if ghc is None:
+          ghc = find_ghc(args.with_compiler)
+
         # In temporary directory, create a directory which we will archive
         tmpdir = TMPDIR.resolve()
         tmpdir.mkdir(parents=True, exist_ok=True)
- 
+
         rootdir = Path(tempfile.mkdtemp(dir=tmpdir))
- 
+
         fetch_from_plan(plan, rootdir)
 
         shutil.copyfile(args.deps, rootdir / 'plan-bootstrap.json')
 
-        fmt = 'gztar'
-        if platform.system() == 'Windows': fmt = 'zip'
- 
-        archivename = shutil.make_archive(args.output, fmt, root_dir=rootdir)
+        archivename = shutil.make_archive(args.output, sources_fmt, root_dir=rootdir)
 
-        print(f'Bootstrap sources saved to {archivename}')
-        print(f'Use `bootstrap.py -d {args.deps} -s {archivename}` to continue')
+        print(f"""
+Bootstrap sources saved to {archivename}
+
+Use `bootstrap.py -w {ghc.ghc_path} -s {archivename}` to continue
+""")
 
     elif(args.command == 'list-sources'):
+        ghc = find_ghc(args.with_compiler)
         plan = gen_fetch_plan(info)
         with open(args.output, 'w') as out:
           json.dump({path : val._asdict() for path,val in plan.items()}, out)
         print(f"Required hackage sources saved to {args.output}")
         tarfmt= "\n./"
         print(f"""
-Download the files listed in {args.output} and save them to a tarball ($TARBALL), along with {args.deps}
+Download the files listed in {args.output}, copying {args.deps} to plan-bootstrap.json, and save them to a tarball ($TARBALL)
+
 The contents of $TARBALL should look like:
 
 ./
 ./plan-bootstrap.json
 ./{tarfmt.join(path for path in plan)}
 
-Then use `bootstrap.py -s $TARBALL` to continue
-Alternatively, you could use `bootstrap.py -d {args.deps} fetch -o $TARBALL` to download and generate the tarball, skipping this step
+To generate $TARBALL, e.g. files in sources-tarball, `TARBALL=sources-tarball.tar.gz; pushd sources-tarball; tar -zcf ../$TARBALL .; popd`
+
+Then use `bootstrap.py -w {ghc.ghc_path} -s $TARBALL` to continue
+
+Alternatively, you could use `bootstrap.py -w {ghc.ghc_path} -d {args.deps} fetch -o sources-tarball` to download and generate the tarball, skipping this step
 """)
 
     elif(args.command == None):
@@ -461,21 +483,21 @@ Alternatively, you could use `bootstrap.py -d {args.deps} fetch -o $TARBALL` to 
         bootstrap(info, ghc)
         hadrian_path = (BINDIR / 'hadrian').resolve()
 
-        archive = make_archive(hadrian_path)
-
         print(dedent(f'''
             Bootstrapping finished!
 
             The resulting hadrian executable can be found at
 
                 {hadrian_path}
-
-            It have been archived for distribution in
-
-                {archive}
-
-            You can use this executable to build GHC.
         '''))
+
+        if args.want_archive:
+            dist_archive = make_archive(hadrian_path)
+            print(dedent(f'''
+                The Hadrian executable has been archived for distribution in
+
+                    {dist_archive}
+            '''))
     else:
       print(f"No such command: {args.command}")
 

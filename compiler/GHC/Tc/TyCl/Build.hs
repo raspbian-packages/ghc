@@ -18,26 +18,29 @@ module GHC.Tc.TyCl.Build (
 import GHC.Prelude
 
 import GHC.Iface.Env
-import GHC.Core.FamInstEnv( FamInstEnvs, mkNewTypeCoAxiom )
-import GHC.Builtin.Types( isCTupleTyConName, unboxedUnitTy )
+import GHC.Builtin.Types
+
+import GHC.Tc.Utils.TcType
+import GHC.Tc.Utils.Monad
+
 import GHC.Core.DataCon
 import GHC.Core.PatSyn
+import GHC.Core.Class
+import GHC.Core.TyCon
+import GHC.Core.Type
+import GHC.Core.Multiplicity
+import GHC.Core.FamInstEnv( FamInstEnvs, mkNewTypeCoAxiom )
+
+import GHC.Types.SrcLoc( SrcSpan, noSrcSpan )
 import GHC.Types.Var
 import GHC.Types.Var.Set
 import GHC.Types.Basic
 import GHC.Types.Name
 import GHC.Types.Name.Env
 import GHC.Types.Id.Make
-import GHC.Core.Class
-import GHC.Core.TyCon
-import GHC.Core.Type
 import GHC.Types.SourceText
-import GHC.Tc.Utils.TcType
-import GHC.Core.Multiplicity
-
-import GHC.Types.SrcLoc( SrcSpan, noSrcSpan )
-import GHC.Tc.Utils.Monad
 import GHC.Types.Unique.Supply
+
 import GHC.Utils.Misc
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
@@ -62,11 +65,12 @@ mkNewTyConRhs tycon_name tycon con
     tvs      = tyConTyVars tycon
     roles    = tyConRoles tycon
     res_kind = tyConResKind tycon
-    con_arg_ty = case dataConRepArgTys con of
-                   [arg_ty] -> scaledThing arg_ty
-                   tys -> pprPanic "mkNewTyConRhs" (ppr con <+> ppr tys)
-    rhs_ty = substTyWith (dataConUnivTyVars con)
-                         (mkTyVarTys tvs) con_arg_ty
+    rhs_ty
+      -- Only try if the newtype is actually valid (see "otherwise" below).
+      | [Scaled _ arg_ty] <- dataConRepArgTys con
+      , null $ dataConExTyCoVars con
+      = substTyWith (dataConUnivTyVars con)
+                         (mkTyVarTys tvs) arg_ty
         -- Instantiate the newtype's RHS with the
         -- type variables from the tycon
         -- NB: a newtype DataCon has a type that must look like
@@ -75,6 +79,13 @@ mkNewTyConRhs tycon_name tycon con
         -- the newtype arising from   class Foo a => Bar a where {}
         -- has a single argument (Foo a) that is a *type class*, so
         -- dataConInstOrigArgTys returns [].
+      | otherwise
+      -- If the newtype is invalid (e.g. doesn't have a single argument),
+      -- we fake up a type here. The newtype will get rejected once we're
+      -- outside the knot-tied loop, in GHC.Tc.TyCl.checkNewDataCon.
+      -- See the various test cases in T23308.
+      = unitTy -- Might be ill-kinded, but checkNewDataCon should reject this
+               -- whole declaration soon enough, before that causes any problems.
 
     -- Eta-reduce the newtype
     -- See Note [Newtype eta] in GHC.Core.TyCon
@@ -175,7 +186,7 @@ buildDataCon fam_envs dc_bang_opts src_name declared_infix prom_info src_bangs
               data_con = mkDataCon src_name declared_infix prom_info
                                    src_bangs field_lbls
                                    univ_tvs ex_tvs user_tvbs eq_spec ctxt
-                                   arg_tys res_ty NoRRI rep_tycon tag
+                                   arg_tys res_ty NoPromInfo rep_tycon tag
                                    stupid_ctxt dc_wrk dc_rep
               dc_wrk = mkDataConWorkId work_name data_con
               dc_rep = initUs_ us (mkDataConRep dc_bang_opts fam_envs wrap_name data_con)
@@ -320,22 +331,20 @@ buildClass tycon_name binders roles fds
               -- (We used to call them D_C, but now we can have two different
               --  superclasses both called C!)
 
-        ; let use_newtype = isSingleton arg_tys
+        ; let use_newtype = isSingleton (sc_theta ++ op_tys)
                 -- Use a newtype if the data constructor
                 --   (a) has exactly one value field
                 --       i.e. exactly one operation or superclass taken together
                 --   (b) that value is of lifted type (which they always are, because
                 --       we box equality superclasses)
                 -- See Note [Class newtypes and equality predicates]
-
-                -- We treat the dictionary superclasses as ordinary arguments.
-                -- That means that in the case of
+                --
+                -- In the case of
                 --     class C a => D a
-                -- we don't get a newtype with no arguments!
+                -- we use a newtype, but with one superclass and no arguments
               args       = sc_sel_names ++ op_names
               op_tys     = [ty | (_,ty,_) <- sig_stuff]
               op_names   = [op | (op,_,_) <- sig_stuff]
-              arg_tys    = sc_theta ++ op_tys
               rec_tycon  = classTyCon rec_clas
               univ_bndrs = tyConInvisTVBinders binders
               univ_tvs   = binderVars univ_bndrs
@@ -353,8 +362,8 @@ buildClass tycon_name binders roles fds
                                    [{- no existentials -}]
                                    univ_bndrs
                                    [{- No GADT equalities -}]
-                                   [{- No theta -}]
-                                   (map unrestricted arg_tys) -- type classes are unrestricted
+                                   sc_theta
+                                   (map unrestricted op_tys) -- type classes are unrestricted
                                    (mkTyConApp rec_tycon (mkTyVarTys univ_tvs))
                                    rec_tycon
                                    (mkTyConTagMap rec_tycon)

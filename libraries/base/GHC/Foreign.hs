@@ -19,6 +19,7 @@
 
 module GHC.Foreign (
     -- * C strings with a configurable encoding
+    CString, CStringLen,
 
     -- conversion of C strings into Haskell strings
     --
@@ -74,8 +75,11 @@ putDebugMsg | c_DEBUG_DUMP = debugLn
             | otherwise    = const (return ())
 
 
--- These definitions are identical to those in Foreign.C.String, but copied in here to avoid a cycle:
+-- | A C string is a reference to an array of C characters terminated by NUL.
 type CString    = Ptr CChar
+
+-- | A string with explicit length information in bytes instead of a
+-- terminating NUL (allowing NUL characters in the middle of the string).
 type CStringLen = (Ptr CChar, Int)
 
 -- exported functions
@@ -301,7 +305,7 @@ fail, the call to the continuation never fails and so the caller should respond
 first to the size check failing and *then* call the continuation. Making this evident
 to the compiler avoids historic space leaks.
 
-In a previous interation of this code we had a pattern that, somewhat simplified,
+In a previous iteration of this code we had a pattern that, somewhat simplified,
 looked like this:
 
 go :: State -> (State -> IO a) -> IO a
@@ -323,6 +327,6 @@ unreachable *after* action returns. This means we keep alive the function closur
 for `action` until `action` returns. Which in turn keeps alive the *whole* lazy list
 via `action` until the action has fully run.
 This went wrong in #20107, where the continuation kept an entire lazy bytestring alive
-rather than allowing it to be incrementaly consumed and collected.
+rather than allowing it to be incrementally consumed and collected.
 -}
 

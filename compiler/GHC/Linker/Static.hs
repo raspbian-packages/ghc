@@ -1,6 +1,5 @@
 module GHC.Linker.Static
    ( linkBinary
-   , linkBinary'
    , linkStaticLib
    )
 where
@@ -30,6 +29,7 @@ import GHC.Linker.ExtraObj
 import GHC.Linker.Windows
 import GHC.Linker.Static.Utils
 
+import GHC.Driver.Config.Linker
 import GHC.Driver.Session
 
 import System.FilePath
@@ -73,23 +73,26 @@ linkBinary' staticLink logger tmpfs dflags unit_env o_files dep_units = do
         unit_state = ue_units unit_env
         toolSettings' = toolSettings dflags
         verbFlags = getVerbFlags dflags
-        output_fn = exeFileName platform staticLink (outputFile_ dflags)
-
-    -- get the full list of packages to link with, by combining the
-    -- explicit packages with the auto packages and all of their
-    -- dependencies, and eliminating duplicates.
+        arch_os   = platformArchOS platform
+        output_fn = exeFileName arch_os staticLink (outputFile_ dflags)
+        namever   = ghcNameVersion dflags
+        ways_     = ways dflags
 
     full_output_fn <- if isAbsolute output_fn
                       then return output_fn
                       else do d <- getCurrentDirectory
                               return $ normalise (d </> output_fn)
+
+    -- get the full list of packages to link with, by combining the
+    -- explicit packages with the auto packages and all of their
+    -- dependencies, and eliminating duplicates.
     pkgs <- mayThrowUnitErr (preloadUnitsInfo' unit_env dep_units)
-    let pkg_lib_paths     = collectLibraryDirs (ways dflags) pkgs
+    let pkg_lib_paths     = collectLibraryDirs ways_ pkgs
     let pkg_lib_path_opts = concatMap get_pkg_lib_path_opts pkg_lib_paths
         get_pkg_lib_path_opts l
          | osElfTarget (platformOS platform) &&
            dynLibLoader dflags == SystemDependent &&
-           ways dflags `hasWay` WayDyn
+           ways_ `hasWay` WayDyn
             = let libpath = if gopt Opt_RelativeDynlibPaths dflags
                             then "$ORIGIN" </>
                                  (l `makeRelativeTo` full_output_fn)
@@ -110,7 +113,7 @@ linkBinary' staticLink logger tmpfs dflags unit_env o_files dep_units = do
               in ["-L" ++ l] ++ rpathlink ++ rpath
          | osMachOTarget (platformOS platform) &&
            dynLibLoader dflags == SystemDependent &&
-           ways dflags `hasWay` WayDyn &&
+           ways_ `hasWay` WayDyn &&
            useXLinkerRPath dflags (platformOS platform)
             = let libpath = if gopt Opt_RelativeDynlibPaths dflags
                             then "@loader_path" </>
@@ -122,8 +125,8 @@ linkBinary' staticLink logger tmpfs dflags unit_env o_files dep_units = do
     pkg_lib_path_opts <-
       if gopt Opt_SingleLibFolder dflags
       then do
-        libs <- getLibs dflags unit_env dep_units
-        tmpDir <- newTempDir logger tmpfs (tmpDir dflags)
+        libs <- getLibs namever ways_ unit_env dep_units
+        tmpDir <- newTempSubDir logger tmpfs (tmpDir dflags)
         sequence_ [ copyFile lib (tmpDir </> basename)
                   | (lib, basename) <- libs]
         return [ "-L" ++ tmpDir ]
@@ -152,14 +155,8 @@ linkBinary' staticLink logger tmpfs dflags unit_env o_files dep_units = do
         = ([],[])
 
     pkg_link_opts <- do
-        (package_hs_libs, extra_libs, other_flags) <- getUnitLinkOpts dflags unit_env dep_units
-        return $ if staticLink
-            then package_hs_libs -- If building an executable really means making a static
-                                 -- library (e.g. iOS), then we only keep the -l options for
-                                 -- HS packages, because libtool doesn't accept other options.
-                                 -- In the case of iOS these need to be added by hand to the
-                                 -- final link in Xcode.
-            else other_flags ++ dead_strip
+        (package_hs_libs, extra_libs, other_flags) <- getUnitLinkOpts namever ways_ unit_env dep_units
+        return $ other_flags ++ dead_strip
                   ++ pre_hs_libs ++ package_hs_libs ++ post_hs_libs
                   ++ extra_libs
                  -- -Wl,-u,<sym> contained in other_flags
@@ -175,7 +172,7 @@ linkBinary' staticLink logger tmpfs dflags unit_env o_files dep_units = do
 
     -- frameworks
     pkg_framework_opts <- getUnitFrameworkOpts unit_env dep_units
-    let framework_opts = getFrameworkOpts dflags platform
+    let framework_opts = getFrameworkOpts (initFrameworkOpts dflags) platform
 
         -- probably _stub.o files
     let extra_ld_inputs = ldInputs dflags
@@ -184,11 +181,12 @@ linkBinary' staticLink logger tmpfs dflags unit_env o_files dep_units = do
       OSMinGW32 | gopt Opt_GenManifest dflags -> maybeCreateManifest logger tmpfs dflags output_fn
       _                                       -> return []
 
-    let link dflags args | staticLink = GHC.SysTools.runLibtool logger dflags args
-                         | platformOS platform == OSDarwin
+    let link dflags args | platformOS platform == OSDarwin
                             = do
                                  GHC.SysTools.runLink logger tmpfs dflags args
-                                 GHC.Linker.MacOS.runInjectRPaths logger dflags pkg_lib_paths output_fn
+                                 -- Make sure to honour -fno-use-rpaths if set on darwin as well; see #20004
+                                 when (gopt Opt_RPath dflags) $
+                                   GHC.Linker.MacOS.runInjectRPaths logger (toolSettings dflags) pkg_lib_paths output_fn
                          | otherwise
                             = GHC.SysTools.runLink logger tmpfs dflags args
 
@@ -220,7 +218,6 @@ linkBinary' staticLink logger tmpfs dflags unit_env o_files dep_units = do
                       -- on x86.
                       ++ (if not (gopt Opt_CompactUnwind dflags) &&
                              toolSettings_ldSupportsCompactUnwind toolSettings' &&
-                             not staticLink &&
                              (platformOS platform == OSDarwin) &&
                              case platformArch platform of
                                ArchX86     -> True
@@ -238,8 +235,7 @@ linkBinary' staticLink logger tmpfs dflags unit_env o_files dep_units = do
                       -- whether this is something we ought to fix, but
                       -- for now this flags silences them.
                       ++ (if platformOS   platform == OSDarwin &&
-                             platformArch platform == ArchX86 &&
-                             not staticLink
+                             platformArch platform == ArchX86
                           then ["-Wl,-read_only_relocs,suppress"]
                           else [])
 
@@ -278,7 +274,10 @@ linkStaticLib logger dflags unit_env o_files dep_units = do
   let platform  = ue_platform unit_env
       extra_ld_inputs = [ f | FileOption _ f <- ldInputs dflags ]
       modules = o_files ++ extra_ld_inputs
-      output_fn = exeFileName platform True (outputFile_ dflags)
+      arch_os = platformArchOS platform
+      output_fn = exeFileName arch_os True (outputFile_ dflags)
+      namever = ghcNameVersion dflags
+      ways_   = ways dflags
 
   full_output_fn <- if isAbsolute output_fn
                     then return output_fn
@@ -295,7 +294,7 @@ linkStaticLib logger dflags unit_env o_files dep_units = do
         | otherwise
         = filter ((/= rtsUnitId) . unitId) pkg_cfgs_init
 
-  archives <- concatMapM (collectArchives dflags) pkg_cfgs
+  archives <- concatMapM (collectArchives namever ways_) pkg_cfgs
 
   ar <- foldl mappend
         <$> (Archive <$> mapM loadObj modules)

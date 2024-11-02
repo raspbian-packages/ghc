@@ -83,10 +83,6 @@ module GHC.Types.Id.Info (
 
         -- ** Tick-box Info
         TickBoxOp(..), TickBoxId,
-
-        -- ** Levity info
-        LevityInfo, levityInfo, setNeverRepPoly, setLevityInfoWithType,
-        isNeverRepPolyIdInfo
     ) where
 
 import GHC.Prelude
@@ -100,13 +96,11 @@ import GHC.Types.Basic
 import GHC.Core.DataCon
 import GHC.Core.TyCon
 import GHC.Core.PatSyn
-import GHC.Core.Type
 import GHC.Types.ForeignCall
 import GHC.Unit.Module
 import GHC.Types.Demand
 import GHC.Types.Cpr
 
-import GHC.Utils.Misc
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
 import GHC.Utils.Panic.Plain
@@ -126,9 +120,7 @@ infixl  1 `setRuleInfo`,
           `setCafInfo`,
           `setDmdSigInfo`,
           `setCprSigInfo`,
-          `setDemandInfo`,
-          `setNeverRepPoly`,
-          `setLevityInfoWithType`
+          `setDemandInfo`
 {-
 ************************************************************************
 *                                                                      *
@@ -161,7 +153,11 @@ data IdDetails
   | ClassOpId Class             -- ^ The 'Id' is a superclass selector,
                                 -- or class operation of a class
 
-  | PrimOpId PrimOp             -- ^ The 'Id' is for a primitive operator
+  | PrimOpId PrimOp Bool        -- ^ The 'Id' is for a primitive operator
+                                -- True <=> is representation-polymorphic,
+                                --          and hence has no binding
+                                -- This lev-poly flag is used only in GHC.Types.Id.hasNoBinding
+
   | FCallId ForeignCall         -- ^ The 'Id' is for a foreign call.
                                 -- Type will be simple: no type families, newtypes, etc
 
@@ -259,7 +255,7 @@ A function with cbv-semantics requires arguments to be visible
 and if no arguments are visible requires us to eta-expand it's
 call site. That is for a binding with three cbv arguments like
 `w[WorkerLikeId[!,!,!]]` we would need to eta expand undersaturated
-occurences like `map w xs` into `map (\x1 x2 x3 -> w x1 x2 x3) xs.
+occurrences like `map w xs` into `map (\x1 x2 x3 -> w x1 x2 x3) xs.
 
 In experiments it turned out that the code size increase of doing so
 can outweigh the performance benefits of doing so.
@@ -269,7 +265,7 @@ Join points are naturally always called saturated so
 this problem can't occur for them.
 For workers and specialized functions there are also always at least
 some applied arguments as we won't inline the wrapper/apply their rule
-if there are unapplied occurances like `map f xs`.
+if there are unapplied occurrences like `map f xs`.
 -}
 
 -- | Recursive Selector Parent
@@ -310,7 +306,7 @@ pprIdDetails other     = brackets (pp other)
    pp (DataConWorkId _)       = text "DataCon"
    pp (DataConWrapId _)       = text "DataConWrapper"
    pp (ClassOpId {})          = text "ClassOp"
-   pp (PrimOpId _)            = text "PrimOp"
+   pp (PrimOpId {})           = text "PrimOp"
    pp (FCallId _)             = text "ForeignCall"
    pp (TickBoxOpId _)         = text "TickBoxOp"
    pp (DFunId nt)             = text "DFunId" <> ppWhen nt (text "(nt)")
@@ -357,15 +353,16 @@ data IdInfo
         occInfo         :: OccInfo,
         -- ^ How the 'Id' occurs in the program
         dmdSigInfo      :: DmdSig,
-        -- ^ A strictness signature. Digests how a function uses its arguments
-        -- if applied to at least 'arityInfo' arguments.
+        -- ^ A strictness signature. Describes how a function uses its arguments
+        --   See Note [idArity varies independently of dmdTypeDepth]
+        --       in GHC.Core.Opt.DmdAnal
         cprSigInfo      :: CprSig,
         -- ^ Information on whether the function will ultimately return a
         -- freshly allocated constructor.
         demandInfo      :: Demand,
         -- ^ ID demand information
         bitfield        :: {-# UNPACK #-} !BitField,
-        -- ^ Bitfield packs CafInfo, OneShotInfo, arity info, LevityInfo, and
+        -- ^ Bitfield packs CafInfo, OneShotInfo, arity info, and
         -- call arity info in one 64-bit word. Packing these fields reduces size
         -- of `IdInfo` from 12 words to 7 words and reduces residency by almost
         -- 4% in some programs. See #17497 and associated MR.
@@ -378,12 +375,12 @@ data IdInfo
         tagSig          :: !(Maybe TagSig)
     }
 
--- | Encodes arities, OneShotInfo, CafInfo and LevityInfo.
+-- | Encodes arities, OneShotInfo, CafInfo.
 -- From least-significant to most-significant bits:
 --
 -- - Bit   0   (1):  OneShotInfo
 -- - Bit   1   (1):  CafInfo
--- - Bit   2   (1):  LevityInfo
+-- - Bit   2   (1):  unused
 -- - Bits  3-32(30): Call Arity info
 -- - Bits 33-62(30): Arity info
 --
@@ -399,10 +396,6 @@ bitfieldGetOneShotInfo (BitField bits) =
 bitfieldGetCafInfo :: BitField -> CafInfo
 bitfieldGetCafInfo (BitField bits) =
     if testBit bits 1 then NoCafRefs else MayHaveCafRefs
-
-bitfieldGetLevityInfo :: BitField -> LevityInfo
-bitfieldGetLevityInfo (BitField bits) =
-    if testBit bits 2 then NeverLevityPolymorphic else NoLevityInfo
 
 bitfieldGetCallArityInfo :: BitField -> ArityInfo
 bitfieldGetCallArityInfo (BitField bits) =
@@ -424,12 +417,6 @@ bitfieldSetCafInfo info (BitField bits) =
       MayHaveCafRefs -> BitField (clearBit bits 1)
       NoCafRefs -> BitField (setBit bits 1)
 
-bitfieldSetLevityInfo :: LevityInfo -> BitField -> BitField
-bitfieldSetLevityInfo info (BitField bits) =
-    case info of
-      NoLevityInfo -> BitField (clearBit bits 2)
-      NeverLevityPolymorphic -> BitField (setBit bits 2)
-
 bitfieldSetCallArityInfo :: ArityInfo -> BitField -> BitField
 bitfieldSetCallArityInfo info bf@(BitField bits) =
     assert (info < 2^(30 :: Int) - 1) $
@@ -442,10 +429,6 @@ bitfieldSetArityInfo info (BitField bits) =
     BitField ((fromIntegral info `shiftL` 33) .|. (bits .&. ((1 `shiftL` 33) - 1)))
 
 -- Getters
-
--- | When applied, will this Id ever have a representation-polymorphic type?
-levityInfo :: IdInfo -> LevityInfo
-levityInfo = bitfieldGetLevityInfo . bitfield
 
 -- | Info about a lambda-bound variable, if the 'Id' is one
 oneShotInfo :: IdInfo -> OneShotInfo
@@ -487,7 +470,7 @@ setOccInfo        info oc = oc `seq` info { occInfo = oc }
 unfoldingInfo :: IdInfo -> Unfolding
 unfoldingInfo info
   | isStrongLoopBreaker (occInfo info) = trimUnfolding $ realUnfoldingInfo info
-  | otherwise                          =                realUnfoldingInfo info
+  | otherwise                          =                 realUnfoldingInfo info
 
 setUnfoldingInfo :: IdInfo -> Unfolding -> IdInfo
 setUnfoldingInfo info uf
@@ -549,7 +532,6 @@ vanillaIdInfo
                              bitfieldSetArityInfo unknownArity $
                              bitfieldSetCallArityInfo unknownArity $
                              bitfieldSetOneShotInfo NoOneShotInfo $
-                             bitfieldSetLevityInfo NoLevityInfo $
                              emptyBitField,
             lfInfo         = Nothing,
             tagSig         = Nothing
@@ -864,55 +846,3 @@ data TickBoxOp
 
 instance Outputable TickBoxOp where
     ppr (TickBox mod n)         = text "tick" <+> ppr (mod,n)
-
-{-
-************************************************************************
-*                                                                      *
-   Levity
-*                                                                      *
-************************************************************************
-
-Note [Levity info]
-~~~~~~~~~~~~~~~~~~
-
-Ids store whether or not they can be representation-polymorphic at any amount
-of saturation. This is helpful in optimizing representation polymorphism checks,
-allowing us to learn that something is not representation-polymorphic without
-actually figuring out its type.
-See exprHasFixedRuntimeRep in GHC.Core.Utils for where this info is used.
-
-Historical note: this was very important when representation polymorphism
-was checked in the desugarer (it was needed to prevent T5631 from blowing up).
-It's less important now that the checks happen in the typechecker, but remains useful.
-Refer to Note [The Concrete mechanism] in GHC.Tc.Utils.Concrete for details
-about the new approach being used.
--}
-
--- See Note [Levity info]
-data LevityInfo = NoLevityInfo  -- always safe
-                | NeverLevityPolymorphic
-  deriving Eq
-
-instance Outputable LevityInfo where
-  ppr NoLevityInfo           = text "NoLevityInfo"
-  ppr NeverLevityPolymorphic = text "NeverLevityPolymorphic"
-
--- | Marks an IdInfo describing an Id that is never representation-polymorphic
--- (even when applied). The Type is only there for checking that it's really
--- never representation-polymorphic.
-setNeverRepPoly :: HasDebugCallStack => IdInfo -> Type -> IdInfo
-setNeverRepPoly info ty
-  = assertPpr (resultHasFixedRuntimeRep ty) (ppr ty) $
-    info { bitfield = bitfieldSetLevityInfo NeverLevityPolymorphic (bitfield info) }
-
-setLevityInfoWithType :: IdInfo -> Type -> IdInfo
-setLevityInfoWithType info ty
-  | resultHasFixedRuntimeRep ty
-  = info { bitfield = bitfieldSetLevityInfo NeverLevityPolymorphic (bitfield info) }
-  | otherwise
-  = info
-
-isNeverRepPolyIdInfo :: IdInfo -> Bool
-isNeverRepPolyIdInfo info
-  | NeverLevityPolymorphic <- levityInfo info = True
-  | otherwise                                 = False

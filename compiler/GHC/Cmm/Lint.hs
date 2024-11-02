@@ -6,6 +6,7 @@
 --
 -----------------------------------------------------------------------------
 {-# LANGUAGE DeriveFunctor #-}
+{-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE GADTs #-}
 module GHC.Cmm.Lint (
@@ -21,13 +22,15 @@ import GHC.Cmm.Dataflow.Collections
 import GHC.Cmm.Dataflow.Graph
 import GHC.Cmm.Dataflow.Label
 import GHC.Cmm
-import GHC.Cmm.Utils
 import GHC.Cmm.Liveness
 import GHC.Cmm.Switch (switchTargetsToList)
-import GHC.Cmm.Ppr () -- For Outputable instances
+import GHC.Cmm.CLabel (pprDebugCLabel)
 import GHC.Utils.Outputable
 
-import Control.Monad (ap, unless)
+import Control.Monad (unless)
+import Control.Monad.Trans.Except (ExceptT (..), Except)
+import Control.Monad.Trans.Reader (ReaderT (..))
+import Data.Functor.Identity (Identity (..))
 
 -- Things to check:
 --     - invariant on CmmBlock in GHC.Cmm.Expr (see comment there)
@@ -47,7 +50,8 @@ cmmLintGraph platform g = runCmmLint platform lintCmmGraph g
 runCmmLint :: OutputableP Platform a => Platform -> (a -> CmmLint b) -> a -> Maybe SDoc
 runCmmLint platform l p =
    case unCL (l p) platform of
-     Left err -> Just (vcat [text "Cmm lint error:",
+     Left err -> Just (withPprStyle defaultDumpStyle $ vcat
+                            [text "Cmm lint error:",
                              nest 2 err,
                              text "Program was:",
                              nest 2 (pdoc platform p)])
@@ -57,7 +61,7 @@ lintCmmDecl :: GenCmmDecl h i CmmGraph -> CmmLint ()
 lintCmmDecl (CmmProc _ lbl _ g)
   = do
     platform <- getPlatform
-    addLintInfo (text "in proc " <> pdoc platform lbl) $ lintCmmGraph g
+    addLintInfo (text "in proc " <> pprDebugCLabel platform lbl) $ lintCmmGraph g
 lintCmmDecl (CmmData {})
   = return ()
 
@@ -274,17 +278,8 @@ checkCond platform expr
 -- just a basic error monad:
 
 newtype CmmLint a = CmmLint { unCL :: Platform -> Either SDoc a }
-    deriving (Functor)
-
-instance Applicative CmmLint where
-      pure a = CmmLint (\_ -> Right a)
-      (<*>) = ap
-
-instance Monad CmmLint where
-  CmmLint m >>= k = CmmLint $ \platform ->
-                                case m platform of
-                                Left e -> Left e
-                                Right a -> unCL (k a) platform
+  deriving stock (Functor)
+  deriving (Applicative, Monad) via ReaderT Platform (Except SDoc)
 
 getPlatform :: CmmLint Platform
 getPlatform = CmmLint $ \platform -> Right platform

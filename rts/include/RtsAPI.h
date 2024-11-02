@@ -141,7 +141,7 @@ typedef struct GCDetails_ {
   uint32_t threads;
     // Number of bytes allocated since the previous GC
   uint64_t allocated_bytes;
-    // Total amount of live data in the heap (incliudes large + compact data).
+    // Total amount of live data in the heap (includes large + compact data).
     // Updated after every GC. Data in uncollected generations (in minor GCs)
     // are considered live.
   uint64_t live_bytes;
@@ -155,6 +155,8 @@ typedef struct GCDetails_ {
   uint64_t mem_in_use_bytes;
     // Total amount of data copied during this GC
   uint64_t copied_bytes;
+    // Memory lost due to block fragmentation
+  uint64_t block_fragmentation_bytes;
     // In parallel GC, the max amount of data copied by any one thread
   uint64_t par_max_copied_bytes;
   // In parallel GC, the amount of balanced data copied by all threads
@@ -176,11 +178,9 @@ typedef struct GCDetails_ {
     // The time elapsed during the post-mark pause phase of the concurrent
     // nonmoving GC.
   Time nonmoving_gc_sync_elapsed_ns;
-    // The CPU time used during the post-mark pause phase of the concurrent
-    // nonmoving GC.
+    // The total CPU time used by the nonmoving GC.
   Time nonmoving_gc_cpu_ns;
-    // The time elapsed during the post-mark pause phase of the concurrent
-    // nonmoving GC.
+    // The total time elapsed during which there is a nonmoving GC active.
   Time nonmoving_gc_elapsed_ns;
 } GCDetails;
 
@@ -261,23 +261,20 @@ typedef struct _RTSStats {
   // ----------------------------------
   // Concurrent garbage collector
 
-    // The CPU time used during the post-mark pause phase of the concurrent
-    // nonmoving GC.
+    // The total CPU time used during the post-mark pause phase of the
+    // concurrent nonmoving GC.
   Time nonmoving_gc_sync_cpu_ns;
-    // The time elapsed during the post-mark pause phase of the concurrent
-    // nonmoving GC.
+    // The total time elapsed during the post-mark pause phase of the
+    // concurrent nonmoving GC.
   Time nonmoving_gc_sync_elapsed_ns;
     // The maximum time elapsed during the post-mark pause phase of the
     // concurrent nonmoving GC.
   Time nonmoving_gc_sync_max_elapsed_ns;
-    // The CPU time used during the post-mark pause phase of the concurrent
-    // nonmoving GC.
+    // The total CPU time used by the nonmoving GC.
   Time nonmoving_gc_cpu_ns;
-    // The time elapsed during the post-mark pause phase of the concurrent
-    // nonmoving GC.
+    // The total time elapsed during which there is a nonmoving GC active.
   Time nonmoving_gc_elapsed_ns;
-    // The maximum time elapsed during the post-mark pause phase of the
-    // concurrent nonmoving GC.
+    // The maximum time elapsed during any nonmoving GC cycle.
   Time nonmoving_gc_max_elapsed_ns;
 } RTSStats;
 
@@ -313,11 +310,11 @@ extern void hs_init_ghc (int *argc, char **argv[],   // program arguments
                          RtsConfig rts_config);      // RTS configuration
 
 extern void shutdownHaskellAndExit (int exitCode, int fastExit)
-    GNUC3_ATTRIBUTE(__noreturn__);
+    STG_NORETURN;
 
 #if !defined(mingw32_HOST_OS)
 extern void shutdownHaskellAndSignal (int sig, int fastExit)
-     GNUC3_ATTRIBUTE(__noreturn__);
+    STG_NORETURN;
 #endif
 
 extern void getProgArgv            ( int *argc, char **argv[] );

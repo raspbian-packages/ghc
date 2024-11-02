@@ -182,6 +182,7 @@ initStats0(void)
             .copied_bytes = 0,
             .par_max_copied_bytes = 0,
             .par_balanced_copied_bytes = 0,
+            .block_fragmentation_bytes = 0,
             .sync_elapsed_ns = 0,
             .cpu_ns = 0,
             .elapsed_ns = 0,
@@ -437,7 +438,7 @@ stat_startGC (Capability *cap, gc_thread *gct)
     // (though converted from Time=StgInt64 to EventTimestamp=StgWord64).
     // Here, as opposed to other places, the event is emitted on the cap
     // that initiates the GC and external tools expect it to have the same
-    // timestamp as used in +RTS -s calculcations.
+    // timestamp as used in +RTS -s calculations.
     traceEventGcStartAtT(cap,
                          TimeToNS(gct->gc_start_elapsed - start_init_elapsed));
 
@@ -482,6 +483,9 @@ stat_endGC (Capability *cap, gc_thread *initiating_gct, W_ live, W_ copied, W_ s
     stats.gc.copied_bytes = copied * sizeof(W_);
     stats.gc.par_max_copied_bytes = par_max_copied * sizeof(W_);
     stats.gc.par_balanced_copied_bytes = par_balanced_copied * sizeof(W_);
+    stats.gc.block_fragmentation_bytes =
+        (mblocks_allocated * BLOCKS_PER_MBLOCK
+         - n_alloc_blocks) * BLOCK_SIZE;
 
     bool stats_enabled =
         RtsFlags.GcFlags.giveStats != NO_GC_STATS ||
@@ -582,9 +586,7 @@ stat_endGC (Capability *cap, gc_thread *initiating_gct, W_ live, W_ copied, W_ s
                           stats.gc.gen,
                           stats.gc.copied_bytes,
                           stats.gc.slop_bytes,
-                          /* current loss due to fragmentation */
-                          (mblocks_allocated * BLOCKS_PER_MBLOCK
-                           - n_alloc_blocks) * BLOCK_SIZE,
+                          stats.gc.block_fragmentation_bytes,
                           par_n_threads,
                           stats.gc.par_max_copied_bytes,
                           stats.gc.copied_bytes,
@@ -594,7 +596,7 @@ stat_endGC (Capability *cap, gc_thread *initiating_gct, W_ live, W_ copied, W_ s
         // (though converted from Time=StgInt64 to EventTimestamp=StgWord64).
         // Here, as opposed to other places, the event is emitted on the cap
         // that initiates the GC and external tools expect it to have the same
-        // timestamp as used in +RTS -s calculcations.
+        // timestamp as used in +RTS -s calculations.
         traceEventGcEndAtT(cap, TimeToNS(stats.elapsed_ns));
 
         if (gen == RtsFlags.GcFlags.generations-1) { // major GC?
@@ -643,7 +645,7 @@ stat_endGC (Capability *cap, gc_thread *initiating_gct, W_ live, W_ copied, W_ s
 }
 
 /* -----------------------------------------------------------------------------
-   Called at the beginning of each Retainer Profiliing
+   Called at the beginning of each Retainer Profiling
    -------------------------------------------------------------------------- */
 #if defined(PROFILING)
 void
@@ -660,7 +662,7 @@ stat_startRP(void)
 #endif /* PROFILING */
 
 /* -----------------------------------------------------------------------------
-   Called at the end of each Retainer Profiliing
+   Called at the end of each Retainer Profiling
    -------------------------------------------------------------------------- */
 
 #if defined(PROFILING)
@@ -839,7 +841,7 @@ static void report_summary(const RTSSummaryStats* sum)
     statsPrintf("%16s bytes maximum slop\n", temp);
 
     statsPrintf("%16" FMT_Word64 " MiB total memory in use (%"
-                FMT_Word64 " MB lost due to fragmentation)\n\n",
+                FMT_Word64 " MiB lost due to fragmentation)\n\n",
                 stats.max_mem_in_use_bytes  / (1024 * 1024),
                 sum->fragmentation_bytes / (1024 * 1024));
 

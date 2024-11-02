@@ -51,7 +51,7 @@ dummyFlags = emptyFlags
 emptyFlags :: InitFlags
 emptyFlags = mempty
 
--- | Retireves the proper base version based on the GHC version
+-- | Retrieves the proper base version based on the GHC version
 baseVersion :: Compiler -> VersionRange
 baseVersion Compiler {compilerId = CompilerId GHC ver} =
   let ghcToBase = baseVersion' . prettyShow $ ver in
@@ -67,7 +67,6 @@ baseVersion' "8.8.4"  = [4,13,0,0]
 baseVersion' "8.6.5"  = [4,12,0,0]
 baseVersion' "8.4.4"  = [4,11,1,0]
 baseVersion' "8.2.2"  = [4,10,1,0]
-baseVersion' "8.0.2"  = [4,10,0,0]
 baseVersion' "7.10.3" = [4,9,0,0]
 baseVersion' "7.8.4"  = [4,8,0,0]
 baseVersion' "7.6.3"  = [4,7,0,0]

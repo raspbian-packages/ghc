@@ -46,12 +46,13 @@ module GHC.HsToCore.Utils (
 
 import GHC.Prelude
 
+import Language.Haskell.Syntax.Basic (Boxity(..))
+
 import {-# SOURCE #-} GHC.HsToCore.Match ( matchSimply )
 import {-# SOURCE #-} GHC.HsToCore.Expr  ( dsLExpr, dsSyntaxExpr )
 
 import GHC.Hs
 import GHC.Hs.Syn.Type
-import GHC.Tc.Utils.TcType( tcSplitTyConApp )
 import GHC.Core
 import GHC.HsToCore.Monad
 
@@ -66,7 +67,6 @@ import GHC.Core.PatSyn
 import GHC.Core.Type
 import GHC.Core.Coercion
 import GHC.Builtin.Types
-import GHC.Types.Basic
 import GHC.Core.ConLike
 import GHC.Types.Unique.Set
 import GHC.Types.Unique.Supply
@@ -142,7 +142,7 @@ selectMatchVar _w (VarPat _ var)    = return (localiseId (unLoc var))
                                   -- multiplicity stored within the variable
                                   -- itself. It's easier to pull it from the
                                   -- variable, so we ignore the multiplicity.
-selectMatchVar _w (AsPat _ var _) = assert (isManyDataConTy _w ) (return (unLoc var))
+selectMatchVar _w (AsPat _ var _ _) = assert (isManyTy _w ) (return (unLoc var))
 selectMatchVar w other_pat        = newSysLocalDs w (hsPatType other_pat)
 
 {- Note [Localise pattern binders]
@@ -421,7 +421,7 @@ f x True = False
 
 Adding 'f x False = error "Non-exhaustive pattern..."' would violate
 the linearity of x.
-Instead, we use 'f x False = case error "Non-exhausive pattern..." :: () of {}'.
+Instead, we use 'f x False = case error "Non-exhaustive pattern..." :: () of {}'.
 This case expression accounts for linear variables by assigning bottom usage
 (See Note [Bottom as a usage] in GHC.Core.Multiplicity).
 This is done in mkErrorAppDs, called from mkFailExpr.
@@ -471,14 +471,12 @@ There are a few subtleties in the desugaring of `seq`:
     Consider,
        f x y = x `seq` (y `seq` (# x,y #))
 
-    The [Core let/app invariant] means that, other things being equal, because
-    the argument to the outer 'seq' has an unlifted type, we'll use call-by-value thus:
+    Because the argument to the outer 'seq' has an unlifted type, we'll use
+    call-by-value, and compile it as if we had
 
        f x y = case (y `seq` (# x,y #)) of v -> x `seq` v
 
-    But that is bad for two reasons:
-      (a) we now evaluate y before x, and
-      (b) we can't bind v to an unboxed pair
+    But that is bad, because we now evaluate y before x!
 
     Seq is very, very special!  So we recognise it right here, and desugar to
             case x of _ -> case y of _ -> (# x,y #)
@@ -495,7 +493,7 @@ There are a few subtleties in the desugaring of `seq`:
        let chp = case b of { True -> fst x; False -> 0 }
        case chp of _ { I# -> ...chp... }
 
-    But since chp is cheap, and the case is an alluring contet, we'll
+    But since chp is cheap, and the case is an alluring context, we'll
     inline chp into the case scrutinee.  Now there is only one use of chp,
     so we'll inline a second copy.  Alas, we've now ruined the purpose of
     the seq, by re-introducing the space leak:
@@ -541,7 +539,7 @@ mkCoreAppDs _ (Var f `App` Type _r `App` Type ty1 `App` Type ty2 `App` arg1) arg
     case_bndr = case arg1 of
                    Var v1 | isInternalName (idName v1)
                           -> v1        -- Note [Desugaring seq], points (2) and (3)
-                   _      -> mkWildValBinder Many ty1
+                   _      -> mkWildValBinder ManyTy ty1
 
 mkCoreAppDs _ (Var f `App` Type _r) arg
   | f `hasKey` noinlineIdKey   -- See Note [noinlineId magic] in GHC.Types.Id.Make
@@ -631,7 +629,7 @@ There are two cases.
   Note that we return 't' as the variable to force if the pattern
   is strict (i.e. with -XStrict or an outermost-bang-pattern)
 
-  Note that (A) /includes/ the situation where
+  Note that (C) /includes/ the situation where
 
    * The pattern binds exactly one variable
         let !(Just (Just x) = e in body
@@ -641,7 +639,8 @@ There are two cases.
        in t `seq` body
     The 'Solo' is a one-tuple; see Note [One-tuples] in GHC.Builtin.Types
     Note that forcing 't' makes the pattern match happen,
-    but does not force 'v'.
+    but does not force 'v'.  That's why we call `mkBigCoreVarTupSolo`
+    in `mkSeletcorBinds`
 
   * The pattern binds no variables
         let !(True,False) = e in body
@@ -739,7 +738,7 @@ mkSelectorBinds ticks pat val_expr
 
   | is_flat_prod_lpat pat'           -- Special case (B)
   = do { let pat_ty = hsLPatType pat'
-       ; val_var <- newSysLocalDs Many pat_ty
+       ; val_var <- newSysLocalDs ManyTy pat_ty
 
        ; let mk_bind tick bndr_var
                -- (mk_bind sv bv)  generates  bv = case sv of { pat -> bv }
@@ -757,13 +756,13 @@ mkSelectorBinds ticks pat val_expr
        ; return ( val_var, (val_var, val_expr) : binds) }
 
   | otherwise                          -- General case (C)
-  = do { tuple_var  <- newSysLocalDs Many tuple_ty
+  = do { tuple_var  <- newSysLocalDs ManyTy tuple_ty
        ; error_expr <- mkErrorAppDs pAT_ERROR_ID tuple_ty (ppr pat')
        ; tuple_expr <- matchSimply val_expr PatBindRhs pat
                                    local_tuple error_expr
        ; let mk_tup_bind tick binder
                = (binder, mkOptTickBox tick $
-                          mkTupleSelector1 local_binders binder
+                          mkBigTupleSelectorSolo local_binders binder
                                            tuple_var (Var tuple_var))
              tup_binds = zipWith mk_tup_bind ticks' binders
        ; return (tuple_var, (tuple_var, tuple_expr) : tup_binds) }
@@ -776,7 +775,7 @@ mkSelectorBinds ticks pat val_expr
     ticks'  = ticks ++ repeat []
 
     local_binders = map localiseId binders      -- See Note [Localise pattern binders]
-    local_tuple   = mkBigCoreVarTup1 binders
+    local_tuple   = mkBigCoreVarTupSolo binders
     tuple_ty      = exprType local_tuple
 
 strip_bangs :: LPat (GhcPass p) -> LPat (GhcPass p)
@@ -822,7 +821,7 @@ is_triv_pat _            = False
 mkLHsPatTup :: [LPat GhcTc] -> LPat GhcTc
 mkLHsPatTup []     = noLocA $ mkVanillaTuplePat [] Boxed
 mkLHsPatTup [lpat] = lpat
-mkLHsPatTup lpats  = L (getLoc (head lpats)) $
+mkLHsPatTup lpats@(L l _:_)  = L l $
                      mkVanillaTuplePat lpats Boxed
 
 mkVanillaTuplePat :: [LPat GhcTc] -> Boxity -> Pat GhcTc
@@ -914,11 +913,11 @@ mkFailurePair :: CoreExpr       -- Result type of the whole case expression
                       CoreExpr) -- Fail variable applied to realWorld#
 -- See Note [Failure thunks and CPR]
 mkFailurePair expr
-  = do { fail_fun_var <- newFailLocalDs Many (unboxedUnitTy `mkVisFunTyMany` ty)
-       ; fail_fun_arg <- newSysLocalDs Many unboxedUnitTy
+  = do { fail_fun_var <- newFailLocalDs ManyTy (unboxedUnitTy `mkVisFunTyMany` ty)
+       ; fail_fun_arg <- newSysLocalDs ManyTy unboxedUnitTy
        ; let real_arg = setOneShotLambda fail_fun_arg
        ; return (NonRec fail_fun_var (Lam real_arg expr),
-                 App (Var fail_fun_var) (Var voidPrimId)) }
+                 App (Var fail_fun_var) unboxedUnitExpr) }
   where
     ty = exprType expr
 
@@ -939,8 +938,8 @@ Note [Failure thunks and CPR]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 (This note predates join points as formal entities (hence the quotation marks).
 We can't use actual join points here (see above); if we did, this would also
-solve the CPR problem, since join points don't get CPR'd. See Note [Don't CPR
-join points] in GHC.Core.Opt.WorkWrap.)
+solve the CPR problem, since join points don't get CPR'd. See Note [Don't w/w
+join points for CPR] in GHC.Core.Opt.WorkWrap.)
 
 When we make a failure point we ensure that it
 does not look like a thunk. Example:
@@ -998,7 +997,7 @@ mkBinaryTickBox :: Int -> Int -> CoreExpr -> DsM CoreExpr
 mkBinaryTickBox ixT ixF e = do
        uq <- newUnique
        this_mod <- getModule
-       let bndr1 = mkSysLocal (fsLit "t1") uq One boolTy
+       let bndr1 = mkSysLocal (fsLit "t1") uq OneTy boolTy
          -- It's always sufficient to pattern-match on a boolean with
          -- multiplicity 'One'.
        let
@@ -1067,7 +1066,7 @@ isTrueLHsExpr :: LHsExpr GhcTc -> Maybe (CoreExpr -> DsM CoreExpr)
 -- Returns Just {..} if we're sure that the expression is True
 -- I.e.   * 'True' datacon
 --        * 'otherwise' Id
---        * Trivial wappings of these
+--        * Trivial wrappings of these
 -- The arguments to Just are any HsTicks that we have found,
 -- because we still want to tick then, even it they are always evaluated.
 isTrueLHsExpr (L _ (HsVar _ (L _ v)))

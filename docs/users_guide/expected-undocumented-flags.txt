@@ -26,7 +26,6 @@
 -dsource-stats
 -dstg-stats
 -dsuppress-stg-exts
--exclude-module
 -fallow-incoherent-instances
 -fallow-overlapping-instances
 -fallow-undecidable-instances
@@ -80,6 +79,7 @@
 -n
 -no-keep-hi-file
 -no-keep-o-file
+-no-link
 -no-recomp
 -no-rtsopts
 -no-user-package-conf

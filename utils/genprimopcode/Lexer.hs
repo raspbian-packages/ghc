@@ -1,7 +1,7 @@
 {-# OPTIONS_GHC -fno-warn-unused-binds -fno-warn-missing-signatures #-}
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE MagicHash #-}
-{-# LINE 1 "_build/source-dist/ghc-9.4.7-src/ghc-9.4.7/utils/genprimopcode/Lexer.x" #-}
+{-# LINE 1 "_build/source-dist/ghc-9.6.6-src/ghc-9.6.6/utils/genprimopcode/Lexer.x" #-}
 module Lexer (lex_tok) where
 
 import ParserM (ParserM (..), mkT, mkTv, Token(..), start_code,
@@ -361,7 +361,7 @@ alex_actions = array (0 :: Int, 138)
   , (0,alex_action_21)
   ]
 
-{-# LINE 66 "_build/source-dist/ghc-9.4.7-src/ghc-9.4.7/utils/genprimopcode/Lexer.x" #-}
+{-# LINE 66 "_build/source-dist/ghc-9.6.6-src/ghc-9.6.6/utils/genprimopcode/Lexer.x" #-}
 get_tok :: ParserM Token
 get_tok = ParserM $ \i st ->
    case alexScan i (start_code st) of

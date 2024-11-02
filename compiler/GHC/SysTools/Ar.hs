@@ -1,19 +1,20 @@
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE OverloadedStrings, GeneralizedNewtypeDeriving #-}
-{- Note: [The need for Ar.hs]
-Building `-staticlib` required the presence of libtool, and was a such
-restricted to mach-o only. As libtool on macOS and gnu libtool are very
+{- Note [The need for Ar.hs]
+   ~~~~~~~~~~~~~~~~~~~~~~~~~
+Building `-staticlib` previously required the presence of libtool, and was a
+such restricted to mach-o only. As libtool on macOS and gnu libtool are very
 different, there was no simple portable way to support this.
 
-libtool for static archives does essentially: concatinate the input archives,
+libtool for static archives does essentially: concatenate the input archives,
 add the input objects, and create a symbol index. Using `ar` for this task
 fails as even `ar` (bsd and gnu, llvm, ...) do not provide the same
 features across platforms (e.g. index prefixed retrieval of objects with
 the same name.)
 
-As Archives are rather simple structurally, we can just build the archives
+As archives are rather simple structurally, we can just build the archives
 with Haskell directly and use ranlib on the final result to get the symbol
-index. This should allow us to work around with the differences/abailability
+index. This should allow us to work around with the differences/availability
 of libtool across different platforms.
 -}
 module GHC.SysTools.Ar
@@ -143,7 +144,7 @@ getGNUArchEntries extInfo = do
         if C.unpack (C.take 1 name) == "/"
         then case C.takeWhile (/= ' ') name of
                name@"/"  -> name               -- symbol table
-               name@"//" -> name               -- extendedn file names table
+               name@"//" -> name               -- extended file names table
                name      -> getExtName extInfo (read . C.unpack $ C.drop 1 name)
         else C.takeWhile (/= '/') name
       case name of
@@ -157,7 +158,7 @@ getGNUArchEntries extInfo = do
    getExtName (Just info) offset = C.takeWhile (/= '/') . C.drop offset $ filedata info
 
 -- | put an Archive Entry. This assumes that the entries
--- have been preprocessed to account for the extenden file name
+-- have been preprocessed to account for the extended file name
 -- table section "//" e.g. for GNU Archives. Or that the names
 -- have been move into the payload for BSD Archives.
 putArchEntry :: ArchiveEntry -> PutM ()

@@ -73,6 +73,7 @@ typedef struct {
     MarkQueueEnt entries[];
 } MarkQueueBlock;
 
+
 // How far ahead in mark queue to prefetch?
 #define MARK_PREFETCH_QUEUE_DEPTH 5
 
@@ -166,7 +167,7 @@ void markQueueAddRoot(MarkQueue* q, StgClosure** root);
 void initMarkQueue(MarkQueue *queue);
 void freeMarkQueue(MarkQueue *queue);
 void nonmovingMark(MarkBudget *budget, struct MarkQueue_ *queue);
-INLINE_HEADER void nonmovingMarkUnlimitedBudget(struct MarkQueue_ *queue) {
+INLINE_HEADER void nonmovingMarkUnlimitedBudget(struct MarkQueue_ *restrict queue) {
     MarkBudget budget = UNLIMITED_MARK_BUDGET;
     nonmovingMark(&budget, queue);
 }

@@ -90,8 +90,8 @@ parseOneFile libdir fileName = do
            Left _err -> error "parseOneFile"
            Right ms -> parseModule ms
 
-getPragmas :: Located HsModule -> String
-getPragmas (L _ (HsModule { hsmodAnn = anns'})) = pragmaStr
+getPragmas :: Located (HsModule GhcPs) -> String
+getPragmas (L _ (HsModule { hsmodExt = XModulePs { hsmodAnn = anns' } })) = pragmaStr
   where
     tokComment (L _ (EpaComment (EpaBlockComment s) _)) = s
     tokComment (L _ (EpaComment (EpaLineComment  s) _)) = s
@@ -110,7 +110,7 @@ eraseLayoutInfo = everywhere go
   where
     go :: forall a. Typeable a => a -> a
     go x =
-      case eqT @a @LayoutInfo of
+      case eqT @a @(LayoutInfo GhcPs) of
         Nothing -> x
         Just Refl -> NoLayoutInfo
 

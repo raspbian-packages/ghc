@@ -1,5 +1,7 @@
 module Rules.Program (buildProgramRules) where
 
+import qualified Data.Set as Set
+
 import Hadrian.Haskell.Cabal
 import Hadrian.Haskell.Cabal.Type
 
@@ -63,8 +65,8 @@ getProgramContexts stage = do
     ctx <- programContext stage pkg -- TODO: see todo on programContext.
     let allCtxs = if pkg == iserv
         then [ vanillaContext stage pkg
-             , Context stage pkg profiling
-             , Context stage pkg dynamic
+             , Context stage pkg profiling Final
+             , Context stage pkg dynamic Final
              ]
         else [ ctx ]
     forM allCtxs $ \ctx -> do
@@ -113,15 +115,17 @@ buildBinary rs bin context@Context {..} = do
     needLibrary =<< contextDependencies context
     when (stage > stage0InTree) $ do
         ways <- interpretInContext context (getLibraryWays <> getRtsWays)
-        needLibrary [ (rtsContext stage) { way = w } | w <- ways ]
+        needLibrary [ (rtsContext stage) { way = w } | w <- Set.toList ways ]
     asmSrcs <- interpretInContext context (getContextData asmSrcs)
     asmObjs <- mapM (objectPath context) asmSrcs
     cSrcs   <- interpretInContext context (getContextData cSrcs)
     cxxSrcs <- interpretInContext context (getContextData cxxSrcs)
+    jsSrcs  <- interpretInContext context (getContextData jsSrcs)
     cObjs   <- mapM (objectPath context) cSrcs
     cxxObjs <- mapM (objectPath context) cxxSrcs
+    jsObjs  <- mapM (objectPath context) jsSrcs
     hsObjs  <- hsObjects context
-    let binDeps = asmObjs ++ cObjs ++ cxxObjs ++ hsObjs
+    let binDeps = asmObjs ++ cObjs ++ cxxObjs ++ jsObjs ++ hsObjs
     need binDeps
     buildWithResources rs $ target context (Ghc LinkHs stage) binDeps [bin]
     synopsis <- pkgSynopsis package

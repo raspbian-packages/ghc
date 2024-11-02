@@ -20,6 +20,7 @@ module GHC.Types.Unique.Map (
     addListToUniqMap,
     addToUniqMap_C,
     addToUniqMap_Acc,
+    addToUniqMap_L,
     alterUniqMap,
     addListToUniqMap_C,
     adjustUniqMap,
@@ -31,6 +32,7 @@ module GHC.Types.Unique.Map (
     plusUniqMapList,
     minusUniqMap,
     intersectUniqMap,
+    intersectUniqMap_C,
     disjointUniqMap,
     mapUniqMap,
     filterUniqMap,
@@ -57,9 +59,10 @@ import Data.Semigroup as Semi ( Semigroup(..) )
 import Data.Coerce
 import Data.Maybe
 import Data.Data
+import Control.DeepSeq
 
 -- | Maps indexed by 'Uniquable' keys
-newtype UniqMap k a = UniqMap (UniqFM k (k, a))
+newtype UniqMap k a = UniqMap { getUniqMap :: UniqFM k (k, a) }
     deriving (Data, Eq, Functor)
 type role UniqMap nominal representational
 
@@ -75,6 +78,9 @@ instance (Outputable k, Outputable a) => Outputable (UniqMap k a) where
         brackets $ fsep $ punctuate comma $
         [ ppr k <+> text "->" <+> ppr v
         | (k, v) <- nonDetEltsUFM m ]
+
+instance (NFData k, NFData a) => NFData (UniqMap k a) where
+  rnf (UniqMap fm) = seqEltsUFM rnf fm
 
 liftC :: (a -> a -> a) -> (k, a) -> (k, a) -> (k, a)
 liftC f (_, v) (k', v') = (k', f v v')
@@ -122,6 +128,22 @@ addToUniqMap_Acc exi new (UniqMap m) k0 v0 = UniqMap $
     addToUFM_Acc (\b (k, v) -> (k, exi b v))
                  (\b -> (k0, new b))
                  m k0 v0
+
+-- | Add an element, returns previous lookup result and new map. If
+-- old element doesn't exist, add the passed element directly,
+-- otherwise compute the element to add using the passed function.
+addToUniqMap_L :: Uniquable k
+               => (k -> a -> a -> a) -- key,old,new
+               -> k
+               -> a -- new
+               -> UniqMap k a
+               -> (Maybe a, UniqMap k a)
+addToUniqMap_L f k v (UniqMap m) = case addToUFM_L
+  (\_k (_, _o) (_, _n) -> (_k, f _k _o _n))
+  k
+  (k, v)
+  m of
+  (_maybe, _ufm) -> (snd <$> _maybe, UniqMap _ufm)
 
 alterUniqMap :: Uniquable k
              => (Maybe a -> Maybe a)
@@ -175,6 +197,10 @@ minusUniqMap (UniqMap m1) (UniqMap m2) = UniqMap $ minusUFM m1 m2
 
 intersectUniqMap :: UniqMap k a -> UniqMap k b -> UniqMap k a
 intersectUniqMap (UniqMap m1) (UniqMap m2) = UniqMap $ intersectUFM m1 m2
+
+-- | Intersection with a combining function.
+intersectUniqMap_C :: (a -> b -> c) -> UniqMap k a -> UniqMap k b -> UniqMap k c
+intersectUniqMap_C f (UniqMap m1) (UniqMap m2) = UniqMap $ intersectUFM_C (\(k, a) (_, b) -> (k, f a b)) m1 m2
 
 disjointUniqMap :: UniqMap k a -> UniqMap k b -> Bool
 disjointUniqMap (UniqMap m1) (UniqMap m2) = disjointUFM m1 m2

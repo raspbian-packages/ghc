@@ -637,7 +637,6 @@ build_os
 build_vendor
 build_cpu
 build
-BUILD_PACKAGE_BOOL
 EGREP
 GREP
 CPP
@@ -1769,6 +1768,60 @@ $as_echo "$ac_res" >&6; }
   eval $as_lineno_stack; ${as_lineno_stack:+:} unset as_lineno
 
 } # ac_fn_c_check_func
+
+# ac_fn_c_check_type LINENO TYPE VAR INCLUDES
+# -------------------------------------------
+# Tests whether TYPE exists after having included INCLUDES, setting cache
+# variable VAR accordingly.
+ac_fn_c_check_type ()
+{
+  as_lineno=${as_lineno-"$1"} as_lineno_stack=as_lineno_stack=$as_lineno_stack
+  { $as_echo "$as_me:${as_lineno-$LINENO}: checking for $2" >&5
+$as_echo_n "checking for $2... " >&6; }
+if eval \${$3+:} false; then :
+  $as_echo_n "(cached) " >&6
+else
+  eval "$3=no"
+  cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+/* end confdefs.h.  */
+$4
+int
+main ()
+{
+if (sizeof ($2))
+	 return 0;
+  ;
+  return 0;
+}
+_ACEOF
+if ac_fn_c_try_compile "$LINENO"; then :
+  cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+/* end confdefs.h.  */
+$4
+int
+main ()
+{
+if (sizeof (($2)))
+	    return 0;
+  ;
+  return 0;
+}
+_ACEOF
+if ac_fn_c_try_compile "$LINENO"; then :
+
+else
+  eval "$3=yes"
+fi
+rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
+fi
+rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
+fi
+eval ac_res=\$$3
+	       { $as_echo "$as_me:${as_lineno-$LINENO}: result: $ac_res" >&5
+$as_echo "$ac_res" >&6; }
+  eval $as_lineno_stack; ${as_lineno_stack:+:} unset as_lineno
+
+} # ac_fn_c_check_type
 
 # ac_fn_c_check_decl LINENO SYMBOL VAR INCLUDES
 # ---------------------------------------------
@@ -3664,17 +3717,6 @@ $as_echo "$ac_cv_safe_to_define___extensions__" >&6; }
 ac_config_headers="$ac_config_headers include/HsUnixConfig.h"
 
 
-# Is this a Unix system?
-ac_fn_c_check_header_mongrel "$LINENO" "dlfcn.h" "ac_cv_header_dlfcn_h" "$ac_includes_default"
-if test "x$ac_cv_header_dlfcn_h" = xyes; then :
-  BUILD_PACKAGE_BOOL=True
-else
-  BUILD_PACKAGE_BOOL=False
-fi
-
-
-
-
 { $as_echo "$as_me:${as_lineno-$LINENO}: checking for an ANSI C-conforming const" >&5
 $as_echo_n "checking for an ANSI C-conforming const... " >&6; }
 if ${ac_cv_c_const+:} false; then :
@@ -3997,6 +4039,18 @@ fi
 
 done
 
+for ac_header in sys/sysmacros.h
+do :
+  ac_fn_c_check_header_mongrel "$LINENO" "sys/sysmacros.h" "ac_cv_header_sys_sysmacros_h" "$ac_includes_default"
+if test "x$ac_cv_header_sys_sysmacros_h" = xyes; then :
+  cat >>confdefs.h <<_ACEOF
+#define HAVE_SYS_SYSMACROS_H 1
+_ACEOF
+
+fi
+
+done
+
 for ac_header in bsd/libutil.h libutil.h pty.h utmp.h
 do :
   as_ac_Header=`$as_echo "ac_cv_header_$ac_header" | $as_tr_sh`
@@ -4103,6 +4157,198 @@ _ACEOF
 
 fi
 done
+
+
+for ac_func in alarm
+do :
+  ac_fn_c_check_func "$LINENO" "alarm" "ac_cv_func_alarm"
+if test "x$ac_cv_func_alarm" = xyes; then :
+  cat >>confdefs.h <<_ACEOF
+#define HAVE_ALARM 1
+_ACEOF
+
+fi
+done
+
+for ac_func in dup
+do :
+  ac_fn_c_check_func "$LINENO" "dup" "ac_cv_func_dup"
+if test "x$ac_cv_func_dup" = xyes; then :
+  cat >>confdefs.h <<_ACEOF
+#define HAVE_DUP 1
+_ACEOF
+
+fi
+done
+
+for ac_func in execv
+do :
+  ac_fn_c_check_func "$LINENO" "execv" "ac_cv_func_execv"
+if test "x$ac_cv_func_execv" = xyes; then :
+  cat >>confdefs.h <<_ACEOF
+#define HAVE_EXECV 1
+_ACEOF
+
+fi
+done
+
+for ac_func in getpid
+do :
+  ac_fn_c_check_func "$LINENO" "getpid" "ac_cv_func_getpid"
+if test "x$ac_cv_func_getpid" = xyes; then :
+  cat >>confdefs.h <<_ACEOF
+#define HAVE_GETPID 1
+_ACEOF
+
+fi
+done
+
+for ac_func in mknod
+do :
+  ac_fn_c_check_func "$LINENO" "mknod" "ac_cv_func_mknod"
+if test "x$ac_cv_func_mknod" = xyes; then :
+  cat >>confdefs.h <<_ACEOF
+#define HAVE_MKNOD 1
+_ACEOF
+
+fi
+done
+
+for ac_func in mkstemp
+do :
+  ac_fn_c_check_func "$LINENO" "mkstemp" "ac_cv_func_mkstemp"
+if test "x$ac_cv_func_mkstemp" = xyes; then :
+  cat >>confdefs.h <<_ACEOF
+#define HAVE_MKSTEMP 1
+_ACEOF
+
+fi
+done
+
+for ac_func in pipe
+do :
+  ac_fn_c_check_func "$LINENO" "pipe" "ac_cv_func_pipe"
+if test "x$ac_cv_func_pipe" = xyes; then :
+  cat >>confdefs.h <<_ACEOF
+#define HAVE_PIPE 1
+_ACEOF
+
+fi
+done
+
+for ac_func in times
+do :
+  ac_fn_c_check_func "$LINENO" "times" "ac_cv_func_times"
+if test "x$ac_cv_func_times" = xyes; then :
+  cat >>confdefs.h <<_ACEOF
+#define HAVE_TIMES 1
+_ACEOF
+
+fi
+done
+
+for ac_func in chown fchdir fchmod
+do :
+  as_ac_var=`$as_echo "ac_cv_func_$ac_func" | $as_tr_sh`
+ac_fn_c_check_func "$LINENO" "$ac_func" "$as_ac_var"
+if eval test \"x\$"$as_ac_var"\" = x"yes"; then :
+  cat >>confdefs.h <<_ACEOF
+#define `$as_echo "HAVE_$ac_func" | $as_tr_cpp` 1
+_ACEOF
+
+fi
+done
+
+
+ac_fn_c_check_type "$LINENO" "struct rlimit" "ac_cv_type_struct_rlimit" "#include <sys/resource.h>
+"
+if test "x$ac_cv_type_struct_rlimit" = xyes; then :
+
+$as_echo "#define HAVE_STRUCT_RLIMIT 1" >>confdefs.h
+
+fi
+
+
+# check for statx
+ac_fn_c_check_func "$LINENO" "statx" "ac_cv_func_statx"
+if test "x$ac_cv_func_statx" = xyes; then :
+
+$as_echo "#define HAVE_STATX_FUN 1" >>confdefs.h
+
+fi
+
+ac_fn_c_check_type "$LINENO" "struct statx" "ac_cv_type_struct_statx" "#include <sys/stat.h>
+"
+if test "x$ac_cv_type_struct_statx" = xyes; then :
+
+$as_echo "#define HAVE_STRUCT_STATX 1" >>confdefs.h
+
+fi
+
+{ $as_echo "$as_me:${as_lineno-$LINENO}: checking for statx.stx_mnt_id" >&5
+$as_echo_n "checking for statx.stx_mnt_id... " >&6; }
+cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+/* end confdefs.h.  */
+
+#include <sys/stat.h>
+int
+main ()
+{
+
+struct statx statxbuf;
+statx(0, "", 0, STATX_BASIC_STATS | STATX_MNT_ID, &statxbuf);
+return statxbuf.stx_mnt_id;
+
+  ;
+  return 0;
+}
+_ACEOF
+if ac_fn_c_try_link "$LINENO"; then :
+
+{ $as_echo "$as_me:${as_lineno-$LINENO}: result: yes" >&5
+$as_echo "yes" >&6; }
+
+$as_echo "#define HAVE_STATX_MNT_ID 1" >>confdefs.h
+
+
+else
+
+{ $as_echo "$as_me:${as_lineno-$LINENO}: result: no" >&5
+$as_echo "no" >&6; }
+
+
+fi
+rm -f core conftest.err conftest.$ac_objext \
+    conftest$ac_exeext conftest.$ac_ext
+
+
+{ $as_echo "$as_me:${as_lineno-$LINENO}: checking for F_GETLK from fcntl.h" >&5
+$as_echo_n "checking for F_GETLK from fcntl.h... " >&6; }
+cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+/* end confdefs.h.  */
+
+ #include <fcntl.h>
+ #ifdef F_GETLK
+        yes
+ #endif
+
+_ACEOF
+if (eval "$ac_cpp conftest.$ac_ext") 2>&5 |
+  $EGREP "yes" >/dev/null 2>&1; then :
+
+  { $as_echo "$as_me:${as_lineno-$LINENO}: result: yes" >&5
+$as_echo "yes" >&6; }
+
+$as_echo "#define HAVE_F_GETLK 1" >>confdefs.h
+
+
+else
+
+  { $as_echo "$as_me:${as_lineno-$LINENO}: result: no" >&5
+$as_echo "no" >&6; }
+
+fi
+rm -f conftest*
 
 
 ac_aux_dir=
@@ -4297,6 +4543,28 @@ fi
 done
 
 
+ac_fn_c_check_decl "$LINENO" "CLOCKS_PER_SEC" "ac_cv_have_decl_CLOCKS_PER_SEC" "$ac_includes_default
+#ifdef HAVE_TIME_H
+#include <time.h>
+#endif
+
+"
+if test "x$ac_cv_have_decl_CLOCKS_PER_SEC" = xyes; then :
+  ac_have_decl=1
+else
+  ac_have_decl=0
+fi
+
+cat >>confdefs.h <<_ACEOF
+#define HAVE_DECL_CLOCKS_PER_SEC $ac_have_decl
+_ACEOF
+if test $ac_have_decl = 1; then :
+
+$as_echo "#define HAVE_CLOCKS_PER_SEC 1" >>confdefs.h
+
+fi
+
+
 ac_fn_c_check_member "$LINENO" "struct stat" "st_atim" "ac_cv_member_struct_stat_st_atim" "$ac_includes_default"
 if test "x$ac_cv_member_struct_stat_st_atim" = xyes; then :
 
@@ -4448,6 +4716,27 @@ _ACEOF
 fi
 
 
+ac_fn_c_check_member "$LINENO" "struct stat" "st_blocks" "ac_cv_member_struct_stat_st_blocks" "$ac_includes_default"
+if test "x$ac_cv_member_struct_stat_st_blocks" = xyes; then :
+
+cat >>confdefs.h <<_ACEOF
+#define HAVE_STRUCT_STAT_ST_BLOCKS 1
+_ACEOF
+
+
+fi
+
+ac_fn_c_check_member "$LINENO" "struct stat" "st_blksize" "ac_cv_member_struct_stat_st_blksize" "$ac_includes_default"
+if test "x$ac_cv_member_struct_stat_st_blksize" = xyes; then :
+
+cat >>confdefs.h <<_ACEOF
+#define HAVE_STRUCT_STAT_ST_BLKSIZE 1
+_ACEOF
+
+
+fi
+
+
 ac_fn_c_check_member "$LINENO" "struct passwd" "pw_gecos" "ac_cv_member_struct_passwd_pw_gecos" "#include <pwd.h>
 "
 if test "x$ac_cv_member_struct_passwd_pw_gecos" = xyes; then :
@@ -4486,7 +4775,7 @@ done
 
 
 # Additional temp functions
-# We explicilty check for android, as the check AC_CHECK_FUNCS performs returns "yes" for mkstemps
+# We explicitly check for android, as the check AC_CHECK_FUNCS performs returns "yes" for mkstemps
 # when targetting android. See similar conditionals for seekdir and telldir.
 case $target_os in #(
   *-android*) :
@@ -4707,7 +4996,6 @@ else
 else
   fp_check_const_result='-1'
 fi
-
 
 eval "$as_fp_Cache=\$fp_check_const_result"
 fi
@@ -5136,6 +5424,26 @@ if test "$ac_res" != no; then :
 else
   { $as_echo "$as_me:${as_lineno-$LINENO}: Not found" >&5
 $as_echo "$as_me: Not found" >&6;}
+fi
+
+
+ac_fn_c_check_decl "$LINENO" "sem_getvalue" "ac_cv_have_decl_sem_getvalue" "$ac_includes_default
+#include <semaphore.h>
+
+"
+if test "x$ac_cv_have_decl_sem_getvalue" = xyes; then :
+  ac_have_decl=1
+else
+  ac_have_decl=0
+fi
+
+cat >>confdefs.h <<_ACEOF
+#define HAVE_DECL_SEM_GETVALUE $ac_have_decl
+_ACEOF
+if test $ac_have_decl = 1; then :
+
+$as_echo "#define HAVE_SEM_GETVALUE 1" >>confdefs.h
+
 fi
 
 

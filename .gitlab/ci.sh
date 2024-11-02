@@ -50,11 +50,6 @@ Common Modes:
   shell         Run an interactive shell with a configured build environment.
   save_cache    Preserve the cabal cache
 
-Make build system:
-
-  build_make    Build GHC via the make build system
-  test_make     Test GHC via the make build system
-
 Hadrian build system
   build_hadrian Build GHC via the Hadrian build system
   test_hadrian  Test GHC via the Hadrian build system
@@ -70,6 +65,7 @@ Environment variables affecting both build systems:
                     "decreases", or "all")
   HERMETIC          Take measures to avoid looking at anything in \$HOME
   CONFIGURE_ARGS    Arguments passed to configure script.
+  CONFIGURE_WRAPPER Wrapper for the configure script (e.g. Emscripten's emconfigure).
   ENABLE_NUMA       Whether to enable numa support for the build (disabled by default)
   INSTALL_CONFIGURE_ARGS
                     Arguments passed to the binary distribution configure script
@@ -93,6 +89,7 @@ Environment variables determining build configuration of Hadrian system:
   BUILD_FLAVOUR     Which flavour to build.
   REINSTALL_GHC     Build and test a reinstalled "stage3" ghc built using cabal-install
                     This tests the "reinstall" configuration
+  CROSS_EMULATOR    The emulator to use for testing of cross-compilers.
 
 Environment variables determining bootstrap toolchain (Linux):
 
@@ -216,10 +213,14 @@ function set_toolchain_paths() {
           x86_64-darwin|aarch64-darwin) ;;
           *) fail "unknown NIX_SYSTEM" ;;
         esac
-        nix build -f .gitlab/darwin/toolchain.nix --argstr system "$NIX_SYSTEM" -o toolchain.sh
+        info "Building toolchain for $NIX_SYSTEM"
+        nix-build .gitlab/darwin/toolchain.nix --argstr system "$NIX_SYSTEM" -o toolchain.sh
         cat toolchain.sh
       fi
-      source toolchain.sh ;;
+      source toolchain.sh
+      info "--info for GHC for $NIX_SYSTEM"
+      $GHC --info
+      ;;
     env)
       # These are generally set by the Docker image but
       # we provide these handy fallbacks in case the
@@ -236,10 +237,16 @@ function set_toolchain_paths() {
   export CABAL
   export HAPPY
   export ALEX
+
+  if [[ "${CROSS_TARGET:-}" == *"wasm"* ]]; then
+    source "/home/ghc/.ghc-wasm/env"
+  fi
 }
 
 function cabal_update() {
-  run "$CABAL" update --index="$HACKAGE_INDEX_STATE"
+  # In principle -w shouldn't be necessary here but with
+  # cabal-install 3.8.1.0 it is, due to cabal#8447.
+  run "$CABAL" update -w "$GHC" --index="$HACKAGE_INDEX_STATE"
 }
 
 
@@ -318,7 +325,7 @@ function fetch_cabal() {
             MINGW64) cabal_arch="x86_64" ;;
             *) fail "unknown MSYSTEM $MSYSTEM" ;;
           esac
-          url="https://downloads.haskell.org/~cabal/cabal-install-$v/cabal-install-$v-$cabal_arch-unknown-mingw32.zip"
+          url="https://downloads.haskell.org/~cabal/cabal-install-$v/cabal-install-$v-$cabal_arch-windows.zip"
           info "Fetching cabal binary distribution from $url..."
           curl "$url" > "$TMP/cabal.zip"
           unzip "$TMP/cabal.zip"
@@ -376,8 +383,8 @@ function cleanup_submodules() {
     # On Windows submodules can inexplicably get into funky states where git
     # believes that the submodule is initialized yet its associated repository
     # is not valid. Avoid failing in this case with the following insanity.
-    git submodule sync --recursive || git submodule deinit --force --all
-    git submodule update --init --recursive
+    git submodule sync || git submodule deinit --force --all
+    git submodule update --init
     git submodule foreach git clean -xdf
   else
     info "Not cleaning submodules, not in a git repo"
@@ -406,6 +413,11 @@ EOF
 }
 
 function configure() {
+  case "${CONFIGURE_WRAPPER:-}" in
+    emconfigure) source "$EMSDK/emsdk_env.sh" ;;
+    *) ;;
+  esac
+
   if [[ -z "${NO_BOOT:-}" ]]; then
     start_section "booting"
     run python3 boot
@@ -425,7 +437,7 @@ function configure() {
   start_section "configuring"
   # See https://stackoverflow.com/questions/7577052 for a rationale for the
   # args[@] symbol-soup below.
-  run ./configure \
+  run ${CONFIGURE_WRAPPER:-} ./configure \
     --enable-tarballs-autodownload \
     "${args[@]+"${args[@]}"}" \
     GHC="$GHC" \
@@ -433,23 +445,6 @@ function configure() {
     ALEX="$ALEX" \
     || ( cat config.log; fail "configure failed" )
   end_section "configuring"
-}
-
-function build_make() {
-  check_release_build
-  prepare_build_mk
-  if [[ -z "$BIN_DIST_PREP_TAR_COMP" ]]; then
-    fail "BIN_DIST_PREP_TAR_COMP is not set"
-  fi
-  if [[ -n "${VERBOSE:-}" ]]; then
-    MAKE_ARGS="${MAKE_ARGS:-} V=1"
-  else
-    MAKE_ARGS="${MAKE_ARGS:-} V=0"
-  fi
-
-  run "$MAKE" -j"$cores" "$MAKE_ARGS"
-  run "$MAKE" -j"$cores" binary-dist-prep TAR_COMP_OPTS=-1
-  ls -lh "$BIN_DIST_PREP_TAR_COMP"
 }
 
 function fetch_perf_notes() {
@@ -507,23 +502,6 @@ function check_release_build() {
   fi
 }
 
-function test_make() {
-  if [ -n "${CROSS_TARGET:-}" ]; then
-    info "Can't test cross-compiled build."
-    return
-  fi
-
-  check_msys2_deps inplace/bin/ghc-stage2 --version
-  check_release_build
-
-  run "$MAKE" test_bindist TEST_PREP=YES TEST_PROF=${RELEASE_JOB:-}
-  (unset $(compgen -v | grep CI_*);
-    run "$MAKE" V=0 VERBOSE=1 test \
-      THREADS="$cores" \
-      JUNIT_FILE=../../junit.xml \
-      EXTRA_RUNTEST_OPTS="${RUNTEST_ARGS:-}")
-}
-
 function build_hadrian() {
   if [ -z "${BIN_DIST_NAME:-}" ]; then
     fail "BIN_DIST_NAME not set"
@@ -534,14 +512,17 @@ function build_hadrian() {
 
   check_release_build
 
-  # N.B. First build Hadrian, unsetting MACOSX_DEPLOYMENT_TARGET which may warn
-  # if the bootstrap libraries were built with a different version expectation.
-  MACOSX_DEPLOYMENT_TARGET="" run_hadrian stage1:exe:ghc-bin
+  # We can safely enable parallel compression for x64. By the time
+  # hadrian calls tar/xz to produce bindist, there's no other build
+  # work taking place.
+  if [[ "${CI_JOB_NAME:-}" != *"i386"* ]]; then
+    XZ_OPT="${XZ_OPT:-} -T$cores"
+  fi
 
   if [[ -n "${REINSTALL_GHC:-}" ]]; then
     run_hadrian build-cabal -V
   else
-    run_hadrian binary-dist -V
+    run_hadrian test:all_deps binary-dist -V
     mv _build/bindist/ghc*.tar.xz "$BIN_DIST_NAME.tar.xz"
   fi
 
@@ -557,7 +538,7 @@ function make_install_destdir() {
 
   mkdir -p "$destdir"
   mkdir -p "$instdir"
-  run "$MAKE" DESTDIR="$destdir" install
+  run "$MAKE" DESTDIR="$destdir" install || fail "make install failed"
   # check for empty dir portably
   # https://superuser.com/a/667100
   if find "$instdir" -mindepth 1 -maxdepth 1 | read; then
@@ -565,15 +546,45 @@ function make_install_destdir() {
   fi
   info "merging file tree from $destdir to $instdir"
   cp -a "$destdir/$instdir"/* "$instdir"/
-  "$instdir"/bin/ghc-pkg recache
+  "$instdir"/bin/${cross_prefix}ghc-pkg recache
+}
+
+# install the binary distribution in directory $1 to $2.
+function install_bindist() {
+  case "${CONFIGURE_WRAPPER:-}" in
+    emconfigure) source "$EMSDK/emsdk_env.sh" ;;
+    *) ;;
+  esac
+
+  local bindist="$1"
+  local instdir="$2"
+  pushd "$bindist"
+  case "$(uname)" in
+    MSYS_*|MINGW*)
+      mkdir -p "$instdir"
+      cp -a * "$instdir"
+      ;;
+    *)
+      read -r -a args <<< "${INSTALL_CONFIGURE_ARGS:-}"
+
+      # FIXME: The bindist configure script shouldn't need to be reminded of
+      # the target platform. See #21970.
+      if [ -n "${CROSS_TARGET:-}" ]; then
+          args+=( "--target=$CROSS_TARGET" "--host=$CROSS_TARGET" )
+      fi
+
+      run ${CONFIGURE_WRAPPER:-} ./configure \
+          --prefix="$instdir" \
+          "${args[@]+"${args[@]}"}"
+      make_install_destdir "$TOP"/destdir "$instdir"
+      # And check the `--info` of the installed compiler, sometimes useful in CI log.
+      "$instdir"/bin/ghc --info
+      ;;
+  esac
+  popd
 }
 
 function test_hadrian() {
-  if [ -n "${CROSS_TARGET:-}" ]; then
-    info "Can't test cross-compiled build."
-    return
-  fi
-
   check_msys2_deps _build/stage1/bin/ghc --version
   check_release_build
 
@@ -594,7 +605,22 @@ function test_hadrian() {
   fi
 
 
-  if [[ -n "${REINSTALL_GHC:-}" ]]; then
+  if [[ "${CROSS_EMULATOR:-}" == "NOT_SET" ]]; then
+    info "Cannot test cross-compiled build without CROSS_EMULATOR being set."
+    return
+  elif [ -n "${CROSS_TARGET:-}" ]; then
+    local instdir="$TOP/_build/install"
+    local test_compiler="$instdir/bin/${cross_prefix}ghc$exe"
+    install_bindist _build/bindist/ghc-*/ "$instdir"
+    echo 'main = putStrLn "hello world"' > expected
+    run "$test_compiler" -package ghc "$TOP/.gitlab/hello.hs" -o hello
+    # Despite "-o hello", ghc may output something like hello.exe or
+    # hello.wasm depending on the backend. For the time being let's
+    # just move it to hello before proceeding to running it.
+    mv hello.wasm hello || true
+    ${CROSS_EMULATOR:-} ./hello > actual
+    run diff expected actual
+  elif [[ -n "${REINSTALL_GHC:-}" ]]; then
     run_hadrian \
       test \
       --test-root-dirs=testsuite/tests/stage1 \
@@ -603,33 +629,28 @@ function test_hadrian() {
       --test-root-dirs=testsuite/tests/typecheck \
       "runtest.opts+=${RUNTEST_ARGS:-}" || fail "hadrian cabal-install test"
   else
-    cd _build/bindist/ghc-*/
-    case "$(uname)" in
-      MSYS_*|MINGW*)
-        mkdir -p "$TOP"/_build/install
-        cp -a * "$TOP"/_build/install
-        ;;
-      *)
-        read -r -a args <<< "${INSTALL_CONFIGURE_ARGS:-}"
-        run ./configure --prefix="$TOP"/_build/install "${args[@]+"${args[@]}"}"
-        make_install_destdir "$TOP"/destdir "$TOP"/_build/install
-        ;;
-    esac
-    cd ../../../
-    test_compiler="$TOP/_build/install/bin/ghc$exe"
+    local instdir="$TOP/_build/install"
+    local test_compiler="$instdir/bin/${cross_prefix}ghc$exe"
+    install_bindist _build/bindist/ghc-*/ "$instdir"
 
-    # Disabled, see #21072
-    # run_hadrian \
-    #  test \
-    #  --test-root-dirs=testsuite/tests/stage1 \
-    #  --test-compiler=stage1 \
-    #  "runtest.opts+=${RUNTEST_ARGS:-}" || fail "hadrian stage1 test"
-    #info "STAGE1_TEST=$?"
+    if [[ "${WINDOWS_HOST}" == "no" ]] && [ -z "${CROSS_TARGET:-}" ]
+    then
+      run_hadrian \
+        test \
+        --test-root-dirs=testsuite/tests/stage1 \
+        --test-compiler=stage1 \
+        "runtest.opts+=${RUNTEST_ARGS:-}" || fail "hadrian stage1 test"
+      info "STAGE1_TEST=$?"
+    fi
 
-    # Ensure the resulting compiler has the correct bignum-flavour
-    test_compiler_backend=$(${test_compiler} -e "GHC.Num.Backend.backendName")
-    if [ $test_compiler_backend != "\"$BIGNUM_BACKEND\"" ]; then
-      fail "Test compiler has a different BIGNUM_BACKEND ($test_compiler_backend) thean requested ($BIGNUM_BACKEND)"
+    # Ensure the resulting compiler has the correct bignum-flavour,
+    # except for cross-compilers as they may not support the interpreter
+    if [ -z "${CROSS_TARGET:-}" ]
+    then
+      test_compiler_backend=$(${test_compiler} -e "GHC.Num.Backend.backendName")
+      if [ $test_compiler_backend != "\"$BIGNUM_BACKEND\"" ]; then
+        fail "Test compiler has a different BIGNUM_BACKEND ($test_compiler_backend) thean requested ($BIGNUM_BACKEND)"
+      fi
     fi
 
     # If we are doing a release job, check the compiler can build a profiled executable
@@ -650,6 +671,36 @@ function test_hadrian() {
 
     fi
 
+}
+
+function summarise_hi_files() {
+  for iface in $(find . -type f -name "*.hi" | sort); do echo "$iface  $($HC --show-iface $iface | grep "  ABI hash:")"; done | tee $OUT/abis
+  for iface in $(find . -type f -name "*.hi" | sort); do echo "$iface  $($HC --show-iface $iface | grep "  interface hash:")"; done | tee $OUT/interfaces
+  for iface in $(find . -type f -name "*.hi" | sort); do
+      fname="$OUT/$(dirname $iface)"
+      mkdir -p $fname
+      $HC --show-iface $iface > "$OUT/$iface"
+  done
+}
+
+function cabal_abi_test() {
+  if [ -z "$OUT" ]; then
+    fail "OUT not set"
+  fi
+
+  cp -r libraries/Cabal $DIR
+  pushd $DIR
+  echo $PWD
+
+  start_section "Cabal test: $OUT"
+  mkdir -p "$OUT"
+  run "$HC" \
+    -hidir tmp -odir tmp -fforce-recomp -haddock \
+    -iCabal/Cabal/src -XNoPolyKinds Distribution.Simple -j"$cores" \
+    "$@" 2>&1 | tee $OUT/log
+  summarise_hi_files
+  popd
+  end_section "Cabal test: $OUT"
 }
 
 function cabal_test() {
@@ -682,6 +733,35 @@ function run_perf_test() {
   OUT=out/Cabal-O2 cabal_test -O2
 }
 
+function check_interfaces(){
+  difference=$(diff "$1/$3" "$2/$3") || warn "diff failed"
+  if [ -z "$difference" ]
+   then
+      info "$1 and $2 $3 match"
+   else
+     echo $difference
+     for line in $(echo "$difference" | tr ' ' '\n' | grep ".hi" | sort | uniq); do
+       diff "$1/$line" "$2/$line"
+     done
+     fail "$3"
+  fi
+}
+
+function abi_test() {
+  for i in {1..20}; do info "iteration $i"; run_abi_test; done
+}
+
+function run_abi_test() {
+  if [ -z "$HC" ]; then
+    fail "HC not set"
+  fi
+  mkdir -p out
+  OUT="$PWD/out/run1" DIR=$(mktemp -d XXXX-looooooooong) cabal_abi_test -O0
+  OUT="$PWD/out/run2" DIR=$(mktemp -d XXXX-short) cabal_abi_test -O0
+  check_interfaces out/run1 out/run2 abis "Mismatched ABI hash"
+  check_interfaces out/run1 out/run2 interfaces "Mismatched interface hashes"
+}
+
 function save_cache () {
   info "Storing cabal cache from $CABAL_DIR to $CABAL_CACHE..."
   rm -Rf "$CABAL_CACHE"
@@ -690,7 +770,6 @@ function save_cache () {
 
 function clean() {
   rm -R tmp
-  run "$MAKE" --quiet clean || true
   run rm -Rf _build
 }
 
@@ -732,6 +811,22 @@ function lint_author(){
   done
 }
 
+function abi_of(){
+  DIR=$(realpath $1)
+  mkdir -p "$OUT"
+  pushd $DIR
+  summarise_hi_files
+  popd
+}
+
+# Checks that the interfaces in folder $1 match the interfaces in folder $2
+function compare_interfaces_of(){
+  OUT=$PWD/out/run1 abi_of $1
+  OUT=$PWD/out/run2 abi_of $2
+  check_interfaces out/run1 out/run2 abis "Mismatched ABI hash"
+  check_interfaces out/run1 out/run2 interfaces "Mismatched interface hashes"
+}
+
 
 setup_locale
 
@@ -754,9 +849,11 @@ case "$(uname)" in
     exe=".exe"
     # N.B. cabal-install expects CABAL_DIR to be a Windows path
     CABAL_DIR="$(cygpath -w "$CABAL_DIR")"
+    WINDOWS_HOST="yes"
     ;;
   *)
     exe=""
+    WINDOWS_HOST="no"
     ;;
 esac
 
@@ -777,6 +874,9 @@ esac
 if [ -n "${CROSS_TARGET:-}" ]; then
   info "Cross-compiling for $CROSS_TARGET..."
   target_triple="$CROSS_TARGET"
+  cross_prefix="$target_triple-"
+else
+  cross_prefix=""
 fi
 
 echo "Branch name ${CI_MERGE_REQUEST_SOURCE_BRANCH_NAME:-}"
@@ -810,13 +910,6 @@ case $1 in
   usage) usage ;;
   setup) setup && cleanup_submodules ;;
   configure) time_it "configure" configure ;;
-  build_make) time_it "build" build_make ;;
-  test_make)
-    fetch_perf_notes
-    res=0
-    time_it "test" test_make || res=$?
-    push_perf_notes
-    exit $res ;;
   build_hadrian) time_it "build" build_hadrian ;;
   # N.B. Always push notes, even if the build fails. This is okay to do as the
   # testsuite driver doesn't record notes for tests that fail due to
@@ -829,8 +922,10 @@ case $1 in
     exit $res ;;
   run_hadrian) shift; run_hadrian "$@" ;;
   perf_test) run_perf_test ;;
+  abi_test) abi_test ;;
   cabal_test) cabal_test ;;
   lint_author) shift; lint_author "$@" ;;
+  compare_interfaces_of) shift; compare_interfaces_of "$@" ;;
   clean) clean ;;
   save_cache) save_cache ;;
   shell) shift; shell "$@" ;;

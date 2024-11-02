@@ -13,24 +13,24 @@ import GHC.Prelude
 import GHC.Driver.Session
 import GHC.Driver.Plugins ( withPlugins, installCoreToDos )
 import GHC.Driver.Env
+import GHC.Driver.Config.Core.Lint ( endPass )
+import GHC.Driver.Config.Core.Opt.LiberateCase ( initLiberateCaseOpts )
+import GHC.Driver.Config.Core.Opt.Simplify ( initSimplifyOpts, initSimplMode, initGentleSimplMode )
+import GHC.Driver.Config.Core.Opt.WorkWrap ( initWorkWrapOpts )
+import GHC.Driver.Config.Core.Rules ( initRuleOpts )
 import GHC.Platform.Ways  ( hasWay, Way(WayProf) )
 
 import GHC.Core
 import GHC.Core.Opt.CSE  ( cseProgram )
-import GHC.Core.Rules   ( mkRuleBase,
-                          extendRuleBaseList, ruleCheckProgram, addRuleInfo,
-                          getRules, initRuleOpts )
-import GHC.Core.Ppr     ( pprCoreBindings, pprCoreExpr )
-import GHC.Core.Opt.OccurAnal ( occurAnalysePgm, occurAnalyseExpr )
-import GHC.Core.Stats   ( coreBindsSize, coreBindsStats, exprSize )
-import GHC.Core.Utils   ( mkTicks, stripTicksTop, dumpIdInfoOfProgram )
-import GHC.Core.Lint    ( endPass, lintPassResult, dumpPassResult,
-                          lintAnnots )
-import GHC.Core.Opt.Simplify       ( simplTopBinds, simplExpr, simplImpRules )
-import GHC.Core.Opt.Simplify.Utils ( simplEnvForGHCi, activeRule, activeUnfolding )
-import GHC.Core.Opt.Simplify.Env
+import GHC.Core.Rules   ( RuleBase, mkRuleBase, ruleCheckProgram, getRules )
+import GHC.Core.Ppr     ( pprCoreBindings )
+import GHC.Core.Utils   ( dumpIdInfoOfProgram )
+import GHC.Core.Lint    ( lintAnnots )
+import GHC.Core.Lint.Interactive ( interactiveInScope )
+import GHC.Core.Opt.Simplify ( simplifyExpr, simplifyPgm )
 import GHC.Core.Opt.Simplify.Monad
 import GHC.Core.Opt.Monad
+import GHC.Core.Opt.Pipeline.Types
 import GHC.Core.Opt.FloatIn      ( floatInwards )
 import GHC.Core.Opt.FloatOut     ( floatOutwards )
 import GHC.Core.Opt.LiberateCase ( liberateCase )
@@ -51,29 +51,19 @@ import GHC.Utils.Error  ( withTiming )
 import GHC.Utils.Logger as Logger
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
-import GHC.Utils.Constants (debugIsOn)
-import GHC.Utils.Trace
 
-import GHC.Unit.External
-import GHC.Unit.Module.Env
 import GHC.Unit.Module.ModGuts
-import GHC.Unit.Module.Deps
 
-import GHC.Runtime.Context
-
-import GHC.Types.Id
 import GHC.Types.Id.Info
 import GHC.Types.Basic
 import GHC.Types.Demand ( zapDmdEnvSig )
-import GHC.Types.Var.Set
-import GHC.Types.Var.Env
-import GHC.Types.Tickish
-import GHC.Types.Unique.FM
 import GHC.Types.Name.Ppr
+import GHC.Types.Var ( Var )
 
 import Control.Monad
 import qualified GHC.LanguageExtensions as LangExt
 import GHC.Unit.Module
+
 {-
 ************************************************************************
 *                                                                      *
@@ -85,14 +75,12 @@ import GHC.Unit.Module
 core2core :: HscEnv -> ModGuts -> IO ModGuts
 core2core hsc_env guts@(ModGuts { mg_module  = mod
                                 , mg_loc     = loc
-                                , mg_deps    = deps
                                 , mg_rdr_env = rdr_env })
-  = do { let builtin_passes = getCoreToDo logger dflags
-             orph_mods = mkModuleSet (mod : dep_orphs deps)
+  = do { let builtin_passes = getCoreToDo dflags hpt_rule_base extra_vars
              uniq_mask = 's'
-       ;
+
        ; (guts2, stats) <- runCoreM hsc_env hpt_rule_base uniq_mask mod
-                                    orph_mods print_unqual loc $
+                                    name_ppr_ctx loc $
                            do { hsc_env' <- getHscEnv
                               ; all_passes <- withPlugins (hsc_plugins hsc_env')
                                                 installCoreToDos
@@ -106,12 +94,14 @@ core2core hsc_env guts@(ModGuts { mg_module  = mod
 
        ; return guts2 }
   where
-    logger         = hsc_logger hsc_env
     dflags         = hsc_dflags hsc_env
+    logger         = hsc_logger hsc_env
+    extra_vars     = interactiveInScope (hsc_IC hsc_env)
     home_pkg_rules = hptRules hsc_env (moduleUnitId mod) (GWIB { gwib_mod = moduleName mod
                                                                , gwib_isBoot = NotBoot })
     hpt_rule_base  = mkRuleBase home_pkg_rules
-    print_unqual   = mkPrintUnqualified (hsc_unit_env hsc_env) rdr_env
+    name_ppr_ctx   = mkNamePprCtx ptc (hsc_unit_env hsc_env) rdr_env
+    ptc            = initPromotionTickContext dflags
     -- mod: get the module out of the current HscEnv so we can retrieve it from the monad.
     -- This is very convienent for the users of the monad (e.g. plugins do not have to
     -- consume the ModGuts to find the module) but somewhat ugly because mg_module may
@@ -126,8 +116,9 @@ core2core hsc_env guts@(ModGuts { mg_module  = mod
 ************************************************************************
 -}
 
-getCoreToDo :: Logger -> DynFlags -> [CoreToDo]
-getCoreToDo logger dflags
+getCoreToDo :: DynFlags -> RuleBase -> [Var] -> [CoreToDo]
+-- This function builds the pipeline of optimisations
+getCoreToDo dflags hpt_rule_base extra_vars
   = flatten_todos core_todo
   where
     phases        = simplPhases        dflags
@@ -147,8 +138,6 @@ getCoreToDo logger dflags
     late_specialise = gopt Opt_LateSpecialise             dflags
     static_args   = gopt Opt_StaticArgumentTransformation dflags
     rules_on      = gopt Opt_EnableRewriteRules           dflags
-    eta_expand_on = gopt Opt_DoLambdaEtaExpansion         dflags
-    pre_inline_on = gopt Opt_SimplPreInlining             dflags
     ww_on         = gopt Opt_WorkerWrapper                dflags
     static_ptrs   = xopt LangExt.StaticPointers           dflags
     profiling     = ways dflags `hasWay` WayProf
@@ -159,30 +148,15 @@ getCoreToDo logger dflags
     maybe_rule_check phase = runMaybe rule_check (CoreDoRuleCheck phase)
 
     maybe_strictness_before (Phase phase)
-      | phase `elem` strictnessBefore dflags = CoreDoDemand
+      | phase `elem` strictnessBefore dflags = CoreDoDemand False
     maybe_strictness_before _
       = CoreDoNothing
-
-    base_mode = SimplMode { sm_phase        = panic "base_mode"
-                          , sm_names        = []
-                          , sm_dflags       = dflags
-                          , sm_logger       = logger
-                          , sm_uf_opts      = unfoldingOpts dflags
-                          , sm_rules        = rules_on
-                          , sm_eta_expand   = eta_expand_on
-                          , sm_cast_swizzle = True
-                          , sm_inline       = True
-                          , sm_case_case    = True
-                          , sm_pre_inline   = pre_inline_on
-                          }
 
     simpl_phase phase name iter
       = CoreDoPasses
       $   [ maybe_strictness_before phase
-          , CoreDoSimplify iter
-                (base_mode { sm_phase = phase
-                           , sm_names = [name] })
-
+          , CoreDoSimplify $ initSimplifyOpts dflags extra_vars iter
+                             (initSimplMode dflags phase name) hpt_rule_base
           , maybe_rule_check phase ]
 
     -- Run GHC's internal simplification phase, after all rules have run.
@@ -190,18 +164,13 @@ getCoreToDo logger dflags
     simplify name = simpl_phase FinalPhase name max_iter
 
     -- initial simplify: mk specialiser happy: minimum effort please
-    simpl_gently = CoreDoSimplify max_iter
-                       (base_mode { sm_phase = InitialPhase
-                                  , sm_names = ["Gentle"]
-                                  , sm_rules = rules_on   -- Note [RULEs enabled in InitialPhase]
-                                  , sm_inline = True
-                                              -- See Note [Inline in InitialPhase]
-                                  , sm_case_case = False })
-                          -- Don't do case-of-case transformations.
-                          -- This makes full laziness work better
+    -- See Note [Inline in InitialPhase]
+    -- See Note [RULEs enabled in InitialPhase]
+    simpl_gently = CoreDoSimplify $ initSimplifyOpts dflags extra_vars max_iter
+                                    (initGentleSimplMode dflags) hpt_rule_base
 
-    dmd_cpr_ww = if ww_on then [CoreDoDemand,CoreDoCpr,CoreDoWorkerWrapper]
-                          else [CoreDoDemand,CoreDoCpr]
+    dmd_cpr_ww = if ww_on then [CoreDoDemand True,CoreDoCpr,CoreDoWorkerWrapper]
+                          else [CoreDoDemand False] -- NB: No CPR! See Note [Don't change boxity without worker/wrapper]
 
 
     demand_analyser = (CoreDoPasses (
@@ -273,7 +242,7 @@ getCoreToDo logger dflags
            -- GHC.Iface.Tidy.StaticPtrTable.
            static_ptrs_float_outwards,
 
-        -- Run the simplier phases 2,1,0 to allow rewrite rules to fire
+        -- Run the simplifier phases 2,1,0 to allow rewrite rules to fire
         runWhen do_simpl3
             (CoreDoPasses $ [ simpl_phase (Phase phase) "main" max_iter
                             | phase <- [phases, phases-1 .. 1] ] ++
@@ -369,7 +338,7 @@ getCoreToDo logger dflags
         -- has run at all. See Note [Final Demand Analyser run] in GHC.Core.Opt.DmdAnal
         -- It is EXTREMELY IMPORTANT to run this pass, otherwise execution
         -- can become /exponentially/ more expensive. See #11731, #12996.
-        runWhen (strictness || late_dmd_anal) CoreDoDemand,
+        runWhen (strictness || late_dmd_anal) (CoreDoDemand False),
 
         maybe_rule_check FinalPhase,
 
@@ -383,6 +352,15 @@ getCoreToDo logger dflags
     flatten_todos (CoreDoPasses passes : rest) =
       flatten_todos passes ++ flatten_todos rest
     flatten_todos (todo : rest) = todo : flatten_todos rest
+
+-- The core-to-core pass ordering is derived from the DynFlags:
+runWhen :: Bool -> CoreToDo -> CoreToDo
+runWhen True  do_this = do_this
+runWhen False _       = CoreDoNothing
+
+runMaybe :: Maybe a -> (a -> CoreToDo) -> CoreToDo
+runMaybe (Just x) f = f x
+runMaybe Nothing  _ = CoreDoNothing
 
 {- Note [Inline in InitialPhase]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -437,7 +415,7 @@ for two reasons, both shown up in test perf/compiler/T16473,
 with -O2 -flate-specialise
 
 1.  I found that running late-Specialise after SpecConstr, with no
-    simplification in between meant that the carefullly constructed
+    simplification in between meant that the carefully constructed
     SpecConstr rule never got to fire.  (It was something like
           lvl = f a   -- Arity 1
           ....g lvl....
@@ -477,6 +455,7 @@ runCorePasses passes guts
 doCorePass :: CoreToDo -> ModGuts -> CoreM ModGuts
 doCorePass pass guts = do
   logger    <- getLogger
+  hsc_env   <- getHscEnv
   dflags    <- getDynFlags
   us        <- getUniqueSupplyM
   p_fam_env <- getPackageFamInstEnv
@@ -484,16 +463,21 @@ doCorePass pass guts = do
   let fam_envs = (p_fam_env, mg_fam_inst_env guts)
   let updateBinds  f = return $ guts { mg_binds = f (mg_binds guts) }
   let updateBindsM f = f (mg_binds guts) >>= \b' -> return $ guts { mg_binds = b' }
+  let name_ppr_ctx =
+        mkNamePprCtx
+          (initPromotionTickContext dflags)
+          (hsc_unit_env hsc_env)
+          (mg_rdr_env guts)
 
   case pass of
-    CoreDoSimplify {}         -> {-# SCC "Simplify" #-}
-                                 simplifyPgm pass guts
+    CoreDoSimplify opts       -> {-# SCC "Simplify" #-}
+                                 liftIOWithCount $ simplifyPgm logger (hsc_unit_env hsc_env) name_ppr_ctx opts guts
 
     CoreCSE                   -> {-# SCC "CommonSubExpr" #-}
                                  updateBinds cseProgram
 
     CoreLiberateCase          -> {-# SCC "LiberateCase" #-}
-                                 updateBinds (liberateCase dflags)
+                                 updateBinds (liberateCase (initLiberateCaseOpts dflags))
 
     CoreDoFloatInwards        -> {-# SCC "FloatInwards" #-}
                                  updateBinds (floatInwards platform)
@@ -510,14 +494,16 @@ doCorePass pass guts = do
     CoreDoExitify             -> {-# SCC "Exitify" #-}
                                  updateBinds exitifyProgram
 
-    CoreDoDemand              -> {-# SCC "DmdAnal" #-}
-                                 updateBindsM (liftIO . dmdAnal logger dflags fam_envs (mg_rules guts))
+    CoreDoDemand before_ww    -> {-# SCC "DmdAnal" #-}
+                                 updateBindsM (liftIO . dmdAnal logger before_ww dflags fam_envs (mg_rules guts))
 
     CoreDoCpr                 -> {-# SCC "CprAnal" #-}
                                  updateBindsM (liftIO . cprAnalProgram logger fam_envs)
 
     CoreDoWorkerWrapper       -> {-# SCC "WorkWrap" #-}
-                                 updateBinds (wwTopBinds (mg_module guts) dflags fam_envs us)
+                                 updateBinds (wwTopBinds
+                                               (initWorkWrapOpts (mg_module guts) dflags fam_envs)
+                                               us)
 
     CoreDoSpecialising        -> {-# SCC "Specialise" #-}
                                  specProgram guts
@@ -545,7 +531,6 @@ doCorePass pass guts = do
     CoreDesugarOpt            -> pprPanic "doCorePass" (ppr pass)
     CoreTidy                  -> pprPanic "doCorePass" (ppr pass)
     CorePrep                  -> pprPanic "doCorePass" (ppr pass)
-    CoreOccurAnal             -> pprPanic "doCorePass" (ppr pass)
 
 {-
 ************************************************************************
@@ -565,516 +550,19 @@ ruleCheckPass current_phase pat guts = do
     logger <- getLogger
     withTiming logger (text "RuleCheck"<+>brackets (ppr $ mg_module guts))
                 (const ()) $ do
-        rb <- getRuleBase
-        vis_orphs <- getVisibleOrphanMods
-        let rule_fn fn = getRules (RuleEnv [rb] vis_orphs) fn
-                          ++ (mg_rules guts)
-        let ropts = initRuleOpts dflags
+        rule_env <- initRuleEnv guts
+        let rule_fn fn = getRules rule_env fn
+            ropts = initRuleOpts dflags
         liftIO $ logDumpMsg logger "Rule check"
                      (ruleCheckProgram ropts current_phase pat
                         rule_fn (mg_binds guts))
         return guts
 
-{-
-************************************************************************
-*                                                                      *
-        Gentle simplification
-*                                                                      *
-************************************************************************
--}
-
-simplifyExpr :: HscEnv -- includes spec of what core-to-core passes to do
-             -> CoreExpr
-             -> IO CoreExpr
--- simplifyExpr is called by the driver to simplify an
--- expression typed in at the interactive prompt
-simplifyExpr hsc_env expr
-  = withTiming logger (text "Simplify [expr]") (const ()) $
-    do  { eps <- hscEPS hsc_env ;
-        ; let fi_env    = ( eps_fam_inst_env eps
-                          , extendFamInstEnvList emptyFamInstEnv $
-                            snd $ ic_instances $ hsc_IC hsc_env )
-              simpl_env = simplEnvForGHCi logger dflags
-
-        ; let sz = exprSize expr
-
-        ; (expr', counts) <- initSmpl logger dflags (eps_rule_base <$> hscEPS hsc_env) emptyRuleEnv fi_env sz $
-                             simplExprGently simpl_env expr
-
-        ; Logger.putDumpFileMaybe logger Opt_D_dump_simpl_stats
-                  "Simplifier statistics" FormatText (pprSimplCount counts)
-
-        ; Logger.putDumpFileMaybe logger Opt_D_dump_simpl "Simplified expression"
-                        FormatCore
-                        (pprCoreExpr expr')
-
-        ; return expr'
-        }
-  where
-    dflags = hsc_dflags hsc_env
-    logger = hsc_logger hsc_env
-
-simplExprGently :: SimplEnv -> CoreExpr -> SimplM CoreExpr
--- Simplifies an expression
---      does occurrence analysis, then simplification
---      and repeats (twice currently) because one pass
---      alone leaves tons of crud.
--- Used (a) for user expressions typed in at the interactive prompt
---      (b) the LHS and RHS of a RULE
---      (c) Template Haskell splices
---
--- The name 'Gently' suggests that the SimplMode is InitialPhase,
--- and in fact that is so.... but the 'Gently' in simplExprGently doesn't
--- enforce that; it just simplifies the expression twice
-
--- It's important that simplExprGently does eta reduction; see
--- Note [Simplify rule LHS] above.  The
--- simplifier does indeed do eta reduction (it's in GHC.Core.Opt.Simplify.completeLam)
--- but only if -O is on.
-
-simplExprGently env expr = do
-    expr1 <- simplExpr env (occurAnalyseExpr expr)
-    simplExpr env (occurAnalyseExpr expr1)
-
-{-
-************************************************************************
-*                                                                      *
-\subsection{The driver for the simplifier}
-*                                                                      *
-************************************************************************
--}
-
-simplifyPgm :: CoreToDo -> ModGuts -> CoreM ModGuts
-simplifyPgm pass guts
-  = do { hsc_env <- getHscEnv
-       ; rb <- getRuleBase
-       ; liftIOWithCount $
-         simplifyPgmIO pass hsc_env rb guts }
-
-simplifyPgmIO :: CoreToDo
-              -> HscEnv
-              -> RuleBase
-              -> ModGuts
-              -> IO (SimplCount, ModGuts)  -- New bindings
-
-simplifyPgmIO pass@(CoreDoSimplify max_iterations mode)
-              hsc_env hpt_rule_base
-              guts@(ModGuts { mg_module = this_mod
-                            , mg_rdr_env = rdr_env
-                            , mg_deps = deps
-                            , mg_binds = binds, mg_rules = rules
-                            , mg_fam_inst_env = fam_inst_env })
-  = do { (termination_msg, it_count, counts_out, guts')
-           <- do_iteration 1 [] binds rules
-
-        ; when (logHasDumpFlag logger Opt_D_verbose_core2core
-                && logHasDumpFlag logger Opt_D_dump_simpl_stats) $
-          logDumpMsg logger
-                  "Simplifier statistics for following pass"
-                  (vcat [text termination_msg <+> text "after" <+> ppr it_count
-                                              <+> text "iterations",
-                         blankLine,
-                         pprSimplCount counts_out])
-
-        ; return (counts_out, guts')
-    }
-  where
-    dflags       = hsc_dflags hsc_env
-    logger       = hsc_logger hsc_env
-    print_unqual = mkPrintUnqualified (hsc_unit_env hsc_env) rdr_env
-    simpl_env    = mkSimplEnv mode
-    active_rule  = activeRule mode
-    active_unf   = activeUnfolding mode
-
-    do_iteration :: Int --UniqSupply
-                --  -> Int          -- Counts iterations
-                 -> [SimplCount] -- Counts from earlier iterations, reversed
-                 -> CoreProgram  -- Bindings in
-                 -> [CoreRule]   -- and orphan rules
-                 -> IO (String, Int, SimplCount, ModGuts)
-
-    do_iteration iteration_no counts_so_far binds rules
-        -- iteration_no is the number of the iteration we are
-        -- about to begin, with '1' for the first
-      | iteration_no > max_iterations   -- Stop if we've run out of iterations
-      = warnPprTrace (debugIsOn && (max_iterations > 2))
-            "Simplifier bailing out"
-            ( hang (ppr this_mod <> text ", after"
-                    <+> int max_iterations <+> text "iterations"
-                    <+> (brackets $ hsep $ punctuate comma $
-                         map (int . simplCountN) (reverse counts_so_far)))
-                 2 (text "Size =" <+> ppr (coreBindsStats binds))) $
-
-                -- Subtract 1 from iteration_no to get the
-                -- number of iterations we actually completed
-        return ( "Simplifier baled out", iteration_no - 1
-               , totalise counts_so_far
-               , guts { mg_binds = binds, mg_rules = rules } )
-
-      -- Try and force thunks off the binds; significantly reduces
-      -- space usage, especially with -O.  JRS, 000620.
-      | let sz = coreBindsSize binds
-      , () <- sz `seq` ()     -- Force it
-      = do {
-                -- Occurrence analysis
-           let { tagged_binds = {-# SCC "OccAnal" #-}
-                     occurAnalysePgm this_mod active_unf active_rule rules
-                                     binds
-               } ;
-           Logger.putDumpFileMaybe logger Opt_D_dump_occur_anal "Occurrence analysis"
-                     FormatCore
-                     (pprCoreBindings tagged_binds);
-
-                -- read_eps_rules:
-                -- We need to read rules from the EPS regularly because simplification can
-                -- poke on IdInfo thunks, which in turn brings in new rules
-                -- behind the scenes.  Otherwise there's a danger we'll simply
-                -- miss the rules for Ids hidden inside imported inlinings
-                -- Hence just before attempting to match rules we read on the EPS
-                -- value and then combine it when the existing rule base.
-                -- See `GHC.Core.Opt.Simplify.Monad.getSimplRules`.
-           eps <- hscEPS hsc_env ;
-           let  { read_eps_rules = eps_rule_base <$> hscEPS hsc_env
-                ; rule_base = extendRuleBaseList hpt_rule_base rules
-                ; fam_envs = (eps_fam_inst_env eps, fam_inst_env)
-                ; vis_orphs = this_mod : dep_orphs deps } ;
-
-                -- Simplify the program
-           ((binds1, rules1), counts1) <-
-             initSmpl logger dflags read_eps_rules (mkRuleEnv rule_base vis_orphs) fam_envs sz $
-               do { (floats, env1) <- {-# SCC "SimplTopBinds" #-}
-                                      simplTopBinds simpl_env tagged_binds
-
-                      -- Apply the substitution to rules defined in this module
-                      -- for imported Ids.  Eg  RULE map my_f = blah
-                      -- If we have a substitution my_f :-> other_f, we'd better
-                      -- apply it to the rule to, or it'll never match
-                  ; rules1 <- simplImpRules env1 rules
-
-                  ; return (getTopFloatBinds floats, rules1) } ;
-
-                -- Stop if nothing happened; don't dump output
-                -- See Note [Which transformations are innocuous] in GHC.Core.Opt.Monad
-           if isZeroSimplCount counts1 then
-                return ( "Simplifier reached fixed point", iteration_no
-                       , totalise (counts1 : counts_so_far)  -- Include "free" ticks
-                       , guts { mg_binds = binds1, mg_rules = rules1 } )
-           else do {
-                -- Short out indirections
-                -- We do this *after* at least one run of the simplifier
-                -- because indirection-shorting uses the export flag on *occurrences*
-                -- and that isn't guaranteed to be ok until after the first run propagates
-                -- stuff from the binding site to its occurrences
-                --
-                -- ToDo: alas, this means that indirection-shorting does not happen at all
-                --       if the simplifier does nothing (not common, I know, but unsavoury)
-           let { binds2 = {-# SCC "ZapInd" #-} shortOutIndirections binds1 } ;
-
-                -- Dump the result of this iteration
-           let { dump_core_sizes = not (gopt Opt_SuppressCoreSizes dflags) } ;
-           dump_end_iteration logger dump_core_sizes print_unqual iteration_no counts1 binds2 rules1 ;
-           lintPassResult hsc_env pass binds2 ;
-
-                -- Loop
-           do_iteration (iteration_no + 1) (counts1:counts_so_far) binds2 rules1
-           } }
-#if __GLASGOW_HASKELL__ <= 810
-      | otherwise = panic "do_iteration"
-#endif
-      where
-        -- Remember the counts_so_far are reversed
-        totalise :: [SimplCount] -> SimplCount
-        totalise = foldr (\c acc -> acc `plusSimplCount` c)
-                         (zeroSimplCount dflags)
-
-simplifyPgmIO _ _ _ _ = panic "simplifyPgmIO"
-
--------------------
-dump_end_iteration :: Logger -> Bool -> PrintUnqualified -> Int
-                   -> SimplCount -> CoreProgram -> [CoreRule] -> IO ()
-dump_end_iteration logger dump_core_sizes print_unqual iteration_no counts binds rules
-  = dumpPassResult logger dump_core_sizes print_unqual mb_flag hdr pp_counts binds rules
-  where
-    mb_flag | logHasDumpFlag logger Opt_D_dump_simpl_iterations = Just Opt_D_dump_simpl_iterations
-            | otherwise                                         = Nothing
-            -- Show details if Opt_D_dump_simpl_iterations is on
-
-    hdr = "Simplifier iteration=" ++ show iteration_no
-    pp_counts = vcat [ text "---- Simplifier counts for" <+> text hdr
-                     , pprSimplCount counts
-                     , text "---- End of simplifier counts for" <+> text hdr ]
-
-{-
-************************************************************************
-*                                                                      *
-                Shorting out indirections
-*                                                                      *
-************************************************************************
-
-If we have this:
-
-        x_local = <expression>
-        ...bindings...
-        x_exported = x_local
-
-where x_exported is exported, and x_local is not, then we replace it with this:
-
-        x_exported = <expression>
-        x_local = x_exported
-        ...bindings...
-
-Without this we never get rid of the x_exported = x_local thing.  This
-save a gratuitous jump (from \tr{x_exported} to \tr{x_local}), and
-makes strictness information propagate better.  This used to happen in
-the final phase, but it's tidier to do it here.
-
-Note [Messing up the exported Id's RULES]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-We must be careful about discarding (obviously) or even merging the
-RULES on the exported Id. The example that went bad on me at one stage
-was this one:
-
-    iterate :: (a -> a) -> a -> [a]
-        [Exported]
-    iterate = iterateList
-
-    iterateFB c f x = x `c` iterateFB c f (f x)
-    iterateList f x =  x : iterateList f (f x)
-        [Not exported]
-
-    {-# RULES
-    "iterate"   forall f x.     iterate f x = build (\c _n -> iterateFB c f x)
-    "iterateFB"                 iterateFB (:) = iterateList
-     #-}
-
-This got shorted out to:
-
-    iterateList :: (a -> a) -> a -> [a]
-    iterateList = iterate
-
-    iterateFB c f x = x `c` iterateFB c f (f x)
-    iterate f x =  x : iterate f (f x)
-
-    {-# RULES
-    "iterate"   forall f x.     iterate f x = build (\c _n -> iterateFB c f x)
-    "iterateFB"                 iterateFB (:) = iterate
-     #-}
-
-And now we get an infinite loop in the rule system
-        iterate f x -> build (\cn -> iterateFB c f x)
-                    -> iterateFB (:) f x
-                    -> iterate f x
-
-Old "solution":
-        use rule switching-off pragmas to get rid
-        of iterateList in the first place
-
-But in principle the user *might* want rules that only apply to the Id
-they say.  And inline pragmas are similar
-   {-# NOINLINE f #-}
-   f = local
-   local = <stuff>
-Then we do not want to get rid of the NOINLINE.
-
-Hence hasShortableIdinfo.
-
-
-Note [Rules and indirection-zapping]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Problem: what if x_exported has a RULE that mentions something in ...bindings...?
-Then the things mentioned can be out of scope!  Solution
- a) Make sure that in this pass the usage-info from x_exported is
-        available for ...bindings...
- b) If there are any such RULES, rec-ify the entire top-level.
-    It'll get sorted out next time round
-
-Other remarks
-~~~~~~~~~~~~~
-If more than one exported thing is equal to a local thing (i.e., the
-local thing really is shared), then we do one only:
-\begin{verbatim}
-        x_local = ....
-        x_exported1 = x_local
-        x_exported2 = x_local
-==>
-        x_exported1 = ....
-
-        x_exported2 = x_exported1
-\end{verbatim}
-
-We rely on prior eta reduction to simplify things like
-\begin{verbatim}
-        x_exported = /\ tyvars -> x_local tyvars
-==>
-        x_exported = x_local
-\end{verbatim}
-Hence,there's a possibility of leaving unchanged something like this:
-\begin{verbatim}
-        x_local = ....
-        x_exported1 = x_local Int
-\end{verbatim}
-By the time we've thrown away the types in STG land this
-could be eliminated.  But I don't think it's very common
-and it's dangerous to do this fiddling in STG land
-because we might eliminate a binding that's mentioned in the
-unfolding for something.
-
-Note [Indirection zapping and ticks]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Unfortunately this is another place where we need a special case for
-ticks. The following happens quite regularly:
-
-        x_local = <expression>
-        x_exported = tick<x> x_local
-
-Which we want to become:
-
-        x_exported =  tick<x> <expression>
-
-As it makes no sense to keep the tick and the expression on separate
-bindings. Note however that this might increase the ticks scoping
-over the execution of x_local, so we can only do this for floatable
-ticks. More often than not, other references will be unfoldings of
-x_exported, and therefore carry the tick anyway.
--}
-
-type IndEnv = IdEnv (Id, [CoreTickish]) -- Maps local_id -> exported_id, ticks
-
-shortOutIndirections :: CoreProgram -> CoreProgram
-shortOutIndirections binds
-  | isEmptyVarEnv ind_env = binds
-  | no_need_to_flatten    = binds'                      -- See Note [Rules and indirection-zapping]
-  | otherwise             = [Rec (flattenBinds binds')] -- for this no_need_to_flatten stuff
-  where
-    ind_env            = makeIndEnv binds
-    -- These exported Ids are the subjects  of the indirection-elimination
-    exp_ids            = map fst $ nonDetEltsUFM ind_env
-      -- It's OK to use nonDetEltsUFM here because we forget the ordering
-      -- by immediately converting to a set or check if all the elements
-      -- satisfy a predicate.
-    exp_id_set         = mkVarSet exp_ids
-    no_need_to_flatten = all (null . ruleInfoRules . idSpecialisation) exp_ids
-    binds'             = concatMap zap binds
-
-    zap (NonRec bndr rhs) = [NonRec b r | (b,r) <- zapPair (bndr,rhs)]
-    zap (Rec pairs)       = [Rec (concatMap zapPair pairs)]
-
-    zapPair (bndr, rhs)
-        | bndr `elemVarSet` exp_id_set
-        = []   -- Kill the exported-id binding
-
-        | Just (exp_id, ticks) <- lookupVarEnv ind_env bndr
-        , (exp_id', lcl_id') <- transferIdInfo exp_id bndr
-        =      -- Turn a local-id binding into two bindings
-               --    exp_id = rhs; lcl_id = exp_id
-          [ (exp_id', mkTicks ticks rhs),
-            (lcl_id', Var exp_id') ]
-
-        | otherwise
-        = [(bndr,rhs)]
-
-makeIndEnv :: [CoreBind] -> IndEnv
-makeIndEnv binds
-  = foldl' add_bind emptyVarEnv binds
-  where
-    add_bind :: IndEnv -> CoreBind -> IndEnv
-    add_bind env (NonRec exported_id rhs) = add_pair env (exported_id, rhs)
-    add_bind env (Rec pairs)              = foldl' add_pair env pairs
-
-    add_pair :: IndEnv -> (Id,CoreExpr) -> IndEnv
-    add_pair env (exported_id, exported)
-        | (ticks, Var local_id) <- stripTicksTop tickishFloatable exported
-        , shortMeOut env exported_id local_id
-        = extendVarEnv env local_id (exported_id, ticks)
-    add_pair env _ = env
-
------------------
-shortMeOut :: IndEnv -> Id -> Id -> Bool
-shortMeOut ind_env exported_id local_id
--- The if-then-else stuff is just so I can get a pprTrace to see
--- how often I don't get shorting out because of IdInfo stuff
-  = if isExportedId exported_id &&              -- Only if this is exported
-
-       isLocalId local_id &&                    -- Only if this one is defined in this
-                                                --      module, so that we *can* change its
-                                                --      binding to be the exported thing!
-
-       not (isExportedId local_id) &&           -- Only if this one is not itself exported,
-                                                --      since the transformation will nuke it
-
-       not (local_id `elemVarEnv` ind_env)      -- Only if not already substituted for
-    then
-        if hasShortableIdInfo exported_id
-        then True       -- See Note [Messing up the exported Id's RULES]
-        else warnPprTrace True "Not shorting out" (ppr exported_id) False
-    else
-        False
-
------------------
-hasShortableIdInfo :: Id -> Bool
--- True if there is no user-attached IdInfo on exported_id,
--- so we can safely discard it
--- See Note [Messing up the exported Id's RULES]
-hasShortableIdInfo id
-  =  isEmptyRuleInfo (ruleInfo info)
-  && isDefaultInlinePragma (inlinePragInfo info)
-  && not (isStableUnfolding (realUnfoldingInfo info))
-  where
-     info = idInfo id
-
------------------
-{- Note [Transferring IdInfo]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-If we have
-     lcl_id = e; exp_id = lcl_id
-
-and lcl_id has useful IdInfo, we don't want to discard it by going
-     gbl_id = e; lcl_id = gbl_id
-
-Instead, transfer IdInfo from lcl_id to exp_id, specifically
-* (Stable) unfolding
-* Strictness
-* Rules
-* Inline pragma
-
-Overwriting, rather than merging, seems to work ok.
-
-For the lcl_id we
-
-* Zap the InlinePragma. It might originally have had a NOINLINE, which
-  we have now transferred; and we really want the lcl_id to inline now
-  that its RHS is trivial!
-
-* Zap any Stable unfolding.  agian, we want lcl_id = gbl_id to inline,
-  replacing lcl_id by gbl_id. That won't happen if lcl_id has its original
-  great big Stable unfolding
--}
-
-transferIdInfo :: Id -> Id -> (Id, Id)
--- See Note [Transferring IdInfo]
-transferIdInfo exported_id local_id
-  = ( modifyIdInfo transfer exported_id
-    , modifyIdInfo zap_info local_id )
-  where
-    local_info = idInfo local_id
-    transfer exp_info = exp_info `setDmdSigInfo`     dmdSigInfo local_info
-                                 `setCprSigInfo`     cprSigInfo local_info
-                                 `setUnfoldingInfo`  realUnfoldingInfo local_info
-                                 `setInlinePragInfo` inlinePragInfo local_info
-                                 `setRuleInfo`       addRuleInfo (ruleInfo exp_info) new_info
-    new_info = setRuleInfoHead (idName exported_id)
-                               (ruleInfo local_info)
-        -- Remember to set the function-name field of the
-        -- rules as we transfer them from one function to another
-
-    zap_info lcl_info = lcl_info `setInlinePragInfo` defaultInlinePragma
-                                 `setUnfoldingInfo`  noUnfolding
-
-
-dmdAnal :: Logger -> DynFlags -> FamInstEnvs -> [CoreRule] -> CoreProgram -> IO CoreProgram
-dmdAnal logger dflags fam_envs rules binds = do
+dmdAnal :: Logger -> Bool -> DynFlags -> FamInstEnvs -> [CoreRule] -> CoreProgram -> IO CoreProgram
+dmdAnal logger before_ww dflags fam_envs rules binds = do
   let !opts = DmdAnalOpts
                { dmd_strict_dicts    = gopt Opt_DictsStrict dflags
+               , dmd_do_boxity       = before_ww -- only run Boxity Analysis immediately preceding WW
                , dmd_unbox_width     = dmdUnboxWidth dflags
                , dmd_max_worker_args = maxWorkerArgs dflags
                }

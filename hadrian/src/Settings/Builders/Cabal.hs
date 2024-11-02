@@ -10,6 +10,7 @@ import Packages
 import Settings.Builders.Common
 import qualified Settings.Builders.Common as S
 import Control.Exception (assert)
+import qualified Data.Set as Set
 import System.Directory
 import Settings.Program (programContext)
 
@@ -26,9 +27,10 @@ cabalInstallArgs = builder (Cabal Install) ?  do
         | otherwise     = pkgName pkg
   assertNoBuildRootLeak $
     mconcat [ arg $ "--store-dir="   ++ (root -/- "stage-cabal" -/- "cabal-store")
-            , arg "install"
-            , if isProgram pkg then arg $ "exe:" ++ pgmName else mconcat [arg "--lib", arg $ pkgName pkg]
+            , if isProgram pkg then arg "install" else arg "build"
+            , if isProgram pkg then (arg $ "exe:" ++ pgmName) else (arg $ pkgName pkg)
             , commonReinstallCabalArgs
+            , if isProgram pkg then extraInstallArgs else mempty
             ]
 
 -- | Checks that _build/stageN/lib/* doesn't leak into the arguments for
@@ -44,6 +46,13 @@ assertNoBuildRootLeak args = do
                                        | libPath <- libPaths]) xs)
                 xs
 
+extraInstallArgs :: Args
+extraInstallArgs = do
+    root      <- getBuildRoot
+    mconcat [ arg $ "--install-method=copy"
+            , arg $ "--overwrite-policy=always"
+            , arg $ "--installdir="  ++ (root -/- "stage-cabal" -/- "cabal-bin") ]
+
 commonReinstallCabalArgs :: Args
 commonReinstallCabalArgs = do
     top       <- expr topDirectory
@@ -55,12 +64,7 @@ commonReinstallCabalArgs = do
             , arg $ top -/- "cabal.project-reinstall"
             , arg "--distdir"
             , arg $ root -/- "stage-cabal" -/- "dist-newstyle"
-            , arg ("--ghc-option=-j" ++ show threads)
-            , arg $ "--install-method=copy"
-            , arg $ "--overwrite-policy=always"
             , arg $ "--with-compiler=" ++ top -/- compiler
-            , arg $ "--installdir="  ++ (root -/- "stage-cabal" -/- "cabal-bin")
-            , arg $ "--package-env=" ++ (root -/- "stage-cabal" -/- "cabal-packages")
             , arg "--enable-executable-dynamic"
             , arg "--enable-library-vanilla"
             ]
@@ -111,16 +115,15 @@ commonCabalArgs stage = do
             , arg "--htmldir"
             , arg $ "${pkgroot}/../../doc/html/libraries/" ++ package_id
 
-            , withStaged $ Ghc CompileHs
+            -- These trigger a need on each dependency, so every important to need
+            -- them in parallel or  it linearises the build of Ghc and GhcPkg
+            , withStageds [Ghc CompileHs, GhcPkg Update, Cc CompileC, Ar Pack]
             , withBuilderArgs (Ghc CompileHs stage)
-            , withStaged (GhcPkg Update)
             , withBuilderArgs (GhcPkg Update stage)
             , bootPackageDatabaseArgs
             , libraryArgs
             , bootPackageConstraints
-            , withStaged $ Cc CompileC
             , notStage0 ? with (Ld stage)
-            , withStaged (Ar Pack)
             , with Alex
             , with Happy
             -- Update Target.trackArgument if changing these:
@@ -141,7 +144,7 @@ libraryArgs = do
     withGhci    <- expr ghcWithInterpreter
     dynPrograms <- expr (flavour >>= dynamicGhcPrograms)
     ghciObjsSupported <- expr platformSupportsGhciObjects
-    let ways = flavourWays ++ [contextWay]
+    let ways = Set.insert contextWay flavourWays
         hasVanilla = vanilla `elem` ways
         hasProfiling = any (wayUnit Profiling) ways
         hasDynamic = any (wayUnit Dynamic) ways
@@ -229,7 +232,7 @@ withBuilderArgs :: Builder -> Args
 withBuilderArgs b = case b of
     Ghc _ stage -> do
       top   <- expr topDirectory
-      pkgDb <- expr $ packageDbPath stage
+      pkgDb <- expr $ packageDbPath (PackageDbLoc stage Inplace)
       -- GHC starts with a nonempty package DB stack, so we need to tell it
       -- to empty the stack first for it to truly consider only the package
       -- DB we explicitly provide. See #17468.
@@ -237,22 +240,29 @@ withBuilderArgs b = case b of
                   arg ("--ghc-option=-package-db=" ++ top -/- pkgDb)
     GhcPkg _ stage -> do
       top   <- expr topDirectory
-      pkgDb <- expr $ packageDbPath stage
+      pkgDb <- expr $ packageDbPath (PackageDbLoc stage Inplace)
       notStage0 ? arg ("--ghc-pkg-option=--global-package-db=" ++ top -/- pkgDb)
     _          -> return [] -- no arguments
 
 -- | Expression 'with Alex' appends "--with-alex=/path/to/alex" and needs Alex.
 with :: Builder -> Args
-with b = do
-    path <- getBuilderPath b
-    if null path then mempty else do
-        top <- expr topDirectory
-        expr $ needBuilder b
+with b = withs [b]
+
+-- | Expression 'with Alex' appends "--with-alex=/path/to/alex" and needs Alex.
+withs :: [Builder] -> Args
+withs bs = do
+    paths <- filter (not . null . snd) <$> mapM (\b -> (b,) <$> getBuilderPath b) bs
+    let bs = map fst paths
+    expr $ (needBuilders bs)
+    top <- expr topDirectory
+    mconcat $ map (\(b, path) ->
         -- Do not inject top, if we have a bare name. E.g. do not turn
         -- `ar` into `$top/ar`. But let `ar` be `ar` as found on $PATH.
         arg  $ withBuilderKey b ++ unifyPath (if path /= takeFileName path
                                               then top </> path
-                                              else path)
+                                              else path)) paths
 
-withStaged :: (Stage -> Builder) -> Args
-withStaged sb = with . sb =<< getStage
+withStageds :: [Stage -> Builder] -> Args
+withStageds sb = do
+  st <- getStage
+  withs (map (\f -> f st) sb)

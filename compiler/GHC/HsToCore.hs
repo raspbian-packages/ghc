@@ -1,4 +1,4 @@
-
+{-# LANGUAGE MonadComprehensions #-}
 {-# LANGUAGE TypeFamilies #-}
 
 {-# OPTIONS_GHC -Wno-incomplete-uni-patterns #-}
@@ -20,6 +20,9 @@ import GHC.Prelude
 
 import GHC.Driver.Session
 import GHC.Driver.Config
+import GHC.Driver.Config.Core.Lint ( endPassHscEnvIO )
+import GHC.Driver.Config.HsToCore.Ticks
+import GHC.Driver.Config.HsToCore.Usage
 import GHC.Driver.Env
 import GHC.Driver.Backend
 import GHC.Driver.Plugins
@@ -32,17 +35,20 @@ import GHC.HsToCore.Errors.Types
 import GHC.HsToCore.Expr
 import GHC.HsToCore.Binds
 import GHC.HsToCore.Foreign.Decl
+import GHC.HsToCore.Ticks
+import GHC.HsToCore.Breakpoints
 import GHC.HsToCore.Coverage
 import GHC.HsToCore.Docs
 
 import GHC.Tc.Types
-import GHC.Tc.Utils.Monad  ( finalSafeMode, fixSafeInstances )
+import GHC.Tc.Utils.Monad  ( finalSafeMode, fixSafeInstances, initIfaceLoad )
 import GHC.Tc.Module ( runTcInteractive )
 
 import GHC.Core.Type
-import GHC.Core.TyCon     ( tyConDataCons )
+import GHC.Core.TyCo.Compare( eqType )
+import GHC.Core.TyCon       ( tyConDataCons )
 import GHC.Core
-import GHC.Core.FVs       ( exprsSomeFreeVarsList )
+import GHC.Core.FVs       ( exprsSomeFreeVarsList, exprFreeVars )
 import GHC.Core.SimpleOpt ( simpleOptPgm, simpleOptExpr )
 import GHC.Core.Utils
 import GHC.Core.Unfold.Make
@@ -50,8 +56,7 @@ import GHC.Core.Coercion
 import GHC.Core.DataCon ( dataConWrapId )
 import GHC.Core.Make
 import GHC.Core.Rules
-import GHC.Core.Opt.Monad ( CoreToDo(..) )
-import GHC.Core.Lint     ( endPassIO )
+import GHC.Core.Opt.Pipeline.Types ( CoreToDo(..) )
 import GHC.Core.Ppr
 
 import GHC.Builtin.Names
@@ -61,6 +66,7 @@ import GHC.Builtin.Types
 import GHC.Data.FastString
 import GHC.Data.Maybe    ( expectJust )
 import GHC.Data.OrdList
+import GHC.Data.SizedSeq ( sizeSS )
 
 import GHC.Utils.Error
 import GHC.Utils.Outputable
@@ -91,6 +97,7 @@ import GHC.Unit.Module.Deps
 
 import Data.List (partition)
 import Data.IORef
+import Data.Traversable (for)
 
 {-
 ************************************************************************
@@ -139,26 +146,41 @@ deSugar hsc_env
 
   = do { let dflags = hsc_dflags hsc_env
              logger = hsc_logger hsc_env
-             print_unqual = mkPrintUnqualified (hsc_unit_env hsc_env) rdr_env
+             ptc = initPromotionTickContext (hsc_dflags hsc_env)
+             name_ppr_ctx = mkNamePprCtx ptc (hsc_unit_env hsc_env) rdr_env
         ; withTiming logger
                      (text "Desugar"<+>brackets (ppr mod))
                      (const ()) $
      do { -- Desugar the program
         ; let export_set = availsToNameSet exports
               bcknd      = backend dflags
-              hpcInfo    = emptyHpcInfo other_hpc_info
 
-        ; (binds_cvr, ds_hpc_info, modBreaks)
+        ; (binds_cvr, m_tickInfo)
                          <- if not (isHsBootOrSig hsc_src)
                               then addTicksToBinds
-                                       (CoverageConfig
-                                        { coverageConfig_logger = hsc_logger hsc_env
-                                        , coverageConfig_dynFlags = hsc_dflags hsc_env
-                                        , coverageConfig_mInterp = hsc_interp hsc_env
-                                        })
+                                       (hsc_logger hsc_env)
+                                       (initTicksConfig (hsc_dflags hsc_env))
                                        mod mod_loc
                                        export_set (typeEnvTyCons type_env) binds
-                              else return (binds, hpcInfo, Nothing)
+                              else return (binds, Nothing)
+        ; modBreaks <- for
+           [ (i, s)
+           | i <- hsc_interp hsc_env
+           , (_, s) <- m_tickInfo
+           , backendWantsBreakpointTicks (backend dflags)
+           ]
+           $ \(interp, specs) -> mkModBreaks interp mod specs
+
+        ; ds_hpc_info <- case m_tickInfo of
+            Just (orig_file2, ticks)
+              | gopt Opt_Hpc $ hsc_dflags hsc_env
+              -> do
+              hashNo <- if gopt Opt_Hpc $ hsc_dflags hsc_env
+                then writeMixEntries (hpcDir dflags) mod ticks orig_file2
+                else return 0 -- dummy hash when none are written
+              pure $ HpcInfo (fromIntegral $ sizeSS ticks) hashNo
+            _ -> pure $ emptyHpcInfo other_hpc_info
+
         ; (msgs, mb_res) <- initDs hsc_env tcg_env $
                        do { ds_ev_binds <- dsEvBinds ev_binds
                           ; core_prs <- dsTopLHsBinds binds_cvr
@@ -191,7 +213,7 @@ deSugar hsc_env
         -- You might think it doesn't matter, but the simplifier brings all top-level
         -- things into the in-scope set before simplifying; so we get no unfolding for F#!
 
-        ; endPassIO hsc_env print_unqual CoreDesugar final_pgm rules_for_imps
+        ; endPassHscEnvIO hsc_env name_ppr_ctx CoreDesugar final_pgm rules_for_imps
         ; let simpl_opts = initSimpleOpts dflags
         ; let (ds_binds, ds_rules_for_imps, occ_anald_binds)
                 = simpleOptPgm simpl_opts mod final_pgm rules_for_imps
@@ -200,7 +222,7 @@ deSugar hsc_env
         ; putDumpFileMaybe logger Opt_D_dump_occur_anal "Occurrence analysis"
             FormatCore (pprCoreBindings occ_anald_binds $$ pprRules ds_rules_for_imps )
 
-        ; endPassIO hsc_env print_unqual CoreDesugarOpt ds_binds ds_rules_for_imps
+        ; endPassHscEnvIO hsc_env name_ppr_ctx CoreDesugarOpt ds_binds ds_rules_for_imps
 
         ; let used_names = mkUsedNames tcg_env
               pluginModules = map lpModule (loadedPlugins (hsc_plugins hsc_env))
@@ -215,8 +237,13 @@ deSugar hsc_env
         ; safe_mode <- finalSafeMode dflags tcg_env
         ; (needed_mods, needed_pkgs) <- readIORef (tcg_th_needed_deps tcg_env)
 
-        ; usages <- mkUsageInfo hsc_env mod (imp_mods imports) used_names
-                      dep_files merged needed_mods needed_pkgs
+        ; let uc = initUsageConfig hsc_env
+        ; let plugins = hsc_plugins hsc_env
+        ; let fc = hsc_FC hsc_env
+        ; let unit_env = hsc_unit_env hsc_env
+        ; usages <- initIfaceLoad hsc_env $
+                      mkUsageInfo uc plugins fc unit_env mod (imp_mods imports) used_names
+                        dep_files merged needed_mods needed_pkgs
         -- id_mod /= mod when we are processing an hsig, but hsigs
         -- never desugared and compiled (there's no code!)
         -- Consequently, this should hold for any ModGuts that make
@@ -335,33 +362,28 @@ deSugarExpr hsc_env tc_expr = do
 addExportFlagsAndRules
     :: Backend -> NameSet -> NameSet -> [CoreRule]
     -> [(Id, t)] -> [(Id, t)]
-addExportFlagsAndRules bcknd exports keep_alive rules prs
-  = mapFst add_one prs
-  where
-    add_one bndr = add_rules name (add_export name bndr)
-       where
-         name = idName bndr
-
-    ---------- Rules --------
-        -- See Note [Attach rules to local ids]
+addExportFlagsAndRules bcknd exports keep_alive rules
+  = mapFst (addRulesToId rule_base . add_export_flag)
+        -- addRulesToId: see Note [Attach rules to local ids]
         -- NB: the binder might have some existing rules,
         -- arising from specialisation pragmas
-    add_rules name bndr
-        | Just rules <- lookupNameEnv rule_base name
-        = bndr `addIdSpecialisations` rules
-        | otherwise
-        = bndr
+
+  where
+
+    ---------- Rules --------
     rule_base = extendRuleBaseList emptyRuleBase rules
 
     ---------- Export flag --------
     -- See Note [Adding export flags]
-    add_export name bndr
-        | dont_discard name = setIdExported bndr
+    add_export_flag bndr
+        | dont_discard bndr = setIdExported bndr
         | otherwise         = bndr
 
-    dont_discard :: Name -> Bool
-    dont_discard name = is_exported name
+    dont_discard :: Id -> Bool
+    dont_discard bndr = is_exported name
                      || name `elemNameSet` keep_alive
+       where
+         name = idName bndr
 
         -- In interactive mode, we don't want to discard any top-level
         -- entities at all (eg. do not inline them away during
@@ -371,7 +393,7 @@ addExportFlagsAndRules bcknd exports keep_alive rules prs
         -- isExternalName separates the user-defined top-level names from those
         -- introduced by the type checker.
     is_exported :: Name -> Bool
-    is_exported | backendRetainsAllBindings bcknd = isExternalName
+    is_exported | backendWantsGlobalBindings bcknd = isExternalName
                 | otherwise                       = (`elemNameSet` exports)
 
 {-
@@ -439,7 +461,7 @@ dsRule (L loc (HsRule { rd_name = name
         -- Substitute the dict bindings eagerly,
         -- and take the body apart into a (f args) form
         ; dflags <- getDynFlags
-        ; case decomposeRuleLhs dflags bndrs'' lhs'' of {
+        ; case decomposeRuleLhs dflags bndrs'' lhs'' (exprFreeVars rhs'') of {
                 Left msg -> do { diagnosticDs msg; return Nothing } ;
                 Right (final_bndrs, fn_id, args) -> do
 
@@ -450,27 +472,28 @@ dsRule (L loc (HsRule { rd_name = name
               fn_name   = idName fn_id
               simpl_opts = initSimpleOpts dflags
               final_rhs = simpleOptExpr simpl_opts rhs''    -- De-crap it
-              rule_name = snd (unLoc name)
-              final_bndrs_set = mkVarSet final_bndrs
-              arg_ids = filterOut (`elemVarSet` final_bndrs_set) $
-                        exprsSomeFreeVarsList isId args
-
-        ; rule <- dsMkUserRule this_mod is_local
-                         rule_name rule_act fn_name final_bndrs args
-                         final_rhs
-        ; warnRuleShadowing rule_name rule_act fn_id arg_ids
+              rule_name = unLoc name
+              rule = mkRule this_mod False is_local rule_name rule_act
+                            fn_name final_bndrs args final_rhs
+        ; dsWarnOrphanRule rule
+        ; dsWarnRuleShadowing fn_id rule
 
         ; return (Just rule)
         } } }
 
-warnRuleShadowing :: RuleName -> Activation -> Id -> [Id] -> DsM ()
+dsWarnRuleShadowing :: Id -> CoreRule -> DsM ()
 -- See Note [Rules and inlining/other rules]
-warnRuleShadowing rule_name rule_act fn_id arg_ids
+dsWarnRuleShadowing fn_id
+    (Rule { ru_name = rule_name, ru_act = rule_act, ru_bndrs = bndrs, ru_args = args})
   = do { check False fn_id    -- We often have multiple rules for the same Id in a
                               -- module. Maybe we should check that they don't overlap
                               -- but currently we don't
        ; mapM_ (check True) arg_ids }
   where
+    bndrs_set = mkVarSet bndrs
+    arg_ids = filterOut (`elemVarSet` bndrs_set) $
+              exprsSomeFreeVarsList isId args
+
     check check_rules_too lhs_id
       | isLocalId lhs_id || canUnfold (idUnfolding lhs_id)
                        -- If imported with no unfolding, no worries
@@ -485,6 +508,8 @@ warnRuleShadowing rule_name rule_act fn_id arg_ids
     get_bad_rules lhs_id
       = [ rule | rule <- idCoreRules lhs_id
                , ruleActivation rule `competesWith` rule_act ]
+
+dsWarnRuleShadowing _ _ = return () -- Not expecting built-in rules here
 
 -- See Note [Desugaring coerce as cast]
 unfold_coerce :: [Id] -> CoreExpr -> CoreExpr -> DsM ([Var], CoreExpr, CoreExpr)
@@ -720,11 +745,11 @@ mkUnsafeCoercePrimPair _old_id old_expr
                           , openAlphaTyVar, openBetaTyVar
                           , x ] $
                    mkSingleAltCase scrut1
-                                   (mkWildValBinder Many scrut1_ty)
+                                   (mkWildValBinder ManyTy scrut1_ty)
                                    (DataAlt unsafe_refl_data_con)
                                    [rr_cv] $
                    mkSingleAltCase scrut2
-                                   (mkWildValBinder Many scrut2_ty)
+                                   (mkWildValBinder ManyTy scrut2_ty)
                                    (DataAlt unsafe_refl_data_con)
                                    [ab_cv] $
                    Var x `mkCast` x_co
@@ -761,7 +786,7 @@ mkUnsafeCoercePrimPair _old_id old_expr
 
 
              info = noCafIdInfo `setInlinePragInfo` alwaysInlinePragma
-                                `setUnfoldingInfo` mkCompulsoryUnfolding' rhs
+                                `setUnfoldingInfo` mkCompulsoryUnfolding rhs
                                 `setArityInfo`     arity
 
              ty = mkSpecForAllTys [ runtimeRep1TyVar, runtimeRep2TyVar

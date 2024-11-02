@@ -49,6 +49,7 @@ import GHC.Types.TyThing
 import Control.Monad
 import Control.Monad.Catch as MC
 import Data.List ( (\\), partition )
+import qualified Data.List.NonEmpty as NE
 import Data.Maybe
 import Data.IORef
 
@@ -57,7 +58,7 @@ import Data.IORef
 -------------------------------------
 pprintClosureCommand :: GhcMonad m => Bool -> Bool -> String -> m ()
 pprintClosureCommand bindThings force str = do
-  tythings <- (catMaybes . concat) `liftM`
+  tythings <- (catMaybes . concatMap NE.toList) `liftM`
                  mapM (\w -> GHC.parseName w >>=
                                 mapM GHC.lookupName)
                       (words str)
@@ -67,7 +68,7 @@ pprintClosureCommand bindThings force str = do
 
   -- Obtain the terms and the recovered type information
   let ids = [id | AnId id <- pprintables]
-  (subst, terms) <- mapAccumLM go emptyTCvSubst ids
+  (subst, terms) <- mapAccumLM go emptySubst ids
 
   -- Apply the substitutions obtained after recovering the types
   modifySession $ \hsc_env ->
@@ -97,11 +98,11 @@ pprintClosureCommand bindThings force str = do
    printSDocs :: GhcMonad m => [SDoc] -> m ()
    printSDocs sdocs = do
       logger <- getLogger
-      unqual <- GHC.getPrintUnqual
-      liftIO $ printOutputForUser logger unqual $ vcat sdocs
+      name_ppr_ctx <- GHC.getNamePprCtx
+      liftIO $ printOutputForUser logger name_ppr_ctx $ vcat sdocs
 
    -- Do the obtainTerm--bindSuspensions-computeSubstitution dance
-   go :: GhcMonad m => TCvSubst -> Id -> m (TCvSubst, Term)
+   go :: GhcMonad m => Subst -> Id -> m (Subst, Term)
    go subst id = do
        let id' = updateIdTypeAndMult (substTy subst) id
            id_ty' = idType id'
@@ -124,7 +125,7 @@ pprintClosureCommand bindThings force str = do
                                  (fsep $ [text "RTTI Improvement for", ppr id,
                                   text "old substitution:" , ppr subst,
                                   text "new substitution:" , ppr subst'])
-                           ; return (subst `unionTCvSubst` subst', term')}
+                           ; return (subst `unionSubst` subst', term')}
 
    tidyTermTyVars :: GhcMonad m => Term -> m Term
    tidyTermTyVars t =
@@ -161,7 +162,7 @@ bindSuspensions t = do
       return t'
      where
 
---    Processing suspensions. Give names and recopilate info
+--    Processing suspensions. Give names and collect info
         nameSuspensionsAndGetInfos :: HscEnv -> IORef [String]
                                    -> TermFold (IO (Term, [(Name,Type,ForeignHValue)]))
         nameSuspensionsAndGetInfos hsc_env freeNames = TermFold

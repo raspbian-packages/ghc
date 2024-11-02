@@ -27,7 +27,7 @@ import GHC.Core.Utils
 import GHC.Core.FVs
 import GHC.Core.Unfold
 import GHC.Core.Unfold.Make
-import GHC.Core.Make ( FloatBind(..) )
+import GHC.Core.Make ( FloatBind(..), mkWildValBinder )
 import GHC.Core.Opt.OccurAnal( occurAnalyseExpr, occurAnalysePgm, zapLambdaBndrs )
 import GHC.Types.Literal
 import GHC.Types.Id
@@ -36,7 +36,7 @@ import GHC.Types.Var      ( isNonCoVarId )
 import GHC.Types.Var.Set
 import GHC.Types.Var.Env
 import GHC.Core.DataCon
-import GHC.Types.Demand( etaConvertDmdSig )
+import GHC.Types.Demand( etaConvertDmdSig, topSubDmd )
 import GHC.Types.Tickish
 import GHC.Core.Coercion.Opt ( optCoercion, OptCoercionOpts (..) )
 import GHC.Core.Type hiding ( substTy, extendTvSubst, extendCvSubst, extendTvSubstList
@@ -91,14 +91,15 @@ little dance in action; the full Simplifier is a lot more complicated.
 data SimpleOpts = SimpleOpts
    { so_uf_opts :: !UnfoldingOpts   -- ^ Unfolding options
    , so_co_opts :: !OptCoercionOpts -- ^ Coercion optimiser options
+   , so_eta_red :: !Bool            -- ^ Eta reduction on?
    }
 
 -- | Default options for the Simple optimiser.
 defaultSimpleOpts :: SimpleOpts
 defaultSimpleOpts = SimpleOpts
    { so_uf_opts = defaultUnfoldingOpts
-   , so_co_opts = OptCoercionOpts
-      { optCoercionEnabled = False }
+   , so_co_opts = OptCoercionOpts { optCoercionEnabled = False }
+   , so_eta_red = False
    }
 
 simpleOptExpr :: HasDebugCallStack => SimpleOpts -> CoreExpr -> CoreExpr
@@ -181,13 +182,10 @@ simpleOptPgm opts this_mod binds rules =
 type SimpleClo = (SimpleOptEnv, InExpr)
 
 data SimpleOptEnv
-  = SOE { soe_co_opt_opts :: !OptCoercionOpts
-             -- ^ Options for the coercion optimiser
+  = SOE { soe_opts :: {-# UNPACK #-} !SimpleOpts
+             -- ^ Simplifier options
 
-        , soe_uf_opts :: !UnfoldingOpts
-             -- ^ Unfolding options
-
-        , soe_inl   :: IdEnv SimpleClo
+        , soe_inl :: IdEnv SimpleClo
              -- ^ Deals with preInlineUnconditionally; things
              -- that occur exactly once and are inlined
              -- without having first been simplified
@@ -207,23 +205,21 @@ instance Outputable SimpleOptEnv where
                    <+> text "}"
 
 emptyEnv :: SimpleOpts -> SimpleOptEnv
-emptyEnv opts = SOE
-   { soe_inl         = emptyVarEnv
-   , soe_subst       = emptySubst
-   , soe_rec_ids = emptyUnVarSet
-   , soe_co_opt_opts = so_co_opts opts
-   , soe_uf_opts     = so_uf_opts opts
-   }
+emptyEnv opts = SOE { soe_inl     = emptyVarEnv
+                    , soe_subst   = emptySubst
+                    , soe_rec_ids = emptyUnVarSet
+                    , soe_opts    = opts  }
 
 soeZapSubst :: SimpleOptEnv -> SimpleOptEnv
 soeZapSubst env@(SOE { soe_subst = subst })
-  = env { soe_inl = emptyVarEnv, soe_subst = zapSubstEnv subst }
+  = env { soe_inl = emptyVarEnv, soe_subst = zapSubst subst }
 
-soeSetInScope :: SimpleOptEnv -> SimpleOptEnv -> SimpleOptEnv
--- Take in-scope set from env1, and the rest from env2
-soeSetInScope (SOE { soe_subst = subst1 })
-              env2@(SOE { soe_subst = subst2 })
-  = env2 { soe_subst = setInScope subst2 (substInScope subst1) }
+soeInScope :: SimpleOptEnv -> InScopeSet
+soeInScope (SOE { soe_subst = subst }) = getSubstInScope subst
+
+soeSetInScope :: InScopeSet -> SimpleOptEnv -> SimpleOptEnv
+soeSetInScope in_scope env2@(SOE { soe_subst = subst2 })
+  = env2 { soe_subst = setInScope subst2 in_scope }
 
 enterRecGroupRHSs :: SimpleOptEnv -> [OutBndr] -> (SimpleOptEnv -> (SimpleOptEnv, r))
                   -> (SimpleOptEnv, r)
@@ -233,9 +229,11 @@ enterRecGroupRHSs env bndrs k
     (env', r) = k env{soe_rec_ids = extendUnVarSetList bndrs (soe_rec_ids env)}
 
 ---------------
-simple_opt_clo :: SimpleOptEnv -> SimpleClo -> OutExpr
-simple_opt_clo env (e_env, e)
-  = simple_opt_expr (soeSetInScope env e_env) e
+simple_opt_clo :: InScopeSet
+               -> SimpleClo
+               -> OutExpr
+simple_opt_clo in_scope (e_env, e)
+  = simple_opt_expr (soeSetInScope in_scope e_env) e
 
 simple_opt_expr :: HasCallStack => SimpleOptEnv -> InExpr -> OutExpr
 simple_opt_expr env expr
@@ -243,18 +241,18 @@ simple_opt_expr env expr
   where
     rec_ids      = soe_rec_ids env
     subst        = soe_subst env
-    in_scope     = substInScope subst
-    in_scope_env = (in_scope, simpleUnfoldingFun)
+    in_scope     = getSubstInScope subst
+    in_scope_env = ISE in_scope alwaysActiveUnfoldingFun
 
     ---------------
     go (Var v)
        | Just clo <- lookupVarEnv (soe_inl env) v
-       = simple_opt_clo env clo
+       = simple_opt_clo in_scope clo
        | otherwise
        = lookupIdSubst (soe_subst env) v
 
     go (App e1 e2)      = simple_app env e1 [(env,e2)]
-    go (Type ty)        = Type     (substTy subst ty)
+    go (Type ty)        = Type     (substTyUnchecked subst ty)
     go (Coercion co)    = Coercion (go_co co)
     go (Lit lit)        = Lit lit
     go (Tick tickish e) = mkTick (substTickish subst tickish) (go e)
@@ -277,7 +275,7 @@ simple_opt_expr env expr
               (env', mb_prs) = mapAccumL (simple_out_bind NotTopLevel) env $
                                zipEqual "simpleOptExpr" bs es
 
-         -- Note [Getting the map/coerce RULE to work]
+         -- See Note [Getting the map/coerce RULE to work]
       | isDeadBinder b
       , [Alt DEFAULT _ rhs] <- as
       , isCoVarType (varType b)
@@ -287,14 +285,14 @@ simple_opt_expr env expr
       = go rhs
 
       | otherwise
-      = Case e' b' (substTy subst ty)
+      = Case e' b' (substTyUnchecked subst ty)
                    (map (go_alt env') as)
       where
         e' = go e
         (env', b') = subst_opt_bndr env b
 
     ----------------------
-    go_co co = optCoercion (soe_co_opt_opts env) (getTCvSubst subst) co
+    go_co co = optCoercion (so_co_opts (soe_opts env)) subst co
 
     ----------------------
     go_alt env (Alt con bndrs rhs)
@@ -312,8 +310,9 @@ simple_opt_expr env expr
        where
          (env', b') = subst_opt_bndr env b
     go_lam env bs' e
-       | Just etad_e <- tryEtaReduce rec_ids bs e' = etad_e
-       | otherwise                                 = mkLams bs e'
+       | so_eta_red (soe_opts env)
+       , Just etad_e <- tryEtaReduce rec_ids bs e' topSubDmd = etad_e
+       | otherwise                                           = mkLams bs e'
        where
          bs = reverse bs'
          e' = simple_opt_expr env e
@@ -333,12 +332,12 @@ simple_app :: HasDebugCallStack => SimpleOptEnv -> InExpr -> [SimpleClo] -> Core
 
 simple_app env (Var v) as
   | Just (env', e) <- lookupVarEnv (soe_inl env) v
-  = simple_app (soeSetInScope env env') e as
+  = simple_app (soeSetInScope (soeInScope env) env') e as
 
   | let unf = idUnfolding v
   , isCompulsoryUnfolding (idUnfolding v)
   , isAlwaysActive (idInlineActivation v)
-    -- See Note [Unfold compulsory unfoldings in LHSs]
+    -- See Note [Unfold compulsory unfoldings in RULE LHSs]
   = simple_app (soeZapSubst env) (unfoldingTemplate unf) as
 
   | otherwise
@@ -360,8 +359,19 @@ simple_app env e@(Lam {}) as@(_:_)
     n_args = length as
 
     do_beta env (Lam b body) (a:as)
-      | (env', mb_pr) <- simple_bind_pair env b Nothing a NotTopLevel
-      = wrapLet mb_pr $ do_beta env' body as
+      | -- simpl binder before looking at its type
+        -- See Note [Dark corner with representation polymorphism]
+        needsCaseBinding (idType b') (snd a)
+        -- This arg must not be inlined (side-effects) and cannot be let-bound,
+        -- due to the let-can-float invariant. So simply case-bind it here.
+      , let a' = simple_opt_clo (soeInScope env) a
+      = mkDefaultCase a' b' $ do_beta env' body as
+
+      | (env'', mb_pr) <- simple_bind_pair env' b (Just b') a NotTopLevel
+      = wrapLet mb_pr $ do_beta env'' body as
+
+      where (env', b') = subst_opt_bndr env b
+
     do_beta env body as
       = simple_app env body as
 
@@ -390,10 +400,18 @@ simple_app env e as
   = finish_app env (simple_opt_expr env e) as
 
 finish_app :: SimpleOptEnv -> OutExpr -> [SimpleClo] -> OutExpr
-finish_app _ fun []
-  = fun
-finish_app env fun (arg:args)
-  = finish_app env (App fun (simple_opt_clo env arg)) args
+-- See Note [Eliminate casts in function position]
+finish_app env (Cast (Lam x e) co) as@(_:_)
+  | not (isTyVar x) && not (isCoVar x)
+  , assert (not $ x `elemVarSet` tyCoVarsOfCo co) True
+  , Just (x',e') <- pushCoercionIntoLambda (soeInScope env) x e co
+  = simple_app (soeZapSubst env) (Lam x' e') as
+
+finish_app env fun args
+  = foldl mk_app fun args
+  where
+    in_scope = soeInScope env
+    mk_app fun arg = App fun (simple_opt_clo in_scope arg)
 
 ----------------------
 simple_opt_bind :: SimpleOptEnv -> InBind -> TopLevelFlag
@@ -434,12 +452,12 @@ simple_bind_pair env@(SOE { soe_inl = inl_env, soe_subst = subst })
                  in_bndr mb_out_bndr clo@(rhs_env, in_rhs)
                  top_level
   | Type ty <- in_rhs        -- let a::* = TYPE ty in <body>
-  , let out_ty = substTy (soe_subst rhs_env) ty
+  , let out_ty = substTyUnchecked (soe_subst rhs_env) ty
   = assertPpr (isTyVar in_bndr) (ppr in_bndr $$ ppr in_rhs) $
     (env { soe_subst = extendTvSubst subst in_bndr out_ty }, Nothing)
 
   | Coercion co <- in_rhs
-  , let out_co = optCoercion (soe_co_opt_opts env) (getTCvSubst (soe_subst rhs_env)) co
+  , let out_co = optCoercion (so_co_opts (soe_opts env)) (soe_subst rhs_env) co
   = assert (isCoVar in_bndr)
     (env { soe_subst = extendCvSubst subst in_bndr out_co }, Nothing)
 
@@ -456,16 +474,17 @@ simple_bind_pair env@(SOE { soe_inl = inl_env, soe_subst = subst })
     stable_unf = isStableUnfolding (idUnfolding in_bndr)
     active     = isAlwaysActive (idInlineActivation in_bndr)
     occ        = idOccInfo in_bndr
+    in_scope   = getSubstInScope subst
 
     out_rhs | Just join_arity <- isJoinId_maybe in_bndr
             = simple_join_rhs join_arity
             | otherwise
-            = simple_opt_clo env clo
+            = simple_opt_clo in_scope clo
 
     simple_join_rhs join_arity -- See Note [Preserve join-binding arity]
       = mkLams join_bndrs' (simple_opt_expr env_body join_body)
       where
-        env0 = soeSetInScope env rhs_env
+        env0 = soeSetInScope in_scope rhs_env
         (join_bndrs, join_body) = collectNBinders join_arity in_rhs
         (env_body, join_bndrs') = subst_opt_bndrs env0 join_bndrs
 
@@ -561,6 +580,53 @@ Those differences obviate the reasons for not inlining a trivial rhs,
 and increase the benefit for doing so.  So we unconditionally inline trivial
 rhss here.
 
+Note [Eliminate casts in function position]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Consider the following program:
+
+  type R :: Type -> RuntimeRep
+  type family R a where { R Float = FloatRep; R Double = DoubleRep }
+  type F :: forall (a :: Type) -> TYPE (R a)
+  type family F a where { F Float = Float#  ; F Double = Double# }
+
+  type N :: forall (a :: Type) -> TYPE (R a)
+  newtype N a = MkN (F a)
+
+As MkN is a newtype, its unfolding is a lambda which wraps its argument
+in a cast:
+
+  MkN :: forall (a :: Type). F a -> N a
+  MkN = /\a \(x::F a). x |> co_ax
+    -- recall that F a :: TYPE (R a)
+
+This is a representation-polymorphic lambda, in which the binder has an unknown
+representation (R a). We can't compile such a lambda on its own, but we can
+compile instantiations, such as `MkN @Float` or `MkN @Double`.
+
+Our strategy to avoid running afoul of the representation-polymorphism
+invariants of Note [Representation polymorphism invariants] in GHC.Core is thus:
+
+  1. Give the newtype a compulsory unfolding (it has no binding, as we can't
+     define lambdas with representation-polymorphic value binders in source Haskell).
+  2. Rely on the optimiser to beta-reduce away any representation-polymorphic
+     value binders.
+
+For example, consider the application
+
+    MkN @Float 34.0#
+
+After inlining MkN we'll get
+
+   ((/\a \(x:F a). x |> co_ax) @Float) |> co 34#
+
+where co :: (F Float -> N Float) ~ (Float# ~ N Float)
+
+But to actually beta-reduce that lambda, we need to push the 'co'
+inside the `\x` with pushCoecionIntoLambda.  Hence the extra
+equation for Cast-of-Lam in finish_app.
+
+This is regrettably delicate.
+
 Note [Preserve join-binding arity]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Be careful /not/ to eta-reduce the RHS of a join point, lest we lose
@@ -646,7 +712,7 @@ subst_opt_id_bndr env@(SOE { soe_subst = subst, soe_inl = inl }) old_id
     Subst in_scope id_subst tv_subst cv_subst = subst
 
     id1    = uniqAway in_scope old_id
-    id2    = updateIdTypeAndMult (substTy subst) id1
+    id2    = updateIdTypeAndMult (substTyUnchecked subst) id1
     new_id = zapFragileIdInfo id2
              -- Zaps rules, unfolding, and fragile OccInfo
              -- The unfolding and rules will get added back later, by add_info
@@ -671,7 +737,7 @@ add_info env old_bndr top_level new_rhs new_bndr
  | otherwise        = lazySetIdInfo new_bndr new_info
  where
    subst    = soe_subst env
-   uf_opts  = soe_uf_opts env
+   uf_opts  = so_uf_opts (soe_opts env)
    old_info = idInfo old_bndr
 
    -- Add back in the rules and unfolding which were
@@ -690,15 +756,10 @@ add_info env old_bndr top_level new_rhs new_bndr
                  | otherwise
                  = unfolding_from_rhs
 
-   unfolding_from_rhs = mkUnfolding uf_opts InlineRhs
+   unfolding_from_rhs = mkUnfolding uf_opts VanillaSrc
                                     (isTopLevel top_level)
                                     False -- may be bottom or not
                                     new_rhs Nothing
-
-simpleUnfoldingFun :: IdUnfoldingFun
-simpleUnfoldingFun id
-  | isAlwaysActive (idInlineActivation id) = idUnfolding id
-  | otherwise                              = noUnfolding
 
 wrapLet :: Maybe (Id,CoreExpr) -> CoreExpr -> CoreExpr
 wrapLet Nothing      body = body
@@ -724,8 +785,8 @@ we don't know what phase we're in.  Here's an example
 When inlining 'foo' in 'bar' we want the let-binding for 'inner'
 to remain visible until Phase 1
 
-Note [Unfold compulsory unfoldings in LHSs]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Note [Unfold compulsory unfoldings in RULE LHSs]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 When the user writes `RULES map coerce = coerce` as a rule, the rule
 will only ever match if simpleOptExpr replaces coerce by its unfolding
 on the LHS, because that is the core that the rule matching engine
@@ -1006,7 +1067,7 @@ Now we are optimising
    case $WMkT (I# 3) |> sym axT of I# y -> ...
 we clearly want to simplify this. If $WMkT did not have a compulsory
 unfolding, we would end up with
-   let a = I#3 in case a of I# y -> ...
+   let a = I# 3 in case a of I# y -> ...
 because in general, we do this on-the-fly beta-reduction
    (\x. e) blah  -->  let x = blah in e
 and then float the let.  (Substitution would risk duplicating 'blah'.)
@@ -1118,7 +1179,7 @@ data ConCont = CC [CoreExpr] Coercion
 exprIsConApp_maybe :: HasDebugCallStack
                    => InScopeEnv -> CoreExpr
                    -> Maybe (InScopeSet, [FloatBind], DataCon, [Type], [CoreExpr])
-exprIsConApp_maybe (in_scope, id_unf) expr
+exprIsConApp_maybe ise@(ISE in_scope id_unf) expr
   = go (Left in_scope) [] expr (CC [] (mkRepReflCo (exprType expr)))
   where
     go :: Either InScopeSet Subst
@@ -1140,6 +1201,30 @@ exprIsConApp_maybe (in_scope, id_unf) expr
            MRefl    -> go subst floats expr (CC args' co2)
 
     go subst floats (App fun arg) (CC args co)
+       | let arg_type = exprType arg
+       , not (isTypeArg arg) && needsCaseBinding arg_type arg
+       -- An unlifted argument that’s not ok for speculation must not simply be
+       -- put into the args, as these are going to be substituted into the case
+       -- alternatives, and possibly lost on the way.
+       --
+       -- Instead, we need need to
+       -- make sure they are evaluated right here (using a case float), and
+       -- the case binder can then be substituted into the case alternaties.
+       --
+       -- Example:
+       -- Simplifying  case Mk# exp of Mk# a → rhs
+       -- will use     exprIsConApp_maybe (Mk# exp)
+       --
+       -- Bad:  returning (Mk#, [exp]) with no floats
+       --       simplifier produces rhs[exp/a], changing semantics if exp is not ok-for-spec
+       -- Good: returning (Mk#, [x]) with a float of  case exp of x { DEFAULT -> [] }
+       --       simplifier produces case exp of a { DEFAULT -> exp[x/a] }
+       = let arg' = subst_expr subst arg
+             bndr = uniqAway (subst_in_scope subst) (mkWildValBinder ManyTy arg_type)
+             float = FloatCase arg' bndr DEFAULT []
+             subst' = subst_extend_in_scope subst bndr
+         in go subst' (float:floats) fun (CC (Var bndr : args) co)
+       | otherwise
        = go subst floats fun (CC (subst_expr subst arg : args) co)
 
     go subst floats (Lam bndr body) (CC (arg:args) co)
@@ -1168,7 +1253,7 @@ exprIsConApp_maybe (in_scope, id_unf) expr
            go subst'' (float:floats) expr cont
 
     go (Right sub) floats (Var v) cont
-       = go (Left (substInScope sub))
+       = go (Left (getSubstInScope sub))
             floats
             (lookupIdSubst sub v)
             cont
@@ -1214,7 +1299,7 @@ exprIsConApp_maybe (in_scope, id_unf) expr
         | (fun `hasKey` unpackCStringIdKey) ||
           (fun `hasKey` unpackCStringUtf8IdKey)
         , [arg]              <- args
-        , Just (LitString str) <- exprIsLiteral_maybe (in_scope, id_unf) arg
+        , Just (LitString str) <- exprIsLiteral_maybe ise arg
         = succeedWith in_scope floats $
           dealWithStringLiteral fun str co
         where
@@ -1238,6 +1323,13 @@ exprIsConApp_maybe (in_scope, id_unf) expr
     ----------------------------
     -- Operations on the (Either InScopeSet GHC.Core.Subst)
     -- The Left case is wildly dominant
+
+    subst_in_scope (Left in_scope) = in_scope
+    subst_in_scope (Right s) = getSubstInScope s
+
+    subst_extend_in_scope (Left in_scope) v = Left (in_scope `extendInScopeSet` v)
+    subst_extend_in_scope (Right s) v = Right (s `extendSubstInScope` v)
+
     subst_co (Left {}) co = co
     subst_co (Right s) co = GHC.Core.Subst.substCo s co
 
@@ -1303,7 +1395,7 @@ exprIsLiteral_maybe :: InScopeEnv -> CoreExpr -> Maybe Literal
 -- Nevertheless we do need to look through unfoldings for
 -- string literals, which are vigorously hoisted to top level
 -- and not subsequently inlined
-exprIsLiteral_maybe env@(_, id_unf) e
+exprIsLiteral_maybe env@(ISE _ id_unf) e
   = case e of
       Lit l     -> Just l
       Tick _ e' -> exprIsLiteral_maybe env e' -- dubious?
@@ -1333,14 +1425,14 @@ exprIsLambda_maybe _ (Lam x e)
     = Just (x, e, [])
 
 -- Still straightforward: Ticks that we can float out of the way
-exprIsLambda_maybe (in_scope_set, id_unf) (Tick t e)
+exprIsLambda_maybe ise (Tick t e)
     | tickishFloatable t
-    , Just (x, e, ts) <- exprIsLambda_maybe (in_scope_set, id_unf) e
+    , Just (x, e, ts) <- exprIsLambda_maybe ise e
     = Just (x, e, t:ts)
 
 -- Also possible: A casted lambda. Push the coercion inside
-exprIsLambda_maybe (in_scope_set, id_unf) (Cast casted_e co)
-    | Just (x, e,ts) <- exprIsLambda_maybe (in_scope_set, id_unf) casted_e
+exprIsLambda_maybe ise@(ISE in_scope_set _) (Cast casted_e co)
+    | Just (x, e,ts) <- exprIsLambda_maybe ise casted_e
     -- Only do value lambdas.
     -- this implies that x is not in scope in gamma (makes this code simpler)
     , not (isTyVar x) && not (isCoVar x)
@@ -1351,7 +1443,7 @@ exprIsLambda_maybe (in_scope_set, id_unf) (Cast casted_e co)
       res
 
 -- Another attempt: See if we find a partial unfolding
-exprIsLambda_maybe (in_scope_set, id_unf) e
+exprIsLambda_maybe ise@(ISE in_scope_set id_unf) e
     | (Var f, as, ts) <- collectArgsTicks tickishFloatable e
     , idArity f > count isValArg as
     -- Make sure there is hope to get a lambda
@@ -1359,7 +1451,7 @@ exprIsLambda_maybe (in_scope_set, id_unf) e
     -- Optimize, for beta-reduction
     , let e' = simpleOptExprWith defaultSimpleOpts (mkEmptySubst in_scope_set) (rhs `mkApps` as)
     -- Recurse, because of possible casts
-    , Just (x', e'', ts') <- exprIsLambda_maybe (in_scope_set, id_unf) e'
+    , Just (x', e'', ts') <- exprIsLambda_maybe ise e'
     , let res = Just (x', e'', ts++ts')
     = -- pprTrace "exprIsLambda_maybe:Unfold" (vcat [ppr e, ppr (x',e'')])
       res

@@ -40,6 +40,60 @@ import CLOSURE ghczmprim_GHCziTypes_False_closure;
 import CLOSURE CCS_MAIN;
 #endif
 
+#if !defined(UnregisterisedCompiler)
+import CLOSURE ALLOC_RTS_ctr;
+import CLOSURE ALLOC_RTS_tot;
+import CLOSURE CCS_SYSTEM;
+import CLOSURE HEAP_CHK_ctr;
+import CLOSURE RtsFlags;
+import CLOSURE STK_CHK_ctr;
+import CLOSURE blocked_queue_hd;
+import CLOSURE blocked_queue_tl;
+import CLOSURE g0;
+import CLOSURE large_alloc_lim;
+import CLOSURE n_capabilities;
+import CLOSURE sleeping_queue;
+import CLOSURE stable_name_table;
+import CLOSURE stable_ptr_table;
+import CLOSURE stg_AP_STACK_info;
+import CLOSURE stg_AP_info;
+import CLOSURE stg_ARR_WORDS_info;
+import CLOSURE stg_BCO_info;
+import CLOSURE stg_C_FINALIZER_LIST_info;
+import CLOSURE stg_DEAD_WEAK_info;
+import CLOSURE stg_END_STM_WATCH_QUEUE_closure;
+import CLOSURE stg_END_TSO_QUEUE_closure;
+import CLOSURE stg_IND_info;
+import CLOSURE stg_MSG_NULL_info;
+import CLOSURE stg_MUT_ARR_PTRS_DIRTY_info;
+import CLOSURE stg_MUT_ARR_PTRS_FROZEN_CLEAN_info;
+import CLOSURE stg_MUT_ARR_PTRS_FROZEN_DIRTY_info;
+import CLOSURE stg_MUT_VAR_CLEAN_info;
+import CLOSURE stg_MUT_VAR_DIRTY_info;
+import CLOSURE stg_MVAR_CLEAN_info;
+import CLOSURE stg_MVAR_DIRTY_info;
+import CLOSURE stg_MVAR_TSO_QUEUE_info;
+import CLOSURE stg_NO_FINALIZER_closure;
+import CLOSURE stg_NO_TREC_closure;
+import CLOSURE stg_SMALL_MUT_ARR_PTRS_DIRTY_info;
+import CLOSURE stg_SMALL_MUT_ARR_PTRS_FROZEN_CLEAN_info;
+import CLOSURE stg_SMALL_MUT_ARR_PTRS_FROZEN_DIRTY_info;
+import CLOSURE stg_STABLE_NAME_info;
+import CLOSURE stg_TREC_HEADER_info;
+import CLOSURE stg_TVAR_DIRTY_info;
+import CLOSURE stg_WEAK_info;
+import CLOSURE stg_WHITEHOLE_info;
+import CLOSURE stg_ap_2_upd_info;
+import CLOSURE stg_atomically_frame_info;
+import CLOSURE stg_atomically_waiting_frame_info;
+import CLOSURE stg_catch_retry_frame_info;
+import CLOSURE stg_catch_stm_frame_info;
+import CLOSURE stg_keepAlive_frame_info;
+import CLOSURE stg_noDuplicate_info;
+import CLOSURE stg_ret_p_info;
+import CLOSURE stg_sel_0_upd_info;
+#endif
+
 #if defined(DEBUG)
 #define ASSERT_IN_BOUNDS(ind, sz) \
     if (ind >= sz) { ccall rtsOutOfBoundsAccess(); }
@@ -155,7 +209,10 @@ stg_isByteArrayPinnedzh ( gcptr ba )
     // See the comment in Storage.c:allocatePinned.
     // We also consider BF_COMPACT objects to be immovable. See #14900.
     flags = TO_W_(bdescr_flags(bd));
-    return (flags & (BF_PINNED | BF_LARGE | BF_COMPACT) != 0);
+
+    // We used to also consider BF_LARGE pinned, but stopped doing so
+    // because it interacted badly with compact regions. See #22255
+    return (flags & BF_PINNED != 0);
 }
 
 stg_isMutableByteArrayPinnedzh ( gcptr mba )
@@ -349,6 +406,11 @@ stg_newArrayzh ( W_ n /* words */, gcptr init )
     SET_HDR(arr, stg_MUT_ARR_PTRS_DIRTY_info, CCCS);
     StgMutArrPtrs_ptrs(arr) = n;
     StgMutArrPtrs_size(arr) = size;
+
+    /* Ensure that the card array is initialized */
+    if (n != 0) {
+        setCardsValue(arr, 0, n, 0);
+    }
 
     // Initialise all elements of the array with the value in R2
     p = arr + SIZEOF_StgMutArrPtrs;
@@ -717,7 +779,7 @@ stg_atomicModifyMutVar2zh ( gcptr mv, gcptr f )
     StgThunk_payload(y,0) = z;
 
   retry:
-    x = StgMutVar_var(mv);
+    x = %relaxed StgMutVar_var(mv);
     StgThunk_payload(z,1) = x;
 #if defined(THREADED_RTS)
     (h) = prim %cmpxchgW(mv + SIZEOF_StgHeader + OFFSET_StgMutVar_var, x, y);
@@ -770,7 +832,7 @@ stg_atomicModifyMutVarzuzh ( gcptr mv, gcptr f )
     StgThunk_payload(z,0) = f;
 
   retry:
-    x = StgMutVar_var(mv);
+    x = %relaxed StgMutVar_var(mv);
     StgThunk_payload(z,1) = x;
 #if defined(THREADED_RTS)
     (h) = prim %cmpxchgW(mv + SIZEOF_StgHeader + OFFSET_StgMutVar_var, x, z);
@@ -918,8 +980,7 @@ stg_deRefWeakzh ( gcptr w )
     W_ code, info;
     gcptr val;
 
-    info = GET_INFO(w);
-    prim_read_barrier;
+    info = GET_INFO_ACQUIRE(w);
 
     if (info == stg_WHITEHOLE_info) {
         // w is locked by another thread. Now it's not immediately clear if w is
@@ -1062,10 +1123,6 @@ again: MAYBE_GC(again);
 
     ccall scheduleThreadOn(MyCapability() "ptr", cpu, threadid "ptr");
 
-    // context switch soon, but not immediately: we don't want every
-    // forkIO to force a context-switch.
-    Capability_context_switch(MyCapability()) = 1 :: CInt;
-
     return (threadid);
 }
 
@@ -1085,11 +1142,30 @@ stg_labelThreadzh ( gcptr threadid, W_ addr )
     return ();
 }
 
+stg_listThreadszh ()
+{
+  P_ arr;
+
+  ("ptr" arr) = ccall listThreads(MyCapability() "ptr");
+  return (arr);
+}
+
 stg_isCurrentThreadBoundzh (/* no args */)
 {
     W_ r;
     (r) = ccall isThreadBound(CurrentTSO);
     return (r);
+}
+
+stg_threadLabelzh ( gcptr tso )
+{
+    W_ r;
+    r = StgTSO_label(tso);
+    if (r == 0) {
+        return (0, 0);
+    } else {
+        return (1, r);
+    }
 }
 
 stg_threadStatuszh ( gcptr tso )
@@ -1507,9 +1583,8 @@ stg_readTVarIOzh ( P_ tvar /* :: TVar a */ )
     W_ result, resultinfo;
 
 again:
-    result = StgTVar_current_value(tvar);
+    result = %acquire StgTVar_current_value(tvar);
     resultinfo = %INFO_PTR(result);
-    prim_read_barrier;
     if (resultinfo == stg_TREC_HEADER_info) {
         goto again;
     }
@@ -1656,7 +1731,7 @@ stg_takeMVarzh ( P_ mvar /* :: MVar a */ )
         // Write barrier before we make the new MVAR_TSO_QUEUE
         // visible to other cores.
         // See Note [Heap memory barriers]
-        prim_write_barrier;
+        RELEASE_FENCE;
 
         if (StgMVar_head(mvar) == stg_END_TSO_QUEUE_closure) {
             StgMVar_head(mvar) = q;
@@ -1689,11 +1764,10 @@ loop:
         updateRemembSetPushPtr(val);
         return (val);
     }
-    qinfo = StgHeader_info(q);
-    prim_read_barrier;
+    qinfo = GET_INFO_ACQUIRE(q);
     if (qinfo == stg_IND_info ||
         qinfo == stg_MSG_NULL_info) {
-        q = StgInd_indirectee(q);
+        q = %acquire StgInd_indirectee(q);
         goto loop;
     }
 
@@ -1757,12 +1831,11 @@ loop:
         return (1, val);
     }
 
-    qinfo = StgHeader_info(q);
-    prim_read_barrier;
+    qinfo = GET_INFO_ACQUIRE(q);
 
     if (qinfo == stg_IND_info ||
         qinfo == stg_MSG_NULL_info) {
-        q = StgInd_indirectee(q);
+        q = %acquire StgInd_indirectee(q);
         goto loop;
     }
 
@@ -1825,7 +1898,7 @@ stg_putMVarzh ( P_ mvar, /* :: MVar a */
 
         SET_HDR(q, stg_MVAR_TSO_QUEUE_info, CCS_SYSTEM);
         // See Note [Heap memory barriers]
-        prim_write_barrier;
+        RELEASE_FENCE;
 
         if (StgMVar_head(mvar) == stg_END_TSO_QUEUE_closure) {
             StgMVar_head(mvar) = q;
@@ -1860,12 +1933,11 @@ loop:
         return ();
     }
 
-    qinfo = StgHeader_info(q);
-    prim_read_barrier;
+    qinfo = GET_INFO_ACQUIRE(q);
 
     if (qinfo == stg_IND_info ||
         qinfo == stg_MSG_NULL_info) {
-        q = StgInd_indirectee(q);
+        q = %acquire StgInd_indirectee(q);
         goto loop;
     }
 
@@ -1950,12 +2022,11 @@ loop:
         return (1);
     }
 
-    qinfo = StgHeader_info(q);
-    prim_read_barrier;
+    qinfo = GET_INFO_ACQUIRE(q);
 
     if (qinfo == stg_IND_info ||
         qinfo == stg_MSG_NULL_info) {
-        q = StgInd_indirectee(q);
+        q = %acquire StgInd_indirectee(q);
         goto loop;
     }
 
@@ -2036,7 +2107,7 @@ stg_readMVarzh ( P_ mvar, /* :: MVar a */ )
 
         SET_HDR(q, stg_MVAR_TSO_QUEUE_info, CCS_SYSTEM);
         // See Note [Heap memory barriers]
-        prim_write_barrier;
+        RELEASE_FENCE;
 
         StgTSO__link(CurrentTSO)       = q;
         StgTSO_block_info(CurrentTSO)  = mvar;
@@ -2169,7 +2240,7 @@ stg_readIOPortzh ( P_ ioport /* :: IOPort a */ )
 
         SET_HDR(q, stg_MVAR_TSO_QUEUE_info, CCS_SYSTEM);
         // See Note [Heap memory barriers]
-        prim_write_barrier;
+        RELEASE_FENCE;
 
         StgMVar_head(ioport) = q;
         StgTSO__link(CurrentTSO)       = q;
@@ -2236,7 +2307,7 @@ loop:
     //Possibly IND added by removeFromMVarBlockedQueue
     if (StgHeader_info(q) == stg_IND_info ||
         StgHeader_info(q) == stg_MSG_NULL_info) {
-        q = StgInd_indirectee(q);
+        q = %acquire StgInd_indirectee(q);
         goto loop;
     }
 
@@ -2307,7 +2378,7 @@ stg_newIOPortzh ()
 }
 
 /* -----------------------------------------------------------------------------
-   Stable pointer primitives
+   Stable name primitives
    -------------------------------------------------------------------------  */
 
 stg_makeStableNamezh ( P_ obj )
@@ -2321,7 +2392,8 @@ stg_makeStableNamezh ( P_ obj )
     /* Is there already a StableName for this heap object?
      *  stable_name_table is a pointer to an array of snEntry structs.
      */
-    if ( snEntry_sn_obj(W_[stable_name_table] + index*SIZEOF_snEntry) == NULL ) {
+    sn_obj = %acquire snEntry_sn_obj(W_[stable_name_table] + index*SIZEOF_snEntry);
+    if (sn_obj  == NULL) {
         // At this point we have a snEntry, but it doesn't look as used to the
         // GC yet because we don't have a StableName object for the sn_obj field
         // (remember that sn_obj == NULL means the entry is free). So if we call
@@ -2338,14 +2410,15 @@ stg_makeStableNamezh ( P_ obj )
         // This will make the StableName# object visible to other threads;
         // be sure that its completely visible to other cores.
         // See Note [Heap memory barriers] in SMP.h.
-        prim_write_barrier;
-        snEntry_sn_obj(W_[stable_name_table] + index*SIZEOF_snEntry) = sn_obj;
-    } else {
-        sn_obj = snEntry_sn_obj(W_[stable_name_table] + index*SIZEOF_snEntry);
+        %release snEntry_sn_obj(W_[stable_name_table] + index*SIZEOF_snEntry) = sn_obj;
     }
 
     return (sn_obj);
 }
+
+/* -----------------------------------------------------------------------------
+   Stable pointer primitives
+   -------------------------------------------------------------------------  */
 
 stg_makeStablePtrzh ( P_ obj )
 {
@@ -2358,7 +2431,9 @@ stg_makeStablePtrzh ( P_ obj )
 stg_deRefStablePtrzh ( P_ sp )
 {
     W_ r;
-    r = spEntry_addr(W_[stable_ptr_table] + sp*SIZEOF_spEntry);
+    // see Note [NULL StgStablePtr] in StablePtr.c
+    // here we assume that sp is a valid StablePtr#
+    r = spEntry_addr(W_[stable_ptr_table] + (sp-1)*SIZEOF_spEntry);
     return (r);
 }
 
@@ -2491,18 +2566,6 @@ stg_whereFromzh (P_ clos)
    Thread I/O blocking primitives
    -------------------------------------------------------------------------- */
 
-/* Add a thread to the end of the blocked queue. (C-- version of the C
- * macro in Schedule.h).
- */
-#define APPEND_TO_BLOCKED_QUEUE(tso)                    \
-    ASSERT(StgTSO__link(tso) == END_TSO_QUEUE);         \
-    if (W_[blocked_queue_hd] == END_TSO_QUEUE) {        \
-        W_[blocked_queue_hd] = tso;                     \
-    } else {                                            \
-        ccall setTSOLink(MyCapability() "ptr", W_[blocked_queue_tl] "ptr", tso); \
-    }                                                   \
-    W_[blocked_queue_tl] = tso;
-
 stg_waitReadzh ( W_ fd )
 {
 #if defined(THREADED_RTS)
@@ -2514,7 +2577,7 @@ stg_waitReadzh ( W_ fd )
     StgTSO_block_info(CurrentTSO) = fd;
     // No locking - we're not going to use this interface in the
     // threaded RTS anyway.
-    APPEND_TO_BLOCKED_QUEUE(CurrentTSO);
+    ccall appendToIOBlockedQueue(MyCapability() "ptr", CurrentTSO "ptr");
     jump stg_block_noregs();
 #endif
 }
@@ -2530,7 +2593,7 @@ stg_waitWritezh ( W_ fd )
     StgTSO_block_info(CurrentTSO) = fd;
     // No locking - we're not going to use this interface in the
     // threaded RTS anyway.
-    APPEND_TO_BLOCKED_QUEUE(CurrentTSO);
+    ccall appendToIOBlockedQueue(MyCapability() "ptr", CurrentTSO "ptr");
     jump stg_block_noregs();
 #endif
 }
@@ -2567,32 +2630,16 @@ stg_delayzh ( W_ us_delay )
      * delayed thread on the blocked_queue.
      */
     StgTSO_why_blocked(CurrentTSO) = BlockedOnDoProc::I16;
-    APPEND_TO_BLOCKED_QUEUE(CurrentTSO);
+    ccall appendToIOBlockedQueue(MyCapability() "ptr", CurrentTSO "ptr");
     jump stg_block_async_void();
 
 #else
-
 
     (target) = ccall getDelayTarget(us_delay);
 
     StgTSO_block_info(CurrentTSO) = target;
 
-    /* Insert the new thread in the sleeping queue. */
-    prev = NULL;
-    t = W_[sleeping_queue];
-while:
-    if (t != END_TSO_QUEUE && StgTSO_block_info(t) < target) {
-        prev = t;
-        t = StgTSO__link(t);
-        goto while;
-    }
-
-    StgTSO__link(CurrentTSO) = t;
-    if (prev == NULL) {
-        W_[sleeping_queue] = CurrentTSO;
-    } else {
-        ccall setTSOLink(MyCapability() "ptr", prev "ptr", CurrentTSO);
-    }
+    ccall insertIntoSleepingQueue(MyCapability() "ptr", CurrentTSO "ptr", target);
     jump stg_block_noregs();
 #endif
 #endif /* !THREADED_RTS */
@@ -2620,7 +2667,7 @@ stg_asyncReadzh ( W_ fd, W_ is_sock, W_ len, W_ buf )
     StgAsyncIOResult_len(ares)     = 0;
     StgAsyncIOResult_errCode(ares) = 0;
     StgTSO_block_info(CurrentTSO)  = ares;
-    APPEND_TO_BLOCKED_QUEUE(CurrentTSO);
+    ccall appendToIOBlockedQueue(MyCapability() "ptr", CurrentTSO "ptr");
     jump stg_block_async();
 #endif
 }
@@ -2645,7 +2692,7 @@ stg_asyncWritezh ( W_ fd, W_ is_sock, W_ len, W_ buf )
     StgAsyncIOResult_len(ares)     = 0;
     StgAsyncIOResult_errCode(ares) = 0;
     StgTSO_block_info(CurrentTSO)  = ares;
-    APPEND_TO_BLOCKED_QUEUE(CurrentTSO);
+    ccall appendToIOBlockedQueue(MyCapability() "ptr", CurrentTSO "ptr");
     jump stg_block_async();
 #endif
 }
@@ -2670,7 +2717,7 @@ stg_asyncDoProczh ( W_ proc, W_ param )
     StgAsyncIOResult_len(ares)     = 0;
     StgAsyncIOResult_errCode(ares) = 0;
     StgTSO_block_info(CurrentTSO) = ares;
-    APPEND_TO_BLOCKED_QUEUE(CurrentTSO);
+    ccall appendToIOBlockedQueue(MyCapability() "ptr", CurrentTSO "ptr");
     jump stg_block_async();
 #endif
 }
@@ -2780,21 +2827,6 @@ stg_getApStackValzh ( P_ ap_stack, W_ offset )
    } else {
        return (0,ap_stack);
    }
-}
-
-// Write the cost center stack of the first argument on stderr; return
-// the second.  Possibly only makes sense for already evaluated
-// things?
-stg_traceCcszh ( P_ obj, P_ ret )
-{
-    W_ ccs;
-
-#if defined(PROFILING)
-    ccs = StgHeader_ccs(UNTAG(obj));
-    ccall fprintCCS_stderr(ccs "ptr");
-#endif
-
-    jump stg_ap_0_fast(ret);
 }
 
 stg_getSparkzh ()

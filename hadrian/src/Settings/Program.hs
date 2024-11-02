@@ -12,9 +12,9 @@ import Packages
 -- get a context/contexts for a given stage and package.
 programContext :: Stage -> Package -> Action Context
 programContext stage pkg = do
-    profiled <- askGhcProfiled
+    profiled <- askGhcProfiled stage
     dynGhcProgs <- askDynGhcPrograms --dynamicGhcPrograms =<< flavour
-    return $ Context stage pkg (wayFor profiled dynGhcProgs)
+    return $ Context stage pkg (wayFor profiled dynGhcProgs) Final
 
     where wayFor prof dyn
             | prof && dyn                          =

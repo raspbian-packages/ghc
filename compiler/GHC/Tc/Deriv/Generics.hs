@@ -21,21 +21,25 @@ module GHC.Tc.Deriv.Generics
    )
 where
 
-import GHC.Prelude
+import GHC.Prelude hiding (head, init, last, tail)
 
 import GHC.Hs
-import GHC.Core.Type
 import GHC.Tc.Utils.TcType
 import GHC.Tc.Deriv.Generate
 import GHC.Tc.Deriv.Functor
 import GHC.Tc.Errors.Types
+import GHC.Tc.Instance.Family
+
+import GHC.Core.Type
 import GHC.Core.DataCon
 import GHC.Core.TyCon
 import GHC.Core.FamInstEnv ( FamInst, FamFlavor(..), mkSingleCoAxiom )
-import GHC.Tc.Instance.Family
-import GHC.Unit.Module ( moduleName, moduleNameFS
-                        , moduleUnit, unitFS, getModule )
+
+import GHC.Unit.Module ( moduleName, moduleUnit
+                       , unitFS, getModule )
+
 import GHC.Iface.Env    ( newGlobalBinder )
+
 import GHC.Types.Name hiding ( varName )
 import GHC.Types.Name.Reader
 import GHC.Types.SourceText
@@ -58,8 +62,13 @@ import GHC.Utils.Panic.Plain
 import GHC.Data.FastString
 import GHC.Utils.Misc
 
+import Language.Haskell.Syntax.Basic (FieldLabelString(..))
+
 import Control.Monad (mplus)
 import Data.List (zip4, partition)
+import qualified Data.List as Partial (last)
+import Data.List.NonEmpty (nonEmpty)
+import qualified Data.List.NonEmpty as NE
 import Data.Maybe (isJust)
 
 {-
@@ -289,9 +298,9 @@ canDoGenerics1 dit@(DerivInstTys{dit_rep_tc = rep_tc}) =
       , ft_var = caseVar, ft_co_var = caseVar
 
       -- (component_0,component_1,...,component_n)
-      , ft_tup = \_ components -> if any _ccdg1_hasParam (init components)
-                                  then bmbad con
-                                  else foldr bmplus bmzero components
+      , ft_tup = \_ components -> case nonEmpty components of
+            Just components' | any _ccdg1_hasParam (NE.init components') -> bmbad con
+            _ -> foldr bmplus bmzero components
 
       -- (dom -> rng), where the head of ty is not a tuple tycon
       , ft_fun = \dom rng -> -- cf #8516
@@ -338,11 +347,11 @@ data GenericKind_DC = Gen0_DC | Gen1_DC TyVar
 gk2gkDC :: GenericKind -> DataCon -> [Type] -> GenericKind_DC
 gk2gkDC Gen0 _  _       = Gen0_DC
 gk2gkDC Gen1 dc tc_args = Gen1_DC $ assert (isTyVarTy last_dc_inst_univ)
-                                  $ getTyVar "gk2gkDC" last_dc_inst_univ
+                                  $ getTyVar last_dc_inst_univ
   where
     dc_inst_univs = dataConInstUnivs dc tc_args
     last_dc_inst_univ = assert (not (null dc_inst_univs)) $
-                        last dc_inst_univs
+                        Partial.last dc_inst_univs
 
 
 -- Bindings for the Generic instance
@@ -654,7 +663,7 @@ tc_mkRepTy gk get_fixity dit@(DerivInstTys{ dit_rep_tc = tycon
                               then promotedTrueDataCon
                               else promotedFalseDataCon
 
-        selName = mkStrLitTy . flLabel
+        selName = mkStrLitTy . field_label . flLabel
 
         mbSel Nothing  = mkTyConApp promotedNothingDataCon [typeSymbolKind]
         mbSel (Just s) = mkTyConApp promotedJustDataCon
@@ -677,7 +686,7 @@ tc_mkRepTy gk get_fixity dit@(DerivInstTys{ dit_rep_tc = tycon
 
             pDStrness = mkTyConTy $ case ib of
                                          HsLazy      -> pDLzy
-                                         HsStrict    -> pDStr
+                                         HsStrict _  -> pDStr
                                          HsUnpack{}  -> pDUpk
 
     return (mkD tycon)
@@ -1069,7 +1078,7 @@ is usually too small for GHC to do that.
 
 The recommended approach thus far was to increase unfolding threshold, but this
 makes GHC inline more aggressively in general, whereas it should only be more
-aggresive with generics-based code.
+aggressive with generics-based code.
 
 The solution is to use a heuristic that'll annotate Generic class methods with
 INLINE[1] pragmas (the explicit phase is used to give users phase control as

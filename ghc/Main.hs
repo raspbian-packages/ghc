@@ -16,9 +16,10 @@ module Main (main) where
 
 -- The official GHC API
 import qualified GHC
-import GHC              (parseTargetFiles,  Ghc, GhcMonad(..), Backend (..),
+import GHC              (parseTargetFiles,  Ghc, GhcMonad(..),
                           LoadHowMuch(..) )
 
+import GHC.Driver.Backend
 import GHC.Driver.CmdLine
 import GHC.Driver.Env
 import GHC.Driver.Errors
@@ -40,7 +41,7 @@ import GHC.Platform.Host
 import GHCi.UI              ( interactiveUI, ghciWelcomeMsg, defaultGhciSettings )
 #endif
 
-import GHC.Runtime.Loader   ( loadFrontendPlugin )
+import GHC.Runtime.Loader   ( loadFrontendPlugin, initializeSessionPlugins )
 
 import GHC.Unit.Env
 import GHC.Unit (UnitId, homeUnitDepends)
@@ -175,9 +176,9 @@ main' postLoadMode units dflags0 args flagWarnings = do
   let dflt_backend = backend dflags0
       (mode, bcknd, link)
          = case postLoadMode of
-               DoInteractive   -> (CompManager, Interpreter,  LinkInMemory)
-               DoEval _        -> (CompManager, Interpreter,  LinkInMemory)
-               DoRun           -> (CompManager, Interpreter,  LinkInMemory)
+               DoInteractive   -> (CompManager, interpreterBackend,  LinkInMemory)
+               DoEval _        -> (CompManager, interpreterBackend,  LinkInMemory)
+               DoRun           -> (CompManager, interpreterBackend,  LinkInMemory)
                DoMake          -> (CompManager, dflt_backend, LinkBinary)
                DoBackpack      -> (CompManager, dflt_backend, LinkBinary)
                DoMkDependHS    -> (MkDepend,    dflt_backend, LinkBinary)
@@ -208,6 +209,11 @@ main' postLoadMode units dflags0 args flagWarnings = do
         where def_ghci_flags = dflags1 `gopt_set` Opt_ImplicitImportQualified
                                        `gopt_set` Opt_IgnoreOptimChanges
                                        `gopt_set` Opt_IgnoreHpcChanges
+                                       -- Setting this by default has the nice effect that
+                                       -- -fno-code and --interactive falls back to interpreter rather than
+                                       -- object code but has little other effect unless you are also using
+                                       -- fat interface files.
+                                       `gopt_set` Opt_UseBytecodeRatherThanObjects
 
   logger1 <- getLogger
   let logger2 = setLogFlags logger1 (initLogFlags dflags2)
@@ -217,8 +223,9 @@ main' postLoadMode units dflags0 args flagWarnings = do
   (dflags3, fileish_args, dynamicFlagWarnings) <-
       GHC.parseDynamicFlags logger2 dflags2 args'
 
-  let dflags4 = case bcknd of
-                Interpreter | not (gopt Opt_ExternalInterpreter dflags3) ->
+  let dflags4 = if backendNeedsFullWays bcknd &&
+                   not (gopt Opt_ExternalInterpreter dflags3)
+                then
                     let platform = targetPlatform dflags3
                         dflags3a = dflags3 { targetWays_ = hostFullWays }
                         dflags3b = foldl gopt_set dflags3a
@@ -228,7 +235,7 @@ main' postLoadMode units dflags0 args flagWarnings = do
                                  $ concatMap (wayUnsetGeneralFlags platform)
                                              hostFullWays
                     in dflags3c
-                _ ->
+                else
                     dflags3
 
   let logger4 = setLogFlags logger2 (initLogFlags dflags4)
@@ -240,7 +247,7 @@ main' postLoadMode units dflags0 args flagWarnings = do
   handleSourceError (\e -> do
        GHC.printException e
        liftIO $ exitWith (ExitFailure 1)) $ do
-         liftIO $ handleFlagWarnings logger4 (initDiagOpts dflags4) flagWarnings'
+         liftIO $ handleFlagWarnings logger4 (initPrintConfig dflags4) (initDiagOpts dflags4) flagWarnings'
 
   liftIO $ showBanner postLoadMode dflags4
 
@@ -249,8 +256,16 @@ main' postLoadMode units dflags0 args flagWarnings = do
   -- we've finished manipulating the DynFlags, update the session
   _ <- GHC.setSessionDynFlags dflags5
   dflags6 <- GHC.getSessionDynFlags
-  hsc_env <- GHC.getSession
+
+  -- Must do this before loading plugins
+  liftIO $ initUniqSupply (initialUnique dflags6) (uniqueIncrement dflags6)
+
+  -- Initialise plugins here because the plugin author might already expect this
+  -- subsequent call to `getLogger` to be affected by a plugin.
+  initializeSessionPlugins
+  hsc_env <- getSession
   logger <- getLogger
+
 
         ---------------- Display configuration -----------
   case verbosity dflags6 of
@@ -258,7 +273,6 @@ main' postLoadMode units dflags0 args flagWarnings = do
       | v >= 5 -> liftIO $ dumpUnits       hsc_env
       | otherwise -> return ()
 
-  liftIO $ initUniqSupply (initialUnique dflags6) (uniqueIncrement dflags6)
         ---------------- Final sanity checking -----------
   liftIO $ checkOptions postLoadMode dflags6 srcs objs units
 
@@ -364,7 +378,7 @@ checkOptions mode dflags srcs objs units = do
         else do
 
    case mode of
-      StopBefore StopC | backend dflags /= ViaC
+      StopBefore StopC | not (backendGeneratesHc (backend dflags))
         -> throwGhcException $ UsageError $
            "the option -C is only available with an unregisterised GHC"
       StopBefore StopAs | ghcLink dflags == NoLink
@@ -772,7 +786,7 @@ initMulti unitArgsFiles  = do
     handleSourceError (\e -> do
        GHC.printException e
        liftIO $ exitWith (ExitFailure 1)) $ do
-         liftIO $ handleFlagWarnings logger (initDiagOpts dflags2) warns
+         liftIO $ handleFlagWarnings logger (initPrintConfig dflags2) (initDiagOpts dflags2) warns
 
     let (dflags3, srcs, objs) = parseTargetFiles dflags2 (map unLoc fileish_args)
         dflags4 = offsetDynFlags dflags3

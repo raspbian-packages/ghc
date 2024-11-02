@@ -47,8 +47,6 @@
  */
 #define updateWithIndirection(p1, p2, and_then) \
     W_ bd;                                                      \
-                                                                \
-    prim_write_barrier;                                         \
     bd = Bdescr(p1);                                            \
     if (bdescr_gen_no(bd) != 0 :: bits16) {                     \
       IF_NONMOVING_WRITE_BARRIER_ENABLED {                      \
@@ -59,10 +57,10 @@
     } else {                                                    \
       TICK_UPD_NEW_IND();                                       \
     }                                                           \
+                                                                \
     OVERWRITING_CLOSURE(p1);                                    \
-    StgInd_indirectee(p1) = p2;                                 \
-    prim_write_barrier;                                         \
-    SET_INFO(p1, stg_BLACKHOLE_info);                           \
+    %release StgInd_indirectee(p1) = p2;                        \
+    %release SET_INFO(p1, stg_BLACKHOLE_info);                  \
     LDV_RECORD_CREATE(p1);                                      \
     and_then;
 
@@ -78,9 +76,9 @@ INLINE_HEADER void updateWithIndirection (Capability *cap,
     /* See Note [Heap memory barriers] in SMP.h */
     bdescr *bd = Bdescr((StgPtr)p1);
     if (bd->gen_no != 0) {
-      IF_NONMOVING_WRITE_BARRIER_ENABLED {
-          updateRemembSetPushThunk(cap, (StgThunk*)p1);
-      }
+        IF_NONMOVING_WRITE_BARRIER_ENABLED {
+            updateRemembSetPushThunk(cap, (StgThunk*)p1);
+        }
         recordMutableCap(p1, cap, bd->gen_no);
         TICK_UPD_OLD_IND();
     } else {

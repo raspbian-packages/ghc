@@ -27,6 +27,8 @@
 #include <unistd.h>
 #endif
 
+#define MIN(x,y) ((x) < (y) ? (x) : (y))
+
 Mutex state_change_mutex;
 bool eventlog_enabled; // protected by state_change_mutex to ensure
                        // serialisation of calls to
@@ -76,7 +78,7 @@ bool eventlog_enabled; // protected by state_change_mutex to ensure
  *  6. stop the writer
  *  7. release state_change_mutex
  *
- * Note that a corrollary of this is that !eventlog_enabled implies that the
+ * Note that a corollary of this is that !eventlog_enabled implies that the
  * eventlog buffers are all empty (modulo the block marker that all buffers
  * always have).
  *
@@ -85,6 +87,14 @@ bool eventlog_enabled; // protected by state_change_mutex to ensure
  * case is that we must ensure that the buffers of any disabled capabilities are
  * flushed, lest their events are stuck in limbo. This is achieved with a call to
  * flushLocalEventsBuf in traceCapDisable.
+ *
+ *
+ * Note [Maximum event length]
+ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ * The maximum length of an eventlog event is determined by the maximum event
+ * buffer size, EVENT_LOG_SIZE. We must ensure that no variable-length event
+ * exceeds this limit. For this reason we impose maximum length limits on
+ * fields which may have unbounded values.
  */
 
 static const EventLogWriter *event_log_writer = NULL;
@@ -93,6 +103,7 @@ static const EventLogWriter *event_log_writer = NULL;
 // eventlog is restarted
 static eventlog_init_func_t *eventlog_header_funcs = NULL;
 
+// See Note [Maximum event length]
 #define EVENT_LOG_SIZE 2 * (1024 * 1024) // 2MB
 
 static int flushCount = 0;
@@ -136,12 +147,12 @@ static void postBlockMarker(EventsBuf *eb);
 static void closeBlockMarker(EventsBuf *ebuf);
 
 static StgBool hasRoomForEvent(EventsBuf *eb, EventTypeNum eNum);
-static StgBool hasRoomForVariableEvent(EventsBuf *eb, uint32_t payload_bytes);
+static StgBool hasRoomForVariableEvent(EventsBuf *eb, StgWord payload_bytes);
 
 static void freeEventLoggingBuffer(void);
 
 static void ensureRoomForEvent(EventsBuf *eb, EventTypeNum tag);
-static int ensureRoomForVariableEvent(EventsBuf *eb, StgWord16 size);
+static int ensureRoomForVariableEvent(EventsBuf *eb, StgWord size);
 
 static inline void postWord8(EventsBuf *eb, StgWord8 i)
 {
@@ -166,21 +177,20 @@ static inline void postWord64(EventsBuf *eb, StgWord64 i)
     postWord32(eb, (StgWord32)i);
 }
 
-static inline void postBuf(EventsBuf *eb, StgWord8 *buf, uint32_t size)
+static inline void postBuf(EventsBuf *eb, const StgWord8 *buf, uint32_t size)
 {
     memcpy(eb->pos, buf, size);
     eb->pos += size;
 }
 
-/* Post a null-terminated string to the event log.
- * It is the caller's responsibility to ensure that there is
- * enough room for strlen(buf)+1 bytes.
+/* Post a null-terminated string up to a given length to the event log. It is
+ * the caller's responsibility to ensure that there is enough room for
+ * len+1 bytes.
  */
-static inline void postString(EventsBuf *eb, const char *buf)
+static inline void postStringLen(EventsBuf *eb, const char *buf, StgWord len)
 {
     if (buf) {
-        const int len = strlen(buf);
-        ASSERT(eb->begin + eb->size > eb->pos + len);
+        ASSERT(eb->begin + eb->size > eb->pos + len + 1);
         memcpy(eb->pos, buf, len);
         eb->pos += len;
     }
@@ -302,7 +312,7 @@ postHeaderEvents(void)
     postInt32(&eventBuf, EVENT_DATA_BEGIN);
 }
 
-// These events will be reposted everytime we restart the eventlog
+// These events will be reposted every time we restart the eventlog
 void
 postInitEvent(EventlogInitPost post_init){
     ACQUIRE_LOCK(&state_change_mutex);
@@ -383,7 +393,9 @@ initEventLogging(void)
 enum EventLogStatus
 eventLogStatus(void)
 {
-    if (eventlog_enabled) {
+    /* This relaxed load is needed as the eventLogStatus is called from
+     * handleTick without holding the eventlog state mutex. */
+    if (RELAXED_LOAD(&eventlog_enabled)) {
         return EVENTLOG_RUNNING;
     } else {
         return EVENTLOG_NOT_CONFIGURED;
@@ -757,10 +769,8 @@ void postCapsetVecEvent (EventTypeNum tag,
         // 1 + strlen to account for the trailing \0, used as separator
         int increment = 1 + strlen(argv[i]);
         if (size + increment > EVENT_PAYLOAD_SIZE_MAX) {
-            errorBelch("Event size exceeds EVENT_PAYLOAD_SIZE_MAX, record only %"
-                       FMT_Int " out of %" FMT_Int " args",
-                       (StgInt) i,
-                       (StgInt) argc);
+            errorBelch("Event size exceeds EVENT_PAYLOAD_SIZE_MAX, record only "
+                       "%d out of %d args", i, argc);
             argc = i;
             break;
         } else {
@@ -1087,9 +1097,10 @@ void postUserBinaryEvent(Capability   *cap,
 
 void postThreadLabel(Capability    *cap,
                      EventThreadID  id,
-                     char          *label)
+                     char          *label,
+                     size_t         len)
 {
-    const int strsize = strlen(label);
+    const int strsize = (int) len;
     const int size = strsize + sizeof(EventThreadID);
     if (size > EVENT_PAYLOAD_SIZE_MAX) {
         errorBelch("Event size exceeds EVENT_PAYLOAD_SIZE_MAX, bail out");
@@ -1217,19 +1228,19 @@ void postHeapProfBegin(StgWord8 profile_id)
         1+8+4 + modSelector_len + descrSelector_len +
         typeSelector_len + ccSelector_len + ccsSelector_len +
         retainerSelector_len + bioSelector_len + 7;
-    ensureRoomForVariableEvent(&eventBuf, len);
+    CHECK(!ensureRoomForVariableEvent(&eventBuf, len));
     postEventHeader(&eventBuf, EVENT_HEAP_PROF_BEGIN);
     postPayloadSize(&eventBuf, len);
     postWord8(&eventBuf, profile_id);
     postWord64(&eventBuf, TimeToNS(flags->heapProfileInterval));
     postWord32(&eventBuf, getHeapProfBreakdown());
-    postString(&eventBuf, flags->modSelector);
-    postString(&eventBuf, flags->descrSelector);
-    postString(&eventBuf, flags->typeSelector);
-    postString(&eventBuf, flags->ccSelector);
-    postString(&eventBuf, flags->ccsSelector);
-    postString(&eventBuf, flags->retainerSelector);
-    postString(&eventBuf, flags->bioSelector);
+    postStringLen(&eventBuf, flags->modSelector, modSelector_len);
+    postStringLen(&eventBuf, flags->descrSelector, descrSelector_len);
+    postStringLen(&eventBuf, flags->typeSelector, typeSelector_len);
+    postStringLen(&eventBuf, flags->ccSelector, ccSelector_len);
+    postStringLen(&eventBuf, flags->ccsSelector, ccsSelector_len);
+    postStringLen(&eventBuf, flags->retainerSelector, retainerSelector_len);
+    postStringLen(&eventBuf, flags->bioSelector, bioSelector_len);
     RELEASE_LOCK(&eventBufMutex);
 }
 
@@ -1269,12 +1280,12 @@ void postHeapProfSampleString(StgWord8 profile_id,
     ACQUIRE_LOCK(&eventBufMutex);
     StgWord label_len = strlen(label);
     StgWord len = 1+8+label_len+1;
-    ensureRoomForVariableEvent(&eventBuf, len);
+    CHECK(!ensureRoomForVariableEvent(&eventBuf, len));
     postEventHeader(&eventBuf, EVENT_HEAP_PROF_SAMPLE_STRING);
     postPayloadSize(&eventBuf, len);
     postWord8(&eventBuf, profile_id);
     postWord64(&eventBuf, residency);
-    postString(&eventBuf, label);
+    postStringLen(&eventBuf, label, label_len);
     RELEASE_LOCK(&eventBufMutex);
 }
 
@@ -1290,13 +1301,13 @@ void postHeapProfCostCentre(StgWord32 ccID,
     StgWord module_len = strlen(module);
     StgWord srcloc_len = strlen(srcloc);
     StgWord len = 4+label_len+module_len+srcloc_len+3+1;
-    ensureRoomForVariableEvent(&eventBuf, len);
+    CHECK(!ensureRoomForVariableEvent(&eventBuf, len));
     postEventHeader(&eventBuf, EVENT_HEAP_PROF_COST_CENTRE);
     postPayloadSize(&eventBuf, len);
     postWord32(&eventBuf, ccID);
-    postString(&eventBuf, label);
-    postString(&eventBuf, module);
-    postString(&eventBuf, srcloc);
+    postStringLen(&eventBuf, label, label_len);
+    postStringLen(&eventBuf, module, module_len);
+    postStringLen(&eventBuf, srcloc, srcloc_len);
     postWord8(&eventBuf, is_caf);
     RELEASE_LOCK(&eventBufMutex);
 }
@@ -1313,7 +1324,7 @@ void postHeapProfSampleCostCentre(StgWord8 profile_id,
     if (depth > 0xff) depth = 0xff;
 
     StgWord len = 1+8+1+depth*4;
-    ensureRoomForVariableEvent(&eventBuf, len);
+    CHECK(!ensureRoomForVariableEvent(&eventBuf, len));
     postEventHeader(&eventBuf, EVENT_HEAP_PROF_SAMPLE_COST_CENTRE);
     postPayloadSize(&eventBuf, len);
     postWord8(&eventBuf, profile_id);
@@ -1339,7 +1350,7 @@ void postProfSampleCostCentre(Capability *cap,
     if (depth > 0xff) depth = 0xff;
 
     StgWord len = 4+8+1+depth*4;
-    ensureRoomForVariableEvent(&eventBuf, len);
+    CHECK(!ensureRoomForVariableEvent(&eventBuf, len));
     postEventHeader(&eventBuf, EVENT_PROF_SAMPLE_COST_CENTRE);
     postPayloadSize(&eventBuf, len);
     postWord32(&eventBuf, cap->no);
@@ -1354,7 +1365,7 @@ void postProfSampleCostCentre(Capability *cap,
 
 // This event is output at the start of profiling so the tick interval can
 // be reported. Once the tick interval is reported the total executation time
-// can be calculuated from how many samples there are.
+// can be calculated from how many samples there are.
 void postProfBegin(void)
 {
     ACQUIRE_LOCK(&eventBufMutex);
@@ -1368,17 +1379,20 @@ void postProfBegin(void)
 #if defined(TICKY_TICKY)
 static void postTickyCounterDef(EventsBuf *eb, StgEntCounter *p)
 {
-    StgWord len = 8 + 2 + strlen(p->arg_kinds)+1 + strlen(p->str)+1 + 8 + strlen(p->ticky_json)+1;
-    ensureRoomForVariableEvent(eb, len);
+    StgWord arg_kinds_len = strlen(p->arg_kinds);
+    StgWord str_len = strlen(p->str);
+    StgWord ticky_json_len = strlen(p->ticky_json);
+    StgWord len = 8 + 2 + arg_kinds_len+1 + str_len+1 + 8 + ticky_json_len+1;
+    CHECK(!ensureRoomForVariableEvent(eb, len));
     postEventHeader(eb, EVENT_TICKY_COUNTER_DEF);
     postPayloadSize(eb, len);
 
     postWord64(eb, (uint64_t)((uintptr_t) p));
     postWord16(eb, (uint16_t) p->arity);
-    postString(eb, p->arg_kinds);
-    postString(eb, p->str);
+    postStringLen(eb, p->arg_kinds, arg_kinds_len);
+    postStringLen(eb, p->str, str_len);
     postWord64(eb, (W_) (INFO_PTR_TO_STRUCT(p->info)));
-    postString(eb, p->ticky_json);
+    postStringLen(eb, p->ticky_json, ticky_json_len);
 
 }
 
@@ -1423,26 +1437,38 @@ void postTickyCounterSamples(StgEntCounter *counters)
 #endif /* TICKY_TICKY */
 void postIPE(const InfoProvEnt *ipe)
 {
+    // See Note [Maximum event length].
+    const StgWord MAX_IPE_STRING_LEN = 65535;
     ACQUIRE_LOCK(&eventBufMutex);
-    StgWord table_name_len = strlen(ipe->prov.table_name);
-    StgWord closure_desc_len = strlen(ipe->prov.closure_desc);
-    StgWord ty_desc_len = strlen(ipe->prov.ty_desc);
-    StgWord label_len = strlen(ipe->prov.label);
-    StgWord module_len = strlen(ipe->prov.module);
-    StgWord srcloc_len = strlen(ipe->prov.srcloc);
+    StgWord table_name_len = MIN(strlen(ipe->prov.table_name), MAX_IPE_STRING_LEN);
+    StgWord closure_desc_len = MIN(strlen(ipe->prov.closure_desc), MAX_IPE_STRING_LEN);
+    StgWord ty_desc_len = MIN(strlen(ipe->prov.ty_desc), MAX_IPE_STRING_LEN);
+    StgWord label_len = MIN(strlen(ipe->prov.label), MAX_IPE_STRING_LEN);
+    StgWord module_len = MIN(strlen(ipe->prov.module), MAX_IPE_STRING_LEN);
+    StgWord src_file_len = MIN(strlen(ipe->prov.src_file), MAX_IPE_STRING_LEN);
+    StgWord src_span_len = MIN(strlen(ipe->prov.src_span), MAX_IPE_STRING_LEN);
+
     // 8 for the info word
-    // 6 for the number of strings in the payload as postString adds 1 to the length
-    StgWord len = 8+table_name_len+closure_desc_len+ty_desc_len+label_len+module_len+srcloc_len+6;
-    ensureRoomForVariableEvent(&eventBuf, len);
+    // 1 null after each string
+    // 1 colon between src_file and src_span
+    StgWord extra_comma = 1;
+    StgWord len = 8+table_name_len+1+closure_desc_len+1+ty_desc_len+1+label_len+1+module_len+1+src_file_len+1+extra_comma+src_span_len+1;
+    CHECK(!ensureRoomForVariableEvent(&eventBuf, len));
     postEventHeader(&eventBuf, EVENT_IPE);
     postPayloadSize(&eventBuf, len);
     postWord64(&eventBuf, (StgWord) INFO_PTR_TO_STRUCT(ipe->info));
-    postString(&eventBuf, ipe->prov.table_name);
-    postString(&eventBuf, ipe->prov.closure_desc);
-    postString(&eventBuf, ipe->prov.ty_desc);
-    postString(&eventBuf, ipe->prov.label);
-    postString(&eventBuf, ipe->prov.module);
-    postString(&eventBuf, ipe->prov.srcloc);
+    postStringLen(&eventBuf, ipe->prov.table_name, table_name_len);
+    postStringLen(&eventBuf, ipe->prov.closure_desc, closure_desc_len);
+    postStringLen(&eventBuf, ipe->prov.ty_desc, ty_desc_len);
+    postStringLen(&eventBuf, ipe->prov.label, label_len);
+    postStringLen(&eventBuf, ipe->prov.module, module_len);
+
+    // Manually construct the location field: "<file>:<span>\0"
+    postBuf(&eventBuf, (const StgWord8*) ipe->prov.src_file, src_file_len);
+    StgWord8 colon = ':';
+    postBuf(&eventBuf, &colon, 1);
+    postStringLen(&eventBuf, ipe->prov.src_span, src_span_len);
+
     RELEASE_LOCK(&eventBufMutex);
 }
 
@@ -1484,6 +1510,7 @@ void resetEventsBuf(EventsBuf* eb)
     eb->marker = NULL;
 }
 
+STG_WARN_UNUSED_RESULT
 StgBool hasRoomForEvent(EventsBuf *eb, EventTypeNum eNum)
 {
   uint32_t size = sizeof(EventTypeNum) + sizeof(EventTimestamp) + eventTypes[eNum].size;
@@ -1495,9 +1522,10 @@ StgBool hasRoomForEvent(EventsBuf *eb, EventTypeNum eNum)
   }
 }
 
-StgBool hasRoomForVariableEvent(EventsBuf *eb, uint32_t payload_bytes)
+STG_WARN_UNUSED_RESULT
+StgBool hasRoomForVariableEvent(EventsBuf *eb, StgWord payload_bytes)
 {
-  uint32_t size = sizeof(EventTypeNum) + sizeof(EventTimestamp) +
+  StgWord size = sizeof(EventTypeNum) + sizeof(EventTimestamp) +
       sizeof(EventPayloadSize) + payload_bytes;
 
   if (eb->pos + size > eb->begin + eb->size) {
@@ -1512,16 +1540,19 @@ void ensureRoomForEvent(EventsBuf *eb, EventTypeNum tag)
     if (!hasRoomForEvent(eb, tag)) {
         // Flush event buffer to make room for new event.
         printAndClearEventBuf(eb);
+        ASSERT(hasRoomForEvent(eb, tag));
     }
 }
 
-int ensureRoomForVariableEvent(EventsBuf *eb, StgWord16 size)
+STG_WARN_UNUSED_RESULT
+int ensureRoomForVariableEvent(EventsBuf *eb, StgWord size)
 {
     if (!hasRoomForVariableEvent(eb, size)) {
         // Flush event buffer to make room for new event.
         printAndClearEventBuf(eb);
-        if (!hasRoomForVariableEvent(eb, size))
+        if (!hasRoomForVariableEvent(eb, size)) {
             return 1; // Not enough space
+        }
     }
     return 0;
 }

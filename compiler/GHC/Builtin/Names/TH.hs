@@ -10,13 +10,14 @@ import GHC.Prelude ()
 
 import GHC.Builtin.Names( mk_known_key_name )
 import GHC.Unit.Types
-import GHC.Unit.Module.Name
 import GHC.Types.Name( Name )
 import GHC.Types.Name.Occurrence( tcName, clsName, dataName, varName )
 import GHC.Types.Name.Reader( RdrName, nameRdrName )
 import GHC.Types.Unique
 import GHC.Builtin.Uniques
 import GHC.Data.FastString
+
+import Language.Haskell.Syntax.Module.Name
 
 -- To add a name, do three things
 --
@@ -31,7 +32,7 @@ templateHaskellNames :: [Name]
 templateHaskellNames = [
     returnQName, bindQName, sequenceQName, newNameName, liftName, liftTypedName,
     mkNameName, mkNameG_vName, mkNameG_dName, mkNameG_tcName, mkNameLName,
-    mkNameSName,
+    mkNameSName, mkNameQName,
     mkModNameName,
     liftStringName,
     unTypeName, unTypeCodeName,
@@ -68,7 +69,7 @@ templateHaskellNames = [
     -- Stmt
     bindSName, letSName, noBindSName, parSName, recSName,
     -- Dec
-    funDName, valDName, dataDName, newtypeDName, tySynDName,
+    funDName, valDName, dataDName, newtypeDName, typeDataDName, tySynDName,
     classDName, instanceWithOverlapDName,
     standaloneDerivWithStrategyDName, sigDName, kiSigDName, forImpDName,
     pragInlDName, pragOpaqueDName, pragSpecDName, pragSpecInlDName, pragSpecInstDName,
@@ -215,7 +216,7 @@ modNameTyConName       = thTc (fsLit "ModName")        modNameTyConKey
 returnQName, bindQName, sequenceQName, newNameName, liftName,
     mkNameName, mkNameG_vName, mkNameG_dName, mkNameG_tcName,
     mkNameLName, mkNameSName, liftStringName, unTypeName, unTypeCodeName,
-    unsafeCodeCoerceName, liftTypedName, mkModNameName :: Name
+    unsafeCodeCoerceName, liftTypedName, mkModNameName, mkNameQName :: Name
 returnQName    = thFun (fsLit "returnQ")   returnQIdKey
 bindQName      = thFun (fsLit "bindQ")     bindQIdKey
 sequenceQName  = thFun (fsLit "sequenceQ") sequenceQIdKey
@@ -227,6 +228,7 @@ mkNameG_vName  = thFun (fsLit "mkNameG_v")  mkNameG_vIdKey
 mkNameG_dName  = thFun (fsLit "mkNameG_d")  mkNameG_dIdKey
 mkNameG_tcName = thFun (fsLit "mkNameG_tc") mkNameG_tcIdKey
 mkNameLName    = thFun (fsLit "mkNameL")    mkNameLIdKey
+mkNameQName    = thFun (fsLit "mkNameQ")    mkNameQIdKey
 mkNameSName    = thFun (fsLit "mkNameS")    mkNameSIdKey
 mkModNameName  = thFun (fsLit "mkModName")  mkModNameIdKey
 unTypeName     = thFun (fsLit "unType")     unTypeIdKey
@@ -353,7 +355,7 @@ parSName    = libFun (fsLit "parS")    parSIdKey
 recSName    = libFun (fsLit "recS")    recSIdKey
 
 -- data Dec = ...
-funDName, valDName, dataDName, newtypeDName, tySynDName, classDName,
+funDName, valDName, dataDName, newtypeDName, typeDataDName, tySynDName, classDName,
     instanceWithOverlapDName, sigDName, kiSigDName, forImpDName, pragInlDName,
     pragSpecDName, pragSpecInlDName, pragSpecInstDName, pragRuleDName,
     pragAnnDName, standaloneDerivWithStrategyDName, defaultSigDName, defaultDName,
@@ -365,6 +367,7 @@ funDName                         = libFun (fsLit "funD")                        
 valDName                         = libFun (fsLit "valD")                         valDIdKey
 dataDName                        = libFun (fsLit "dataD")                        dataDIdKey
 newtypeDName                     = libFun (fsLit "newtypeD")                     newtypeDIdKey
+typeDataDName                    = libFun (fsLit "typeDataD")                    typeDataDIdKey
 tySynDName                       = libFun (fsLit "tySynD")                       tySynDIdKey
 classDName                       = libFun (fsLit "classD")                       classDIdKey
 instanceWithOverlapDName         = libFun (fsLit "instanceWithOverlapD")         instanceWithOverlapDIdKey
@@ -740,7 +743,7 @@ incoherentDataConKey   = mkPreludeDataConUnique 212
 returnQIdKey, bindQIdKey, sequenceQIdKey, liftIdKey, newNameIdKey,
     mkNameIdKey, mkNameG_vIdKey, mkNameG_dIdKey, mkNameG_tcIdKey,
     mkNameLIdKey, mkNameSIdKey, unTypeIdKey, unTypeCodeIdKey,
-    unsafeCodeCoerceIdKey, liftTypedIdKey, mkModNameIdKey :: Unique
+    unsafeCodeCoerceIdKey, liftTypedIdKey, mkModNameIdKey, mkNameQIdKey :: Unique
 returnQIdKey        = mkPreludeMiscIdUnique 200
 bindQIdKey          = mkPreludeMiscIdUnique 201
 sequenceQIdKey      = mkPreludeMiscIdUnique 202
@@ -757,6 +760,7 @@ unTypeCodeIdKey      = mkPreludeMiscIdUnique 212
 liftTypedIdKey        = mkPreludeMiscIdUnique 214
 mkModNameIdKey        = mkPreludeMiscIdUnique 215
 unsafeCodeCoerceIdKey = mkPreludeMiscIdUnique 216
+mkNameQIdKey         = mkPreludeMiscIdUnique 217
 
 
 -- data Lit = ...
@@ -887,7 +891,7 @@ funDIdKey, valDIdKey, dataDIdKey, newtypeDIdKey, tySynDIdKey, classDIdKey,
     newtypeInstDIdKey, tySynInstDIdKey, standaloneDerivWithStrategyDIdKey,
     infixLDIdKey, infixRDIdKey, infixNDIdKey, roleAnnotDIdKey, patSynDIdKey,
     patSynSigDIdKey, pragCompleteDIdKey, implicitParamBindDIdKey,
-    kiSigDIdKey, defaultDIdKey, pragOpaqueDIdKey :: Unique
+    kiSigDIdKey, defaultDIdKey, pragOpaqueDIdKey, typeDataDIdKey :: Unique
 funDIdKey                         = mkPreludeMiscIdUnique 320
 valDIdKey                         = mkPreludeMiscIdUnique 321
 dataDIdKey                        = mkPreludeMiscIdUnique 322
@@ -922,7 +926,8 @@ pragCompleteDIdKey                = mkPreludeMiscIdUnique 350
 implicitParamBindDIdKey           = mkPreludeMiscIdUnique 351
 kiSigDIdKey                       = mkPreludeMiscIdUnique 352
 defaultDIdKey                     = mkPreludeMiscIdUnique 353
-pragOpaqueDIdKey                   = mkPreludeMiscIdUnique 354
+pragOpaqueDIdKey                  = mkPreludeMiscIdUnique 354
+typeDataDIdKey                    = mkPreludeMiscIdUnique 355
 
 -- type Cxt = ...
 cxtIdKey :: Unique

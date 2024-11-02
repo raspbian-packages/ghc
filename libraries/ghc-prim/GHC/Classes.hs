@@ -27,6 +27,9 @@
 -- Portability :  non-portable (GHC extensions)
 --
 -- Basic classes.
+-- Do not import this module directly.  It is an GHC internal only
+-- module.  Some of its contents are instead available from @Prelude@
+-- and @GHC.Int@.
 --
 -----------------------------------------------------------------------------
 
@@ -35,6 +38,8 @@ module GHC.Classes(
     IP(..),
 
     -- * Equality and ordering
+    -- | Do not import these classes from this module. Import them
+    -- from @Prelude@ instead.
     Eq(..),
     Ord(..),
     -- ** Monomorphic equality operators
@@ -48,6 +53,8 @@ module GHC.Classes(
     gtWord, geWord, leWord, ltWord, compareWord, compareWord#,
 
     -- * Functions over Bool
+    -- | Do not import these functions from this module. Import them
+    -- from @Prelude@ instead.
     (&&), (||), not,
 
     -- * Integer arithmetic
@@ -333,10 +340,11 @@ class  (Eq a) => Ord a  where
                   else if x <= y then LT
                   else GT
 
-    x <  y = case compare x y of { LT -> True;  _ -> False }
     x <= y = case compare x y of { GT -> False; _ -> True }
-    x >  y = case compare x y of { GT -> True;  _ -> False }
-    x >= y = case compare x y of { LT -> False; _ -> True }
+    x >= y = y <= x
+    x > y = not (x <= y)
+    x < y = not (y <= x)
+
 
         -- These two default methods use '<=' rather than 'compare'
         -- because the latter is often more expensive

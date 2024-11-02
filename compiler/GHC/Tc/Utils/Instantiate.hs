@@ -1,9 +1,7 @@
-
-{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE FlexibleContexts, RecursiveDo #-}
 {-# LANGUAGE DisambiguateRecordFields #-}
 
 {-# OPTIONS_GHC -Wno-incomplete-uni-patterns   #-}
-{-# OPTIONS_GHC -Wno-incomplete-record-updates #-}
 
 {-
 (c) The University of Glasgow 2006
@@ -179,7 +177,7 @@ topSkolemise :: SkolemInfo
 topSkolemise skolem_info ty
   = go init_subst idHsWrapper [] [] ty
   where
-    init_subst = mkEmptyTCvSubst (mkInScopeSet (tyCoVarsOfType ty))
+    init_subst = mkEmptySubst (mkInScopeSet (tyCoVarsOfType ty))
 
     -- Why recursive?  See Note [Skolemisation]
     go subst wrap tv_prs ev_vars ty
@@ -188,7 +186,7 @@ topSkolemise skolem_info ty
       = do { (subst', tvs1) <- tcInstSkolTyVarsX skolem_info subst tvs
            ; ev_vars1       <- newEvVars (substTheta subst' theta)
            ; go subst'
-                (wrap <.> mkWpTyLams tvs1 <.> mkWpLams ev_vars1)
+                (wrap <.> mkWpTyLams tvs1 <.> mkWpEvLams ev_vars1)
                 (tv_prs ++ (map tyVarName tvs `zip` tvs1))
                 (ev_vars ++ ev_vars1)
                 inner_ty }
@@ -204,7 +202,7 @@ topInstantiate ::CtOrigin -> TcSigmaType -> TcM (HsWrapper, TcRhoType)
 -- NB: returns a type with no (=>),
 --     and no invisible forall at the top
 topInstantiate orig sigma
-  | (tvs,   body1) <- tcSplitSomeForAllTyVars isInvisibleArgFlag sigma
+  | (tvs,   body1) <- tcSplitSomeForAllTyVars isInvisibleForAllTyFlag sigma
   , (theta, body2) <- tcSplitPhiTy body1
   , not (null tvs && null theta)
   = do { (_, wrap1, body3) <- instantiateSigma orig tvs theta body2
@@ -220,7 +218,7 @@ topInstantiate orig sigma
 instantiateSigma :: CtOrigin -> [TyVar] -> TcThetaType -> TcSigmaType
                  -> TcM ([TcTyVar], HsWrapper, TcSigmaType)
 -- (instantiate orig tvs theta ty)
--- instantiates the the type variables tvs, emits the (instantiated)
+-- instantiates the type variables tvs, emits the (instantiated)
 -- constraints theta, and returns the (instantiated) type ty
 instantiateSigma orig tvs theta body_ty
   = do { (subst, inst_tvs) <- mapAccumLM newMetaTyVarX empty_subst tvs
@@ -241,16 +239,16 @@ instantiateSigma orig tvs theta body_ty
   where
     free_tvs = tyCoVarsOfType body_ty `unionVarSet` tyCoVarsOfTypes theta
     in_scope = mkInScopeSet (free_tvs `delVarSetList` tvs)
-    empty_subst = mkEmptyTCvSubst in_scope
+    empty_subst = mkEmptySubst in_scope
 
-instTyVarsWith :: CtOrigin -> [TyVar] -> [TcType] -> TcM TCvSubst
+instTyVarsWith :: CtOrigin -> [TyVar] -> [TcType] -> TcM Subst
 -- Use this when you want to instantiate (forall a b c. ty) with
 -- types [ta, tb, tc], but when the kinds of 'a' and 'ta' might
 -- not yet match (perhaps because there are unsolved constraints; #14154)
 -- If they don't match, emit a kind-equality to promise that they will
--- eventually do so, and thus make a kind-homongeneous substitution.
+-- eventually do so, and thus make a kind-homogeneous substitution.
 instTyVarsWith orig tvs tys
-  = go emptyTCvSubst tvs tys
+  = go emptySubst tvs tys
   where
     go subst [] []
       = return subst
@@ -262,7 +260,7 @@ instTyVarsWith orig tvs tys
            ; go (extendTvSubstAndInScope subst tv (ty `mkCastTy` co)) tvs tys }
       where
         tv_kind = substTy subst (tyVarKind tv)
-        ty_kind = tcTypeKind ty
+        ty_kind = typeKind ty
 
     go _ _ _ = pprPanic "instTysWith" (ppr tvs $$ ppr tys)
 
@@ -335,11 +333,11 @@ instDFunType dfun_id dfun_inst_tys
   where
     dfun_ty = idType dfun_id
     (dfun_tvs, dfun_theta, _) = tcSplitSigmaTy dfun_ty
-    empty_subst = mkEmptyTCvSubst (mkInScopeSet (tyCoVarsOfType dfun_ty))
+    empty_subst = mkEmptySubst (mkInScopeSet (tyCoVarsOfType dfun_ty))
                   -- With quantified constraints, the
                   -- type of a dfun may not be closed
 
-    go :: TCvSubst -> [TyVar] -> [DFunInstType] -> TcM (TCvSubst, [TcType])
+    go :: Subst -> [TyVar] -> [DFunInstType] -> TcM (Subst, [TcType])
     go subst [] [] = return (subst, [])
     go subst (tv:tvs) (Just ty : mb_tys)
       = do { (subst', tys) <- go (extendTvSubstAndInScope subst tv ty)
@@ -369,6 +367,7 @@ instStupidTheta orig theta
 
 -- | Given ty::forall k1 k2. k, instantiate all the invisible forall-binders
 --   returning ty @kk1 @kk2 :: k[kk1/k1, kk2/k1]
+-- Called only to instantiate kinds, in user-written type signatures
 tcInstInvisibleTyBinders :: TcType -> TcKind -> TcM (TcType, TcKind)
 tcInstInvisibleTyBinders ty kind
   = do { (extra_args, kind') <- tcInstInvisibleTyBindersN n_invis kind
@@ -377,37 +376,40 @@ tcInstInvisibleTyBinders ty kind
     n_invis = invisibleTyBndrCount kind
 
 tcInstInvisibleTyBindersN :: Int -> TcKind -> TcM ([TcType], TcKind)
+-- Called only to instantiate kinds, in user-written type signatures
 tcInstInvisibleTyBindersN 0 kind
   = return ([], kind)
 tcInstInvisibleTyBindersN n ty
   = go n empty_subst ty
   where
-    empty_subst = mkEmptyTCvSubst (mkInScopeSet (tyCoVarsOfType ty))
+    empty_subst = mkEmptySubst (mkInScopeSet (tyCoVarsOfType ty))
 
     go n subst kind
       | n > 0
       , Just (bndr, body) <- tcSplitPiTy_maybe kind
-      , isInvisibleBinder bndr
+      , isInvisiblePiTyBinder bndr
       = do { (subst', arg) <- tcInstInvisibleTyBinder subst bndr
            ; (args, inner_ty) <- go (n-1) subst' body
            ; return (arg:args, inner_ty) }
       | otherwise
       = return ([], substTy subst kind)
 
--- | Used only in *types*
-tcInstInvisibleTyBinder :: TCvSubst -> TyBinder -> TcM (TCvSubst, TcType)
+tcInstInvisibleTyBinder :: Subst -> PiTyVarBinder -> TcM (Subst, TcType)
+-- Called only to instantiate kinds, in user-written type signatures
+
 tcInstInvisibleTyBinder subst (Named (Bndr tv _))
   = do { (subst', tv') <- newMetaTyVarX subst tv
        ; return (subst', mkTyVarTy tv') }
 
-tcInstInvisibleTyBinder subst (Anon af ty)
+tcInstInvisibleTyBinder subst (Anon ty af)
   | Just (mk, k1, k2) <- get_eq_tys_maybe (substTy subst (scaledThing ty))
-    -- Equality is the *only* constraint currently handled in types.
+    -- For kinds like (k1 ~ k2) => blah, we want to emit a unification
+    -- constraint for (k1 ~# k2) and return the argument (Eq# k1 k2)
     -- See Note [Constraints in kinds] in GHC.Core.TyCo.Rep
-  = assert (af == InvisArg) $
+    -- Equality is the *only* constraint currently handled in types.
+  = assert (isInvisibleFunArg af) $
     do { co <- unifyKind Nothing k1 k2
-       ; arg' <- mk co
-       ; return (subst, arg') }
+       ; return (subst, mk co) }
 
   | otherwise  -- This should never happen
                -- See GHC.Core.TyCo.Rep Note [Constraints in kinds]
@@ -415,9 +417,9 @@ tcInstInvisibleTyBinder subst (Anon af ty)
 
 -------------------------------
 get_eq_tys_maybe :: Type
-                 -> Maybe ( Coercion -> TcM Type
-                             -- given a coercion proving t1 ~# t2, produce the
-                             -- right instantiation for the TyBinder at hand
+                 -> Maybe ( Coercion -> Type
+                             -- Given a coercion proving t1 ~# t2, produce the
+                             -- right instantiation for the PiTyVarBinder at hand
                           , Type  -- t1
                           , Type  -- t2
                           )
@@ -426,31 +428,28 @@ get_eq_tys_maybe ty
   -- Lifted heterogeneous equality (~~)
   | Just (tc, [_, _, k1, k2]) <- splitTyConApp_maybe ty
   , tc `hasKey` heqTyConKey
-  = Just (\co -> mkHEqBoxTy co k1 k2, k1, k2)
+  = Just (mkHEqBoxTy k1 k2, k1, k2)
 
   -- Lifted homogeneous equality (~)
   | Just (tc, [_, k1, k2]) <- splitTyConApp_maybe ty
   , tc `hasKey` eqTyConKey
-  = Just (\co -> mkEqBoxTy co k1 k2, k1, k2)
+  = Just (mkEqBoxTy k1 k2, k1, k2)
 
   | otherwise
   = Nothing
 
 -- | This takes @a ~# b@ and returns @a ~~ b@.
-mkHEqBoxTy :: TcCoercion -> Type -> Type -> TcM Type
--- monadic just for convenience with mkEqBoxTy
-mkHEqBoxTy co ty1 ty2
-  = return $
-    mkTyConApp (promoteDataCon heqDataCon) [k1, k2, ty1, ty2, mkCoercionTy co]
-  where k1 = tcTypeKind ty1
-        k2 = tcTypeKind ty2
+mkHEqBoxTy :: Type -> Type -> TcCoercion -> Type
+mkHEqBoxTy ty1 ty2 co
+  = mkTyConApp (promoteDataCon heqDataCon) [k1, k2, ty1, ty2, mkCoercionTy co]
+  where k1 = typeKind ty1
+        k2 = typeKind ty2
 
 -- | This takes @a ~# b@ and returns @a ~ b@.
-mkEqBoxTy :: TcCoercion -> Type -> Type -> TcM Type
-mkEqBoxTy co ty1 ty2
-  = return $
-    mkTyConApp (promoteDataCon eqDataCon) [k, ty1, ty2, mkCoercionTy co]
-  where k = tcTypeKind ty1
+mkEqBoxTy :: Type -> Type -> TcCoercion -> Type
+mkEqBoxTy ty1 ty2 co
+  = mkTyConApp (promoteDataCon eqDataCon) [k, ty1, ty2, mkCoercionTy co]
+  where k = typeKind ty1
 
 {- *********************************************************************
 *                                                                      *
@@ -458,7 +457,7 @@ mkEqBoxTy co ty1 ty2
 *                                                                      *
 ********************************************************************* -}
 
-tcInstType :: ([TyVar] -> TcM (TCvSubst, [TcTyVar]))
+tcInstType :: ([TyVar] -> TcM (Subst, [TcTyVar]))
                    -- ^ How to instantiate the type variables
            -> Id                                           -- ^ Type to instantiate
            -> TcM ([(Name, TcTyVar)], TcThetaType, TcType) -- ^ Result
@@ -470,50 +469,62 @@ tcInstType inst_tyvars id
   | otherwise
   = do { (subst, tyvars') <- inst_tyvars tyvars
        ; let tv_prs  = map tyVarName tyvars `zip` tyvars'
-             subst'  = extendTCvInScopeSet subst (tyCoVarsOfType rho)
+             subst'  = extendSubstInScopeSet subst (tyCoVarsOfType rho)
        ; return (tv_prs, substTheta subst' theta, substTy subst' tau) }
   where
     (tyvars, rho) = tcSplitForAllInvisTyVars (idType id)
     (theta, tau)  = tcSplitPhiTy rho
 
-tcInstTypeBndrs :: Id -> TcM ([(Name, InvisTVBinder)], TcThetaType, TcType)
+tcInstTypeBndrs :: Type -> TcM ([(Name, InvisTVBinder)], TcThetaType, TcType)
                      -- (type vars, preds (incl equalities), rho)
 -- Instantiate the binders of a type signature with TyVarTvs
-tcInstTypeBndrs id
+tcInstTypeBndrs poly_ty
   | null tyvars   -- There may be overloading despite no type variables;
                   --      (?x :: Int) => Int -> Int
   = return ([], theta, tau)
   | otherwise
-  = do { (subst, tyvars') <- mapAccumLM inst_invis_bndr emptyTCvSubst tyvars
+  = do { (subst, tyvars') <- mapAccumLM inst_invis_bndr emptySubst tyvars
        ; let tv_prs  = map (tyVarName . binderVar) tyvars `zip` tyvars'
-             subst'  = extendTCvInScopeSet subst (tyCoVarsOfType rho)
+             subst'  = extendSubstInScopeSet subst (tyCoVarsOfType rho)
        ; return (tv_prs, substTheta subst' theta, substTy subst' tau) }
   where
-    (tyvars, rho) = splitForAllInvisTVBinders (idType id)
+    (tyvars, rho) = tcSplitForAllInvisTVBinders poly_ty
     (theta, tau)  = tcSplitPhiTy rho
 
-    inst_invis_bndr :: TCvSubst -> InvisTVBinder
-                    -> TcM (TCvSubst, InvisTVBinder)
+    inst_invis_bndr :: Subst -> InvisTVBinder
+                    -> TcM (Subst, InvisTVBinder)
     inst_invis_bndr subst (Bndr tv spec)
       = do { (subst', tv') <- newMetaTyVarTyVarX subst tv
            ; return (subst', Bndr tv' spec) }
 
 --------------------------
-tcSkolDFunType :: SkolemInfo -> DFunId -> TcM ([TcTyVar], TcThetaType, TcType)
+tcSkolDFunType :: Type -> TcM (SkolemInfoAnon, [TcTyVar], TcThetaType, Class, [TcType])
 -- Instantiate a type signature with skolem constants.
 -- This freshens the names, but no need to do so
-tcSkolDFunType skol_info dfun
-  = do { (tv_prs, theta, tau) <- tcInstType (tcInstSuperSkolTyVars skol_info) dfun
-       ; return (map snd tv_prs, theta, tau) }
+tcSkolDFunType dfun_ty
+  = do { let (tvs, theta, cls, tys) = tcSplitDFunTy dfun_ty
 
-tcSuperSkolTyVars :: TcLevel -> SkolemInfo -> [TyVar] -> (TCvSubst, [TcTyVar])
+         -- rec {..}: see Note [Keeping SkolemInfo inside a SkolemTv]
+         --           in GHC.Tc.Utils.TcType
+       ; rec { skol_info <- mkSkolemInfo skol_info_anon
+             ; (subst, inst_tvs) <- tcInstSuperSkolTyVars skol_info tvs
+                     -- We instantiate the dfun_tyd with superSkolems.
+                     -- See Note [Subtle interaction of recursion and overlap]
+                     -- and Note [Binding when looking up instances]
+             ; let inst_tys = substTys subst tys
+                   skol_info_anon = mkClsInstSkol cls inst_tys }
+
+       ; let inst_theta = substTheta subst theta
+       ; return (skol_info_anon, inst_tvs, inst_theta, cls, inst_tys) }
+
+tcSuperSkolTyVars :: TcLevel -> SkolemInfo -> [TyVar] -> (Subst, [TcTyVar])
 -- Make skolem constants, but do *not* give them new names, as above
 -- As always, allocate them one level in
 -- Moreover, make them "super skolems"; see GHC.Core.InstEnv
 --    Note [Binding when looking up instances]
 -- See Note [Kind substitution when instantiating]
 -- Precondition: tyvars should be ordered by scoping
-tcSuperSkolTyVars tc_lvl skol_info = mapAccumL do_one emptyTCvSubst
+tcSuperSkolTyVars tc_lvl skol_info = mapAccumL do_one emptySubst
   where
     details = SkolemTv skol_info (pushTcLevel tc_lvl)
                        True   -- The "super" bit
@@ -525,29 +536,31 @@ tcSuperSkolTyVars tc_lvl skol_info = mapAccumL do_one emptyTCvSubst
 -- | Given a list of @['TyVar']@, skolemize the type variables,
 -- returning a substitution mapping the original tyvars to the
 -- skolems, and the list of newly bound skolems.
-tcInstSkolTyVars :: SkolemInfo -> [TyVar] -> TcM (TCvSubst, [TcTyVar])
+tcInstSkolTyVars :: SkolemInfo -> [TyVar] -> TcM (Subst, [TcTyVar])
 -- See Note [Skolemising type variables]
-tcInstSkolTyVars skol_info = tcInstSkolTyVarsX skol_info emptyTCvSubst
+tcInstSkolTyVars skol_info = tcInstSkolTyVarsX skol_info emptySubst
 
-tcInstSkolTyVarsX :: SkolemInfo -> TCvSubst -> [TyVar] -> TcM (TCvSubst, [TcTyVar])
+tcInstSkolTyVarsX :: SkolemInfo -> Subst -> [TyVar] -> TcM (Subst, [TcTyVar])
 -- See Note [Skolemising type variables]
 tcInstSkolTyVarsX skol_info = tcInstSkolTyVarsPushLevel skol_info False
 
-tcInstSuperSkolTyVars :: SkolemInfo -> [TyVar] -> TcM (TCvSubst, [TcTyVar])
+tcInstSuperSkolTyVars :: SkolemInfo -> [TyVar] -> TcM (Subst, [TcTyVar])
 -- See Note [Skolemising type variables]
 -- This version freshens the names and creates "super skolems";
--- see comments around superSkolemTv.
-tcInstSuperSkolTyVars skol_info = tcInstSuperSkolTyVarsX skol_info emptyTCvSubst
+--    see comments around superSkolemTv.
+-- Must be lazy in skol_info:
+--   see Note [Keeping SkolemInfo inside a SkolemTv] in GHC.Tc.Utils.TcType
+tcInstSuperSkolTyVars skol_info = tcInstSuperSkolTyVarsX skol_info emptySubst
 
-tcInstSuperSkolTyVarsX :: SkolemInfo -> TCvSubst -> [TyVar] -> TcM (TCvSubst, [TcTyVar])
+tcInstSuperSkolTyVarsX :: SkolemInfo -> Subst -> [TyVar] -> TcM (Subst, [TcTyVar])
 -- See Note [Skolemising type variables]
 -- This version freshens the names and creates "super skolems";
 -- see comments around superSkolemTv.
 tcInstSuperSkolTyVarsX skol_info subst = tcInstSkolTyVarsPushLevel skol_info True subst
 
 tcInstSkolTyVarsPushLevel :: SkolemInfo -> Bool  -- True <=> make "super skolem"
-                          -> TCvSubst -> [TyVar]
-                          -> TcM (TCvSubst, [TcTyVar])
+                          -> Subst -> [TyVar]
+                          -> TcM (Subst, [TcTyVar])
 -- Skolemise one level deeper, hence pushTcLevel
 -- See Note [Skolemising type variables]
 tcInstSkolTyVarsPushLevel skol_info overlappable subst tvs
@@ -557,8 +570,8 @@ tcInstSkolTyVarsPushLevel skol_info overlappable subst tvs
        ; tcInstSkolTyVarsAt skol_info pushed_lvl overlappable subst tvs }
 
 tcInstSkolTyVarsAt :: SkolemInfo -> TcLevel -> Bool
-                   -> TCvSubst -> [TyVar]
-                   -> TcM (TCvSubst, [TcTyVar])
+                   -> Subst -> [TyVar]
+                   -> TcM (Subst, [TcTyVar])
 tcInstSkolTyVarsAt skol_info lvl overlappable subst tvs
   = freshenTyCoVarsX new_skol_tv subst tvs
   where
@@ -575,12 +588,12 @@ tcSkolemiseInvisibleBndrs skol_info ty
        ; skol_info     <- mkSkolemInfo skol_info
        ; let details = SkolemTv skol_info lvl False
              mk_skol_tv name kind = return (mkTcTyVar name kind details)  -- No freshening
-       ; (subst, tvs') <- instantiateTyVarsX mk_skol_tv emptyTCvSubst tvs
+       ; (subst, tvs') <- instantiateTyVarsX mk_skol_tv emptySubst tvs
        ; return (tvs', substTy subst body_ty) }
 
 instantiateTyVarsX :: (Name -> Kind -> TcM TcTyVar)
-                   -> TCvSubst -> [TyVar]
-                   -> TcM (TCvSubst, [TcTyVar])
+                   -> Subst -> [TyVar]
+                   -> TcM (Subst, [TcTyVar])
 -- Instantiate each type variable in turn with the specified function
 instantiateTyVarsX mk_tv subst tvs
   = case tvs of
@@ -592,25 +605,25 @@ instantiateTyVarsX mk_tv subst tvs
                      ; return (subst', tv':tvs') }
 
 ------------------
-freshenTyVarBndrs :: [TyVar] -> TcM (TCvSubst, [TyVar])
+freshenTyVarBndrs :: [TyVar] -> TcM (Subst, [TyVar])
 -- ^ Give fresh uniques to a bunch of TyVars, but they stay
 --   as TyVars, rather than becoming TcTyVars
 -- Used in 'GHC.Tc.Instance.Family.newFamInst', and 'GHC.Tc.Utils.Instantiate.newClsInst'
 freshenTyVarBndrs = freshenTyCoVars mkTyVar
 
-freshenCoVarBndrsX :: TCvSubst -> [CoVar] -> TcM (TCvSubst, [CoVar])
+freshenCoVarBndrsX :: Subst -> [CoVar] -> TcM (Subst, [CoVar])
 -- ^ Give fresh uniques to a bunch of CoVars
 -- Used in "GHC.Tc.Instance.Family.newFamInst"
 freshenCoVarBndrsX subst = freshenTyCoVarsX mkCoVar subst
 
 ------------------
 freshenTyCoVars :: (Name -> Kind -> TyCoVar)
-                -> [TyVar] -> TcM (TCvSubst, [TyCoVar])
-freshenTyCoVars mk_tcv = freshenTyCoVarsX mk_tcv emptyTCvSubst
+                -> [TyVar] -> TcM (Subst, [TyCoVar])
+freshenTyCoVars mk_tcv = freshenTyCoVarsX mk_tcv emptySubst
 
 freshenTyCoVarsX :: (Name -> Kind -> TyCoVar)
-                 -> TCvSubst -> [TyCoVar]
-                 -> TcM (TCvSubst, [TyCoVar])
+                 -> Subst -> [TyCoVar]
+                 -> TcM (Subst, [TyCoVar])
 -- This a complete freshening operation:
 -- the skolems have a fresh unique, and a location from the monad
 -- See Note [Skolemising type variables]
@@ -670,7 +683,7 @@ Then we have to instantiate the kind variables, build a substitution
 from old variables to the new variables, then instantiate the type
 variables substituting the original kind.
 
-Exemple: If we want to instantiate
+Example: If we want to instantiate
   [(k1 :: *), (k2 :: *), (a :: k1 -> k2), (b :: k1)]
 we want
   [(?k1 :: *), (?k2 :: *), (?a :: ?k1 -> ?k2), (?b :: ?k1)]

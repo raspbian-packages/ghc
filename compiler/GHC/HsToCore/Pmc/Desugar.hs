@@ -38,10 +38,11 @@ import GHC.Core.Coercion
 import GHC.Tc.Types.Evidence (HsWrapper(..), isIdHsWrapper)
 import {-# SOURCE #-} GHC.HsToCore.Expr (dsExpr, dsLExpr, dsSyntaxExpr)
 import {-# SOURCE #-} GHC.HsToCore.Binds (dsHsWrapper)
-import GHC.HsToCore.Utils (isTrueLHsExpr, selectMatchVar)
+import GHC.HsToCore.Utils (isTrueLHsExpr, selectMatchVar, decideBangHood)
 import GHC.HsToCore.Match.Literal (dsLit, dsOverLit)
 import GHC.HsToCore.Monad
 import GHC.Core.TyCo.Rep
+import GHC.Core.TyCo.Compare( eqType )
 import GHC.Core.Type
 import GHC.Data.Maybe
 import qualified GHC.LanguageExtensions as LangExt
@@ -119,7 +120,7 @@ desugarPat x pat = case pat of
 
   -- (x@pat)   ==>   Desugar pat with x as match var and handle impedance
   --                 mismatch with incoming match var
-  AsPat _ (L _ y) p -> (mkPmLetVar y x ++) <$> desugarLPat y p
+  AsPat _ (L _ y) _ p -> (mkPmLetVar y x ++) <$> desugarLPat y p
 
   SigPat _ p _ty -> desugarLPat x p
 
@@ -139,7 +140,8 @@ desugarPat x pat = case pat of
         ListPat {}
           | ViewPat arg_ty _lexpr pat <- expansion
           , not (xopt LangExt.RebindableSyntax dflags)
-          , Just _ <- splitListTyConApp_maybe arg_ty
+          , Just tc <- tyConAppTyCon_maybe arg_ty
+          , tc == listTyCon
           -> desugarLPat x pat
 
         _ -> desugarPat x expansion
@@ -247,7 +249,7 @@ desugarPat x pat = case pat of
 -- | 'desugarPat', but also select and return a new match var.
 desugarPatV :: Pat GhcTc -> DsM (Id, [PmGrd])
 desugarPatV pat = do
-  x <- selectMatchVar Many pat
+  x <- selectMatchVar ManyTy pat
   grds <- desugarPat x pat
   pure (x, grds)
 
@@ -332,7 +334,10 @@ desugarMatches vars matches =
 -- Desugar a single match
 desugarMatch :: [Id] -> LMatch GhcTc (LHsExpr GhcTc) -> DsM (PmMatch Pre)
 desugarMatch vars (L match_loc (Match { m_pats = pats, m_grhss = grhss })) = do
-  pats'  <- concat <$> zipWithM desugarLPat vars pats
+  dflags <- getDynFlags
+  -- decideBangHood: See Note [Desugaring -XStrict matches in Pmc]
+  let banged_pats = map (decideBangHood dflags) pats
+  pats'  <- concat <$> zipWithM desugarLPat vars banged_pats
   grhss' <- desugarGRHSs (locA match_loc) (sep (map ppr pats)) grhss
   -- tracePm "desugarMatch" (vcat [ppr pats, ppr pats', ppr grhss'])
   return PmMatch { pm_pats = GrdVec pats', pm_grhss = grhss' }
@@ -487,7 +492,7 @@ abstraction we match against) might be different than that of @pat@. Data
 instances such as @Sing (a :: Bool)@ are a good example of this: If we would
 just drop the coercion, we'd get a type error when matching @pat@ against its
 value abstraction, with the result being that pmIsSatisfiable decides that every
-possible data constructor fitting @pat@ is rejected as uninhabitated, leading to
+possible data constructor fitting @pat@ is rejected as uninhabited, leading to
 a lot of false warnings.
 
 But we can check whether the coercion is a hole or if it is just refl, in
@@ -531,4 +536,30 @@ the whole point.
 The place to store the 'PmLet' guards for @where@ clauses (which are per
 'GRHSs') is as a field of 'PmGRHSs'. For plain @let@ guards as in the guards of
 @x@, we can simply add them to the 'pg_grds' field of 'PmGRHS'.
+
+Note [Desugaring -XStrict matches in Pmc]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Consider (#21761)
+
+  {-# LANGUAGE Strict #-}
+  idV :: Void -> Void
+  idV v = v
+
+Without -XStrict, we would not warn here. But with -XStrict, there is an
+implicit bang on `v` and we should give an inaccessible warning for the RHS.
+The way we account for that is by calling `decideBangHood` on patterns
+in a `Match`, which inserts the implicit bang.
+
+Making the call here actually seems redundant with the call to `decideBangHood`
+in `GHC.HsToCore.Match.matchWrapper`, which does it *after* it calls the
+pattern-match checker on the Match's patterns. It would be great if we could expect
+`matchWrapper` to pass the bang-adorned `Match` to the pattern-match checker,
+but sadly then we get worse warning messages which would print `idV` as if the
+user *had* written a bang:
+
+     Pattern match has inaccessible right hand side
+-    In an equation for ‘idV’: idV v = ...
++    In an equation for ‘idV’: idV !v = ...
+
+So we live with the duplication.
 -}

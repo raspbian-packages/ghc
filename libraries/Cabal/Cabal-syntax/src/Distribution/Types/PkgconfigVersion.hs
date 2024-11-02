@@ -53,7 +53,7 @@ instance Parsec PkgconfigVersion where
         predicate c = isAsciiAlphaNum c || c == '.' || c == '-'
 
 -------------------------------------------------------------------------------
--- rmpvercmp - pure Haskell implementation
+-- rpmvercmp - pure Haskell implementation
 -------------------------------------------------------------------------------
 
 -- | Compare two version strings as @pkg-config@ would compare them.
@@ -115,5 +115,4 @@ isDigit8 w = 0x30 <= w && w <= 0x39
 
 isAlpha8 :: Word8 -> Bool
 isAlpha8 w = (0x41 <= w && w <= 0x5A) || (0x61 <= w && w <= 0x7A)
-
 

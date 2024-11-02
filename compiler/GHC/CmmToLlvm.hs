@@ -11,7 +11,7 @@ module GHC.CmmToLlvm
    )
 where
 
-import GHC.Prelude
+import GHC.Prelude hiding ( head )
 
 import GHC.Llvm
 import GHC.CmmToLlvm.Base
@@ -25,7 +25,6 @@ import GHC.CmmToLlvm.Mangler
 import GHC.StgToCmm.CgUtils ( fixStgRegisters )
 import GHC.Cmm
 import GHC.Cmm.Dataflow.Collections
-import GHC.Cmm.Ppr
 
 import GHC.Utils.BufHandle
 import GHC.Driver.Session
@@ -38,6 +37,7 @@ import GHC.Utils.Logger
 import qualified GHC.Data.Stream as Stream
 
 import Control.Monad ( when, forM_ )
+import Data.List.NonEmpty ( head )
 import Data.Maybe ( fromMaybe, catMaybes )
 import System.IO
 
@@ -69,7 +69,7 @@ llvmCodeGen logger cfg h cmm_stream
            "System LLVM version: " <> text (llvmVersionStr ver) $$
            "We will try though..."
          let isS390X = platformArch (llvmCgPlatform cfg)  == ArchS390X
-         let major_ver = head . llvmVersionList $ ver
+         let major_ver = head . llvmVersionNE $ ver
          when (isS390X && major_ver < 10 && doWarn) $ putMsg logger $
            "Warning: For s390x the GHC calling convention is only supported since LLVM version 10." <+>
            "You are using LLVM version: " <> text (llvmVersionStr ver)
@@ -110,8 +110,8 @@ llvmCodeGen' cfg cmm_stream
     header =
       let target  = llvmCgLlvmTarget cfg
           llvmCfg = llvmCgLlvmConfig cfg
-      in     text ("target datalayout = \"" ++ getDataLayout llvmCfg target ++ "\"")
-         $+$ text ("target triple = \"" ++ target ++ "\"")
+      in     (text "target datalayout = \"" <> text (getDataLayout llvmCfg target) <> text "\"")
+         $+$ (text "target triple = \"" <> text target <> text "\"")
 
     getDataLayout :: LlvmConfig -> String -> String
     getDataLayout config target =

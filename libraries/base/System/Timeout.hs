@@ -17,7 +17,7 @@
 -- TODO: Inspect is still suitable.
 module System.Timeout ( Timeout, timeout ) where
 
-#if !defined(mingw32_HOST_OS)
+#if !defined(mingw32_HOST_OS) && !defined(javascript_HOST_ARCH)
 import Control.Monad
 import GHC.Event           (getSystemTimerManager,
                             registerTimeout, unregisterTimeout)
@@ -58,7 +58,9 @@ instance Exception Timeout where
 -- is available within @n@ microseconds (@1\/10^6@ seconds). In case a result
 -- is available before the timeout expires, @Just a@ is returned. A negative
 -- timeout interval means \"wait indefinitely\". When specifying long timeouts,
--- be careful not to exceed @maxBound :: Int@.
+-- be careful not to exceed @maxBound :: Int@, which on 32-bit machines is only
+-- 2147483647 μs, less than 36 minutes.
+-- Consider using @Control.Concurrent.Timeout.timeout@ from @unbounded-delays@ package.
 --
 -- >>> timeout 1000000 (threadDelay 1000 *> pure "finished on time")
 -- Just "finished on time"
@@ -97,7 +99,7 @@ timeout :: Int -> IO a -> IO (Maybe a)
 timeout n f
     | n <  0    = fmap Just f
     | n == 0    = return Nothing
-#if !defined(mingw32_HOST_OS)
+#if !defined(mingw32_HOST_OS) && !defined(javascript_HOST_ARCH)
     | rtsSupportsBoundThreads = do
         -- In the threaded RTS, we use the Timer Manager to delay the
         -- (fairly expensive) 'forkIO' call until the timeout has expired.

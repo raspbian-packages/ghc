@@ -6,8 +6,6 @@
 --
 -----------------------------------------------------------------------------
 
-{-# OPTIONS_GHC -Wno-incomplete-uni-patterns #-}
-
 module GHC.StgToCmm.Heap (
         getVirtHp, setVirtHp, setRealHp,
         getHpRelOffset,
@@ -161,19 +159,20 @@ hpStore base vals = do
 --              Layout of static closures
 -----------------------------------------------------------
 
--- Make a static closure, adding on any extra padding needed for CAFs,
--- and adding a static link field if necessary.
-
+-- | Make a static closure, adding on any extra padding needed for CAFs, and
+-- adding a static link field if necessary.
 mkStaticClosureFields
         :: Profile
         -> CmmInfoTable
         -> CostCentreStack
         -> CafInfo
-        -> [CmmLit]             -- Payload
+        -> [CmmLit]             -- ^ Payload
+        -> [CmmLit]             -- ^ Extra non-pointers that go to the end of the closure.
+                                -- See Note [unpack_cstring closures] in StgStdThunks.cmm.
         -> [CmmLit]             -- The full closure
-mkStaticClosureFields profile info_tbl ccs caf_refs payload
+mkStaticClosureFields profile info_tbl ccs caf_refs payload extras
   = mkStaticClosure profile info_lbl ccs payload padding
-        static_link_field saved_info_field
+        static_link_field saved_info_field extras
   where
     platform = profilePlatform profile
     info_lbl = cit_lbl info_tbl
@@ -218,14 +217,15 @@ mkStaticClosureFields profile info_tbl ccs caf_refs payload
                                       -- in rts/sm/Storage.h
 
 mkStaticClosure :: Profile -> CLabel -> CostCentreStack -> [CmmLit]
-  -> [CmmLit] -> [CmmLit] -> [CmmLit] -> [CmmLit]
-mkStaticClosure profile info_lbl ccs payload padding static_link_field saved_info_field
+  -> [CmmLit] -> [CmmLit] -> [CmmLit] -> [CmmLit] -> [CmmLit]
+mkStaticClosure profile info_lbl ccs payload padding static_link_field saved_info_field extras
   =  [CmmLabel info_lbl]
   ++ staticProfHdr profile ccs
   ++ payload
   ++ padding
   ++ static_link_field
   ++ saved_info_field
+  ++ extras
 
 -----------------------------------------------------------
 --              Heap overflow checking
@@ -610,10 +610,6 @@ do_checks mb_stk_hwm checkYield mb_alloc_lit do_gc = do
   gc_id       <- newBlockId
 
   let
-    Just alloc_lit = mb_alloc_lit
-
-    bump_hp   = cmmOffsetExprB platform hpExpr alloc_lit
-
     -- Sp overflow if ((old + 0) - CmmHighStack < SpLim)
     -- At the beginning of a function old + 0 = Sp
     -- See Note [Single stack check]
@@ -628,8 +624,6 @@ do_checks mb_stk_hwm checkYield mb_alloc_lit do_gc = do
     -- HpLim points to the LAST WORD of valid allocation space.
     hp_oflo = CmmMachOp (mo_wordUGt platform) [hpExpr, hpLimExpr]
 
-    alloc_n = mkAssign hpAllocReg alloc_lit
-
   case mb_stk_hwm of
     Nothing -> return ()
     Just stk_hwm -> tickyStackCheck
@@ -640,16 +634,18 @@ do_checks mb_stk_hwm checkYield mb_alloc_lit do_gc = do
   -- See Note [Self-recursive loop header].
   self_loop_info <- getSelfLoop
   case self_loop_info of
-    Just (_, loop_header_id, _)
+    Just MkSelfLoopInfo { sli_header_block = loop_header_id }
         | checkYield && isJust mb_stk_hwm -> emitLabel loop_header_id
     _otherwise -> return ()
 
-  if isJust mb_alloc_lit
-    then do
+  case mb_alloc_lit of
+    Just alloc_lit -> do
+     let bump_hp   = cmmOffsetExprB platform hpExpr alloc_lit
+         alloc_n = mkAssign hpAllocReg alloc_lit
      tickyHeapCheck
      emitAssign hpReg bump_hp
      emit =<< mkCmmIfThen' hp_oflo (alloc_n <*> mkBranch gc_id) (Just False)
-    else
+    Nothing ->
       when (checkYield && not omit_yields) $ do
          -- Yielding if HpLim == 0
          let yielding = CmmMachOp (mo_wordEq platform)

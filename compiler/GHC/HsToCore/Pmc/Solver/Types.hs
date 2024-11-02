@@ -57,6 +57,7 @@ import GHC.Core.Type
 import GHC.Core.TyCon
 import GHC.Types.Literal
 import GHC.Core
+import GHC.Core.TyCo.Compare( eqType )
 import GHC.Core.Map.Expr
 import GHC.Core.Utils (exprType)
 import GHC.Builtin.Names
@@ -348,9 +349,9 @@ isDataConSolution _                                             = False
 lookupSolution :: Nabla -> Id -> Maybe PmAltConApp
 lookupSolution nabla x = case vi_pos (lookupVarInfo (nabla_tm_st nabla) x) of
   []                                         -> Nothing
-  pos
+  pos@(x:_)
     | Just sol <- find isDataConSolution pos -> Just sol
-    | otherwise                              -> Just (head pos)
+    | otherwise                              -> Just x
 
 --------------------------------------------------------------------------------
 -- The rest is just providing an IR for (overloaded!) literals and AltCons that
@@ -766,7 +767,7 @@ it's already overloaded.
 
 instance Outputable PmLitValue where
   ppr (PmLitInt i)        = ppr i
-  ppr (PmLitRat r)        = ppr (double (fromRat r)) -- good enough
+  ppr (PmLitRat r)        = double (fromRat r) -- good enough
   ppr (PmLitChar c)       = pprHsChar c
   ppr (PmLitString s)     = pprHsString s
   ppr (PmLitOverInt n i)  = minuses n (ppr i)

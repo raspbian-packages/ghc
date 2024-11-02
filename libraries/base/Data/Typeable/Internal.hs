@@ -182,8 +182,9 @@ rnfTyCon (TyCon _ _ m n _ k) = rnfModule m `seq` rnfTrName n `seq` rnfKindRep k
 *                                                                      *
 ********************************************************************* -}
 
--- | A concrete representation of a (monomorphic) type.
+-- | TypeRep is a concrete representation of a (monomorphic) type.
 -- 'TypeRep' supports reasonably efficient equality.
+-- See Note [Grand plan for Typeable] in GHC.Tc.Instance.Typeable
 type TypeRep :: k -> Type
 data TypeRep a where
     -- The TypeRep of Type. See Note [Kind caching], Wrinkle 2
@@ -214,8 +215,13 @@ data TypeRep a where
                , trAppKind :: !(TypeRep k2) }   -- See Note [Kind caching]
             -> TypeRep (a b)
 
-    -- | @TrFun fpr m a b@ represents a function type @a # m -> b@. We use this for
+    -- | @TrFun fpr m a b@ represents a function type @a % m -> b@. We use this for
     -- the sake of efficiency as functions are quite ubiquitous.
+    -- A TrFun can represent `t1 -> t2` or `t1 -= t2`; but not  (a => b) or (a ==> b).
+    -- See Note [No Typeable for polytypes or qualified types] in GHC.Tc.Instance.Class
+    -- and Note [Function type constructors and FunTy] in GHC.Builtin.Types.Prim
+    -- We do not represent the function TyCon (i.e. (->) vs (-=>)) explicitly;
+    -- instead, the TyCon is implicit in the kinds of the arguments.
     TrFun   :: forall (m :: Multiplicity) (r1 :: RuntimeRep) (r2 :: RuntimeRep)
                       (a :: TYPE r1) (b :: TYPE r2).
                { -- See Note [TypeRep fingerprints]
@@ -830,6 +836,8 @@ instance Show (TypeRep (a :: k)) where
 showTypeable :: Int -> TypeRep (a :: k) -> ShowS
 showTypeable _ TrType = showChar '*'
 showTypeable _ rep
+  | isListTyCon tc, [] <- tys =
+    showString "[]"
   | isListTyCon tc, [ty] <- tys =
     showChar '[' . shows ty . showChar ']'
 

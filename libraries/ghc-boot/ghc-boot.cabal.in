@@ -28,7 +28,7 @@ build-type:     Custom
 extra-source-files: changelog.md
 
 custom-setup
-    setup-depends: base >= 3 && < 5, Cabal >= 1.6 && <3.9, directory, filepath
+    setup-depends: base >= 3 && < 5, Cabal >= 1.6 && <3.10, directory, filepath
 
 source-repository head
     type:     git
@@ -45,6 +45,7 @@ Library
             GHC.Data.ShortText
             GHC.Data.SizedSeq
             GHC.Utils.Encoding
+            GHC.Utils.Encoding.UTF8
             GHC.LanguageExtensions
             GHC.Unit.Database
             GHC.Serialized
@@ -69,7 +70,7 @@ Library
             GHC.Version
             GHC.Platform.Host
 
-    build-depends: base       >= 4.7 && < 4.18,
+    build-depends: base       >= 4.7 && < 4.19,
                    binary     == 0.8.*,
                    bytestring >= 0.10 && < 0.12,
                    containers >= 0.5 && < 0.7,
@@ -79,4 +80,4 @@ Library
                    ghc-boot-th == @ProjectVersionMunged@
     if !os(windows)
         build-depends:
-                   unix       >= 2.7 && < 2.8
+                   unix       >= 2.7 && < 2.9

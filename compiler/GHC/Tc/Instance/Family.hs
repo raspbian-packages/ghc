@@ -364,7 +364,7 @@ checkFamInstConsistency directlyImpMods
         -- We could, but doing so means one of two things:
         --
         --   1. When looping over the cartesian product we convert
-        --   a set into a non-deterministicly ordered list. Which
+        --   a set into a non-deterministically ordered list. Which
         --   happens to be fine for interface file determinism
         --   in this case, today, because the order only
         --   determines the order of deferred checks. But such
@@ -519,16 +519,16 @@ tcLookupDataFamInst_maybe fam_inst_envs tc tc_args
   = Nothing
 
 -- | 'tcTopNormaliseNewTypeTF_maybe' gets rid of top-level newtypes,
--- potentially looking through newtype /instances/.
+-- potentially looking through newtype /instances/ and type synonyms.
 --
 -- It is only used by the type inference engine (specifically, when
 -- solving representational equality), and hence it is careful to unwrap
 -- only if the relevant data constructor is in scope.  That's why
 -- it gets a GlobalRdrEnv argument.
 --
--- It is careful not to unwrap data/newtype instances if it can't
--- continue unwrapping.  Such care is necessary for proper error
--- messages.
+-- It is careful not to unwrap data/newtype instances nor synonyms
+-- if it can't continue unwrapping.  Such care is necessary for proper
+-- error messages.
 --
 -- It does not look through type families.
 -- It does not normalise arguments to a tycon.
@@ -558,8 +558,7 @@ tcTopNormaliseNewTypeTF_maybe faminsts rdr_env ty
     -- which would lead to terrible error messages
     unwrap_newtype_instance rec_nts tc tys
       | Just (tc', tys', co) <- tcLookupDataFamInst_maybe faminsts tc tys
-      = mapStepResult (\(gres, co1) -> (gres, co `mkTransCo` co1)) $
-        unwrap_newtype rec_nts tc' tys'
+      = fmap (mkTransCo co) <$> unwrap_newtype rec_nts tc' tys'
       | otherwise = NS_Done
 
     unwrap_newtype rec_nts tc tys
@@ -567,8 +566,7 @@ tcTopNormaliseNewTypeTF_maybe faminsts rdr_env ty
       , Just gre <- lookupGRE_Name rdr_env (dataConName con)
            -- This is where we check that the
            -- data constructor is in scope
-      = mapStepResult (\co -> (unitBag gre, co)) $
-        unwrapNewTypeStepper rec_nts tc tys
+      = (,) (unitBag gre) <$> unwrapNewTypeStepper rec_nts tc tys
 
       | otherwise
       = NS_Done

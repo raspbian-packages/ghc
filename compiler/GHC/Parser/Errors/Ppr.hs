@@ -3,6 +3,10 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE DataKinds #-}
+{-# LANGUAGE PolyKinds #-}
+{-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE TypeFamilies #-}
 
 {-# OPTIONS_GHC -fno-warn-orphans #-} -- instance Diagnostic PsMessage
 
@@ -18,6 +22,7 @@ import GHC.Types.Hint
 import GHC.Types.Error
 import GHC.Types.Hint.Ppr (perhapsAsPat)
 import GHC.Types.SrcLoc
+import GHC.Types.Error.Codes ( constructorCode )
 import GHC.Types.Name.Reader ( opIsAt, rdrNameOcc, mkUnqual )
 import GHC.Types.Name.Occurrence (isSymOcc, occNameFS, varName)
 import GHC.Utils.Outputable
@@ -26,16 +31,18 @@ import GHC.Data.FastString
 import GHC.Data.Maybe (catMaybes)
 import GHC.Hs.Expr (prependQualified, HsExpr(..), LamCaseVariant(..), lamCaseKeyword)
 import GHC.Hs.Type (pprLHsContext)
-import GHC.Builtin.Names (allNameStrings)
+import GHC.Builtin.Names (allNameStringList)
 import GHC.Builtin.Types (filterCTuple)
 import qualified GHC.LanguageExtensions as LangExt
 import Data.List.NonEmpty (NonEmpty((:|)))
 
 
 instance Diagnostic PsMessage where
-  diagnosticMessage = \case
-    PsUnknownMessage m
-      -> diagnosticMessage m
+  type DiagnosticOpts PsMessage = NoDiagnosticOpts
+  defaultDiagnosticOpts = NoDiagnosticOpts
+  diagnosticMessage _ = \case
+    PsUnknownMessage (UnknownDiagnostic @e m)
+      -> diagnosticMessage (defaultDiagnosticOpts @e) m
 
     PsHeaderMessage m
       -> psHeaderMessageDiagnostic m
@@ -70,20 +77,20 @@ instance Diagnostic PsMessage where
     PsWarnTransitionalLayout reason
       -> mkSimpleDecorated $
             text "transitional layout will not be accepted in the future:"
-            $$ text (case reason of
-               TransLayout_Where -> "`where' clause at the same depth as implicit layout block"
-               TransLayout_Pipe  -> "`|' at the same depth as implicit layout block"
+            $$ (case reason of
+               TransLayout_Where -> text "`where' clause at the same depth as implicit layout block"
+               TransLayout_Pipe  -> text "`|' at the same depth as implicit layout block"
             )
     PsWarnOperatorWhitespaceExtConflict sym
       -> let mk_prefix_msg extension_name syntax_meaning =
                   text "The prefix use of a" <+> quotes (pprOperatorWhitespaceSymbol sym)
-                    <+> text "would denote" <+> text syntax_meaning
-               $$ nest 2 (text "were the" <+> text extension_name <+> text "extension enabled.")
+                    <+> text "would denote" <+> syntax_meaning
+               $$ nest 2 (text "were the" <+> extension_name <+> text "extension enabled.")
          in mkSimpleDecorated $
          case sym of
-           OperatorWhitespaceSymbol_PrefixPercent -> mk_prefix_msg "LinearTypes" "a multiplicity annotation"
-           OperatorWhitespaceSymbol_PrefixDollar -> mk_prefix_msg "TemplateHaskell" "an untyped splice"
-           OperatorWhitespaceSymbol_PrefixDollarDollar -> mk_prefix_msg "TemplateHaskell" "a typed splice"
+           OperatorWhitespaceSymbol_PrefixPercent -> mk_prefix_msg (text "LinearTypes") (text "a multiplicity annotation")
+           OperatorWhitespaceSymbol_PrefixDollar -> mk_prefix_msg (text "TemplateHaskell") (text "an untyped splice")
+           OperatorWhitespaceSymbol_PrefixDollarDollar -> mk_prefix_msg (text "TemplateHaskell") (text "a typed splice")
     PsWarnOperatorWhitespace sym occ_type
       -> let mk_msg occ_type_str =
                   text "The" <+> text occ_type_str <+> text "use of a" <+> quotes (ftext sym)
@@ -105,8 +112,9 @@ instance Diagnostic PsMessage where
              <+> quotes (text "Data.Kind.Type")
           $$ text "relies on the StarIsType extension, which will become"
           $$ text "deprecated in the future."
-    PsWarnUnrecognisedPragma
+    PsWarnUnrecognisedPragma prag _
       -> mkSimpleDecorated $ text "Unrecognised pragma"
+                          <> if null prag then empty else text ":" <+> text prag
     PsWarnMisplacedPragma prag
       -> mkSimpleDecorated $ text "Misplaced" <+> pprFileHeaderPragmaType prag <+> text "pragma"
     PsWarnImportPreQualified
@@ -116,21 +124,21 @@ instance Diagnostic PsMessage where
 
     PsErrLexer err kind
       -> mkSimpleDecorated $ hcat
-           [ text $ case err of
-              LexError               -> "lexical error"
-              LexUnknownPragma       -> "unknown pragma"
-              LexErrorInPragma       -> "lexical error in pragma"
-              LexNumEscapeRange      -> "numeric escape sequence out of range"
-              LexStringCharLit       -> "lexical error in string/character literal"
-              LexStringCharLitEOF    -> "unexpected end-of-file in string/character literal"
-              LexUnterminatedComment -> "unterminated `{-'"
-              LexUnterminatedOptions -> "unterminated OPTIONS pragma"
-              LexUnterminatedQQ      -> "unterminated quasiquotation"
+           [ case err of
+              LexError               -> text "lexical error"
+              LexUnknownPragma       -> text "unknown pragma"
+              LexErrorInPragma       -> text "lexical error in pragma"
+              LexNumEscapeRange      -> text "numeric escape sequence out of range"
+              LexStringCharLit       -> text "lexical error in string/character literal"
+              LexStringCharLitEOF    -> text "unexpected end-of-file in string/character literal"
+              LexUnterminatedComment -> text "unterminated `{-'"
+              LexUnterminatedOptions -> text "unterminated OPTIONS pragma"
+              LexUnterminatedQQ      -> text "unterminated quasiquotation"
 
-           , text $ case kind of
-              LexErrKind_EOF    -> " at end of input"
-              LexErrKind_UTF8   -> " (UTF-8 decoding error)"
-              LexErrKind_Char c -> " at character " ++ show c
+           , case kind of
+              LexErrKind_EOF    -> text " at end of input"
+              LexErrKind_UTF8   -> text " (UTF-8 decoding error)"
+              LexErrKind_Char c -> text $ " at character " ++ show c
            ]
     PsErrParse token _details
       | null token
@@ -445,7 +453,7 @@ instance Diagnostic PsMessage where
                  PEIP_NegApp -> text "-" <> ppr s
                  PEIP_TypeArgs peipd_tyargs
                    | not (null peipd_tyargs) -> ppr s <+> vcat [
-                               hsep [text "@" <> ppr t | t <- peipd_tyargs]
+                               hsep (map ppr peipd_tyargs)
                              , text "Type applications in patterns are only allowed on data constructors."
                              ]
                    | otherwise -> ppr s
@@ -478,7 +486,7 @@ instance Diagnostic PsMessage where
                  , nest 2
                    (what
                     <+> tc'
-                    <+> hsep (map text (takeList tparms allNameStrings))
+                    <+> hsep (map text (takeList tparms allNameStringList))
                     <+> equals_or_where) ] ]
            where
              -- Avoid printing a constraint tuple in the error message. Print
@@ -499,7 +507,23 @@ instance Diagnostic PsMessage where
             ]
     PsErrInvalidCApiImport {} -> mkSimpleDecorated $ vcat [ text "Wrapper stubs can't be used with CApiFFI."]
 
-  diagnosticReason  = \case
+    PsErrMultipleConForNewtype tycon n -> mkSimpleDecorated $ vcat
+      [ sep
+          [ text "A newtype must have exactly one constructor,"
+          , nest 2 $ text "but" <+> quotes (ppr tycon) <+> text "has" <+> speakN n ]
+      , text "In the newtype declaration for" <+> quotes (ppr tycon) ]
+
+    PsErrUnicodeCharLooksLike bad_char looks_like_char looks_like_char_name
+      -> mkSimpleDecorated $
+           hsep [ text "Unicode character"
+                -- purposefully not using `quotes (text [bad_char])`, because the quotes function adds smart quotes,
+                -- and smart quotes may be the topic of this error message
+                , text "'" <> text [bad_char] <> text "' (" <> text (show bad_char) <> text ")"
+                , text "looks like"
+                , text "'" <> text [looks_like_char] <> text "' (" <> text looks_like_char_name <> text ")" <> comma
+                , text "but it is not" ]
+
+  diagnosticReason = \case
     PsUnknownMessage m                            -> diagnosticReason m
     PsHeaderMessage  m                            -> psHeaderMessageReason m
     PsWarnBidirectionalFormatChars{}              -> WarningWithFlag Opt_WarnUnicodeBidirectionalFormatCharacters
@@ -511,7 +535,7 @@ instance Diagnostic PsMessage where
     PsWarnHaddockIgnoreMulti                      -> WarningWithFlag Opt_WarnInvalidHaddock
     PsWarnStarBinder                              -> WarningWithFlag Opt_WarnStarBinder
     PsWarnStarIsType                              -> WarningWithFlag Opt_WarnStarIsType
-    PsWarnUnrecognisedPragma                      -> WarningWithFlag Opt_WarnUnrecognisedPragmas
+    PsWarnUnrecognisedPragma{}                    -> WarningWithFlag Opt_WarnUnrecognisedPragmas
     PsWarnMisplacedPragma{}                       -> WarningWithFlag Opt_WarnMisplacedPragmas
     PsWarnImportPreQualified                      -> WarningWithFlag Opt_WarnPrepositiveQualifiedModule
     PsErrLexer{}                                  -> ErrorWithoutFlag
@@ -615,8 +639,10 @@ instance Diagnostic PsMessage where
     PsErrParseRightOpSectionInPat{}               -> ErrorWithoutFlag
     PsErrIllegalGadtRecordMultiplicity{}          -> ErrorWithoutFlag
     PsErrInvalidCApiImport {}                     -> ErrorWithoutFlag
+    PsErrMultipleConForNewtype {}                 -> ErrorWithoutFlag
+    PsErrUnicodeCharLooksLike{}                   -> ErrorWithoutFlag
 
-  diagnosticHints  = \case
+  diagnosticHints = \case
     PsUnknownMessage m                            -> diagnosticHints m
     PsHeaderMessage  m                            -> psHeaderMessageHints m
     PsWarnBidirectionalFormatChars{}              -> noHints
@@ -628,7 +654,12 @@ instance Diagnostic PsMessage where
     PsWarnHaddockIgnoreMulti                      -> noHints
     PsWarnStarBinder                              -> [SuggestQualifyStarOperator]
     PsWarnStarIsType                              -> [SuggestUseTypeFromDataKind Nothing]
-    PsWarnUnrecognisedPragma                      -> noHints
+    PsWarnUnrecognisedPragma ""  _                -> noHints
+    PsWarnUnrecognisedPragma p   avail            ->
+      let suggestions = fuzzyMatch p avail
+       in if null suggestions
+          then noHints
+          else [SuggestCorrectPragmaName suggestions]
     PsWarnMisplacedPragma{}                       -> [SuggestPlacePragmaInHeader]
     PsWarnImportPreQualified                      -> [ SuggestQualifiedAfterModuleName
                                                      , suggestExtension LangExt.ImportQualifiedPost]
@@ -779,6 +810,10 @@ instance Diagnostic PsMessage where
     PsErrInvalidPackageName{}                     -> noHints
     PsErrIllegalGadtRecordMultiplicity{}          -> noHints
     PsErrInvalidCApiImport {}                     -> noHints
+    PsErrMultipleConForNewtype {}                 -> noHints
+    PsErrUnicodeCharLooksLike{}                   -> noHints
+
+  diagnosticCode = constructorCode
 
 psHeaderMessageDiagnostic :: PsHeaderMessage -> DecoratedSDoc
 psHeaderMessageDiagnostic = \case

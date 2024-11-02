@@ -4,6 +4,7 @@ module Oracles.Flag (
     Flag (..), flag, getFlag,
     platformSupportsSharedLibs,
     platformSupportsGhciObjects,
+    targetSupportsThreadedRts,
     targetSupportsSMP,
     useLibffiForAdjustors,
     arSupportsDashL,
@@ -28,12 +29,18 @@ data Flag = ArSupportsAtFile
           | GmpFrameworkPref
           | LeadingUnderscore
           | SolarisBrokenShld
-          | WithLibdw
-          | WithLibnuma
           | UseSystemFfi
           | BootstrapThreadedRts
           | BootstrapEventLoggingRts
           | UseLibffiForAdjustors
+          | UseLibdw
+          | UseLibnuma
+          | UseLibm
+          | UseLibrt
+          | UseLibdl
+          | UseLibbfd
+          | UseLibpthread
+          | NeedLibatomic
 
 -- Note, if a flag is set to empty string we treat it as set to NO. This seems
 -- fragile, but some flags do behave like this.
@@ -52,12 +59,18 @@ flag f = do
             GmpFrameworkPref     -> "gmp-framework-preferred"
             LeadingUnderscore    -> "leading-underscore"
             SolarisBrokenShld    -> "solaris-broken-shld"
-            WithLibdw            -> "with-libdw"
-            WithLibnuma          -> "with-libnuma"
             UseSystemFfi         -> "use-system-ffi"
             BootstrapThreadedRts -> "bootstrap-threaded-rts"
             BootstrapEventLoggingRts -> "bootstrap-event-logging-rts"
             UseLibffiForAdjustors -> "use-libffi-for-adjustors"
+            UseLibdw             -> "use-lib-dw"
+            UseLibnuma           -> "use-lib-numa"
+            UseLibm              -> "use-lib-m"
+            UseLibrt             -> "use-lib-rt"
+            UseLibdl             -> "use-lib-dl"
+            UseLibbfd            -> "use-lib-bfd"
+            UseLibpthread        -> "use-lib-pthread"
+            NeedLibatomic        -> "need-libatomic"
     value <- lookupSystemConfig key
     when (value `notElem` ["YES", "NO", ""]) . error $ "Configuration flag "
         ++ quote (key ++ " = " ++ value) ++ " cannot be parsed."
@@ -84,12 +97,20 @@ arSupportsAtFile _           = flag ArSupportsAtFile
 platformSupportsSharedLibs :: Action Bool
 platformSupportsSharedLibs = do
     windows       <- isWinTarget
+    wasm          <- anyTargetArch [ "wasm32" ]
     ppc_linux     <- anyTargetPlatform [ "powerpc-unknown-linux" ]
     solaris       <- anyTargetPlatform [ "i386-unknown-solaris2" ]
+    javascript    <- anyTargetArch     [ "javascript" ]
     solarisBroken <- flag SolarisBrokenShld
-    return $ not (windows || ppc_linux || solaris && solarisBroken)
+    return $ not (windows || wasm || javascript || ppc_linux || solaris && solarisBroken)
 
--- | Does the target support the threaded runtime system?
+-- | Does the target support threaded RTS?
+targetSupportsThreadedRts :: Action Bool
+targetSupportsThreadedRts = do
+    bad_arch <- anyTargetArch [ "wasm32", "javascript" ]
+    return $ not bad_arch
+
+-- | Does the target support the -N RTS flag?
 targetSupportsSMP :: Action Bool
 targetSupportsSMP = do
   unreg <- flag GhcUnregisterised
@@ -102,7 +123,8 @@ targetSupportsSMP = do
                             , "arm"
                             , "aarch64"
                             , "s390x"
-                            , "riscv64"]
+                            , "riscv64"
+                            , "loongarch64"]
   if   -- The THREADED_RTS requires `BaseReg` to be in a register and the
        -- Unregisterised mode doesn't allow that.
      | unreg                -> return False

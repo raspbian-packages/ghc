@@ -15,6 +15,10 @@ import Rules.Register
 import Settings
 import Target
 import Utilities
+import Data.Time.Clock
+import Rules.Generate (generatedDependencies)
+import Oracles.Flag
+
 
 -- * Library 'Rules'
 
@@ -25,6 +29,7 @@ libraryRules = do
     root -/- "**/libHS*-*.so"          %> buildDynamicLib root "so"
     root -/- "**/libHS*-*.dll"         %> buildDynamicLib root "dll"
     root -/- "**/*.a"                  %> buildStaticLib  root
+    root -/- "**/stamp-*"              %> buildPackage root
     priority 2 $ do
         root -/- "stage*/lib/**/libHS*-*.dylib" %> registerDynamicLib root "dylib"
         root -/- "stage*/lib/**/libHS*-*.so"    %> registerDynamicLib root "so"
@@ -40,13 +45,12 @@ libraryRules = do
 registerStaticLib :: FilePath -> FilePath -> Action ()
 registerStaticLib root archivePath = do
     -- Simply need the ghc-pkg database .conf file.
-    GhcPkgPath _ stage _ (LibA name version _)
+    GhcPkgPath _ stage _ (LibA name _ w)
         <- parsePath (parseGhcPkgLibA root)
                     "<.a library (register) path parser>"
                     archivePath
-    need [ root -/- relativePackageDbPath stage
-                -/- (pkgId name version) ++ ".conf"
-         ]
+    let ctx = Context stage (unsafeFindPackageByName name) w Final
+    need . (:[]) =<< pkgConfFile ctx
 
 -- | Build a static library ('LibA') under the given build root, whose path is
 -- the second argument.
@@ -71,13 +75,12 @@ buildStaticLib root archivePath = do
 registerDynamicLib :: FilePath -> String -> FilePath -> Action ()
 registerDynamicLib root suffix dynlibpath = do
     -- Simply need the ghc-pkg database .conf file.
-    (GhcPkgPath _ stage _ (LibDyn name version _ _))
+    (GhcPkgPath _ stage _ (LibDyn name _ w _))
         <- parsePath (parseGhcPkgLibDyn root suffix)
                             "<dyn register lib parser>"
                             dynlibpath
-    need [ root -/- relativePackageDbPath stage
-                -/- pkgId name version ++ ".conf"
-         ]
+    let ctx = Context stage (unsafeFindPackageByName name) w Final
+    need . (:[]) =<< pkgConfFile ctx
 
 -- | Build a dynamic library ('LibDyn') under the given build root, with the
 -- given suffix (@.so@ or @.dylib@, @.dll@), where the complete path of the
@@ -105,6 +108,56 @@ buildGhciLibO root ghcilibPath = do
     need objs
     build $ target context (MergeObjects stage) objs [ghcilibPath]
 
+
+{-
+Note [Stamp Files]
+~~~~~~~~~~~~~~~~~~
+
+A package stamp file exists to communicate that all the objects for a certain
+package are built.
+
+If you need a stamp file, then it needs all the library dependencies
+
+The format for a stamp file is defined in `pkgStampFile`. The stamp file is named
+"stamp-<way>" so if you want to build base in dynamic way then need `_build/stage1/libraries/base/stamp-dyn`
+
+By using stamp files you can easily say you want to build a library in a certain
+way by needing the stamp file for that context.
+
+Before these stamp files existed the way to declare that all objects in a certain way
+were build was by needing the .conf file for the package. Stamp files decouple this
+decision from creating the .conf file which does extra stuff such as linking, copying
+files etc.
+
+-}
+
+
+buildPackage :: FilePath -> FilePath -> Action ()
+buildPackage root fp = do
+  l@(BuildPath _ _ _ (PkgStamp _ _ way)) <- parsePath (parseStampPath root) "<.stamp parser>" fp
+  let ctx = stampContext l
+  srcs <- hsSources ctx
+  gens <- interpretInContext ctx generatedDependencies
+
+  lib_targets <- libraryTargets True ctx
+
+  need (srcs ++ gens ++ lib_targets)
+
+  -- Write the current time into the file so the file always changes if
+  -- we restamp it because a dependency changes.
+  time <- liftIO $ getCurrentTime
+  liftIO $ writeFile fp (show time)
+  ways <- interpretInContext ctx getLibraryWays
+  let hasVanilla = elem vanilla ways
+      hasDynamic = elem dynamic ways
+  support <- platformSupportsSharedLibs
+  when ((hasVanilla && hasDynamic) &&
+        support && way == vanilla) $ do
+    stamp <- (pkgStampFile (ctx { way = dynamic }))
+    liftIO $ writeFile stamp (show time)
+
+
+
 -- * Helpers
 
 -- | Return all Haskell and non-Haskell object files for the given 'Context'.
@@ -119,10 +172,11 @@ nonHsObjects context = do
     asmObjs <- mapM (objectPath context) asmSrcs
     cObjs   <- cObjects context
     cxxObjs <- cxxObjects context
+    jsObjs  <- jsObjects context
     cmmSrcs <- interpretInContext context (getContextData cmmSrcs)
     cmmObjs <- mapM (objectPath context) cmmSrcs
     eObjs   <- extraObjects context
-    return $ asmObjs ++ cObjs ++ cxxObjs ++ cmmObjs ++ eObjs
+    return $ asmObjs ++ cObjs ++ cxxObjs ++ cmmObjs ++ jsObjs ++ eObjs
 
 -- | Return all the Cxx object files needed to build the given library context.
 cxxObjects :: Context -> Action [FilePath]
@@ -138,6 +192,12 @@ cObjects context = do
     return $ if Threaded `wayUnit` way context
         then objs
         else filter ((`notElem` ["Evac_thr", "Scav_thr"]) . takeBaseName) objs
+
+-- | Return all the JS object files to be included in the library.
+jsObjects :: Context -> Action [FilePath]
+jsObjects context = do
+  srcs <- interpretInContext context (getContextData jsSrcs)
+  mapM (objectPath context) srcs
 
 -- | Return extra object files needed to build the given library context. The
 -- resulting list is currently non-empty only when the package from the
@@ -181,23 +241,39 @@ data LibGhci = LibGhci String [Integer] Way deriving (Eq, Show)
 -- | Get the 'Context' corresponding to the build path for a given static library.
 libAContext :: BuildPath LibA -> Context
 libAContext (BuildPath _ stage pkgpath (LibA pkgname _ way)) =
-    Context stage pkg way
+    Context stage pkg way Final
   where
     pkg = library pkgname pkgpath
 
 -- | Get the 'Context' corresponding to the build path for a given GHCi library.
 libGhciContext :: BuildPath LibGhci -> Context
 libGhciContext (BuildPath _ stage pkgpath (LibGhci pkgname _ way)) =
-    Context stage pkg way
+    Context stage pkg way Final
   where
     pkg = library pkgname pkgpath
 
 -- | Get the 'Context' corresponding to the build path for a given dynamic library.
 libDynContext :: BuildPath LibDyn -> Context
 libDynContext (BuildPath _ stage pkgpath (LibDyn pkgname _ way _)) =
-    Context stage pkg way
+    Context stage pkg way Final
   where
     pkg = library pkgname pkgpath
+
+-- | Get the 'Context' corresponding to the build path for a given static library.
+stampContext :: BuildPath PkgStamp -> Context
+stampContext (BuildPath _ stage _ (PkgStamp pkgname _ way)) =
+    Context stage pkg way Final
+  where
+    pkg = unsafeFindPackageByName pkgname
+
+data PkgStamp = PkgStamp String [Integer] Way deriving (Eq, Show)
+
+
+-- | Parse a path to a ghci library to be built, making sure the path starts
+-- with the given build root.
+parseStampPath :: FilePath -> Parsec.Parsec String () (BuildPath PkgStamp)
+parseStampPath root = parseBuildPath root parseStamp
+
 
 -- | Parse a path to a registered ghc-pkg static library to be built, making
 -- sure the path starts with the given build root.
@@ -262,6 +338,9 @@ parseLibDynFilename ext = do
     _ <- Parsec.string ("." ++ ext)
     return (LibDyn pkgname pkgver way $ if ext == "so" then So else Dylib)
 
--- | Get the package identifier given the package name and version.
-pkgId :: String -> [Integer] -> String
-pkgId name version = name ++ "-" ++ intercalate "." (map show version)
+parseStamp :: Parsec.Parsec String () PkgStamp
+parseStamp = do
+    _ <- Parsec.string "stamp-"
+    (pkgname, pkgver) <- parsePkgId
+    way <- parseWaySuffix vanilla
+    return (PkgStamp pkgname pkgver way)

@@ -1,7 +1,7 @@
 {-# OPTIONS_GHC -fno-warn-unused-binds -fno-warn-missing-signatures #-}
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE MagicHash #-}
-{-# LINE 13 "_build/source-dist/ghc-9.4.7-src/ghc-9.4.7/compiler/GHC/Cmm/Lexer.x" #-}
+{-# LINE 13 "_build/source-dist/ghc-9.6.6-src/ghc-9.6.6/compiler/GHC/Cmm/Lexer.x" #-}
 module GHC.Cmm.Lexer (
    CmmToken(..), cmmlex,
   ) where
@@ -385,7 +385,7 @@ alex_actions = array (0 :: Int, 138)
   , (0,alex_action_20)
   ]
 
-{-# LINE 133 "_build/source-dist/ghc-9.4.7-src/ghc-9.4.7/compiler/GHC/Cmm/Lexer.x" #-}
+{-# LINE 133 "_build/source-dist/ghc-9.6.6-src/ghc-9.6.6/compiler/GHC/Cmm/Lexer.x" #-}
 data CmmToken
   = CmmT_SpecChar  Char
   | CmmT_DotDot

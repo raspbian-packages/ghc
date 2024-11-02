@@ -1,19 +1,24 @@
 cabal-version:  3.0
 name:           base
-version:        4.17.2.0
+version:        4.18.2.1
 -- NOTE: Don't forget to update ./changelog.md
 
 license:        BSD-3-Clause
 license-file:   LICENSE
-maintainer:     libraries@haskell.org
-bug-reports:    https://gitlab.haskell.org/ghc/ghc/issues/new
-synopsis:       Basic libraries
+maintainer:     Core Libraries Committee <core-libraries-committee@haskell.org>
+bug-reports:    https://github.com/haskell/core-libraries-committee/issues
+synopsis:       Core data structures and operations
 category:       Prelude
 build-type:     Configure
-description:
-    This package contains the Standard Haskell "Prelude" and its support libraries,
-    and a large collection of useful libraries ranging from data
-    structures to parsing combinators and debugging utilities.
+description:    Haskell's base library provides, among other things, core types (e.g. [Bool]("Data.Bool") and [Int]("Data.Int")),
+                data structures (e.g. [List]("Data.List"), [Tuple]("Data.Tuple") and [Maybe]("Data.Maybe")),
+                the [Exception]("Control.Exception") mechanism, and the [IO]("System.IO") & [Concurrency]("Control.Concurrent") operations.
+                The "Prelude" module, which is imported by default, exposes a curated set of types and functions from other modules.
+
+                Other data structures like [Map](https://hackage.haskell.org/package/containers/docs/Data-Map.html),
+                [Set](https://hackage.haskell.org/package/containers/docs/Data-Set.html) are available in the [containers](https://hackage.haskell.org/package/containers) library.
+                To work with textual data, use the [text](https://hackage.haskell.org/package/text/docs/Data-Text.html) library.
+
 
 extra-tmp-files:
     autom4te.cache
@@ -86,7 +91,7 @@ Library
 
     build-depends:
         rts == 1.0.*,
-        ghc-prim >= 0.5.1.0 && < 0.10,
+        ghc-prim >= 0.5.1.0 && < 0.11,
         ghc-bignum >= 1.0 && < 2.0
 
     exposed-modules:
@@ -115,6 +120,7 @@ Library
         Control.Monad.Zip
         Data.Array.Byte
         Data.Bifoldable
+        Data.Bifoldable1
         Data.Bifunctor
         Data.Bitraversable
         Data.Bits
@@ -128,6 +134,7 @@ Library
         Data.Eq
         Data.Fixed
         Data.Foldable
+        Data.Foldable1
         Data.Function
         Data.Functor
         Data.Functor.Classes
@@ -167,6 +174,7 @@ Library
         Debug.Trace
         Foreign
         Foreign.C
+        Foreign.C.ConstPtr
         Foreign.C.Error
         Foreign.C.String
         Foreign.C.Types
@@ -200,6 +208,7 @@ Library
         GHC.ConsoleHandler
         GHC.Constants
         GHC.Desugar
+        GHC.Encoding.UTF8
         GHC.Enum
         GHC.Environment
         GHC.Err
@@ -219,6 +228,7 @@ Library
         GHC.GHCi
         GHC.GHCi.Helpers
         GHC.Generics
+        GHC.InfoProv
         GHC.IO
         GHC.IO.Buffer
         GHC.IO.BufferedIO
@@ -286,6 +296,7 @@ Library
         GHC.TypeNats.Internal
         GHC.Unicode
         GHC.Weak
+        GHC.Weak.Finalize
         GHC.Word
         Numeric
         Numeric.Natural
@@ -346,31 +357,45 @@ Library
         GHC.Event.PSQ
         GHC.Event.Unique
         -- GHC.IOPort -- TODO: hide again after debug
+        GHC.Unicode.Internal.Bits
+        GHC.Unicode.Internal.Char.DerivedCoreProperties
+        GHC.Unicode.Internal.Char.UnicodeData.GeneralCategory
+        GHC.Unicode.Internal.Char.UnicodeData.SimpleLowerCaseMapping
+        GHC.Unicode.Internal.Char.UnicodeData.SimpleTitleCaseMapping
+        GHC.Unicode.Internal.Char.UnicodeData.SimpleUpperCaseMapping
+        GHC.Unicode.Internal.Version
         System.Environment.ExecutablePath
         System.CPUTime.Utils
 
-    c-sources:
-        cbits/DarwinUtils.c
-        cbits/PrelIOUtils.c
-        cbits/SetEnv.c
-        cbits/WCsubst.c
-        cbits/iconv.c
-        cbits/inputReady.c
-        cbits/md5.c
-        cbits/primFloat.c
-        cbits/sysconf.c
-        cbits/fs.c
+    if !arch(javascript)
+      c-sources:
+          cbits/DarwinUtils.c
+          cbits/PrelIOUtils.c
+          cbits/SetEnv.c
+          cbits/iconv.c
+          cbits/inputReady.c
+          cbits/md5.c
+          cbits/primFloat.c
+          cbits/sysconf.c
+          cbits/fs.c
 
-    cmm-sources:
-        cbits/CastFloatWord.cmm
-        cbits/StackCloningDecoding.cmm
+      cmm-sources:
+          cbits/CastFloatWord.cmm
+          cbits/StackCloningDecoding.cmm
+
+    if arch(javascript)
+      js-sources:
+          -- "platform" must be linked first because it defines global constants
+          -- (e.g. h$isNode)
+          jsbits/platform.js
+          jsbits/base.js
+          jsbits/errno.js
 
     include-dirs: include
     includes:
         HsBase.h
     install-includes:
         HsBase.h
-        WCsubst.h
         consUtils.h
 
     -- OS Specific
@@ -441,11 +466,21 @@ Library
             System.CPUTime.Posix.RUsage
             System.CPUTime.Unsupported
 
+        if arch(javascript)
+          other-modules:
+            System.CPUTime.Javascript
+
     -- The Ports framework always passes this flag when building software that
     -- uses iconv to make iconv from Ports compatible with iconv from the base system
     -- See /usr/ports/Mk/Uses/iconv.mk
     if os(freebsd)
         cc-options: -DLIBICONV_PLUG
+
+    if arch(javascript)
+        exposed-modules:
+            GHC.JS.Prim
+            GHC.JS.Prim.Internal
+            GHC.JS.Prim.Internal.Build
 
     -- We need to set the unit id to base (without a version number)
     -- as it's magic.

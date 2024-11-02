@@ -6,6 +6,7 @@
 module GHC.CmmToAsm.AArch64.CodeGen (
       cmmTopCodeGen
     , generateJumpTableForInstr
+    , makeFarBranches
 )
 
 where
@@ -42,9 +43,11 @@ import GHC.Cmm.Utils
 import GHC.Cmm.Switch
 import GHC.Cmm.CLabel
 import GHC.Cmm.Dataflow.Block
+import GHC.Cmm.Dataflow.Label
 import GHC.Cmm.Dataflow.Graph
 import GHC.Types.Tickish ( GenTickish(..) )
 import GHC.Types.SrcLoc  ( srcSpanFile, srcSpanStartLine, srcSpanStartCol )
+import GHC.Types.Unique.Supply
 
 -- The rest:
 import GHC.Data.OrdList
@@ -59,6 +62,11 @@ import GHC.Types.ForeignCall
 import GHC.Data.FastString
 import GHC.Utils.Misc
 import GHC.Utils.Panic
+import GHC.Utils.Panic.Plain
+import GHC.Utils.Constants (debugIsOn)
+import GHC.Utils.Monad (mapAccumLM)
+
+import GHC.Cmm.Dataflow.Collections
 
 -- Note [General layout of an NCG]
 -- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -134,10 +142,11 @@ basicBlockCodeGen block = do
       id = entryLabel block
       stmts = blockToList nodes
 
-      header_comment_instr = unitOL $ MULTILINE_COMMENT (
+      header_comment_instr | debugIsOn = unitOL $ MULTILINE_COMMENT (
           text "-- --------------------------- basicBlockCodeGen --------------------------- --\n"
-          $+$ pdoc (ncgPlatform config) block
+          $+$ withPprStyle defaultDumpStyle (pdoc (ncgPlatform config) block)
           )
+                           | otherwise = nilOL
   -- Generate location directive
   dbg <- getDebugBlock (entryLabel block)
   loc_instrs <- case dblSourceTick =<< dbg of
@@ -158,15 +167,17 @@ basicBlockCodeGen block = do
   let
         (top,other_blocks,statics) = foldrOL mkBlocks ([],[],[]) instrs
 
-        mkBlocks (NEWBLOCK id) (instrs,blocks,statics)
-          = ([], BasicBlock id instrs : blocks, statics)
-        mkBlocks (LDATA sec dat) (instrs,blocks,statics)
-          = (instrs, blocks, CmmData sec dat:statics)
-        mkBlocks instr (instrs,blocks,statics)
-          = (instr:instrs, blocks, statics)
   return (BasicBlock id top : other_blocks, statics)
 
-
+mkBlocks :: Instr
+          -> ([Instr], [GenBasicBlock Instr], [GenCmmDecl RawCmmStatics h g])
+          -> ([Instr], [GenBasicBlock Instr], [GenCmmDecl RawCmmStatics h g])
+mkBlocks (NEWBLOCK id) (instrs,blocks,statics)
+  = ([], BasicBlock id instrs : blocks, statics)
+mkBlocks (LDATA sec dat) (instrs,blocks,statics)
+  = (instrs, blocks, CmmData sec dat:statics)
+mkBlocks instr (instrs,blocks,statics)
+  = (instr:instrs, blocks, statics)
 -- -----------------------------------------------------------------------------
 -- | Utilities
 ann :: SDoc -> Instr -> Instr
@@ -176,13 +187,13 @@ ann doc instr {- debugIsOn -} = ANN doc instr
 
 -- Using pprExpr will hide the AST, @ANN@ will end up in the assembly with
 -- -dppr-debug.  The idea is that we can trivially see how a cmm expression
--- ended up producing the assmebly we see.  By having the verbatim AST printed
--- we can simply check the patterns that were matched to arrive at the assmebly
+-- ended up producing the assembly we see.  By having the verbatim AST printed
+-- we can simply check the patterns that were matched to arrive at the assembly
 -- we generated.
 --
 -- pprExpr will hide a lot of noise of the underlying data structure and print
 -- the expression into something that can be easily read by a human. However
--- going back to the exact CmmExpr representation can be labourous and adds
+-- going back to the exact CmmExpr representation can be laborious and adds
 -- indirections to find the matches that lead to the assembly.
 --
 -- An improvement oculd be to have
@@ -911,7 +922,6 @@ getRegister' config plat expr
                       intOp True w (\d x y -> toOL [ SDIV t x y, MSUB d t y x ])
 
         -- Unsigned multiply/divide
-        MO_U_MulMayOflo _w -> unsupportedP plat expr
         MO_U_Quot w -> intOp False w (\d x y -> unitOL $ UDIV d x y)
         MO_U_Rem w  -> withTempIntReg w $ \t ->
                        intOp False w (\d x y -> toOL [ UDIV t x y, MSUB d t y x ])
@@ -941,7 +951,7 @@ getRegister' config plat expr
         -- careful with the floating point operations.
         -- SLE is effectively LE or unordered (NaN)
         -- SLT is the same. ULE, and ULT will not return true for NaN.
-        -- This is a bit counter intutive. Don't let yourself be fooled by
+        -- This is a bit counter-intuitive. Don't let yourself be fooled by
         -- the S/U prefix for floats, it's only meaningful for integers.
         MO_F_Ge w    -> floatCond w (\d x y -> toOL [ CMP x y, CSET d OGE ])
         MO_F_Le w    -> floatCond w (\d x y -> toOL [ CMP x y, CSET d OLE ]) -- x <= y <=> y > x
@@ -963,13 +973,11 @@ getRegister' config plat expr
       -> pprPanic "getRegister' (variadic CmmMachOp): " (pdoc plat expr)
 
   where
-    unsupportedP :: OutputableP env a => env -> a -> b
-    unsupportedP platform op = pprPanic "Unsupported op:" (pdoc platform op)
-
     isNbitEncodeable :: Int -> Integer -> Bool
     isNbitEncodeable n i = let shift = n - 1 in (-1 `shiftL` shift) <= i && i < (1 `shiftL` shift)
 
     -- N.B. MUL does not set the overflow flag.
+    -- These implementations are based on output from GCC 11.
     do_mul_may_oflo :: Width -> CmmExpr -> CmmExpr -> NatM Register
     do_mul_may_oflo w@W64 x y = do
         (reg_x, _format_x, code_x) <- getSomeReg x
@@ -983,31 +991,47 @@ getRegister' config plat expr
             SMULH (OpReg w hi) (OpReg w reg_x) (OpReg w reg_y) `snocOL`
             CMP (OpReg w hi) (OpRegShift w lo SASR 63) `snocOL`
             CSET (OpReg w dst) NE)
+
+    do_mul_may_oflo W32 x y = do
+        (reg_x, _format_x, code_x) <- getSomeReg x
+        (reg_y, _format_y, code_y) <- getSomeReg y
+        tmp1 <- getNewRegNat II64
+        tmp2 <- getNewRegNat II64
+        return $ Any (intFormat W32) (\dst ->
+            code_x `appOL`
+            code_y `snocOL`
+            SMULL (OpReg W64 tmp1) (OpReg W32 reg_x) (OpReg W32 reg_y) `snocOL`
+            ASR (OpReg W64 tmp2) (OpReg W64 tmp1) (OpImm (ImmInt 31)) `snocOL`
+            CMP (OpReg W32 tmp2) (OpRegShift W32 tmp1 SASR 31) `snocOL`
+            CSET (OpReg W32 dst) NE)
+
     do_mul_may_oflo w x y = do
         (reg_x, _format_x, code_x) <- getSomeReg x
         (reg_y, _format_y, code_y) <- getSomeReg y
-        let tmp_w = case w of
-                      W32 -> W64
-                      W16 -> W32
-                      W8  -> W32
-                      _   -> panic "do_mul_may_oflo: impossible"
-        -- This will hold the product
-        tmp <- getNewRegNat (intFormat tmp_w)
-        let ext_mode = case w of
-                         W32 -> ESXTW
-                         W16 -> ESXTH
-                         W8  -> ESXTB
-                         _   -> panic "do_mul_may_oflo: impossible"
-            mul = case w of
-                    W32 -> SMULL
-                    W16 -> MUL
-                    W8  -> MUL
-                    _   -> panic "do_mul_may_oflo: impossible"
+        tmp1 <- getNewRegNat II32
+        tmp2 <- getNewRegNat II32
+        let extend dst arg =
+              case w of
+                W16 -> SXTH (OpReg W32 dst) (OpReg W32 arg)
+                W8  -> SXTB (OpReg W32 dst) (OpReg W32 arg)
+                _   -> panic "unreachable"
+            cmp_ext_mode =
+              case w of
+                W16 -> EUXTH
+                W8  -> EUXTB
+                _   -> panic "unreachable"
+            width = widthInBits w
+            opInt = OpImm . ImmInt
+
         return $ Any (intFormat w) (\dst ->
             code_x `appOL`
             code_y `snocOL`
-            mul (OpReg tmp_w tmp) (OpReg w reg_x) (OpReg w reg_y) `snocOL`
-            CMP (OpReg tmp_w tmp) (OpRegExt tmp_w tmp ext_mode 0) `snocOL`
+            extend tmp1 reg_x `snocOL`
+            extend tmp2 reg_y `snocOL`
+            MUL (OpReg W32 tmp1) (OpReg W32 tmp1) (OpReg W32 tmp2) `snocOL`
+            SBFX (OpReg W64 tmp2) (OpReg W64 tmp1) (opInt $ width - 1) (opInt 1) `snocOL`
+            UBFX (OpReg W32 tmp1) (OpReg W32 tmp1) (opInt width) (opInt width) `snocOL`
+            CMP (OpReg W32 tmp1) (OpRegExt W32 tmp2 cmp_ext_mode 0) `snocOL`
             CSET (OpReg w dst) NE)
 
 -- | Is a given number encodable as a bitmask immediate?
@@ -1168,6 +1192,7 @@ assignReg_FltCode = assignReg_IntCode
 
 -- -----------------------------------------------------------------------------
 -- Jumps
+
 genJump :: CmmExpr{-the branch target-} -> NatM InstrBlock
 genJump expr@(CmmLit (CmmLabel lbl))
   = return $ unitOL (annExpr expr (J (TLabel lbl)))
@@ -1253,6 +1278,22 @@ genCondJump bid expr = do
           _ -> pprPanic "AArch64.genCondJump:case mop: " (text $ show expr)
       _ -> pprPanic "AArch64.genCondJump: " (text $ show expr)
 
+-- A conditional jump with at least +/-128M jump range
+genCondFarJump :: MonadUnique m => Cond -> Target -> m InstrBlock
+genCondFarJump cond far_target = do
+  skip_lbl_id <- newBlockId
+  jmp_lbl_id <- newBlockId
+
+  -- TODO: We can improve this by inverting the condition
+  -- but it's not quite trivial since we don't know if we
+  -- need to consider float orderings.
+  -- So we take the hit of the additional jump in the false
+  -- case for now.
+  return $ toOL [ BCOND cond (TBlock jmp_lbl_id)
+                , B (TBlock skip_lbl_id)
+                , NEWBLOCK jmp_lbl_id
+                , B far_target
+                , NEWBLOCK skip_lbl_id]
 
 genCondBranch
     :: BlockId      -- the source of the jump
@@ -1557,9 +1598,34 @@ genCCall target dest_regs arg_regs bid = do
         MO_BRev w           -> mkCCall (bRevLabel w)
 
         -- -- Atomic read-modify-write.
+        MO_AtomicRead w ord
+          | [p_reg] <- arg_regs
+          , [dst_reg] <- dest_regs -> do
+              (p, _fmt_p, code_p) <- getSomeReg p_reg
+              platform <- getPlatform
+              let instr = case ord of
+                      MemOrderRelaxed -> LDR
+                      _               -> LDAR
+                  dst = getRegisterReg platform (CmmLocal dst_reg)
+                  code =
+                    code_p `snocOL`
+                    instr (intFormat w) (OpReg w dst) (OpAddr $ AddrReg p)
+              return (code, Nothing)
+          | otherwise -> panic "mal-formed AtomicRead"
+        MO_AtomicWrite w ord
+          | [p_reg, val_reg] <- arg_regs -> do
+              (p, _fmt_p, code_p) <- getSomeReg p_reg
+              (val, fmt_val, code_val) <- getSomeReg val_reg
+              let instr = case ord of
+                      MemOrderRelaxed -> STR
+                      _               -> STLR
+                  code =
+                    code_p `appOL`
+                    code_val `snocOL`
+                    instr fmt_val (OpReg w val) (OpAddr $ AddrReg p)
+              return (code, Nothing)
+          | otherwise -> panic "mal-formed AtomicWrite"
         MO_AtomicRMW w amop -> mkCCall (atomicRMWLabel w amop)
-        MO_AtomicRead w _   -> mkCCall (atomicReadLabel w)
-        MO_AtomicWrite w _  -> mkCCall (atomicWriteLabel w)
         MO_Cmpxchg w        -> mkCCall (cmpxchgLabel w)
         -- -- Should be an AtomicRMW variant eventually.
         -- -- Sequential consistent.
@@ -1579,7 +1645,7 @@ genCCall target dest_regs arg_regs bid = do
       genCCall (ForeignTarget target cconv) dest_regs arg_regs bid
 
     -- TODO: Optimize using paired stores and loads (STP, LDP). It is
-    -- automomatically done by the allocator for us. However it's not optimal,
+    -- automatically done by the allocator for us. However it's not optimal,
     -- as we'd rather want to have control over
     --     all spill/load registers, so we can optimize with instructions like
     --       STP xA, xB, [sp, #-16]!
@@ -1743,3 +1809,163 @@ genCCall target dest_regs arg_regs bid = do
       let dst = getRegisterReg platform (CmmLocal dest_reg)
       let code = code_fx `appOL` op (OpReg w dst) (OpReg w reg_fx)
       return (code, Nothing)
+
+{- Note [AArch64 far jumps]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+AArch conditional jump instructions can only encode an offset of +/-1MB
+which is usually enough but can be exceeded in edge cases. In these cases
+we will replace:
+
+  b.cond <cond> foo
+
+with the sequence:
+
+  b.cond <cond> <lbl_true>
+  b <lbl_false>
+  <lbl_true>:
+  b foo
+  <lbl_false>:
+
+Note the encoding of the `b` instruction still limits jumps to
++/-128M offsets, but that seems like an acceptable limitation.
+
+Since AArch64 instructions are all of equal length we can reasonably estimate jumps
+in range by counting the instructions between a jump and its target label.
+
+We make some simplifications in the name of performance which can result in overestimating
+jump <-> label offsets:
+
+* To avoid having to recalculate the label offsets once we replaced a jump we simply
+  assume all jumps will be expanded to a three instruction far jump sequence.
+* For labels associated with a info table we assume the info table is 64byte large.
+  Most info tables are smaller than that but it means we don't have to distinguish
+  between multiple types of info tables.
+
+In terms of implementation we walk the instruction stream at least once calculating
+label offsets, and if we determine during this that the functions body is big enough
+to potentially contain out of range jumps we walk the instructions a second time, replacing
+out of range jumps with the sequence of instructions described above.
+
+-}
+
+-- See Note [AArch64 far jumps]
+data BlockInRange = InRange | NotInRange Target
+
+-- See Note [AArch64 far jumps]
+makeFarBranches :: Platform -> LabelMap RawCmmStatics -> [NatBasicBlock Instr]
+                -> UniqSM [NatBasicBlock Instr]
+makeFarBranches {- only used when debugging -} _platform statics basic_blocks = do
+  -- All offsets/positions are counted in multiples of 4 bytes (the size of AArch64 instructions)
+  -- That is an offset of 1 represents a 4-byte/one instruction offset.
+  let (func_size, lblMap) = foldl' calc_lbl_positions (0, mapEmpty) basic_blocks
+  if func_size < max_jump_dist
+    then pure basic_blocks
+    else do
+      (_,blocks) <- mapAccumLM (replace_blk lblMap) 0 basic_blocks
+      pure $ concat blocks
+      -- pprTrace "lblMap" (ppr lblMap) $ basic_blocks
+
+  where
+    -- 2^18, 19 bit immediate with one bit is reserved for the sign
+    max_jump_dist = 2^(18::Int) - 1 :: Int
+    -- Currently all inline info tables fit into 64 bytes.
+    max_info_size     = 16 :: Int
+    long_bc_jump_size =  3 :: Int
+    long_bz_jump_size =  4 :: Int
+
+    -- Replace out of range conditional jumps with unconditional jumps.
+    replace_blk :: LabelMap Int -> Int -> GenBasicBlock Instr -> UniqSM (Int, [GenBasicBlock Instr])
+    replace_blk !m !pos (BasicBlock lbl instrs) = do
+      -- Account for a potential info table before the label.
+      let !block_pos = pos + infoTblSize_maybe lbl
+      (!pos', instrs') <- mapAccumLM (replace_jump m) block_pos instrs
+      let instrs'' = concat instrs'
+      -- We might have introduced new labels, so split the instructions into basic blocks again if neccesary.
+      let (top, split_blocks, no_data) = foldr mkBlocks ([],[],[]) instrs''
+      -- There should be no data in the instruction stream at this point
+      massert (null no_data)
+
+      let final_blocks = BasicBlock lbl top : split_blocks
+      pure (pos', final_blocks)
+
+    replace_jump :: LabelMap Int -> Int -> Instr -> UniqSM (Int, [Instr])
+    replace_jump !m !pos instr = do
+      case instr of
+        ANN ann instr -> do
+          (idx,instr':instrs') <- replace_jump m pos instr
+          pure (idx, ANN ann instr':instrs')
+        BCOND cond t
+          -> case target_in_range m t pos of
+              InRange -> pure (pos+long_bc_jump_size,[instr])
+              NotInRange far_target -> do
+                jmp_code <- genCondFarJump cond far_target
+                pure (pos+long_bc_jump_size, fromOL jmp_code)
+        CBZ op t -> long_zero_jump op t EQ
+        CBNZ op t -> long_zero_jump op t NE
+        instr
+          | isMetaInstr instr -> pure (pos,[instr])
+          | otherwise -> pure (pos+1, [instr])
+
+      where
+        -- cmp_op: EQ = CBZ, NEQ = CBNZ
+        long_zero_jump op t cmp_op =
+          case target_in_range m t pos of
+              InRange -> pure (pos+long_bz_jump_size,[instr])
+              NotInRange far_target -> do
+                jmp_code <- genCondFarJump cmp_op far_target
+                -- TODO: Fix zero reg so we can use it here
+                pure (pos + long_bz_jump_size, CMP op (OpImm (ImmInt 0)) : fromOL jmp_code)
+
+
+    target_in_range :: LabelMap Int -> Target -> Int -> BlockInRange
+    target_in_range m target src =
+      case target of
+        (TReg{}) -> InRange
+        (TBlock bid) -> block_in_range m src bid
+        (TLabel clbl)
+          | Just bid <- maybeLocalBlockLabel clbl
+          -> block_in_range m src bid
+          | otherwise
+          -- Maybe we should be pessimistic here, for now just fixing intra proc jumps
+          -> InRange
+
+    block_in_range :: LabelMap Int -> Int -> BlockId -> BlockInRange
+    block_in_range m src_pos dest_lbl =
+      case mapLookup dest_lbl m of
+        Nothing       ->
+          pprTrace "not in range" (ppr dest_lbl) $
+            NotInRange (TBlock dest_lbl)
+        Just dest_pos -> if abs (dest_pos - src_pos) < max_jump_dist
+          then InRange
+          else NotInRange (TBlock dest_lbl)
+
+    calc_lbl_positions :: (Int, LabelMap Int) -> GenBasicBlock Instr -> (Int, LabelMap Int)
+    calc_lbl_positions (pos, m) (BasicBlock lbl instrs)
+      = let !pos' = pos + infoTblSize_maybe lbl
+        in foldl' instr_pos (pos',mapInsert lbl pos' m) instrs
+
+    instr_pos :: (Int, LabelMap Int) -> Instr -> (Int, LabelMap Int)
+    instr_pos (pos, m) instr =
+      case instr of
+        ANN _ann instr -> instr_pos (pos, m) instr
+        NEWBLOCK _bid -> panic "mkFarBranched - unexpected NEWBLOCK" -- At this point there should be no NEWBLOCK
+                                                                     -- in the instruction stream
+                                                                     -- (pos, mapInsert bid pos m)
+        COMMENT{} -> (pos, m)
+        instr
+          | Just jump_size <- is_expandable_jump instr -> (pos+jump_size, m)
+          | otherwise -> (pos+1, m)
+
+    infoTblSize_maybe bid =
+      case mapLookup bid statics of
+        Nothing           -> 0 :: Int
+        Just _info_static -> max_info_size
+
+    -- These jumps have a 19bit immediate as offset which is quite
+    -- limiting so we potentially have to expand them into
+    -- multiple instructions.
+    is_expandable_jump i = case i of
+      CBZ{}   -> Just long_bz_jump_size
+      CBNZ{}  -> Just long_bz_jump_size
+      BCOND{} -> Just long_bc_jump_size
+      _ -> Nothing

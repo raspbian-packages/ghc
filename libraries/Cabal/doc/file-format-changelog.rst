@@ -70,8 +70,9 @@ relative to the respective preceding *published* version.
 * License fields use identifiers from SPDX License List version
   ``3.9 2020-05-15``
 
-* Dependencies to sublibraries have to be specified explicitly,
+* Dependencies to sublibraries must be specified explicitly,
   even for current package.
+  For example: ``build-depends: mypackage:internal-lib``
   This way you can have an internal library with the same
   name as some external dependency.
 
@@ -85,6 +86,11 @@ relative to the respective preceding *published* version.
 
 ``cabal-version: 3.0``
 ----------------------
+
+* New :pkg-field:`library:visibility` for exposing sublibraries.
+
+* New ``pkg:lib`` and ``pkg:{lib1,lib2}`` syntax in :pkg-field:`build-depends`
+  for depending on public sublibraries from other packages.
 
 * Added the :pkg-field:`extra-dynamic-library-flavours` field to specify non-trivial
   variants of dynamic flavours. It is :pkg-field:`extra-library-flavours` but for
@@ -155,6 +161,10 @@ relative to the respective preceding *published* version.
     ``foo/**/bar.html`` are all invalid). As ``**`` was an error in
     globs before, this does not affect any existing ``.cabal`` files
     that previously worked.
+    (Caveat: Double-star wildcards in :pkg-field:`data-files` directories,
+    e.g. ``data-files: data/**/*.csv``,
+    `are only supported correctly from Cabal 3.0 <https://github.com/haskell/cabal/issues/6125#issuecomment-1379878419>`_.)
+
 
   * Wildcards now match when the pattern's extensions form a suffix of
     the candidate file's extension, rather than requiring strict

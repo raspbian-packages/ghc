@@ -13,7 +13,18 @@ module GHC.Utils.Trace
   )
 where
 
-import GHC.Prelude
+{- Note [Exporting pprTrace from GHC.Prelude]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+For our own sanity we want to export pprTrace from GHC.Prelude.
+Since calls to traces should never be performance sensitive it's okay for these
+to be source imports/exports. However we still need to make sure that all
+transitive imports from Trace.hs-boot do not import GHC.Prelude.
+
+To get there we import the basic GHC.Prelude.Basic prelude instead of GHC.Prelude
+within the transitive dependencies of Trace.hs
+-}
+
+import GHC.Prelude.Basic
 import GHC.Utils.Outputable
 import GHC.Utils.Exception
 import GHC.Utils.Panic
@@ -28,7 +39,7 @@ import Control.Monad.IO.Class
 pprTrace :: String -> SDoc -> a -> a
 pprTrace str doc x
   | unsafeHasNoDebugOutput = x
-  | otherwise              = pprDebugAndThen defaultSDocContext trace (text str) doc x
+  | otherwise              = pprDebugAndThen traceSDocContext trace (text str) doc x
 
 pprTraceM :: Applicative f => String -> SDoc -> f ()
 pprTraceM str doc = pprTrace str doc (pure ())
@@ -69,7 +80,7 @@ warnPprTrace _     _s _    x | not debugIsOn     = x
 warnPprTrace _     _s _msg x | unsafeHasNoDebugOutput = x
 warnPprTrace False _s _msg x = x
 warnPprTrace True   s  msg x
-  = pprDebugAndThen defaultSDocContext trace (text "WARNING:")
+  = pprDebugAndThen traceSDocContext trace (text "WARNING:")
                     (text s $$ msg $$ withFrozenCallStack traceCallStackDoc )
                     x
 
@@ -78,7 +89,7 @@ warnPprTrace True   s  msg x
 pprTraceUserWarning :: HasCallStack => SDoc -> a -> a
 pprTraceUserWarning msg x
   | unsafeHasNoDebugOutput = x
-  | otherwise = pprDebugAndThen defaultSDocContext trace (text "WARNING:")
+  | otherwise = pprDebugAndThen traceSDocContext trace (text "WARNING:")
                     (msg $$ withFrozenCallStack traceCallStackDoc )
                     x
 

@@ -14,6 +14,7 @@ module GHC.Driver.Env
    , hsc_all_home_unit_ids
    , hscUpdateLoggerFlags
    , hscUpdateHUG
+   , hscUpdateHPT_lazy
    , hscUpdateHPT
    , hscSetActiveHomeUnit
    , hscSetActiveUnitId
@@ -45,7 +46,7 @@ import GHC.Driver.Session
 import GHC.Driver.Errors ( printOrThrowDiagnostics )
 import GHC.Driver.Errors.Types ( GhcMessage )
 import GHC.Driver.Config.Logger (initLogFlags)
-import GHC.Driver.Config.Diagnostic (initDiagOpts)
+import GHC.Driver.Config.Diagnostic (initDiagOpts, initPrintConfig)
 import GHC.Driver.Env.Types ( Hsc(..), HscEnv(..) )
 
 import GHC.Runtime.Context
@@ -80,7 +81,6 @@ import GHC.Utils.Monad
 import GHC.Utils.Panic
 import GHC.Utils.Misc
 import GHC.Utils.Logger
-import GHC.Utils.Trace
 
 import Data.IORef
 import qualified Data.Set as Set
@@ -94,7 +94,8 @@ runHsc hsc_env (Hsc hsc) = do
     (a, w) <- hsc hsc_env emptyMessages
     let dflags = hsc_dflags hsc_env
     let !diag_opts = initDiagOpts dflags
-    printOrThrowDiagnostics (hsc_logger hsc_env) diag_opts w
+        !print_config = initPrintConfig dflags
+    printOrThrowDiagnostics (hsc_logger hsc_env) print_config diag_opts w
     return a
 
 runHsc' :: HscEnv -> Hsc a -> IO (a, Messages GhcMessage)
@@ -133,8 +134,15 @@ hsc_HUG = ue_home_unit_graph . hsc_unit_env
 hsc_all_home_unit_ids :: HscEnv -> Set.Set UnitId
 hsc_all_home_unit_ids = unitEnv_keys . hsc_HUG
 
+hscUpdateHPT_lazy :: (HomePackageTable -> HomePackageTable) -> HscEnv -> HscEnv
+hscUpdateHPT_lazy f hsc_env =
+  let !res = updateHpt_lazy f (hsc_unit_env hsc_env)
+  in hsc_env { hsc_unit_env = res }
+
 hscUpdateHPT :: (HomePackageTable -> HomePackageTable) -> HscEnv -> HscEnv
-hscUpdateHPT f hsc_env = hsc_env { hsc_unit_env = updateHpt f (hsc_unit_env hsc_env) }
+hscUpdateHPT f hsc_env =
+  let !res = updateHpt f (hsc_unit_env hsc_env)
+  in hsc_env { hsc_unit_env = res }
 
 hscUpdateHUG :: (HomeUnitGraph -> HomeUnitGraph) -> HscEnv -> HscEnv
 hscUpdateHUG f hsc_env = hsc_env { hsc_unit_env = updateHug f (hsc_unit_env hsc_env) }

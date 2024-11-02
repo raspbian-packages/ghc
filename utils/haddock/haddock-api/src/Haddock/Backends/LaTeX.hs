@@ -18,20 +18,19 @@ module Haddock.Backends.LaTeX (
 ) where
 
 import Documentation.Haddock.Markup
+import Haddock.Doc (combineDocumentation)
 import Haddock.Types
 import Haddock.Utils
 import Haddock.GhcUtils
 import GHC.Utils.Ppr hiding (Doc, quote)
 import qualified GHC.Utils.Ppr as Pretty
 
-import GHC.Types.Basic        ( PromotionFlag(..), isPromoted )
 import GHC hiding (fromMaybeContext )
 import GHC.Types.Name.Occurrence
 import GHC.Types.Name        ( nameOccName )
 import GHC.Types.Name.Reader ( rdrNameOcc )
 import GHC.Core.Type         ( Specificity(..) )
 import GHC.Data.FastString   ( unpackFS )
-import GHC.Utils.Panic       ( panic)
 
 import qualified Data.Map as Map
 import System.Directory
@@ -40,12 +39,9 @@ import Data.Char
 import Control.Monad
 import Data.Maybe
 import Data.List            ( sort )
-import Data.Void            ( absurd )
+import Data.List.NonEmpty ( NonEmpty (..) )
+import Data.Foldable ( toList )
 import Prelude hiding ((<>))
-
-import Haddock.Doc (combineDocumentation)
-
--- import Debug.Trace
 
 {- SAMPLE OUTPUT
 
@@ -181,7 +177,18 @@ ppLaTeXModule _title odir iface = do
 
 -- | Prints out an entry in a module export list.
 exportListItem :: ExportItem DocNameI -> LaTeX
-exportListItem ExportDecl { expItemDecl = decl, expItemSubDocs = subdocs }
+exportListItem
+    ( ExportDecl
+      ( RnExportD
+        { rnExpDExpD =
+          ( ExportD
+            { expDDecl    = decl
+            , expDSubDocs = subdocs
+            }
+          )
+        }
+      )
+    )
   = let (leader, names) = declNames decl
     in sep (punctuate comma [ leader <+> ppDocBinder name | name <- names ]) <>
          case subdocs of
@@ -216,9 +223,18 @@ processExports (e : es) =
 
 
 isSimpleSig :: ExportItem DocNameI -> Maybe ([DocName], HsSigType DocNameI)
-isSimpleSig ExportDecl { expItemDecl = L _ (SigD _ (TypeSig _ lnames t))
-                       , expItemMbDoc = (Documentation Nothing Nothing, argDocs) }
-  | Map.null argDocs = Just (map unLoc lnames, unLoc (dropWildCards t))
+isSimpleSig
+    ( ExportDecl
+      ( RnExportD
+        { rnExpDExpD =
+          ExportD
+          { expDDecl  = L _ (SigD _ (TypeSig _ lnames t))
+          , expDMbDoc = (Documentation Nothing Nothing, argDocs)
+          }
+        }
+      )
+    )
+    | Map.null argDocs = Just (map unLoc lnames, unLoc (dropWildCards t))
 isSimpleSig _ = Nothing
 
 
@@ -230,7 +246,7 @@ isExportModule _ = Nothing
 processExport :: ExportItem DocNameI -> LaTeX
 processExport (ExportGroup lev _id0 doc)
   = ppDocGroup lev (docToLaTeX doc)
-processExport (ExportDecl decl pats doc subdocs insts fixities _splice)
+processExport (ExportDecl (RnExportD (ExportD decl pats doc subdocs insts fixities _splice) _))
   = ppDecl decl pats doc insts subdocs fixities
 processExport (ExportNoDecl y [])
   = ppDocName y
@@ -293,13 +309,9 @@ ppDecl :: LHsDecl DocNameI                         -- ^ decl to print
        -> LaTeX
 
 ppDecl decl pats (doc, fnArgsDoc) instances subdocs _fxts = case unLoc decl of
-  TyClD _ d@FamDecl {}         -> ppFamDecl False doc instances d unicode
-  TyClD _ d@DataDecl {}        -> ppDataDecl pats instances subdocs (Just doc) d unicode
-  TyClD _ d@SynDecl {}         -> ppTySyn (doc, fnArgsDoc) d unicode
--- Family instances happen via FamInst now
---  TyClD _ d@TySynonym{}
---    | Just _  <- tcdTyPats d    -> ppTyInst False loc doc d unicode
--- Family instances happen via FamInst now
+  TyClD _ d@FamDecl {}           -> ppFamDecl False doc instances d unicode
+  TyClD _ d@DataDecl {}          -> ppDataDecl pats instances subdocs (Just doc) d unicode
+  TyClD _ d@SynDecl {}           -> ppTySyn (doc, fnArgsDoc) d unicode
   TyClD _ d@ClassDecl{}          -> ppClassDecl instances doc subdocs d unicode
   SigD _ (TypeSig _ lnames ty)   -> ppFunSig Nothing (doc, fnArgsDoc) (map unLoc lnames) (dropWildCards ty) unicode
   SigD _ (PatSynSig _ lnames ty) -> ppLPatSig (doc, fnArgsDoc) (map unLoc lnames) ty unicode
@@ -696,8 +708,8 @@ ppInstDecl unicode (InstHead {..}) = case ihdInstType of
   ClassInst ctx _ _ _ -> keyword "instance" <+> ppContextNoLocs ctx unicode <+> typ
   TypeInst rhs -> keyword "type" <+> keyword "instance" <+> typ <+> tibody rhs
   DataInst dd ->
-    let nd = dd_ND (tcdDataDefn dd)
-        pref = case nd of { NewType -> keyword "newtype"; DataType -> keyword "data" }
+    let cons = dd_cons (tcdDataDefn dd)
+        pref = case cons of { NewTypeCon _ -> keyword "newtype"; DataTypeCons _ _ -> keyword "data" }
     in pref <+> keyword "instance" <+> typ
   where
     typ = ppAppNameTypes ihdClsName ihdTypes unicode
@@ -729,7 +741,6 @@ ppDataDecl pats instances subdocs doc dataDecl unicode =
 
   where
     cons      = dd_cons (tcdDataDefn dataDecl)
-    resTy     = (unLoc . head) cons
 
     body = catMaybes [doc >>= documentationToLaTeX, constrBit,patternBit]
 
@@ -737,8 +748,8 @@ ppDataDecl pats instances subdocs doc dataDecl unicode =
       | null cons
       , null pats = (empty,[])
       | null cons = (text "where", repeat empty)
-      | otherwise = case resTy of
-        ConDeclGADT{} -> (text "where", repeat empty)
+      | otherwise = case toList cons of
+        L _ ConDeclGADT{} : _ -> (text "where", repeat empty)
         _             -> (empty, (decltt (text "=") : repeat (decltt (text "|"))))
 
     constrBit
@@ -746,7 +757,7 @@ ppDataDecl pats instances subdocs doc dataDecl unicode =
       | otherwise = Just $
           text "\\enspace" <+> emph (text "Constructors") <> text "\\par" $$
           text "\\haddockbeginconstrs" $$
-          vcat (zipWith (ppSideBySideConstr subdocs unicode) leaders cons) $$
+          vcat (zipWith (ppSideBySideConstr subdocs unicode) leaders (toList cons)) $$
           text "\\end{tabulary}\\par"
 
     patternBit
@@ -792,9 +803,9 @@ ppSideBySideConstr subdocs unicode leader (L _ con) =
   where
     -- Find the name of a constructors in the decl (`getConName` always returns
     -- a non-empty list)
-    aConName = unLoc (head (getConNamesI con))
+    L _ aConName :| _ = getConNamesI con
 
-    occ      = map (nameOccName . getName . unLoc) $ getConNamesI con
+    occ      = toList $ nameOccName . getName . unLoc <$> getConNamesI con
 
     ppOcc      = cat (punctuate comma (map ppBinder occ))
     ppOccInfix = cat (punctuate comma (map ppBinderInfix occ))
@@ -879,8 +890,7 @@ ppSideBySideConstr subdocs unicode leader (L _ con) =
     -- don't use "con_doc con", in case it's reconstructed from a .hi file,
     -- or also because we want Haddock to do the doc-parsing, not GHC.
     mbDoc = case getConNamesI con of
-              [] -> panic "empty con_names"
-              (cn:_) -> lookup (unLoc cn) subdocs >>=
+              cn:|_ -> lookup (unLoc cn) subdocs >>=
                         fmap _doc . combineDocumentation . fst
 
 
@@ -929,9 +939,13 @@ ppSideBySidePat lnames typ (doc, argDocs) unicode =
 -- Currently doesn't handle 'data instance' decls or kind signatures
 ppDataHeader :: TyClDecl DocNameI -> Bool -> LaTeX
 ppDataHeader (DataDecl { tcdLName = L _ name, tcdTyVars = tyvars
-                       , tcdDataDefn = HsDataDefn { dd_ND = nd, dd_ctxt = ctxt } }) unicode
+                       , tcdDataDefn = HsDataDefn { dd_cons = cons, dd_ctxt = ctxt } }) unicode
   = -- newtype or data
-    (case nd of { NewType -> keyword "newtype"; DataType -> keyword "data" }) <+>
+    (case cons of
+        { NewTypeCon _ -> keyword "newtype"
+        ; DataTypeCons False _ -> keyword "data"
+        ; DataTypeCons True _ -> keyword "type" <+> keyword "data"
+        }) <+>
     -- context
     ppLContext ctxt unicode <+>
     -- T a b c ..., or a :+: b
@@ -1120,7 +1134,7 @@ ppr_mono_ty (HsSumTy _ tys) u       = sumParens (map (ppLType u) tys)
 ppr_mono_ty (HsKindSig _ ty kind) u = parens (ppr_mono_lty ty u <+> dcolon u <+> ppLKind u kind)
 ppr_mono_ty (HsListTy _ ty)       u = brackets (ppr_mono_lty ty u)
 ppr_mono_ty (HsIParamTy _ (L _ n) ty) u = ppIPName n <+> dcolon u <+> ppr_mono_lty ty u
-ppr_mono_ty (HsSpliceTy v _)    _ = absurd v
+ppr_mono_ty (HsSpliceTy v _)    _ = dataConCantHappen v
 ppr_mono_ty (HsRecTy {})        _ = text "{..}"
 ppr_mono_ty (XHsType {})        _ = error "ppr_mono_ty HsCoreTy"
 ppr_mono_ty (HsExplicitListTy _ IsPromoted tys) u = Pretty.quote $ brackets $ hsep $ punctuate comma $ map (ppLType u) tys
@@ -1156,7 +1170,7 @@ ppr_mono_ty (HsTyLit _ t) u = ppr_tylit t u
 ppr_mono_ty (HsStarTy _ isUni) unicode = starSymbol (isUni || unicode)
 
 
-ppr_tylit :: HsTyLit -> Bool -> LaTeX
+ppr_tylit :: HsTyLit DocNameI -> Bool -> LaTeX
 ppr_tylit (HsNumTy _ n) _ = integer n
 ppr_tylit (HsStrTy _ s) _ = text (show s)
 ppr_tylit (HsCharTy _ c) _ = text (show c)

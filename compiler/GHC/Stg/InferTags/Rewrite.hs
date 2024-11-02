@@ -20,15 +20,20 @@ where
 
 import GHC.Prelude
 
+import GHC.Builtin.PrimOps ( PrimOp(..) )
+import GHC.Types.Basic     ( CbvMark (..), isMarkedCbv
+                           , TopLevelFlag(..), isTopLevel
+                           , Levity(..) )
 import GHC.Types.Id
 import GHC.Types.Name
 import GHC.Types.Unique.Supply
 import GHC.Types.Unique.FM
 import GHC.Types.RepType
-import GHC.Unit.Types (Module, isInteractiveModule)
+import GHC.Types.Var.Set
+import GHC.Unit.Types
 
 import GHC.Core.DataCon
-import GHC.Core (AltCon(..) )
+import GHC.Core            ( AltCon(..) )
 import GHC.Core.Type
 
 import GHC.StgToCmm.Types
@@ -39,7 +44,6 @@ import GHC.Stg.Syntax as StgSyn
 
 import GHC.Data.Maybe
 import GHC.Utils.Panic
-import GHC.Utils.Panic.Plain
 
 import GHC.Utils.Outputable
 import GHC.Utils.Monad.State.Strict
@@ -48,10 +52,6 @@ import GHC.Utils.Misc
 import GHC.Stg.InferTags.Types
 
 import Control.Monad
-import GHC.Types.Basic (CbvMark (NotMarkedCbv, MarkedCbv), isMarkedCbv, TopLevelFlag(..), isTopLevel)
-import GHC.Types.Var.Set
--- import GHC.Utils.Trace
--- import GHC.Driver.Ppr
 
 newtype RM a = RM { unRM :: (State (UniqFM Id TagSig, UniqSupply, Module, IdSet) a) }
     deriving (Functor, Monad, Applicative)
@@ -89,12 +89,12 @@ Which will result in a W/W split along the lines of
     $wf :: (a -> b -> d -> c) -> a -> b -> c -> d
     $wf m1 a b c = m1 a b c
 
-It's notable that the worker is called *undersatured* in the wrapper.
+It's notable that the worker is called *undersaturated* in the wrapper.
 At runtime what happens is that the wrapper will allocate a PAP which
 once fully applied will call the worker. And all is fine.
 
 But what about a call by value function! Well the function returned by `f` would
-be a unknown call, so we lose the ability to enfore the invariant that
+be a unknown call, so we lose the ability to enforce the invariant that
 cbv marked arguments from StictWorkerId's are actually properly tagged
 as the annotations would be unavailable at the (unknown) call site.
 
@@ -129,7 +129,7 @@ getMap :: RM (UniqFM Id TagSig)
 getMap = RM $ ((\(fst,_,_,_) -> fst) <$> get)
 
 setMap :: (UniqFM Id TagSig) -> RM ()
-setMap m = RM $ do
+setMap !m = RM $ do
     (_,us,mod,lcls) <- get
     put (m, us,mod,lcls)
 
@@ -140,7 +140,7 @@ getFVs :: RM IdSet
 getFVs = RM $ ((\(_,_,_,lcls) -> lcls) <$> get)
 
 setFVs :: IdSet -> RM ()
-setFVs fvs = RM $ do
+setFVs !fvs = RM $ do
     (tag_map,us,mod,_lcls) <- get
     put (tag_map, us,mod,fvs)
 
@@ -196,9 +196,9 @@ withBinders NotTopLevel sigs cont = do
 withClosureLcls :: DIdSet -> RM a -> RM a
 withClosureLcls fvs act = do
     old_fvs <- getFVs
-    let fvs' = nonDetStrictFoldDVarSet (flip extendVarSet) old_fvs fvs
+    let !fvs' = nonDetStrictFoldDVarSet (flip extendVarSet) old_fvs fvs
     setFVs fvs'
-    r <- act
+    !r <- act
     setFVs old_fvs
     return r
 
@@ -207,9 +207,9 @@ withClosureLcls fvs act = do
 withLcl :: Id -> RM a -> RM a
 withLcl fv act = do
     old_fvs <- getFVs
-    let fvs' = extendVarSet old_fvs fv
+    let !fvs' = extendVarSet old_fvs fv
     setFVs fvs'
-    r <- act
+    !r <- act
     setFVs old_fvs
     return r
 
@@ -217,7 +217,8 @@ withLcl fv act = do
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 When compiling bytecode we call myCoreToStg to get STG code first.
 myCoreToStg in turn calls out to stg2stg which runs the STG to STG
-passes followed by free variables analysis and tag inference at the end.
+passes followed by free variables analysis and the tag inference pass including
+it's rewriting phase at the end.
 Running tag inference is important as it upholds Note [Strict Field Invariant].
 While code executed by GHCi doesn't take advantage of the SFI it can call into
 compiled code which does. So it must still make sure that the SFI is upheld.
@@ -257,7 +258,9 @@ isTagged v = do
                                     (TagSig TagDunno)
     case nameIsLocalOrFrom this_mod (idName v) of
         True
-            | isUnliftedType (idType v)
+            | Just Unlifted <- typeLevity_maybe (idType v)
+              -- NB: v might be the Id of a representation-polymorphic join point,
+              -- so we shouldn't use isUnliftedType here. See T22212.
             -> return True
             | otherwise -> do -- Local binding
                 !s <- getMap
@@ -366,11 +369,13 @@ rewriteRhs (_id, _tagSig) (StgRhsCon ccs con cn ticks args) = {-# SCC rewriteRhs
             fvs <- fvArgs args
             -- lcls <- getFVs
             -- pprTraceM "RhsClosureConversion" (ppr (StgRhsClosure fvs ccs ReEntrant [] $! conExpr) $$ text "lcls:" <> ppr lcls)
-            return $! (StgRhsClosure fvs ccs ReEntrant [] $! conExpr)
+            -- We mark the closure updatable to retain sharing in the case that
+            -- conExpr is an infinite recursive data type. See #23783.
+            return $! (StgRhsClosure fvs ccs Updatable [] $! conExpr)
 rewriteRhs _binding (StgRhsClosure fvs ccs flag args body) = do
     withBinders NotTopLevel args $
         withClosureLcls fvs $
-            StgRhsClosure fvs ccs flag (map fst args) <$> rewriteExpr False body
+            StgRhsClosure fvs ccs flag (map fst args) <$> rewriteExpr body
         -- return (closure)
 
 fvArgs :: [StgArg] -> RM DVarSet
@@ -379,24 +384,36 @@ fvArgs args = do
     -- pprTraceM "fvArgs" (text "args:" <> ppr args $$ text "lcls:" <> pprVarSet (fv_lcls) (braces . fsep . map ppr) )
     return $ mkDVarSet [ v | StgVarArg v <- args, elemVarSet v fv_lcls]
 
-type IsScrut = Bool
+rewriteArgs :: [StgArg] -> RM [StgArg]
+rewriteArgs = mapM rewriteArg
+rewriteArg :: StgArg -> RM StgArg
+rewriteArg (StgVarArg v) = StgVarArg <$!> rewriteId v
+rewriteArg  (lit@StgLitArg{}) = return lit
 
-rewriteExpr :: IsScrut -> InferStgExpr -> RM TgStgExpr
-rewriteExpr _ (e@StgCase {})          = rewriteCase e
-rewriteExpr _ (e@StgLet {})           = rewriteLet e
-rewriteExpr _ (e@StgLetNoEscape {})   = rewriteLetNoEscape e
-rewriteExpr isScrut (StgTick t e)     = StgTick t <$!> rewriteExpr isScrut e
-rewriteExpr _ e@(StgConApp {})        = rewriteConApp e
+rewriteId :: Id -> RM Id
+rewriteId v = do
+    !is_tagged <- isTagged v
+    if is_tagged then return $! setIdTagSig v (TagSig TagProper)
+                 else return v
 
-rewriteExpr isScrut e@(StgApp {})     = rewriteApp isScrut e
-rewriteExpr _ (StgLit lit)           = return $! (StgLit lit)
-rewriteExpr _ (StgOpApp op args res_ty) = return $! (StgOpApp op args res_ty)
+rewriteExpr :: InferStgExpr -> RM TgStgExpr
+rewriteExpr (e@StgCase {})          = rewriteCase e
+rewriteExpr (e@StgLet {})           = rewriteLet e
+rewriteExpr (e@StgLetNoEscape {})   = rewriteLetNoEscape e
+rewriteExpr (StgTick t e)     = StgTick t <$!> rewriteExpr e
+rewriteExpr e@(StgConApp {})        = rewriteConApp e
+rewriteExpr e@(StgApp {})     = rewriteApp e
+rewriteExpr (StgLit lit)           = return $! (StgLit lit)
+rewriteExpr (StgOpApp op@(StgPrimOp DataToTagOp) args res_ty) = do
+        (StgOpApp op) <$!> rewriteArgs args <*> pure res_ty
+rewriteExpr (StgOpApp op args res_ty) = return $! (StgOpApp op args res_ty)
+
 
 rewriteCase :: InferStgExpr -> RM TgStgExpr
 rewriteCase (StgCase scrut bndr alt_type alts) =
     withBinder NotTopLevel bndr $
         pure StgCase <*>
-            rewriteExpr True scrut <*>
+            rewriteExpr scrut <*>
             pure (fst bndr) <*>
             pure alt_type <*>
             mapM rewriteAlt alts
@@ -406,7 +423,7 @@ rewriteCase _ = panic "Impossible: nodeCase"
 rewriteAlt :: InferStgAlt -> RM TgStgAlt
 rewriteAlt alt@GenStgAlt{alt_con=_, alt_bndrs=bndrs, alt_rhs=rhs} =
     withBinders NotTopLevel bndrs $ do
-        !rhs' <- rewriteExpr False rhs
+        !rhs' <- rewriteExpr rhs
         return $! alt {alt_bndrs = map fst bndrs, alt_rhs = rhs'}
 
 rewriteLet :: InferStgExpr -> RM TgStgExpr
@@ -414,7 +431,7 @@ rewriteLet (StgLet xt bind expr) = do
     (!bind') <- rewriteBinds NotTopLevel bind
     withBind NotTopLevel bind $ do
         -- pprTraceM "withBindLet" (ppr $ bindersOfX bind)
-        !expr' <- rewriteExpr False expr
+        !expr' <- rewriteExpr expr
         return $! (StgLet xt bind' expr')
 rewriteLet _ = panic "Impossible"
 
@@ -422,7 +439,7 @@ rewriteLetNoEscape :: InferStgExpr -> RM TgStgExpr
 rewriteLetNoEscape (StgLetNoEscape xt bind expr) = do
     (!bind') <- rewriteBinds NotTopLevel bind
     withBind NotTopLevel bind $ do
-        !expr' <- rewriteExpr False expr
+        !expr' <- rewriteExpr expr
         return $! (StgLetNoEscape xt bind' expr')
 rewriteLetNoEscape _ = panic "Impossible"
 
@@ -442,24 +459,18 @@ rewriteConApp (StgConApp con cn args tys) = do
 
 rewriteConApp _ = panic "Impossible"
 
--- Special case: Expressions like `case x of { ... }`
-rewriteApp :: IsScrut -> InferStgExpr -> RM TgStgExpr
-rewriteApp True (StgApp f []) = do
-    -- pprTraceM "rewriteAppScrut" (ppr f)
-    f_tagged <- isTagged f
-    -- isTagged looks at more than the result of our analysis.
-    -- So always update here if useful.
-    let f' = if f_tagged
-                then setIdTagSig f (TagSig TagProper)
-                else f
+-- Special case: Atomic binders, usually in a case context like `case f of ...`.
+rewriteApp :: InferStgExpr -> RM TgStgExpr
+rewriteApp (StgApp f []) = do
+    f' <- rewriteId f
     return $! StgApp f' []
-rewriteApp _ (StgApp f args)
+rewriteApp (StgApp f args)
     -- pprTrace "rewriteAppOther" (ppr f <+> ppr args) False
     -- = undefined
     | Just marks <- idCbvMarks_maybe f
     , relevant_marks <- dropWhileEndLE (not . isMarkedCbv) marks
     , any isMarkedCbv relevant_marks
-    = assert (length relevant_marks <= length args)
+    = assertPpr (length relevant_marks <= length args) (ppr f $$ ppr args $$ ppr relevant_marks)
       unliftArg relevant_marks
 
     where
@@ -474,8 +485,8 @@ rewriteApp _ (StgApp f args)
             cbvArgIds = [x | StgVarArg x <- map fstOf3 cbvArgInfo] :: [Id]
         mkSeqs args cbvArgIds (\cbv_args -> StgApp f cbv_args)
 
-rewriteApp _ (StgApp f args) = return $ StgApp f args
-rewriteApp _ _ = panic "Impossible"
+rewriteApp (StgApp f args) = return $ StgApp f args
+rewriteApp _ = panic "Impossible"
 
 -- `mkSeq` x x' e generates `case x of x' -> e`
 -- We could also substitute x' for x in e but that's so rarely beneficial
@@ -514,14 +525,20 @@ mkSeqs args untaggedIds mkExpr = do
 
 -- Out of all arguments passed at runtime only return these ending up in a
 -- strict field
-getStrictConArgs :: DataCon -> [a] -> [a]
+getStrictConArgs :: Outputable a => DataCon -> [a] -> [a]
 getStrictConArgs con args
     -- These are always lazy in their arguments.
     | isUnboxedTupleDataCon con = []
     | isUnboxedSumDataCon con = []
     -- For proper data cons we have to check.
     | otherwise =
+        assertPpr   (length args == length (dataConRuntimeRepStrictness con))
+                    (text "Mismatched con arg and con rep strictness lengths:" $$
+                     text "Con" <> ppr con <+> text "is applied to" <+> ppr args $$
+                     text "But seems to have arity" <> ppr (length repStrictness)) $
         [ arg | (arg,MarkedStrict)
                     <- zipEqual "getStrictConArgs"
                                 args
-                                (dataConRuntimeRepStrictness con)]
+                                repStrictness]
+        where
+            repStrictness = (dataConRuntimeRepStrictness con)

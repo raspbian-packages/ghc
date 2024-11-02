@@ -14,8 +14,9 @@ import GHC.Platform
 import GHC.ForeignSrcLang
 import GHC.IO (catchException)
 
-import GHC.CmmToLlvm.Base   (llvmVersionStr, supportedLlvmVersionUpperBound, parseLlvmVersion, supportedLlvmVersionLowerBound)
-import GHC.CmmToLlvm.Config (LlvmVersion)
+import GHC.CmmToLlvm.Config (LlvmVersion, llvmVersionStr, supportedLlvmVersionUpperBound, parseLlvmVersion, supportedLlvmVersionLowerBound)
+
+import GHC.Settings
 
 import GHC.SysTools.Process
 import GHC.SysTools.Info
@@ -45,7 +46,7 @@ import System.Process
 -}
 
 runUnlit :: Logger -> DynFlags -> [Option] -> IO ()
-runUnlit logger dflags args = traceToolCommand logger "unlit" $ do
+runUnlit logger dflags args = traceSystoolCommand logger "unlit" $ do
   let prog = pgm_L dflags
       opts = getOpts dflags opt_L
   runSomething logger "Literate pre-processor" prog
@@ -61,7 +62,7 @@ augmentImports dflags ("-include":fp:fps) = "-include" : augmentByWorkingDirecto
 augmentImports dflags (fp1: fp2: fps) = fp1 : augmentImports dflags (fp2:fps)
 
 runCpp :: Logger -> DynFlags -> [Option] -> IO ()
-runCpp logger dflags args = traceToolCommand logger "cpp" $ do
+runCpp logger dflags args = traceSystoolCommand logger "cpp" $ do
   let opts = getOpts dflags opt_P
       modified_imports = augmentImports dflags opts
   let (p,args0) = pgm_P dflags
@@ -73,14 +74,14 @@ runCpp logger dflags args = traceToolCommand logger "cpp" $ do
                        (args0 ++ args1 ++ args2 ++ args) Nothing mb_env
 
 runPp :: Logger -> DynFlags -> [Option] -> IO ()
-runPp logger dflags args = traceToolCommand logger "pp" $ do
+runPp logger dflags args = traceSystoolCommand logger "pp" $ do
   let prog = pgm_F dflags
       opts = map Option (getOpts dflags opt_F)
   runSomething logger "Haskell pre-processor" prog (args ++ opts)
 
 -- | Run compiler of C-like languages and raw objects (such as gcc or clang).
 runCc :: Maybe ForeignSrcLang -> Logger -> TmpFs -> DynFlags -> [Option] -> IO ()
-runCc mLanguage logger tmpfs dflags args = traceToolCommand logger "cc" $ do
+runCc mLanguage logger tmpfs dflags args = traceSystoolCommand logger "cc" $ do
   let args1 = map Option userOpts
       args2 = languageOptions ++ args ++ args1
       -- We take care to pass -optc flags in args1 last to ensure that the
@@ -160,6 +161,10 @@ runCc mLanguage logger tmpfs dflags args = traceToolCommand logger "cc" $ do
                         ,pgm_c dflags,    "Asm Compiler")
           RawObject  -> ("c",             []
                         ,pgm_c dflags,    "C Compiler") -- claim C for lack of a better idea
+          --JS backend shouldn't reach here, so we just pass
+          -- strings to satisfy the totality checker
+          LangJs     -> ("js",            []
+                        ,pgm_c dflags,    "JS Backend Compiler")
   userOpts_c   = getOpts dflags opt_c
   userOpts_cxx = getOpts dflags opt_cxx
 
@@ -168,7 +173,7 @@ xs `isContainedIn` ys = any (xs `isPrefixOf`) (tails ys)
 
 -- | Run the linker with some arguments and return the output
 askLd :: Logger -> DynFlags -> [Option] -> IO String
-askLd logger dflags args = traceToolCommand logger "linker" $ do
+askLd logger dflags args = traceSystoolCommand logger "linker" $ do
   let (p,args0) = pgm_l dflags
       args1     = map Option (getOpts dflags opt_l)
       args2     = args0 ++ args1 ++ args
@@ -177,7 +182,7 @@ askLd logger dflags args = traceToolCommand logger "linker" $ do
     readCreateProcessWithExitCode' (proc p real_args){ env = mb_env }
 
 runAs :: Logger -> DynFlags -> [Option] -> IO ()
-runAs logger dflags args = traceToolCommand logger "as" $ do
+runAs logger dflags args = traceSystoolCommand logger "as" $ do
   let (p,args0) = pgm_a dflags
       args1 = map Option (getOpts dflags opt_a)
       args2 = args0 ++ args1 ++ args
@@ -186,7 +191,7 @@ runAs logger dflags args = traceToolCommand logger "as" $ do
 
 -- | Run the LLVM Optimiser
 runLlvmOpt :: Logger -> DynFlags -> [Option] -> IO ()
-runLlvmOpt logger dflags args = traceToolCommand logger "opt" $ do
+runLlvmOpt logger dflags args = traceSystoolCommand logger "opt" $ do
   let (p,args0) = pgm_lo dflags
       args1 = map Option (getOpts dflags opt_lo)
       -- We take care to pass -optlo flags (e.g. args0) last to ensure that the
@@ -195,7 +200,7 @@ runLlvmOpt logger dflags args = traceToolCommand logger "opt" $ do
 
 -- | Run the LLVM Compiler
 runLlvmLlc :: Logger -> DynFlags -> [Option] -> IO ()
-runLlvmLlc logger dflags args = traceToolCommand logger "llc" $ do
+runLlvmLlc logger dflags args = traceSystoolCommand logger "llc" $ do
   let (p,args0) = pgm_lc dflags
       args1 = map Option (getOpts dflags opt_lc)
   runSomething logger "LLVM Compiler" p (args0 ++ args1 ++ args)
@@ -204,7 +209,7 @@ runLlvmLlc logger dflags args = traceToolCommand logger "llc" $ do
 -- backend on OS X as LLVM doesn't support the OS X system
 -- assembler)
 runClang :: Logger -> DynFlags -> [Option] -> IO ()
-runClang logger dflags args = traceToolCommand logger "clang" $ do
+runClang logger dflags args = traceSystoolCommand logger "clang" $ do
   let (clang,_) = pgm_lcc dflags
       -- be careful what options we call clang with
       -- see #5903 and #7617 for bugs caused by this.
@@ -222,9 +227,15 @@ runClang logger dflags args = traceToolCommand logger "clang" $ do
         throwIO err
     )
 
+runEmscripten :: Logger -> DynFlags -> [Option] -> IO ()
+runEmscripten logger dflags args = traceSystoolCommand logger "emcc" $ do
+  let (p,args0) = pgm_a dflags
+      args1     = args0 ++ args
+  runSomething logger "Emscripten" p args1
+
 -- | Figure out which version of LLVM we are running this session
 figureLlvmVersion :: Logger -> DynFlags -> IO (Maybe LlvmVersion)
-figureLlvmVersion logger dflags = traceToolCommand logger "llc" $ do
+figureLlvmVersion logger dflags = traceSystoolCommand logger "llc" $ do
   let (pgm,opts) = pgm_lc dflags
       args = filter notNull (map showOpt opts)
       -- we grab the args even though they should be useless just in
@@ -267,7 +278,7 @@ figureLlvmVersion logger dflags = traceToolCommand logger "llc" $ do
 
 
 runLink :: Logger -> TmpFs -> DynFlags -> [Option] -> IO ()
-runLink logger tmpfs dflags args = traceToolCommand logger "linker" $ do
+runLink logger tmpfs dflags args = traceSystoolCommand logger "linker" $ do
   -- See Note [Run-time linker info]
   --
   -- `-optl` args come at the end, so that later `-l` options
@@ -332,7 +343,7 @@ ld: warning: symbol referencing errors
 -- See Note [Merging object files for GHCi] in GHC.Driver.Pipeline.
 runMergeObjects :: Logger -> TmpFs -> DynFlags -> [Option] -> IO ()
 runMergeObjects logger tmpfs dflags args =
-  traceToolCommand logger "merge-objects" $ do
+  traceSystoolCommand logger "merge-objects" $ do
     let (p,args0) = fromMaybe err (pgm_lm dflags)
         err = throwGhcException $ UsageError $ unwords
             [ "Attempted to merge object files but the configured linker"
@@ -348,38 +359,29 @@ runMergeObjects logger tmpfs dflags args =
       else do
         runSomething logger "Merge objects" p args2
 
-runLibtool :: Logger -> DynFlags -> [Option] -> IO ()
-runLibtool logger dflags args = traceToolCommand logger "libtool" $ do
-  linkargs <- neededLinkArgs `fmap` getLinkerInfo logger dflags
-  let args1      = map Option (getOpts dflags opt_l)
-      args2      = [Option "-static"] ++ args1 ++ args ++ linkargs
-      libtool    = pgm_libtool dflags
-  mb_env <- getGccEnv args2
-  runSomethingFiltered logger id "Libtool" libtool args2 Nothing mb_env
-
 runAr :: Logger -> DynFlags -> Maybe FilePath -> [Option] -> IO ()
-runAr logger dflags cwd args = traceToolCommand logger "ar" $ do
+runAr logger dflags cwd args = traceSystoolCommand logger "ar" $ do
   let ar = pgm_ar dflags
   runSomethingFiltered logger id "Ar" ar args cwd Nothing
 
-askOtool :: Logger -> DynFlags -> Maybe FilePath -> [Option] -> IO String
-askOtool logger dflags mb_cwd args = do
-  let otool = pgm_otool dflags
+askOtool :: Logger -> ToolSettings -> Maybe FilePath -> [Option] -> IO String
+askOtool logger toolSettings mb_cwd args = do
+  let otool = toolSettings_pgm_otool toolSettings
   runSomethingWith logger "otool" otool args $ \real_args ->
     readCreateProcessWithExitCode' (proc otool real_args){ cwd = mb_cwd }
 
-runInstallNameTool :: Logger -> DynFlags -> [Option] -> IO ()
-runInstallNameTool logger dflags args = do
-  let tool = pgm_install_name_tool dflags
+runInstallNameTool :: Logger -> ToolSettings -> [Option] -> IO ()
+runInstallNameTool logger toolSettings args = do
+  let tool = toolSettings_pgm_install_name_tool toolSettings
   runSomethingFiltered logger id "Install Name Tool" tool args Nothing Nothing
 
 runRanlib :: Logger -> DynFlags -> [Option] -> IO ()
-runRanlib logger dflags args = traceToolCommand logger "ranlib" $ do
+runRanlib logger dflags args = traceSystoolCommand logger "ranlib" $ do
   let ranlib = pgm_ranlib dflags
   runSomethingFiltered logger id "Ranlib" ranlib args Nothing Nothing
 
 runWindres :: Logger -> DynFlags -> [Option] -> IO ()
-runWindres logger dflags args = traceToolCommand logger "windres" $ do
+runWindres logger dflags args = traceSystoolCommand logger "windres" $ do
   let cc_args = map Option (sOpt_c (settings dflags))
       windres = pgm_windres dflags
       opts = map Option (getOpts dflags opt_windres)
@@ -387,17 +389,5 @@ runWindres logger dflags args = traceToolCommand logger "windres" $ do
   runSomethingFiltered logger id "Windres" windres (opts ++ args) Nothing mb_env
 
 touch :: Logger -> DynFlags -> String -> String -> IO ()
-touch logger dflags purpose arg = traceToolCommand logger "touch" $
+touch logger dflags purpose arg = traceSystoolCommand logger "touch" $
   runSomething logger purpose (pgm_T dflags) [FileOption "" arg]
-
--- * Tracing utility
-
--- | Record in the eventlog when the given tool command starts
---   and finishes, prepending the given 'String' with
---   \"systool:\", to easily be able to collect and process
---   all the systool events.
---
---   For those events to show up in the eventlog, you need
---   to run GHC with @-v2@ or @-ddump-timings@.
-traceToolCommand :: Logger -> String -> IO a -> IO a
-traceToolCommand logger tool = withTiming logger (text "systool:" <> text tool) (const ())

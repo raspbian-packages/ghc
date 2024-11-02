@@ -33,12 +33,19 @@
 /* Define to 1 if you have the <memory.h> header file. */
 #undef HAVE_MEMORY_H
 
+/* Define to 1 if you have the `pipe2' function. */
+#undef HAVE_PIPE2
+
 /* Define to 1 if you have the `posix_spawnp' function. */
 #undef HAVE_POSIX_SPAWNP
 
 /* Define to 1 if you have the `posix_spawn_file_actions_addchdir' function.
    */
 #undef HAVE_POSIX_SPAWN_FILE_ACTIONS_ADDCHDIR
+
+/* Define to 1 if you have the `posix_spawn_file_actions_addchdir_np'
+   function. */
+#undef HAVE_POSIX_SPAWN_FILE_ACTIONS_ADDCHDIR_NP
 
 /* Define to 1 if you have the `setitimer' function. */
 #undef HAVE_SETITIMER

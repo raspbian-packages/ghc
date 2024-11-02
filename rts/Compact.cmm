@@ -13,6 +13,10 @@
 import CLOSURE base_GHCziIOziException_cannotCompactFunction_closure;
 import CLOSURE base_GHCziIOziException_cannotCompactMutable_closure;
 import CLOSURE base_GHCziIOziException_cannotCompactPinned_closure;
+#if !defined(UnregisterisedCompiler)
+import CLOSURE g0;
+import CLOSURE large_alloc_lim;
+#endif
 
 //
 // Allocate space for a new object in the compact region.  We first try
@@ -96,7 +100,7 @@ eval:
 
     // Follow indirections:
     case IND, IND_STATIC: {
-        p = StgInd_indirectee(p);
+        p = %acquire StgInd_indirectee(p);
         goto eval;
     }
 
@@ -133,7 +137,8 @@ eval:
         FUN_0_2,
         FUN_STATIC,
         BCO,
-        PAP: {
+        PAP,
+        CONTINUATION: {
         jump stg_raisezh(base_GHCziIOziException_cannotCompactFunction_closure);
     }
 
@@ -279,7 +284,7 @@ eval:
         goto constructor;
     }}
 
-    ccall barf("stg_compactWorkerzh");
+    ccall barf("stg_compactWorkerzh", NULL);
 }
 
 //

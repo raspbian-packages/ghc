@@ -21,8 +21,6 @@
 -- Stability   :  stable
 -- Portability :  non-portable (local universal quantification)
 --
--- \"Scrap your boilerplate\" --- Generic programming in Haskell.  See
--- <http://www.haskell.org/haskellwiki/Research_papers/Generics#Scrap_your_boilerplate.21>.
 -- This module provides the 'Data' class with its primitives for
 -- generic programming, along with instances for many datatypes. It
 -- corresponds to a merge between the previous "Data.Generics.Basics"
@@ -30,8 +28,8 @@
 -- not present in this module were moved to the
 -- @Data.Generics.Instances@ module in the @syb@ package.
 --
--- For more information, please visit the new
--- SYB wiki: <http://www.cs.uu.nl/wiki/bin/view/GenericProgramming/SYB>.
+-- \"Scrap your boilerplate\" --- Generic programming in Haskell.  See
+-- <https://wiki.haskell.org/Research_papers/Generics#Scrap_your_boilerplate.21>.
 --
 -----------------------------------------------------------------------------
 
@@ -142,6 +140,7 @@ import Data.Word             -- So we can give Data instance for Word8, ...
 import GHC.Real              -- So we can give Data instance for Ratio
 --import GHC.IOBase            -- So we can give Data instance for IO, Handle
 import GHC.Ptr               -- So we can give Data instance for Ptr
+import Foreign.C.ConstPtr    -- So we can give Data instance for ConstPtr
 import GHC.ForeignPtr        -- So we can give Data instance for ForeignPtr
 import Foreign.Ptr (IntPtr(..), WordPtr(..))
                              -- So we can give Data instance for IntPtr and WordPtr
@@ -632,6 +631,8 @@ mkDataType str cs = DataType
                         }
 
 -- | Constructs a constructor
+--
+-- @since 4.16.0.0
 mkConstrTag :: DataType -> String -> Int -> [String] -> Fixity -> Constr
 mkConstrTag dt str idx fields fix =
         Constr
@@ -1189,6 +1190,9 @@ deriving instance Data Ordering
 -- | @since 4.0.0.0
 deriving instance (Data a, Data b) => Data (Either a b)
 
+-- | @since 4.8.0.0
+deriving instance Data Void
+
 -- | @since 4.0.0.0
 deriving instance Data ()
 
@@ -1225,6 +1229,9 @@ instance Data a => Data (Ptr a) where
   gunfold _ _  = errorWithoutStackTrace "Data.Data.gunfold(Ptr)"
   dataTypeOf _ = mkNoRepType "GHC.Ptr.Ptr"
   dataCast1 x  = gcast1 x
+
+-- | @since 4.18.0.0
+deriving instance Data a => Data (ConstPtr a)
 
 ------------------------------------------------------------------------------
 

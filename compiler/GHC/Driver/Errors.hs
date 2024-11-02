@@ -1,3 +1,4 @@
+{-# LANGUAGE ScopedTypeVariables #-}
 module GHC.Driver.Errors (
     printOrThrowDiagnostics
   , printMessages
@@ -16,47 +17,48 @@ import GHC.Utils.Outputable (hang, ppr, ($$), SDocContext,  text, withPprStyle, 
 import GHC.Utils.Logger
 import qualified GHC.Driver.CmdLine as CmdLine
 
-printMessages :: Diagnostic a => Logger -> DiagOpts -> Messages a -> IO ()
-printMessages logger opts msgs
-  = sequence_ [ let style = mkErrStyle unqual
+printMessages :: forall a . Diagnostic a => Logger -> DiagnosticOpts a -> DiagOpts -> Messages a -> IO ()
+printMessages logger msg_opts opts msgs
+  = sequence_ [ let style = mkErrStyle name_ppr_ctx
                     ctx   = (diag_ppr_ctx opts) { sdocStyle = style }
-                in logMsg logger (MCDiagnostic sev . diagnosticReason $ dia) s $
+                in logMsg logger (MCDiagnostic sev (diagnosticReason dia) (diagnosticCode dia)) s $
                    withPprStyle style (messageWithHints ctx dia)
-              | MsgEnvelope { errMsgSpan      = s,
+              | MsgEnvelope { errMsgSpan       = s,
                               errMsgDiagnostic = dia,
-                              errMsgSeverity = sev,
-                              errMsgContext   = unqual } <- sortMsgBag (Just opts)
-                                                                       (getMessages msgs) ]
+                              errMsgSeverity   = sev,
+                              errMsgContext    = name_ppr_ctx }
+                  <- sortMsgBag (Just opts) (getMessages msgs) ]
   where
     messageWithHints :: Diagnostic a => SDocContext -> a -> SDoc
     messageWithHints ctx e =
-      let main_msg = formatBulleted ctx $ diagnosticMessage e
+      let main_msg = formatBulleted ctx $ diagnosticMessage msg_opts e
           in case diagnosticHints e of
                []  -> main_msg
                [h] -> main_msg $$ hang (text "Suggested fix:") 2 (ppr h)
                hs  -> main_msg $$ hang (text "Suggested fixes:") 2
                                        (formatBulleted ctx . mkDecorated . map ppr $ hs)
 
-handleFlagWarnings :: Logger -> DiagOpts -> [CmdLine.Warn] -> IO ()
-handleFlagWarnings logger opts warns = do
+handleFlagWarnings :: Logger -> GhcMessageOpts -> DiagOpts -> [CmdLine.Warn] -> IO ()
+handleFlagWarnings logger print_config opts warns = do
   let -- It would be nicer if warns :: [Located SDoc], but that
       -- has circular import problems.
       bag = listToBag [ mkPlainMsgEnvelope opts loc $
                         GhcDriverMessage $
                         DriverUnknownMessage $
+                        UnknownDiagnostic $
                         mkPlainDiagnostic reason noHints $ text warn
                       | CmdLine.Warn reason (L loc warn) <- warns ]
 
-  printOrThrowDiagnostics logger opts (mkMessages bag)
+  printOrThrowDiagnostics logger print_config opts (mkMessages bag)
 
 -- | Given a bag of diagnostics, turn them into an exception if
 -- any has 'SevError', or print them out otherwise.
-printOrThrowDiagnostics :: Logger -> DiagOpts -> Messages GhcMessage -> IO ()
-printOrThrowDiagnostics logger opts msgs
+printOrThrowDiagnostics :: Logger -> GhcMessageOpts -> DiagOpts -> Messages GhcMessage -> IO ()
+printOrThrowDiagnostics logger print_config opts msgs
   | errorsOrFatalWarningsFound msgs
   = throwErrors msgs
   | otherwise
-  = printMessages logger opts msgs
+  = printMessages logger print_config opts msgs
 
 -- | Convert a 'PsError' into a wrapped 'DriverMessage'; use it
 -- for dealing with parse errors when the driver is doing dependency analysis.
