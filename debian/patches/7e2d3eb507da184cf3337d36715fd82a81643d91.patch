@@ -1,0 +1,108 @@
+From 7e2d3eb507da184cf3337d36715fd82a81643d91 Mon Sep 17 00:00:00 2001
+From: lrzlin <lrzlin@163.com>
+Date: Fri, 13 Jan 2023 00:56:37 +0800
+Subject: [PATCH] Enable tables next to code for LoongArch64
+
+---
+ compiler/GHC/CmmToLlvm/Mangler.hs | 25 ++++++++++++++++++++++++-
+ compiler/ghc.cabal.in             |  2 +-
+ libraries/ghci/GHCi/InfoTable.hsc |  9 +++++++++
+ m4/ghc_tables_next_to_code.m4     |  2 +-
+ 4 files changed, 35 insertions(+), 3 deletions(-)
+
+diff --git a/compiler/GHC/CmmToLlvm/Mangler.hs b/compiler/GHC/CmmToLlvm/Mangler.hs
+index 749cedef2dd4..62625195b579 100644
+--- a/compiler/GHC/CmmToLlvm/Mangler.hs
++++ b/compiler/GHC/CmmToLlvm/Mangler.hs
+@@ -38,7 +38,7 @@ llvmFixupAsm platform f1 f2 = {-# SCC "llvm_mangler" #-}
+ 
+ -- | These are the rewrites that the mangler will perform
+ rewrites :: [Rewrite]
+-rewrites = [rewriteSymType, rewriteAVX, rewriteCall]
++rewrites = [rewriteSymType, rewriteAVX, rewriteCall, rewriteJump]
+ 
+ type Rewrite = Platform -> B.ByteString -> Maybe B.ByteString
+ 
+@@ -123,6 +123,29 @@ rewriteCall platform l
+         removePlt = replaceOnce (B.pack "@plt") (B.pack "")
+         appendInsn i = (`B.append` B.pack ("\n\t" ++ i))
+ 
++-- | This rewrites bl and b jump inst to avoid creating PLT entries for
++-- functions on loongarch64, because there is no separate call instruction
++-- for function calls in loongarch64. Also, this replacement will load
++-- the function address from the GOT, which is resolved to point to the
++-- real address of the function.
++rewriteJump :: Rewrite
++rewriteJump platform l
++  | not isLoongArch64 = Nothing
++  | isBL l            = Just $ replaceJump "bl" "$ra" "$ra" l
++  | isB l             = Just $ replaceJump "b" "$zero" "$t0" l
++  | otherwise         = Nothing
++  where
++    isLoongArch64 = platformArch platform == ArchLoongArch64
++    isBL = B.isPrefixOf (B.pack "bl\t")
++    isB = B.isPrefixOf (B.pack "b\t")
++
++    replaceJump jump rd rj l =
++        appendInsn ("jirl" ++ "\t" ++ rd ++ ", " ++ rj ++ ", 0") $ removeBracket $
++        replaceOnce (B.pack (jump ++ "\t%plt(")) (B.pack ("la\t" ++ rj ++ ", ")) l
++      where
++        removeBracket = replaceOnce (B.pack ")") (B.pack "")
++        appendInsn i = (`B.append` B.pack ("\n\t" ++ i))
++
+ -- | @replaceOnce match replace bs@ replaces the first occurrence of the
+ -- substring @match@ in @bs@ with @replace@.
+ replaceOnce :: B.ByteString -> B.ByteString -> B.ByteString -> B.ByteString
+diff --git a/compiler/ghc.cabal.in b/compiler/ghc.cabal.in
+index 98cc71dde2d8..cb3d82e5910f 100644
+--- a/compiler/ghc.cabal.in
++++ b/compiler/ghc.cabal.in
+@@ -557,6 +557,7 @@ Library
+         GHC.Platform.ARM
+         GHC.Platform.AArch64
+         GHC.Platform.Constants
++        GHC.Platform.LoongArch64
+         GHC.Platform.NoRegs
+         GHC.Platform.PPC
+         GHC.Platform.Profile
+@@ -564,7 +565,6 @@ Library
+         GHC.Platform.Reg.Class
+         GHC.Platform.Regs
+         GHC.Platform.RISCV64
+-        GHC.Platform.LoongArch64
+         GHC.Platform.S390X
+         GHC.Platform.Wasm32
+         GHC.Platform.Ways
+diff --git a/libraries/ghci/GHCi/InfoTable.hsc b/libraries/ghci/GHCi/InfoTable.hsc
+index ce5aee21fbc1..5ac08f693c80 100644
+--- a/libraries/ghci/GHCi/InfoTable.hsc
++++ b/libraries/ghci/GHCi/InfoTable.hsc
+@@ -228,6 +228,15 @@ mkJumpToAddr a = case hostPlatformArch of
+                  , fromIntegral w64
+                  , fromIntegral (w64 `shiftR` 32) ]
+ 
++    ArchLoongArch64 -> pure $
++        let w64 = fromIntegral (funPtrToInt a) :: Word64
++        in Right [ 0x1c00000c          -- pcaddu12i $t0,0
++                 , 0x28c0418c          -- ld.d      $t0,$t0,16
++                 , 0x4c000180          -- jr        $t0
++                 , 0x03400000          -- nop
++                 , fromIntegral w64
++                 , fromIntegral (w64 `shiftR` 32) ]
++
+     arch ->
+       -- The arch isn't supported. You either need to add your architecture as a
+       -- distinct case, or use non-TABLES_NEXT_TO_CODE mode.
+diff --git a/m4/ghc_tables_next_to_code.m4 b/m4/ghc_tables_next_to_code.m4
+index 8acf250c4474..3e0ced2137df 100644
+--- a/m4/ghc_tables_next_to_code.m4
++++ b/m4/ghc_tables_next_to_code.m4
+@@ -17,7 +17,7 @@ AC_DEFUN([GHC_TABLES_NEXT_TO_CODE],
+   case "$Unregisterised" in
+       NO)
+           case "$TargetArch" in
+-              ia64|powerpc64|powerpc64le|s390x|wasm32|loongarch64)
++              ia64|powerpc64|powerpc64le|s390x|wasm32)
+                   TablesNextToCodeDefault=NO
+                   AC_MSG_RESULT([no])
+                   ;;
