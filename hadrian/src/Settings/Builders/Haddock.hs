@@ -30,6 +30,7 @@ haddockBuilderArgs = mconcat
             , arg "-o", arg $ takeDirectory output
             , arg "-t", arg "Haskell Hierarchical Libraries"
             , arg "-p", arg "libraries/prologue.txt"
+            , arg "--mathjax=file:///usr/share/javascript/mathjax/MathJax.js"
             , pure [ "--read-interface="
                      ++ (takeFileName . takeDirectory) haddock
                      ++ "," ++ haddock | haddock <- inputs ] ]
@@ -58,6 +59,7 @@ haddockBuilderArgs = mconcat
             , arg "--hyperlinked-source"
             , arg "--hoogle"
             , arg "--quickjump"
+            , arg "--mathjax=file:///usr/share/javascript/mathjax/MathJax.js"
             , arg $ "--title=" ++ pkgName pkg ++ "-" ++ version
                     ++ ": " ++ synopsis
             , arg $ "--prologue=" ++ takeDirectory output -/- "haddock-prologue.txt"
