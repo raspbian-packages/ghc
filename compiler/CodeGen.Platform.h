@@ -6,6 +6,7 @@ import GHC.Utils.Panic.Plain
 #endif
 import GHC.Platform.Reg
 
+#include "ghcautoconf.h"
 #include "MachRegs.h"
 
 #if defined(MACHREGS_i386) || defined(MACHREGS_x86_64)
