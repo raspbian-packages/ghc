@@ -1,4 +1,4 @@
-ghc (9.6.6-2+rpi1) trixie-staging; urgency=medium
+ghc (9.6.6-4+rpi1) trixie-staging; urgency=medium
 
   [changes brought forward from 7.6.3-21+rpi1 by Peter Michael Green <plugwash@raspbian.org> at Sun, 19 Apr 2015 14:00:16 +0000]
   * Change compiler defaults for armv6
@@ -9,7 +9,30 @@ ghc (9.6.6-2+rpi1) trixie-staging; urgency=medium
   [changes introduced in 9.4.7-2+rpi1 by Peter Michael Green]
   * replace dmb instruction with coprocessor barrier instruction.
 
- -- Peter Michael Green <plugwash@raspbian.org>  Sat, 02 Nov 2024 06:04:23 +0000
+ -- Raspbian forward porter <root@raspbian.org>  Sat, 08 Mar 2025 09:38:06 +0000
+
+ghc (9.6.6-4) unstable; urgency=medium
+
+  [ John Paul Adrian Glaubitz ]
+  * Add patch to fix FTBFS on alpha (Closes#: 1086830)
+
+  [ Gianfranco Costamagna ]
+  * Add binutils-gold to armel and armhf, according to rules file
+    (Closes: #1094995)
+
+  [ 王鑫 <wangxin03@loongson.cn> ]
+  * Update loongarch64 patch with new upstream backported commits
+   (Closes: #1089921)
+
+ -- Gianfranco Costamagna <locutusofborg@debian.org>  Mon, 17 Feb 2025 09:44:23 +0100
+
+ghc (9.6.6-3) unstable; urgency=medium
+
+  [ fanpeng <fanpeng@loongson.cn> ]
+  * debian/patches/7e2d3eb507da184cf3337d36715fd82a81643d91.patch:
+    - upstream fix for loong64 build failures (Closes: #1085966)
+
+ -- Gianfranco Costamagna <locutusofborg@debian.org>  Wed, 06 Nov 2024 00:21:23 +0100
 
 ghc (9.6.6-2) unstable; urgency=medium
 

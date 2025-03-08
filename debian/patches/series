@@ -27,4 +27,9 @@ llvm-new-pass-manager
 llvm-newer-version
 hadrian-plans
 pr-13096
+alpha-fix-ieee_set_fp_control-invocation.patch
+0001-llvmGen-Add-export-list-to-GHC.Llvm.MetaData.patch
+0002-llvmGen-Allow-LlvmLits-in-MetaExprs.patch
+0003-llvmGen-Introduce-infrastructure-for-module-flag-metadata.patch
+0004-llvmGen-Pass-mcmodel-medium-option-to-LLVM-backend-on-LoongArch.patch
 replace-dmb-instruction-with-coprocessor.patch

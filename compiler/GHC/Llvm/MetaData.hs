@@ -1,6 +1,15 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 
-module GHC.Llvm.MetaData where
+module GHC.Llvm.MetaData
+  ( MetaId(..)
+  , MetaExpr(..)
+  , MetaAnnot(..)
+  , MetaDecl(..)
+    -- * Module flags
+  , ModuleFlagBehavior(..)
+  , ModuleFlag(..)
+  , moduleFlagToMetaExpr
+  ) where
 
 import GHC.Prelude
 
@@ -68,6 +77,7 @@ instance Outputable MetaId where
 
 -- | LLVM metadata expressions
 data MetaExpr = MetaStr !LMString
+              | MetaLit !LlvmLit
               | MetaNode !MetaId
               | MetaVar !LlvmVar
               | MetaStruct [MetaExpr]
@@ -86,3 +96,42 @@ data MetaDecl
     -- | Metadata node declaration.
     -- ('!0 = metadata !{ \<metadata expression> }' form).
     | MetaUnnamed !MetaId !MetaExpr
+
+----------------------------------------------------------------
+-- Module flags
+----------------------------------------------------------------
+data ModuleFlagBehavior
+  = MFBError
+  | MFBWarning
+  | MFBRequire
+  | MFBOverride
+  | MFBAppend
+  | MFBAppendUnique
+  | MFBMax
+  | MFBMin
+
+moduleFlagBehaviorToMetaExpr :: ModuleFlagBehavior -> MetaExpr
+moduleFlagBehaviorToMetaExpr mfb =
+    MetaLit $ LMIntLit n i32
+  where
+    n = case mfb of
+      MFBError -> 1
+      MFBWarning -> 2
+      MFBRequire -> 3
+      MFBOverride -> 4
+      MFBAppend -> 5
+      MFBAppendUnique -> 6
+      MFBMax -> 7
+      MFBMin -> 8
+
+data ModuleFlag = ModuleFlag { mfBehavior :: ModuleFlagBehavior
+                             , mfName :: LMString
+                             , mfValue :: MetaExpr
+                             }
+
+moduleFlagToMetaExpr :: ModuleFlag -> MetaExpr
+moduleFlagToMetaExpr flag = MetaStruct
+    [ moduleFlagBehaviorToMetaExpr (mfBehavior flag)
+    , MetaStr (mfName flag)
+    , mfValue flag
+    ]

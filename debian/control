@@ -10,6 +10,7 @@ Rules-Requires-Root: no
 Build-Depends:
   debhelper-compat (= 12),
   haskell-devscripts-minimal (>= 0.16.31) <!cross>,
+  binutils-gold [armel armhf],
   gcc,
   g++,
   pkg-config,
@@ -35,6 +36,7 @@ Package: ghc
 Architecture: any
 Depends:
   llvm-18 [armel armhf s390x riscv64 loong64],
+  binutils-gold [armel armhf],
   gcc,
   libgmp-dev,
   libffi-dev,

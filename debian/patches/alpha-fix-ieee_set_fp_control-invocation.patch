@@ -1,0 +1,51 @@
+From 5099057b7eaa08d53c8ab07be0f6d626496ec79d Mon Sep 17 00:00:00 2001
+From: John Paul Adrian Glaubitz <glaubitz@physik.fu-berlin.de>
+Date: Thu, 3 Oct 2024 14:30:23 +0200
+Subject: [PATCH] rts: Fix invocation of __ieee_set_fp_control() on alpha-linux
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Fixes the following error when building GHC on alpha-linux:
+
+rts/posix/Signals.c: In function ‘initDefaultHandlers’:
+
+rts/posix/Signals.c:709:5: error:
+     error: implicit declaration of function ‘ieee_set_fp_control’ [-Wimplicit-function-declaration]
+      709 |     ieee_set_fp_control(0);
+          |     ^~~~~~~~~~~~~~~~~~~
+    |
+709 |     ieee_set_fp_control(0);
+    |
+---
+ rts/posix/Signals.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/rts/posix/Signals.c b/rts/posix/Signals.c
+index b6bfe77f35..7c788b82b2 100644
+--- a/rts/posix/Signals.c
++++ b/rts/posix/Signals.c
+@@ -27,7 +27,7 @@
+ 
+ #if defined(alpha_HOST_ARCH)
+ # if defined(linux_HOST_OS)
+-#  include <asm/fpu.h>
++#  include <fenv.h>
+ # else
+ #  include <machine/fpu.h>
+ # endif
+@@ -721,7 +721,11 @@ initDefaultHandlers(void)
+ #endif
+ 
+ #if defined(alpha_HOST_ARCH)
++# if defined(linux_HOST_OS)
++    __ieee_set_fp_control(0);
++# else
+     ieee_set_fp_control(0);
++# endif
+ #endif
+ 
+     // ignore SIGPIPE; see #1619
+-- 
+2.39.5
+
