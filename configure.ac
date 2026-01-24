@@ -277,7 +277,9 @@ FP_PROG_SH
 
 # Verify that the installed (bootstrap) GHC is capable of generating
 # code for the requested build platform.
-if test "$BuildPlatform" != "$bootstrap_target"
+if test "$BuildPlatform" != "$bootstrap_target" \
+    && (test "$BuildPlatform" != "arm-unknown-linux" \
+        || test "$bootstrap_target" != "armv7-unknown-linux")
 then
     echo "This GHC (${WithGhc}) does not generate code for the build platform"
     echo "   GHC target platform    : $bootstrap_target"
