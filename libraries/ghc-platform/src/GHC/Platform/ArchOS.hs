@@ -42,9 +42,11 @@ data Arch
    | ArchARM ArmISA [ArmISAExt] ArmABI
    | ArchAArch64
    | ArchAlpha
+   | ArchHPPA
    | ArchMipseb
    | ArchMipsel
    | ArchRISCV64
+   | ArchSPARC64
    | ArchLoongArch64
    | ArchJavaScript
    | ArchWasm32
@@ -134,10 +136,12 @@ stringEncodeArch = \case
   ArchARM ARMv7 _ _ -> "armv7"
   ArchAArch64       -> "aarch64"
   ArchAlpha         -> "alpha"
+  ArchHPPA          -> "hppa"
   ArchMipseb        -> "mipseb"
   ArchMipsel        -> "mipsel"
   ArchRISCV64       -> "riscv64"
   ArchLoongArch64   -> "loongarch64"
+  ArchSPARC64       -> "sparc64"
   ArchJavaScript    -> "javascript"
   ArchWasm32        -> "wasm32"
 
