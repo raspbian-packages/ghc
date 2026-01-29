@@ -111,7 +111,7 @@ import System.FilePath as FilePath
 import Control.Monad
 import Data.Graph (stronglyConnComp, SCC(..))
 import Data.Char ( toUpper )
-import Data.List ( intersperse, partition, sortBy, isSuffixOf, sortOn )
+import Data.List ( intersperse, partition, sortBy, isSuffixOf, sortOn, sort )
 import Data.Set (Set)
 import Data.Monoid (First(..))
 import qualified Data.Semigroup as Semigroup
@@ -1676,7 +1676,9 @@ mkUnitState logger cfg = do
   -- NB: preload IS important even for type-checking, because we
   -- need the correct include path to be set.
   --
-  let preload1 = nonDetKeysUniqMap (filterUniqMap (isJust . uv_explicit) vis_map)
+  -- NB: Sorting keys here to ensure a deterministic order for the linker.
+  --
+  let preload1 = sort $ nonDetKeysUniqMap (filterUniqMap (isJust . uv_explicit) vis_map)
 
       -- add default preload units if they can be found in the db
       basicLinkedUnits = fmap (RealUnit . Definite)
