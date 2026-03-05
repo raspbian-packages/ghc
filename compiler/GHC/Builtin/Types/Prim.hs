@@ -63,7 +63,8 @@ module GHC.Builtin.Types.Prim(
         doublePrimTyCon,        doublePrimTy, doublePrimTyConName,
 
         statePrimTyCon,         mkStatePrimTy,
-        realWorldTyCon,         realWorldTy, realWorldStatePrimTy,
+        realWorldTyCon,         realWorldTy,
+        realWorldStatePrimTy,   realWorldMutableByteArrayPrimTy,
 
         proxyPrimTyCon,         mkProxyPrimTy,
 
@@ -420,8 +421,8 @@ mkTemplateKiTyVars
                              -- Result is anon arg kinds [ak1, .., akm]
     -> [TyVar]   -- [kv1:k1, ..., kvn:kn, av1:ak1, ..., avm:akm]
 -- Example: if you want the tyvars for
---   forall (r:RuntimeRep) (a:TYPE r) (b:*). blah
--- call mkTemplateKiTyVars [RuntimeRep] (\[r] -> [TYPE r, *])
+--   forall (r::RuntimeRep) (a::TYPE r) (b::Type). blah
+-- call mkTemplateKiTyVars [RuntimeRep] (\[r] -> [TYPE r, Type])
 mkTemplateKiTyVars kind_var_kinds mk_arg_kinds
   = kv_bndrs ++ tv_bndrs
   where
@@ -435,8 +436,8 @@ mkTemplateKiTyVar
                              -- Result is anon arg kinds [ak1, .., akm]
     -> [TyVar]   -- [kv1:k1, ..., kvn:kn, av1:ak1, ..., avm:akm]
 -- Example: if you want the tyvars for
---   forall (r:RuntimeRep) (a:TYPE r) (b:*). blah
--- call mkTemplateKiTyVar RuntimeRep (\r -> [TYPE r, *])
+--   forall (r::RuntimeRep) (a::TYPE r) (b::Type). blah
+-- call mkTemplateKiTyVar RuntimeRep (\r -> [TYPE r, Type])
 mkTemplateKiTyVar kind mk_arg_kinds
   = kv_bndr : tv_bndrs
   where
@@ -758,10 +759,17 @@ Wrinkles
      are not /apart/: see Note [Type and Constraint are not apart]
 
 (W2) We need two absent-error Ids, aBSENT_ERROR_ID for types of kind Type, and
-     aBSENT_CONSTRAINT_ERROR_ID for vaues of kind Constraint.  Ditto noInlineId
-     vs noInlieConstraintId in GHC.Types.Id.Make; see Note [inlineId magic].
+     aBSENT_CONSTRAINT_ERROR_ID for types of kind Constraint.
+     See Note [Type vs Constraint for error ids] in GHC.Core.Make.
+     Ditto noInlineId vs noInlineConstraintId in GHC.Types.Id.Make;
+     see Note [inlineId magic].
 
 (W3) We need a TypeOrConstraint flag in LitRubbish.
+
+(W4) In the CPR transformation, we can't unbox constructors with constraint
+     arguments because unboxed tuples (# …, … #) currently only supports fields
+     of type TYPE rr. See (CPR2) in Note [Which types are unboxed?] in
+     GHC.Core.Opt.WorkWrap.Utils.
 
 Note [Type and Constraint are not apart]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -802,7 +810,7 @@ irretrievably overlap with:
 
 Wrinkles
 
-(W1) In GHC.Core.RoughMap.roughMtchTyConName we are careful to map
+(W1) In GHC.Core.RoughMap.roughMatchTyConName we are careful to map
      TYPE and CONSTRAINT to the same rough-map key.  Reason:
      If we insert (F @Constraint tys) into a FamInstEnv, and look
      up (F @Type tys'), we /must/ ensure that the (C @Constraint tys)
@@ -819,7 +827,7 @@ Wrinkles
      are not Apart. See the FunTy/FunTy case in GHC.Core.Unify.unify_ty.
 
 (W3) Are (TYPE IntRep) and (CONSTRAINT WordRep) apart?  In truth yes,
-     they are.  But it's easier to say that htey are not apart, by
+     they are.  But it's easier to say that they are not apart, by
      reporting "maybeApart" (which is always safe), rather than
      recurse into the arguments (whose kinds may be utterly different)
      to look for apartness inside them.  Again this is in
@@ -839,8 +847,8 @@ Wrinkles
 Note [RuntimeRep polymorphism]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Generally speaking, you can't be polymorphic in `RuntimeRep`.  E.g
-   f :: forall (rr:RuntimeRep) (a:TYPE rr). a -> [a]
-   f = /\(rr:RuntimeRep) (a:rr) \(a:rr). ...
+   f :: forall (rr::RuntimeRep) (a::TYPE rr). a -> [a]
+   f = /\(rr::RuntimeRep) (a::rr) \(a::rr). ...
 This is no good: we could not generate code for 'f', because the
 calling convention for 'f' varies depending on whether the argument is
 a a Int, Int#, or Float#.  (You could imagine generating specialised
@@ -849,7 +857,7 @@ code, one for each instantiation of 'rr', but we don't do that.)
 Certain functions CAN be runtime-rep-polymorphic, because the code
 generator never has to manipulate a value of type 'a :: TYPE rr'.
 
-* error :: forall (rr:RuntimeRep) (a:TYPE rr). String -> a
+* error :: forall (rr::RuntimeRep) (a::TYPE rr). String -> a
   Code generator never has to manipulate the return value.
 
 * unsafeCoerce#, defined in Desugar.mkUnsafeCoercePair:
@@ -1037,8 +1045,8 @@ Here's what's unusual about it:
  * It is "naturally coherent". This means that the solver won't hesitate to
    solve a goal of type (a ~~ b) even if there is, say (Int ~~ c) in the
    context. (Normally, it waits to learn more, just in case the given
-   influences what happens next.) See Note [Naturally coherent classes]
-   in GHC.Tc.Solver.Interact.
+   influences what happens next.) See Note [Solving equality classes]
+   in GHC.Tc.Solver.Dict
 
  * It always terminates. That is, in the UndecidableInstances checks, we
    don't worry if a (~~) constraint is too big, as we know that solving
@@ -1047,7 +1055,7 @@ Here's what's unusual about it:
 On the other hand, this behaves just like any class w.r.t. eager superclass
 unpacking in the solver. So a lifted equality given quickly becomes an unlifted
 equality given. This is good, because the solver knows all about unlifted
-equalities. There is some special-casing in GHC.Tc.Solver.Interact.matchClassInst to
+equalities. There is some special-casing in GHC.Tc.Solver.Dict.matchClassInst to
 pretend that there is an instance of this class, as we can't write the instance
 in Haskell.
 
@@ -1171,7 +1179,9 @@ realWorldTy :: Type
 realWorldTy          = mkTyConTy realWorldTyCon
 realWorldStatePrimTy :: Type
 realWorldStatePrimTy = mkStatePrimTy realWorldTy        -- State# RealWorld
-
+realWorldMutableByteArrayPrimTy :: Type
+realWorldMutableByteArrayPrimTy
+  = mkMutableByteArrayPrimTy realWorldTy -- MutableByteArray# RealWorld
 
 mkProxyPrimTy :: Type -> Type -> Type
 mkProxyPrimTy k ty = TyConApp proxyPrimTyCon [k, ty]

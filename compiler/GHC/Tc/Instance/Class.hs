@@ -1,16 +1,16 @@
-
+{-# LANGUAGE MultiWayIf #-}
 {-# OPTIONS_GHC -Wno-incomplete-uni-patterns #-}
 
 module GHC.Tc.Instance.Class (
-     matchGlobalInst,
+     matchGlobalInst, matchEqualityInst,
      ClsInstResult(..),
      InstanceWhat(..), safeOverlap, instanceReturnsDictCon,
-     AssocInstInfo(..), isNotAssociated,
+     AssocInstInfo(..), isNotAssociated
   ) where
 
 import GHC.Prelude
 
-import GHC.Driver.Session
+import GHC.Driver.DynFlags
 
 import GHC.Core.TyCo.Rep
 
@@ -21,20 +21,22 @@ import GHC.Tc.Utils.Instantiate(instDFunType, tcInstType)
 import GHC.Tc.Instance.Typeable
 import GHC.Tc.Utils.TcMType
 import GHC.Tc.Types.Evidence
+import GHC.Tc.Types.Origin (InstanceWhat (..), SafeOverlapping)
 import GHC.Tc.Instance.Family( tcGetFamInstEnvs, tcInstNewTyCon_maybe, tcLookupDataFamInst )
-import GHC.Rename.Env( addUsedGRE )
+import GHC.Rename.Env( addUsedGRE, addUsedDataCons, DeprecationWarnings (..) )
 
 import GHC.Builtin.Types
 import GHC.Builtin.Types.Prim
 import GHC.Builtin.Names
+import GHC.Builtin.PrimOps ( PrimOp(..) )
+import GHC.Builtin.PrimOps.Ids ( primOpId )
 
 import GHC.Types.FieldLabel
-import GHC.Types.Name.Reader( lookupGRE_FieldLabel, greMangledName )
+import GHC.Types.Name.Reader
 import GHC.Types.SafeHaskell
-import GHC.Types.Name   ( Name, pprDefinedAt )
+import GHC.Types.Name   ( Name )
 import GHC.Types.Var.Env ( VarEnv )
 import GHC.Types.Id
-import GHC.Types.Id.Make ( nospecId )
 import GHC.Types.Var
 
 import GHC.Core.Predicate
@@ -46,14 +48,26 @@ import GHC.Core.DataCon
 import GHC.Core.TyCon
 import GHC.Core.Class
 
-import GHC.Core ( Expr(Var, App, Cast, Type) )
+import GHC.Core ( Expr(..) )
+
+import GHC.StgToCmm.Closure ( isSmallFamily )
 
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
 import GHC.Utils.Misc( splitAtList, fstOf3 )
 import GHC.Data.FastString
 
+import GHC.Unit.Module.Warnings
+
+import GHC.Hs.Extension
+
 import Language.Haskell.Syntax.Basic (FieldLabelString(..))
+import GHC.Types.Id.Info
+import GHC.Tc.Errors.Types
+import Control.Monad
+
+import Data.Functor
+import Data.Maybe
 
 {- *******************************************************************
 *                                                                    *
@@ -87,38 +101,18 @@ isNotAssociated (InClsInst {})     = False
 *                                                                    *
 **********************************************************************-}
 
--- | Indicates if Instance met the Safe Haskell overlapping instances safety
--- check.
---
--- See Note [Safe Haskell Overlapping Instances] in GHC.Tc.Solver
--- See Note [Safe Haskell Overlapping Instances Implementation] in GHC.Tc.Solver
-type SafeOverlapping = Bool
-
 data ClsInstResult
   = NoInstance   -- Definitely no instance
 
-  | OneInst { cir_new_theta :: [TcPredType]
-            , cir_mk_ev     :: [EvExpr] -> EvTerm
-            , cir_what      :: InstanceWhat }
+  | OneInst { cir_new_theta   :: [TcPredType]
+            , cir_mk_ev       :: [EvExpr] -> EvTerm
+            , cir_canonical   :: Canonical --   cir_canonical=True => you can specialise on this instance
+                                           --   cir_canonical= False => you cannot specialise on this instance
+                                           --                           (its OverlapFlag is NonCanonical)
+                                           -- See Note [Coherence and specialisation: overview]
+            , cir_what        :: InstanceWhat }
 
   | NotSure      -- Multiple matches and/or one or more unifiers
-
-data InstanceWhat  -- How did we solve this constraint?
-  = BuiltinEqInstance    -- Built-in solver for (t1 ~ t2), (t1 ~~ t2), Coercible t1 t2
-                         -- See GHC.Tc.Solver.InertSet Note [Solved dictionaries]
-
-  | BuiltinTypeableInstance TyCon   -- Built-in solver for Typeable (T t1 .. tn)
-                         -- See Note [Well-staged instance evidence]
-
-  | BuiltinInstance      -- Built-in solver for (C t1 .. tn) where C is
-                         --   KnownNat, .. etc (classes with no top-level evidence)
-
-  | LocalInstance        -- Solved by a quantified constraint
-                         -- See GHC.Tc.Solver.InertSet Note [Solved dictionaries]
-
-  | TopLevInstance       -- Solved by a top-level instance decl
-      { iw_dfun_id   :: DFunId
-      , iw_safe_over :: SafeOverlapping }
 
 instance Outputable ClsInstResult where
   ppr NoInstance = text "NoInstance"
@@ -126,15 +120,6 @@ instance Outputable ClsInstResult where
   ppr (OneInst { cir_new_theta = ev
                , cir_what = what })
     = text "OneInst" <+> vcat [ppr ev, ppr what]
-
-instance Outputable InstanceWhat where
-  ppr BuiltinInstance   = text "a built-in instance"
-  ppr BuiltinTypeableInstance {} = text "a built-in typeable instance"
-  ppr BuiltinEqInstance = text "a built-in equality instance"
-  ppr LocalInstance     = text "a locally-quantified instance"
-  ppr (TopLevInstance { iw_dfun_id = dfun })
-      = hang (text "instance" <+> pprSigmaType (idType dfun))
-           2 (text "--" <+> pprDefinedAt (idName dfun))
 
 safeOverlap :: InstanceWhat -> Bool
 safeOverlap (TopLevInstance { iw_safe_over = so }) = so
@@ -152,18 +137,20 @@ matchGlobalInst :: DynFlags
                 -> Bool      -- True <=> caller is the short-cut solver
                              -- See Note [Shortcut solving: overlap]
                 -> Class -> [Type] -> TcM ClsInstResult
+-- Precondition: Class does not satisfy GHC.Core.Predicate.isEqualityClass
+-- (That is handled by a separate code path: see GHC.Tc.Solver.Dict.solveDict,
+--  which calls solveEqualityDict for equality classes.)
 matchGlobalInst dflags short_cut clas tys
-  | cls_name == knownNatClassName     = matchKnownNat    dflags short_cut clas tys
-  | cls_name == knownSymbolClassName  = matchKnownSymbol dflags short_cut clas tys
-  | cls_name == knownCharClassName    = matchKnownChar   dflags short_cut clas tys
-  | isCTupleClass clas                = matchCTuple                       clas tys
-  | cls_name == typeableClassName     = matchTypeable                     clas tys
-  | cls_name == withDictClassName     = matchWithDict                          tys
-  | clas `hasKey` heqTyConKey         = matchHeteroEquality                    tys
-  | clas `hasKey` eqTyConKey          = matchHomoEquality                      tys
-  | clas `hasKey` coercibleTyConKey   = matchCoercible                         tys
-  | cls_name == hasFieldClassName     = matchHasField    dflags short_cut clas tys
-  | otherwise                         = matchInstEnv     dflags short_cut clas tys
+  | cls_name == knownNatClassName      = matchKnownNat    dflags short_cut clas tys
+  | cls_name == knownSymbolClassName   = matchKnownSymbol dflags short_cut clas tys
+  | cls_name == knownCharClassName     = matchKnownChar   dflags short_cut clas tys
+  | isCTupleClass clas                 = matchCTuple                       clas tys
+  | cls_name == typeableClassName      = matchTypeable                     clas tys
+  | cls_name == withDictClassName      = matchWithDict                          tys
+  | cls_name == dataToTagClassName     = matchDataToTag                    clas tys
+  | cls_name == hasFieldClassName      = matchHasField    dflags short_cut clas tys
+  | cls_name == unsatisfiableClassName = return NoInstance -- See (B) in Note [Implementation of Unsatisfiable constraints] in GHC.Tc.Errors
+  | otherwise                          = matchInstEnv     dflags short_cut clas tys
   where
     cls_name = className clas
 
@@ -188,12 +175,12 @@ matchInstEnv dflags short_cut_solver clas tys
         ; case (matches, unify, safeHaskFail) of
 
             -- Nothing matches
-            ([], NoUnifiers, _)
+            ([], NoUnifiers{}, _)
                 -> do { traceTc "matchClass not matching" (ppr pred $$ ppr (ie_local instEnvs))
                       ; return NoInstance }
 
             -- A single match (& no safe haskell failure)
-            ([(ispec, inst_tys)], NoUnifiers, False)
+            ([(ispec, inst_tys)], NoUnifiers canonical, False)
                 | short_cut_solver      -- Called from the short-cut solver
                 , isOverlappable ispec
                 -- If the instance has OVERLAPPABLE or OVERLAPS or INCOHERENT
@@ -205,12 +192,13 @@ matchInstEnv dflags short_cut_solver clas tys
 
                 | otherwise
                 -> do { let dfun_id = instanceDFunId ispec
+                            warn    = instanceWarning ispec
                       ; traceTc "matchClass success" $
-                        vcat [text "dict" <+> ppr pred,
+                        vcat [text "dict" <+> ppr pred <+> parens (if canonical then text "canonical" else text "non-canonical"),
                               text "witness" <+> ppr dfun_id
                                              <+> ppr (idType dfun_id) ]
                                 -- Record that this dfun is needed
-                      ; match_one (null unsafeOverlaps) dfun_id inst_tys }
+                      ; match_one (null unsafeOverlaps) canonical dfun_id inst_tys warn }
 
             -- More than one matches (or Safe Haskell fail!). Defer any
             -- reactions of a multitude until we learn more about the reagent
@@ -221,16 +209,18 @@ matchInstEnv dflags short_cut_solver clas tys
    where
      pred = mkClassPred clas tys
 
-match_one :: SafeOverlapping -> DFunId -> [DFunInstType] -> TcM ClsInstResult
-             -- See Note [DFunInstType: instantiating types] in GHC.Core.InstEnv
-match_one so dfun_id mb_inst_tys
+match_one :: SafeOverlapping -> Canonical -> DFunId -> [DFunInstType]
+          -> Maybe (WarningTxt GhcRn) -> TcM ClsInstResult
+match_one so canonical dfun_id mb_inst_tys warn
   = do { traceTc "match_one" (ppr dfun_id $$ ppr mb_inst_tys)
        ; (tys, theta) <- instDFunType dfun_id mb_inst_tys
        ; traceTc "match_one 2" (ppr dfun_id $$ ppr tys $$ ppr theta)
-       ; return $ OneInst { cir_new_theta = theta
-                          , cir_mk_ev     = evDFunApp dfun_id tys
-                          , cir_what      = TopLevInstance { iw_dfun_id = dfun_id
-                                                           , iw_safe_over = so } } }
+       ; return $ OneInst { cir_new_theta   = theta
+                          , cir_mk_ev       = evDFunApp dfun_id tys
+                          , cir_canonical   = canonical
+                          , cir_what        = TopLevInstance { iw_dfun_id = dfun_id
+                                                             , iw_safe_over = so
+                                                             , iw_warn = warn } } }
 
 
 {- Note [Shortcut solving: overlap]
@@ -262,9 +252,10 @@ was a puzzling example.
 
 matchCTuple :: Class -> [Type] -> TcM ClsInstResult
 matchCTuple clas tys   -- (isCTupleClass clas) holds
-  = return (OneInst { cir_new_theta = tys
-                    , cir_mk_ev     = tuple_ev
-                    , cir_what      = BuiltinInstance })
+  = return (OneInst { cir_new_theta   = tys
+                    , cir_mk_ev       = tuple_ev
+                    , cir_canonical   = True
+                    , cir_what        = BuiltinInstance })
             -- The dfun *is* the data constructor!
   where
      data_con = tyConSingleDataCon (classTyCon clas)
@@ -295,9 +286,10 @@ Conceptually, this class has infinitely many instances:
   instance KnownNat 2       where natSing = SNat 2
   ...
 
-In practice, we solve `KnownNat` predicates in the type-checker
-(see GHC.Tc.Solver.Interact) because we can't have infinitely many instances.
-The evidence (aka "dictionary") for `KnownNat` is of the form `EvLit (EvNum n)`.
+In practice, we solve `KnownNat` predicates in the type-checker (see
+`matchKnownNat` in this module) because we can't have infinitely many
+instances.  The evidence (aka "dictionary") for `KnownNat` is of the
+form `EvLit (EvNum n)`.
 
 We make the following assumptions about dictionaries in GHC:
   1. The "dictionary" for classes with a single method---like `KnownNat`---is
@@ -405,8 +397,8 @@ matchKnownChar df sc clas tys = matchInstEnv df sc clas tys
 
 makeLitDict :: Class -> Type -> EvExpr -> TcM ClsInstResult
 -- makeLitDict adds a coercion that will convert the literal into a dictionary
--- of the appropriate type.  See Note [KnownNat & KnownSymbol and EvLit]
--- in GHC.Tc.Types.Evidence.  The coercion happens in 2 steps:
+-- of the appropriate type.  See Note [KnownNat & KnownSymbol and EvLit].
+-- The coercion happens in 2 steps:
 --
 --     Integer -> SNat n     -- representation of literal to singleton
 --     SNat n  -> KnownNat n -- singleton to dictionary
@@ -424,9 +416,10 @@ makeLitDict clas ty et
     , Just (_, co_rep) <- tcInstNewTyCon_maybe tcRep [ty]
           -- SNat n ~ Integer
     , let ev_tm = mkEvCast et (mkSymCo (mkTransCo co_dict co_rep))
-    = return $ OneInst { cir_new_theta = []
-                       , cir_mk_ev     = \_ -> ev_tm
-                       , cir_what      = BuiltinInstance }
+    = return $ OneInst { cir_new_theta   = []
+                       , cir_mk_ev       = \_ -> ev_tm
+                       , cir_canonical   = True
+                       , cir_what        = BuiltinInstance }
 
     | otherwise
     = pprPanic "makeLitDict" $
@@ -457,19 +450,9 @@ matchWithDict [cls, mty]
        -- the WithDict dictionary:
        --
        --   \@(r :: RuntimeRep) @(a :: TYPE r) (sv :: mty) (k :: cls => a) ->
-       --     nospec @(cls => a) k (sv |> (sub co ; sym co2))
-       --
-       -- where  nospec :: forall a. a -> a  ensures that the typeclass specialiser
-       -- doesn't attempt to common up this evidence term with other evidence terms
-       -- of the same type.
-       --
-       -- See (WD6) in Note [withDict], and Note [nospecId magic] in GHC.Types.Id.Make.
+       --     k (sv |> (sub co ; sym co2))
        ; let evWithDict co2 =
                mkCoreLams [ runtimeRep1TyVar, openAlphaTyVar, sv, k ] $
-                 Var nospecId
-                   `App`
-                 (Type $ mkInvisFunTy cls openAlphaTy)
-                   `App`
                  Var k
                    `App`
                  (Var sv `Cast` mkTransCo (mkSubCo co2) (mkSymCo co))
@@ -482,9 +465,10 @@ matchWithDict [cls, mty]
                             [cls, mty] [evWithDict (evTermCoercion (EvExpr c))]
              mk_ev e   = pprPanic "matchWithDict" (ppr e)
 
-       ; return $ OneInst { cir_new_theta = [mkPrimEqPred mty inst_meth_ty]
-                          , cir_mk_ev     = mk_ev
-                          , cir_what      = BuiltinInstance }
+       ; return $ OneInst { cir_new_theta   = [mkPrimEqPred mty inst_meth_ty]
+                          , cir_mk_ev       = mk_ev
+                          , cir_canonical   = False -- See (WD6) in Note [withDict]
+                          , cir_what        = BuiltinInstance }
        }
 
 matchWithDict _
@@ -587,12 +571,14 @@ Some further observations about `withDict`:
 (WD6) In fact, we desugar `withDict @cls @mty @{rr} @r` to
 
          \@(r :: RuntimeRep) @(a :: TYPE r) (sv :: mty) (k :: cls => a) ->
-           nospec @(cls => a) k (sv |> (sub co2 ; sym co)))
+           k (sv |> (sub co2 ; sym co)))
 
-      That is, we cast the method using a coercion, and apply k to it.
-      However, we use the 'nospec' magicId (see Note [nospecId magic] in GHC.Types.Id.Make)
-      to ensure that the typeclass specialiser doesn't incorrectly common-up distinct
-      evidence terms. This is super important! Suppose we have calls
+      That is, we cast the method using a coercion, and apply k to
+      it. Moreover, we mark the evidence as non-canonical, resulting in
+      the use of the 'nospec' magicId (see Note [nospecId magic] in
+      GHC.Types.Id.Make) to ensure that the typeclass specialiser
+      doesn't incorrectly common-up distinct evidence terms. This is
+      super important! Suppose we have calls
 
           withDict A k
           withDict B k
@@ -630,7 +616,336 @@ Some further observations about `withDict`:
 
       See test-case T21575b.
 
+
+
+Note [DataToTag overview]
+~~~~~~~~~~~~~~~~~~~~~~~~~
+Class `DataToTag` is defined like this, in GHC.Magic:
+
+  type DataToTag :: forall {lev :: Levity}.
+                    TYPE (BoxedRep lev) -> Constraint
+  class DataToTag a where
+     dataToTag# :: a -> Int#
+
+`dataToTag#`, evaluates its argument and returns the index of the data
+constructor used to build that argument.  Clearly, `dataToTag#` cannot
+work on /any/ type, only on data types, hence the type-class constraint.
+
+Users cannot define instances of `DataToTag`
+(see `GHC.Tc.Validity.check_special_inst_head`).
+Instead, GHC's constraint solver has built-in solving behaviour,
+ implemented in `GHC.Tc.Instance.Class.matchGlobalInst`.
+
+(#20441: This common handling of special typeclasses is a bit of a
+mess and could use some love, and a dedicated Note.)
+
+GHC solves a wanted constraint `DataToTag @{lev} dty`
+when all of the following conditions are met:
+
+C1: `dty` is an algebraic data type, i.e. `dty` matches any of:
+       * a "data" declaration,
+       * a "data instance" declaration,
+       * a boxed tuple type
+      "type data" declarations are NOT included; see also wrinkle W2c
+      of Note [Type data declarations] in GHC.Rename.Module.
+      (In principle we could accept newtypes that wrap algebraic data
+      types, but we do not do so.)
+
+C2: All of the constructors of that "data" or "data instance"
+      declaration are in scope.  Otherwise, `dataToTag#` could be
+      used to peek behind the curtain when used with an abstract
+      data type whose constructors are intentionally hidden.
+
+C3: `lev` is statically known, either Lifted or Unlifted:
+      Otherwise the argument to `dataToTag#` would be
+      representation-polymorphic and we couldn't do anything
+      with it without Core Lint rightfully complaining.
+      This guarantees invariant (DTT1) below.
+
+It would be possible for GHC to generate custom code for each type, like
+this:
+
+   instance DataToTag [a] where
+     dataToTag# []    = 0#
+     dataToTag# (_:_) = 1#
+
+But, to avoid all this boilerplate code, and improve optimisation opportunities,
+GHC generates instances like this:
+
+   instance DataToTag [a] where
+     dataToTag# = dataToTagSmall#
+
+using one of two dedicated primops: `dataToTagSmall#` and `dataToTagLarge#`.
+(Why two primops? What's the difference? See wrinkles DTW4 and DTW5.)
+Both primops have the following over-polymorphic type:
+
+  dataToTagLarge# :: forall {l::levity} (a::TYPE (BoxedRep l)). a -> Int#
+
+Every call to either primop that we generate should look like
+(dataToTagSmall# @{lev} @ty) with two type arguments that satisfy
+these conditions:
+
+(DTT1) `lev` is concrete (either lifted or unlifted), not polymorphic.
+   This is an invariant--we must satisfy this or Core Lint will complain.
+   (This falls under situation 1 in GHC.Core.Lint's
+   Note [Linting representation-polymorphic builtins].)
+
+(DTT2) `ty` is always headed by a TyCon corresponding to one of the following:
+   * A boxed tuple
+   * A "data" declaration (but NOT a "type data" declaration)
+   * The /representation type/ for a "data instance" declaration
+     (but NOT the data family TyCon itself)
+
+   This ensures that the DataCons associated with `ty` are easily
+   accessible and safe to use in Core without running afoul of
+   invariant I1 from Note [Type data declarations] in
+   GHC.Rename.Module.  See Note [caseRules for dataToTag] in
+   GHC.Core.Opt.ConstantFold for why this matters.
+
+   While wrinkle DTW7 is unresolved, this cannot be a true invariant.
+   But with a little effort we can ensure that every primop
+   call we generate in a DataToTag instance satisfies this condition.
+
+(DTT3) If the TyCon in wrinkle DTT2 is a "large data type" with more
+   constructors than fit in pointer tags on the target, then the
+   primop must be dataToTagLarge# and not dataToTagSmall#.
+   Otherwise, the primop must be dataToTagSmall# and not dataToTagLarge#.
+   (See wrinkles DTW4 and DTW5.)
+
+These two primops have special handling in several parts of
+the compiler:
+
+H1. They have a couple of built-in rewrite rules, implemented in
+    GHC.Core.Opt.ConstantFold.dataToTagRule
+
+H2. The simplifier rewrites most case expressions scrutinizing their results.
+    See Note [caseRules for dataToTag] in GHC.Core.Opt.ConstantFold.
+
+H3. Each evaluates its argument.  But we want to omit this eval when the
+    actual argument is already evaluated and properly tagged.  To do this,
+
+    * We have a special case in GHC.Stg.InferTags.Rewrite.rewriteOpApp
+      ensuring that any inferred tag information on the argument is
+      retained until code generation.
+
+    * We generate code via special cases in GHC.StgToCmm.Expr.cgExpr
+      instead of with the other primops in GHC.StgToCmm.Prim.emitPrimOp;
+      tag info is not readily available in the latter function.
+      (Wrinkle DTW4 describes what we generate after the eval.)
+
+Wrinkles:
+
+(DTW1) To guarantee (DTT2) we need to take care with data families.
+  Consider  data family D a
+            data instance D (Either p q) = D1 | D2 p q
+  To solve the constraint
+     [W] DataToTag (D (Either t1 t2))
+  GHC uses the built-in instance
+     instance DataToTag (D (Either p q)) where
+        dataToTag# x = dataToTagSmall# @Lifted @(R:DEither p q)
+                                       (x |> sym (ax:DEither p q))
+  where `ax:DEither` is the axiom arising from the `data instance`:
+    ax:DEither p q :: D (Either p q) ~ R:DEither p q
+
+  Notice that we cast `x` before giving it to `dataToTagSmall#`, so
+  that (DTT2) is satisfied.
+
+(DTW2) Suppose we have module A (T(..)) where { data T = TCon }
+  and in module B, the constraint `DataToTag T` is needed. Per
+  condition C2, we only solve this constraint if `TCon` is in
+  scope.  So we had better not later report a warning about the
+  import of `TCon` being unused in module B!
+
+  To avoid this simply call `addUsedDataCons` when creating a built-in
+  DataToTag instance.
+
+(DTW3) Similar to DTW2, consider this example:
+
+    {-# LANGUAGE MagicHash #-}
+    module A (X(X2, X3), g) where
+    -- see also testsuite/tests/warnings/should_compile/DataToTagWarnings.hs
+    import GHC.Exts (dataToTag#, Int#)
+    data X = X1 | X2 | X3 | X4
+    g :: X -> Int#
+    g X2 = 12#
+    g v = dataToTag# v
+
+  QUESTION: What warnings should be emitted with -Wunused-top-binds?
+
+  The X1 and X4 constructors are used only in the solving of a
+  `DataToTag X` constraint in the second equation for `g`.  But if
+  these constructors were just removed, they would not be needed for
+  the solving of that `DataToTag X` constraint!  So for now we take
+  the stance that both X1 and X4 should be reported as unused.
+
+  It's not entirely clear if this is the right behavior:
+  Notice that removing X1 changes the value of `g X3` from 2# to 1#.
+  (Removing X4 causes no observable change in behavior.)
+  But this is a very obscure program!  The current "warn about both"
+  approach is not obviously wrong, either, and is consistent with the
+  behavior of derived Ix instances.
+
+  To get these warnings, we do nothing; in particular we do not call
+  keepAlive on the constructor names.
+  (Contrast with Note [Unused name reporting and HasField].)
+
+(DTW4) Why have two primops, `dataToTagSmall#` and `dataToTagLarge#`?
+  The way tag information is stored at runtime is described in
+  Note [Tagging big families] in GHC.StgToCmm.Expr.  In particular,
+  for "big data types" we must consult the heap object's info table at
+  least in the mAX_PTR_TAG case, while for "small data types" we can
+  always just examine the tag bits on the pointer itself. So:
+
+  * dataToTagSmall# consults the tag bits in the pointer, ignoring the
+    info table.  It should, therefore, be used only for data type with
+    few enough constructors that the tag always fits in the pointer.
+
+  * dataToTagLarge# also consults the tag bits in the pointer, but
+    must fall back to examining the info table whenever those tag
+    bits are equal to mAX_PTR_TAG.
+
+  One could imagine having one primop with a small/large tag, or just
+  the data type width, but the PrimOp data type is not currently set
+  up for that.  Looking at the type information on the argument during
+  code generation is also possible, but would be less reliable.
+  Remember: type information is not always preserved in STG.
+
+(DTW5) How do the two primops differ in their semantics?  We consider
+  a call `dataToTagSmall# x` to result in undefined behavior whenever
+  the target supports pointer tagging but the actual constructor index
+  for `x` is too large to fit in the pointer's tag bits.  Otherwise,
+  `dataToTagSmall#` behaves identically to `dataToTagLarge#`.
+
+  This allows the rewrites performed in GHC.Core.Opt.ConstantFold to
+  safely treat `dataToTagSmall#` identically to `dataToTagLarge#`:
+  the allowed program behaviors for the former is always a superset of
+  the allowed program behaviors for the latter.
+
+  This undefined behavior is only observable if a user writes a
+  wrongly-sized primop call.  The calls we generate are properly-sized
+  (condition DTT3 above) so that the type system protects us.
+
+(DTW6) We make no promises about the primops used to implement
+  DataToTag instances.  Changes to GHC's representation of algebraic
+  data types at runtime may force us to redesign these primops.
+  Indeed, accommodating such changes without breaking users of the
+  original (no longer existing) "dataToTag#" primop is one of the
+  main reasons the DataToTag class exists!
+
+  In particular, our current two primop implementations (as described
+  in wrinkle DTW4) are adequate for every DataToTag instance only
+  because every Haskell-land data constructor use gets translated to
+  its own "real" heap or static data object at runtime and the index
+  of that constructor is always exposed via pointer tagging and via
+  the object's info table.
+
+(DTW7) Currently, the generated module GHC.PrimopWrappers in ghc-prim
+  contains the following non-sense definitions:
+
+    {-# NOINLINE dataToTagSmall# #-}
+    dataToTagSmall# :: a_levpoly -> Int#
+    dataToTagSmall# a1 = GHC.Prim.dataToTagSmall# a1
+    {-# NOINLINE dataToTagLarge# #-}
+    dataToTagLarge# :: a_levpoly -> Int#
+    dataToTagLarge# a1 = GHC.Prim.dataToTagLarge# a1
+
+  Why do these exist? GHCi uses these symbols for... something.  There
+  is on-going work to get rid of them.  See also #24169, #20155, and !6245.
+  Their continued existence makes it difficult to do several nice things:
+
+   * As explained in DTW6, the dataToTag# primops are very internal.
+     We would like to hide them from GHC.Prim entirely to prevent
+     their mis-use, but doing so would cause GHC.PrimopWrappers to
+     fail to compile.
+
+   * The primops are applied at the (confusingly monomorphic) type
+     variable `a_levpoly` in the above definitions.  In particular,
+     they do not satisfy conditions DTT2 and DTT3 above.  We would
+     very much like these conditions to be invariants, but while
+     GHC.PrimopWrappers breaks them we cannot do so.  (The code that
+     would check these invariants in Core Lint exists but remains
+     commented out for now.)
+
+   * This in turn means that `GHC.Core.Opt.ConstantFold.caseRules`
+     must check for condition DTT2 before doing the work described in
+     Note [caseRules for dataToTag].
+
+   * Likewise, wrinkle DTW5 is only necessary because condition DTT3
+     is not an invariant.  Otherwise, invoking the currently-specified
+     undefined behavior of `dataToTagSmall# @ty` would require passing it
+     an argument which will not really have type `ty` at runtime.  And
+     evaluating such an expression is always undefined behavior anyway!
+
+
+
+Historical note:
+During its time as a primop, `dataToTag#` underwent several changes,
+mostly relating to under what circumstances it evaluates its argument.
+Today, that story is simple: A dataToTag primop always evaluates its
+argument, unless tag inference determines the argument was already
+evaluated and correctly tagged.  Getting here was a long journey, with
+many similarities to the story behind Note [Strict Field Invariant] in
+GHC.Stg.InferTags.  See also #15696.
+
 -}
+
+
+{- ********************************************************************
+*                                                                     *
+                   Class lookup for DataToTag
+*                                                                     *
+***********************************************************************-}
+
+matchDataToTag :: Class -> [Type] -> TcM ClsInstResult
+-- See Note [DataToTag overview]
+matchDataToTag dataToTagClass [levity, dty] = do
+  famEnvs <- tcGetFamInstEnvs
+  (gbl_env, _lcl_env) <- getEnvs
+  platform <- getPlatform
+  if | isConcreteType levity -- condition C3
+     , Just (rawTyCon, rawTyConArgs) <- tcSplitTyConApp_maybe dty
+     , let (repTyCon, repArgs, repCo)
+             = tcLookupDataFamInst famEnvs rawTyCon rawTyConArgs
+
+     , not (isTypeDataTyCon repTyCon)
+     , Just constrs <- tyConAlgDataCons_maybe repTyCon
+         -- condition C1
+
+     , let  rdr_env = tcg_rdr_env gbl_env
+            inScope con = isJust $ lookupGRE_Name rdr_env $ dataConName con
+     , all inScope constrs -- condition C2
+
+     , let  repTy = mkTyConApp repTyCon repArgs
+            numConstrs = tyConFamilySize repTyCon
+            !whichOp -- see wrinkle DTW4
+              | isSmallFamily platform numConstrs
+                = primOpId DataToTagSmallOp
+              | otherwise
+                = primOpId DataToTagLargeOp
+
+            -- See wrinkle DTW1; we must apply the underlying
+            -- operation at the representation type and cast it
+            methodRep = Var whichOp `App` Type levity `App` Type repTy
+            methodCo = mkFunCo Representational
+                               FTF_T_T
+                               (mkNomReflCo ManyTy)
+                               (mkSymCo repCo)
+                               (mkReflCo Representational intPrimTy)
+            dataToTagDataCon = tyConSingleDataCon (classTyCon dataToTagClass)
+            mk_ev _ = evDataConApp dataToTagDataCon
+                                   [levity, dty]
+                                   [methodRep `Cast` methodCo]
+     -> addUsedDataCons rdr_env repTyCon -- See wrinkles DTW2 and DTW3
+          $> OneInst { cir_new_theta = [] -- (Ignore stupid theta.)
+                     , cir_mk_ev = mk_ev
+                     , cir_canonical = True
+                     , cir_what = BuiltinInstance
+                     }
+     | otherwise -> pure NoInstance
+
+matchDataToTag _ _ = pure NoInstance
+
+
 
 {- ********************************************************************
 *                                                                     *
@@ -672,14 +987,15 @@ matchTypeable _ _ = return NoInstance
 -- | Representation for a type @ty@ of the form @arg -> ret@.
 doFunTy :: Class -> Type -> Mult -> Type -> Type -> TcM ClsInstResult
 doFunTy clas ty mult arg_ty ret_ty
-  = return $ OneInst { cir_new_theta = preds
-                     , cir_mk_ev     = mk_ev
-                     , cir_what      = BuiltinInstance }
+  = return $ OneInst { cir_new_theta   = preds
+                     , cir_mk_ev       = mk_ev
+                     , cir_canonical   = True
+                     , cir_what        = BuiltinInstance }
   where
     preds = map (mk_typeable_pred clas) [mult, arg_ty, ret_ty]
     mk_ev [mult_ev, arg_ev, ret_ev] = evTypeable ty $
                         EvTypeableTrFun (EvExpr mult_ev) (EvExpr arg_ev) (EvExpr ret_ev)
-    mk_ev _ = panic "GHC.Tc.Solver.Interact.doFunTy"
+    mk_ev _ = panic "GHC.Tc.Instance.Class.doFunTy"
 
 
 -- | Representation for type constructor applied to some kinds.
@@ -688,9 +1004,10 @@ doFunTy clas ty mult arg_ty ret_ty
 doTyConApp :: Class -> Type -> TyCon -> [Kind] -> TcM ClsInstResult
 doTyConApp clas ty tc kind_args
   | tyConIsTypeable tc
-  = return $ OneInst { cir_new_theta = map (mk_typeable_pred clas) kind_args
-                     , cir_mk_ev     = mk_ev
-                     , cir_what      = BuiltinTypeableInstance tc }
+  = return $ OneInst { cir_new_theta   = map (mk_typeable_pred clas) kind_args
+                     , cir_mk_ev       = mk_ev
+                     , cir_canonical   = True
+                     , cir_what        = BuiltinTypeableInstance tc }
   | otherwise
   = return NoInstance
   where
@@ -719,9 +1036,10 @@ doTyApp clas ty f tk
   | isForAllTy (typeKind f)
   = return NoInstance -- We can't solve until we know the ctr.
   | otherwise
-  = return $ OneInst { cir_new_theta = map (mk_typeable_pred clas) [f, tk]
-                     , cir_mk_ev     = mk_ev
-                     , cir_what      = BuiltinInstance }
+  = return $ OneInst { cir_new_theta   = map (mk_typeable_pred clas) [f, tk]
+                     , cir_mk_ev       = mk_ev
+                     , cir_canonical   = True
+                     , cir_what        = BuiltinInstance }
   where
     mk_ev [t1,t2] = evTypeable ty $ EvTypeableTyApp (EvExpr t1) (EvExpr t2)
     mk_ev _ = panic "doTyApp"
@@ -739,9 +1057,10 @@ doTyLit kc t = do { kc_clas <- tcLookupClass kc
                   ; let kc_pred    = mkClassPred kc_clas [ t ]
                         mk_ev [ev] = evTypeable t $ EvTypeableTyLit (EvExpr ev)
                         mk_ev _    = panic "doTyLit"
-                  ; return (OneInst { cir_new_theta = [kc_pred]
-                                    , cir_mk_ev     = mk_ev
-                                    , cir_what      = BuiltinInstance }) }
+                  ; return (OneInst { cir_new_theta   = [kc_pred]
+                                    , cir_mk_ev       = mk_ev
+                                    , cir_canonical   = True
+                                    , cir_what        = BuiltinInstance }) }
 
 {- Note [Typeable (T a b c)]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -827,30 +1146,25 @@ if you'd written
 ***********************************************************************-}
 
 -- See also Note [The equality types story] in GHC.Builtin.Types.Prim
-matchHeteroEquality :: [Type] -> TcM ClsInstResult
--- Solves (t1 ~~ t2)
-matchHeteroEquality args
-  = return (OneInst { cir_new_theta = [ mkTyConApp eqPrimTyCon args ]
-                    , cir_mk_ev     = evDataConApp heqDataCon args
-                    , cir_what      = BuiltinEqInstance })
+matchEqualityInst :: Class -> [Type] -> (DataCon, Role, Type, Type)
+-- Precondition: `cls` satisfies GHC.Core.Predicate.isEqualityClass
+-- See Note [Solving equality classes] in GHC.Tc.Solver.Dict
+matchEqualityInst cls args
+  | cls `hasKey` eqTyConKey  -- Solves (t1 ~ t2)
+  , [_,t1,t2] <- args
+  = (eqDataCon, Nominal, t1, t2)
 
-matchHomoEquality :: [Type] -> TcM ClsInstResult
--- Solves (t1 ~ t2)
-matchHomoEquality args@[k,t1,t2]
-  = return (OneInst { cir_new_theta = [ mkTyConApp eqPrimTyCon [k,k,t1,t2] ]
-                    , cir_mk_ev     = evDataConApp eqDataCon args
-                    , cir_what      = BuiltinEqInstance })
-matchHomoEquality args = pprPanic "matchHomoEquality" (ppr args)
+  | cls `hasKey` heqTyConKey -- Solves (t1 ~~ t2)
+  , [_,_,t1,t2] <- args
+  = (heqDataCon,  Nominal, t1, t2)
 
--- See also Note [The equality types story] in GHC.Builtin.Types.Prim
-matchCoercible :: [Type] -> TcM ClsInstResult
-matchCoercible args@[k, t1, t2]
-  = return (OneInst { cir_new_theta = [ mkTyConApp eqReprPrimTyCon args' ]
-                    , cir_mk_ev     = evDataConApp coercibleDataCon args
-                    , cir_what      = BuiltinEqInstance })
-  where
-    args' = [k, k, t1, t2]
-matchCoercible args = pprPanic "matchLiftedCoercible" (ppr args)
+  | cls `hasKey` coercibleTyConKey  -- Solves (Coercible t1 t2)
+  , [_, t1, t2] <- args
+  = (coercibleDataCon, Representational, t1, t2)
+
+  | otherwise  -- Does not satisfy the precondition
+  = pprPanic "matchEqualityInst" (ppr (mkClassPred cls args))
+
 
 {- ********************************************************************
 *                                                                     *
@@ -947,7 +1261,8 @@ matchHasField dflags short_cut clas tys
                -- the field selector should be in scope
              , Just gre <- lookupGRE_FieldLabel rdr_env fl
 
-             -> do { sel_id <- tcLookupId (flSelector fl)
+             -> do { let name = flSelector fl
+                   ; sel_id <- tcLookupId name
                    ; (tv_prs, preds, sel_ty) <- tcInstType newMetaTyVars sel_id
 
                          -- The first new wanted constraint equates the actual
@@ -976,11 +1291,16 @@ matchHasField dflags short_cut clas tys
                      -- it must not be higher-rank.
                    ; if not (isNaughtyRecordSelector sel_id) && isTauTy sel_ty
                      then do { -- See Note [Unused name reporting and HasField]
-                               addUsedGRE True gre
-                             ; keepAlive (greMangledName gre)
-                             ; return OneInst { cir_new_theta = theta
-                                              , cir_mk_ev     = mk_ev
-                                              , cir_what      = BuiltinInstance } }
+                               addUsedGRE AllDeprecationWarnings gre
+                             ; keepAlive name
+                             ; unless (null $ snd $ sel_cons $ idDetails sel_id)
+                                 $ addDiagnostic $ TcRnHasFieldResolvedIncomplete name
+                                 -- Only emit an incomplete selector warning if it's an implicit instance
+                                 -- See Note [Detecting incomplete record selectors] in GHC.HsToCore.Pmc
+                             ; return OneInst { cir_new_theta   = theta
+                                              , cir_mk_ev       = mk_ev
+                                              , cir_canonical   = True
+                                              , cir_what        = BuiltinInstance } }
                      else matchInstEnv dflags short_cut clas tys }
 
            _ -> matchInstEnv dflags short_cut clas tys }

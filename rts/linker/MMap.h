@@ -54,13 +54,19 @@ typedef enum {
     MEM_NO_ACCESS,
     MEM_READ_ONLY,
     MEM_READ_WRITE,
+    // Initially map pages as rw- and then switch to r-x later.
+    MEM_READ_WRITE_THEN_READ_EXECUTE,
     MEM_READ_EXECUTE,
     MEM_READ_WRITE_EXECUTE,
 } MemoryAccess;
 
 extern void *mmap_32bit_base;
 
-// Map read/write anonymous memory.
+// Map read/write anonymous memory anywhere in memory.
+void *mmapAnon(size_t bytes);
+
+// Map read/write anonymous memory, enforcing the constraint of
+// placing the mapping within 4GB of the executable image.
 void *mmapAnonForLinker (size_t bytes);
 
 // Change protection of previous mapping memory.

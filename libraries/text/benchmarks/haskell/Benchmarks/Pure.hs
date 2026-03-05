@@ -26,6 +26,8 @@ import qualified Data.Text.Encoding as T
 import qualified Data.Text.Lazy as TL
 import qualified Data.Text.Lazy.Builder as TB
 import qualified Data.Text.Lazy.Encoding as TL
+import Data.Semigroup
+import Data.List.NonEmpty (NonEmpty((:|)))
 
 data Env = Env
     { bsa :: !BS.ByteString
@@ -82,6 +84,14 @@ benchmark kind ~Env{..} =
         , bgroup "concat"
             [ benchT   $ nf T.concat tl
             , benchTL  $ nf TL.concat tll
+            ]
+        , bgroup "sconcat"
+            [ benchT   $ nf sconcat (T.empty :| tl)
+            , benchTL  $ nf sconcat (TL.empty :| tll)
+            ]
+        , bgroup "stimes"
+            [ benchT   $ nf (stimes (10 :: Int)) ta
+            , benchTL  $ nf (stimes (10 :: Int)) tla
             ]
         , bgroup "cons"
             [ benchT   $ nf (T.cons c) ta
@@ -192,6 +202,10 @@ benchmark kind ~Env{..} =
             [ benchT   $ nf T.toUpper ta
             , benchTL  $ nf TL.toUpper tla
             ]
+        , bgroup "toTitle"
+            [ benchT   $ nf T.toTitle ta
+            , benchTL  $ nf TL.toTitle tla
+            ]
         , bgroup "uncons"
             [ benchT   $ nf T.uncons ta
             , benchTL  $ nf TL.uncons tla
@@ -203,6 +217,14 @@ benchmark kind ~Env{..} =
         , bgroup "zipWith"
             [ benchT   $ nf (T.zipWith min tb) ta
             , benchTL  $ nf (TL.zipWith min tlb) tla
+            ]
+        , bgroup "length . unpack" -- length should fuse with unpack
+            [ benchT   $ nf (L.length . T.unpack) ta
+            , benchTL  $ nf (L.length . TL.unpack) tla
+            ]
+        , bgroup "length . drop 1 . unpack" -- no list fusion because of drop 1
+            [ benchT   $ nf (L.length . L.drop 1 . T.unpack) ta
+            , benchTL  $ nf (L.length . L.drop 1 . TL.unpack) tla
             ]
         , bgroup "length"
             [ bgroup "cons"
@@ -268,6 +290,10 @@ benchmark kind ~Env{..} =
             , bgroup "toUpper"
                 [ benchT   $ nf (T.length . T.toUpper) ta
                 , benchTL  $ nf (TL.length . TL.toUpper) tla
+                ]
+            , bgroup "toTitle"
+                [ benchT   $ nf (T.length . T.toTitle) ta
+                , benchTL  $ nf (TL.length . TL.toTitle) tla
                 ]
             , bgroup "words"
                 [ benchT   $ nf (L.length . T.words) ta

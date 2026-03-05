@@ -174,8 +174,7 @@ srcButton :: SourceURLs -> Maybe Interface -> Maybe Html
 srcButton (Just src_base_url, _, _, _) Nothing =
   Just (anchor ! [href src_base_url] << "Source")
 srcButton (_, Just src_module_url, _, _) (Just iface) =
-  let url = spliceURL (Just $ ifaceOrigFilename iface)
-                      (Just $ ifaceMod iface) Nothing Nothing src_module_url
+  let url = spliceURL (Just $ ifaceMod iface) Nothing Nothing src_module_url
    in Just (anchor ! [href url] << "Source")
 srcButton _ _ =
   Nothing
@@ -186,7 +185,7 @@ wikiButton (Just wiki_base_url, _, _) Nothing =
   Just (anchor ! [href wiki_base_url] << "User Comments")
 
 wikiButton (_, Just wiki_module_url, _) (Just mdl) =
-  let url = spliceURL Nothing (Just mdl) Nothing Nothing wiki_module_url
+  let url = spliceURL (Just mdl) Nothing Nothing wiki_module_url
    in Just (anchor ! [href url] << "User Comments")
 
 wikiButton _ _ =
@@ -237,8 +236,8 @@ moduleInfo iface =
       info = ifaceInfo iface
 
       doOneEntry :: (String, HaddockModInfo GHC.Name -> Maybe String) -> Maybe HtmlTable
-      doOneEntry (fieldName, field) =
-        field info >>= \a -> return (th << fieldName <-> td << a)
+      doOneEntry (fldNm, fld) =
+        fld info >>= \a -> return (th << fldNm <-> td << a)
 
       entries :: [HtmlTable]
       entries = maybeToList copyrightsTable ++ mapMaybe doOneEntry [
@@ -490,8 +489,7 @@ ppJsonIndex odir maybe_source_url maybe_wiki_url unicode pkg qual_opt ifaces ins
     fromInterface iface =
         mkIndex mdl qual `mapMaybe` ifaceRnExportItems iface
       where
-        aliases = ifaceModuleAliases iface
-        qual    = makeModuleQual qual_opt aliases mdl
+        qual    = makeModuleQual qual_opt mdl
         mdl     = ifaceMod iface
 
     mkIndex :: Module -> Qualification -> ExportItem DocNameI -> Maybe JsonIndexEntry
@@ -684,7 +682,6 @@ ppHtmlModule odir doctitle themes
   maybe_contents_url maybe_index_url unicode pkg qual debug iface = do
   let
       mdl = ifaceMod iface
-      aliases = ifaceModuleAliases iface
       mdl_str = moduleString mdl
       mdl_str_annot = mdl_str ++ if ifaceIsSig iface
                                     then " (signature)"
@@ -696,7 +693,7 @@ ppHtmlModule odir doctitle themes
                        ")"
         | otherwise
         = toHtml mdl_str
-      real_qual = makeModuleQual qual aliases mdl
+      real_qual = makeModuleQual qual mdl
       html =
         headHtml mdl_str_annot themes maybe_mathjax_url maybe_base_url +++
         bodyHtml doctitle (Just iface)

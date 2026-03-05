@@ -56,12 +56,11 @@ Dumping out compiler intermediate structures
     output of one way with the output of another.
 
 .. ghc-flag:: -ddump-json
-    :shortdesc: Dump error messages as JSON documents
+    :shortdesc: *(deprecated)* Use :ghc-flag:`-fdiagnostics-as-json` instead
     :type: dynamic
 
-    Dump error messages as JSON documents. This is intended to be consumed
-    by external tooling. A good way to use it is in conjunction with
-    :ghc-flag:`-ddump-to-file`.
+    This flag was previously used to generated JSON formatted GHC diagnostics,
+    but has been deprecated. Instead, use :ghc-flag:`-fdiagnostics-as-json`.
 
 .. ghc-flag:: -dshow-passes
     :shortdesc: Print out each pass name as it happens
@@ -333,7 +332,15 @@ subexpression elimination pass.
     :shortdesc: Dump specialiser output
     :type: dynamic
 
-    Dump output of specialisation pass
+    Dump output of typeclass specialisation pass
+
+.. ghc-flag:: -ddump-spec-constr
+    :shortdesc: Dump specialiser output from SpecConstr
+    :type: dynamic
+
+    :since: 9.8.1
+
+    Dump output of the SpecConstr specialisation pass
 
 .. ghc-flag:: -ddump-rules
     :shortdesc: Dump rewrite rules
@@ -402,6 +409,12 @@ subexpression elimination pass.
     to determine whether the inlining is beneficial.
 
 .. ghc-flag:: -ddump-stranal
+    :shortdesc: *(deprecated)* Alias for :ghc-flag:`-ddump-dmdanal`
+    :type: dynamic
+
+    Has been renamed to :ghc-flag:`-ddump-dmdanal`.
+
+.. ghc-flag:: -ddump-dmdanal
     :shortdesc: Dump demand analysis output
     :type: dynamic
 
@@ -411,6 +424,12 @@ subexpression elimination pass.
     annotations.
 
 .. ghc-flag:: -ddump-str-signatures
+    :shortdesc: *(deprecated)* Alias for :ghc-flag:`-ddump-dmd-signatures`
+    :type: dynamic
+
+    Has been renamed to :ghc-flag:`-ddump-dmd-signatures`.
+
+.. ghc-flag:: -ddump-dmd-signatures
     :shortdesc: Dump top-level demand signatures
     :type: dynamic
 
@@ -436,6 +455,31 @@ subexpression elimination pass.
     :type: dynamic
 
     Dump common subexpression elimination (CSE) pass output
+
+.. ghc-flag:: -ddump-full-laziness
+              -ddump-float-out
+    :shortdesc: Dump full laziness pass output
+    :type: dynamic
+
+    Dump full laziness pass (also known as float-out) output (see :ghc-flag:`-ffull-laziness`)
+
+.. ghc-flag:: -ddump-float-in
+    :shortdesc: Dump float in output
+    :type: dynamic
+
+    Dump float-in pass output (see :ghc-flag:`-ffloat-in`)
+
+.. ghc-flag:: -ddump-liberate-case
+    :shortdesc: Dump liberate case output
+    :type: dynamic
+
+    Dump liberate case pass output (see :ghc-flag:`-fliberate-case`)
+
+.. ghc-flag:: -ddump-static-argument-transformation
+    :shortdesc: Dump static argument transformation output
+    :type: dynamic
+
+    Dump static argument transformation pass output (see :ghc-flag:`-fstatic-argument-transformation`)
 
 .. ghc-flag:: -ddump-worker-wrapper
     :shortdesc: Dump worker-wrapper output
@@ -732,6 +776,24 @@ assembler.
     Dump the final JavaScript code produced by the JavaScript code generator.
 
 
+JavaScript code generator
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. ghc-flag:: -ddisable-js-minifier
+   :shortdesc: Generate pretty-printed JavaScript code instead of minified (compacted) code.
+   :type: dynamic
+
+   Include human-readable spacing and indentation when generating JavaScript.
+
+.. ghc-flag:: -ddisable-js-c-sources
+   :shortdesc: Disable the link with C sources compiled to JavaScript
+   :type: dynamic
+
+   For debugging it can be useful to avoid linking with C sources compiled to
+   JavaScript with Emscripten. This also avoids linking with Emcscripten's RTS.
+   Note that code that calls into this C code or that uses Emscripten's
+   primitives will fail at runtime (e.g. undefined function errors).
+
 Miscellaneous backend dumps
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -992,7 +1054,7 @@ Checking for consistency
     :shortdesc: Enable several common internal sanity checkers
     :type: dynamic
 
-    :implies: -dcore-lint, -dstg-lint, -dcmm-lint, -dasm-lint, -fllvm-fill-undef-with-garbage, -debug
+    :implies: -dcore-lint, -dstg-lint, -dcmm-lint, -dasm-lint, -fllvm-fill-undef-with-garbage, -fcatch-nonexhaustive-cases, -debug
     :since: 9.4.1
 
     Turn on various heavy-weight intra-pass sanity-checking measures within GHC
@@ -1055,6 +1117,8 @@ Checking for consistency
     :shortdesc: Align functions at given boundary.
     :type: dynamic
 
+    :since: 8.6.1
+
     Align functions to multiples of the given value. Only valid values are powers
     of two.
 
@@ -1078,6 +1142,18 @@ Checking for consistency
     With this flag GHC generates a default alternative with ``error`` in these
     cases. This is helpful when debugging demand analysis or type checker bugs
     which can sometimes manifest as segmentation faults.
+
+.. ghc-flag:: -forig-thunk-info
+    :shortdesc: Generate ``stg_orig_thunk_info`` stack frames on thunk entry
+    :type: dynamic
+
+    When debugging cyclic thunks it can be helpful to know the original
+    info table of a thunk being evaluated. This flag enables code generation logic
+    to facilitate this, producing a ``stg_orig_thunk_info`` stack frame alongside
+    the usual update frame; such ``orig_thunk`` frames have no operational
+    effect but capture the original info table of the updated thunk for inspection
+    by debugging tools. See ``Note [Original thunk info table frames]`` in
+    ``GHC.StgToCmm.Bind`` for details.
 
 .. ghc-flag:: -fcheck-prim-bounds
     :shortdesc: Instrument array primops with bounds checks.
@@ -1153,3 +1229,23 @@ Other
     be terminated. This helps narrowing down if an issue is due to tag inference
     if things go wrong. Which would otherwise be quite difficult.
 
+.. ghc-flag:: -funoptimized-core-for-interpreter
+    :shortdesc: Disable optimizations with the interpreter
+    :reverse: -fno-unoptimized-core-for-interpreter
+    :type: dynamic
+
+    :since: 9.8.1
+
+    default: enabled
+
+    At the moment, ghci disables optimizations, because not all passes
+    are compatible with the interpreter.
+    This option can be used to override this check, e.g.
+    ``ghci -O2 -fno-unoptimized-core-for-interpreter``.
+    It is not recommended for normal use and can cause a compiler panic.
+
+    Note that this has an effect on the debugger interface: With optimizations
+    in play, free variables in breakpoints may now be substituted with complex
+    expressions.
+    Those cannot be stored in breakpoints, so any free variable that refers to
+    optimized code will not be inspectable when this flag is enabled.

@@ -1,7 +1,4 @@
-{-# LANGUAGE BangPatterns #-}
-{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE GADTs #-}
-{-# LANGUAGE ScopedTypeVariables #-}
 
 module GHC.Cmm.Liveness
     ( CmmLocalLive
@@ -21,7 +18,6 @@ import GHC.Platform
 import GHC.Cmm.BlockId
 import GHC.Cmm
 import GHC.Cmm.Dataflow.Block
-import GHC.Cmm.Dataflow.Collections
 import GHC.Cmm.Dataflow
 import GHC.Cmm.Dataflow.Label
 import GHC.Cmm.LRegSet

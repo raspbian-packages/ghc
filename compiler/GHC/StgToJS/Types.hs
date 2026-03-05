@@ -1,4 +1,3 @@
-{-# LANGUAGE DeriveGeneric              #-}
 {-# LANGUAGE DerivingStrategies         #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE LambdaCase                 #-}
@@ -23,12 +22,15 @@ module GHC.StgToJS.Types where
 
 import GHC.Prelude
 
-import GHC.JS.Syntax
+import GHC.JS.JStg.Syntax
+import GHC.JS.Ident
+import qualified GHC.JS.Syntax as Sat
 import GHC.JS.Make
-import GHC.JS.Ppr ()
+import GHC.JS.Ppr () -- expose Outputable instances to downstream modules
 
 import GHC.Stg.Syntax
 import GHC.Core.TyCon
+import GHC.Linker.Config
 
 import GHC.Types.Unique
 import GHC.Types.Unique.FM
@@ -36,7 +38,7 @@ import GHC.Types.Var
 import GHC.Types.ForeignCall
 
 import Control.Monad.Trans.State.Strict
-import GHC.Utils.Outputable (Outputable (..), text, SDocContext, (<+>), ($$))
+import GHC.Utils.Outputable (Outputable (..), text, SDocContext)
 
 import GHC.Data.FastString
 import GHC.Data.FastMutInt
@@ -47,9 +49,7 @@ import qualified Data.Map as M
 import           Data.Set (Set)
 import qualified Data.ByteString as BS
 import           Data.Monoid
-import           Data.Typeable (Typeable)
-import           GHC.Generics (Generic)
-import           Control.DeepSeq
+import           Data.Word
 
 -- | A State monad over IO holding the generator state.
 type G = StateT GenState IO
@@ -62,12 +62,12 @@ data GenState = GenState
   , gsIdents    :: !IdCache               -- ^ hash consing for identifiers from a Unique
   , gsUnfloated :: !(UniqFM Id CgStgExpr) -- ^ unfloated arguments
   , gsGroup     :: GenGroupState          -- ^ state for the current binding group
-  , gsGlobal    :: [JStat]                -- ^ global (per module) statements (gets included when anything else from the module is used)
+  , gsGlobal    :: [JStgStat]             -- ^ global (per module) statements (gets included when anything else from the module is used)
   }
 
 -- | The JS code generator state relevant for the current binding group
 data GenGroupState = GenGroupState
-  { ggsToplevelStats :: [JStat]        -- ^ extra toplevel statements for the binding group
+  { ggsToplevelStats :: [JStgStat]     -- ^ extra toplevel statements for the binding group
   , ggsClosureInfo   :: [ClosureInfo]  -- ^ closure metadata (info tables) for the binding group
   , ggsStatic        :: [StaticInfo]   -- ^ static (CAF) data in our binding group
   , ggsStack         :: [StackSlot]    -- ^ stack info for the current expression
@@ -85,6 +85,7 @@ data StgToJSConfig = StgToJSConfig
   , csInlineLoadRegs  :: !Bool
   , csInlineEnter     :: !Bool
   , csInlineAlloc     :: !Bool
+  , csPrettyRender    :: !Bool
   , csTraceRts        :: !Bool
   , csAssertRts       :: !Bool
   , csBoundsCheck     :: !Bool
@@ -94,6 +95,7 @@ data StgToJSConfig = StgToJSConfig
   , csRuntimeAssert   :: !Bool -- ^ Enable runtime assertions
   -- settings
   , csContext         :: !SDocContext
+  , csLinkerConfig    :: !LinkerConfig -- ^ Emscripten linker
   }
 
 -- | Information relevenat to code generation for closures.
@@ -105,17 +107,15 @@ data ClosureInfo = ClosureInfo
   , ciType    :: CIType     -- ^ type of the object, with extra info where required
   , ciStatic  :: CIStatic   -- ^ static references of this object
   }
-  deriving stock (Eq, Show, Generic)
+  deriving stock (Eq, Show)
 
 -- | Closure information, 'ClosureInfo', registers
 data CIRegs
   = CIRegsUnknown                     -- ^ A value witnessing a state of unknown registers
   | CIRegs { ciRegsSkip  :: Int       -- ^ unused registers before actual args start
-           , ciRegsTypes :: [VarType] -- ^ args
+           , ciRegsTypes :: [JSRep]   -- ^ args
            }
-  deriving stock (Eq, Ord, Show, Generic)
-
-instance NFData CIRegs
+  deriving stock (Eq, Ord, Show)
 
 -- | Closure Information, 'ClosureInfo', layout
 data CILayout
@@ -125,11 +125,9 @@ data CILayout
       }
   | CILayoutFixed               -- ^ whole layout known
       { layoutSize :: !Int      -- ^ closure size in array positions, including entry
-      , layout     :: [VarType] -- ^ The set of sized Types to layout
+      , layout     :: [JSRep]   -- ^ The list of JSReps to layout
       }
-  deriving stock (Eq, Ord, Show, Generic)
-
-instance NFData CILayout
+  deriving stock (Eq, Ord, Show)
 
 -- | The type of 'ClosureInfo'
 data CIType
@@ -141,51 +139,47 @@ data CIType
   | CIPap                            -- ^ The closure is a Partial Application
   | CIBlackhole                      -- ^ The closure is a black hole
   | CIStackFrame                     -- ^ The closure is a stack frame
-  deriving stock (Eq, Ord, Show, Generic)
-
-instance NFData CIType
+  deriving stock (Eq, Ord, Show)
 
 -- | Static references that must be kept alive
 newtype CIStatic = CIStaticRefs { staticRefs :: [FastString] }
-  deriving stock   (Eq, Generic)
+  deriving stock   (Eq)
   deriving newtype (Semigroup, Monoid, Show)
 
 -- | static refs: array = references, null = nothing to report
 --   note: only works after all top-level objects have been created
 instance ToJExpr CIStatic where
   toJExpr (CIStaticRefs [])  = null_ -- [je| null |]
-  toJExpr (CIStaticRefs rs)  = toJExpr (map TxtI rs)
+  toJExpr (CIStaticRefs rs)  = toJExpr (map global rs)
 
--- | Free variable types
-data VarType
-  = PtrV     -- ^ pointer = reference to heap object (closure object)
+-- | JS primitive representations
+data JSRep
+  = PtrV     -- ^ pointer = reference to heap object (closure object), lifted or not.
+             -- Can also be some RTS object (e.g. TVar#, MVar#, MutVar#, Weak#)
   | VoidV    -- ^ no fields
   | DoubleV  -- ^ A Double: one field
   | IntV     -- ^ An Int (32bit because JS): one field
   | LongV    -- ^ A Long: two fields one for the upper 32bits, one for the lower (NB: JS is little endian)
   | AddrV    -- ^ a pointer not to the heap: two fields, array + index
-  | RtsObjV  -- ^ some RTS object from GHCJS (for example TVar#, MVar#, MutVar#, Weak#)
   | ObjV     -- ^ some JS object, user supplied, be careful around these, can be anything
   | ArrV     -- ^ boxed array
-  deriving stock (Eq, Ord, Enum, Bounded, Show, Generic)
+  deriving stock (Eq, Ord, Enum, Bounded, Show)
 
-instance NFData VarType
-
-instance ToJExpr VarType where
+instance ToJExpr JSRep where
   toJExpr = toJExpr . fromEnum
 
 -- | The type of identifiers. These determine the suffix of generated functions
 -- in JS Land. For example, the entry function for the 'Just' constructor is a
 -- 'IdConEntry' which compiles to:
 -- @
--- function h$baseZCGHCziMaybeziJust_con_e() { return h$rs() };
+-- function h$ghczminternalZCGHCziInternalziMaybeziJust_con_e() { return h$rs() };
 -- @
 -- which just returns whatever the stack point is pointing to. Whereas the entry
 -- function to 'Just' is an 'IdEntry' and does the work. It compiles to:
 -- @
--- function h$baseZCGHCziMaybeziJust_e() {
+-- function h$ghczminternalZCGHCziInternalziMaybeziJust_e() {
 --    var h$$baseZCGHCziMaybezieta_8KXnScrCjF5 = h$r2;
---    h$r1 = h$c1(h$baseZCGHCziMaybeziJust_con_e, h$$baseZCGHCziMaybezieta_8KXnScrCjF5);
+--    h$r1 = h$c1(h$ghczminternalZCGHCziInternalziMaybeziJust_con_e, h$$ghczminternalZCGHCziInternalziMaybezieta_8KXnScrCjF5);
 --    return h$rs();
 --    };
 -- @
@@ -200,7 +194,7 @@ data IdType
 
 -- | Keys to differentiate Ident's in the ID Cache
 data IdKey
-  = IdKey !Int !Int !IdType
+  = IdKey !Word64 !Int !IdType
   deriving (Eq, Ord)
 
 -- | Some other symbol
@@ -229,7 +223,7 @@ data StaticInfo = StaticInfo
   { siVar    :: !FastString    -- ^ global object
   , siVal    :: !StaticVal     -- ^ static initialization
   , siCC     :: !(Maybe Ident) -- ^ optional CCS name
-  } deriving stock (Eq, Show, Typeable, Generic)
+  } deriving stock (Eq, Show)
 
 data StaticVal
   = StaticFun     !FastString [StaticArg]
@@ -243,7 +237,7 @@ data StaticVal
     -- ^ regular datacon app
   | StaticList    [StaticArg] (Maybe FastString)
     -- ^ list initializer (with optional tail)
-  deriving stock (Eq, Show, Generic)
+  deriving stock (Eq, Show)
 
 data StaticUnboxed
   = StaticUnboxedBool         !Bool
@@ -251,9 +245,7 @@ data StaticUnboxed
   | StaticUnboxedDouble       !SaneDouble
   | StaticUnboxedString       !BS.ByteString
   | StaticUnboxedStringOffset !BS.ByteString
-  deriving stock (Eq, Ord, Show, Generic)
-
-instance NFData StaticUnboxed
+  deriving stock (Eq, Ord, Show)
 
 -- | Static Arguments. Static Arguments are things that are statically
 -- allocated, i.e., they exist at program startup. These are static heap objects
@@ -262,7 +254,7 @@ data StaticArg
   = StaticObjArg !FastString             -- ^ reference to a heap object
   | StaticLitArg !StaticLit              -- ^ literal
   | StaticConArg !FastString [StaticArg] -- ^ unfloated constructor
-  deriving stock (Eq, Show, Generic)
+  deriving stock (Eq, Show)
 
 instance Outputable StaticArg where
   ppr x = text (show x)
@@ -276,11 +268,10 @@ data StaticLit
   | StringLit !FastString
   | BinLit    !BS.ByteString
   | LabelLit  !Bool !FastString -- ^ is function pointer, label (also used for string / binary init)
-  deriving (Eq, Show, Generic)
+  deriving (Eq, Show)
 
 instance Outputable StaticLit where
   ppr x = text (show x)
-
 
 instance ToJExpr StaticLit where
   toJExpr (BoolLit b)           = toJExpr b
@@ -299,11 +290,11 @@ data ForeignJSRef = ForeignJSRef
   , foreignRefCConv    :: !CCallConv
   , foreignRefArgs     :: ![FastString]
   , foreignRefResult   :: !FastString
-  } deriving stock (Generic)
+  }
 
--- | data used to generate one ObjUnit in our object file
+-- | data used to generate one ObjBlock in our object file
 data LinkableUnit = LinkableUnit
-  { luObjUnit      :: ObjUnit       -- ^ serializable unit info
+  { luObjBlock     :: ObjBlock      -- ^ serializable unit info
   , luIdExports    :: [Id]          -- ^ exported names from haskell identifiers
   , luOtherExports :: [FastString]  -- ^ other exports
   , luIdDeps       :: [Id]          -- ^ identifiers this unit depends on
@@ -314,11 +305,11 @@ data LinkableUnit = LinkableUnit
   }
 
 -- | one toplevel block in the object file
-data ObjUnit = ObjUnit
+data ObjBlock = ObjBlock
   { oiSymbols  :: ![FastString]   -- ^ toplevel symbols (stored in index)
   , oiClInfo   :: ![ClosureInfo]  -- ^ closure information of all closures in block
   , oiStatic   :: ![StaticInfo]   -- ^ static closure data
-  , oiStat     :: JStat           -- ^ the code
+  , oiStat     :: Sat.JStat       -- ^ the code
   , oiRaw      :: !BS.ByteString  -- ^ raw JS code
   , oiFExports :: ![ExpFun]
   , oiFImports :: ![ForeignJSRef]
@@ -350,26 +341,26 @@ data JSFFIType
 -- | Typed expression
 data TypedExpr = TypedExpr
   { typex_typ  :: !PrimRep
-  , typex_expr :: [JExpr]
+  , typex_expr :: [JStgExpr]
   }
 
 instance Outputable TypedExpr where
-  ppr x = text "TypedExpr: " <+> ppr (typex_expr x)
-          $$  text "PrimReps: " <+> ppr (typex_typ x)
+  ppr (TypedExpr typ x) = ppr (typ, x)
 
 -- | A Primop result is either an inlining of some JS payload, or a primitive
 -- call to a JS function defined in Shim files in base.
 data PrimRes
-  = PrimInline JStat  -- ^ primop is inline, result is assigned directly
-  | PRPrimCall JStat  -- ^ primop is async call, primop returns the next
-                      --     function to run. result returned to stack top in registers
+  = PrimInline JStgStat  -- ^ primop is inline, result is assigned directly
+  | PRPrimCall JStgStat  -- ^ primop is async call, primop returns the next
+                         -- function to run. result returned to stack top in
+                         -- registers
 
 data ExprResult
   = ExprCont
-  | ExprInline (Maybe [JExpr])
+  | ExprInline
   deriving (Eq)
 
-newtype ExprValData = ExprValData [JExpr]
+newtype ExprValData = ExprValData [JStgExpr]
   deriving newtype (Eq)
 
 -- | A Closure is one of six types

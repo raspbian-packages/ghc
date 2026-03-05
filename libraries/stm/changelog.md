@@ -1,5 +1,26 @@
 # Changelog for [`stm` package](http://hackage.haskell.org/package/stm)
 
+## 2.5.3.1 *November 2023*
+
+  * Drop unused testcase inadvertently introduced in previous reversion
+
+## 2.5.3.0 *November 2023*
+
+  * Revert array-based reimplementation of `TBQueue` due to [#76](https://github.com/haskell/stm/issues/76)
+
+## 2.5.2.1 *September 2023*
+
+  * Eliminate reliance on undefined CPP behavior ([#75](https://github.com/haskell/stm/issues/75))
+
+## 2.5.2.0 *September 2023*
+
+  * Fix strictness of `stateTVar` ([#30](https://github.com/haskell/stm/ssues/30))
+  * Rewrite `TBQueue` to use a more-efficient array-based representation ([#65](https://github.com/haskell/stm/issues/65))
+  * `newTBQueue 0` now fails as one would expect ([#28](https://github.com/haskell/stm/issues/28))
+  * Add `capacityTBQueue` ([#61](https://github.com/haskell/stm/issues/61))
+  * Add `MArray TArray e IO` instance
+  * Use unlifted `Array#` for `TArray` ([#66](https://github.com/haskell/stm/pull/66))
+
 ## 2.5.1.0 *Aug 2022*
 
   * Teach `flushTBQueue` to only flush queue when necessary

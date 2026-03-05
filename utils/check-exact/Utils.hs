@@ -26,20 +26,21 @@ import Data.Ord (comparing)
 
 import GHC.Hs.Dump
 import Lookup
-import Orphans (Default())
-import qualified Orphans as Orphans
 
 import GHC hiding (EpaComment)
 import qualified GHC
+import GHC.Data.Bag
 import GHC.Types.Name
 import GHC.Types.Name.Reader
 import GHC.Types.SrcLoc
 import GHC.Driver.Ppr
 import GHC.Data.FastString
 import qualified GHC.Data.Strict as Strict
+import GHC.Base (NonEmpty(..))
 
 import Data.Data hiding ( Fixity )
 import Data.List (sortBy, elemIndex)
+import qualified Data.Map.Strict as Map
 
 import Debug.Trace
 import Types
@@ -108,6 +109,7 @@ pos2delta (refl,refc) (l,c) = deltaPos lo co
     lo = l - refl
     co = if lo == 0 then c - refc
                     else c
+                    -- else c - 1
 
 -- | Apply the delta to the current position, taking into account the
 -- current column offset if advancing to a new line
@@ -120,9 +122,9 @@ undelta (l,_) (DifferentLine dl dc) (LayoutStartCol co) = (fl,fc)
     fc = co + dc
 
 undeltaSpan :: RealSrcSpan -> AnnKeywordId -> DeltaPos -> AddEpAnn
-undeltaSpan anchor kw dp = AddEpAnn kw (EpaSpan sp Strict.Nothing)
+undeltaSpan anc kw dp = AddEpAnn kw (EpaSpan (RealSrcSpan sp Strict.Nothing))
   where
-    (l,c) = undelta (ss2pos anchor) dp (LayoutStartCol 0)
+    (l,c) = undelta (ss2pos anc) dp (LayoutStartCol 0)
     len = length (keywordToString kw)
     sp = range2rs ((l,c),(l,c+len))
 
@@ -164,6 +166,12 @@ badRealSrcSpan = mkRealSrcSpan bad bad
 spanLength :: RealSrcSpan -> Int
 spanLength = (-) <$> srcSpanEndCol <*> srcSpanStartCol
 
+
+-- | Useful for debug dumps
+eloc2str :: EpaLocation -> String
+eloc2str (EpaSpan r) = "EpaSpan " ++ show (ss2range r)
+eloc2str epaLoc = show epaLoc
+
 -- ---------------------------------------------------------------------
 -- | Checks whether a SrcSpan has zero length.
 isPointSrcSpan :: RealSrcSpan -> Bool
@@ -172,9 +180,30 @@ isPointSrcSpan ss = spanLength ss == 0
 
 -- ---------------------------------------------------------------------
 
+-- | A GHC comment includes the span of the preceding token.  Take an
+-- original comment, and convert the 'Anchor to have a have a
+-- `MovedAnchor` operation based on the original location, only if it
+-- does not already have one.
+commentOrigDelta :: LEpaComment -> LEpaComment
+commentOrigDelta (L (EpaSpan (RealSrcSpan la _)) (GHC.EpaComment t pp))
+  = (L (EpaDelta dp NoComments) (GHC.EpaComment t pp))
+                  `debug` ("commentOrigDelta: (la, pp, r,c, dp)=" ++ showAst (la, pp, r,c, dp))
+  where
+        (r,c) = ss2posEnd pp
+
+        dp = if r == 0
+               then (ss2delta (r,c+1) la)
+               else (ss2delta (r,c)   la)
+commentOrigDelta c = c
+
+origDelta :: RealSrcSpan -> RealSrcSpan -> DeltaPos
+origDelta pos pp = ss2delta (ss2posEnd pp) pos
+
+-- ---------------------------------------------------------------------
+
 -- |Given a list of items and a list of keys, returns a list of items
 -- ordered by their position in the list of keys.
-orderByKey :: [(RealSrcSpan,a)] -> [RealSrcSpan] -> [(RealSrcSpan,a)]
+orderByKey :: [(DeclTag,a)] -> [DeclTag] -> [(DeclTag,a)]
 orderByKey keys order
     -- AZ:TODO: if performance becomes a problem, consider a Map of the order
     -- SrcSpan to an index, and do a lookup instead of elemIndex.
@@ -201,10 +230,16 @@ insertCppComments ::  ParsedSource -> [LEpaComment] -> ParsedSource
 insertCppComments (L l p) cs = L l p'
   where
     an' = case GHC.hsmodAnn $ GHC.hsmodExt p of
-      (EpAnn a an ocs) -> EpAnn a an (EpaComments cs')
+      (EpAnn a an ocs) -> EpAnn a an cs'
         where
-          cs' = sortEpaComments $ priorComments ocs ++ getFollowingComments ocs ++ cs
-      unused -> unused
+          pc = priorComments ocs
+          fc = getFollowingComments ocs
+          cs' = case fc of
+            [] -> EpaComments $ sortEpaComments $ pc ++ fc ++ cs
+            (L ac _:_) -> EpaCommentsBalanced (sortEpaComments $ pc ++ cs_before)
+                                              (sortEpaComments $ fc ++ cs_after)
+                   where
+                     (cs_before,cs_after) = break (\(L ll _) ->   (ss2pos $ anchor ll) < (ss2pos $ anchor ac) ) cs
     p' = p { GHC.hsmodExt = (GHC.hsmodExt p) { GHC.hsmodAnn = an' } }
 
 -- ---------------------------------------------------------------------
@@ -214,10 +249,48 @@ ghcCommentText (L _ (GHC.EpaComment (EpaDocComment s) _))      = exactPrintHsDoc
 ghcCommentText (L _ (GHC.EpaComment (EpaDocOptions s) _))      = s
 ghcCommentText (L _ (GHC.EpaComment (EpaLineComment s) _))     = s
 ghcCommentText (L _ (GHC.EpaComment (EpaBlockComment s) _))    = s
-ghcCommentText (L _ (GHC.EpaComment (EpaEofComment) _))        = ""
 
-tokComment :: LEpaComment -> Comment
-tokComment t@(L lt c) = mkComment (normaliseCommentText $ ghcCommentText t) lt (ac_prior_tok c)
+tokComment :: LEpaComment -> [Comment]
+tokComment t@(L lt c) =
+  case c of
+    (GHC.EpaComment (EpaDocComment dc) pt) -> hsDocStringComments (noCommentsToEpaLocation lt) pt dc
+    _ -> [mkComment (normaliseCommentText (ghcCommentText t)) lt (ac_prior_tok c)]
+
+hsDocStringComments :: Anchor -> RealSrcSpan -> GHC.HsDocString -> [Comment]
+hsDocStringComments _ pt (MultiLineDocString dec (x :| xs)) =
+  let
+    decStr = printDecorator dec
+    L lx x' = dedentDocChunkBy (3 + length decStr) x
+    str = "-- " ++ decStr ++ unpackHDSC x'
+    docChunk _ [] = []
+    docChunk pt' (L l chunk:cs)
+      = Comment ("--" ++ unpackHDSC chunk) (spanAsAnchor l) pt' Nothing : docChunk (rs l) cs
+  in
+    (Comment str (spanAsAnchor lx) pt Nothing : docChunk (rs lx) (map dedentDocChunk xs))
+hsDocStringComments anc pt (NestedDocString dec@(HsDocStringNamed _) (L _ chunk))
+  = [Comment ("{- " ++ printDecorator dec ++ unpackHDSC chunk ++ "-}") (epaToNoCommentsLocation anc) pt Nothing ]
+hsDocStringComments anc pt (NestedDocString dec (L _ chunk))
+  = [Comment ("{-" ++ printDecorator dec ++ unpackHDSC chunk ++ "-}") (epaToNoCommentsLocation anc) pt Nothing ]
+
+hsDocStringComments _ _ (GeneratedDocString _) = [] -- Should not appear in user-written code
+
+-- At the moment the locations of the 'HsDocStringChunk's are from the start of
+-- the string part, leaving aside the "--". So we need to subtract 2 columns from it
+dedentDocChunk :: LHsDocStringChunk -> LHsDocStringChunk
+dedentDocChunk chunk = dedentDocChunkBy 2 chunk
+
+dedentDocChunkBy :: Int -> LHsDocStringChunk -> LHsDocStringChunk
+dedentDocChunkBy  dedent (L (RealSrcSpan l mb) c) = L (RealSrcSpan l' mb) c
+  where
+    f = srcSpanFile l
+    sl = srcSpanStartLine l
+    sc = srcSpanStartCol l
+    el = srcSpanEndLine l
+    ec = srcSpanEndCol l
+    l' = mkRealSrcSpan (mkRealSrcLoc f sl (sc - dedent))
+                       (mkRealSrcLoc f el (ec - dedent))
+
+dedentDocChunkBy _ x = x
 
 mkEpaComments :: [Comment] -> [Comment] -> EpAnnComments
 mkEpaComments priorCs []
@@ -228,12 +301,11 @@ mkEpaComments priorCs postCs
 comment2LEpaComment :: Comment -> LEpaComment
 comment2LEpaComment (Comment s anc r _mk) = mkLEpaComment s anc r
 
-mkLEpaComment :: String -> Anchor -> RealSrcSpan -> LEpaComment
-mkLEpaComment "" anc r = (L anc (GHC.EpaComment (EpaEofComment) r))
-mkLEpaComment s anc r = (L anc (GHC.EpaComment (EpaLineComment s) r))
+mkLEpaComment :: String -> NoCommentsLocation -> RealSrcSpan -> LEpaComment
+mkLEpaComment s loc r = (L loc (GHC.EpaComment (EpaLineComment s) r))
 
-mkComment :: String -> Anchor -> RealSrcSpan -> Comment
-mkComment c anc r = Comment c anc r Nothing
+mkComment :: String -> NoCommentsLocation -> RealSrcSpan -> Comment
+mkComment c loc r = Comment c loc r Nothing
 
 -- Windows comments include \r in them from the lexer.
 normaliseCommentText :: String -> String
@@ -256,11 +328,13 @@ sortEpaComments cs = sortBy cmp cs
     cmp (L l1 _) (L l2 _) = compare (ss2pos $ anchor l1) (ss2pos $ anchor l2)
 
 -- | Makes a comment which originates from a specific keyword.
-mkKWComment :: AnnKeywordId -> EpaLocation -> Comment
-mkKWComment kw (EpaSpan ss _)
-  = Comment (keywordToString kw) (Anchor ss UnchangedAnchor) ss (Just kw)
-mkKWComment kw (EpaDelta dp _)
-  = Comment (keywordToString kw) (Anchor placeholderRealSpan (MovedAnchor dp)) placeholderRealSpan (Just kw)
+mkKWComment :: AnnKeywordId -> NoCommentsLocation -> Comment
+mkKWComment kw (EpaSpan (RealSrcSpan ss mb))
+  = Comment (keywordToString kw) (EpaSpan (RealSrcSpan ss mb)) ss (Just kw)
+mkKWComment kw (EpaSpan (UnhelpfulSpan _))
+  = Comment (keywordToString kw) (EpaDelta (SameLine 0) NoComments) placeholderRealSpan (Just kw)
+mkKWComment kw (EpaDelta dp cs)
+  = Comment (keywordToString kw) (EpaDelta dp cs) placeholderRealSpan (Just kw)
 
 -- | Detects a comment which originates from a specific keyword.
 isKWComment :: Comment -> Bool
@@ -306,54 +380,8 @@ name2String = showPprUnsafe
 
 -- ---------------------------------------------------------------------
 
--- occAttributes :: OccName.OccName -> String
--- occAttributes o = "(" ++ ns ++ vo ++ tv ++ tc ++ d ++ ds ++ s ++ v ++ ")"
---   where
---     -- ns = (showSDocUnsafe $ OccName.pprNameSpaceBrief $ occNameSpace o) ++ ", "
---     ns = (showSDocUnsafe $ OccName.pprNameSpaceBrief $ occNameSpace o) ++ ", "
---     vo = if isVarOcc     o then "Var "     else ""
---     tv = if isTvOcc      o then "Tv "      else ""
---     tc = if isTcOcc      o then "Tc "      else ""
---     d  = if isDataOcc    o then "Data "    else ""
---     ds = if isDataSymOcc o then "DataSym " else ""
---     s  = if isSymOcc     o then "Sym "     else ""
---     v  = if isValOcc     o then "Val "     else ""
-
- -- ---------------------------------------------------------------------
-
 locatedAnAnchor :: LocatedAn a t -> RealSrcSpan
-locatedAnAnchor (L (SrcSpanAnn EpAnnNotUsed l) _) = realSrcSpan l
-locatedAnAnchor (L (SrcSpanAnn (EpAnn a _ _) _) _) = anchor a
-
--- ---------------------------------------------------------------------
-
-setAnchorAn :: (Default an) => LocatedAn an a -> Anchor -> EpAnnComments -> LocatedAn an a
-setAnchorAn (L (SrcSpanAnn EpAnnNotUsed l)    a) anc cs
-  = (L (SrcSpanAnn (EpAnn anc Orphans.def cs) l) a)
-     -- `debug` ("setAnchorAn: anc=" ++ showAst anc)
-setAnchorAn (L (SrcSpanAnn (EpAnn _ an _) l) a) anc cs
-  = (L (SrcSpanAnn (EpAnn anc an cs) l) a)
-     -- `debug` ("setAnchorAn: anc=" ++ showAst anc)
-
-setAnchorEpa :: (Default an) => EpAnn an -> Anchor -> EpAnnComments -> EpAnn an
-setAnchorEpa EpAnnNotUsed   anc cs = EpAnn anc Orphans.def cs
-setAnchorEpa (EpAnn _ an _) anc cs = EpAnn anc an          cs
-
-setAnchorEpaL :: EpAnn AnnList -> Anchor -> EpAnnComments -> EpAnn AnnList
-setAnchorEpaL EpAnnNotUsed   anc cs = EpAnn anc mempty cs
-setAnchorEpaL (EpAnn _ an _) anc cs = EpAnn anc (an {al_anchor = Nothing}) cs
-
-setAnchorHsModule :: HsModule GhcPs -> Anchor -> EpAnnComments -> HsModule GhcPs
-setAnchorHsModule hsmod anc cs = hsmod { hsmodExt = (hsmodExt hsmod) {hsmodAnn = an'} }
-  where
-    anc' = anc { anchor_op = UnchangedAnchor }
-    an' = setAnchorEpa (hsmodAnn $ hsmodExt hsmod) anc' cs
-
--- |Version of l2l that preserves the anchor, immportant if it has an
--- updated AnchorOperation
-moveAnchor :: Monoid b => SrcAnn a -> SrcAnn b
-moveAnchor (SrcSpanAnn EpAnnNotUsed l) = noAnnSrcSpan l
-moveAnchor (SrcSpanAnn (EpAnn anc _ cs) l) = SrcSpanAnn (EpAnn anc mempty cs) l
+locatedAnAnchor (L (EpAnn a _ _) _) = anchor a
 
 -- ---------------------------------------------------------------------
 
@@ -361,21 +389,24 @@ trailingAnnLoc :: TrailingAnn -> EpaLocation
 trailingAnnLoc (AddSemiAnn ss)    = ss
 trailingAnnLoc (AddCommaAnn ss)   = ss
 trailingAnnLoc (AddVbarAnn ss)    = ss
+trailingAnnLoc (AddDarrowAnn ss)  = ss
+trailingAnnLoc (AddDarrowUAnn ss) = ss
 
 setTrailingAnnLoc :: TrailingAnn -> EpaLocation -> TrailingAnn
 setTrailingAnnLoc (AddSemiAnn _)    ss = (AddSemiAnn ss)
 setTrailingAnnLoc (AddCommaAnn _)   ss = (AddCommaAnn ss)
 setTrailingAnnLoc (AddVbarAnn _)    ss = (AddVbarAnn ss)
+setTrailingAnnLoc (AddDarrowAnn _)  ss = (AddDarrowAnn ss)
+setTrailingAnnLoc (AddDarrowUAnn _) ss = (AddDarrowUAnn ss)
 
 addEpAnnLoc :: AddEpAnn -> EpaLocation
 addEpAnnLoc (AddEpAnn _ l) = l
 
 -- ---------------------------------------------------------------------
 
--- TODO: move this to GHC
+-- TODO: get rid of this identity function
 anchorToEpaLocation :: Anchor -> EpaLocation
-anchorToEpaLocation (Anchor r UnchangedAnchor) = EpaSpan r Strict.Nothing
-anchorToEpaLocation (Anchor _ (MovedAnchor dp)) = EpaDelta dp []
+anchorToEpaLocation a = a
 
 -- ---------------------------------------------------------------------
 -- Horrible hack for dealing with some things still having a SrcSpan,
@@ -404,28 +435,175 @@ To be absolutely sure, we make the delta versions use -ve values.
 
 hackSrcSpanToAnchor :: SrcSpan -> Anchor
 hackSrcSpanToAnchor (UnhelpfulSpan s) = error $ "hackSrcSpanToAnchor : UnhelpfulSpan:" ++ show s
-hackSrcSpanToAnchor (RealSrcSpan r Strict.Nothing) = Anchor r UnchangedAnchor
-hackSrcSpanToAnchor (RealSrcSpan r (Strict.Just (BufSpan (BufPos s) (BufPos e))))
-  = if s <= 0 && e <= 0
-    then Anchor r (MovedAnchor (deltaPos (-s) (-e)))
-      `debug` ("hackSrcSpanToAnchor: (r,s,e)=" ++ showAst (r,s,e) )
-    else Anchor r UnchangedAnchor
+hackSrcSpanToAnchor (RealSrcSpan r mb)
+  = case mb of
+    (Strict.Just (BufSpan (BufPos s) (BufPos e))) ->
+      if s <= 0 && e <= 0
+      then EpaDelta (deltaPos (-s) (-e)) []
+        `debug` ("hackSrcSpanToAnchor: (r,s,e)=" ++ showAst (r,s,e) )
+      else EpaSpan (RealSrcSpan r mb)
+    _ -> EpaSpan (RealSrcSpan r mb)
 
 hackAnchorToSrcSpan :: Anchor -> SrcSpan
-hackAnchorToSrcSpan (Anchor r UnchangedAnchor) = RealSrcSpan r Strict.Nothing
-hackAnchorToSrcSpan (Anchor r (MovedAnchor dp))
-  = RealSrcSpan r (Strict.Just (BufSpan (BufPos s) (BufPos e)))
-      `debug` ("hackAnchorToSrcSpan: (r,dp,s,e)=" ++ showAst (r,dp,s,e) )
-  where
-    s = - (getDeltaLine dp)
-    e = - (deltaColumn dp)
+hackAnchorToSrcSpan (EpaSpan s) = s
+hackAnchorToSrcSpan _ = error $ "hackAnchorToSrcSpan"
 
- -- ---------------------------------------------------------------------
+-- ---------------------------------------------------------------------
+
+type DeclsByTag a = Map.Map DeclTag [(RealSrcSpan, a)]
+
+orderedDecls
+  :: AnnSortKey DeclTag
+  -> DeclsByTag a
+  -> [(RealSrcSpan, a)]
+orderedDecls sortKey declGroup  =
+  case sortKey of
+    NoAnnSortKey ->
+      sortBy (\a b -> compare (fst a) (fst b)) (concat $ Map.elems declGroup)
+    AnnSortKey keys ->
+      let
+        go :: [DeclTag] -> DeclsByTag a -> [(RealSrcSpan, a)]
+        go [] _                      = []
+        go (tag:ks) dbt = d : go ks dbt'
+          where
+            dbt' = Map.adjust (\ds -> drop 1 ds) tag dbt
+            d = case Map.lookup tag dbt of
+              Just (d':_) -> d'
+              _           -> error $ "orderedDecls: could not look up "
+                                       ++ show tag ++ " in " ++ show (Map.keys dbt)
+      in
+        go keys declGroup
+
+hsDeclsClassDecl :: TyClDecl GhcPs -> [LHsDecl GhcPs]
+hsDeclsClassDecl dec = case dec of
+  ClassDecl { tcdCExt = (_an2, _layout, sortKey),
+              tcdSigs = sigs,tcdMeths = methods,
+              tcdATs = ats, tcdATDefs = at_defs
+            } -> map snd decls
+    where
+      srs :: EpAnn a -> RealSrcSpan
+      srs a = realSrcSpan $ locA a
+      decls
+          = orderedDecls sortKey $ Map.fromList
+              [(ClsSigTag,    map (\(L l s) -> (srs l, L l (SigD noExtField s))) sigs),
+               (ClsMethodTag, map (\(L l s) -> (srs l, L l (ValD noExtField s))) (bagToList methods)),
+               (ClsAtTag,     map (\(L l s) -> (srs l, L l (TyClD noExtField $ FamDecl noExtField s))) ats),
+               (ClsAtdTag,    map (\(L l s) -> (srs l, L l (InstD noExtField $ TyFamInstD noExtField s))) at_defs)
+              ]
+  _ -> error $ "hsDeclsClassDecl:dec=" ++ showAst dec
+
+replaceDeclsClassDecl :: TyClDecl GhcPs -> [LHsDecl GhcPs] -> TyClDecl GhcPs
+replaceDeclsClassDecl decl decls = case decl of
+  ClassDecl { tcdCExt = (an2, layout, _) } -> decl'
+    where
+      (tags, methods', sigs', ats', at_defs', _, _docs) = partitionWithSortKey decls
+      decl' = decl { tcdCExt = (an2, layout, AnnSortKey tags),
+                     tcdSigs = sigs',tcdMeths = methods',
+                     tcdATs = ats', tcdATDefs = at_defs'
+                   }
+
+  _ -> error $ "replaceDeclsClassDecl:decl=" ++ showAst decl
+
+partitionWithSortKey
+  :: [LHsDecl GhcPs]
+  -> ([DeclTag], LHsBinds GhcPs, [LSig GhcPs], [LFamilyDecl GhcPs],
+      [LTyFamInstDecl GhcPs], [LDataFamInstDecl GhcPs], [LDocDecl GhcPs])
+partitionWithSortKey = go
+  where
+    go [] = ([], emptyBag, [], [], [], [], [])
+    go ((L l decl) : ds) =
+      let (tags, bs, ss, ts, tfis, dfis, docs) = go ds in
+      case decl of
+        ValD _ b
+          -> (ClsMethodTag:tags, L l b `consBag` bs, ss, ts, tfis, dfis, docs)
+        SigD _ s
+          -> (ClsSigTag:tags, bs, L l s : ss, ts, tfis, dfis, docs)
+        TyClD _ (FamDecl _ t)
+          -> (ClsAtTag:tags, bs, ss, L l t : ts, tfis, dfis, docs)
+        InstD _ (TyFamInstD { tfid_inst = tfi })
+          -> (ClsAtdTag:tags, bs, ss, ts, L l tfi : tfis, dfis, docs)
+        InstD _ (DataFamInstD { dfid_inst = dfi })
+          -> (tags, bs, ss, ts, tfis, L l dfi : dfis, docs)
+        DocD _ d
+          -> (tags, bs, ss, ts, tfis, dfis, L l d : docs)
+        _ -> error $ "partitionBindsAndSigs" ++ (showAst decl)
+
+
+-- ---------------------------------------------------------------------
+
+orderedDeclsBinds
+  :: AnnSortKey BindTag
+  -> [LHsDecl GhcPs] -> [LHsDecl GhcPs]
+  -> [LHsDecl GhcPs]
+orderedDeclsBinds sortKey binds sigs =
+  case sortKey of
+    NoAnnSortKey ->
+      sortBy (\a b -> compare (realSrcSpan $ getLocA a)
+                              (realSrcSpan $ getLocA b)) (binds ++ sigs)
+    AnnSortKey keys ->
+      let
+        go [] _ _                      = []
+        go (BindTag:ks) (b:bs) ss = b : go ks bs ss
+        go (SigDTag:ks) bs (s:ss) = s : go ks bs ss
+        go (_:ks) bs ss           =     go ks bs ss
+      in
+        go keys binds sigs
+
+hsDeclsLocalBinds :: HsLocalBinds GhcPs -> [LHsDecl GhcPs]
+hsDeclsLocalBinds lb = case lb of
+    HsValBinds _ (ValBinds sortKey bs sigs) ->
+      let
+        bds = map wrapDecl (bagToList bs)
+        sds = map wrapSig sigs
+      in
+        orderedDeclsBinds sortKey bds sds
+    HsValBinds _ (XValBindsLR _) -> error $ "hsDecls.XValBindsLR not valid"
+    HsIPBinds {}       -> []
+    EmptyLocalBinds {} -> []
+
+hsDeclsValBinds :: (HsValBindsLR GhcPs GhcPs) -> [LHsDecl GhcPs]
+hsDeclsValBinds (ValBinds sortKey bs sigs) =
+      let
+        bds = map wrapDecl (bagToList bs)
+        sds = map wrapSig sigs
+      in
+        orderedDeclsBinds sortKey bds sds
+hsDeclsValBinds XValBindsLR{} = error "hsDeclsValBinds"
+
+-- ---------------------------------------------------------------------
+
+-- |Pure function to convert a 'LHsDecl' to a 'LHsBind'. This does
+-- nothing to any annotations that may be attached to either of the elements.
+-- It is used as a utility function in 'replaceDecls'
+decl2Bind :: LHsDecl GhcPs -> [LHsBind GhcPs]
+decl2Bind (L l (ValD _ s)) = [L l s]
+decl2Bind _                      = []
+
+-- |Pure function to convert a 'LSig' to a 'LHsBind'. This does
+-- nothing to any annotations that may be attached to either of the elements.
+-- It is used as a utility function in 'replaceDecls'
+decl2Sig :: LHsDecl GhcPs -> [LSig GhcPs]
+decl2Sig (L l (SigD _ s)) = [L l s]
+decl2Sig _                = []
+
+-- ---------------------------------------------------------------------
+
+-- |Convert a 'LSig' into a 'LHsDecl'
+wrapSig :: LSig GhcPs -> LHsDecl GhcPs
+wrapSig (L l s) = L l (SigD NoExtField s)
+
+-- ---------------------------------------------------------------------
+
+-- |Convert a 'LHsBind' into a 'LHsDecl'
+wrapDecl :: LHsBind GhcPs -> LHsDecl GhcPs
+wrapDecl (L l s) = L l (ValD NoExtField s)
+
+-- ---------------------------------------------------------------------
 
 showAst :: (Data a) => a -> String
 showAst ast
   = showSDocUnsafe
-    $ showAstData NoBlankSrcSpan NoBlankEpAnnotations ast
+    $ showAstData BlankSrcSpanFile NoBlankEpAnnotations ast
 
 -- ---------------------------------------------------------------------
 -- Putting these here for the time being, to avoid import loops
@@ -439,8 +617,8 @@ glast  info []    = error $ "glast " ++ info ++ " []"
 glast _info h     = last h
 
 gtail :: String -> [a] -> [a]
-gtail  info []   = error $ "gtail " ++ info ++ " []"
-gtail _info h    = tail h
+gtail  info []    = error $ "gtail " ++ info ++ " []"
+gtail _info (_:t) = t
 
 gfromJust :: String -> Maybe a -> a
 gfromJust _info (Just h) = h

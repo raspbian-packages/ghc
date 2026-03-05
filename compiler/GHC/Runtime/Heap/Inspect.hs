@@ -1,4 +1,4 @@
-{-# LANGUAGE BangPatterns, ScopedTypeVariables, MagicHash #-}
+{-# LANGUAGE MagicHash #-}
 
 -----------------------------------------------------------------------------
 --
@@ -41,9 +41,10 @@ import GHC.Core.TyCon
 import GHC.Tc.Utils.Monad
 import GHC.Tc.Utils.TcType
 import GHC.Tc.Utils.TcMType
-import GHC.Tc.Utils.Zonk ( zonkTcTypeToTypeX, mkEmptyZonkEnv, ZonkFlexi( RuntimeUnkFlexi ) )
+import GHC.Tc.Zonk.Type
 import GHC.Tc.Utils.Unify
 import GHC.Tc.Utils.Env
+import GHC.Tc.Zonk.TcType
 
 import GHC.Types.Var
 import GHC.Types.Name
@@ -55,11 +56,10 @@ import GHC.Types.Var.Set
 import GHC.Types.Basic ( Boxity(..) )
 import GHC.Builtin.Types.Prim
 import GHC.Builtin.Types
-import GHC.Driver.Session
+import GHC.Driver.DynFlags
 import GHC.Driver.Ppr
 import GHC.Utils.Outputable as Ppr
 import GHC.Utils.Panic
-import GHC.Utils.Panic.Plain
 import GHC.Char
 import GHC.Exts.Heap
 import GHC.Runtime.Heap.Layout ( roundUpTo )
@@ -478,22 +478,6 @@ repPrim t = rep where
     | t == int64PrimTyCon            = text $ show (build x :: Int64)
     | t == word64PrimTyCon           = text $ show (build x :: Word64)
     | t == addrPrimTyCon             = text $ show (nullPtr `plusPtr` build x)
-    | t == stablePtrPrimTyCon        = text "<stablePtr>"
-    | t == stableNamePrimTyCon       = text "<stableName>"
-    | t == statePrimTyCon            = text "<statethread>"
-    | t == proxyPrimTyCon            = text "<proxy>"
-    | t == realWorldTyCon            = text "<realworld>"
-    | t == threadIdPrimTyCon         = text "<ThreadId>"
-    | t == weakPrimTyCon             = text "<Weak>"
-    | t == arrayPrimTyCon            = text "<array>"
-    | t == smallArrayPrimTyCon       = text "<smallArray>"
-    | t == byteArrayPrimTyCon        = text "<bytearray>"
-    | t == mutableArrayPrimTyCon     = text "<mutableArray>"
-    | t == smallMutableArrayPrimTyCon = text "<smallMutableArray>"
-    | t == mutableByteArrayPrimTyCon = text "<mutableByteArray>"
-    | t == mutVarPrimTyCon           = text "<mutVar>"
-    | t == mVarPrimTyCon             = text "<mVar>"
-    | t == tVarPrimTyCon             = text "<tVar>"
     | otherwise                      = char '<' <> ppr t <> char '>'
     where build ww = unsafePerformIO $ withArray ww (peek . castPtr)
 --   This ^^^ relies on the representation of Haskell heap values being
@@ -672,7 +656,7 @@ applyRevSubst :: RttiInstantiation -> TR ()
 -- Apply the *reverse* substitution in-place to any un-filled-in
 -- meta tyvars.  This recovers the original debugger-world variable
 -- unless it has been refined by new information from the heap
-applyRevSubst pairs = liftTcM (mapM_ do_pair pairs)
+applyRevSubst pairs = liftTcM (liftZonkM $ mapM_ do_pair pairs)
   where
     do_pair (tc_tv, rtti_tv)
       = do { tc_ty <- zonkTcTyVar tc_tv
@@ -735,7 +719,7 @@ cvObtainTerm hsc_env max_depth force old_ty hval = runTR hsc_env $ do
               when (check1 old_tvs) (traceTR (text "check1 passed") >>
                                           addConstraint my_ty old_ty')
               term  <- go max_depth my_ty old_ty hval
-              new_ty <- zonkTcType (termType term)
+              new_ty <- liftTcM $ liftZonkM $ zonkTcType (termType term)
               if isMonomorphic new_ty || check2 new_ty old_ty
                  then do
                       traceTR (text "check2 passed")
@@ -904,8 +888,8 @@ extractSubTerms recurse clos = liftM thdOf3 . go 0 0
            (ptr_i, arr_i, terms1) <- go ptr_i arr_i tys
            return (ptr_i, arr_i, unboxedTupleTerm ty terms0 : terms1)
       | otherwise
-      = case typePrimRepArgs ty of
-          [rep_ty] ->  do
+      = case typePrimRep ty of
+          [rep_ty] -> do
             (ptr_i, arr_i, term0)  <- go_rep ptr_i arr_i ty rep_ty
             (ptr_i, arr_i, terms1) <- go ptr_i arr_i tys
             return (ptr_i, arr_i, term0 : terms1)
@@ -1012,11 +996,11 @@ cvReconstructType hsc_env max_depth old_ty hval = runTR_maybe hsc_env $ do
           my_ty <- newOpenVar
           when (check1 old_tvs) (traceTR (text "check1 passed") >>
                                       addConstraint my_ty old_ty')
-          search (isMonomorphic `fmap` zonkTcType my_ty)
+          search (isMonomorphic `fmap` liftZonkM (zonkTcType my_ty))
                  (\(ty,a) -> go ty a)
                  (Seq.singleton (my_ty, hval))
                  max_depth
-          new_ty <- zonkTcType my_ty
+          new_ty <- liftZonkM $ zonkTcType my_ty
           if isMonomorphic new_ty || check2 new_ty old_ty
             then do
                  traceTR (text "check2 passed" <+> ppr old_ty $$ ppr new_ty)
@@ -1397,8 +1381,8 @@ zonkTerm = foldTermM (TermFoldM
 zonkRttiType :: TcType -> TcM Type
 -- Zonk the type, replacing any unbound Meta tyvars
 -- by RuntimeUnk skolems, safely out of Meta-tyvar-land
-zonkRttiType ty= do { ze <- mkEmptyZonkEnv RuntimeUnkFlexi
-                    ; zonkTcTypeToTypeX ze ty }
+zonkRttiType ty
+  = initZonkEnv RuntimeUnkFlexi $ zonkTcTypeToTypeX ty
 
 --------------------------------------------------------------------------------
 -- Restore Class predicates out of a representation type

@@ -16,14 +16,14 @@ lower levels it is preserved with @let@/@letrec@s).
 
 module GHC.HsToCore.Binds
    ( dsTopLHsBinds, dsLHsBinds, decomposeRuleLhs, dsSpec
-   , dsHsWrapper, dsEvTerm, dsTcEvBinds, dsTcEvBinds_s, dsEvBinds
+   , dsHsWrapper, dsHsWrappers, dsEvTerm, dsTcEvBinds, dsTcEvBinds_s, dsEvBinds
    , dsWarnOrphanRule
    )
 where
 
 import GHC.Prelude
 
-import GHC.Driver.Session
+import GHC.Driver.DynFlags
 import GHC.Driver.Config
 import qualified GHC.LanguageExtensions as LangExt
 import GHC.Unit.Module
@@ -41,6 +41,7 @@ import GHC.Hs             -- lots of things
 import GHC.Core           -- lots of things
 import GHC.Core.SimpleOpt    ( simpleOptExpr )
 import GHC.Core.Opt.OccurAnal ( occurAnalyseExpr )
+import GHC.Core.InstEnv ( Canonical )
 import GHC.Core.Make
 import GHC.Core.Utils
 import GHC.Core.Opt.Arity     ( etaExpand )
@@ -60,6 +61,7 @@ import GHC.Builtin.Types ( naturalTy, typeSymbolKind, charTy )
 import GHC.Tc.Types.Evidence
 
 import GHC.Types.Id
+import GHC.Types.Id.Make ( nospecId )
 import GHC.Types.Name
 import GHC.Types.Var.Set
 import GHC.Types.Var.Env
@@ -72,13 +74,13 @@ import GHC.Data.Maybe
 import GHC.Data.OrdList
 import GHC.Data.Graph.Directed
 import GHC.Data.Bag
+import qualified Data.Set as S
 
 import GHC.Utils.Constants (debugIsOn)
 import GHC.Utils.Misc
 import GHC.Utils.Monad
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
-import GHC.Utils.Panic.Plain
 
 import Control.Monad
 
@@ -114,10 +116,54 @@ dsTopLHsBinds binds
     top_level_err bindsType (L loc bind)
       = putSrcSpanDs (locA loc) $
         diagnosticDs (DsTopLevelBindsNotAllowed bindsType bind)
+{-
+Note [Return non-recursive bindings in dependency order]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+For recursive bindings, the desugarer has no choice: it returns a single big
+Rec{...} group.
 
+But for /non-recursive/ bindings, the desugarer guarantees to desugar them to
+a sequence of non-recurive Core bindings, in dependency order.
+
+Why is this important?  Partly it saves a bit of work in the first run of the
+occurrence analyser. But more importantly, for linear types, non-recursive lets
+can be linear whereas recursive-let can't. Since we check the output of the
+desugarer for linearity (see also Note [Linting linearity]), desugaring
+non-recursive lets to recursive lets would break linearity checks. An
+alternative is to refine the typing rule for recursive lets so that we don't
+have to care (see in particular #23218 and #18694), but the outcome of this line
+of work is still unclear. In the meantime, being a little precise in the
+desugarer is cheap. (paragraph written on 2023-06-09)
+
+In dsLHSBinds (and dependencies), a single binding can be desugared to multiple
+bindings. For instance because the source binding has the {-# SPECIALIZE #-}
+pragma. In:
+
+f _ = …
+ where
+  {-# SPECIALIZE g :: F Int -> F Int #-}
+  g :: C a => F a -> F a
+  g _ = …
+
+The g binding desugars to
+
+let {
+  $sg = … } in
+
+  g
+  [RULES: "SPEC g" g @Int $dC = $sg]
+  g = …
+
+In order to avoid generating a letrec that will immediately be reordered, we
+make sure to return the binding in dependency order [$sg, g].
+
+-}
 
 -- | Desugar all other kind of bindings, Ids of strict binds are returned to
 -- later be forced in the binding group body, see Note [Desugar Strict binds]
+--
+-- Invariant: the desugared bindings are returned in dependency order,
+-- see Note [Return non-recursive bindings in dependency order]
 dsLHsBinds :: LHsBinds GhcTc -> DsM ([Id], [(Id,CoreExpr)])
 dsLHsBinds binds
   = do { ds_bs <- mapBagM dsLHsBind binds
@@ -131,6 +177,9 @@ dsLHsBind (L loc bind) = do dflags <- getDynFlags
                             putSrcSpanDs (locA loc) $ dsHsBind dflags bind
 
 -- | Desugar a single binding (or group of recursive binds).
+--
+-- Invariant: the desugared bindings are returned in dependency order,
+-- see Note [Return non-recursive bindings in dependency order]
 dsHsBind :: DynFlags
          -> HsBind GhcTc
          -> DsM ([Id], [(Id,CoreExpr)])
@@ -153,7 +202,8 @@ dsHsBind dflags b@(FunBind { fun_id = L loc fun
                            , fun_matches = matches
                            , fun_ext = (co_fn, tick)
                            })
- = do   { (args, body) <- addTyCs FromSource (hsWrapDictBinders co_fn) $
+ = do   { dsHsWrapper co_fn $ \core_wrap -> do
+        { (args, body) <- addTyCs FromSource (hsWrapDictBinders co_fn) $
                           -- FromSource might not be accurate (we don't have any
                           -- origin annotations for things in this module), but at
                           -- worst we do superfluous calls to the pattern match
@@ -163,7 +213,6 @@ dsHsBind dflags b@(FunBind { fun_id = L loc fun
                           -- See Note [Long-distance information] in "GHC.HsToCore.Pmc"
                           matchWrapper (mkPrefixFunRhs (L loc (idName fun))) Nothing matches
 
-        ; core_wrap <- dsHsWrapper co_fn
         ; let body' = mkOptTickBox tick body
               rhs   = core_wrap (mkLams args body')
               core_binds@(id,_) = makeCorePair dflags fun False 0 rhs
@@ -179,7 +228,7 @@ dsHsBind dflags b@(FunBind { fun_id = L loc fun
         ; --pprTrace "dsHsBind" (vcat [ ppr fun <+> ppr (idInlinePragma fun)
           --                          , ppr (mg_alts matches)
           --                          , ppr args, ppr core_binds, ppr body']) $
-          return (force_var, [core_binds]) }
+          return (force_var, [core_binds]) } }
 
 dsHsBind dflags (PatBind { pat_lhs = pat, pat_rhs = grhss
                          , pat_ext = (ty, (rhs_tick, var_ticks))
@@ -188,7 +237,7 @@ dsHsBind dflags (PatBind { pat_lhs = pat, pat_rhs = grhss
         ; body_expr <- dsGuarded grhss ty rhss_nablas
         ; let body' = mkOptTickBox rhs_tick body_expr
               pat'  = decideBangHood dflags pat
-        ; (force_var,sel_binds) <- mkSelectorBinds var_ticks pat body'
+        ; (force_var,sel_binds) <- mkSelectorBinds var_ticks pat PatBindRhs body'
           -- We silently ignore inline pragmas; no makeCorePair
           -- Not so cool, but really doesn't matter
         ; let force_var' = if isBangedLPat pat'
@@ -202,16 +251,15 @@ dsHsBind
                         , abs_exports = exports
                         , abs_ev_binds = ev_binds
                         , abs_binds = binds, abs_sig = has_sig }))
-  = do { ds_binds <- addTyCs FromSource (listToBag dicts) $
+  = dsTcEvBinds_s ev_binds $ \ds_ev_binds -> do
+    { ds_binds <- addTyCs FromSource (listToBag dicts) $
                      dsLHsBinds binds
              -- addTyCs: push type constraints deeper
              --            for inner pattern match check
              -- See Check, Note [Long-distance information]
 
-       ; ds_ev_binds <- dsTcEvBinds_s ev_binds
-
-       -- dsAbsBinds does the hard work
-       ; dsAbsBinds dflags tyvars dicts exports ds_ev_binds ds_binds has_sig }
+    -- dsAbsBinds does the hard work
+    ; dsAbsBinds dflags tyvars dicts exports ds_ev_binds ds_binds (isSingletonBag binds) has_sig }
 
 dsHsBind _ (PatSynBind{}) = panic "dsHsBind: PatSynBind"
 
@@ -220,11 +268,12 @@ dsAbsBinds :: DynFlags
            -> [TyVar] -> [EvVar] -> [ABExport]
            -> [CoreBind]                -- Desugared evidence bindings
            -> ([Id], [(Id,CoreExpr)])   -- Desugared value bindings
+           -> Bool                      -- Single source binding
            -> Bool                      -- Single binding with signature
            -> DsM ([Id], [(Id,CoreExpr)])
 
 dsAbsBinds dflags tyvars dicts exports
-           ds_ev_binds (force_vars, bind_prs) has_sig
+           ds_ev_binds (force_vars, bind_prs) is_singleton has_sig
 
     -- A very important common case: one exported variable
     -- Non-recursive bindings come through this way
@@ -241,9 +290,8 @@ dsAbsBinds dflags tyvars dicts exports
                            _                   -> Nothing
        -- If there is a variable to force, it's just the
        -- single variable we are binding here
-  = do { core_wrap <- dsHsWrapper wrap -- Usually the identity
-
-       ; let rhs = core_wrap $
+  = do { dsHsWrapper wrap $ \core_wrap -> do -- Usually the identity
+       { let rhs = core_wrap $
                    mkLams tyvars $ mkLams dicts $
                    mkCoreLets ds_ev_binds $
                    body
@@ -261,30 +309,40 @@ dsAbsBinds dflags tyvars dicts exports
                                        (isDefaultMethod prags)
                                        (dictArity dicts) rhs
 
-       ; return (force_vars', main_bind : fromOL spec_binds) }
+       ; return (force_vars', fromOL spec_binds ++ [main_bind]) } }
 
     -- Another common case: no tyvars, no dicts
     -- In this case we can have a much simpler desugaring
     --    lcl_id{inl-prag} = rhs  -- Auxiliary binds
     --    gbl_id = lcl_id |> co   -- Main binds
+    --
+    -- See Note [The no-tyvar no-dict case]
   | null tyvars, null dicts
-  = do { let mk_main :: ABExport -> DsM (Id, CoreExpr)
+  = do { let wrap_first_bind f ((main, main_rhs):other_binds) =
+               ((main, f main_rhs):other_binds)
+             wrap_first_bind _ [] = panic "dsAbsBinds received an empty binding list"
+
+             mk_main :: ABExport -> DsM (Id, CoreExpr)
              mk_main (ABE { abe_poly = gbl_id, abe_mono = lcl_id
                           , abe_wrap = wrap })
                      -- No SpecPrags (no dicts)
                      -- Can't be a default method (default methods are singletons)
-               = do { core_wrap <- dsHsWrapper wrap
-                    ; return ( gbl_id `setInlinePragma` defaultInlinePragma
-                             , core_wrap (Var lcl_id)) }
-
+               = do { dsHsWrapper wrap $ \core_wrap -> do
+                    { return ( gbl_id `setInlinePragma` defaultInlinePragma
+                             , core_wrap (Var lcl_id)) } }
        ; main_prs <- mapM mk_main exports
-       ; return (force_vars, flattenBinds ds_ev_binds
-                              ++ mk_aux_binds bind_prs ++ main_prs ) }
+       ; let bind_prs' = map mk_aux_bind bind_prs
+             -- When there's a single source binding, we wrap the evidence binding in a
+             -- separate let-rec (DSB1) inside the first desugared binding (DSB2).
+             -- See Note [The no-tyvar no-dict case].
+             final_prs | is_singleton = wrap_first_bind (mkCoreLets ds_ev_binds) bind_prs'
+                       | otherwise = flattenBinds ds_ev_binds ++ bind_prs'
+       ; return (force_vars, final_prs ++ main_prs ) }
 
     -- The general case
     -- See Note [Desugaring AbsBinds]
   | otherwise
-  = do { let aux_binds = Rec (mk_aux_binds bind_prs)
+  = do { let aux_binds = Rec (map mk_aux_bind bind_prs)
                 -- Monomorphic recursion possible, hence Rec
 
              new_force_vars = get_new_force_vars force_vars
@@ -307,10 +365,10 @@ dsAbsBinds dflags tyvars dicts exports
        ; let mk_bind (ABE { abe_wrap = wrap
                           , abe_poly = global
                           , abe_mono = local, abe_prags = spec_prags })
-                          -- See Note [AbsBinds wrappers] in "GHC.Hs.Binds"
+                          -- See Note [ABExport wrapper] in "GHC.Hs.Binds"
                 = do { tup_id  <- newSysLocalDs ManyTy tup_ty
-                     ; core_wrap <- dsHsWrapper wrap
-                     ; let rhs = core_wrap $ mkLams tyvars $ mkLams dicts $
+                     ; dsHsWrapper wrap $ \core_wrap -> do
+                     { let rhs = core_wrap $ mkLams tyvars $ mkLams dicts $
                                  mkBigTupleSelector all_locals local tup_id $
                                  mkVarApps (Var poly_tup_id) (tyvars ++ dicts)
                            rhs_for_spec = Let (NonRec poly_tup_id poly_tup_rhs) rhs
@@ -320,7 +378,7 @@ dsAbsBinds dflags tyvars dicts exports
                            -- Kill the INLINE pragma because it applies to
                            -- the user written (local) function.  The global
                            -- Id is just the selector.  Hmm.
-                     ; return ((global', rhs) : fromOL spec_binds) }
+                     ; return (fromOL spec_binds ++ [(global', rhs)]) } }
 
        ; export_binds_s <- mapM mk_bind (exports ++ extra_exports)
 
@@ -328,11 +386,11 @@ dsAbsBinds dflags tyvars dicts exports
                 , (poly_tup_id, poly_tup_rhs) :
                    concat export_binds_s) }
   where
-    mk_aux_binds :: [(Id,CoreExpr)] -> [(Id,CoreExpr)]
-    mk_aux_binds bind_prs = [ makeCorePair dflags lcl_w_inline False 0 rhs
-                            | (lcl_id, rhs) <- bind_prs
-                            , let lcl_w_inline = lookupVarEnv inline_env lcl_id
-                                                 `orElse` lcl_id ]
+    mk_aux_bind :: (Id,CoreExpr) -> (Id,CoreExpr)
+    mk_aux_bind (lcl_id, rhs) = let lcl_w_inline = lookupVarEnv inline_env lcl_id
+                                                   `orElse` lcl_id
+                                 in
+                                 makeCorePair dflags lcl_w_inline False 0 rhs
 
     inline_env :: IdEnv Id -- Maps a monomorphic local Id to one with
                            -- the inline pragma from the source
@@ -471,47 +529,70 @@ So the overloading is in the nested AbsBinds. A good example is in GHC.Float:
 The top-level AbsBinds for $cround has no tyvars or dicts (because the
 instance does not).  But the method is locally overloaded!
 
-Note [Abstracting over tyvars only]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-When abstracting over type variable only (not dictionaries), we don't really need to
-built a tuple and select from it, as we do in the general case. Instead we can take
+Note [The no-tyvar no-dict case]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Suppose we are desugaring
+    AbsBinds { tyvars   = []
+             , dicts    = []
+             , exports  = [ ABE f fm, ABE g gm ]
+             , binds    = B
+             , ev_binds = EB }
+That is: no type variables or dictionary abstractions.  Here, `f` and `fm` are
+the polymorphic and monomorphic versions of `f`; in this special case they will
+both have the same type.
 
-        AbsBinds [a,b] [ ([a,b], fg, fl, _),
-                         ([b],   gg, gl, _) ]
-                { fl = e1
-                  gl = e2
-                   h = e3 }
+Specialising Note [Desugaring AbsBinds] for this case gives the desugaring
 
-and desugar it to
+    tup = letrec EB' in letrec B' in (fm,gm)
+    f = case tup of { (fm,gm) -> fm }
+    g = case tup of { (fm,gm) -> fm }
 
-        fg = /\ab. let B in e1
-        gg = /\b. let a = () in let B in S(e2)
-        h  = /\ab. let B in e3
+where B' is the result of desugaring B. This desugaring is a little silly: we
+don't need the intermediate tuple (contrast with the general case where fm and f
+have different types). So instead, in this case, we desugar to
 
-where B is the *non-recursive* binding
-        fl = fg a b
-        gl = gg b
-        h  = h a b    -- See (b); note shadowing!
+    EB'; B'; f=fm; g=gm
 
-Notice (a) g has a different number of type variables to f, so we must
-             use the mkArbitraryType thing to fill in the gaps.
-             We use a type-let to do that.
+This is done in the `null tyvars, null dicts` case of `dsAbsBinds`.
 
-         (b) The local variable h isn't in the exports, and rather than
-             clone a fresh copy we simply replace h by (h a b), where
-             the two h's have different types!  Shadowing happens here,
-             which looks confusing but works fine.
+But there is a wrinkle (DSB1).  If the original binding group was
+/non-recursive/, we want to return a bunch of non-recursive bindings in
+dependency order: see Note [Return non-recursive bindings in dependency order].
 
-         (c) The result is *still* quadratic-sized if there are a lot of
-             small bindings.  So if there are more than some small
-             number (10), we filter the binding set B by the free
-             variables of the particular RHS.  Tiresome.
+But there is no guarantee that EB', the desugared evidence bindings, will be
+non-recursive.  Happily, in the non-recursive case, B will have just a single
+binding (f = rhs), so we can wrap EB' around its RHS, thus:
+
+   fm = letrec EB' in rhs; f = fm
+
+There is a sub-wrinkle (DSB2).  If B is a /pattern/ bindings, it will desugar to
+a "main" binding followed by a bunch of selectors. The main binding always
+comes first, so we can pick it out and wrap EB' around its RHS.  For example
+
+    AbsBinds { tyvars   = []
+             , dicts    = []
+             , exports  = [ ABE p pm, ABE q qm ]
+             , binds    = PatBind (pm, Just qm) rhs
+             , ev_binds = EB }
+
+can desguar to
+
+   pt = let EB' in
+        case rhs of
+          (pm,Just qm) -> (pm,qm)
+   pm = case pt of (pm,qm) -> pm
+   qm = case pt of (pm,qm) -> qm
+
+   p = pm
+   q = qm
+
+The first three bindings come from desugaring the PatBind, and subsequently
+wrapping the RHS of the main binding in EB'.
 
 Why got to this trouble?  It's a common case, and it removes the
 quadratic-sized tuple desugaring.  Less clutter, hopefully faster
 compilation, especially in a case where there are a *lot* of
 bindings.
-
 
 Note [Eta-expanding INLINE things]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -621,6 +702,65 @@ tuple `t`, thus:
 See https://gitlab.haskell.org/ghc/ghc/wikis/strict-pragma for a more
 detailed explanation of the desugaring of strict bindings.
 
+Wrinkle 1: forcing linear variables
+
+Consider
+
+  let %1 !x = rhs in <body>
+==>
+  let x = rhs in x `seq` <body>
+
+In the desugared version x is used in both arguments of seq. This isn't
+recognised a linear. So we can't strictly speaking use seq. Instead, the code is
+really desugared as
+
+  let x = rhs in case x of x { _ -> <body> }
+
+The shadowing with the case-binder is crucial. The linear linter (see
+Note [Linting linearity] in GHC.Core.Lint) understands this as linear. This is
+what the seqVar function does.
+
+To be more precise, suppose x has multiplicity p, the fully annotated seqVar (in
+Core, p is really stored inside x) is
+
+  case x of %p x { _ -> <body> }
+
+In linear Core, case u of %p y { _ -> v } consumes u with multiplicity p, and
+makes y available with multiplicity p in v. Which is exactly what we want.
+
+Wrinkle 2: linear patterns
+
+Consider the following linear binding (linear lets are always non-recursive):
+
+  let
+     %1 f : g = rhs
+  in <body>
+
+The general case would desugar it to
+
+  let t = let tm = rhs
+              fm = case tm of fm:_ -> fm
+              gm = case tm of _:gm -> gm
+           in
+           (tm, fm, gm)
+
+  in let f = case t a of (_,fm,_) -> fm
+  in let g = case t a of (_,_,gm) -> gm
+  in let tm = case t a of (tm,_,_) -> tm
+  in tm `seq` <body>
+
+But all the case expression drop variables, which is prohibited by
+linearity. But because this is a non-recursive let (in particular we're
+desugaring a single binding), we can (and do) desugar the binding as a simple
+case-expression instead:
+
+  case rhs of {
+    (f:g) -> <body>
+  }
+
+This is handled by the special case: a non-recursive PatBind in
+GHC.HsToCore.Expr.ds_val_bind.
+
 Note [Strict binds checks]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
 There are several checks around properly formed strict bindings. They
@@ -698,9 +838,9 @@ dsSpec mb_poly_rhs (L loc (SpecPrag poly_id spec_co spec_inl))
                -- perhaps with the body of the lambda wrapped in some WpLets
                -- E.g. /\a \(d:Eq a). let d2 = $df d in [] (Maybe a) d2
 
-       ; core_app <- dsHsWrapper spec_app
+       ; dsHsWrapper spec_app $ \core_app -> do
 
-       ; let ds_lhs  = core_app (Var poly_id)
+       { let ds_lhs  = core_app (Var poly_id)
              spec_ty = mkLamTypes spec_bndrs (exprType ds_lhs)
        ; -- pprTrace "dsRule" (vcat [ text "Id:" <+> ppr poly_id
          --                         , text "spec_co:" <+> ppr spec_co
@@ -729,7 +869,7 @@ dsSpec mb_poly_rhs (L loc (SpecPrag poly_id spec_co spec_inl))
             -- NB: do *not* use makeCorePair on (spec_id,spec_rhs), because
             --     makeCorePair overwrites the unfolding, which we have
             --     just created using specUnfolding
-       } } }
+       } } } }
   where
     is_local_id = isJust mb_poly_rhs
     poly_rhs | Just rhs <-  mb_poly_rhs
@@ -991,9 +1131,9 @@ Consider
   {-# RULES "myrule"  foo C = 1 #-}
 
 After type checking the LHS becomes (foo alpha (C alpha)), where alpha
-is an unbound meta-tyvar.  The zonker in GHC.Tc.Utils.Zonk is careful not to
+is an unbound meta-tyvar.  The zonker in GHC.Tc.Zonk.Type is careful not to
 turn the free alpha into Any (as it usually does).  Instead it turns it
-into a TyVar 'a'.  See Note [Zonking the LHS of a RULE] in "GHC.Tc.Utils.Zonk".
+into a TyVar 'a'.  See Note [Zonking the LHS of a RULE] in "GHC.Tc.Zonk.Type".
 
 Now we must quantify over that 'a'.  It's /really/ inconvenient to do that
 in the zonker, because the HsExpr data type is very large.  But it's /easy/
@@ -1161,75 +1301,161 @@ evidence that is used in `e`.
 
 This question arose when thinking about deep subsumption; see
 https://github.com/ghc-proposals/ghc-proposals/pull/287#issuecomment-1125419649).
+
+Note [Desugaring non-canonical evidence]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+If the evidence is canonical, we desugar WpEvApp by simply passing
+core_tm directly to k:
+
+  k core_tm
+
+If the evidence is not canonical, we mark the application with nospec:
+
+  nospec @(cls => a) k core_tm
+
+where  nospec :: forall a. a -> a  ensures that the typeclass specialiser
+doesn't attempt to common up this evidence term with other evidence terms
+of the same type (see Note [nospecId magic] in GHC.Types.Id.Make).
+
+See Note [Coherence and specialisation: overview] for why we shouldn't
+specialise incoherent evidence.
+
+We can find out if a given evidence is canonical or not during the
+desugaring of its WpLet wrapper: an evidence is non-canonical if its
+own resolution was incoherent (see Note [Incoherent instances]), or
+if its definition refers to other non-canonical evidence. dsEvBinds is
+the convenient place to compute this, since it already needs to do
+inter-evidence dependency analysis to generate well-scoped
+bindings. We then record this specialisability information in the
+dsl_unspecables field of DsM's local environment.
+
 -}
 
-dsHsWrapper :: HsWrapper -> DsM (CoreExpr -> CoreExpr)
-dsHsWrapper WpHole            = return $ \e -> e
-dsHsWrapper (WpTyApp ty)      = return $ \e -> App e (Type ty)
-dsHsWrapper (WpEvLam ev)      = return $ Lam ev
-dsHsWrapper (WpTyLam tv)      = return $ Lam tv
-dsHsWrapper (WpLet ev_binds)  = do { bs <- dsTcEvBinds ev_binds
-                                   ; return (mkCoreLets bs) }
-dsHsWrapper (WpCompose c1 c2) = do { w1 <- dsHsWrapper c1
-                                   ; w2 <- dsHsWrapper c2
-                                   ; return (w1 . w2) }
-dsHsWrapper (WpFun c1 c2 (Scaled w t1))  -- See Note [Desugaring WpFun]
-                              = do { x <- newSysLocalDs w t1
-                                   ; w1 <- dsHsWrapper c1
-                                   ; w2 <- dsHsWrapper c2
-                                   ; let app f a = mkCoreAppDs (text "dsHsWrapper") f a
-                                         arg     = w1 (Var x)
-                                   ; return (\e -> (Lam x (w2 (app e arg)))) }
-dsHsWrapper (WpCast co)       = assert (coercionRole co == Representational) $
-                                return $ \e -> mkCastDs e co
-dsHsWrapper (WpEvApp tm)      = do { core_tm <- dsEvTerm tm
-                                   ; return (\e -> App e core_tm) }
+dsHsWrapper :: HsWrapper -> ((CoreExpr -> CoreExpr) -> DsM a) -> DsM a
+dsHsWrapper WpHole            k = k $ \e -> e
+dsHsWrapper (WpTyApp ty)      k = k $ \e -> App e (Type ty)
+dsHsWrapper (WpEvLam ev)      k = k $ Lam ev
+dsHsWrapper (WpTyLam tv)      k = k $ Lam tv
+dsHsWrapper (WpLet ev_binds)  k = do { dsTcEvBinds ev_binds $ \bs -> do
+                                     { k (mkCoreLets bs) } }
+dsHsWrapper (WpCompose c1 c2) k = do { dsHsWrapper c1 $ \w1 -> do
+                                     { dsHsWrapper c2 $ \w2 -> do
+                                     { k (w1 . w2) } } }
+dsHsWrapper (WpFun c1 c2 (Scaled w t1)) k -- See Note [Desugaring WpFun]
+                                = do { x <- newSysLocalDs w t1
+                                     ; dsHsWrapper c1 $ \w1 -> do
+                                     { dsHsWrapper c2 $ \w2 -> do
+                                     { let app f a = mkCoreAppDs (text "dsHsWrapper") f a
+                                           arg     = w1 (Var x)
+                                     ; k (\e -> (Lam x (w2 (app e arg)))) } } }
+dsHsWrapper (WpCast co)       k = assert (coercionRole co == Representational) $
+                                  k $ \e -> mkCastDs e co
+dsHsWrapper (WpEvApp tm)      k = do { core_tm <- dsEvTerm tm
+                                     ; unspecables <- getUnspecables
+                                     ; let vs = exprFreeVarsList core_tm
+                                           is_unspecable_var v = v `S.member` unspecables
+                                           is_specable = not $ any (is_unspecable_var) vs -- See Note [Desugaring non-canonical evidence]
+                                     ; k (\e -> app_ev is_specable e core_tm) }
   -- See Note [Wrapper returned from tcSubMult] in GHC.Tc.Utils.Unify.
-dsHsWrapper (WpMultCoercion co) = do { when (not (isReflexiveCo co)) $
-                                         diagnosticDs DsMultiplicityCoercionsNotSupported
-                                     ; return $ \e -> e }
---------------------------------------
-dsTcEvBinds_s :: [TcEvBinds] -> DsM [CoreBind]
-dsTcEvBinds_s []       = return []
-dsTcEvBinds_s (b:rest) = assert (null rest) $  -- Zonker ensures null
-                         dsTcEvBinds b
+dsHsWrapper (WpMultCoercion co) k = do { unless (isReflexiveCo co) $
+                                           diagnosticDs DsMultiplicityCoercionsNotSupported
+                                       ; k $ \e -> e }
 
-dsTcEvBinds :: TcEvBinds -> DsM [CoreBind]
+-- We are about to construct an evidence application `f dict`.  If the dictionary is
+-- non-specialisable, instead construct
+--     nospec f dict
+-- See Note [nospecId magic] in GHC.Types.Id.Make for what `nospec` does.
+app_ev :: Bool -> CoreExpr -> CoreExpr -> CoreExpr
+app_ev is_specable k core_tm
+    | not is_specable
+    = Var nospecId `App` Type (exprType k) `App` k `App` core_tm
+
+    | otherwise
+    = k `App` core_tm
+
+dsHsWrappers :: [HsWrapper] -> ([CoreExpr -> CoreExpr] -> DsM a) -> DsM a
+dsHsWrappers (wp:wps) k = dsHsWrapper wp $ \wrap -> dsHsWrappers wps $ \wraps -> k (wrap:wraps)
+dsHsWrappers [] k = k []
+
+--------------------------------------
+dsTcEvBinds_s :: [TcEvBinds] -> ([CoreBind] -> DsM a) -> DsM a
+dsTcEvBinds_s []       k = k []
+dsTcEvBinds_s (b:rest) k = assert (null rest) $  -- Zonker ensures null
+                           dsTcEvBinds b k
+
+dsTcEvBinds :: TcEvBinds -> ([CoreBind] -> DsM a) -> DsM a
 dsTcEvBinds (TcEvBinds {}) = panic "dsEvBinds"    -- Zonker has got rid of this
 dsTcEvBinds (EvBinds bs)   = dsEvBinds bs
 
-dsEvBinds :: Bag EvBind -> DsM [CoreBind]
-dsEvBinds bs
-  = do { ds_bs <- mapBagM dsEvBind bs
-       ; return (mk_ev_binds ds_bs) }
+--   * Desugars the ev_binds, sorts them into dependency order, and
+--     passes the resulting [CoreBind] to thing_inside
+--   * Extends the DsM (dsl_unspecable field) with specialisability information
+--     for each binder in ev_binds, before invoking thing_inside
+dsEvBinds :: Bag EvBind -> ([CoreBind] -> DsM a) -> DsM a
+dsEvBinds ev_binds thing_inside
+  = do { ds_binds <- mapBagM dsEvBind ev_binds
+       ; let comps = sort_ev_binds ds_binds
+       ; go comps thing_inside }
+  where
+    go ::[SCC (Node EvVar (Canonical, CoreExpr))] -> ([CoreBind] -> DsM a) -> DsM a
+    go (comp:comps) thing_inside
+      = do { unspecables <- getUnspecables
+           ; let (core_bind, new_unspecables) = ds_component unspecables comp
+           ; addUnspecables new_unspecables $ go comps $ \ core_binds -> thing_inside (core_bind:core_binds) }
+    go [] thing_inside = thing_inside []
 
-mk_ev_binds :: Bag (Id,CoreExpr) -> [CoreBind]
+    ds_component unspecables (AcyclicSCC node) = (NonRec v rhs, new_unspecables)
+      where
+        ((v, rhs), (this_canonical, deps)) = unpack_node node
+        transitively_unspecable = not this_canonical || any is_unspecable deps
+        is_unspecable dep = dep `S.member` unspecables
+        new_unspecables
+            | transitively_unspecable = S.singleton v
+            | otherwise = mempty
+    ds_component unspecables (CyclicSCC nodes) = (Rec pairs, new_unspecables)
+      where
+        (pairs, direct_canonicity) = unzip $ map unpack_node nodes
+
+        is_unspecable_remote dep = dep `S.member` unspecables
+        transitively_unspecable = or [ not this_canonical || any is_unspecable_remote deps | (this_canonical, deps) <- direct_canonicity ]
+            -- Bindings from a given SCC are transitively specialisable if
+            -- all are specialisable and all their remote dependencies are
+            -- also specialisable; see Note [Desugaring non-canonical evidence]
+
+        new_unspecables
+            | transitively_unspecable = S.fromList [ v | (v, _) <- pairs]
+            | otherwise = mempty
+
+    unpack_node DigraphNode { node_key = v, node_payload = (canonical, rhs), node_dependencies = deps } = ((v, rhs), (canonical, deps))
+
+sort_ev_binds :: Bag (Id, Canonical, CoreExpr) -> [SCC (Node EvVar (Canonical, CoreExpr))]
 -- We do SCC analysis of the evidence bindings, /after/ desugaring
 -- them. This is convenient: it means we can use the GHC.Core
 -- free-variable functions rather than having to do accurate free vars
 -- for EvTerm.
-mk_ev_binds ds_binds
-  = map ds_scc (stronglyConnCompFromEdgedVerticesUniq edges)
+sort_ev_binds ds_binds = stronglyConnCompFromEdgedVerticesUniqR edges
   where
-    edges :: [ Node EvVar (EvVar,CoreExpr) ]
+    edges :: [ Node EvVar (Canonical, CoreExpr) ]
     edges = foldr ((:) . mk_node) [] ds_binds
 
-    mk_node :: (Id, CoreExpr) -> Node EvVar (EvVar,CoreExpr)
-    mk_node b@(var, rhs)
-      = DigraphNode { node_payload = b
+    mk_node :: (Id, Canonical, CoreExpr) -> Node EvVar (Canonical, CoreExpr)
+    mk_node (var, canonical, rhs)
+      = DigraphNode { node_payload = (canonical, rhs)
                     , node_key = var
                     , node_dependencies = nonDetEltsUniqSet $
                                           exprFreeVars rhs `unionVarSet`
                                           coVarsOfType (varType var) }
-      -- It's OK to use nonDetEltsUniqSet here as stronglyConnCompFromEdgedVertices
+      -- It's OK to use nonDetEltsUniqSet here as graphFromEdgedVerticesUniq
       -- is still deterministic even if the edges are in nondeterministic order
       -- as explained in Note [Deterministic SCC] in GHC.Data.Graph.Directed.
 
-    ds_scc (AcyclicSCC (v,r)) = NonRec v r
-    ds_scc (CyclicSCC prs)    = Rec prs
-
-dsEvBind :: EvBind -> DsM (Id, CoreExpr)
-dsEvBind (EvBind { eb_lhs = v, eb_rhs = r}) = liftM ((,) v) (dsEvTerm r)
+dsEvBind :: EvBind -> DsM (Id, Canonical, CoreExpr)
+dsEvBind (EvBind { eb_lhs = v, eb_rhs = r, eb_info = info }) = do
+    e <- dsEvTerm r
+    let canonical = case info of
+            EvBindGiven{} -> True
+            EvBindWanted{ ebi_canonical = canonical } -> canonical
+    return (v, canonical, e)
 
 
 {-**********************************************************************
@@ -1243,10 +1469,10 @@ dsEvTerm (EvExpr e)          = return e
 dsEvTerm (EvTypeable ty ev)  = dsEvTypeable ty ev
 dsEvTerm (EvFun { et_tvs = tvs, et_given = given
                 , et_binds = ev_binds, et_body = wanted_id })
-  = do { ds_ev_binds <- dsTcEvBinds ev_binds
-       ; return $ (mkLams (tvs ++ given) $
+  = do { dsTcEvBinds ev_binds $ \ds_ev_binds -> do
+       { return $ (mkLams (tvs ++ given) $
                    mkCoreLets ds_ev_binds $
-                   Var wanted_id) }
+                   Var wanted_id) } }
 
 
 {-**********************************************************************
@@ -1307,14 +1533,14 @@ ds_ev_typeable ty (EvTypeableTyApp ev1 ev2)
   | Just (t1,t2) <- splitAppTy_maybe ty
   = do { e1  <- getRep ev1 t1
        ; e2  <- getRep ev2 t2
-       ; mkTrApp <- dsLookupGlobalId mkTrAppName
-                    -- mkTrApp :: forall k1 k2 (a :: k1 -> k2) (b :: k1).
-                    --            TypeRep a -> TypeRep b -> TypeRep (a b)
+       ; mkTrAppChecked <- dsLookupGlobalId mkTrAppCheckedName
+                    -- mkTrAppChecked :: forall k1 k2 (a :: k1 -> k2) (b :: k1).
+                    --                   TypeRep a -> TypeRep b -> TypeRep (a b)
        ; let (_, k1, k2) = splitFunTy (typeKind t1)  -- drop the multiplicity,
                                                      -- since it's a kind
-       ; let expr =  mkApps (mkTyApps (Var mkTrApp) [ k1, k2, t1, t2 ])
+       ; let expr =  mkApps (mkTyApps (Var mkTrAppChecked) [ k1, k2, t1, t2 ])
                             [ e1, e2 ]
-       -- ; pprRuntimeTrace "Trace mkTrApp" (ppr expr) expr
+       -- ; pprRuntimeTrace "Trace mkTrAppChecked" (ppr expr) expr
        ; return expr
        }
 
@@ -1333,7 +1559,7 @@ ds_ev_typeable ty (EvTypeableTrFun evm ev1 ev2)
        }
 
 ds_ev_typeable ty (EvTypeableTyLit ev)
-  = -- See Note [Typeable for Nat and Symbol] in GHC.Tc.Solver.Interact
+  = -- See Note [Typeable for Nat and Symbol] in GHC.Tc.Instance.Class
     do { fun  <- dsLookupGlobalId tr_fun
        ; dict <- dsEvTerm ev       -- Of type KnownNat/KnownSymbol
        ; return (mkApps (mkTyApps (Var fun) [ty]) [ dict ]) }

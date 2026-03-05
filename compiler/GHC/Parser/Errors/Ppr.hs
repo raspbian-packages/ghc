@@ -22,14 +22,14 @@ import GHC.Types.Hint
 import GHC.Types.Error
 import GHC.Types.Hint.Ppr (perhapsAsPat)
 import GHC.Types.SrcLoc
-import GHC.Types.Error.Codes ( constructorCode )
+import GHC.Types.Error.Codes
 import GHC.Types.Name.Reader ( opIsAt, rdrNameOcc, mkUnqual )
 import GHC.Types.Name.Occurrence (isSymOcc, occNameFS, varName)
 import GHC.Utils.Outputable
 import GHC.Utils.Misc
 import GHC.Data.FastString
 import GHC.Data.Maybe (catMaybes)
-import GHC.Hs.Expr (prependQualified, HsExpr(..), LamCaseVariant(..), lamCaseKeyword)
+import GHC.Hs.Expr (prependQualified, HsExpr(..), HsLamVariant(..), lamCaseKeyword)
 import GHC.Hs.Type (pprLHsContext)
 import GHC.Builtin.Names (allNameStringList)
 import GHC.Builtin.Types (filterCTuple)
@@ -39,10 +39,9 @@ import Data.List.NonEmpty (NonEmpty((:|)))
 
 instance Diagnostic PsMessage where
   type DiagnosticOpts PsMessage = NoDiagnosticOpts
-  defaultDiagnosticOpts = NoDiagnosticOpts
-  diagnosticMessage _ = \case
-    PsUnknownMessage (UnknownDiagnostic @e m)
-      -> diagnosticMessage (defaultDiagnosticOpts @e) m
+  diagnosticMessage opts = \case
+    PsUnknownMessage (UnknownDiagnostic f m)
+      -> diagnosticMessage (f opts) m
 
     PsHeaderMessage m
       -> psHeaderMessageDiagnostic m
@@ -328,16 +327,12 @@ instance Diagnostic PsMessage where
       -> mkSimpleDecorated $ text "do-notation in pattern"
     PsErrIfThenElseInPat
       -> mkSimpleDecorated $ text "(if ... then ... else ...)-syntax in pattern"
-    (PsErrLambdaCaseInPat lc_variant)
-      -> mkSimpleDecorated $ lamCaseKeyword lc_variant <+> text "...-syntax in pattern"
     PsErrCaseInPat
       -> mkSimpleDecorated $ text "(case ... of ...)-syntax in pattern"
     PsErrLetInPat
       -> mkSimpleDecorated $ text "(let ... in ...)-syntax in pattern"
-    PsErrLambdaInPat
-      -> mkSimpleDecorated $
-           text "Lambda-syntax in pattern."
-           $$ text "Pattern matching on functions is not possible."
+    PsErrLambdaInPat lam_variant
+      -> mkSimpleDecorated $ text "Illegal" <+> lamCaseKeyword lam_variant <> text "-syntax in pattern"
     PsErrArrowExprInPat e
       -> mkSimpleDecorated $ text "Expression syntax in pattern:" <+> ppr e
     PsErrArrowCmdInPat c
@@ -353,13 +348,11 @@ instance Diagnostic PsMessage where
            sep [ text "View pattern in expression context:"
                , nest 4 (ppr a <+> text "->" <+> ppr b)
                ]
-    PsErrLambdaCmdInFunAppCmd a
-      -> mkSimpleDecorated $ pp_unexpected_fun_app (text "lambda command") a
     PsErrCaseCmdInFunAppCmd a
       -> mkSimpleDecorated $ pp_unexpected_fun_app (text "case command") a
-    PsErrLambdaCaseCmdInFunAppCmd lc_variant a
+    PsErrLambdaCmdInFunAppCmd lam_variant a
       -> mkSimpleDecorated $
-           pp_unexpected_fun_app (lamCaseKeyword lc_variant <+> text "command") a
+           pp_unexpected_fun_app (lamCaseKeyword lam_variant <+> text "command") a
     PsErrIfCmdInFunAppCmd a
       -> mkSimpleDecorated $ pp_unexpected_fun_app (text "if command") a
     PsErrLetCmdInFunAppCmd a
@@ -370,12 +363,10 @@ instance Diagnostic PsMessage where
       -> mkSimpleDecorated $ pp_unexpected_fun_app (prependQualified m (text "do block")) a
     PsErrMDoInFunAppExpr m a
       -> mkSimpleDecorated $ pp_unexpected_fun_app (prependQualified m (text "mdo block")) a
-    PsErrLambdaInFunAppExpr a
-      -> mkSimpleDecorated $ pp_unexpected_fun_app (text "lambda expression") a
     PsErrCaseInFunAppExpr a
       -> mkSimpleDecorated $ pp_unexpected_fun_app (text "case expression") a
-    PsErrLambdaCaseInFunAppExpr lc_variant a
-      -> mkSimpleDecorated $ pp_unexpected_fun_app (lamCaseKeyword lc_variant <+> text "expression") a
+    PsErrLambdaInFunAppExpr lam_variant a
+      -> mkSimpleDecorated $ pp_unexpected_fun_app (lamCaseKeyword lam_variant <+> text "expression") a
     PsErrLetInFunAppExpr a
       -> mkSimpleDecorated $ pp_unexpected_fun_app (text "let expression") a
     PsErrIfInFunAppExpr a
@@ -395,7 +386,8 @@ instance Diagnostic PsMessage where
       -> mkSimpleDecorated $ text "primitive string literal must contain only characters <= \'\\xFF\'"
     PsErrSuffixAT
       -> mkSimpleDecorated $
-           text "Suffix occurrence of @. For an as-pattern, remove the leading whitespace."
+           text "The symbol '@' occurs as a suffix." $$
+           text "For an as-pattern, there must not be any whitespace surrounding '@'."
     PsErrPrecedenceOutOfRange i
       -> mkSimpleDecorated $ text "Precedence out of range: " <> int i
     PsErrSemiColonsInCondExpr c st t se e
@@ -430,14 +422,6 @@ instance Diagnostic PsMessage where
       -> mkSimpleDecorated $
            text "Malformed" <+> what
            <+> text "declaration for" <+> quotes (ppr for)
-    PsErrUnexpectedTypeAppInDecl ki what for
-      -> mkSimpleDecorated $
-           vcat [ text "Unexpected type application"
-                  <+> text "@" <> ppr ki
-                , text "In the" <+> what
-                  <+> text "declaration for"
-                  <+> quotes (ppr for)
-                ]
     PsErrNotADataCon name
       -> mkSimpleDecorated $ text "Not a data constructor:" <+> quotes (ppr name)
     PsErrInferredTypeVarNotAllowed
@@ -471,11 +455,17 @@ instance Diagnostic PsMessage where
     PsErrIllegalRoleName role _nearby
       -> mkSimpleDecorated $
            text "Illegal role name" <+> quotes (ppr role)
-    PsErrInvalidTypeSignature lhs
-      -> mkSimpleDecorated $
-           text "Invalid type signature:"
-           <+> ppr lhs
-           <+> text ":: ..."
+    PsErrInvalidTypeSignature reason lhs
+      -> mkSimpleDecorated $ case reason of
+           PsErrInvalidTypeSig_DataCon   -> text "Invalid data constructor" <+> quotes (ppr lhs) <+>
+                                            text "in type signature" <> colon $$
+                                            text "You can only define data constructors in data type declarations."
+           PsErrInvalidTypeSig_Qualified -> text "Invalid qualified name in type signature."
+           PsErrInvalidTypeSig_Other     -> text "Invalid type signature" <> colon $$
+                                            text "A type signature should be of form" <+>
+                                            placeHolder "variables" <+> dcolon <+> placeHolder "type" <>
+                                            dot
+            where placeHolder = angleBrackets . text
     PsErrUnexpectedTypeInDecl t what tc tparms equals_or_where
        -> mkSimpleDecorated $
             vcat [ text "Unexpected type" <+> quotes (ppr t)
@@ -523,7 +513,25 @@ instance Diagnostic PsMessage where
                 , text "'" <> text [looks_like_char] <> text "' (" <> text looks_like_char_name <> text ")" <> comma
                 , text "but it is not" ]
 
-  diagnosticReason = \case
+    PsErrInvalidPun PEP_QuoteDisambiguation
+      -> mkSimpleDecorated $ vcat
+        [ text "Disambiguating data constructors of tuples and lists is disabled."
+        , text "Remove the quote to use the data constructor."
+        ]
+
+    PsErrInvalidPun PEP_TupleSyntaxType
+      -> mkSimpleDecorated $ vcat
+        [ text "Unboxed tuple data constructors are not supported in types."
+        , text "Use" <+> quotes (text "Tuple<n># a b c ...") <+> text "to refer to the type constructor."
+        ]
+
+    PsErrInvalidPun PEP_SumSyntaxType
+      -> mkSimpleDecorated $ vcat
+        [ text "Unboxed sum data constructors are not supported in types."
+        , text "Use" <+> quotes (text "Sum<n># a b c ...") <+> text "to refer to the type constructor."
+        ]
+
+  diagnosticReason  = \case
     PsUnknownMessage m                            -> diagnosticReason m
     PsHeaderMessage  m                            -> psHeaderMessageReason m
     PsWarnBidirectionalFormatChars{}              -> WarningWithFlag Opt_WarnUnicodeBidirectionalFormatCharacters
@@ -593,17 +601,15 @@ instance Diagnostic PsMessage where
     PsErrIllegalUnboxedFloatingLitInPat{}         -> ErrorWithoutFlag
     PsErrDoNotationInPat{}                        -> ErrorWithoutFlag
     PsErrIfThenElseInPat                          -> ErrorWithoutFlag
-    PsErrLambdaCaseInPat{}                        -> ErrorWithoutFlag
     PsErrCaseInPat                                -> ErrorWithoutFlag
     PsErrLetInPat                                 -> ErrorWithoutFlag
-    PsErrLambdaInPat                              -> ErrorWithoutFlag
+    PsErrLambdaInPat{}                            -> ErrorWithoutFlag
     PsErrArrowExprInPat{}                         -> ErrorWithoutFlag
     PsErrArrowCmdInPat{}                          -> ErrorWithoutFlag
     PsErrArrowCmdInExpr{}                         -> ErrorWithoutFlag
     PsErrViewPatInExpr{}                          -> ErrorWithoutFlag
-    PsErrLambdaCmdInFunAppCmd{}                   -> ErrorWithoutFlag
     PsErrCaseCmdInFunAppCmd{}                     -> ErrorWithoutFlag
-    PsErrLambdaCaseCmdInFunAppCmd{}               -> ErrorWithoutFlag
+    PsErrLambdaCmdInFunAppCmd{}                   -> ErrorWithoutFlag
     PsErrIfCmdInFunAppCmd{}                       -> ErrorWithoutFlag
     PsErrLetCmdInFunAppCmd{}                      -> ErrorWithoutFlag
     PsErrDoCmdInFunAppCmd{}                       -> ErrorWithoutFlag
@@ -611,7 +617,6 @@ instance Diagnostic PsMessage where
     PsErrMDoInFunAppExpr{}                        -> ErrorWithoutFlag
     PsErrLambdaInFunAppExpr{}                     -> ErrorWithoutFlag
     PsErrCaseInFunAppExpr{}                       -> ErrorWithoutFlag
-    PsErrLambdaCaseInFunAppExpr{}                 -> ErrorWithoutFlag
     PsErrLetInFunAppExpr{}                        -> ErrorWithoutFlag
     PsErrIfInFunAppExpr{}                         -> ErrorWithoutFlag
     PsErrProcInFunAppExpr{}                       -> ErrorWithoutFlag
@@ -626,7 +631,6 @@ instance Diagnostic PsMessage where
     PsErrAtInPatPos                               -> ErrorWithoutFlag
     PsErrParseErrorOnInput{}                      -> ErrorWithoutFlag
     PsErrMalformedDecl{}                          -> ErrorWithoutFlag
-    PsErrUnexpectedTypeAppInDecl{}                -> ErrorWithoutFlag
     PsErrNotADataCon{}                            -> ErrorWithoutFlag
     PsErrInferredTypeVarNotAllowed                -> ErrorWithoutFlag
     PsErrIllegalTraditionalRecordSyntax{}         -> ErrorWithoutFlag
@@ -641,6 +645,7 @@ instance Diagnostic PsMessage where
     PsErrInvalidCApiImport {}                     -> ErrorWithoutFlag
     PsErrMultipleConForNewtype {}                 -> ErrorWithoutFlag
     PsErrUnicodeCharLooksLike{}                   -> ErrorWithoutFlag
+    PsErrInvalidPun {}                            -> ErrorWithoutFlag
 
   diagnosticHints = \case
     PsUnknownMessage m                            -> diagnosticHints m
@@ -732,17 +737,15 @@ instance Diagnostic PsMessage where
     PsErrIllegalUnboxedFloatingLitInPat{}         -> noHints
     PsErrDoNotationInPat{}                        -> noHints
     PsErrIfThenElseInPat                          -> noHints
-    PsErrLambdaCaseInPat{}                        -> noHints
     PsErrCaseInPat                                -> noHints
     PsErrLetInPat                                 -> noHints
-    PsErrLambdaInPat                              -> noHints
+    PsErrLambdaInPat{}                            -> noHints
     PsErrArrowExprInPat{}                         -> noHints
     PsErrArrowCmdInPat{}                          -> noHints
     PsErrArrowCmdInExpr{}                         -> noHints
     PsErrViewPatInExpr{}                          -> noHints
     PsErrLambdaCmdInFunAppCmd{}                   -> suggestParensAndBlockArgs
     PsErrCaseCmdInFunAppCmd{}                     -> suggestParensAndBlockArgs
-    PsErrLambdaCaseCmdInFunAppCmd{}               -> suggestParensAndBlockArgs
     PsErrIfCmdInFunAppCmd{}                       -> suggestParensAndBlockArgs
     PsErrLetCmdInFunAppCmd{}                      -> suggestParensAndBlockArgs
     PsErrDoCmdInFunAppCmd{}                       -> suggestParensAndBlockArgs
@@ -750,7 +753,6 @@ instance Diagnostic PsMessage where
     PsErrMDoInFunAppExpr{}                        -> suggestParensAndBlockArgs
     PsErrLambdaInFunAppExpr{}                     -> suggestParensAndBlockArgs
     PsErrCaseInFunAppExpr{}                       -> suggestParensAndBlockArgs
-    PsErrLambdaCaseInFunAppExpr{}                 -> suggestParensAndBlockArgs
     PsErrLetInFunAppExpr{}                        -> suggestParensAndBlockArgs
     PsErrIfInFunAppExpr{}                         -> suggestParensAndBlockArgs
     PsErrProcInFunAppExpr{}                       -> suggestParensAndBlockArgs
@@ -767,7 +769,6 @@ instance Diagnostic PsMessage where
     PsErrAtInPatPos                               -> noHints
     PsErrParseErrorOnInput{}                      -> noHints
     PsErrMalformedDecl{}                          -> noHints
-    PsErrUnexpectedTypeAppInDecl{}                -> noHints
     PsErrNotADataCon{}                            -> noHints
     PsErrInferredTypeVarNotAllowed                -> noHints
     PsErrIllegalTraditionalRecordSyntax{}         -> [suggestExtension LangExt.TraditionalRecordSyntax]
@@ -784,15 +785,17 @@ instance Diagnostic PsMessage where
         sug_missingdo _                                     = Nothing
     PsErrParseRightOpSectionInPat{}               -> noHints
     PsErrIllegalRoleName _ nearby                 -> [SuggestRoles nearby]
-    PsErrInvalidTypeSignature lhs                 ->
+    PsErrInvalidTypeSignature reason lhs          ->
         if | foreign_RDR `looks_like` lhs
            -> [suggestExtension LangExt.ForeignFunctionInterface]
            | default_RDR `looks_like` lhs
            -> [suggestExtension LangExt.DefaultSignatures]
            | pattern_RDR `looks_like` lhs
            -> [suggestExtension LangExt.PatternSynonyms]
+           | PsErrInvalidTypeSig_Qualified <- reason
+           -> [SuggestTypeSignatureRemoveQualifier]
            | otherwise
-           -> [SuggestTypeSignatureForm]
+           -> []
       where
         -- A common error is to forget the ForeignFunctionInterface flag
         -- so check for that, and suggest.  cf #3805
@@ -812,6 +815,7 @@ instance Diagnostic PsMessage where
     PsErrInvalidCApiImport {}                     -> noHints
     PsErrMultipleConForNewtype {}                 -> noHints
     PsErrUnicodeCharLooksLike{}                   -> noHints
+    PsErrInvalidPun {}                            -> [suggestExtension LangExt.ListTuplePuns]
 
   diagnosticCode = constructorCode
 

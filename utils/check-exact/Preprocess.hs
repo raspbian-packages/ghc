@@ -24,7 +24,6 @@ import qualified GHC.Driver.Env        as GHC
 import qualified GHC.Driver.Errors.Types as GHC
 import qualified GHC.Driver.Phases     as GHC
 import qualified GHC.Driver.Pipeline   as GHC
-import qualified GHC.Fingerprint.Type  as GHC
 import qualified GHC.Parser.Lexer      as GHC
 import qualified GHC.Settings          as GHC
 import qualified GHC.Types.Error       as GHC
@@ -59,7 +58,7 @@ defaultCppOptions :: CppOptions
 defaultCppOptions = CppOptions [] [] []
 
 -- ---------------------------------------------------------------------
--- | Remove GHC style line pragams (@{-# LINE .. #-}@) and convert them into comments.
+-- | Remove GHC style line pragmas (@{-# LINE .. #-}@) and convert them into comments.
 stripLinePragmas :: String -> (String, [GHC.LEpaComment])
 stripLinePragmas = unlines' . unzip . findLines . lines
   where
@@ -77,7 +76,6 @@ checkLine line s
            ss     = mkSrcSpan (mSrcLoc line 1) (mSrcLoc line (size+1))
        in (res, Just $ mkLEpaComment pragma (GHC.spanAsAnchor ss) (GHC.realSrcSpan ss))
   -- Deal with shebang/cpp directives too
-  -- x |  "#" `isPrefixOf` s = ("",Just $ Comment ((line, 1), (line, length s)) s)
   |  "#!" `isPrefixOf` s =
     let mSrcLoc = mkSrcLoc (mkFastString "SHEBANG")
         ss = mkSrcSpan (mSrcLoc line 1) (mSrcLoc line (length s))
@@ -124,10 +122,10 @@ getCppTokensAsComments cppOptions sourceFile = do
 goodComment :: GHC.LEpaComment -> Bool
 goodComment c = isGoodComment (tokComment c)
   where
-    isGoodComment :: Comment -> Bool
-    isGoodComment (Comment "" _ _ _) = False
+    isGoodComment :: [Comment] -> Bool
+    isGoodComment []                 = False
+    isGoodComment [Comment "" _ _ _] = False
     isGoodComment _                  = True
-
 
 toRealLocated :: GHC.Located a -> GHC.RealLocated a
 toRealLocated (GHC.L (GHC.RealSrcSpan s _) x) = GHC.L s              x
@@ -192,7 +190,7 @@ stripPreprocessorDirectives :: GHC.StringBuffer -> GHC.StringBuffer
 stripPreprocessorDirectives buf = buf'
   where
     srcByLine = lines $ sbufToString buf
-    noDirectivesLines = map (\line -> if line /= [] && head line == '#' then "" else line) srcByLine
+    noDirectivesLines = map (\line -> case line of '#' : _ -> ""; _ -> line) srcByLine
     buf' = GHC.stringToStringBuffer $ unlines noDirectivesLines
 
 -- ---------------------------------------------------------------------
@@ -233,24 +231,32 @@ showErrorMessages msgs =
     $ msgs
 
 injectCppOptions :: CppOptions -> GHC.DynFlags -> GHC.DynFlags
-injectCppOptions CppOptions{..} dflags =
-  foldr addOptP dflags (map mkDefine cppDefine ++ map mkIncludeDir cppInclude ++ map mkInclude cppFile)
+injectCppOptions CppOptions{..} dflags = folded_opt
   where
     mkDefine = ("-D" ++)
     mkIncludeDir = ("-I" ++)
     mkInclude = ("-include" ++)
-
+    file_flags = map mkDefine cppDefine ++ map mkIncludeDir cppInclude ++ map mkInclude cppFile
+    addFs = [addOptP, addOptJSP, addOptCmmP]
+    folded_opt = foldr ($) dflags (addFs <*> file_flags)
 
 addOptP :: String -> GHC.DynFlags -> GHC.DynFlags
 addOptP   f = alterToolSettings $ \s -> s
           { GHC.toolSettings_opt_P   = f : GHC.toolSettings_opt_P s
-          , GHC.toolSettings_opt_P_fingerprint = fingerprintStrings (f : GHC.toolSettings_opt_P s)
+          , GHC.toolSettings_opt_P_fingerprint = GHC.fingerprintStrings (f : GHC.toolSettings_opt_P s)
+          }
+addOptJSP :: String -> GHC.DynFlags -> GHC.DynFlags
+addOptJSP f = alterToolSettings $ \s -> s
+          { GHC.toolSettings_opt_JSP   = f : GHC.toolSettings_opt_JSP s
+          , GHC.toolSettings_opt_JSP_fingerprint = GHC.fingerprintStrings (f : GHC.toolSettings_opt_JSP s)
+          }
+addOptCmmP :: String -> GHC.DynFlags -> GHC.DynFlags
+addOptCmmP f = alterToolSettings $ \s -> s
+          { GHC.toolSettings_opt_CmmP = f : GHC.toolSettings_opt_CmmP s
+          , GHC.toolSettings_opt_CmmP_fingerprint = GHC.fingerprintStrings (f : GHC.toolSettings_opt_CmmP s)
           }
 alterToolSettings :: (GHC.ToolSettings -> GHC.ToolSettings) -> GHC.DynFlags -> GHC.DynFlags
 alterToolSettings f dynFlags = dynFlags { GHC.toolSettings = f (GHC.toolSettings dynFlags) }
-
-fingerprintStrings :: [String] -> GHC.Fingerprint
-fingerprintStrings ss = GHC.fingerprintFingerprints $ map GHC.fingerprintString ss
 
 -- ---------------------------------------------------------------------
 
@@ -259,7 +265,7 @@ fingerprintStrings ss = GHC.fingerprintFingerprints $ map GHC.fingerprintString 
 getPreprocessorAsComments :: FilePath -> IO [(GHC.Located GHC.Token, String)]
 getPreprocessorAsComments srcFile = do
   fcontents <- readFileGhc srcFile
-  let directives = filter (\(_lineNum,line) -> line /= [] && head line == '#')
+  let directives = filter (\(_lineNum,line) -> case line of '#' : _ -> True; _ -> False)
                     $ zip [1..] (lines fcontents)
 
   let mkTok (lineNum,line) = (GHC.L l (GHC.ITlineComment line (makeBufSpan l)),line)
@@ -280,12 +286,7 @@ makeBufSpan ss = pspan
 -- ---------------------------------------------------------------------
 
 parseError :: (GHC.MonadIO m) => GHC.PState -> m b
-parseError pst = do
-     let
-       -- (warns,errs) = GHC.getMessages pst dflags
-     -- throw $ GHC.mkSrcErr (GHC.unitBag $ GHC.mkPlainErrMsg dflags sspan err)
-     -- GHC.throwErrors (fmap GHC.mkParserErr (GHC.getErrorMessages pst))
-     GHC.throwErrors (fmap GHC.GhcPsMessage (GHC.getPsErrorMessages pst))
+parseError pst = GHC.throwErrors (fmap GHC.GhcPsMessage (GHC.getPsErrorMessages pst))
 
 -- ---------------------------------------------------------------------
 

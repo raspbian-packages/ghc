@@ -16,9 +16,11 @@ types that
 
 {-# OPTIONS_GHC -Wno-orphans #-} -- Outputable PromotionFlag, Binary PromotionFlag, Outputable Boxity, Binay Boxity
 {-# LANGUAGE DeriveDataTypeable #-}
+{-# LANGUAGE DeriveFunctor #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE LambdaCase #-}
 
 module GHC.Types.Basic (
         LeftOrRight(..),
@@ -26,7 +28,8 @@ module GHC.Types.Basic (
 
         ConTag, ConTagZ, fIRST_TAG,
 
-        Arity, RepArity, JoinArity, FullArgCount,
+        Arity, VisArity, RepArity, JoinArity, FullArgCount,
+        JoinPointHood(..), isJoinPoint,
 
         Alignment, mkAlignment, alignmentOf, alignmentBytes,
 
@@ -34,14 +37,16 @@ module GHC.Types.Basic (
         FunctionOrData(..),
 
         RecFlag(..), isRec, isNonRec, boolToRecFlag,
-        Origin(..), isGenerated,
+        Origin(..), isGenerated, DoPmc(..), requiresPMC,
+        GenReason(..), isDoExpansionGenerated, doExpansionFlavour,
+        doExpansionOrigin,
 
         RuleName, pprRuleName,
 
         TopLevelFlag(..), isTopLevel, isNotTopLevel,
 
         OverlapFlag(..), OverlapMode(..), setOverlapModeMaybe,
-        hasOverlappingFlag, hasOverlappableFlag, hasIncoherentFlag,
+        hasOverlappingFlag, hasOverlappableFlag, hasIncoherentFlag, hasNonCanonicalFlag,
 
         Boxity(..), isBoxed,
 
@@ -109,6 +114,8 @@ module GHC.Types.Basic (
         Levity(..), mightBeLifted, mightBeUnlifted,
         TypeOrConstraint(..),
 
+        TyConFlavour(..), TypeOrData(..), tyConFlavourAssoc_maybe,
+
         NonStandardDefaultingStrategy(..),
         DefaultingStrategy(..), defaultNonStandardTyVars,
 
@@ -124,12 +131,17 @@ import GHC.Utils.Panic
 import GHC.Utils.Binary
 import GHC.Types.SourceText
 import qualified GHC.LanguageExtensions as LangExt
-import Data.Data
-import qualified Data.Semigroup as Semi
 import {-# SOURCE #-} Language.Haskell.Syntax.Type (PromotionFlag(..), isPromoted)
 import Language.Haskell.Syntax.Basic (Boxity(..), isBoxed, ConTag)
+import {-# SOURCE #-} Language.Haskell.Syntax.Expr (HsDoFlavour)
 
-{- *********************************************************************
+import Control.DeepSeq ( NFData(..) )
+import Data.Data
+import Data.Maybe
+import qualified Data.Semigroup as Semi
+
+{-
+************************************************************************
 *                                                                      *
           Binary choice
 *                                                                      *
@@ -171,6 +183,10 @@ instance Binary LeftOrRight where
 -- See also Note [Definition of arity] in "GHC.Core.Opt.Arity"
 type Arity = Int
 
+-- | Syntactic (visibility) arity, i.e. the number of visible arguments.
+-- See Note [Visibility and arity]
+type VisArity = Int
+
 -- | Representation Arity
 --
 -- The number of represented arguments that can be applied to a value before it does
@@ -190,6 +206,71 @@ type JoinArity = Int
 -- or the number of type or value binders in a lambda.  Note: it includes
 -- both type and value arguments!
 type FullArgCount = Int
+
+{- Note [Visibility and arity]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Arity is the number of arguments that a function expects. In a curried language
+like Haskell, there is more than one way to count those arguments.
+
+* `Arity` is the classic notion of arity, concerned with evalution, so it counts
+  the number of /value/ arguments that need to be supplied before evaluation can
+  take place, as described in notes
+    Note [Definition of arity]      in GHC.Core.Opt.Arity
+    Note [Arity and function types] in GHC.Types.Id.Info
+
+  Examples:
+    Int                       has arity == 0
+    Int -> Int                has arity <= 1
+    Int -> Bool -> Int        has arity <= 2
+  We write (<=) rather than (==) as sometimes evaluation can occur before all
+  value arguments are supplied, depending on the actual function definition.
+
+  This evaluation-focused notion of arity ignores type arguments, so:
+    forall a.   a             has arity == 0
+    forall a.   a -> a        has arity <= 1
+    forall a b. a -> b -> a   has arity <= 2
+  This is true regardless of ForAllTyFlag, so the arity is also unaffected by
+  (forall {a}. ty) or (forall a -> ty).
+
+  Class dictionaries count towards the arity, as they are passed at runtime
+    forall a.   (Num a)        => a            has arity <= 1
+    forall a.   (Num a)        => a -> a       has arity <= 2
+    forall a b. (Num a, Ord b) => a -> b -> a  has arity <= 4
+
+* `VisArity` is the syntactic notion of arity. It is the number of /visible/
+  arguments, i.e. arguments that occur visibly in the source code.
+
+  In a function call `f x y z`, we can confidently say that f's vis-arity >= 3,
+  simply because we see three arguments [x,y,z]. We write (>=) rather than (==)
+  as this could be a partial application.
+
+  At definition sites, we can acquire an underapproximation of vis-arity by
+  counting the patterns on the LHS, e.g. `f a b = rhs` has vis-arity >= 2.
+  The actual vis-arity can be higher if there is a lambda on the RHS,
+  e.g. `f a b = \c -> rhs`.
+
+  If we look at the types, we can observe the following
+    * function arrows   (a -> b)        add to the vis-arity
+    * visible foralls   (forall a -> b) add to the vis-arity
+    * constraint arrows (a => b)        do not affect the vis-arity
+    * invisible foralls (forall a. b)   do not affect the vis-arity
+
+  This means that ForAllTyFlag matters for VisArity (in contrast to Arity),
+  while the type/value distinction is unimportant (again in contrast to Arity).
+
+  Examples:
+    Int                         -- vis-arity == 0   (no args)
+    Int -> Int                  -- vis-arity == 1   (1 funarg)
+    forall a. a -> a            -- vis-arity == 1   (1 funarg)
+    forall a. Num a => a -> a   -- vis-arity == 1   (1 funarg)
+    forall a -> Num a => a      -- vis-arity == 1   (1 req tyarg, 0 funargs)
+    forall a -> a -> a          -- vis-arity == 2   (1 req tyarg, 1 funarg)
+    Int -> forall a -> Int      -- vis-arity == 2   (1 funarg, 1 req tyarg)
+
+  Wrinkle: with TypeApplications and TypeAbstractions, it is possible to visibly
+  bind and pass invisible arguments, e.g. `f @a x = ...` or `f @Int 42`. Those
+  @-prefixed arguments are ignored for the purposes of vis-arity.
+-}
 
 {-
 ************************************************************************
@@ -575,17 +656,89 @@ instance Binary RecFlag where
 ************************************************************************
 -}
 
+-- | Was this piece of code user-written or generated by the compiler?
+--
+-- See Note [Generated code and pattern-match checking].
 data Origin = FromSource
-            | Generated
+            | Generated GenReason DoPmc
             deriving( Eq, Data )
 
 isGenerated :: Origin -> Bool
-isGenerated Generated = True
-isGenerated FromSource = False
+isGenerated Generated{}  = True
+isGenerated FromSource   = False
+
+-- | This metadata stores the information as to why was the piece of code generated
+--   It is useful for generating the right error context
+-- See Part 3 in Note [Expanding HsDo with XXExprGhcRn] in `GHC.Tc.Gen.Do`
+data GenReason = DoExpansion HsDoFlavour
+               | OtherExpansion
+               deriving (Eq, Data)
+
+instance Outputable GenReason where
+  ppr DoExpansion{}  = text "DoExpansion"
+  ppr OtherExpansion = text "OtherExpansion"
+
+doExpansionFlavour :: Origin -> Maybe HsDoFlavour
+doExpansionFlavour (Generated (DoExpansion f) _) = Just f
+doExpansionFlavour _ = Nothing
+
+-- See Part 3 in Note [Expanding HsDo with XXExprGhcRn] in `GHC.Tc.Gen.Do`
+isDoExpansionGenerated :: Origin -> Bool
+isDoExpansionGenerated = isJust . doExpansionFlavour
+
+-- See Part 3 in Note [Expanding HsDo with XXExprGhcRn] in `GHC.Tc.Gen.Do`
+doExpansionOrigin :: HsDoFlavour -> Origin
+doExpansionOrigin f = Generated (DoExpansion f) DoPmc
+                    -- It is important that we perfrom PMC
+                    -- on the expressions generated by do statements
+                    -- to get the right pattern match checker warnings
+                    -- See `GHC.HsToCore.Pmc.pmcMatches`
 
 instance Outputable Origin where
-  ppr FromSource  = text "FromSource"
-  ppr Generated   = text "Generated"
+  ppr FromSource             = text "FromSource"
+  ppr (Generated reason pmc) = text "Generated" <+> ppr reason <+> ppr pmc
+
+-- | Whether to run pattern-match checks in generated code.
+--
+-- See Note [Generated code and pattern-match checking].
+data DoPmc = SkipPmc
+           | DoPmc
+           deriving( Eq, Data )
+
+instance Outputable DoPmc where
+  ppr SkipPmc     = text "SkipPmc"
+  ppr DoPmc       = text "DoPmc"
+
+-- | Does this 'Origin' require us to run pattern-match checking,
+-- or should we skip these checks?
+--
+-- See Note [Generated code and pattern-match checking].
+requiresPMC :: Origin -> Bool
+requiresPMC (Generated _ SkipPmc) = False
+requiresPMC _ = True
+
+{- Note [Generated code and pattern-match checking]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Some parts of the compiler generate code that is then typechecked. For example:
+
+  - the XXExprGhcRn mechanism described in Note [Rebindable syntax and XXExprGhcRn]
+    in GHC.Hs.Expr,
+  - the deriving mechanism.
+
+It is usually the case that we want to avoid generating error messages that
+refer to generated code. The way this is handled is that we mark certain
+parts of the AST as being generated (using the Origin datatype); this is then
+used to set the tcl_in_gen_code flag in TcLclEnv, as explained in
+Note [Error contexts in generated code] in GHC.Tc.Utils.Monad.
+
+Being in generated code is usually taken to mean we should also skip doing
+pattern-match checking, but not always. For example, when desugaring a record
+update (as described in Note [Record Updates] in GHC.Tc.Gen.Expr), we still want
+to do pattern-match checking, in order to report incomplete record updates
+(failing to do so lead to #23250). So, for a 'Generated' 'Origin', we keep track
+of whether we should do pattern-match checks; see the calls of the requiresPMC
+function (e.g. isMatchContextPmChecked and needToRunPmCheck in GHC.HsToCore.Pmc.Utils).
+-}
 
 {-
 ************************************************************************
@@ -620,6 +773,7 @@ hasIncoherentFlag :: OverlapMode -> Bool
 hasIncoherentFlag mode =
   case mode of
     Incoherent   _ -> True
+    NonCanonical _ -> True
     _              -> False
 
 hasOverlappableFlag :: OverlapMode -> Bool
@@ -628,6 +782,7 @@ hasOverlappableFlag mode =
     Overlappable _ -> True
     Overlaps     _ -> True
     Incoherent   _ -> True
+    NonCanonical _ -> True
     _              -> False
 
 hasOverlappingFlag :: OverlapMode -> Bool
@@ -636,7 +791,13 @@ hasOverlappingFlag mode =
     Overlapping  _ -> True
     Overlaps     _ -> True
     Incoherent   _ -> True
+    NonCanonical _ -> True
     _              -> False
+
+hasNonCanonicalFlag :: OverlapMode -> Bool
+hasNonCanonicalFlag = \case
+  NonCanonical{} -> True
+  _              -> False
 
 data OverlapMode  -- See Note [Rules for instance lookup] in GHC.Core.InstEnv
   = NoOverlap SourceText
@@ -692,6 +853,16 @@ data OverlapMode  -- See Note [Rules for instance lookup] in GHC.Core.InstEnv
     -- instantiating 'b' would change which instance
     -- was chosen. See also Note [Incoherent instances] in "GHC.Core.InstEnv"
 
+  | NonCanonical SourceText
+    -- ^ Behave like Incoherent, but the instance choice is observable
+    -- by the program behaviour. See Note [Coherence and specialisation: overview].
+    --
+    -- We don't have surface syntax for the distinction between
+    -- Incoherent and NonCanonical instances; instead, the flag
+    -- `-f{no-}specialise-incoherents` (on by default) controls
+    -- whether `INCOHERENT` instances are regarded as Incoherent or
+    -- NonCanonical.
+
   deriving (Eq, Data)
 
 
@@ -704,6 +875,7 @@ instance Outputable OverlapMode where
    ppr (Overlapping  _) = text "[overlapping]"
    ppr (Overlaps     _) = text "[overlap ok]"
    ppr (Incoherent   _) = text "[incoherent]"
+   ppr (NonCanonical _) = text "[noncanonical]"
 
 instance Binary OverlapMode where
     put_ bh (NoOverlap    s) = putByte bh 0 >> put_ bh s
@@ -711,6 +883,7 @@ instance Binary OverlapMode where
     put_ bh (Incoherent   s) = putByte bh 2 >> put_ bh s
     put_ bh (Overlapping  s) = putByte bh 3 >> put_ bh s
     put_ bh (Overlappable s) = putByte bh 4 >> put_ bh s
+    put_ bh (NonCanonical s) = putByte bh 5 >> put_ bh s
     get bh = do
         h <- getByte bh
         case h of
@@ -719,6 +892,7 @@ instance Binary OverlapMode where
             2 -> (get bh) >>= \s -> return $ Incoherent s
             3 -> (get bh) >>= \s -> return $ Overlapping s
             4 -> (get bh) >>= \s -> return $ Overlappable s
+            5 -> (get bh) >>= \s -> return $ NonCanonical s
             _ -> panic ("get OverlapMode" ++ show h)
 
 
@@ -955,14 +1129,23 @@ of the type of the method signature.
 *                                                                      *
 ************************************************************************
 
-This data type is used exclusively by the simplifier, but it appears in a
+Note [OccInfo]
+~~~~~~~~~~~~~
+The OccInfo data type is used exclusively by the simplifier, but it appears in a
 SubstResult, which is currently defined in GHC.Types.Var.Env, which is pretty
 near the base of the module hierarchy.  So it seemed simpler to put the defn of
-OccInfo here, safely at the bottom
+OccInfo here, safely at the bottom.
+
+Note that `OneOcc` doesn't meant that it occurs /syntactially/ only once; it
+means that it is /used/ only once. It might occur syntactically many times.
+For example, in (case x of A -> y; B -> y; C -> True),
+* `y` is used only once
+* but it occurs syntactically twice
+
 -}
 
 -- | identifier Occurrence Information
-data OccInfo
+data OccInfo -- See Note [OccInfo]
   = ManyOccs        { occ_tail    :: !TailCallInfo }
                         -- ^ There are many occurrences, or unknown occurrences
 
@@ -1060,8 +1243,9 @@ instance Monoid InsideLam where
   mappend = (Semi.<>)
 
 -----------------
-data TailCallInfo = AlwaysTailCalled JoinArity -- See Note [TailCallInfo]
-                  | NoTailCallInfo
+data TailCallInfo
+  = AlwaysTailCalled {-# UNPACK #-} !JoinArity -- See Note [TailCallInfo]
+  | NoTailCallInfo
   deriving (Eq)
 
 tailCallInfo :: OccInfo -> TailCallInfo
@@ -1142,7 +1326,7 @@ The AlwaysTailCalled marker actually means slightly more than simply that the
 function is always tail-called. See Note [Invariants on join points].
 
 This info is quite fragile and should not be relied upon unless the occurrence
-analyser has *just* run. Use 'Id.isJoinId_maybe' for the permanent state of
+analyser has *just* run. Use 'Id.idJoinPointHood' for the permanent state of
 the join-point-hood of a binder; a join id itself will not be marked
 AlwaysTailCalled.
 
@@ -1553,7 +1737,7 @@ noUserInlineSpec _                = False
 
 defaultInlinePragma, alwaysInlinePragma, neverInlinePragma, dfunInlinePragma
   :: InlinePragma
-defaultInlinePragma = InlinePragma { inl_src = SourceText "{-# INLINE"
+defaultInlinePragma = InlinePragma { inl_src = SourceText $ fsLit "{-# INLINE"
                                    , inl_act = AlwaysActive
                                    , inl_rule = FunLike
                                    , inl_inline = NoUserInlinePrag
@@ -1949,11 +2133,19 @@ isKindLevel KindLevel = True
 data Levity
   = Lifted
   | Unlifted
-  deriving Eq
+  deriving (Data,Eq,Ord,Show)
 
 instance Outputable Levity where
   ppr Lifted   = text "Lifted"
   ppr Unlifted = text "Unlifted"
+
+instance Binary Levity where
+  put_ bh = \case
+    Lifted   -> putByte bh 0
+    Unlifted -> putByte bh 1
+  get bh = getByte bh >>= \case
+    0 -> pure Lifted
+    _ -> pure Unlifted
 
 mightBeLifted :: Maybe Levity -> Bool
 mightBeLifted (Just Unlifted) = False
@@ -1967,6 +2159,77 @@ data TypeOrConstraint
   = TypeLike | ConstraintLike
   deriving( Eq, Ord, Data )
 
+
+{- *********************************************************************
+*                                                                      *
+                          TyConFlavour
+*                                                                      *
+********************************************************************* -}
+
+-- | Paints a picture of what a 'TyCon' represents, in broad strokes.
+-- This is used towards more informative error messages.
+data TyConFlavour tc
+  = ClassFlavour
+  | TupleFlavour Boxity
+  | SumFlavour
+  | DataTypeFlavour
+  | NewtypeFlavour
+  | AbstractTypeFlavour
+  | OpenFamilyFlavour TypeOrData (Maybe tc) -- Just tc <=> (tc == associated class)
+  | ClosedTypeFamilyFlavour
+  | TypeSynonymFlavour
+  | BuiltInTypeFlavour -- ^ e.g., the @(->)@ 'TyCon'.
+  | PromotedDataConFlavour
+  deriving (Eq, Data, Functor)
+
+instance Outputable (TyConFlavour tc) where
+  ppr = text . go
+    where
+      go ClassFlavour = "class"
+      go (TupleFlavour boxed) | isBoxed boxed = "tuple"
+                              | otherwise     = "unboxed tuple"
+      go SumFlavour              = "unboxed sum"
+      go DataTypeFlavour         = "data type"
+      go NewtypeFlavour          = "newtype"
+      go AbstractTypeFlavour     = "abstract type"
+      go (OpenFamilyFlavour type_or_data mb_par)
+        = assoc ++ t_or_d ++ " family"
+        where
+          assoc = if isJust mb_par then "associated " else ""
+          t_or_d = case type_or_data of { IAmType -> "type"; IAmData -> "data" }
+      go ClosedTypeFamilyFlavour = "type family"
+      go TypeSynonymFlavour      = "type synonym"
+      go BuiltInTypeFlavour      = "built-in type"
+      go PromotedDataConFlavour  = "promoted data constructor"
+
+instance NFData tc => NFData (TyConFlavour tc) where
+  rnf ClassFlavour = ()
+  rnf (TupleFlavour !_) = ()
+  rnf SumFlavour = ()
+  rnf DataTypeFlavour = ()
+  rnf NewtypeFlavour = ()
+  rnf AbstractTypeFlavour = ()
+  rnf (OpenFamilyFlavour !_ mb_tc) = rnf mb_tc
+  rnf ClosedTypeFamilyFlavour = ()
+  rnf TypeSynonymFlavour = ()
+  rnf BuiltInTypeFlavour = ()
+  rnf PromotedDataConFlavour = ()
+
+-- | Get the enclosing class TyCon (if there is one) for the given TyConFlavour
+tyConFlavourAssoc_maybe :: TyConFlavour tc -> Maybe tc
+tyConFlavourAssoc_maybe (OpenFamilyFlavour _ mb_parent) = mb_parent
+tyConFlavourAssoc_maybe _                               = Nothing
+
+-- | Whether something is a type or a data declaration,
+-- e.g. a type family or a data family.
+data TypeOrData
+  = IAmData
+  | IAmType
+  deriving (Eq, Data)
+
+instance Outputable TypeOrData where
+  ppr IAmData = text "data"
+  ppr IAmType = text "type"
 
 {- *********************************************************************
 *                                                                      *
@@ -2047,7 +2310,7 @@ GHC.Tc.Solver.applyDefaultingRules
 GHC.Iface.Type.defaultIfaceTyVarsOfKind
 
   This is a built-in defaulting mechanism that only applies when pretty-printing.
-  It defaults 'RuntimeRep'/'Levity' variables unless -fprint-explicit-kinds is enabled,
+  It defaults 'RuntimeRep'/'Levity' variables unless -fprint-explicit-runtime-reps is enabled,
   and 'Multiplicity' variables unless -XLinearTypes is enabled.
 
 -}

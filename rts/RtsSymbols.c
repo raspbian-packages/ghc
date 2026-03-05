@@ -422,9 +422,9 @@ extern char **environ;
       SymI_HasProto(ALLOC_PAP_gds)                      \
       SymI_HasProto(ALLOC_PAP_slp)                      \
       SymI_HasProto(ALLOC_TSO_ctr)                      \
-      SymI_HasProto(ALLOC_TSO_adm)                      \
-      SymI_HasProto(ALLOC_TSO_gds)                      \
-      SymI_HasProto(ALLOC_TSO_slp)                      \
+      SymI_HasProto(ALLOC_TSO_tot)                      \
+      SymI_HasProto(ALLOC_STACK_ctr)                    \
+      SymI_HasProto(ALLOC_STACK_tot)                    \
       SymI_HasProto(RET_NEW_ctr)                        \
       SymI_HasProto(RET_OLD_ctr)                        \
       SymI_HasProto(RET_UNBOXED_TUP_ctr)                \
@@ -464,7 +464,8 @@ extern char **environ;
       SymI_HasProto(mkCostCentre)               \
       SymI_HasProto(registerCcList)             \
       SymI_HasProto(registerCcsList)            \
-      SymI_HasProto(era)
+      SymI_HasProto(era)                        \
+      SymI_HasProto(user_era)
 #else
 #define RTS_PROF_SYMBOLS /* empty */
 #endif
@@ -508,6 +509,7 @@ extern char **environ;
       SymI_HasDataProto(stg_block_putmvar)                                  \
       MAIN_CAP_SYM                                                      \
       SymI_HasProto(addDLL)                                             \
+      SymI_HasProto(loadNativeObj)                                      \
       SymI_HasProto(addLibrarySearchPath)                               \
       SymI_HasProto(removeLibrarySearchPath)                            \
       SymI_HasProto(findSystemLibrary)                                  \
@@ -571,7 +573,7 @@ extern char **environ;
       SymI_HasProto(getOrSetLibHSghcGlobalHasPprDebug)                  \
       SymI_HasProto(getOrSetLibHSghcGlobalHasNoDebugOutput)             \
       SymI_HasProto(getOrSetLibHSghcGlobalHasNoStateHack)               \
-      SymI_HasProto(ghc_unique_counter)                                 \
+      SymI_HasProto(ghc_unique_counter64)                               \
       SymI_HasProto(ghc_unique_inc)                                     \
       SymI_HasProto(genericRaise)                                       \
       SymI_HasProto(getProgArgv)                                        \
@@ -618,6 +620,7 @@ extern char **environ;
       SymI_HasProto(purgeObj)                                           \
       SymI_HasProto(insertSymbol)                                       \
       SymI_HasProto(lookupSymbol)                                       \
+      SymI_HasProto(lookupSymbolInNativeObj)                            \
       SymI_HasDataProto(stg_makeStablePtrzh)                                \
       SymI_HasDataProto(stg_mkApUpd0zh)                                     \
       SymI_HasDataProto(stg_labelThreadzh)                                  \
@@ -870,7 +873,8 @@ extern char **environ;
       SymI_HasDataProto(stg_unpack_cstring_utf8_info)                       \
       SymI_HasDataProto(stg_upd_frame_info)                                 \
       SymI_HasDataProto(stg_bh_upd_frame_info)                              \
-      SymI_HasProto(suspendThread)                                      \
+      SymI_HasDataProto(stg_orig_thunk_info_frame_info)                     \
+      SymI_HasProto(suspendThread)                                          \
       SymI_HasDataProto(stg_takeMVarzh)                                     \
       SymI_HasDataProto(stg_readMVarzh)                                     \
       SymI_HasDataProto(stg_threadStatuszh)                                 \
@@ -878,7 +882,7 @@ extern char **environ;
       SymI_HasDataProto(stg_tryTakeMVarzh)                                  \
       SymI_HasDataProto(stg_tryReadMVarzh)                                  \
       SymI_HasDataProto(stg_unmaskAsyncExceptionszh)                        \
-      SymI_HasProto(unloadObj)                                          \
+      SymI_HasProto(unloadObj)                                              \
       SymI_HasDataProto(stg_unsafeThawArrayzh)                              \
       SymI_HasDataProto(stg_waitReadzh)                                     \
       SymI_HasDataProto(stg_waitWritezh)                                    \
@@ -892,7 +896,7 @@ extern char **environ;
       SymI_NeedsProto(stg_interp_constr5_entry)                         \
       SymI_NeedsProto(stg_interp_constr6_entry)                         \
       SymI_NeedsProto(stg_interp_constr7_entry)                         \
-      SymI_HasDataProto(stg_arg_bitmaps)                                    \
+      SymI_HasDataProto(stg_arg_bitmaps)                                \
       SymI_HasProto(large_alloc_lim)                                    \
       SymI_HasProto(g0)                                                 \
       SymI_HasProto(allocate)                                           \
@@ -907,6 +911,7 @@ extern char **environ;
       SymI_NeedsDataProto(rts_stop_on_exception)                        \
       SymI_HasProto(stopTimer)                                          \
       SymI_HasProto(n_capabilities)                                     \
+      SymI_HasProto(max_n_capabilities)                                 \
       SymI_HasProto(enabled_capabilities)                               \
       SymI_HasDataProto(stg_traceEventzh)                                   \
       SymI_HasDataProto(stg_traceMarkerzh)                                  \
@@ -920,6 +925,9 @@ extern char **environ;
       SymI_HasProto(stopProfTimer)                                      \
       SymI_HasProto(startHeapProfTimer)                                 \
       SymI_HasProto(stopHeapProfTimer)                                  \
+      SymI_HasProto(setUserEra)                                         \
+      SymI_HasProto(incrementUserEra)                                   \
+      SymI_HasProto(getUserEra)                                         \
       SymI_HasProto(requestHeapCensus)                                  \
       SymI_HasProto(atomic_inc)                                         \
       SymI_HasProto(atomic_dec)                                         \
@@ -929,9 +937,6 @@ extern char **environ;
       SymI_HasProto(hs_spt_remove)                                      \
       SymI_HasProto(hs_spt_keys)                                        \
       SymI_HasProto(hs_spt_key_count)                                   \
-      SymI_HasProto(write_barrier)                                      \
-      SymI_HasProto(store_load_barrier)                                 \
-      SymI_HasProto(load_load_barrier)                                  \
       SymI_HasProto(cas)                                                \
       SymI_HasProto(_assertFail)                                        \
       SymI_HasProto(keepCAFs)                                           \
@@ -946,13 +951,17 @@ extern char **environ;
       SymI_HasProto(newArena)                                           \
       SymI_HasProto(arenaAlloc)                                         \
       SymI_HasProto(arenaFree)                                          \
+      SymI_HasProto(rts_clearMemory)                                    \
       SymI_HasProto(setKeepCAFs)                                        \
       SymI_HasProto(rtsBadAlignmentBarf)                                \
       SymI_HasProto(rtsOutOfBoundsAccess)                               \
       SymI_HasProto(rtsMemcpyRangeOverlap)                              \
+      SymI_HasDataProto(stg_castWord64ToDoublezh)                       \
+      SymI_HasDataProto(stg_castDoubleToWord64zh)                       \
+      SymI_HasDataProto(stg_castWord32ToFloatzh)                        \
+      SymI_HasDataProto(stg_castFloatToWord32zh)                        \
       RTS_USER_SIGNALS_SYMBOLS                                          \
       RTS_INTCHAR_SYMBOLS
-
 
 // 64-bit support functions in libgcc.a
 #if defined(__GNUC__) && SIZEOF_VOID_P <= 4 && !defined(_ABIN32) && !(defined(__x86_64__) && defined(__ILP32__))

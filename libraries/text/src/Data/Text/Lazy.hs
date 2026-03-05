@@ -3,6 +3,8 @@
 {-# LANGUAGE Trustworthy #-}
 {-# LANGUAGE TemplateHaskellQuotes #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE PatternSynonyms #-}
+{-# LANGUAGE ViewPatterns #-}
 
 -- |
 -- Module      : Data.Text.Lazy
@@ -46,6 +48,7 @@ module Data.Text.Lazy
 
     -- * Types
       Text
+    , LazyText
 
     -- * Creation and elimination
     , pack
@@ -58,6 +61,11 @@ module Data.Text.Lazy
     , fromStrict
     , foldrChunks
     , foldlChunks
+
+    -- * Pattern matching
+    , pattern Empty
+    , pattern (:<)
+    , pattern (:>)
 
     -- * Basic interface
     , cons
@@ -100,6 +108,7 @@ module Data.Text.Lazy
     , foldl1'
     , foldr
     , foldr1
+    , foldlM'
 
     -- ** Special folds
     , concat
@@ -155,7 +164,9 @@ module Data.Text.Lazy
     , group
     , groupBy
     , inits
+    , initsNE
     , tails
+    , tailsNE
 
     -- ** Breaking into many substrings
     -- $split
@@ -197,12 +208,15 @@ module Data.Text.Lazy
     , zip
     , zipWith
 
+    -- * Showing values
+    , show
+
     -- -* Ordered text
     -- , sort
     ) where
 
 import Prelude (Char, Bool(..), Maybe(..), String,
-                Eq, (==), Ord(..), Ordering(..), Read(..), Show(..),
+                Eq, (==), Ord(..), Ordering(..), Read(..), Show(showsPrec),
                 Monad(..), pure, (<$>),
                 (&&), (+), (-), (.), ($), (++),
                 error, flip, fmap, fromIntegral, not, otherwise, quot)
@@ -216,6 +230,7 @@ import Data.Char (isSpace)
 import Data.Data (Data(gfoldl, toConstr, gunfold, dataTypeOf), constrIndex,
                   Constr, mkConstr, DataType, mkDataType, Fixity(Prefix))
 import Data.Binary (Binary(get, put))
+import Data.Binary.Put (putBuilder)
 import Data.List.NonEmpty (NonEmpty(..))
 import qualified Data.List.NonEmpty as NE
 import Data.Monoid (Monoid(..))
@@ -230,9 +245,11 @@ import qualified Data.Text.Internal.Lazy.Fusion as S
 import Data.Text.Internal.Fusion.Types (PairS(..))
 import Data.Text.Internal.Lazy.Fusion (stream, unstream)
 import Data.Text.Internal.Lazy (Text(..), chunk, empty, foldlChunks,
-                                foldrChunks, smallChunkSize, defaultChunkSize, equal)
+                                foldrChunks, smallChunkSize, defaultChunkSize, equal, LazyText)
 import Data.Text.Internal (firstf, safe, text)
-import Data.Text.Lazy.Encoding (decodeUtf8', encodeUtf8)
+import Data.Text.Internal.Reverse (reverseNonEmpty)
+import Data.Text.Internal.Transformation (mapNonEmpty, toCaseFoldNonEmpty, toLowerNonEmpty, toUpperNonEmpty, filter_)
+import Data.Text.Lazy.Encoding (decodeUtf8', encodeUtf8Builder)
 import Data.Text.Internal.Lazy.Search (indices)
 import qualified GHC.CString as GHC
 import qualified GHC.Exts as Exts
@@ -311,6 +328,13 @@ instance Read Text where
 -- | @since 1.2.2.0
 instance Semigroup Text where
     (<>) = append
+    stimes n _ | n < 0 = P.error "Data.Text.Lazy.stimes: given number is negative!"
+    stimes n a =
+      let nInt64 = fromIntegral n :: Int64
+          len = if n == fromIntegral nInt64 && nInt64 >= 0 then nInt64 else P.maxBound
+          -- We clamp the length to maxBound :: Int64.
+          -- To tell the difference, the caller would have to skip through 2^63 chunks.
+      in replicate len a
 
 instance Monoid Text where
     mempty  = empty
@@ -343,7 +367,11 @@ instance NFData Text where
 
 -- | @since 1.2.1.0
 instance Binary Text where
-    put t = put (encodeUtf8 t)
+    put t = do
+      -- This needs to be in sync with the Binary instance for ByteString
+      -- in the binary package.
+      put (foldlChunks (\n c -> n + T.lengthWord8 c) 0 t)
+      putBuilder (encodeUtf8Builder t)
     get   = do
       bs <- get
       case decodeUtf8' bs of
@@ -403,7 +431,23 @@ unpack ::
 #endif
   Text -> String
 unpack t = S.unstreamList (stream t)
-{-# INLINE [1] unpack #-}
+{-# NOINLINE unpack #-}
+
+foldrFB :: (Char -> b -> b) -> b -> Text -> b
+foldrFB = foldr
+{-# INLINE [0] foldrFB #-}
+
+-- List fusion rules for `unpack`:
+-- * `unpack` rewrites to `build` up till (but not including) phase 1. `build`
+--   fuses if `foldr` is applied to it.
+-- * If it doesn't fuse: In phase 1, `build` inlines to give us `foldrFB (:) []`
+--   and we rewrite that back to `unpack`.
+-- * If it fuses: In phase 0, `foldrFB` inlines and `foldr` inlines. GHC
+--   optimizes the fused code.
+{-# RULES
+"Text.Lazy.unpack"     [~1] forall t. unpack t = Exts.build (\lcons lnil -> foldrFB lcons lnil t)
+"Text.Lazy.unpackBack" [1]  foldrFB (:) [] = unpack
+  #-}
 
 -- | /O(n)/ Convert a literal string into a Text.
 unpackCString# :: Addr# -> Text
@@ -441,12 +485,12 @@ toChunks :: Text -> [T.Text]
 toChunks cs = foldrChunks (:) [] cs
 
 -- | /O(n)/ Convert a lazy 'Text' into a strict 'T.Text'.
-toStrict :: Text -> T.Text
+toStrict :: LazyText -> T.StrictText
 toStrict t = T.concat (toChunks t)
 {-# INLINE [1] toStrict #-}
 
 -- | /O(c)/ Convert a strict 'T.Text' into a lazy 'Text'.
-fromStrict :: T.Text -> Text
+fromStrict :: T.StrictText -> LazyText
 fromStrict t = chunk t Empty
 {-# INLINE [1] fromStrict #-}
 
@@ -519,6 +563,26 @@ null Empty = True
 null _     = False
 {-# INLINE [1] null #-}
 
+-- | Bidirectional pattern synonym for 'cons' (/O(n)/) and 'uncons' (/O(1)/),
+-- to be used together with 'Empty'.
+--
+-- @since 2.1.2
+pattern (:<) :: Char -> Text -> Text
+pattern x :< xs <- (uncons -> Just (x, xs)) where
+  (:<) = cons
+infixr 5 :<
+{-# COMPLETE Empty, (:<) #-}
+
+-- | Bidirectional pattern synonym for 'snoc' (/O(n)/) and 'unsnoc' (/O(1)/)
+-- to be used together with 'Empty'.
+--
+-- @since 2.1.2
+pattern (:>) :: Text -> Char -> Text
+pattern xs :> x <- (unsnoc -> Just (xs, x)) where
+  (:>) = snoc
+infixl 5 :>
+{-# COMPLETE Empty, (:>) #-}
+
 -- | /O(1)/ Tests whether a 'Text' contains exactly one character.
 isSingleton :: Text -> Bool
 isSingleton = S.isSingleton . stream
@@ -577,7 +641,7 @@ compareLength t c = S.compareLengthI (stream t) c
 -- each element of @t@. Performs replacement on
 -- invalid scalar values.
 map :: (Char -> Char) -> Text -> Text
-map f = foldrChunks (Chunk . T.map f) Empty
+map f = foldrChunks (Chunk . mapNonEmpty f) Empty
 {-# INLINE [1] map #-}
 
 {-# RULES
@@ -663,7 +727,7 @@ reverse ::
   Text -> Text
 reverse = rev Empty
   where rev a Empty        = a
-        rev a (Chunk t ts) = rev (Chunk (T.reverse t) a) ts
+        rev a (Chunk t ts) = rev (Chunk (reverseNonEmpty t) a) ts
 
 -- | /O(m+n)/ Replace every non-overlapping occurrence of @needle@ in
 -- @haystack@ with @replacement@.
@@ -728,7 +792,7 @@ replace s d = intercalate d . splitOn s
 -- case folded to the Greek small letter letter mu (U+03BC) instead of
 -- itself.
 toCaseFold :: Text -> Text
-toCaseFold = foldrChunks (\chnk acc -> Chunk (T.toCaseFold chnk) acc) Empty
+toCaseFold = foldrChunks (\chnk acc -> Chunk (toCaseFoldNonEmpty chnk) acc) Empty
 {-# INLINE toCaseFold #-}
 
 -- | /O(n)/ Convert a string to lower case, using simple case
@@ -739,7 +803,7 @@ toCaseFold = foldrChunks (\chnk acc -> Chunk (T.toCaseFold chnk) acc) Empty
 -- to the sequence Latin small letter i (U+0069) followed by combining
 -- dot above (U+0307).
 toLower :: Text -> Text
-toLower = foldrChunks (\chnk acc -> Chunk (T.toLower chnk) acc) Empty
+toLower = foldrChunks (\chnk acc -> Chunk (toLowerNonEmpty chnk) acc) Empty
 {-# INLINE toLower #-}
 
 -- | /O(n)/ Convert a string to upper case, using simple case
@@ -749,7 +813,7 @@ toLower = foldrChunks (\chnk acc -> Chunk (T.toLower chnk) acc) Empty
 -- instance, the German eszett (U+00DF) maps to the two-letter
 -- sequence SS.
 toUpper :: Text -> Text
-toUpper = foldrChunks (\chnk acc -> Chunk (T.toUpper chnk) acc) Empty
+toUpper = foldrChunks (\chnk acc -> Chunk (toUpperNonEmpty chnk) acc) Empty
 {-# INLINE toUpper #-}
 
 
@@ -809,6 +873,13 @@ foldl1 f t = S.foldl1 f (stream t)
 foldl1' :: HasCallStack => (Char -> Char -> Char) -> Text -> Char
 foldl1' f t = S.foldl1' f (stream t)
 {-# INLINE foldl1' #-}
+
+-- | /O(n)/ A monadic version of 'foldl''.
+--
+-- @since 2.1.2
+foldlM' :: Monad m => (a -> Char -> m a) -> a -> Text -> m a
+foldlM' f z t = S.foldlM' f z (stream t)
+{-# INLINE foldlM' #-}
 
 -- | /O(n)/ 'foldr', applied to a binary operator, a starting value
 -- (typically the right-identity of the operator), and a 'Text',
@@ -1227,7 +1298,7 @@ splitAt :: Int64 -> Text -> (Text, Text)
 splitAt = loop
   where
     loop :: Int64 -> Text -> (Text, Text)
-    loop _ Empty      = (empty, empty)
+    loop !_ Empty     = (empty, empty)
     loop n t | n <= 0 = (empty, t)
     loop n (Chunk t ts)
          | n < len   = let (t',t'') = T.splitAt (int64ToInt n) t
@@ -1240,7 +1311,7 @@ splitAt = loop
 -- element is a prefix of @t@ whose chunks contain @n@ 'Word8'
 -- values, and whose second is the remainder of the string.
 splitAtWord :: Int64 -> Text -> PairS Text Text
-splitAtWord _ Empty = empty :*: empty
+splitAtWord !_ Empty = empty :*: empty
 splitAtWord x (Chunk c@(T.Text arr off len) cs)
     | y >= len  = let h :*: t = splitAtWord (x-intToInt64 len) cs
                   in  Chunk c h :*: t
@@ -1421,21 +1492,43 @@ groupBy eq (Chunk t ts) = cons x ys : groupBy eq zs
                                 x  = T.unsafeHead t
                                 xs = chunk (T.unsafeTail t) ts
 
--- | /O(n)/ Return all initial segments of the given 'Text',
+-- | /O(n²)/ Return all initial segments of the given 'Text',
 -- shortest first.
 inits :: Text -> [Text]
-inits = (Empty :) . inits'
-  where inits' Empty        = []
-        inits' (Chunk t ts) = L.map (\t' -> Chunk t' Empty) (L.drop 1 (T.inits t))
-                           ++ L.map (Chunk t) (inits' ts)
+inits = (NE.toList P.$!) . initsNE
+
+-- | /O(n²)/ Return all initial segments of the given 'Text',
+-- shortest first.
+--
+-- @since 2.1.2
+initsNE :: Text -> NonEmpty Text
+initsNE ts0 = Empty NE.:| inits' 0 ts0
+  where
+    inits' :: Int64  -- Number of previous chunks i
+           -> Text   -- The remainder after dropping i chunks from ts0
+           -> [Text] -- Prefixes longer than the first i chunks of ts0.
+    inits' !i (Chunk t ts) = L.map (takeChunks i ts0) (NE.tail (T.initsNE t))
+                          ++ inits' (i + 1) ts
+    inits' _ Empty         = []
+
+takeChunks :: Int64 -> Text -> T.Text -> Text
+takeChunks !i (Chunk t ts) lastChunk | i > 0 = Chunk t (takeChunks (i - 1) ts lastChunk)
+takeChunks _ _ lastChunk = Chunk lastChunk Empty
 
 -- | /O(n)/ Return all final segments of the given 'Text', longest
 -- first.
 tails :: Text -> [Text]
-tails Empty         = Empty : []
-tails ts@(Chunk t ts')
-  | T.length t == 1 = ts : tails ts'
-  | otherwise       = ts : tails (Chunk (T.unsafeTail t) ts')
+tails = (NE.toList P.$!) . tailsNE
+
+-- | /O(n)/ Return all final segments of the given 'Text', longest
+-- first.
+--
+-- @since 2.1.2
+tailsNE :: Text -> NonEmpty Text
+tailsNE Empty = Empty :| []
+tailsNE ts@(Chunk t ts')
+  | T.length t == 1 = ts :| tails ts'
+  | otherwise       = ts :| tails (Chunk (T.unsafeTail t) ts')
 
 -- $split
 --
@@ -1682,12 +1775,12 @@ stripSuffix p t = reverse `fmap` stripPrefix (reverse p) (reverse t)
 -- returns a 'Text' containing those characters that satisfy the
 -- predicate.
 filter :: (Char -> Bool) -> Text -> Text
-filter p = foldrChunks (chunk . T.filter p) Empty
+filter p = foldrChunks (chunk . filter_ T.Text p) Empty
 {-# INLINE [1] filter #-}
 
 {-# RULES
 "TEXT filter/filter -> filter" forall p q t.
-    filter p (filter q t) = filter (\c -> p c && q c) t
+    filter p (filter q t) = filter (\c -> q c && p c) t
 #-}
 
 -- | /O(n)/ The 'find' function takes a predicate and a 'Text', and
@@ -1757,6 +1850,12 @@ zipWith :: (Char -> Char -> Char) -> Text -> Text -> Text
 zipWith f t1 t2 = unstream (S.zipWith g (stream t1) (stream t2))
     where g a b = safe (f a b)
 {-# INLINE [0] zipWith #-}
+
+-- | Convert a value to lazy 'Text'.
+--
+-- @since 2.1.2
+show :: Show a => a -> Text
+show = pack . P.show
 
 revChunks :: [T.Text] -> Text
 revChunks = L.foldl' (flip chunk) Empty

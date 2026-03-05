@@ -1,3 +1,12 @@
+0.10.9 [2024.10.31]
+-------------------
+* Drop support for pre-8.0 versions of GHC.
+
+0.10.8 [2024.04.20]
+-------------------
+* Allow building with `template-haskell-2.22.*`.
+* Make the test suite build with GHC 9.4 and `mtl-2.3.1`.
+
 0.10.7 [2022.12.04]
 -------------------
 * On pre-8.0 GHCs, drop the `call-stack` dependency. This dependency was

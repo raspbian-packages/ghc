@@ -9,6 +9,7 @@
 {-# LANGUAGE MonadComprehensions #-}
 {-# OPTIONS_GHC -fno-warn-orphans #-}
 {-# OPTIONS_GHC -Wno-incomplete-record-updates #-}
+{-# OPTIONS_GHC -Wno-redundant-constraints #-}
 {-# OPTIONS_HADDOCK hide #-}
 -----------------------------------------------------------------------------
 -- |
@@ -34,14 +35,15 @@ import qualified Data.Set as Set
 
 import Haddock.Types( DocName, DocNameI, XRecCond )
 
+import GHC
+import GHC.Builtin.Names
+import GHC.Data.FastString
+import GHC.Driver.Ppr (showPpr )
+import GHC.Driver.Session
+import GHC.Types.Name
 import GHC.Utils.FV as FV
 import GHC.Utils.Outputable ( Outputable )
 import GHC.Utils.Panic ( panic )
-import GHC.Driver.Ppr (showPpr )
-import GHC.Types.Name
-import GHC.Unit.Module
-import GHC
-import GHC.Driver.Session
 import GHC.Types.SrcLoc  ( advanceSrcLoc )
 import GHC.Types.Var     ( Specificity, VarBndr(..), TyVarBinder
                          , tyVarKind, updateTyVarKind, isInvisibleForAllTyFlag )
@@ -58,7 +60,7 @@ import           Data.ByteString ( ByteString )
 import qualified Data.ByteString          as BS
 import qualified Data.ByteString.Internal as BS
 
-import GHC.HsToCore.Docs
+import GHC.HsToCore.Docs hiding (sigNameNoLoc)
 
 moduleString :: Module -> String
 moduleString = moduleNameString . moduleName
@@ -76,10 +78,10 @@ filterLSigNames p (L loc sig) = L loc <$> (filterSigNames p sig)
 filterSigNames :: (IdP (GhcPass p) -> Bool) -> Sig (GhcPass p) -> Maybe (Sig (GhcPass p))
 filterSigNames p orig@(SpecSig _ n _ _)          = ifTrueJust (p $ unLoc n) orig
 filterSigNames p orig@(InlineSig _ n _)          = ifTrueJust (p $ unLoc n) orig
-filterSigNames p (FixSig _ (FixitySig _ ns ty)) =
+filterSigNames p (FixSig _ (FixitySig ns_spec ns ty)) =
   case filter (p . unLoc) ns of
     []       -> Nothing
-    filtered -> Just (FixSig noAnn (FixitySig noExtField filtered ty))
+    filtered -> Just (FixSig noAnn (FixitySig ns_spec filtered ty))
 filterSigNames _ orig@(MinimalSig _ _)      = Just orig
 filterSigNames p (TypeSig _ ns ty) =
   case filter (p . unLoc) ns of
@@ -100,7 +102,16 @@ ifTrueJust True  = Just
 ifTrueJust False = const Nothing
 
 sigName :: LSig GhcRn -> [IdP GhcRn]
-sigName (L _ sig) = sigNameNoLoc emptyOccEnv sig
+sigName (L _ sig) = sigNameNoLoc' emptyOccEnv sig
+
+sigNameNoLoc' :: forall pass w. UnXRec pass => w -> Sig pass -> [IdP pass]
+sigNameNoLoc' _ (TypeSig    _   ns _)         = map (unXRec @pass) ns
+sigNameNoLoc' _ (ClassOpSig _ _ ns _)         = map (unXRec @pass) ns
+sigNameNoLoc' _ (PatSynSig  _   ns _)         = map (unXRec @pass) ns
+sigNameNoLoc' _ (SpecSig    _   n _ _)        = [unXRec @pass n]
+sigNameNoLoc' _ (InlineSig  _   n _)          = [unXRec @pass n]
+sigNameNoLoc' _ (FixSig _ (FixitySig _ ns _)) = map (unXRec @pass) ns
+sigNameNoLoc' _ _                             = []
 
 -- | Was this signature given by the user?
 isUserLSig :: forall p. UnXRec p => LSig p -> Bool
@@ -112,6 +123,12 @@ isClassD _ = False
 
 pretty :: Outputable a => DynFlags -> a -> String
 pretty = showPpr
+
+dataListModule :: Module
+dataListModule = mkBaseModule (fsLit "Data.List")
+
+dataTupleModule :: Module
+dataTupleModule = mkBaseModule (fsLit "Data.Tuple")
 
 -- ---------------------------------------------------------------------
 
@@ -182,11 +199,11 @@ getGADTConType (ConDeclGADT { con_bndrs = L _ outer_bndrs
 
 --  tau_ty :: LHsType DocNameI
    tau_ty = case args of
-              RecConGADT flds _ -> mkFunTy (noLocA (HsRecTy noAnn (unLoc flds))) res_ty
-              PrefixConGADT pos_args -> foldr mkFunTy res_ty (map hsScaledThing pos_args)
+              RecConGADT _ flds -> mkFunTy (noLocA (HsRecTy noAnn (unLoc flds))) res_ty
+              PrefixConGADT _ pos_args -> foldr mkFunTy res_ty (map hsScaledThing pos_args)
 
    mkFunTy :: LHsType DocNameI -> LHsType DocNameI -> LHsType DocNameI
-   mkFunTy a b = noLocA (HsFunTy noAnn (HsUnrestrictedArrow noHsUniTok) a b)
+   mkFunTy a b = noLocA (HsFunTy noAnn (HsUnrestrictedArrow noExtField) a b)
 
 getGADTConType (ConDeclH98 {}) = panic "getGADTConType"
   -- Should only be called on ConDeclGADT
@@ -197,7 +214,7 @@ getMainDeclBinderI (ValD _ d) =
   case collectHsBindBinders CollNoDictBinders d of
     []       -> []
     (name:_) -> [name]
-getMainDeclBinderI (SigD _ d) = sigNameNoLoc emptyOccEnv d
+getMainDeclBinderI (SigD _ d) = sigNameNoLoc' emptyOccEnv d
 getMainDeclBinderI (ForD _ (ForeignImport _ name _ _)) = [unLoc name]
 getMainDeclBinderI (ForD _ (ForeignExport _ _ _ _)) = []
 getMainDeclBinderI _ = []
@@ -241,7 +258,7 @@ addClassContext _ _ sig = sig   -- E.g. a MinimalSig is fine
 
 lHsQTyVarsToTypes :: LHsQTyVars GhcRn -> [LHsTypeArg GhcRn]
 lHsQTyVarsToTypes tvs
-  = [ HsValArg $ noLocA (HsTyVar noAnn NotPromoted (noLocA (hsLTyVarName tv)))
+  = [ HsValArg noExtField $ noLocA (HsTyVar noAnn NotPromoted (noLocA (hsLTyVarName tv)))
     | tv <- hsQTvExplicit tvs ]
 
 
@@ -286,9 +303,9 @@ restrictCons names decls = [ L p d | L p (Just d) <- fmap keep <$> decls ]
 
           ConDeclGADT { con_g_args = con_args' } -> case con_args' of
             PrefixConGADT {} -> Just d
-            RecConGADT fields _
+            RecConGADT _ fields
               | all field_avail (unLoc fields) -> Just d
-              | otherwise -> Just (d { con_g_args = PrefixConGADT (field_types $ unLoc fields) })
+              | otherwise -> Just (d { con_g_args = PrefixConGADT noExtField (field_types $ unLoc fields) })
               -- see above
       where
         field_avail :: LConDeclField GhcRn -> Bool

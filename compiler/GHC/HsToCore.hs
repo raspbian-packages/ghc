@@ -18,7 +18,7 @@ module GHC.HsToCore (
 
 import GHC.Prelude
 
-import GHC.Driver.Session
+import GHC.Driver.DynFlags
 import GHC.Driver.Config
 import GHC.Driver.Config.Core.Lint ( endPassHscEnvIO )
 import GHC.Driver.Config.HsToCore.Ticks
@@ -41,6 +41,7 @@ import GHC.HsToCore.Coverage
 import GHC.HsToCore.Docs
 
 import GHC.Tc.Types
+import GHC.Tc.Types.Origin ( Position(..) )
 import GHC.Tc.Utils.Monad  ( finalSafeMode, fixSafeInstances, initIfaceLoad )
 import GHC.Tc.Module ( runTcInteractive )
 
@@ -77,6 +78,7 @@ import GHC.Utils.Logger
 
 import GHC.Types.Id
 import GHC.Types.Id.Info
+import GHC.Types.Id.Make ( mkRepPolyIdConcreteTyVars )
 import GHC.Types.ForeignStubs
 import GHC.Types.Avail
 import GHC.Types.Basic
@@ -167,7 +169,7 @@ deSugar hsc_env
            [ (i, s)
            | i <- hsc_interp hsc_env
            , (_, s) <- m_tickInfo
-           , backendWantsBreakpointTicks (backend dflags)
+           , breakpointsAllowed dflags
            ]
            $ \(interp, specs) -> mkModBreaks interp mod specs
 
@@ -182,8 +184,8 @@ deSugar hsc_env
             _ -> pure $ emptyHpcInfo other_hpc_info
 
         ; (msgs, mb_res) <- initDs hsc_env tcg_env $
-                       do { ds_ev_binds <- dsEvBinds ev_binds
-                          ; core_prs <- dsTopLHsBinds binds_cvr
+                       do { dsEvBinds ev_binds $ \ ds_ev_binds -> do
+                          { core_prs <- dsTopLHsBinds binds_cvr
                           ; core_prs <- patchMagicDefns core_prs
                           ; (spec_prs, spec_rules) <- dsImpSpecs imp_specs
                           ; (ds_fords, foreign_prs) <- dsForeigns fords
@@ -194,7 +196,7 @@ deSugar hsc_env
                           ; return ( ds_ev_binds
                                    , foreign_prs `appOL` core_prs `appOL` spec_prs
                                    , spec_rules ++ ds_rules
-                                   , ds_fords `appendStubC` hpc_init) }
+                                   , ds_fords `appendStubC` hpc_init) } }
 
         ; case mb_res of {
            Nothing -> return (msgs, Nothing) ;
@@ -764,7 +766,7 @@ mkUnsafeCoercePrimPair _old_id old_expr
              unsafe_equality k a b
                = ( mkTyApps (Var unsafe_equality_proof_id) [k,b,a]
                  , mkTyConApp unsafe_equality_tc [k,b,a]
-                 , mkHeteroPrimEqPred k k a b
+                 , mkNomPrimEqPred k a b
                  )
              -- NB: UnsafeRefl :: (b ~# a) -> UnsafeEquality a b, so we have to
              -- carefully swap the arguments above
@@ -795,5 +797,9 @@ mkUnsafeCoercePrimPair _old_id old_expr
 
              arity = 1
 
-             id   = mkExportedVanillaId unsafeCoercePrimName ty `setIdInfo` info
+             concs = mkRepPolyIdConcreteTyVars
+                     [((mkTyVarTy openAlphaTyVar, Argument 1 Top), runtimeRep1TyVar)]
+                     unsafeCoercePrimName
+
+             id   = mkExportedLocalId (RepPolyId concs) unsafeCoercePrimName ty `setIdInfo` info
        ; return (id, old_expr) }

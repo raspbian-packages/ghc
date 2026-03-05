@@ -3,6 +3,7 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE UndecidableInstances #-}
+{-# LANGUAGE NamedFieldPuns #-}
 
 module GHC.Unit.Module.ModIface
    ( ModIface
@@ -109,8 +110,10 @@ data ModIfaceBackend = ModIfaceBackend
     -- other fields and are not put into the interface file.
     -- Not really produced by the backend but there is no need to create them
     -- any earlier.
-  , mi_warn_fn :: !(OccName -> Maybe (WarningTxt GhcRn))
-    -- ^ Cached lookup for 'mi_warns'
+  , mi_decl_warn_fn :: !(OccName -> Maybe (WarningTxt GhcRn))
+    -- ^ Cached lookup for 'mi_warns' for declaration deprecations
+  , mi_export_warn_fn :: !(Name -> Maybe (WarningTxt GhcRn))
+    -- ^ Cached lookup for 'mi_warns' for export deprecations
   , mi_fix_fn :: !(OccName -> Maybe Fixity)
     -- ^ Cached lookup for 'mi_fixities'
   , mi_hash_fn :: !(OccName -> Maybe (OccName, Fingerprint))
@@ -184,7 +187,7 @@ data ModIface_ (phase :: ModIfacePhase)
                 -- ^ Fixities
                 -- NOT STRICT!  we read this field lazily from the interface file
 
-        mi_warns    :: (Warnings GhcRn),
+        mi_warns    :: IfaceWarnings,
                 -- ^ Warnings
                 -- NOT STRICT!  we read this field lazily from the interface file
 
@@ -205,7 +208,7 @@ data ModIface_ (phase :: ModIfacePhase)
                 -- combined with mi_decls allows us to restart code generation.
                 -- See Note [Interface Files with Core Definitions] and Note [Interface File with Core: Sharing RHSs]
 
-        mi_globals  :: !(Maybe GlobalRdrEnv),
+        mi_globals  :: !(Maybe IfGlobalRdrEnv),
                 -- ^ Binds all the things defined at the top level in
                 -- the /original source/ code for this module. which
                 -- is NOT the same as mi_exports, nor mi_decls (which
@@ -478,7 +481,8 @@ instance Binary ModIface where
                    mi_finsts = hasFamInsts,
                    mi_exp_hash = exp_hash,
                    mi_orphan_hash = orphan_hash,
-                   mi_warn_fn = mkIfaceWarnCache warns,
+                   mi_decl_warn_fn = mkIfaceDeclWarnCache $ fromIfaceWarnings warns,
+                   mi_export_warn_fn = mkIfaceExportWarnCache $ fromIfaceWarnings warns,
                    mi_fix_fn = mkIfaceFixCache fixities,
                    mi_hash_fn = mkIfaceHashCache decls
                  }})
@@ -497,7 +501,7 @@ emptyPartialModIface mod
                mi_exports     = [],
                mi_used_th     = False,
                mi_fixities    = [],
-               mi_warns       = NoWarnings,
+               mi_warns       = IfWarnSome [] [],
                mi_anns        = [],
                mi_insts       = [],
                mi_fam_insts   = [],
@@ -529,7 +533,8 @@ emptyFullModIface mod =
           mi_finsts = False,
           mi_exp_hash = fingerprint0,
           mi_orphan_hash = fingerprint0,
-          mi_warn_fn = emptyIfaceWarnCache,
+          mi_decl_warn_fn = emptyIfaceWarnCache,
+          mi_export_warn_fn = emptyIfaceWarnCache,
           mi_fix_fn = emptyIfaceFixCache,
           mi_hash_fn = emptyIfaceHashCache } }
 
@@ -549,20 +554,60 @@ emptyIfaceHashCache _occ = Nothing
 
 -- Take care, this instance only forces to the degree necessary to
 -- avoid major space leaks.
-instance (NFData (IfaceBackendExts (phase :: ModIfacePhase)), NFData (IfaceDeclExts (phase :: ModIfacePhase))) => NFData (ModIface_ phase) where
-  rnf (ModIface f1 f2 f3 f4 f5 f6 f7 f8 f9 f10 f11 f12
-                f13 f14 f15 f16 f17 f18 f19 f20 f21 f22 f23 f24) =
-    rnf f1 `seq` rnf f2 `seq` f3 `seq` f4 `seq` f5 `seq` f6 `seq` rnf f7 `seq` f8 `seq`
-    f9 `seq` rnf f10 `seq` rnf f11 `seq` rnf f12 `seq` rnf f13 `seq` rnf f14 `seq` rnf f15 `seq` rnf f16 `seq`
-    rnf f17 `seq` f18 `seq` rnf f19 `seq` rnf f20 `seq` rnf f21 `seq` f22 `seq` f23 `seq` rnf f24
+instance ( NFData (IfaceBackendExts (phase :: ModIfacePhase))
+         , NFData (IfaceDeclExts (phase :: ModIfacePhase))
+         ) => NFData (ModIface_ phase) where
+  rnf (ModIface{ mi_module, mi_sig_of, mi_hsc_src, mi_deps, mi_usages
+               , mi_exports, mi_used_th, mi_fixities, mi_warns, mi_anns
+               , mi_decls, mi_extra_decls, mi_globals, mi_insts
+               , mi_fam_insts, mi_rules, mi_hpc, mi_trust, mi_trust_pkg
+               , mi_complete_matches, mi_docs, mi_final_exts
+               , mi_ext_fields, mi_src_hash })
+    =     rnf mi_module
+    `seq` rnf mi_sig_of
+    `seq`     mi_hsc_src
+    `seq`     mi_deps
+    `seq`     mi_usages
+    `seq`     mi_exports
+    `seq` rnf mi_used_th
+    `seq`     mi_fixities
+    `seq` rnf mi_warns
+    `seq` rnf mi_anns
+    `seq` rnf mi_decls
+    `seq` rnf mi_extra_decls
+    `seq` rnf mi_globals
+    `seq` rnf mi_insts
+    `seq` rnf mi_fam_insts
+    `seq` rnf mi_rules
+    `seq` rnf mi_hpc
+    `seq`     mi_trust
+    `seq` rnf mi_trust_pkg
+    `seq` rnf mi_complete_matches
+    `seq` rnf mi_docs
+    `seq`     mi_final_exts
+    `seq`     mi_ext_fields
+    `seq` rnf mi_src_hash
     `seq` ()
 
-
 instance NFData (ModIfaceBackend) where
-  rnf (ModIfaceBackend f1 f2 f3 f4 f5 f6 f7 f8 f9 f10 f11 f12 f13)
-    = rnf f1 `seq` rnf f2 `seq` rnf f3 `seq` rnf f4 `seq`
-      rnf f5 `seq` rnf f6 `seq` rnf f7 `seq` rnf f8 `seq`
-      rnf f9 `seq` rnf f10 `seq` rnf f11 `seq` rnf f12 `seq` rnf f13
+  rnf (ModIfaceBackend{ mi_iface_hash, mi_mod_hash, mi_flag_hash, mi_opt_hash
+                      , mi_hpc_hash, mi_plugin_hash, mi_orphan, mi_finsts, mi_exp_hash
+                      , mi_orphan_hash, mi_decl_warn_fn, mi_export_warn_fn, mi_fix_fn
+                      , mi_hash_fn})
+    =     rnf mi_iface_hash
+    `seq` rnf mi_mod_hash
+    `seq` rnf mi_flag_hash
+    `seq` rnf mi_opt_hash
+    `seq` rnf mi_hpc_hash
+    `seq` rnf mi_plugin_hash
+    `seq` rnf mi_orphan
+    `seq` rnf mi_finsts
+    `seq` rnf mi_exp_hash
+    `seq` rnf mi_orphan_hash
+    `seq` rnf mi_decl_warn_fn
+    `seq` rnf mi_export_warn_fn
+    `seq` rnf mi_fix_fn
+    `seq` rnf mi_hash_fn
 
 
 forceModIface :: ModIface -> IO ()

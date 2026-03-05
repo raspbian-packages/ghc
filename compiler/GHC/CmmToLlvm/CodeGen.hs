@@ -12,6 +12,7 @@ import GHC.Platform
 import GHC.Platform.Regs ( activeStgRegs )
 
 import GHC.Llvm
+import GHC.Llvm.Types
 import GHC.CmmToLlvm.Base
 import GHC.CmmToLlvm.Config
 import GHC.CmmToLlvm.Regs
@@ -23,7 +24,7 @@ import GHC.Cmm.Utils
 import GHC.Cmm.Switch
 import GHC.Cmm.Dataflow.Block
 import GHC.Cmm.Dataflow.Graph
-import GHC.Cmm.Dataflow.Collections
+import GHC.Cmm.Dataflow.Label
 
 import GHC.Data.FastString
 import GHC.Data.OrdList
@@ -33,7 +34,6 @@ import GHC.Types.Unique.Supply
 import GHC.Types.Unique
 
 import GHC.Utils.Outputable
-import GHC.Utils.Panic.Plain (massert)
 import qualified GHC.Utils.Panic as Panic
 import GHC.Utils.Misc
 
@@ -171,31 +171,17 @@ getInstrinct fname retTy parTys =
         fty = LMFunction funSig
     in getInstrinct2 fname fty
 
--- | Memory barrier instruction for LLVM >= 3.0
-barrier :: LlvmM StmtData
-barrier = do
-    let s = Fence False SyncSeqCst
-    return (unitOL s, [])
-
--- | Insert a 'barrier', unless the target platform is in the provided list of
---   exceptions (where no code will be emitted instead).
-barrierUnless :: [Arch] -> LlvmM StmtData
-barrierUnless exs = do
-    platform <- getPlatform
-    if platformArch platform `elem` exs
-        then return (nilOL, [])
-        else barrier
-
 -- | Foreign Calls
 genCall :: ForeignTarget -> [CmmFormal] -> [CmmActual] -> LlvmM StmtData
 
 -- Barriers need to be handled specially as they are implemented as LLVM
 -- intrinsic functions.
-genCall (PrimTarget MO_ReadBarrier) _ _ =
-    barrierUnless [ArchX86, ArchX86_64]
-
-genCall (PrimTarget MO_WriteBarrier) _ _ =
-    barrierUnless [ArchX86, ArchX86_64]
+genCall (PrimTarget MO_AcquireFence) _ _ = runStmtsDecls $
+    statement $ Fence False SyncAcquire
+genCall (PrimTarget MO_ReleaseFence) _ _ = runStmtsDecls $
+    statement $ Fence False SyncRelease
+genCall (PrimTarget MO_SeqCstFence) _ _ = runStmtsDecls $
+    statement $ Fence False SyncSeqCst
 
 genCall (PrimTarget MO_Touch) _ _ =
     return (nilOL, [])
@@ -207,7 +193,7 @@ genCall (PrimTarget (MO_UF_Conv w)) [dst] [e] = runStmtsDecls $ do
     castV <- lift $ mkLocalVar ty
     ve <- exprToVarW e
     statement $ Assignment castV $ Cast LM_Uitofp ve width
-    statement $ Store castV dstV Nothing
+    statement $ Store castV dstV Nothing []
 
 genCall (PrimTarget (MO_UF_Conv _)) [_] args =
     panic $ "genCall: Too many arguments to MO_UF_Conv. " ++
@@ -263,12 +249,12 @@ genCall (PrimTarget (MO_AtomicRMW width amop)) [dst] [addr, n] = runStmtsDecls $
                AMO_Or   -> LAO_Or
                AMO_Xor  -> LAO_Xor
     retVar <- doExprW targetTy $ AtomicRMW op ptrVar nVar SyncSeqCst
-    statement $ Store retVar dstVar Nothing
+    statement $ Store retVar dstVar Nothing []
 
 genCall (PrimTarget (MO_AtomicRead _ mem_ord)) [dst] [addr] = runStmtsDecls $ do
     dstV <- getCmmRegW (CmmLocal dst)
     v1 <- genLoadW (Just mem_ord) addr (localRegType dst) NaturallyAligned
-    statement $ Store v1 dstV Nothing
+    statement $ Store v1 dstV Nothing []
 
 genCall (PrimTarget (MO_Cmpxchg _width))
         [dst] [addr, old, new] = runStmtsDecls $ do
@@ -282,7 +268,7 @@ genCall (PrimTarget (MO_Cmpxchg _width))
     retVar <- doExprW (LMStructU [targetTy,i1])
               $ CmpXChg ptrVar oldVar newVar SyncSeqCst SyncSeqCst
     retVar' <- doExprW targetTy $ ExtractV retVar 0
-    statement $ Store retVar' dstVar Nothing
+    statement $ Store retVar' dstVar Nothing []
 
 genCall (PrimTarget (MO_Xchg _width)) [dst] [addr, val] = runStmtsDecls $ do
     dstV <- getCmmRegW (CmmLocal dst) :: WriterT LlvmAccum LlvmM LlvmVar
@@ -292,7 +278,7 @@ genCall (PrimTarget (MO_Xchg _width)) [dst] [addr, val] = runStmtsDecls $ do
         ptrExpr = Cast LM_Inttoptr addrVar ptrTy
     ptrVar <- doExprW ptrTy ptrExpr
     resVar <- doExprW (getVarType valVar) (AtomicRMW LAO_Xchg ptrVar valVar SyncSeqCst)
-    statement $ Store resVar dstV Nothing
+    statement $ Store resVar dstV Nothing []
 
 genCall (PrimTarget (MO_AtomicWrite _width mem_ord)) [] [addr, val] = runStmtsDecls $ do
     addrVar <- exprToVarW addr
@@ -353,8 +339,8 @@ genCall (PrimTarget (MO_U_Mul2 w)) [dstH, dstL] [lhs, rhs] = runStmtsDecls $ do
     retH <- doExprW width $ Cast LM_Trunc retShifted width
     dstRegL <- getCmmRegW (CmmLocal dstL)
     dstRegH <- getCmmRegW (CmmLocal dstH)
-    statement $ Store retL dstRegL Nothing
-    statement $ Store retH dstRegH Nothing
+    statement $ Store retL dstRegL Nothing []
+    statement $ Store retH dstRegH Nothing []
 
 genCall (PrimTarget (MO_S_Mul2 w)) [dstC, dstH, dstL] [lhs, rhs] = runStmtsDecls $ do
     let width = widthToLlvmInt w
@@ -385,9 +371,9 @@ genCall (PrimTarget (MO_S_Mul2 w)) [dstC, dstH, dstL] [lhs, rhs] = runStmtsDecls
     dstRegL <- getCmmRegW (CmmLocal dstL)
     dstRegH <- getCmmRegW (CmmLocal dstH)
     dstRegC <- getCmmRegW (CmmLocal dstC)
-    statement $ Store retL dstRegL Nothing
-    statement $ Store retH dstRegH Nothing
-    statement $ Store retC dstRegC Nothing
+    statement $ Store retL dstRegL Nothing []
+    statement $ Store retH dstRegH Nothing []
+    statement $ Store retC dstRegC Nothing []
 
 -- MO_U_QuotRem2 is another case we handle by widening the registers to double
 -- the width and use normal LLVM instructions (similarly to the MO_U_Mul2). The
@@ -421,8 +407,8 @@ genCall (PrimTarget (MO_U_QuotRem2 w))
     retRem <- narrow retExtRem
     dstRegQ <- lift $ getCmmReg (CmmLocal dstQ)
     dstRegR <- lift $ getCmmReg (CmmLocal dstR)
-    statement $ Store retDiv dstRegQ Nothing
-    statement $ Store retRem dstRegR Nothing
+    statement $ Store retDiv dstRegQ Nothing []
+    statement $ Store retRem dstRegR Nothing []
 
 -- Handle the MO_{Add,Sub}IntC separately. LLVM versions return a record from
 -- which we need to extract the actual values.
@@ -529,7 +515,7 @@ genCall target res args = do
             vreg <- getCmmRegW (CmmLocal creg)
             if retTy == pLower (getVarType vreg)
                 then do
-                    statement $ Store v1 vreg Nothing
+                    statement $ Store v1 vreg Nothing []
                     doReturn
                 else do
                     let ty = pLower $ getVarType vreg
@@ -541,7 +527,7 @@ genCall target res args = do
                                         ++ " returned type!"
 
                     v2 <- doExprW ty $ Cast op v1 ty
-                    statement $ Store v2 vreg Nothing
+                    statement $ Store v2 vreg Nothing []
                     doReturn
 
 -- | Generate a call to an LLVM intrinsic that performs arithmetic operation
@@ -559,7 +545,7 @@ genCallWithOverflow t@(PrimTarget op) w [dstV, dstO] [lhs, rhs] = do
                             , MO_AddWordC w
                             , MO_SubWordC w
                             ]
-    massert valid
+    Panic.massert valid
     let width = widthToLlvmInt w
     -- This will do most of the work of generating the call to the intrinsic and
     -- extracting the values from the struct.
@@ -570,8 +556,8 @@ genCallWithOverflow t@(PrimTarget op) w [dstV, dstO] [lhs, rhs] = do
     (overflow, zext) <- doExpr width $ Cast LM_Zext overflowBit width
     dstRegV <- getCmmReg (CmmLocal dstV)
     dstRegO <- getCmmReg (CmmLocal dstO)
-    let storeV = Store value dstRegV Nothing
-        storeO = Store overflow dstRegO Nothing
+    let storeV = Store value dstRegV Nothing []
+        storeO = Store overflow dstRegO Nothing []
     return (stmts `snocOL` zext `snocOL` storeV `snocOL` storeO, top)
 genCallWithOverflow _ _ _ _ =
     panic "genCallExtract: wrong ForeignTarget or number of arguments"
@@ -636,7 +622,7 @@ genCallSimpleCast w t@(PrimTarget op) [dst] args = do
     (retV, s1)                  <- doExpr width $ Call StdCall fptr argsV' []
     (retVs', stmts5)            <- castVars (cmmPrimOpRetValSignage op) [(retV,dstTy)]
     let retV'                    = singletonPanic "genCallSimpleCast" retVs'
-    let s2                       = Store retV' dstV Nothing
+    let s2                       = Store retV' dstV Nothing []
 
     let stmts = stmts2 `appOL` stmts4 `snocOL`
                 s1 `appOL` stmts5 `snocOL` s2
@@ -668,7 +654,7 @@ genCallSimpleCast2 w t@(PrimTarget op) [dst] args = do
     (retV, s1)                  <- doExpr width $ Call StdCall fptr argsV' []
     (retVs', stmts5)             <- castVars (cmmPrimOpRetValSignage op) [(retV,dstTy)]
     let retV'                    = singletonPanic "genCallSimpleCast2" retVs'
-    let s2                       = Store retV' dstV Nothing
+    let s2                       = Store retV' dstV Nothing []
 
     let stmts = stmts2 `appOL` stmts4 `snocOL`
                 s1 `appOL` stmts5 `snocOL` s2
@@ -1008,8 +994,11 @@ cmmPrimOpFunctions mop = do
     -- We support MO_U_Mul2 through ordinary LLVM mul instruction, see the
     -- appropriate case of genCall.
     MO_U_Mul2 {}     -> unsupported
-    MO_ReadBarrier   -> unsupported
-    MO_WriteBarrier  -> unsupported
+
+    MO_ReleaseFence  -> unsupported
+    MO_AcquireFence  -> unsupported
+    MO_SeqCstFence   -> unsupported
+
     MO_Touch         -> unsupported
     MO_UF_Conv _     -> unsupported
 
@@ -1098,16 +1087,16 @@ genAssign reg val = do
       -- Some registers are pointer types, so need to cast value to pointer
       LMPointer _ | getVarType vval == llvmWord platform -> do
           (v, s1) <- doExpr ty $ Cast LM_Inttoptr vval ty
-          let s2 = Store v vreg Nothing
+          let s2 = Store v vreg Nothing []
           return (stmts `snocOL` s1 `snocOL` s2, top2)
 
       LMVector _ _ -> do
           (v, s1) <- doExpr ty $ Cast LM_Bitcast vval ty
-          let s2 = mkStore v vreg NaturallyAligned
+          let s2 = mkStore v vreg NaturallyAligned []
           return (stmts `snocOL` s1 `snocOL` s2, top2)
 
       _ -> do
-          let s1 = Store vval vreg Nothing
+          let s1 = Store vval vreg Nothing []
           return (stmts `snocOL` s1, top2)
 
 
@@ -1143,12 +1132,12 @@ genStore addr val alignment
 -- | CmmStore operation
 -- This is a special case for storing to a global register pointer
 -- offset such as I32[Sp+8].
-genStore_fast :: CmmExpr -> GlobalReg -> Int -> CmmExpr -> AlignmentSpec
+genStore_fast :: CmmExpr -> GlobalRegUse -> Int -> CmmExpr -> AlignmentSpec
               -> LlvmM StmtData
 genStore_fast addr r n val alignment
   = do platform <- getPlatform
        (gv, grt, s1) <- getCmmRegVal (CmmGlobal r)
-       meta          <- getTBAARegMeta r
+       meta          <- getTBAARegMeta (globalRegUseGlobalReg r)
        let (ix,rem) = n `divMod` ((llvmWidthInBits platform . pLower) grt  `div` 8)
        case isPointer grt && rem == 0 of
             True -> do
@@ -1158,7 +1147,7 @@ genStore_fast addr r n val alignment
                 case pLower grt == getVarType vval of
                      -- were fine
                      True  -> do
-                         let s3 = MetaStmt meta $ mkStore vval ptr alignment
+                         let s3 = mkStore vval ptr alignment meta
                          return (stmts `appOL` s1 `snocOL` s2
                                  `snocOL` s3, top)
 
@@ -1166,7 +1155,7 @@ genStore_fast addr r n val alignment
                      False -> do
                          let ty = (pLift . getVarType) vval
                          (ptr', s3) <- doExpr ty $ Cast LM_Bitcast ptr ty
-                         let s4 = MetaStmt meta $ mkStore vval ptr' alignment
+                         let s4 = mkStore vval ptr' alignment meta
                          return (stmts `appOL` s1 `snocOL` s2
                                  `snocOL` s3 `snocOL` s4, top)
 
@@ -1189,17 +1178,17 @@ genStore_slow addr val alignment meta = do
         -- sometimes we need to cast an int to a pointer before storing
         LMPointer ty@(LMPointer _) | getVarType vval == llvmWord platform -> do
             (v, s1) <- doExpr ty $ Cast LM_Inttoptr vval ty
-            let s2 = MetaStmt meta $ mkStore v vaddr alignment
+            let s2 = mkStore v vaddr alignment meta
             return (stmts `snocOL` s1 `snocOL` s2, top1 ++ top2)
 
         LMPointer _ -> do
-            let s1 = MetaStmt meta $ mkStore vval vaddr alignment
+            let s1 = mkStore vval vaddr alignment meta
             return (stmts `snocOL` s1, top1 ++ top2)
 
         i@(LMInt _) | i == llvmWord platform -> do
             let vty = pLift $ getVarType vval
             (vptr, s1) <- doExpr vty $ Cast LM_Inttoptr vaddr vty
-            let s2 = MetaStmt meta $ mkStore vval vptr alignment
+            let s2 = mkStore vval vptr alignment meta
             return (stmts `snocOL` s1 `snocOL` s2, top1 ++ top2)
 
         other ->
@@ -1209,9 +1198,9 @@ genStore_slow addr val alignment meta = do
                      text "Size of var:" <+> ppr (llvmWidthInBits platform other) $$
                      text "Var:"         <+> ppVar cfg vaddr)
 
-mkStore :: LlvmVar -> LlvmVar -> AlignmentSpec -> LlvmStatement
-mkStore vval vptr alignment =
-    Store vval vptr align
+mkStore :: LlvmVar -> LlvmVar -> AlignmentSpec -> [MetaAnnot] -> LlvmStatement
+mkStore vval vptr alignment metas =
+    Store vval vptr align metas
   where
     ty = pLower (getVarType vptr)
     align = case alignment of
@@ -1388,8 +1377,7 @@ exprToVarOpt opt e = case e of
         -> genMachOp opt op exprs
 
     CmmRegOff r i
-        -> do platform <- getPlatform
-              exprToVar $ expandCmmReg platform (r, i)
+        -> exprToVar $ expandCmmReg (r, i)
 
     CmmStackSlot _ _
         -> panic "exprToVar: CmmStackSlot not supported!"
@@ -1442,6 +1430,8 @@ genMachOp _ op [x] = case op of
             all0s = LMLitVar $ LMVectorLit (replicate len all0)
         in negateVec vecty all0s LM_MO_FSub
 
+    MO_RelaxedRead w -> exprToVar (CmmLoad x (cmmBits w) NaturallyAligned)
+
     MO_AlignmentCheck _ _ -> panic "-falignment-sanitisation is not supported by -fllvm"
 
     -- Handle unsupported cases explicitly so we get a warning
@@ -1470,6 +1460,9 @@ genMachOp _ op [x] = case op of
     MO_F_Sub        _ -> panicOp
     MO_F_Mul        _ -> panicOp
     MO_F_Quot       _ -> panicOp
+
+    MO_FMA _ _        -> panicOp
+
     MO_F_Eq         _ -> panicOp
     MO_F_Ne         _ -> panicOp
     MO_F_Ge         _ -> panicOp
@@ -1554,7 +1547,7 @@ genMachOp opt op e = genMachOp_slow opt op e
 -- | Handle CmmMachOp expressions
 -- This is a specialised method that handles Global register manipulations like
 -- 'Sp - 16', using the getelementptr instruction.
-genMachOp_fast :: EOption -> MachOp -> GlobalReg -> Int -> [CmmExpr]
+genMachOp_fast :: EOption -> MachOp -> GlobalRegUse -> Int -> [CmmExpr]
                -> LlvmM ExprData
 genMachOp_fast opt op r n e
   = do (gv, grt, s1) <- getCmmRegVal (CmmGlobal r)
@@ -1653,6 +1646,8 @@ genMachOp_slow opt op [x, y] = case op of
     MO_F_Mul  _ -> genBinMach LM_MO_FMul
     MO_F_Quot _ -> genBinMach LM_MO_FDiv
 
+    MO_FMA _ _ -> panicOp
+
     MO_And _   -> genBinMach LM_MO_And
     MO_Or  _   -> genBinMach LM_MO_Or
     MO_Xor _   -> genBinMach LM_MO_Xor
@@ -1694,12 +1689,9 @@ genMachOp_slow opt op [x, y] = case op of
 
     MO_VF_Neg {} -> panicOp
 
-    MO_AlignmentCheck {} -> panicOp
+    MO_RelaxedRead {} -> panicOp
 
-#if __GLASGOW_HASKELL__ < 811
-    MO_VF_Extract {} -> panicOp
-    MO_V_Extract {} -> panicOp
-#endif
+    MO_AlignmentCheck {} -> panicOp
 
     where
         binLlvmOp ty binOp allow_y_cast = do
@@ -1783,12 +1775,49 @@ genMachOp_slow opt op [x, y] = case op of
                     pprPanic "isSMulOK: Not bit type! " $
                         lparen <> ppr word <> rparen
 
-        panicOp = panic $ "LLVM.CodeGen.genMachOp_slow: unary op encountered"
+        panicOp = panic $ "LLVM.CodeGen.genMachOp_slow: non-binary op encountered"
                        ++ "with two arguments! (" ++ show op ++ ")"
 
--- More than two expression, invalid!
-genMachOp_slow _ _ _ = panic "genMachOp: More than 2 expressions in MachOp!"
+genMachOp_slow _opt op [x, y, z] = do
+  platform <- getPlatform
+  let
+    neg x = CmmMachOp (MO_F_Neg (cmmExprWidth platform x)) [x]
+    panicOp = panic $ "LLVM.CodeGen.genMachOp_slow: non-ternary op encountered"
+                   ++ "with three arguments! (" ++ show op ++ ")"
+  case op of
+    MO_FMA var _ ->
+      case var of
+        -- LLVM only has the fmadd variant.
+        FMAdd   -> genFmaOp x y z
+        -- Other fused multiply-add operations are implemented in terms of fmadd
+        -- This is sound: it does not lose any precision.
+        FMSub   -> genFmaOp x y (neg z)
+        FNMAdd  -> genFmaOp (neg x) y z
+        FNMSub  -> genFmaOp (neg x) y (neg z)
+    _ -> panicOp
 
+-- More than three expressions, invalid!
+genMachOp_slow _ _ _ = panic "genMachOp_slow: More than 3 expressions in MachOp!"
+
+-- | Generate code for a fused multiply-add operation.
+genFmaOp :: CmmExpr -> CmmExpr -> CmmExpr -> LlvmM ExprData
+genFmaOp x y z = runExprData $ do
+  vx <- exprToVarW x
+  vy <- exprToVarW y
+  vz <- exprToVarW z
+  let tx = getVarType vx
+      ty = getVarType vy
+      tz = getVarType vz
+  Panic.massertPpr
+    (tx == ty && tx == tz)
+    (vcat [ text "fma: mismatched arg types"
+          , ppLlvmType tx, ppLlvmType ty, ppLlvmType tz ])
+  let fname = case tx of
+        LMFloat  -> fsLit "llvm.fma.f32"
+        LMDouble -> fsLit "llvm.fma.f64"
+        _ -> pprPanic "fma: type not LMFloat or LMDouble" (ppLlvmType tx)
+  fptr <- liftExprData $ getInstrinct fname ty [tx, ty, tz]
+  doExprW tx $ Call StdCall fptr [vx, vy, vz] [ReadNone, NoUnwind]
 
 -- | Handle CmmLoad expression.
 genLoad :: Atomic -> CmmExpr -> CmmType -> AlignmentSpec -> LlvmM ExprData
@@ -1822,12 +1851,12 @@ genLoad atomic e ty align
 -- | Handle CmmLoad expression.
 -- This is a special case for loading from a global register pointer
 -- offset such as I32[Sp+8].
-genLoad_fast :: Atomic -> CmmExpr -> GlobalReg -> Int -> CmmType
+genLoad_fast :: Atomic -> CmmExpr -> GlobalRegUse -> Int -> CmmType
              -> AlignmentSpec -> LlvmM ExprData
 genLoad_fast atomic e r n ty align = do
     platform <- getPlatform
     (gv, grt, s1) <- getCmmRegVal (CmmGlobal r)
-    meta          <- getTBAARegMeta r
+    meta          <- getTBAARegMeta (globalRegUseGlobalReg r)
     let ty'      = cmmToLlvmType ty
         (ix,rem) = n `divMod` ((llvmWidthInBits platform . pLower) grt  `div` 8)
     case isPointer grt && rem == 0 of
@@ -1917,10 +1946,11 @@ getCmmReg (CmmLocal (LocalReg un _))
            -- "funPrologue" to allocate it on the stack.
 
 getCmmReg (CmmGlobal g)
-  = do onStack  <- checkStackReg g
+  = do let r = globalRegUseGlobalReg g
+       onStack  <- checkStackReg r
        platform <- getPlatform
        if onStack
-         then return (lmGlobalRegVar platform g)
+         then return (lmGlobalRegVar platform r)
          else pprPanic "getCmmReg: Cmm register " $
                 ppr g <> text " not stack-allocated!"
 
@@ -1930,10 +1960,10 @@ getCmmRegVal :: CmmReg -> LlvmM (LlvmVar, LlvmType, LlvmStatements)
 getCmmRegVal reg =
   case reg of
     CmmGlobal g -> do
-      onStack <- checkStackReg g
+      onStack <- checkStackReg (globalRegUseGlobalReg g)
       platform <- getPlatform
       if onStack then loadFromStack else do
-        let r = lmGlobalRegArg platform g
+        let r = lmGlobalRegArg platform (globalRegUseGlobalReg g)
         return (r, getVarType r, nilOL)
     _ -> loadFromStack
  where loadFromStack = do
@@ -2064,7 +2094,7 @@ funPrologue live cmmBlocks = do
         let (newv, stmts) = allocReg reg
         varInsert un (pLower $ getVarType newv)
         return stmts
-      CmmGlobal r -> do
+      CmmGlobal (GlobalRegUse r _) -> do
         let reg   = lmGlobalRegVar platform r
             arg   = lmGlobalRegArg platform r
             ty    = (pLower . getVarType) reg
@@ -2072,7 +2102,7 @@ funPrologue live cmmBlocks = do
             rval  = if isLive r then arg else trash
             alloc = Assignment reg $ Alloca (pLower $ getVarType reg) 1
         markStackReg r
-        return $ toOL [alloc, Store rval reg Nothing]
+        return $ toOL [alloc, Store rval reg Nothing []]
 
   return (concatOL stmtss `snocOL` jumpToEntry, [])
   where
@@ -2107,8 +2137,8 @@ funEpilogue live = do
     let allRegs = activeStgRegs platform
     loads <- forM allRegs $ \r -> if
       -- load live registers
-      | r `elem` alwaysLive  -> loadExpr r
-      | r `elem` live        -> loadExpr r
+      | r `elem` alwaysLive  -> loadExpr (GlobalRegUse r (globalRegSpillType platform r))
+      | r `elem` live        -> loadExpr (GlobalRegUse r (globalRegSpillType platform r))
       -- load all non Floating-Point Registers
       | not (isFPR r)        -> loadUndef r
       -- load padding Floating-Point Registers
@@ -2152,9 +2182,9 @@ doExpr ty expr = do
 
 
 -- | Expand CmmRegOff
-expandCmmReg :: Platform -> (CmmReg, Int) -> CmmExpr
-expandCmmReg platform (reg, off)
-  = let width = typeWidth (cmmRegType platform reg)
+expandCmmReg :: (CmmReg, Int) -> CmmExpr
+expandCmmReg (reg, off)
+  = let width = typeWidth (cmmRegType reg)
         voff  = CmmLit $ CmmInt (fromIntegral off) width
     in CmmMachOp (MO_Add width) [CmmReg reg, voff]
 

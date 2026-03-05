@@ -10,14 +10,20 @@ import System.Exit (exitFailure)
 lintRules :: Rules ()
 lintRules = do
   "lint:base" ~> lint base
+  "lint:ghc-internal" ~> lint ghcInternal
+  "lint:ghc-experimental" ~> lint ghcExperimental
   "lint:compiler" ~> lint compiler
+
+  -- Ensure that autoconf scripts, which are usually run by Cabal, are run to
+  -- avoid depending upon Cabal from the stage0 compiler..
   "libraries" -/- "base" -/- "include" -/- "HsBaseConfig.h" %> \_ ->
       -- ./configure is called here manually because we need to generate
       -- HsBaseConfig.h, which is created from HsBaseConfig.h.in. ./configure
-      -- is usually run by Cabal which generates this file but if we do that
-      -- then hadrian thinks it needs to build the stage0 compiler before
-      -- attempting to configure. Therefore we just run it directly here.
       cmd_ (Cwd "libraries/base") "./configure"
+  "rts" -/- "include" -/- "ghcautoconf.h" %> \_ ->
+      cmd_ (Cwd "rts") "./configure"
+  "rts" -/- "include" -/- "ghcplatform.h" %> \_ ->
+      cmd_ (Cwd "rts") "./configure"
 
 lint :: Action () -> Action ()
 lint lintAction = do
@@ -37,7 +43,7 @@ runHLint :: [FilePath] -- ^ include directories
          -> Action ()
 runHLint includeDirs defines dir = do
   threads <- shakeThreads <$> getShakeOptions
-  hostArch <- (<> "_HOST_ARCH") <$> setting HostArch
+  hostArch <- (<> "_HOST_ARCH") <$> queryHostTarget queryArch
   let hlintYaml = dir </> ".hlint.yaml"
       defines' = hostArch : defines
       cmdLine = unwords $
@@ -64,9 +70,18 @@ base = do
   let includeDirs =
         [ "rts/include"
         , "libraries/base/include"
-        , stage1RtsInc
         ]
   runHLint includeDirs [] "libraries/base"
+
+ghcInternal :: Action ()
+ghcInternal = do
+  let includeDirs = []
+  runHLint includeDirs [] "libraries/ghc-internal"
+
+ghcExperimental :: Action ()
+ghcExperimental = do
+  let includeDirs = []
+  runHLint includeDirs [] "libraries/ghc-experimental"
 
 compiler :: Action ()
 compiler = do
@@ -77,7 +92,8 @@ compiler = do
   let compilerDir    = "compiler"
   let ghcautoconf    = stage1RtsInc </> "ghcautoconf.h"
   let ghcplatform    = stage1RtsInc </> "ghcplatform.h"
-  need $ mconcat [[ghcautoconf, ghcplatform], hsIncls stage1Compiler, [machDeps]]
+  let ghcLlvmVersion = compilerDir </> "GHC/CmmToLlvm/Version/Bounds.hs"
+  need $ mconcat [[ghcautoconf, ghcplatform, ghcLlvmVersion], hsIncls stage1Compiler, [machDeps]]
   let includeDirs =
         [ stage1RtsInc
         , compilerDir
@@ -96,11 +112,12 @@ hsIncls path = [ path </> "primop-vector-tycons.hs-incl"
                , path </> "primop-tag.hs-incl"
                , path </> "primop-list.hs-incl"
                , path </> "primop-strictness.hs-incl"
+               , path </> "primop-is-work-free.hs-incl"
+               , path </> "primop-is-cheap.hs-incl"
                , path </> "primop-fixity.hs-incl"
                , path </> "primop-docs.hs-incl"
                , path </> "primop-primop-info.hs-incl"
                , path </> "primop-out-of-line.hs-incl"
-               , path </> "primop-has-side-effects.hs-incl"
-               , path </> "primop-can-fail.hs-incl"
+               , path </> "primop-effects.hs-incl"
                , path </> "primop-commutable.hs-incl"
                ]

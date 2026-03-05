@@ -541,7 +541,7 @@ including entities that are in scope in the current module context.
 
 .. warning::
     Temporary bindings introduced at the prompt only last until the
-    next :ghci-cmd:`:load`, :ghci-cmd:`:reload`, :ghci-cmd:`:add` or 
+    next :ghci-cmd:`:load`, :ghci-cmd:`:reload`, :ghci-cmd:`:add` or
     :ghci-cmd:`:unadd` command, at which time they will be simply lost.
     However, they do survive a change of context with
     :ghci-cmd:`:module`: the temporary bindings just move to the new location.
@@ -1311,6 +1311,17 @@ often be enough to establish the context of an error. For instance, it
 is possible to break automatically when an exception is thrown, even if
 it is thrown from within compiled code (see
 :ref:`ghci-debugger-exceptions`).
+
+.. ghc-flag:: -fbreak-points
+    :shortdesc: :ref:`Insert breakpoints in the GHCi debugger <ghci-debugger>`
+    :type: dynamic
+    :reverse: -fno-break-points
+    :category: interactive
+
+    :default: enabled for GHCi
+
+    This flag's purpose is to allow disabling breakpoint insertion with
+    the reverse form.
 
 .. _breakpoints:
 
@@ -2357,15 +2368,6 @@ commonly used commands.
     the current breakpoint for the next ``⟨ignoreCount⟩`` iterations.
     See command :ghci-cmd:`:ignore`.
 
-.. ghci-cmd:: :ctags; [⟨filename⟩]
-
-    Generates a "tags" file for Vi-style editors (:ghci-cmd:`:ctags`) or
-    Emacs-style editors (:ghci-cmd:`:etags`). If no filename is specified, the
-    default ``tags`` or ``TAGS`` is used, respectively. Tags for all the
-    functions, constructors and types in the currently loaded modules
-    are created. All modules must be interpreted for these commands to
-    work.
-
 .. ghci-cmd:: :def;[!] ⟨name⟩ ⟨expr⟩
 
     :ghci-cmd:`:def` is used to define new commands, or macros, in GHCi. The
@@ -2467,10 +2469,6 @@ commonly used commands.
     see the number and state of each breakpoint). The ``*`` form enables all the
     disabled breakpoints. Enabling a break point will reset its ``ignore count``
     to 0. (See :ghci-cmd:`:ignore`)
-
-.. ghci-cmd:: :etags
-
-    See :ghci-cmd:`:ctags`.
 
 .. ghci-cmd:: :force; ⟨identifier⟩ ...
 
@@ -2862,7 +2860,7 @@ commonly used commands.
     Sets the function to be used for the prompt displaying in GHCi. The
     function should be of the type ``[String] -> Int -> IO String``. This
     function is called each time the prompt is being made. The first argument
-    stands for the names of the modules currently in scope(the name of the
+    stands for the names of the modules currently in scope (the name of the
     "topmost" module  will begin with a ``*``; see  :ref:`ghci-scope` for
     more information). The second arguments is the line number (as referenced
     in compiler  messages) of the current prompt.
@@ -3185,7 +3183,7 @@ example, to turn on :ghc-flag:`-Wmissing-signatures`, you would say:
 
     ghci> :set -Wmissing-signatures
 
-GHCi will also accept any file-header pragmas it finds, such as 
+GHCi will also accept any file-header pragmas it finds, such as
 ``{-# OPTIONS_GHC ... #-}`` and ``{-# LANGUAGE ... #-}`` (see :ref:`pragmas`).  For example,
 instead of using :ghci-cmd:`:set` to enable :ghc-flag:`-Wmissing-signatures`,
 you could instead write:
@@ -3546,41 +3544,19 @@ The interpreter can't load modules with foreign export declarations!
     Unfortunately not. We haven't implemented it yet. Please compile any
     offending modules by hand before loading them into GHCi.
 
-:ghc-flag:`-O` doesn't work with GHCi!
+:ghc-flag:`-O` is ineffective in GHCi!
 
     .. index::
        single: optimization; and GHCi
 
-    For technical reasons, the bytecode compiler doesn't interact well
-    with one of the optimisation passes, so we have disabled
-    optimisation when using the interpreter. This isn't a great loss:
-    you'll get a much bigger win by compiling the bits of your code that
-    need to go fast, rather than interpreting them with optimisation
-    turned on.
+    Before GHC 9.8, optimizations were considered too unstable to be used with
+    the bytecode interpreter.
+    This restriction has been lifted, but is still regarded as experimental and
+    guarded by :ghc-flag:`-funoptimized-core-for-interpreter`, which is enabled
+    by default.
+    In order to use optimizations, run: ::
 
-Modules using unboxed tuples or sums will automatically enable :ghc-flag:`-fobject-code`
-
-    .. index::
-       single: unboxed tuples, sums; and GHCi
-
-    The bytecode interpreter doesn't support most uses of unboxed tuples or
-    sums, so GHCi will automatically compile these modules, and all modules
-    they depend on, to object code instead of bytecode.
-
-    GHCi checks for the presence of unboxed tuples and sums in a somewhat
-    conservative fashion: it simply checks to see if a module enables the
-    :extension:`UnboxedTuples` or :extension:`UnboxedSums` language extensions.
-    It is not always the case that code which enables :extension:`UnboxedTuples`
-    or :extension:`UnboxedSums` requires :ghc-flag:`-fobject-code`, so if you
-    *really* want to compile
-    :extension:`UnboxedTuples`/:extension:`UnboxedSums`-using code to
-    bytecode, you can do so explicitly by enabling the :ghc-flag:`-fbyte-code`
-    flag. If you do this, do note that bytecode interpreter will throw an error
-    if it encounters unboxed tuple/sum–related code that it cannot handle.
-
-    Incidentally, the previous point, that :ghc-flag:`-O` is
-    incompatible with GHCi, is because the bytecode compiler can't
-    deal with unboxed tuples or sums.
+      ghci -fno-unoptimized-core-for-interpreter -O
 
 Concurrent threads don't carry on running when GHCi is waiting for input.
     This should work, as long as your GHCi was built with the

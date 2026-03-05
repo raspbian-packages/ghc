@@ -24,7 +24,8 @@ module GHCi.UI.Monad (
         runStmt, runDecls, runDecls', resume, recordBreak, revertCAFs,
         ActionStats(..), runAndPrintStats, runWithStats, printStats,
 
-        printForUserNeverQualify, printForUserModInfo,
+        printForUserNeverQualify,
+        printForUserModInfo, printForUserGlobalRdrEnv,
         printForUser, printForUserPartWay, prettyLocations,
 
         compileGHCiExpr,
@@ -41,6 +42,7 @@ import GHC.Driver.Monad hiding (liftIO)
 import GHC.Utils.Outputable
 import qualified GHC.Driver.Ppr as Ppr
 import GHC.Types.Name.Occurrence
+import GHC.Types.Name.Reader
 import GHC.Driver.Session
 import GHC.Data.FastString
 import GHC.Driver.Env
@@ -49,10 +51,12 @@ import GHC.Types.SafeHaskell
 import GHC.Driver.Make (ModIfaceCache(..))
 import GHC.Unit
 import GHC.Types.Name.Reader as RdrName (mkOrig)
-import GHC.Builtin.Names (gHC_GHCI_HELPERS)
+import qualified GHC.Types.Name.Ppr as Ppr (mkNamePprCtx)
+import GHC.Builtin.Names (gHC_INTERNAL_GHCI_HELPERS)
 import GHC.Runtime.Interpreter
 import GHC.Runtime.Context
 import GHCi.RemoteTypes
+import GHCi.UI.Exception (printGhciException)
 import GHC.Hs (ImportDecl, GhcPs, GhciLStmt, LHsDecl)
 import GHC.Hs.Utils
 import GHC.Utils.Misc
@@ -362,11 +366,21 @@ printForUserNeverQualify doc = do
   liftIO $ Ppr.printForUser dflags stdout neverQualify AllTheWay doc
 
 printForUserModInfo :: GhcMonad m => GHC.ModuleInfo -> SDoc -> m ()
-printForUserModInfo info doc = do
+printForUserModInfo info = printForUserGlobalRdrEnv (GHC.modInfoRdrEnv info)
+
+printForUserGlobalRdrEnv :: (GhcMonad m, Outputable info)
+                         => Maybe (GlobalRdrEnvX info) -> SDoc -> m ()
+printForUserGlobalRdrEnv mb_rdr_env doc = do
   dflags <- GHC.getInteractiveDynFlags
-  m_name_ppr_ctx <- GHC.mkNamePprCtxForModule info
-  name_ppr_ctx <- maybe GHC.getNamePprCtx return m_name_ppr_ctx
+  name_ppr_ctx <- mkNamePprCtxFromGlobalRdrEnv dflags mb_rdr_env
   liftIO $ Ppr.printForUser dflags stdout name_ppr_ctx AllTheWay doc
+    where
+      mkNamePprCtxFromGlobalRdrEnv _ Nothing = GHC.getNamePprCtx
+      mkNamePprCtxFromGlobalRdrEnv dflags (Just rdr_env) =
+        withSession $ \ hsc_env ->
+        let unit_env = hsc_unit_env hsc_env
+            ptc = initPromotionTickContext dflags
+        in  return $ Ppr.mkNamePprCtx ptc unit_env rdr_env
 
 printForUser :: GhcMonad m => SDoc -> m ()
 printForUser doc = do
@@ -386,7 +400,7 @@ runStmt
   => GhciLStmt GhcPs -> String -> GHC.SingleStep -> m (Maybe GHC.ExecResult)
 runStmt stmt stmt_text step = do
   st <- getGHCiState
-  GHC.handleSourceError (\e -> do GHC.printException e; return Nothing) $ do
+  GHC.handleSourceError (\e -> do printGhciException e; return Nothing) $ do
     let opts = GHC.execOptions
                   { GHC.execSourceFile = progname st
                   , GHC.execLineNumber = line_number st
@@ -402,7 +416,7 @@ runDecls decls = do
     withProgName (progname st) $
     withArgs (args st) $
       reflectGHCi x $ do
-        GHC.handleSourceError (\e -> do GHC.printException e;
+        GHC.handleSourceError (\e -> do printGhciException e
                                         return Nothing) $ do
           r <- GHC.runDeclsWithLocation (progname st) (line_number st) decls
           return (Just r)
@@ -415,7 +429,7 @@ runDecls' decls = do
     withArgs (args st) $
     reflectGHCi x $
       GHC.handleSourceError
-        (\e -> do GHC.printException e;
+        (\e -> do printGhciException e
                   return Nothing)
         (Just <$> GHC.runParsedDecls decls)
 
@@ -501,7 +515,7 @@ initInterpBuffering = do
   let mkHelperExpr :: OccName -> Ghc ForeignHValue
       mkHelperExpr occ =
         GHC.compileParsedExprRemote
-        $ GHC.nlHsVar $ RdrName.mkOrig gHC_GHCI_HELPERS occ
+        $ GHC.nlHsVar $ RdrName.mkOrig gHC_INTERNAL_GHCI_HELPERS occ
   nobuf <- mkHelperExpr $ mkVarOccFS (fsLit "disableBuffering")
   flush <- mkHelperExpr $ mkVarOccFS (fsLit "flushAll")
   return (nobuf, flush)
@@ -532,7 +546,7 @@ mkEvalWrapper progname' args' =
   where
     nlHsString = nlHsLit . mkHsString
     evalWrapper' =
-      GHC.nlHsVar $ RdrName.mkOrig gHC_GHCI_HELPERS (mkVarOccFS (fsLit "evalWrapper"))
+      GHC.nlHsVar $ RdrName.mkOrig gHC_INTERNAL_GHCI_HELPERS (mkVarOccFS (fsLit "evalWrapper"))
 
 -- | Run a 'GhcMonad' action to compile an expression for internal usage.
 runInternal :: GhcMonad m => m a -> m a

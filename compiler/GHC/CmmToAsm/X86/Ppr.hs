@@ -32,7 +32,6 @@ import GHC.CmmToAsm.Utils
 import GHC.CmmToAsm.Ppr
 
 import GHC.Cmm              hiding (topInfoTable)
-import GHC.Cmm.Dataflow.Collections
 import GHC.Cmm.Dataflow.Label
 import GHC.Cmm.BlockId
 import GHC.Cmm.CLabel
@@ -74,7 +73,6 @@ pprNatCmmDecl config (CmmData section dats) =
 
 pprNatCmmDecl config proc@(CmmProc top_info lbl _ (ListGraph blocks)) =
   let platform = ncgPlatform config in
-  pprProcAlignment config $$
   case topInfoTable proc of
     Nothing ->
         -- special case for code without info table:
@@ -733,6 +731,12 @@ pprInstr platform i = case i of
    SHR format src dst
       -> pprShift (text "shr") format src dst
 
+   SHLD format src dst1 dst2
+      -> pprShift2 (text "shld") format src dst1 dst2
+
+   SHRD format src dst1 dst2
+      -> pprShift2 (text "shrd") format src dst1 dst2
+
    BT format imm src
       -> pprFormatImmOp (text "bt") format imm src
 
@@ -837,6 +841,14 @@ pprInstr platform i = case i of
 
    FDIV format op1 op2
       -> pprFormatOpOp (text "div") format op1 op2
+
+   FMA3 format var perm op1 op2 op3
+      -> let mnemo = case var of
+               FMAdd  -> text "vfmadd"
+               FMSub  -> text "vfmsub"
+               FNMAdd -> text "vfnmadd"
+               FNMSub -> text "vfnmsub"
+         in pprFormatOpRegReg (mnemo <> pprFMAPermutation perm) format op1 op2 op3
 
    SQRT format op1 op2
       -> pprFormatOpReg (text "sqrt") format op1 op2
@@ -968,6 +980,21 @@ pprInstr platform i = case i of
            pprOperand platform format op2
        ]
 
+   pprFormatOpRegReg :: Line doc -> Format -> Operand -> Reg -> Reg -> doc
+   pprFormatOpRegReg name format op1 op2 op3
+     = line $ hcat [
+           pprMnemonic name format,
+           pprOperand platform format op1,
+           comma,
+           pprReg platform format op2,
+           comma,
+           pprReg platform format op3
+       ]
+
+   pprFMAPermutation :: FMAPermutation -> Line doc
+   pprFMAPermutation FMA132 = text "132"
+   pprFMAPermutation FMA213 = text "213"
+   pprFMAPermutation FMA231 = text "231"
 
    pprOpOp :: Line doc -> Format -> Operand -> Operand -> doc
    pprOpOp name format op1 op2
@@ -1046,6 +1073,17 @@ pprInstr platform i = case i of
            pprOperand platform II8 src,  -- src is 8-bit sized
            comma,
            pprOperand platform format dest
+       ]
+
+   pprShift2 :: Line doc -> Format -> Operand -> Operand -> Operand -> doc
+   pprShift2 name format src dest1 dest2
+     = line $ hcat [
+           pprMnemonic name format,
+           pprOperand platform II8 src,  -- src is 8-bit sized
+           comma,
+           pprOperand platform format dest1,
+           comma,
+           pprOperand platform format dest2
        ]
 
 

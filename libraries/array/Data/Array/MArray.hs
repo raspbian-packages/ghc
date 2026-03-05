@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP #-}
+{-# LANGUAGE CPP, Trustworthy #-}
 
 -----------------------------------------------------------------------------
 -- |
@@ -34,6 +34,14 @@ module Data.Array.MArray (
     writeArray,   -- :: (MArray a e m, Ix i) => a i e -> i -> e -> m ()
     modifyArray,
     modifyArray',
+
+    -- * Array folds
+    foldlMArray',
+    foldrMArray',
+    mapMArrayM_,
+    forMArrayM_,
+    foldlMArrayM',
+    foldrMArrayM',
 
     -- * Derived arrays
     mapArray,     -- :: (MArray a e' m, MArray a e m, Ix i) => (e' -> e) -> a i e' -> m (a i e)

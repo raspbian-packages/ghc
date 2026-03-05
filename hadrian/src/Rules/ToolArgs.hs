@@ -154,10 +154,14 @@ toolTargets = [ binary
               , process
               , exceptions
               , filepath
+              , osString
               -- , ghc     -- # depends on ghc library
               -- , runGhc  -- # depends on ghc library
               , ghcBoot
               , ghcBootTh
+              , ghcPlatform
+              , ghcToolchain
+              , ghcToolchainBin
               , ghcHeap
               , ghci
               , ghcPkg  -- # executable
@@ -171,6 +175,7 @@ toolTargets = [ binary
               , templateHaskell
               , text
               , transformers
+              , semaphoreCompat
               , unlit  -- # executable
               ] ++ if windowsHost then [ win32 ] else [ unix ]
 

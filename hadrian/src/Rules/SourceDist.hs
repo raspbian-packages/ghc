@@ -140,11 +140,13 @@ prepareTree dest = do
       moveFile (dest -/- "boot") (dest -/- "boot.source")
 
     bootFiles =
-      [ pkgPath process -/- "include" -/- "HsProcessConfig.h.in"
+      [ pkgPath rts -/- "configure"
+      , pkgPath rts -/- "ghcautoconf.h.autoconf.in"
+      , pkgPath process -/- "include" -/- "HsProcessConfig.h.in"
       , pkgPath process -/- "configure"
       , pkgPath ghcBignum -/- "configure"
-      , pkgPath base -/- "configure"
-      , pkgPath base -/- "include" -/- "HsBaseConfig.h.in"
+      , pkgPath ghcInternal -/- "configure"
+      , pkgPath ghcInternal -/- "include" -/- "HsBaseConfig.h.in"
       , pkgPath directory -/- "configure"
       , pkgPath directory -/- "HsDirectoryConfig.h.in"
       , pkgPath time -/- "configure"
@@ -154,7 +156,7 @@ prepareTree dest = do
       , pkgPath terminfo -/- "configure"
       , "configure"
       , "aclocal.m4"
-      , "mk" -/- "config.h.in" ]
+      ]
 
     copyAlexHappyFiles =
       forM_ alexHappyFiles $ \(stg, pkg, inp, out) -> do
@@ -182,7 +184,8 @@ prepareTree dest = do
         , (stage0InTree , compiler,      "GHC/Parser.y",       "GHC/Parser.hs")
         , (stage0InTree , compiler,      "GHC/Parser/Lexer.x", "GHC/Parser/Lexer.hs")
         , (stage0InTree , compiler,      "GHC/Parser/HaddockLex.x", "GHC/Parser/HaddockLex.hs")
-        , (stage0InTree , hpcBin,        "HpcParser.y",        "HpcParser.hs")
+        , (stage0InTree , hpcBin,        "src/Trace/Hpc/Parser.y", "src/Trace/Hpc/Parser.hs")
         , (stage0InTree , genprimopcode, "Parser.y",           "Parser.hs")
         , (stage0InTree , genprimopcode, "Lexer.x",            "Lexer.hs")
+        , (stage0InTree , cabalSyntax  , "src/Distribution/Fields/Lexer.x",  "src/Distribution/Fields/Lexer.hs")
         ]

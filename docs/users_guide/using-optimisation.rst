@@ -117,9 +117,9 @@ The easiest way to see what ``-O`` (etc.) “really mean” is to run with
    single: -fno-\* options (GHC)
 
 These flags turn on and off individual optimisations. Flags marked as
-on by default are enabled by ``-O``, and as such you shouldn't
-need to set any of them explicitly. A flag ``-fwombat`` can be negated
-by saying ``-fno-wombat``.
+*on* by default are enabled at all optimisation levels by default, and
+as such you shouldn't need to set any of them explicitly. A flag
+``-fwombat`` can be negated by saying ``-fno-wombat``.
 
 .. ghc-flag:: -fcore-constant-folding
     :shortdesc: Enable constant folding in Core. Implied by :ghc-flag:`-O`.
@@ -127,7 +127,7 @@ by saying ``-fno-wombat``.
     :reverse: -fno-core-constant-folding
     :category:
 
-    :default: on
+    :default: off but enabled by :ghc-flag:`-O`.
 
     Enables Core-level constant folding, i.e. propagation of values
     that can be computed at compile time.
@@ -138,7 +138,7 @@ by saying ``-fno-wombat``.
     :reverse: -fno-case-merge
     :category:
 
-    :default: on
+    :default: off but enabled by :ghc-flag:`-O`.
 
     Merge immediately-nested case expressions that scrutinise the same variable.
     For example, ::
@@ -162,7 +162,7 @@ by saying ``-fno-wombat``.
     :reverse: -fno-case-folding
     :category:
 
-    :default: on
+    :default: off but enabled by :ghc-flag:`-O`.
 
     Allow constant folding in case expressions that scrutinise some primops:
     For example, ::
@@ -185,7 +185,7 @@ by saying ``-fno-wombat``.
     :reverse: -fno-call-arity
     :category:
 
-    :default: on
+    :default: off but enabled by :ghc-flag:`-O`.
 
     Enable call-arity analysis.
 
@@ -195,7 +195,7 @@ by saying ``-fno-wombat``.
     :reverse: -fno-exitification
     :category:
 
-    :default: on
+    :default: off but enabled by :ghc-flag:`-O`.
 
     Enables the floating of exit paths out of recursive functions.
 
@@ -205,7 +205,7 @@ by saying ``-fno-wombat``.
     :reverse: -fno-cmm-elim-common-blocks
     :category:
 
-    :default: on
+    :default: off but enabled by :ghc-flag:`-O`.
 
     Enables the common block elimination optimisation
     in the code generator. This optimisation attempts to find identical
@@ -217,7 +217,7 @@ by saying ``-fno-wombat``.
     :reverse: -fno-cmm-sink
     :category:
 
-    :default: on
+    :default: off but enabled by :ghc-flag:`-O`.
 
     Enables the sinking pass in the code generator.
     This optimisation attempts to find identical Cmm blocks and
@@ -231,7 +231,7 @@ by saying ``-fno-wombat``.
     :reverse: -fno-cmm-static-pred
     :category:
 
-    :default: off but enabled with :ghc-flag:`-O`.
+    :default: off but enabled by :ghc-flag:`-O`.
 
     This enables static control flow prediction on the final Cmm
     code. If enabled GHC will apply certain heuristics to identify
@@ -244,18 +244,18 @@ by saying ``-fno-wombat``.
     :reverse: -fno-cmm-control-flow
     :category:
 
-    :default: on
+    :default: off but enabled by :ghc-flag:`-O`.
 
     Enables some control flow optimisations in the Cmm code
     generator, merging basic blocks and avoiding jumps right after jumps.
 
 .. ghc-flag:: -fasm-shortcutting
-    :shortdesc: Enable shortcutting on assembly.
+    :shortdesc: Enable shortcutting on assembly. Implied by :ghc-flag:`-O2`.
     :type: dynamic
     :reverse: -fno-asm-shortcutting
     :category:
 
-    :default: off
+    :default: off but enabled by :ghc-flag:`-O2`.
 
     This enables shortcutting at the assembly stage of the code generator.
     In simpler terms shortcutting means if a block of instructions A only consists
@@ -267,16 +267,13 @@ by saying ``-fno-wombat``.
     these. Note that due to platform limitations (:ghc-ticket:`21972`) this flag
     does nothing on macOS.
 
-    This flag is known to result in unsoundness in this version of GHC
-    (:ghc-ticket:`24507`).
-
 .. ghc-flag:: -fblock-layout-cfg
-    :shortdesc: Use the new cfg based block layout algorithm.
+    :shortdesc: Use the new cfg based block layout algorithm. Implied by :ghc-flag:`-O`.
     :type: dynamic
     :reverse: -fno-block-layout-cfg
     :category:
 
-    :default: off but enabled with :ghc-flag:`-O`.
+    :default: off but enabled by :ghc-flag:`-O`.
 
     The new algorithm considers all outgoing edges of a basic blocks for
     code layout instead of only the last jump instruction.
@@ -329,7 +326,7 @@ by saying ``-fno-wombat``.
     :reverse: -fno-cpr-anal
     :category:
 
-    :default: on
+    :default: off but enabled by :ghc-flag:`-O`.
 
     Turn on CPR analysis, which enables the worker/wrapper transformation (cf.
     :ghc-flag:`-fworker-wrapper`) to unbox the result of a function, such as ::
@@ -375,7 +372,7 @@ by saying ``-fno-wombat``.
         sumIO :: [Int] -> IO Int
         sumIO xs = IO $ \s -> case $wsum xs s of
           (# s', r #) -> (# s', I# r #)
-        $wsumIO :: [Int] -> (# RealWorld#, Int# #)
+        $wsumIO :: [Int] -> (# State# RealWorld, Int# #)
         $wsumIO []        s = (# s, 0# #)
         $wsumIO (I# x:xs) s = case $wsumIO xs of
           (# s', r #) -> (# s', x +# r#)
@@ -389,7 +386,7 @@ by saying ``-fno-wombat``.
     :reverse: -fno-cse
     :category:
 
-    :default: on
+    :default: off but enabled by :ghc-flag:`-O`.
 
     Enables the common-sub-expression elimination
     optimisation. Switching this off can be useful if you have some
@@ -397,16 +394,65 @@ by saying ``-fno-wombat``.
 
 .. ghc-flag:: -fstg-cse
     :shortdesc: Enable common sub-expression elimination on the STG
-        intermediate language
+        intermediate language. Implied by :ghc-flag:`-O`.
     :type: dynamic
     :reverse: -fno-stg-cse
     :category:
 
-    :default: on
+    :default: off but enabled by :ghc-flag:`-O`.
 
     Enables the common-sub-expression elimination optimisation on the STG
     intermediate language, where it is able to common up some subexpressions
     that differ in their types, but not their representation.
+
+.. ghc-flag:: -fspec-eval
+    :shortdesc: Enables speculative evaluation.
+    :type: dynamic
+    :category:
+    :reverse: -fno-spec-eval
+
+    :default: on
+    :since: 9.14.1
+
+    Enables speculative evaluation which usually results in fewer allocations.
+    Enabling speculative evaluation should not cause performance regressions.
+    If you encounter any, please open a ticket.
+
+    Note that disabling this flag will switch off speculative evaluation
+    completely, causing :ghc-flag:`-fspec-eval-dictfun` to have
+    no effect.
+
+.. ghc-flag:: -fspec-eval-dictfun
+    :shortdesc: Enables speculative evaluation of dictionary functions.
+    :type: dynamic
+    :category:
+    :reverse: -fno-spec-eval-dictfun
+
+    :default: on
+    :since: 9.14.1
+
+    Enables speculative (strict) evaluation of dictionary functions.
+
+    This is best explained with an example ::
+
+        instance C a => D a where ...
+
+        g :: D a => a -> Int
+        g x = ...
+
+        f :: C a => a -> Int
+        f x = g x
+
+    Function `f` has to pass a `D a` dictionary to `g`, and uses a dictionary
+    function `C a => D a` to compute it. If speculative evaluation for
+    dictionary functions is enabled, this dictionary is computed
+    strictly.
+
+    Speculative evalation of dictionary functions can lead to slightly better
+    performance, because a thunk is avoided. However, it results in unnecessary
+    computation and allocation if the dictionary goes unused. This causes
+    a significant increase in allocation if the dictionary is large.
+    See (:ghc-ticket:`25284`).
 
 .. ghc-flag:: -fdicts-cheap
     :shortdesc: Make dictionary-valued expressions seem cheap to the optimiser.
@@ -425,7 +471,7 @@ by saying ``-fno-wombat``.
     :reverse: -fno-dicts-strict
     :category:
 
-    :default: off
+    :default: off but enabled by :ghc-flag:`-O2`.
 
     Make dictionaries strict.
 
@@ -450,7 +496,7 @@ by saying ``-fno-wombat``.
     Behaviour is unconditionally enabled starting with 9.2
 
 .. ghc-flag:: -fdo-eta-reduction
-    :shortdesc: Enable eta-reduction. Implied by :ghc-flag:`-O`.
+    :shortdesc: Enable eta-reduction. Always enabled by default.
     :type: dynamic
     :reverse: -fno-do-eta-reduction
     :category:
@@ -469,6 +515,25 @@ by saying ``-fno-wombat``.
     :default: on
 
     Eta-expand let-bindings to increase their arity.
+
+.. ghc-flag:: -fdo-clever-arg-eta-expansion
+    :shortdesc: Enable sophisticated argument eta-expansion. Implied by :ghc-flag:`-O`.
+    :type: dynamic
+    :reverse: -fno-do-clever-arg-eta-expansion
+    :category:
+
+    :default: off
+    :since: 9.10.1
+
+    Eta-expand arguments to increase their arity to avoid allocating unnecessary
+    thunks for them.
+
+    For example in code like `foo = f (g x)` this flag will determine which analysis
+    is used to decide the arity of `g x`, with the goal of avoiding a thunk for `g x`
+    in cases where `g` is a function with an arity higher than one.
+
+    Enabling the flag enables a more sophisticated analysis, resulting in better
+    runtime but longer compile time.
 
 .. ghc-flag:: -feager-blackholing
     :shortdesc: Turn on :ref:`eager blackholing <parallel-compile-options>`
@@ -521,7 +586,7 @@ by saying ``-fno-wombat``.
     :reverse: -fno-float-in
     :category:
 
-    :default: on
+    :default: off but enabled by :ghc-flag:`-O`.
 
     Float let-bindings inwards, nearer their binding
     site. See `Let-floating: moving bindings to give faster programs
@@ -547,7 +612,7 @@ by saying ``-fno-wombat``.
     :reverse: -fno-full-laziness
     :category:
 
-    :default: on
+    :default: off but enabled by :ghc-flag:`-O`.
 
     Run the full laziness optimisation (also known as
     let-floating), which floats let-bindings outside enclosing lambdas,
@@ -588,13 +653,30 @@ by saying ``-fno-wombat``.
     ``-fno-full-laziness``. If that is inconvenient for you, please leave a
     comment `on the issue tracker (#21204) <https://gitlab.haskell.org/ghc/ghc/-/issues/21204>`__.
 
+.. ghc-flag:: -finter-module-far-jumps
+    :shortdesc: Assume code sections can be very large.
+    :type: dynamic
+    :reverse: -fno-inter-module-far-jumps
+    :category:
+
+    :default: Off
+
+    This flag forces GHC to use far jumps instead of near jumps for all jumps
+    which cross module boundries. This removes the need for jump islands/linker
+    jump fixups which some linkers struggle to deal with. (:ghc-ticket:`24648`)
+
+    This comes at a very modest code size (~2%) and runtime (~0.6%) overhead.
+
+    Note that this flag currently only affects the NCG AArch64 backend.
+
+
 .. ghc-flag:: -fignore-asserts
     :shortdesc: Ignore assertions in the source. Implied by :ghc-flag:`-O`.
     :type: dynamic
     :reverse: -fno-ignore-asserts
     :category:
 
-    :default: on
+    :default: off but enabled by :ghc-flag:`-O`.
 
     Causes GHC to ignore uses of the function ``Exception.assert`` in source
     code (in other words, rewriting ``Exception.assert p e`` to ``e`` (see
@@ -606,12 +688,31 @@ by saying ``-fno-wombat``.
     :reverse: -fno-ignore-interface-pragmas
     :category:
 
-    :default: off
+    :default: Implied by :ghc-flag:`-O0`, otherwise off.
 
     Tells GHC to ignore all inessential information when reading
     interface files. That is, even if :file:`M.hi` contains unfolding or
     strictness information for a function, GHC will ignore that
     information.
+
+.. ghc-flag:: -fkeep-auto-rules
+    :shortdesc: Keep all "auto" rules, generated by specialisation
+    :type: dynamic
+    :reverse: -fno-keep-auto-rules
+    :category:
+
+    :default: off
+    :since: 9.10.1
+
+    The type-class specialiser and call-pattern specialisation both
+    generate so-called "auto" RULES.  These rules are usually exposed
+    to importing modules in the interface file. But when an auto rule is the
+    sole reason for keeping a function alive, both the rule and the function
+    are discarded, by default. That reduces code bloat, but risks the same
+    function being specialised again in an importing module.
+
+    You can change this behaviour with :ghc-flag:`-fkeep-auto-rules`. Switching
+    it on keeps all auto-generated rules.
 
 .. ghc-flag:: -flate-dmd-anal
     :shortdesc: Run demand analysis again, at the end of the
@@ -635,7 +736,7 @@ by saying ``-fno-wombat``.
     :reverse: -fno-liberate-case
     :category:
 
-    :default: off but enabled with :ghc-flag:`-O2`.
+    :default: off but enabled by :ghc-flag:`-O2`.
 
     Turn on the liberate-case transformation. This unrolls recursive function
     once in its own RHS, to avoid repeated case analysis of free variables. It's
@@ -660,7 +761,7 @@ by saying ``-fno-wombat``.
     :reverse: -fno-loopification
     :category:
 
-    :default: on
+    :default: off but enabled by :ghc-flag:`-O`.
 
     When this optimisation is enabled the code generator will turn all
     self-recursive saturated tail calls into local jumps rather than
@@ -806,6 +907,21 @@ by saying ``-fno-wombat``.
     A function will not be split into worker and wrapper if the number of
     value arguments of the resulting worker exceeds both that of the original
     function and this setting.
+
+.. ghc-flag:: -fmax-forced-spec-args=⟨n⟩
+    :shortdesc: *default: 333.* Maximum number of value arguments for forced SpecConstr specializations.
+    :type: dynamic
+    :category:
+
+    :default: 512
+
+    When using ``SPEC`` from ``GHC.Types`` to force SpecConstr to fire on a function
+    sometimes this can result in functions taking a ridicolously large number of arguments
+    resulting a very large compile time hits for minor performance benefits.
+
+    Since this is usually unintended we prevent SpecConstr from firing and generate
+    a warning if the number of arguments in the resulting function would exceed
+    the value given by ``-fmax-forced-spec-args``.
 
 .. ghc-flag:: -fno-opt-coercion
     :shortdesc: Turn off the coercion optimiser
@@ -996,8 +1112,8 @@ by saying ``-fno-wombat``.
               last' x (y : ys) = last' y ys
 
     As well avoid unnecessary pattern matching it also helps avoid
-    unnecessary allocation. This applies when a argument is strict in
-    the recursive call to itself but not on the initial entry. As strict
+    unnecessary allocation. This applies when an argument is strict in
+    the recursive call to itself but not on the initial entry. A strict
     recursive branch of the function is created similar to the above
     example.
 
@@ -1077,7 +1193,7 @@ by saying ``-fno-wombat``.
     :reverse: -fno-specialise
     :category:
 
-    :default: on
+    :default: off but enabled by :ghc-flag:`-O`.
 
     Specialise each type-class-overloaded function
     defined in this module for the types at which it is called in this
@@ -1104,12 +1220,12 @@ by saying ``-fno-wombat``.
 
 .. ghc-flag:: -fcross-module-specialise
     :shortdesc: Turn on specialisation of overloaded functions imported from
-        other modules.
+        other modules. Implied by :ghc-flag:`-O`.
     :type: dynamic
     :reverse: -fno-cross-module-specialise
     :category:
 
-    :default: on
+    :default: off but enabled by :ghc-flag:`-O`.
 
     Specialise ``INLINABLE`` (:ref:`inlinable-pragma`)
     type-class-overloaded functions imported from other modules for the types at
@@ -1147,6 +1263,25 @@ by saying ``-fno-wombat``.
     which returns a constrained type. For example, a type class where one
     of the methods implements a traversal.
 
+
+.. ghc-flag:: -fspecialise-incoherents
+    :shortdesc: Enable specialisation on incoherent instances
+    :type: dynamic
+    :reverse: -fno-specialise-incoherents
+    :category:
+
+    :default: on
+
+    Enable specialisation of overloaded functions in cases when the
+    selected instance is incoherent. This makes the choice of instance
+    non-deterministic, so it is only safe to do if there is no
+    observable runtime behaviour difference between potentially
+    unifying instances. Turning this flag off ensures the incoherent
+    instance selection adheres to the algorithm described in
+    :extension:`IncoherentInstances` at the cost of optimisation
+    opportunities arising from specialisation.
+
+
 .. ghc-flag:: -finline-generics
     :shortdesc: Annotate methods of derived Generic and Generic1 instances with
         INLINE[1] pragmas based on heuristics. Implied by :ghc-flag:`-O`.
@@ -1154,7 +1289,7 @@ by saying ``-fno-wombat``.
     :reverse: -fno-inline-generics
     :category:
 
-    :default: on
+    :default: off but enabled by :ghc-flag:`-O`.
     :since: 9.2.1
 
     .. index::
@@ -1193,12 +1328,12 @@ by saying ``-fno-wombat``.
 
 .. ghc-flag:: -fsolve-constant-dicts
     :shortdesc: When solving constraints, try to eagerly solve
-        super classes using available dictionaries.
+        super classes using available dictionaries. Implied by :ghc-flag:`-O`.
     :type: dynamic
     :reverse: -fno-solve-constant-dicts
     :category:
 
-    :default: on
+    :default: off but enabled by :ghc-flag:`-O`.
 
     When solving constraints, try to eagerly solve
     super classes using available dictionaries.
@@ -1247,7 +1382,7 @@ by saying ``-fno-wombat``.
     :reverse: -fno-stg-lift-lams
     :category:
 
-    :default: on
+    :default: off but enabled by :ghc-flag:`-O2`.
 
     Enables the late lambda lifting optimisation on the STG
     intermediate language. This selectively lifts local functions to
@@ -1299,7 +1434,7 @@ by saying ``-fno-wombat``.
     :reverse: -fno-strictness
     :category:
 
-    :default: on
+    :default: off but enabled by :ghc-flag:`-O`.
 
     Turn on demand analysis.
 
@@ -1459,7 +1594,7 @@ by saying ``-fno-wombat``.
     :reverse: -fno-unbox-small-strict-fields
     :category:
 
-    :default: on
+    :default: off but enabled by :ghc-flag:`-O`.
 
     .. index::
        single: strict constructor fields
@@ -1488,9 +1623,9 @@ by saying ``-fno-wombat``.
     default you can disable it for certain constructor fields using the
     ``NOUNPACK`` pragma (see :ref:`nounpack-pragma`).
 
-    Note that for consistency ``Double``, ``Word64``, and ``Int64``
-    constructor fields are unpacked on 32-bit platforms, even though
-    they are technically larger than a pointer on those platforms.
+    Note that for consistency constructor fields are unpacked on 32-bit platforms
+    as if it we were compiling for a 64-bit target even if fields are larger
+    than a pointer on those platforms.
 
 .. ghc-flag:: -funbox-strict-fields
     :shortdesc: Flatten strict constructor fields
@@ -1672,9 +1807,12 @@ by saying ``-fno-wombat``.
 
 
 .. ghc-flag:: -fworker-wrapper
-    :shortdesc: Enable the worker/wrapper transformation.
+    :shortdesc: Enable the worker/wrapper transformation. Implied by :ghc-flag:`-O`
+        and by :ghc-flag:`-fstrictness`.
     :type: dynamic
     :category:
+
+    :default: off but enabled by :ghc-flag:`-O`.
 
     Enable the worker/wrapper transformation after a demand analysis pass.
 
@@ -1706,7 +1844,7 @@ by saying ``-fno-wombat``.
     overhead for the check disappears completely.
 
     This can cause slight codesize increases. It will also cause many more functions
-    to get a worker/wrapper split which can play badly with rules (see Ticket #20364)
+    to get a worker/wrapper split which can play badly with rules (see :ghc-ticket:`20364`)
     which is why it's currently disabled by default.
     In particular if you depend on rules firing on functions marked as NOINLINE without
     marking use sites of these functions as INLINE or INLINEABLE then things will break

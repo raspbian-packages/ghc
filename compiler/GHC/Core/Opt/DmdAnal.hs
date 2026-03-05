@@ -16,38 +16,40 @@ where
 
 import GHC.Prelude
 
-import GHC.Core.Opt.WorkWrap.Utils
 import GHC.Types.Demand   -- All of it
+
 import GHC.Core
-import GHC.Core.Multiplicity ( scaledThing )
-import GHC.Utils.Outputable
-import GHC.Types.Var.Env
-import GHC.Types.Var.Set
-import GHC.Types.Basic
-import Data.List        ( mapAccumL )
 import GHC.Core.DataCon
-import GHC.Types.ForeignCall ( isSafeForeignCall )
-import GHC.Types.Id
 import GHC.Core.Utils
 import GHC.Core.TyCon
 import GHC.Core.Type
-import GHC.Core.Predicate( isClassPred )
+import GHC.Core.Predicate( isEqualityClass, isCTupleClass )
 import GHC.Core.FVs      ( rulesRhsFreeIds, bndrRuleAndUnfoldingIds )
 import GHC.Core.Coercion ( Coercion )
 import GHC.Core.TyCo.FVs     ( coVarsOfCos )
 import GHC.Core.TyCo.Compare ( eqType )
+import GHC.Core.Multiplicity ( scaledThing )
 import GHC.Core.FamInstEnv
 import GHC.Core.Opt.Arity ( typeArity )
-import GHC.Utils.Misc
-import GHC.Utils.Panic
-import GHC.Utils.Panic.Plain
-import GHC.Data.Maybe
+import GHC.Core.Opt.WorkWrap.Utils
+
 import GHC.Builtin.PrimOps
 import GHC.Builtin.Types.Prim ( realWorldStatePrimTy )
+
 import GHC.Types.Unique.Set
 import GHC.Types.Unique.MemoFun
 import GHC.Types.RepType
+import GHC.Types.ForeignCall ( isSafeForeignCall )
+import GHC.Types.Id
+import GHC.Types.Var.Env
+import GHC.Types.Var.Set
+import GHC.Types.Basic
 
+import GHC.Utils.Misc
+import GHC.Utils.Panic
+import GHC.Utils.Outputable
+
+import Data.List        ( mapAccumL )
 
 {-
 ************************************************************************
@@ -85,7 +87,7 @@ data DmdResult a b = R !a !b
 -- | Outputs a new copy of the Core program in which binders have been annotated
 -- with demand and strictness information.
 --
--- Note: use `seqBinds` on the result to avoid leaks due to lazyness (cf Note
+-- Note: use `seqBinds` on the result to avoid leaks due to laziness (cf Note
 -- [Stamp out space leaks in demand analysis])
 dmdAnalProgram :: DmdAnalOpts -> FamInstEnvs -> [CoreRule] -> CoreProgram -> CoreProgram
 dmdAnalProgram opts fam_envs rules binds
@@ -403,7 +405,7 @@ dmdAnalBindLetDown top_lvl env dmd bind anal_body = case bind of
 anticipateANF :: CoreExpr -> Card -> Card
 anticipateANF e n
   | exprIsTrivial e                               = n -- trivial expr won't have a binding
-  | Just Unlifted <- typeLevity_maybe (exprType e)
+  | definitelyUnliftedType (exprType e)
   , not (isAbs n && exprOkForSpeculation e)       = case_bind n
   | otherwise                                     = let_bind  n
   where
@@ -1026,10 +1028,10 @@ dmdTransform env var sd
       TopLevel
         | isInterestingTopLevelFn var
         -- Top-level things will be used multiple times or not at
-        -- all anyway, hence the multDmd below: It means we don't
+        -- all anyway, hence the `floatifyDmd`: it means we don't
         -- have to track whether @var@ is used strictly or at most
-        -- once, because ultimately it never will.
-        -> addVarDmd fn_ty var (C_0N `multDmd` (C_11 :* sd)) -- discard strictness
+        -- once, because ultimately it never will
+        -> addVarDmd fn_ty var (floatifyDmd (C_11 :* sd))
         | otherwise
         -> fn_ty -- don't bother tracking; just annotate with 'topDmd' later
   -- Everything else:
@@ -1089,8 +1091,8 @@ dmdAnalRhsSig top_lvl rec_flag env let_dmd id rhs
 
     WithDmdType rhs_dmd_ty rhs' = dmdAnal env rhs_dmd rhs
     DmdType rhs_env rhs_dmds = rhs_dmd_ty
-    (final_rhs_dmds, final_rhs) = finaliseArgBoxities env id threshold_arity rhs' (de_div rhs_env)
-                                  `orElse` (rhs_dmds, rhs')
+    (final_rhs_dmds, final_rhs) = finaliseArgBoxities env id threshold_arity
+                                                      rhs_dmds (de_div rhs_env) rhs'
 
     sig = mkDmdSigForArity threshold_arity (DmdType sig_env final_rhs_dmds)
 
@@ -1127,9 +1129,9 @@ splitWeakDmds (DE fvs div) = (DE sig_fvs div, weak_fvs)
 thresholdArity :: Id -> CoreExpr -> Arity
 -- See Note [Demand signatures are computed for a threshold arity based on idArity]
 thresholdArity fn rhs
-  = case isJoinId_maybe fn of
-      Just join_arity -> count isId $ fst $ collectNBinders join_arity rhs
-      Nothing         -> idArity fn
+  = case idJoinPointHood fn of
+      JoinPoint join_arity -> count isId $ fst $ collectNBinders join_arity rhs
+      NotJoinPoint         -> idArity fn
 
 -- | The result type after applying 'idArity' many arguments. Returns 'Nothing'
 -- when the type doesn't have exactly 'idArity' many arrows.
@@ -1273,7 +1275,9 @@ The threshold we use is
 * Ordinary bindings: idArity f.
   Why idArity arguments? Because that's a conservative estimate of how many
   arguments we must feed a function before it does anything interesting with
-  them.  Also it elegantly subsumes the trivial RHS and PAP case.
+  them.  Also it elegantly subsumes the trivial RHS and PAP case.  E.g. for
+      f = g
+  we want to use a threshold arity based on g, not 0!
 
   idArity is /at least/ the number of manifest lambdas, but might be higher for
   PAPs and trivial RHS (see Note [Demand analysis for trivial right-hand sides]).
@@ -1398,7 +1402,7 @@ and transform to
 Now if f is subsequently inlined, we'll use 'g' and ... disaster.
 
 SOLUTION: if f has a stable unfolding, treat every free variable as a
-/demand root/, that is: Analyse it as if it was a variable occuring in a
+/demand root/, that is: Analyse it as if it was a variable occurring in a
 'topDmd' context. This is done in `demandRoot` (which we also use for exported
 top-level ids). Do the same for Ids free in the RHS of any RULES for f.
 
@@ -1498,7 +1502,7 @@ bounds-checking.
 
 So we want to give `indexError` a signature like `<1!P(!S,!S)><1!S><S!S>b`
 where the !S (meaning Poly Unboxed C1N) says that the polymorphic arguments
-are unboxed (recursively).  The wrapper for `indexError` won't /acutally/
+are unboxed (recursively).  The wrapper for `indexError` won't /actually/
 unbox them (because their polymorphic type doesn't allow that) but when
 demand-analysing /callers/, we'll behave as if that call needs the args
 unboxed.
@@ -1781,39 +1785,6 @@ applying the strictness demands to the final result of DmdAnal. The result is
 that we get the strict demand signature we wanted even if we can't float
 the case on `x` up through the case on `burble`.
 
-Note [Do not unbox class dictionaries]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-We never unbox class dictionaries in worker/wrapper.
-
-1. INLINABLE functions
-   If we have
-      f :: Ord a => [a] -> Int -> a
-      {-# INLINABLE f #-}
-   and we worker/wrapper f, we'll get a worker with an INLINABLE pragma
-   (see Note [Worker/wrapper for INLINABLE functions] in GHC.Core.Opt.WorkWrap),
-   which can still be specialised by the type-class specialiser, something like
-      fw :: Ord a => [a] -> Int# -> a
-
-   BUT if f is strict in the Ord dictionary, we might unpack it, to get
-      fw :: (a->a->Bool) -> [a] -> Int# -> a
-   and the type-class specialiser can't specialise that. An example is #6056.
-
-   Historical note: #14955 describes how I got this fix wrong the first time.
-   I got aware of the issue in T5075 by the change in boxity of loop between
-   demand analysis runs.
-
-2. -fspecialise-aggressively.  As #21286 shows, the same phenomenon can occur
-   occur without INLINABLE, when we use -fexpose-all-unfoldings and
-   -fspecialise-aggressively to do vigorous cross-module specialisation.
-
-3. #18421 found that unboxing a dictionary can also make the worker less likely
-   to inline; the inlining heuristics seem to prefer to inline a function
-   applied to a dictionary over a function applied to a bunch of functions.
-
-TL;DR we /never/ unbox class dictionaries. Unboxing the dictionary, and passing
-a raft of higher-order functions isn't a huge win anyway -- you really want to
-specialise the function.
-
 Note [Worker argument budget]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 In 'finaliseArgBoxities' we don't want to generate workers with zillions of
@@ -1947,22 +1918,40 @@ spendTopBudget m (MkB n bg) = MkB (n-m) bg
 positiveTopBudget :: Budgets -> Bool
 positiveTopBudget (MkB n _) = n >= 0
 
-finaliseArgBoxities :: AnalEnv -> Id -> Arity -> CoreExpr -> Divergence
-                    -> Maybe ([Demand], CoreExpr)
-finaliseArgBoxities env fn arity rhs div
-  | arity > count isId bndrs  -- Can't find enough binders
-  = Nothing  -- This happens if we have   f = g
-             -- Then there are no binders; we don't worker/wrapper; and we
-             -- simply want to give f the same demand signature as g
+finaliseArgBoxities :: AnalEnv -> Id -> Arity
+                    -> [Demand] -> Divergence
+                    -> CoreExpr -> ([Demand], CoreExpr)
+finaliseArgBoxities env fn threshold_arity rhs_dmds div rhs
 
-  | otherwise -- NB: arity is the threshold_arity, which might be less than
+  -- Check for an OPAQUE function: see Note [OPAQUE pragma]
+  -- In that case, trim off all boxity info from argument demands
+  -- and demand info on lambda binders
+  -- See Note [The OPAQUE pragma and avoiding the reboxing of arguments]
+  | isOpaquePragma (idInlinePragma fn)
+  , let trimmed_rhs_dmds = map trimBoxity rhs_dmds
+  = (trimmed_rhs_dmds, set_lam_dmds trimmed_rhs_dmds rhs)
+
+  -- Check that we have enough visible binders to match the
+  -- threshold arity; if not, we won't do worker/wrapper
+  -- This happens if we have simply  {f = g} or a PAP {f = h 13}
+  -- we simply want to give f the same demand signature as g
+  -- How can such bindings arise?  Perhaps from {-# NOLINE[2] f #-},
+  -- or if the call to `f` is currently not-applied (map f xs).
+  -- It's a bit of a corner case.  Anyway for now we pass on the
+  -- unadulterated demands from the RHS, without any boxity trimming.
+  | threshold_arity > count isId bndrs
+  = (rhs_dmds, rhs)
+
+  -- The normal case
+  | otherwise -- NB: threshold_arity might be less than
               -- manifest arity for join points
   = -- pprTrace "finaliseArgBoxities" (
     --   vcat [text "function:" <+> ppr fn
+    --        , text "max" <+> ppr max_wkr_args
     --        , text "dmds before:" <+> ppr (map idDemandInfo (filter isId bndrs))
     --        , text "dmds after: " <+>  ppr arg_dmds' ]) $
-    Just (arg_dmds', add_demands arg_dmds' rhs)
-    -- add_demands: we must attach the final boxities to the lambda-binders
+    (arg_dmds', set_lam_dmds arg_dmds' rhs)
+    -- set_lam_dmds: we must attach the final boxities to the lambda-binders
     -- of the function, both because that's kosher, and because CPR analysis
     -- uses the info on the binders directly.
   where
@@ -1979,30 +1968,16 @@ finaliseArgBoxities env fn arity rhs div
     (remaining_budget, arg_dmds') = go_args (MkB max_wkr_args remaining_budget) arg_triples
 
     arg_triples :: [(Type, StrictnessMark, Demand)]
-    arg_triples = take arity $
-                  [ (bndr_ty, NotMarkedStrict, get_dmd bndr bndr_ty)
-                  | bndr <- bndrs
-                  , isRuntimeVar bndr, let bndr_ty = idType bndr ]
+    arg_triples = take threshold_arity $
+                  [ (idType bndr, NotMarkedStrict, get_dmd bndr)
+                  | bndr <- bndrs, isRuntimeVar bndr ]
 
-    get_dmd :: Id -> Type -> Demand
-    get_dmd bndr bndr_ty
-      | isClassPred bndr_ty = trimBoxity dmd
-        -- See Note [Do not unbox class dictionaries]
-        -- NB: 'ty' has not been normalised, so this will (rightly)
-        --     catch newtype dictionaries too.
-        -- NB: even for bottoming functions, don't unbox dictionaries
-
-      | is_bot_fn = unboxDeeplyDmd dmd
-        -- See Note [Boxity for bottoming functions], case (B)
-
-      | is_opaque = trimBoxity dmd
-        -- See Note [OPAQUE pragma]
-        -- See Note [The OPAQUE pragma and avoiding the reboxing of arguments]
-
-      | otherwise = dmd
+    get_dmd :: Id -> Demand
+    get_dmd bndr
+      | is_bot_fn = unboxDeeplyDmd dmd -- See Note [Boxity for bottoming functions],
+      | otherwise = dmd                --     case (B)
       where
-        dmd       = idDemandInfo bndr
-        is_opaque = isOpaquePragma (idInlinePragma fn)
+        dmd = idDemandInfo bndr
 
     -- is_bot_fn:  see Note [Boxity for bottoming functions]
     is_bot_fn = div == botDiv
@@ -2059,13 +2034,18 @@ finaliseArgBoxities env fn arity rhs div
                  | positiveTopBudget bg_inner' = (bg_inner', dmd')
                  | otherwise                   = (bg_inner,  trimBoxity dmd)
 
-    add_demands :: [Demand] -> CoreExpr -> CoreExpr
+    set_lam_dmds :: [Demand] -> CoreExpr -> CoreExpr
     -- Attach the demands to the outer lambdas of this expression
-    add_demands [] e = e
-    add_demands (dmd:dmds) (Lam v e)
-      | isTyVar v = Lam v (add_demands (dmd:dmds) e)
-      | otherwise = Lam (v `setIdDemandInfo` dmd) (add_demands dmds e)
-    add_demands dmds e = pprPanic "add_demands" (ppr dmds $$ ppr e)
+    set_lam_dmds (dmd:dmds) (Lam v e)
+      | isTyVar v = Lam v (set_lam_dmds (dmd:dmds) e)
+      | otherwise = Lam (v `setIdDemandInfo` dmd) (set_lam_dmds dmds e)
+    set_lam_dmds dmds (Cast e co) = Cast (set_lam_dmds dmds e) co
+       -- This case happens for an OPAQUE function, which may look like
+       --     f = (\x y. blah) |> co
+       -- We give it strictness but no boxity (#22502)
+    set_lam_dmds _ e = e
+       -- In the OPAQUE case, the list of demands at this point might be
+       -- non-empty, e.g., when looking at a PAP. Hence don't panic (#22997).
 
 finaliseLetBoxity
   :: AnalEnv
@@ -2101,6 +2081,12 @@ wantToUnboxArg env ty str_mark dmd@(n :* _)
          -- isMarkedStrict: see Note [Unboxing evaluated arguments] in DmdAnal
        -> DontUnbox
 
+       | doNotUnbox ty
+       -> DontUnbox  -- See Note [Do not unbox class dictionaries]
+                     -- NB: 'ty' has not been normalised, so this will (rightly)
+                     --     catch newtype dictionaries too.
+                     -- NB: even for bottoming functions, don't unbox dictionaries
+
        | DefinitelyRecursive <- ae_rec_dc env dc
          -- See Note [Which types are unboxed?]
          -- and Note [Demand analysis for recursive data constructors]
@@ -2110,6 +2096,76 @@ wantToUnboxArg env ty str_mark dmd@(n :* _)
        -> DoUnbox (zip3 (dubiousDataConInstArgTys dc tc_args)
                         (dataConRepStrictness dc)
                         dmds)
+
+
+doNotUnbox :: Type -> Bool
+-- Do not unbox class dictionaries, except equality classes and tuples
+-- Note [Do not unbox class dictionaries]
+doNotUnbox arg_ty
+  = case tyConAppTyCon_maybe arg_ty of
+      Just tc | Just cls <- tyConClass_maybe tc
+              -> not (isEqualityClass cls || isCTupleClass cls)
+       -- See (DNB2) and (DNB1) in Note [Do not unbox class dictionaries]
+
+      _ -> False
+
+{- Note [Do not unbox class dictionaries]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+We never unbox class dictionaries in worker/wrapper.
+
+1. INLINABLE functions
+   If we have
+      f :: Ord a => [a] -> Int -> a
+      {-# INLINABLE f #-}
+   and we worker/wrapper f, we'll get a worker with an INLINABLE pragma
+   (see Note [Worker/wrapper for INLINABLE functions] in GHC.Core.Opt.WorkWrap),
+   which can still be specialised by the type-class specialiser, something like
+      fw :: Ord a => [a] -> Int# -> a
+
+   BUT if f is strict in the Ord dictionary, we might unpack it, to get
+      fw :: (a->a->Bool) -> [a] -> Int# -> a
+   and the type-class specialiser can't specialise that. An example is #6056.
+
+   Historical note: #14955 describes how I got this fix wrong the first time.
+   I got aware of the issue in T5075 by the change in boxity of loop between
+   demand analysis runs.
+
+2. -fspecialise-aggressively.  As #21286 shows, the same phenomenon can occur
+   occur without INLINABLE, when we use -fexpose-all-unfoldings and
+   -fspecialise-aggressively to do vigorous cross-module specialisation.
+
+3. #18421 found that unboxing a dictionary can also make the worker less likely
+   to inline; the inlining heuristics seem to prefer to inline a function
+   applied to a dictionary over a function applied to a bunch of functions.
+
+TL;DR we /never/ unbox class dictionaries. Unboxing the dictionary, and passing
+a raft of higher-order functions isn't a huge win anyway -- you really want to
+specialise the function.
+
+Wrinkle (DNB1): we /do/ want to unbox tuple dictionaries (#23398)
+     f :: (% Eq a, Show a %) => blah
+  with -fdicts-strict it is great to unbox to
+     $wf :: Eq a => Show a => blah
+  (where I have written out the currying explicitly).  Now we can specialise
+  $wf on the Eq or Show dictionary.  Nothing is lost.
+
+  And something is gained.  It is possible that `f` will look like this:
+     f = /\a. \d:(% Eq a, Show a %). ... f @a (% sel1 d, sel2 d %)...
+  where there is a recurive call to `f`, or to another function that takes the
+  same tuple dictionary, but where the tuple is built from the components of
+  `d`.  The Simplier does not fix this.  But if we unpacked the dictionary
+  we'd get
+     $wf = /\a. \(d1:Eq a) (d2:Show a). let d = (% d1, d2 %)
+             in ...f @a (% sel1 d, sel2 d %)
+  and all the tuple building and taking apart will disappear.
+
+Wrinkle (DNB2): we /do/ want to unbox equality dictionaries,
+  for (~), (~~), and Coercible (#23398).  Their payload is a single unboxed
+  coercion.  We never want to specialise on `(t1 ~ t2)`.  All that would do is
+  to make a copy of the function's RHS with a particular coercion.  Unlike
+  normal class methods, that does not unlock any new optimisation
+  opportunities in the specialised RHS.
+-}
 
 {- *********************************************************************
 *                                                                      *

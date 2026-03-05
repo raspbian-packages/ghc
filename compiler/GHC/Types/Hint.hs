@@ -21,29 +21,31 @@ module GHC.Types.Hint (
   , noStarIsTypeHints
   ) where
 
+import Language.Haskell.Syntax.Expr (LHsExpr)
+import Language.Haskell.Syntax (LPat, LIdP)
+
 import GHC.Prelude
 
 import qualified Data.List.NonEmpty as NE
 
-import GHC.Utils.Outputable
 import qualified GHC.LanguageExtensions as LangExt
-import Data.Typeable
 import GHC.Unit.Module (ModuleName, Module)
-import GHC.Hs.Extension (GhcTc)
+import GHC.Unit.Module.Imported (ImportedModsVal)
+import GHC.Hs.Extension (GhcTc, GhcRn)
 import GHC.Core.Coercion
-import GHC.Core.Type (PredType)
+import GHC.Core.FamInstEnv (FamFlavor)
+import GHC.Core.TyCon (TyCon)
+import GHC.Core.Type (Type)
 import GHC.Types.Fixity (LexicalFixity(..))
 import GHC.Types.Name (Name, NameSpace, OccName (occNameFS), isSymOcc, nameOccName)
 import GHC.Types.Name.Reader (RdrName (Unqual), ImpDeclSpec)
 import GHC.Types.SrcLoc (SrcSpan)
 import GHC.Types.Basic (Activation, RuleName)
-import {-# SOURCE #-} GHC.Tc.Types.Origin ( ClsInstOrQC(..) )
 import GHC.Parser.Errors.Basic
-import {-# SOURCE #-} Language.Haskell.Syntax.Expr
-import GHC.Unit.Module.Imported (ImportedModsVal)
-import GHC.Data.FastString (fsLit)
-  -- This {-# SOURCE #-} import should be removable once
-  -- 'Language.Haskell.Syntax.Bind' no longer depends on 'GHC.Tc.Types.Evidence'.
+import GHC.Utils.Outputable
+import GHC.Data.FastString (fsLit, FastString)
+
+import Data.Typeable ( Typeable )
 
 -- | The bindings we have available in scope when
 -- suggesting an explicit type signature.
@@ -51,6 +53,7 @@ data AvailableBindings
   = NamedBindings  (NE.NonEmpty Name)
   | UnnamedBinding
   -- ^ An unknown binding (i.e. too complicated to turn into a 'Name')
+
 
 data LanguageExtensionHint
   = -- | Suggest to enable the input extension. This is the hint that
@@ -247,7 +250,6 @@ data GhcHint
     -}
   | SuggestAddToHSigExportList !Name !(Maybe Module)
     {-| Suggests increasing the limit for the number of iterations in the simplifier.
-
     -}
   | SuggestIncreaseSimplifierIterations
     {-| Suggests to explicitly import 'Type' from the 'Data.Kind' module, because
@@ -296,21 +298,26 @@ data GhcHint
     -}
   | SuggestQualifyStarOperator
 
-    {-| Suggests that a type signature should have form <variable> :: <type>
+    {-| Suggests that for a type signature 'M.x :: ...' the qualifier should be omitted
         in order to be accepted by GHC.
 
         Triggered by: 'GHC.Parser.Errors.Types.PsErrInvalidTypeSignature'
-        Test case(s): parser/should_fail/T3811
+        Test case(s): module/mod98
     -}
-  | SuggestTypeSignatureForm
+  | SuggestTypeSignatureRemoveQualifier
 
-    {-| Suggests to move an orphan instance or to newtype-wrap it.
+    {-| Suggests to move an orphan instance (for a typeclass or a type or data
+        family), or to newtype-wrap it.
 
         Triggered by: 'GHC.Tc.Errors.Types.TcRnOrphanInstance'
         Test cases(s): warnings/should_compile/T9178
                        typecheck/should_compile/T4912
+                       indexed-types/should_compile/T22717_fam_orph
     -}
-  | SuggestFixOrphanInstance
+  | SuggestFixOrphanInst
+    { isFamilyInstance :: Maybe FamFlavor }
+      -- ^ Whether this is a family instance (of the given 'FamFlavor'),
+      -- or a class instance ('Nothing').
 
     {-| Suggests to use a standalone deriving declaration when GHC
         can't derive a typeclass instance in a trivial way.
@@ -319,6 +326,14 @@ data GhcHint
         Test cases(s): typecheck/should_fail/tcfail086
     -}
   | SuggestAddStandaloneDerivation
+
+    {-| Suggests to add a standalone kind signature when GHC
+        can't perform kind inference.
+
+        Triggered by: 'GHC.Tc.Errors.Types.TcRnInvisBndrWithoutSig'
+        Test case(s): typecheck/should_fail/T22560_fail_d
+    -}
+  | SuggestAddStandaloneKindSignature Name
 
     {-| Suggests the user to fill in the wildcard constraint to
         disambiguate which constraint that is.
@@ -330,11 +345,6 @@ data GhcHint
         Test cases(s): partial-sigs/should_fail/T13324_fail2
     -}
   | SuggestFillInWildcardConstraint
-
-  {-| Suggests to use an identifier other than 'forall'
-      Triggered by: 'GHC.Tc.Errors.Types.TcRnForallIdentifier'
-  -}
-  | SuggestRenameForall
 
     {-| Suggests to use the appropriate Template Haskell tick:
         a single tick for a term-level 'NameSpace', or a double tick
@@ -395,16 +405,9 @@ data GhcHint
 
       Test cases: mod28, mod36, mod87, mod114, ...
   -}
-  | ImportSuggestion ImportSuggestion
+  | ImportSuggestion OccName ImportSuggestion
 
-    {-| Suggest importing a data constructor to bring it into scope
-        Triggered by: 'GHC.Tc.Errors.Types.TcRnTypeCannotBeMarshaled'
-
-        Test cases: ccfail004
-    -}
-  | SuggestImportingDataCon
-  {- Found a pragma in the body of a module, suggest
-     placing it in the header
+  {-| Found a pragma in the body of a module, suggest placing it in the header.
   -}
   | SuggestPlacePragmaInHeader
     {-| Suggest using pattern matching syntax for a non-bidirectional pattern synonym
@@ -420,7 +423,56 @@ data GhcHint
     -}
   | SuggestSpecialiseVisibilityHints Name
 
-  | LoopySuperclassSolveHint PredType ClsInstOrQC
+    {-| Suggest renaming implicitly quantified type variable in case it
+        captures a term's name.
+    -}
+  | SuggestRenameTypeVariable
+
+  | SuggestExplicitBidiPatSyn Name (LPat GhcRn) [LIdP GhcRn]
+
+    {-| Suggest enabling one of the SafeHaskell modes Safe, Unsafe or
+        Trustworthy.
+    -}
+  | SuggestSafeHaskell
+
+    {-| Suggest removing a record wildcard from a pattern when it doesn't
+        bind anything useful.
+    -}
+  | SuggestRemoveRecordWildcard
+    {-| Suggest moving a method implementation to a different instance to its
+      superclass that defines the canonical version of the method.
+    -}
+  | SuggestMoveNonCanonicalDefinition
+    Name -- ^ move the implementation from this method
+    Name -- ^ ... to this method
+    String -- ^ Documentation URL
+
+    {-| Suggest to increase the solver maximum reduction depth -}
+  | SuggestIncreaseReductionDepth
+
+    {-| Suggest removing a method implementation when a superclass defines the
+      canonical version of that method.
+    -}
+  | SuggestRemoveNonCanonicalDefinition
+    Name -- ^ method with non-canonical implementation
+    Name -- ^ possible other method to use as the RHS instead
+    String -- ^ Documentation URL
+  {-| Suggest eta-reducing a type synonym used in the implementation
+      of abstract data. -}
+  | SuggestEtaReduceAbsDataTySyn TyCon
+  {-| Remind the user that there is no field of a type and name in the record,
+      constructors are in the usual order $x$, $r$, $a$ -}
+  | RemindRecordMissingField FastString Type Type
+  {-| Suggest binding the type variable on the LHS of the type declaration
+  -}
+  | SuggestBindTyVarOnLhs RdrName
+
+  {-| Suggest using an anonymous wildcard instead of a named wildcard -}
+  | SuggestAnonymousWildcard
+
+  {-| Suggest explicitly quantifying a type variable instead of relying on implicit quantification -}
+  | SuggestExplicitQuantification RdrName
+
 
   {-| Suggest binding explicitly; e.g   data T @k (a :: F k) = .... -}
   | SuggestBindTyVarExplicitly Name
@@ -441,9 +493,23 @@ data InstantiationSuggestion = InstantiationSuggestion !ModuleName !Module
 -- | Suggest how to fix an import.
 data ImportSuggestion
   -- | Some module exports what we want, but we aren't explicitly importing it.
-  = CouldImportFrom (NE.NonEmpty (Module, ImportedModsVal)) OccName
+  = CouldImportFrom (NE.NonEmpty (Module, ImportedModsVal))
   -- | Some module exports what we want, but we are explicitly hiding it.
-  | CouldUnhideFrom (NE.NonEmpty (Module, ImportedModsVal)) OccName
+  | CouldUnhideFrom (NE.NonEmpty (Module, ImportedModsVal))
+  -- | The module exports what we want, but it isn't a type.
+  | CouldRemoveTypeKeyword ModuleName
+  -- | The module exports what we want, but it's a type and we have @ExplicitNamespaces@ on.
+  | CouldAddTypeKeyword ModuleName
+  -- | Suggest importing a data constructor to bring it into scope
+  | ImportDataCon
+      -- | Where to suggest importing the 'DataCon' from.
+      --
+      -- The 'Bool' tracks whether to suggest using an import of the form
+      -- @import (pattern Foo)@, depending on whether @-XPatternSynonyms@
+      -- was enabled.
+      { ies_suggest_import_from :: Maybe (ModuleName, Bool)
+        -- | The 'OccName' of the parent of the data constructor.
+      , ies_parent :: OccName }
 
 -- | Explain how something is in scope.
 data HowInScope
@@ -454,7 +520,7 @@ data HowInScope
 
 data SimilarName
   = SimilarName Name
-  | SimilarRdrName RdrName HowInScope
+  | SimilarRdrName RdrName (Maybe HowInScope)
 
 -- | Something is promoted to the type-level without a promotion tick.
 data UntickedPromotedThing

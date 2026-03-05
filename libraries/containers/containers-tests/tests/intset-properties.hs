@@ -8,7 +8,7 @@ import qualified Data.List as List
 import Data.Monoid (mempty)
 import qualified Data.Set as Set
 import IntSetValidity (valid)
-import Prelude hiding (lookup, null, map, filter, foldr, foldl)
+import Prelude hiding (lookup, null, map, filter, foldr, foldl, foldl')
 import Test.Tasty
 import Test.Tasty.HUnit
 import Test.Tasty.QuickCheck hiding ((.&.))
@@ -45,6 +45,7 @@ main = defaultMain $ testGroup "intset-properties"
                    , testProperty "prop_DescList" prop_DescList
                    , testProperty "prop_AscDescList" prop_AscDescList
                    , testProperty "prop_fromList" prop_fromList
+                   , testProperty "prop_fromRange" prop_fromRange
                    , testProperty "prop_MaskPow2" prop_MaskPow2
                    , testProperty "prop_Prefix" prop_Prefix
                    , testProperty "prop_LeftRight" prop_LeftRight
@@ -276,6 +277,12 @@ prop_fromList xs
            t === List.foldr insert empty xs
   where sort_xs = sort xs
         nub_sort_xs = List.map List.head $ List.group sort_xs
+
+prop_fromRange :: Property
+prop_fromRange = forAll (scale (*100) arbitrary) go
+  where
+    go (l,h) = valid t .&&. t === fromAscList [l..h]
+      where t = fromRange (l,h)
 
 {--------------------------------------------------------------------
   Bin invariants

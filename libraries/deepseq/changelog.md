@@ -2,6 +2,21 @@
 
 ## Upcoming
 
+
+
+## 1.5.0.0
+
+  * Add quantified superclasses to NFData(1,2)
+    ([#88](https://github.com/haskell/deepseq/issues/88))
+  * Alter superclasses for Data.Functor.{Sum, Product}
+    ([#95])(https://github.com/haskell/deepseq/pull/95)
+  * Drop support for GHC < 8.6
+    ([#94](https://github.com/haskell/deepseq/pull/94))
+  * List fusion in `instance NFData [a]` reduces allocations
+    ([#99](https://github.com/haskell/deepseq/pull/99))
+
+## 1.4.8.1
+
   * Adapt the rename of the Solo constructor to MkSolo
     ([#87](https://github.com/haskell/deepseq/pull/87))
   * Add instances for the indexed `TypeRep`, along with `Module`.

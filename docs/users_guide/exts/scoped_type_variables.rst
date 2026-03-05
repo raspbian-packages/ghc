@@ -12,7 +12,7 @@ Lexically scoped type variables
 
     :since: 6.8.1
 
-    :status: Included in :extension:`GHC2021`
+    :status: Included in :extension:`GHC2024`, :extension:`GHC2021`
 
     Enable lexical scoping of type variables explicitly introduced with
     ``forall``.
@@ -293,11 +293,11 @@ signatures/ of the methods. For example, the following will be accepted without
 explicitly enabling :extension:`ScopedTypeVariables`: ::
 
       class D a where
-        m :: [a] -> a
+        m :: a -> a
 
-      instance D [a] where
+      instance Num a => D [a] where
         m :: [a] -> [a]
-        m = reverse
+        m x = map (*2) x
 
 Note that writing ``m :: [a] -> [a]`` requires the use of the
 :extension:`InstanceSigs` extension.

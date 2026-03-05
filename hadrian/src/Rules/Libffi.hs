@@ -12,6 +12,7 @@ import Packages
 import Settings.Builders.Common
 import Target
 import Utilities
+import GHC.Toolchain (targetPlatformTriple)
 
 {- Note [Libffi indicating inputs]
    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -131,11 +132,10 @@ configureEnvironment stage = do
     context <- libffiContext stage
     cFlags  <- interpretInContext context $ mconcat
                [ cArgs
-               , getStagedSettingList ConfCcArgs ]
+               , getStagedCCFlags ]
     ldFlags <- interpretInContext context ldArgs
     sequence [ builderEnvironment "CC" $ Cc CompileC stage
              , builderEnvironment "CXX" $ Cc CompileC stage
-             , builderEnvironment "LD" (Ld stage)
              , builderEnvironment "AR" (Ar Unpack stage)
              , builderEnvironment "NM" Nm
              , builderEnvironment "RANLIB" Ranlib
@@ -202,7 +202,8 @@ libffiRules = do
         writeFileLines dynLibMan dynLibFiles
         putSuccess "| Successfully build libffi."
 
-    fmap (libffiPath -/-) ["Makefile.in", "configure" ] &%> \[mkIn, _] -> do
+    fmap (libffiPath -/-) ( "Makefile.in" :& "configure" :& Nil ) &%>
+      \ ( mkIn :& _ ) -> do
         -- Extract libffi tar file
         context <- libffiContext stage
         removeDirectory libffiPath
@@ -225,7 +226,8 @@ libffiRules = do
         files <- liftIO $ getDirectoryFilesIO "." [libffiPath -/- "**"]
         produces files
 
-    fmap (libffiPath -/-) ["Makefile", "config.guess", "config.sub"] &%> \[mk, _, _] -> do
+    fmap (libffiPath -/-) ("Makefile" :& "config.guess" :& "config.sub" :& Nil)
+      &%> \( mk :& _ ) -> do
         _ <- needLibfffiArchive libffiPath
         context <- libffiContext stage
 
@@ -239,6 +241,6 @@ libffiRules = do
         buildWithCmdOptions env $
             target context (Configure libffiPath) [mk <.> "in"] [mk]
 
-        dir   <- setting BuildPlatform
+        dir   <- queryBuildTarget targetPlatformTriple
         files <- liftIO $ getDirectoryFilesIO "." [libffiPath -/- dir -/- "**"]
         produces files

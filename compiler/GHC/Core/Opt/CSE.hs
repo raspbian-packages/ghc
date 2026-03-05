@@ -14,7 +14,7 @@ import GHC.Types.Var.Env ( mkInScopeSet )
 import GHC.Types.Id     ( Id, idType, idHasRules, zapStableUnfolding
                         , idInlineActivation, setInlineActivation
                         , zapIdOccInfo, zapIdUsageInfo, idInlinePragma
-                        , isJoinId, isJoinId_maybe, idUnfolding )
+                        , isJoinId, idJoinPointHood, idUnfolding )
 import GHC.Core.Utils   ( mkAltExpr
                         , exprIsTickedString
                         , stripTicksE, stripTicksT, mkTicks )
@@ -43,7 +43,7 @@ and apply that to the rest of the program.
 When we then see
         y1 = C a b
         y2 = C y1 b
-we replace the C a b with x1.  But then we *dont* want to
+we replace the C a b with x1.  But then we *don't* want to
 add   x1 -> y1  to the mapping.  Rather, we want the reverse, y1 -> x1
 so that a subsequent binding
         y2 = C y1 b
@@ -53,8 +53,8 @@ So we carry an extra var->var substitution which we apply *before* looking up in
 reverse mapping.
 
 
-Note [Shadowing]
-~~~~~~~~~~~~~~~~
+Note [Shadowing in CSE]
+~~~~~~~~~~~~~~~~~~~~~~~
 We have to be careful about shadowing.
 For example, consider
         f = \x -> let y = x+x in
@@ -436,7 +436,7 @@ cse_bind toplevel env_rhs env_body (in_id, in_rhs) out_id
       -- See Note [Take care with literal strings]
   = (env_body', (out_id', in_rhs))
 
-  | Just arity <- isJoinId_maybe out_id
+  | JoinPoint arity <- idJoinPointHood out_id
       -- See Note [Look inside join-point binders]
   = let (params, in_body) = collectNBinders arity in_rhs
         (env', params') = addBinders env_rhs params
@@ -900,7 +900,7 @@ extendCSSubst :: CSEnv -> Id  -> CoreExpr -> CSEnv
 extendCSSubst cse x rhs = cse { cs_subst = extendSubst (cs_subst cse) x rhs }
 
 -- | Add clones to the substitution to deal with shadowing.  See
--- Note [Shadowing] for more details.  You should call this whenever
+-- Note [Shadowing in CSE] for more details.  You should call this whenever
 -- you go under a binder.
 addBinder :: CSEnv -> Var -> (CSEnv, Var)
 addBinder cse v = (cse { cs_subst = sub' }, v')

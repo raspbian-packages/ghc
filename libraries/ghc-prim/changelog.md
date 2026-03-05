@@ -1,3 +1,134 @@
+## 0.12.0
+
+- Shipped with GHC 9.10.1
+
+- Add unaligned addr access primops. These primops will be emulated on platforms that don't support unaligned access.
+
+         readWord8OffAddrAsChar# :: Addr# -> Int# -> State# s -> (# State# s, Char# #)
+         readWord8OffAddrAsAddr# :: Addr# -> Int# -> State# s -> (# State# s, Addr# #)
+         readWord8OffAddrAsFloat# :: Addr# -> Int# -> State# s -> (# State# s, Float# #)
+         readWord8OffAddrAsDouble# :: Addr# -> Int# -> State# s -> (# State# s, Double# #)
+         readWord8OffAddrAsStablePtr# :: Addr# -> Int# -> State# s -> (# State# s, StablePtr# #)
+         readWord8OffAddrAsInt16# :: Addr# -> Int# -> State# s -> (# State# s, Int16# #)
+         readWord8OffAddrAsInt32# :: Addr# -> Int# -> State# s -> (# State# s, Int32# #)
+         readWord8OffAddrAsInt64# :: Addr# -> Int# -> State# s -> (# State# s, Int64# #)
+         readWord8OffAddrAsInt# :: Addr# -> Int# -> State# s -> (# State# s, Int# #)
+
+         readWord8OffAddrAsWord16# :: Addr# -> Int# -> State# s -> (# State# s, Word16# #)
+         readWord8OffAddrAsWord32# :: Addr# -> Int# -> State# s -> (# State# s, Word32# #)
+         readWord8OffAddrAsWord64# :: Addr# -> Int# -> State# s -> (# State# s, Word64# #)
+         readWord8OffAddrAsWord# :: Addr# -> Int# -> State# s -> (# State# s, Word# #)
+
+         indexWord8OffAddrAsChar# :: Addr# -> Int# -> Char#
+         indexWord8OffAddrAsAddr# :: Addr# -> Int# -> Addr#
+         indexWord8OffAddrAsFloat# :: Addr# -> Int# -> Float#
+         indexWord8OffAddrAsDouble# :: Addr# -> Int# -> Double#
+         indexWord8OffAddrAsStablePtr# :: Addr# -> Int# -> StablePtr#
+         indexWord8OffAddrAsInt16# :: Addr# -> Int# -> Int16#
+         indexWord8OffAddrAsInt32# :: Addr# -> Int# -> Int32#
+         indexWord8OffAddrAsInt64# :: Addr# -> Int# -> Int64#
+         indexWord8OffAddrAsInt# :: Addr# -> Int# -> Int#
+
+         indexWord8OffAddrAsWord16# :: Addr# -> Int# -> Word16#
+         indexWord8OffAddrAsWord32# :: Addr# -> Int# -> Word32#
+         indexWord8OffAddrAsWord64# :: Addr# -> Int# -> Word64#
+         indexWord8OffAddrAsWord# :: Addr# -> Int# -> Word#
+
+         writeWord8OffAddrAsChar# :: Addr# -> Int# -> Char# -> State# s -> State# s
+         writeWord8OffAddrAsAddr# :: Addr# -> Int# -> Addr# -> State# s -> State# s
+         writeWord8OffAddrAsFloat# :: Addr# -> Int# -> Float# -> State# s -> State# s
+         writeWord8OffAddrAsDouble# :: Addr# -> Int# -> Double# -> State# s -> State# s
+         writeWord8OffAddrAsStablePtr# :: Addr# -> Int# -> StablePtr# -> State# s -> State# s
+
+         writeWord8OffAddrAsInt16# :: Addr# -> Int# -> Int16# -> State# s -> State# s
+         writeWord8OffAddrAsInt32# :: Addr# -> Int# -> Int32# -> State# s -> State# s
+         writeWord8OffAddrAsInt64# :: Addr# -> Int# -> Int64# -> State# s -> State# s
+         writeWord8OffAddrAsInt# :: Addr# -> Int# -> Int# -> State# s -> State# s
+
+         writeWord8OffAddrAsWord16# :: Addr# -> Int# -> Word16# -> State# s -> State# s
+         writeWord8OffAddrAsWord32# :: Addr# -> Int# -> Word32# -> State# s -> State# s
+         writeWord8OffAddrAsWord64# :: Addr# -> Int# -> Word64# -> State# s -> State# s
+         writeWord8OffAddrAsWord# :: Addr# -> Int# -> Word# -> State# s -> State# s
+
+- The `unsafeThawByteArray#` primop was added, serving as a inverse to the existing
+  `unsafeFreezeByteArray#` primop (see #22710).
+
+- `dataToTag#` has been moved to `GHC.Magic` and made the sole method
+  of a new class:
+
+  ```haskell
+  type DataToTag :: forall {lev :: Levity}. TYPE (BoxedRep lev) -> Constraint
+  class DataToTag a where
+    dataToTag# :: a -> Int#
+  ```
+
+  In particular, it is now applicable only at some (not all)
+  lifted types.  However, if `t` is an algebraic data type (i.e. `t`
+  matches a `data` or `data instance` declaration) with all of its
+  constructors in scope and the levity of `t` is statically known,
+  then the constraint `DataToTag t` can always be solved.
+
+- Renamed several built-in tycon syntaxes to avoid punning:
+
+  - Unboxed tuple tycons are now `Tuple#<N>`
+  - Unboxed sum tycons are now `Sum#<N>`
+  - Constraint tuple classes are now `CTuple<N>`
+  - Unit tycons are now `Unit#`, `CUnit`.
+  - Solo tycons are now `Solo#`, `CSolo`.
+  - `Tuple<N>` have been moved back to `GHC.Tuple`.
+
+  See [https://github.com/ghc-proposals/ghc-proposals/blob/master/proposals/0475-tuple-syntax.rst].
+
+## 0.11.0
+
+- Shipped with GHC 9.8.1
+
+- Primitive pointer comparison functions are now levity-polymorphic, e.g.
+
+  ```haskell
+  sameArray# :: forall {l} (a :: TYPE (BoxedRep l)). Array# a -> Array# a -> Int#
+  ```
+
+  This change affects the following functions:
+    - `sameArray#`, `sameMutableArray#`,
+    - `sameSmallArray#`, `sameSmallMutableArray#`,
+    - `sameMutVar#`, `sameTVar#`, `sameMVar#`
+    - `sameIOPort#`, `eqStableName#`.
+
+- `keepAlive#` and `touch#` are now polymorphic in their state token (#23163; [CLC#152](https://github.com/haskell/core-libraries-committee/issues/152))
+
+- Several new primops were added:
+
+  - `copyMutableByteArrayNonOverlapping#`
+  - `copyAddrToAddr#`
+  - `copyAddrToAddrNonOverlapping#`
+  - `setAddrRange#`
+
+- New primops for fused multiply-add operations. These primops combine a
+  multiplication and an addition, compiling to a single instruction when
+  the `-mfma` flag is enabled and the architecture supports it.
+
+  The new primops are `fmaddFloat#, fmsubFloat#, fnmaddFloat#, fnmsubFloat# :: Float# -> Float# -> Float# -> Float#`
+  and `fmaddDouble#, fmsubDouble#, fnmaddDouble#, fnmsubDouble# :: Double# -> Double# -> Double# -> Double#`.
+
+  These implement the following operations, while performing one single
+  rounding at the end, leading to a more accurate result:
+
+    - `fmaddFloat# x y z`, `fmaddDouble# x y z` compute `x * y + z`.
+    - `fmsubFloat# x y z`, `fmsubDouble# x y z` compute `x * y - z`.
+    - `fnmaddFloat# x y z`, `fnmaddDouble# x y z` compute `- x * y + z`.
+    - `fnmsubFloat# x y z`, `fnmsubDouble# x y z` compute `- x * y - z`.
+
+  Warning: on unsupported architectures, the software emulation provided by
+  the fallback to the C standard library is not guaranteed to be IEEE-compliant.
+
+- `Unit`, `Tuple0`, `Tuple1`, `Tuple2`, `Tuple3` and so on (up to `Tuple64`)
+  are now exported from `GHC.Tuple.Prim` and reexported from `GHC.Tuple`.
+  GHC now uses these as the actual names for tuple data types. As a result,
+  the "brackets with commas" syntax (e.g. `()`, `(,)`, etc.) now becomes just
+  an alias to these names. This change may affect tools and libraries that
+  rely on type names, such as `Generic` and Template Haskell.
+
 ## 0.10.0
 
 - Shipped with GHC 9.6.1
@@ -27,6 +158,8 @@
   with compact regions.
   We are working on ways to allow users and library authors to get back the
   performance benefits of the old behaviour where possible.
+
+- `List` is now exported from `GHC.Types`.
 
 ## 0.9.0 *August 2022*
 

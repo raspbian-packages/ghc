@@ -26,6 +26,7 @@ module GHC.Tc.Deriv.Utils (
 
 import GHC.Prelude
 
+import GHC.Hs.Extension
 import GHC.Data.Bag
 import GHC.Types.Basic
 
@@ -39,7 +40,7 @@ import GHC.Tc.Types.Origin
 import GHC.Tc.Utils.Monad
 import GHC.Tc.Utils.TcType
 import GHC.Tc.Utils.Unify (tcSubTypeSigma)
-import GHC.Tc.Utils.Zonk
+import GHC.Tc.Zonk.Type
 
 import GHC.Core.Class
 import GHC.Core.DataCon
@@ -51,6 +52,7 @@ import GHC.Core.Type
 import GHC.Hs
 import GHC.Driver.Session
 import GHC.Unit.Module (getModule)
+import GHC.Unit.Module.Warnings
 import GHC.Unit.Module.ModIface (mi_fix)
 
 import GHC.Types.Fixity.Env (lookupFixity)
@@ -66,6 +68,7 @@ import GHC.Builtin.Names.TH (liftClassKey)
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
 import GHC.Utils.Error
+import GHC.Utils.Unique (sameUnique)
 
 import Control.Monad.Trans.Reader
 import Data.Foldable (traverse_)
@@ -143,6 +146,8 @@ data DerivEnv = DerivEnv
   , denv_strat        :: Maybe (DerivStrategy GhcTc)
     -- ^ 'Just' if user requests a particular deriving strategy.
     --   Otherwise, 'Nothing'.
+  , denv_warn         :: Maybe (WarningTxt GhcRn)
+    -- ^ A warning to emit whenever the derived instance is used
   }
 
 instance Outputable DerivEnv where
@@ -174,7 +179,8 @@ data DerivSpec theta = DS { ds_loc                 :: SrcSpan
                           , ds_standalone_wildcard :: Maybe SrcSpan
                               -- See Note [Inferring the instance context]
                               -- in GHC.Tc.Deriv.Infer
-                          , ds_mechanism           :: DerivSpecMechanism }
+                          , ds_mechanism           :: DerivSpecMechanism
+                          , ds_warn                :: Maybe (WarningTxt GhcRn)}
         -- This spec implies a dfun declaration of the form
         --       df :: forall tvs. theta => C tys
         -- The Name is the name for the DFun we'll build
@@ -230,22 +236,22 @@ setDerivSpecTheta :: theta' -> DerivSpec theta -> DerivSpec theta'
 setDerivSpecTheta theta ds = ds{ds_theta = theta}
 
 -- | Zonk the 'TcTyVar's in a 'DerivSpec' to 'TyVar's.
--- See @Note [What is zonking?]@ in "GHC.Tc.Utils.TcMType".
+-- See @Note [What is zonking?]@ in "GHC.Tc.Zonk.Type".
 --
 -- This is only used in the final zonking step when inferring
 -- the context for a derived instance.
 -- See @Note [Overlap and deriving]@ in "GHC.Tc.Deriv.Infer".
-zonkDerivSpec :: DerivSpec ThetaType -> TcM (DerivSpec ThetaType)
+zonkDerivSpec :: DerivSpec ThetaType -> ZonkTcM (DerivSpec ThetaType)
 zonkDerivSpec ds@(DS { ds_tvs = tvs, ds_theta = theta
                      , ds_tys = tys, ds_mechanism = mechanism
-                     }) = do
-  (ze, tvs') <- zonkTyBndrs tvs
-  theta'     <- zonkTcTypesToTypesX ze theta
-  tys'       <- zonkTcTypesToTypesX ze tys
-  mechanism' <- zonkDerivSpecMechanism ze mechanism
-  pure ds{ ds_tvs = tvs', ds_theta = theta'
-         , ds_tys = tys', ds_mechanism = mechanism'
-         }
+                     }) =
+  runZonkBndrT (zonkTyBndrsX tvs) $ \ tvs' -> do
+    theta'     <- zonkTcTypesToTypesX theta
+    tys'       <- zonkTcTypesToTypesX tys
+    mechanism' <- zonkDerivSpecMechanism mechanism
+    pure ds{ ds_tvs = tvs', ds_theta = theta'
+           , ds_tys = tys', ds_mechanism = mechanism'
+           }
 
 -- | What action to take in order to derive a class instance.
 -- See @Note [DerivEnv and DerivSpecMechanism]@, as well as
@@ -307,26 +313,26 @@ isDerivSpecVia (DerivSpecVia{}) = True
 isDerivSpecVia _                = False
 
 -- | Zonk the 'TcTyVar's in a 'DerivSpecMechanism' to 'TyVar's.
--- See @Note [What is zonking?]@ in "GHC.Tc.Utils.TcMType".
+-- See @Note [What is zonking?]@ in "GHC.Tc.Zonk.Type".
 --
 -- This is only used in the final zonking step when inferring
 -- the context for a derived instance.
 -- See @Note [Overlap and deriving]@ in "GHC.Tc.Deriv.Infer".
-zonkDerivSpecMechanism :: ZonkEnv -> DerivSpecMechanism -> TcM DerivSpecMechanism
-zonkDerivSpecMechanism ze mechanism =
+zonkDerivSpecMechanism :: DerivSpecMechanism -> ZonkTcM DerivSpecMechanism
+zonkDerivSpecMechanism mechanism =
   case mechanism of
     DerivSpecStock { dsm_stock_dit     = dit
                    , dsm_stock_gen_fns = gen_fns
                    } -> do
-      dit' <- zonkDerivInstTys ze dit
+      dit' <- zonkDerivInstTys dit
       pure $ DerivSpecStock { dsm_stock_dit     = dit'
                             , dsm_stock_gen_fns = gen_fns
                             }
     DerivSpecNewtype { dsm_newtype_dit    = dit
                      , dsm_newtype_rep_ty = rep_ty
                      } -> do
-      dit'    <- zonkDerivInstTys ze dit
-      rep_ty' <- zonkTcTypeToTypeX ze rep_ty
+      dit'    <- zonkDerivInstTys dit
+      rep_ty' <- zonkTcTypeToTypeX rep_ty
       pure $ DerivSpecNewtype { dsm_newtype_dit    = dit'
                               , dsm_newtype_rep_ty = rep_ty'
                               }
@@ -336,9 +342,9 @@ zonkDerivSpecMechanism ze mechanism =
                  , dsm_via_inst_ty = inst_ty
                  , dsm_via_ty      = via_ty
                  } -> do
-      cls_tys' <- zonkTcTypesToTypesX ze cls_tys
-      inst_ty' <- zonkTcTypeToTypeX ze inst_ty
-      via_ty'  <- zonkTcTypeToTypeX ze via_ty
+      cls_tys' <- zonkTcTypesToTypesX cls_tys
+      inst_ty' <- zonkTcTypeToTypeX inst_ty
+      via_ty'  <- zonkTcTypeToTypeX via_ty
       pure $ DerivSpecVia { dsm_via_cls_tys = cls_tys'
                           , dsm_via_inst_ty = inst_ty'
                           , dsm_via_ty      = via_ty'
@@ -893,37 +899,37 @@ classArgsErr cls cls_tys = DerivErrNotAClass (mkClassPred cls cls_tys)
 -- class for which stock deriving isn't possible.
 stockSideConditions :: DerivContext -> Class -> Maybe Condition
 stockSideConditions deriv_ctxt cls
-  | cls_key == eqClassKey          = Just (cond_std `andCond` cond_args cls)
-  | cls_key == ordClassKey         = Just (cond_std `andCond` cond_args cls)
-  | cls_key == showClassKey        = Just (cond_std `andCond` cond_args cls)
-  | cls_key == readClassKey        = Just (cond_std `andCond` cond_args cls)
-  | cls_key == enumClassKey        = Just (cond_std `andCond` cond_isEnumeration)
-  | cls_key == ixClassKey          = Just (cond_std `andCond` cond_enumOrProduct cls)
-  | cls_key == boundedClassKey     = Just (cond_std `andCond` cond_enumOrProduct cls)
-  | cls_key == dataClassKey        = Just (checkFlag LangExt.DeriveDataTypeable `andCond`
-                                           cond_vanilla `andCond`
-                                           cond_args cls)
-  | cls_key == functorClassKey     = Just (checkFlag LangExt.DeriveFunctor `andCond`
-                                           cond_vanilla `andCond`
-                                           cond_functorOK True False)
-  | cls_key == foldableClassKey    = Just (checkFlag LangExt.DeriveFoldable `andCond`
-                                           cond_vanilla `andCond`
-                                           cond_functorOK False True)
-                                           -- Functor/Fold/Trav works ok
-                                           -- for rank-n types
-  | cls_key == traversableClassKey = Just (checkFlag LangExt.DeriveTraversable `andCond`
-                                           cond_vanilla `andCond`
-                                           cond_functorOK False False)
-  | cls_key == genClassKey         = Just (checkFlag LangExt.DeriveGeneric `andCond`
-                                           cond_vanilla `andCond`
-                                           cond_RepresentableOk)
-  | cls_key == gen1ClassKey        = Just (checkFlag LangExt.DeriveGeneric `andCond`
-                                           cond_vanilla `andCond`
-                                           cond_Representable1Ok)
-  | cls_key == liftClassKey        = Just (checkFlag LangExt.DeriveLift `andCond`
-                                           cond_vanilla `andCond`
-                                           cond_args cls)
-  | otherwise                      = Nothing
+  | sameUnique cls_key eqClassKey          = Just (cond_std `andCond` cond_args cls)
+  | sameUnique cls_key ordClassKey         = Just (cond_std `andCond` cond_args cls)
+  | sameUnique cls_key showClassKey        = Just (cond_std `andCond` cond_args cls)
+  | sameUnique cls_key readClassKey        = Just (cond_std `andCond` cond_args cls)
+  | sameUnique cls_key enumClassKey        = Just (cond_std `andCond` cond_isEnumeration)
+  | sameUnique cls_key ixClassKey          = Just (cond_std `andCond` cond_enumOrProduct cls)
+  | sameUnique cls_key boundedClassKey     = Just (cond_std `andCond` cond_enumOrProduct cls)
+  | sameUnique cls_key dataClassKey        = Just (checkFlag LangExt.DeriveDataTypeable `andCond`
+                                                   cond_vanilla `andCond`
+                                                   cond_args cls)
+  | sameUnique cls_key functorClassKey     = Just (checkFlag LangExt.DeriveFunctor `andCond`
+                                                   cond_vanilla `andCond`
+                                                   cond_functorOK True False)
+  | sameUnique cls_key foldableClassKey    = Just (checkFlag LangExt.DeriveFoldable `andCond`
+                                                   cond_vanilla `andCond`
+                                                   cond_functorOK False True)
+                                                   -- Functor/Fold/Trav works ok
+                                                   -- for rank-n types
+  | sameUnique cls_key traversableClassKey = Just (checkFlag LangExt.DeriveTraversable `andCond`
+                                                   cond_vanilla `andCond`
+                                                   cond_functorOK False False)
+  | sameUnique cls_key genClassKey         = Just (checkFlag LangExt.DeriveGeneric `andCond`
+                                                   cond_vanilla `andCond`
+                                                   cond_RepresentableOk)
+  | sameUnique cls_key gen1ClassKey        = Just (checkFlag LangExt.DeriveGeneric `andCond`
+                                                   cond_vanilla `andCond`
+                                                   cond_Representable1Ok)
+  | sameUnique cls_key liftClassKey        = Just (checkFlag LangExt.DeriveLift `andCond`
+                                                   cond_vanilla `andCond`
+                                                   cond_args cls)
+  | otherwise                        = Nothing
   where
     cls_key = getUnique cls
     cond_std     = cond_stdOK deriv_ctxt False
@@ -1181,8 +1187,9 @@ non_coercible_class cls
 newDerivClsInst :: DerivSpec ThetaType -> TcM ClsInst
 newDerivClsInst (DS { ds_name = dfun_name, ds_overlap = overlap_mode
                     , ds_tvs = tvs, ds_theta = theta
-                    , ds_cls = clas, ds_tys = tys })
-  = newClsInst overlap_mode dfun_name tvs theta clas tys
+                    , ds_cls = clas, ds_tys = tys
+                    , ds_warn = warn })
+  = newClsInst overlap_mode dfun_name tvs theta clas tys warn
 
 extendLocalInstEnv :: [ClsInst] -> TcM a -> TcM a
 -- Add new locally-defined instances; don't bother to check

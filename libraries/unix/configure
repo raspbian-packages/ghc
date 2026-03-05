@@ -1702,173 +1702,6 @@ fi
 
 } # ac_fn_c_try_link
 
-# ac_fn_c_check_func LINENO FUNC VAR
-# ----------------------------------
-# Tests whether FUNC exists, setting the cache variable VAR accordingly
-ac_fn_c_check_func ()
-{
-  as_lineno=${as_lineno-"$1"} as_lineno_stack=as_lineno_stack=$as_lineno_stack
-  { $as_echo "$as_me:${as_lineno-$LINENO}: checking for $2" >&5
-$as_echo_n "checking for $2... " >&6; }
-if eval \${$3+:} false; then :
-  $as_echo_n "(cached) " >&6
-else
-  cat confdefs.h - <<_ACEOF >conftest.$ac_ext
-/* end confdefs.h.  */
-/* Define $2 to an innocuous variant, in case <limits.h> declares $2.
-   For example, HP-UX 11i <limits.h> declares gettimeofday.  */
-#define $2 innocuous_$2
-
-/* System header to define __stub macros and hopefully few prototypes,
-    which can conflict with char $2 (); below.
-    Prefer <limits.h> to <assert.h> if __STDC__ is defined, since
-    <limits.h> exists even on freestanding compilers.  */
-
-#ifdef __STDC__
-# include <limits.h>
-#else
-# include <assert.h>
-#endif
-
-#undef $2
-
-/* Override any GCC internal prototype to avoid an error.
-   Use char because int might match the return type of a GCC
-   builtin and then its argument prototype would still apply.  */
-#ifdef __cplusplus
-extern "C"
-#endif
-char $2 ();
-/* The GNU C library defines this for functions which it implements
-    to always fail with ENOSYS.  Some functions are actually named
-    something starting with __ and the normal name is an alias.  */
-#if defined __stub_$2 || defined __stub___$2
-choke me
-#endif
-
-int
-main ()
-{
-return $2 ();
-  ;
-  return 0;
-}
-_ACEOF
-if ac_fn_c_try_link "$LINENO"; then :
-  eval "$3=yes"
-else
-  eval "$3=no"
-fi
-rm -f core conftest.err conftest.$ac_objext \
-    conftest$ac_exeext conftest.$ac_ext
-fi
-eval ac_res=\$$3
-	       { $as_echo "$as_me:${as_lineno-$LINENO}: result: $ac_res" >&5
-$as_echo "$ac_res" >&6; }
-  eval $as_lineno_stack; ${as_lineno_stack:+:} unset as_lineno
-
-} # ac_fn_c_check_func
-
-# ac_fn_c_check_type LINENO TYPE VAR INCLUDES
-# -------------------------------------------
-# Tests whether TYPE exists after having included INCLUDES, setting cache
-# variable VAR accordingly.
-ac_fn_c_check_type ()
-{
-  as_lineno=${as_lineno-"$1"} as_lineno_stack=as_lineno_stack=$as_lineno_stack
-  { $as_echo "$as_me:${as_lineno-$LINENO}: checking for $2" >&5
-$as_echo_n "checking for $2... " >&6; }
-if eval \${$3+:} false; then :
-  $as_echo_n "(cached) " >&6
-else
-  eval "$3=no"
-  cat confdefs.h - <<_ACEOF >conftest.$ac_ext
-/* end confdefs.h.  */
-$4
-int
-main ()
-{
-if (sizeof ($2))
-	 return 0;
-  ;
-  return 0;
-}
-_ACEOF
-if ac_fn_c_try_compile "$LINENO"; then :
-  cat confdefs.h - <<_ACEOF >conftest.$ac_ext
-/* end confdefs.h.  */
-$4
-int
-main ()
-{
-if (sizeof (($2)))
-	    return 0;
-  ;
-  return 0;
-}
-_ACEOF
-if ac_fn_c_try_compile "$LINENO"; then :
-
-else
-  eval "$3=yes"
-fi
-rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
-fi
-rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
-fi
-eval ac_res=\$$3
-	       { $as_echo "$as_me:${as_lineno-$LINENO}: result: $ac_res" >&5
-$as_echo "$ac_res" >&6; }
-  eval $as_lineno_stack; ${as_lineno_stack:+:} unset as_lineno
-
-} # ac_fn_c_check_type
-
-# ac_fn_c_check_decl LINENO SYMBOL VAR INCLUDES
-# ---------------------------------------------
-# Tests whether SYMBOL is declared in INCLUDES, setting cache variable VAR
-# accordingly.
-ac_fn_c_check_decl ()
-{
-  as_lineno=${as_lineno-"$1"} as_lineno_stack=as_lineno_stack=$as_lineno_stack
-  as_decl_name=`echo $2|sed 's/ *(.*//'`
-  as_decl_use=`echo $2|sed -e 's/(/((/' -e 's/)/) 0&/' -e 's/,/) 0& (/g'`
-  { $as_echo "$as_me:${as_lineno-$LINENO}: checking whether $as_decl_name is declared" >&5
-$as_echo_n "checking whether $as_decl_name is declared... " >&6; }
-if eval \${$3+:} false; then :
-  $as_echo_n "(cached) " >&6
-else
-  cat confdefs.h - <<_ACEOF >conftest.$ac_ext
-/* end confdefs.h.  */
-$4
-int
-main ()
-{
-#ifndef $as_decl_name
-#ifdef __cplusplus
-  (void) $as_decl_use;
-#else
-  (void) $as_decl_name;
-#endif
-#endif
-
-  ;
-  return 0;
-}
-_ACEOF
-if ac_fn_c_try_compile "$LINENO"; then :
-  eval "$3=yes"
-else
-  eval "$3=no"
-fi
-rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
-fi
-eval ac_res=\$$3
-	       { $as_echo "$as_me:${as_lineno-$LINENO}: result: $ac_res" >&5
-$as_echo "$ac_res" >&6; }
-  eval $as_lineno_stack; ${as_lineno_stack:+:} unset as_lineno
-
-} # ac_fn_c_check_decl
-
 # ac_fn_c_check_member LINENO AGGR MEMBER VAR INCLUDES
 # ----------------------------------------------------
 # Tries to find if the field MEMBER exists in type AGGR, after including
@@ -2108,6 +1941,173 @@ rm -f conftest.val
   as_fn_set_status $ac_retval
 
 } # ac_fn_c_compute_int
+
+# ac_fn_c_check_func LINENO FUNC VAR
+# ----------------------------------
+# Tests whether FUNC exists, setting the cache variable VAR accordingly
+ac_fn_c_check_func ()
+{
+  as_lineno=${as_lineno-"$1"} as_lineno_stack=as_lineno_stack=$as_lineno_stack
+  { $as_echo "$as_me:${as_lineno-$LINENO}: checking for $2" >&5
+$as_echo_n "checking for $2... " >&6; }
+if eval \${$3+:} false; then :
+  $as_echo_n "(cached) " >&6
+else
+  cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+/* end confdefs.h.  */
+/* Define $2 to an innocuous variant, in case <limits.h> declares $2.
+   For example, HP-UX 11i <limits.h> declares gettimeofday.  */
+#define $2 innocuous_$2
+
+/* System header to define __stub macros and hopefully few prototypes,
+    which can conflict with char $2 (); below.
+    Prefer <limits.h> to <assert.h> if __STDC__ is defined, since
+    <limits.h> exists even on freestanding compilers.  */
+
+#ifdef __STDC__
+# include <limits.h>
+#else
+# include <assert.h>
+#endif
+
+#undef $2
+
+/* Override any GCC internal prototype to avoid an error.
+   Use char because int might match the return type of a GCC
+   builtin and then its argument prototype would still apply.  */
+#ifdef __cplusplus
+extern "C"
+#endif
+char $2 ();
+/* The GNU C library defines this for functions which it implements
+    to always fail with ENOSYS.  Some functions are actually named
+    something starting with __ and the normal name is an alias.  */
+#if defined __stub_$2 || defined __stub___$2
+choke me
+#endif
+
+int
+main ()
+{
+return $2 ();
+  ;
+  return 0;
+}
+_ACEOF
+if ac_fn_c_try_link "$LINENO"; then :
+  eval "$3=yes"
+else
+  eval "$3=no"
+fi
+rm -f core conftest.err conftest.$ac_objext \
+    conftest$ac_exeext conftest.$ac_ext
+fi
+eval ac_res=\$$3
+	       { $as_echo "$as_me:${as_lineno-$LINENO}: result: $ac_res" >&5
+$as_echo "$ac_res" >&6; }
+  eval $as_lineno_stack; ${as_lineno_stack:+:} unset as_lineno
+
+} # ac_fn_c_check_func
+
+# ac_fn_c_check_type LINENO TYPE VAR INCLUDES
+# -------------------------------------------
+# Tests whether TYPE exists after having included INCLUDES, setting cache
+# variable VAR accordingly.
+ac_fn_c_check_type ()
+{
+  as_lineno=${as_lineno-"$1"} as_lineno_stack=as_lineno_stack=$as_lineno_stack
+  { $as_echo "$as_me:${as_lineno-$LINENO}: checking for $2" >&5
+$as_echo_n "checking for $2... " >&6; }
+if eval \${$3+:} false; then :
+  $as_echo_n "(cached) " >&6
+else
+  eval "$3=no"
+  cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+/* end confdefs.h.  */
+$4
+int
+main ()
+{
+if (sizeof ($2))
+	 return 0;
+  ;
+  return 0;
+}
+_ACEOF
+if ac_fn_c_try_compile "$LINENO"; then :
+  cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+/* end confdefs.h.  */
+$4
+int
+main ()
+{
+if (sizeof (($2)))
+	    return 0;
+  ;
+  return 0;
+}
+_ACEOF
+if ac_fn_c_try_compile "$LINENO"; then :
+
+else
+  eval "$3=yes"
+fi
+rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
+fi
+rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
+fi
+eval ac_res=\$$3
+	       { $as_echo "$as_me:${as_lineno-$LINENO}: result: $ac_res" >&5
+$as_echo "$ac_res" >&6; }
+  eval $as_lineno_stack; ${as_lineno_stack:+:} unset as_lineno
+
+} # ac_fn_c_check_type
+
+# ac_fn_c_check_decl LINENO SYMBOL VAR INCLUDES
+# ---------------------------------------------
+# Tests whether SYMBOL is declared in INCLUDES, setting cache variable VAR
+# accordingly.
+ac_fn_c_check_decl ()
+{
+  as_lineno=${as_lineno-"$1"} as_lineno_stack=as_lineno_stack=$as_lineno_stack
+  as_decl_name=`echo $2|sed 's/ *(.*//'`
+  as_decl_use=`echo $2|sed -e 's/(/((/' -e 's/)/) 0&/' -e 's/,/) 0& (/g'`
+  { $as_echo "$as_me:${as_lineno-$LINENO}: checking whether $as_decl_name is declared" >&5
+$as_echo_n "checking whether $as_decl_name is declared... " >&6; }
+if eval \${$3+:} false; then :
+  $as_echo_n "(cached) " >&6
+else
+  cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+/* end confdefs.h.  */
+$4
+int
+main ()
+{
+#ifndef $as_decl_name
+#ifdef __cplusplus
+  (void) $as_decl_use;
+#else
+  (void) $as_decl_name;
+#endif
+#endif
+
+  ;
+  return 0;
+}
+_ACEOF
+if ac_fn_c_try_compile "$LINENO"; then :
+  eval "$3=yes"
+else
+  eval "$3=no"
+fi
+rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
+fi
+eval ac_res=\$$3
+	       { $as_echo "$as_me:${as_lineno-$LINENO}: result: $ac_res" >&5
+$as_echo "$ac_res" >&6; }
+  eval $as_lineno_stack; ${as_lineno_stack:+:} unset as_lineno
+
+} # ac_fn_c_check_decl
 cat >config.log <<_ACEOF
 This file contains any messages produced by compilers while
 running configure, to aid debugging if configure makes a mistake.
@@ -4078,6 +4078,402 @@ fi
 done
 
 
+ac_header_dirent=no
+for ac_hdr in dirent.h sys/ndir.h sys/dir.h ndir.h; do
+  as_ac_Header=`$as_echo "ac_cv_header_dirent_$ac_hdr" | $as_tr_sh`
+{ $as_echo "$as_me:${as_lineno-$LINENO}: checking for $ac_hdr that defines DIR" >&5
+$as_echo_n "checking for $ac_hdr that defines DIR... " >&6; }
+if eval \${$as_ac_Header+:} false; then :
+  $as_echo_n "(cached) " >&6
+else
+  cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+/* end confdefs.h.  */
+#include <sys/types.h>
+#include <$ac_hdr>
+
+int
+main ()
+{
+if ((DIR *) 0)
+return 0;
+  ;
+  return 0;
+}
+_ACEOF
+if ac_fn_c_try_compile "$LINENO"; then :
+  eval "$as_ac_Header=yes"
+else
+  eval "$as_ac_Header=no"
+fi
+rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
+fi
+eval ac_res=\$$as_ac_Header
+	       { $as_echo "$as_me:${as_lineno-$LINENO}: result: $ac_res" >&5
+$as_echo "$ac_res" >&6; }
+if eval test \"x\$"$as_ac_Header"\" = x"yes"; then :
+  cat >>confdefs.h <<_ACEOF
+#define `$as_echo "HAVE_$ac_hdr" | $as_tr_cpp` 1
+_ACEOF
+
+ac_header_dirent=$ac_hdr; break
+fi
+
+done
+# Two versions of opendir et al. are in -ldir and -lx on SCO Xenix.
+if test $ac_header_dirent = dirent.h; then
+  { $as_echo "$as_me:${as_lineno-$LINENO}: checking for library containing opendir" >&5
+$as_echo_n "checking for library containing opendir... " >&6; }
+if ${ac_cv_search_opendir+:} false; then :
+  $as_echo_n "(cached) " >&6
+else
+  ac_func_search_save_LIBS=$LIBS
+cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+/* end confdefs.h.  */
+
+/* Override any GCC internal prototype to avoid an error.
+   Use char because int might match the return type of a GCC
+   builtin and then its argument prototype would still apply.  */
+#ifdef __cplusplus
+extern "C"
+#endif
+char opendir ();
+int
+main ()
+{
+return opendir ();
+  ;
+  return 0;
+}
+_ACEOF
+for ac_lib in '' dir; do
+  if test -z "$ac_lib"; then
+    ac_res="none required"
+  else
+    ac_res=-l$ac_lib
+    LIBS="-l$ac_lib  $ac_func_search_save_LIBS"
+  fi
+  if ac_fn_c_try_link "$LINENO"; then :
+  ac_cv_search_opendir=$ac_res
+fi
+rm -f core conftest.err conftest.$ac_objext \
+    conftest$ac_exeext
+  if ${ac_cv_search_opendir+:} false; then :
+  break
+fi
+done
+if ${ac_cv_search_opendir+:} false; then :
+
+else
+  ac_cv_search_opendir=no
+fi
+rm conftest.$ac_ext
+LIBS=$ac_func_search_save_LIBS
+fi
+{ $as_echo "$as_me:${as_lineno-$LINENO}: result: $ac_cv_search_opendir" >&5
+$as_echo "$ac_cv_search_opendir" >&6; }
+ac_res=$ac_cv_search_opendir
+if test "$ac_res" != no; then :
+  test "$ac_res" = "none required" || LIBS="$ac_res $LIBS"
+
+fi
+
+else
+  { $as_echo "$as_me:${as_lineno-$LINENO}: checking for library containing opendir" >&5
+$as_echo_n "checking for library containing opendir... " >&6; }
+if ${ac_cv_search_opendir+:} false; then :
+  $as_echo_n "(cached) " >&6
+else
+  ac_func_search_save_LIBS=$LIBS
+cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+/* end confdefs.h.  */
+
+/* Override any GCC internal prototype to avoid an error.
+   Use char because int might match the return type of a GCC
+   builtin and then its argument prototype would still apply.  */
+#ifdef __cplusplus
+extern "C"
+#endif
+char opendir ();
+int
+main ()
+{
+return opendir ();
+  ;
+  return 0;
+}
+_ACEOF
+for ac_lib in '' x; do
+  if test -z "$ac_lib"; then
+    ac_res="none required"
+  else
+    ac_res=-l$ac_lib
+    LIBS="-l$ac_lib  $ac_func_search_save_LIBS"
+  fi
+  if ac_fn_c_try_link "$LINENO"; then :
+  ac_cv_search_opendir=$ac_res
+fi
+rm -f core conftest.err conftest.$ac_objext \
+    conftest$ac_exeext
+  if ${ac_cv_search_opendir+:} false; then :
+  break
+fi
+done
+if ${ac_cv_search_opendir+:} false; then :
+
+else
+  ac_cv_search_opendir=no
+fi
+rm conftest.$ac_ext
+LIBS=$ac_func_search_save_LIBS
+fi
+{ $as_echo "$as_me:${as_lineno-$LINENO}: result: $ac_cv_search_opendir" >&5
+$as_echo "$ac_cv_search_opendir" >&6; }
+ac_res=$ac_cv_search_opendir
+if test "$ac_res" != no; then :
+  test "$ac_res" = "none required" || LIBS="$ac_res $LIBS"
+
+fi
+
+fi
+
+
+
+  ac_fn_c_check_member "$LINENO" "struct dirent" "d_type" "ac_cv_member_struct_dirent_d_type" "
+#include <sys/types.h>
+#ifdef HAVE_DIRENT_H
+# include <dirent.h>
+#else
+# define dirent direct
+# ifdef HAVE_SYS_NDIR_H
+#  include <sys/ndir.h>
+# endif
+# ifdef HAVE_SYS_DIR_H
+#  include <sys/dir.h>
+# endif
+# ifdef HAVE_NDIR_H
+#  include <ndir.h>
+# endif
+#endif
+
+"
+if test "x$ac_cv_member_struct_dirent_d_type" = xyes; then :
+
+cat >>confdefs.h <<_ACEOF
+#define HAVE_STRUCT_DIRENT_D_TYPE 1
+_ACEOF
+
+
+fi
+
+
+{ $as_echo "$as_me:${as_lineno-$LINENO}: checking value of DT_UNKNOWN" >&5
+$as_echo_n "checking value of DT_UNKNOWN... " >&6; }
+if ${fp_cv_const_DT_UNKNOWN+:} false; then :
+  $as_echo_n "(cached) " >&6
+else
+  if ac_fn_c_compute_int "$LINENO" "DT_UNKNOWN" "fp_check_const_result"        "
+#if HAVE_STRUCT_DIRENT_D_TYPE
+#include <dirent.h>
+#endif
+"; then :
+
+else
+  fp_check_const_result=-1
+fi
+
+fp_cv_const_DT_UNKNOWN=$fp_check_const_result
+fi
+{ $as_echo "$as_me:${as_lineno-$LINENO}: result: $fp_cv_const_DT_UNKNOWN" >&5
+$as_echo "$fp_cv_const_DT_UNKNOWN" >&6; }
+cat >>confdefs.h <<_ACEOF
+#define CONST_DT_UNKNOWN $fp_cv_const_DT_UNKNOWN
+_ACEOF
+
+{ $as_echo "$as_me:${as_lineno-$LINENO}: checking value of DT_FIFO" >&5
+$as_echo_n "checking value of DT_FIFO... " >&6; }
+if ${fp_cv_const_DT_FIFO+:} false; then :
+  $as_echo_n "(cached) " >&6
+else
+  if ac_fn_c_compute_int "$LINENO" "DT_FIFO" "fp_check_const_result"        "
+#if HAVE_STRUCT_DIRENT_D_TYPE
+#include <dirent.h>
+#endif
+"; then :
+
+else
+  fp_check_const_result=-2
+fi
+
+fp_cv_const_DT_FIFO=$fp_check_const_result
+fi
+{ $as_echo "$as_me:${as_lineno-$LINENO}: result: $fp_cv_const_DT_FIFO" >&5
+$as_echo "$fp_cv_const_DT_FIFO" >&6; }
+cat >>confdefs.h <<_ACEOF
+#define CONST_DT_FIFO $fp_cv_const_DT_FIFO
+_ACEOF
+
+{ $as_echo "$as_me:${as_lineno-$LINENO}: checking value of DT_CHR" >&5
+$as_echo_n "checking value of DT_CHR... " >&6; }
+if ${fp_cv_const_DT_CHR+:} false; then :
+  $as_echo_n "(cached) " >&6
+else
+  if ac_fn_c_compute_int "$LINENO" "DT_CHR" "fp_check_const_result"        "
+#if HAVE_STRUCT_DIRENT_D_TYPE
+#include <dirent.h>
+#endif
+"; then :
+
+else
+  fp_check_const_result=-3
+fi
+
+fp_cv_const_DT_CHR=$fp_check_const_result
+fi
+{ $as_echo "$as_me:${as_lineno-$LINENO}: result: $fp_cv_const_DT_CHR" >&5
+$as_echo "$fp_cv_const_DT_CHR" >&6; }
+cat >>confdefs.h <<_ACEOF
+#define CONST_DT_CHR $fp_cv_const_DT_CHR
+_ACEOF
+
+{ $as_echo "$as_me:${as_lineno-$LINENO}: checking value of DT_DIR" >&5
+$as_echo_n "checking value of DT_DIR... " >&6; }
+if ${fp_cv_const_DT_DIR+:} false; then :
+  $as_echo_n "(cached) " >&6
+else
+  if ac_fn_c_compute_int "$LINENO" "DT_DIR" "fp_check_const_result"        "
+#if HAVE_STRUCT_DIRENT_D_TYPE
+#include <dirent.h>
+#endif
+"; then :
+
+else
+  fp_check_const_result=-4
+fi
+
+fp_cv_const_DT_DIR=$fp_check_const_result
+fi
+{ $as_echo "$as_me:${as_lineno-$LINENO}: result: $fp_cv_const_DT_DIR" >&5
+$as_echo "$fp_cv_const_DT_DIR" >&6; }
+cat >>confdefs.h <<_ACEOF
+#define CONST_DT_DIR $fp_cv_const_DT_DIR
+_ACEOF
+
+{ $as_echo "$as_me:${as_lineno-$LINENO}: checking value of DT_BLK" >&5
+$as_echo_n "checking value of DT_BLK... " >&6; }
+if ${fp_cv_const_DT_BLK+:} false; then :
+  $as_echo_n "(cached) " >&6
+else
+  if ac_fn_c_compute_int "$LINENO" "DT_BLK" "fp_check_const_result"        "
+#if HAVE_STRUCT_DIRENT_D_TYPE
+#include <dirent.h>
+#endif
+"; then :
+
+else
+  fp_check_const_result=-5
+fi
+
+fp_cv_const_DT_BLK=$fp_check_const_result
+fi
+{ $as_echo "$as_me:${as_lineno-$LINENO}: result: $fp_cv_const_DT_BLK" >&5
+$as_echo "$fp_cv_const_DT_BLK" >&6; }
+cat >>confdefs.h <<_ACEOF
+#define CONST_DT_BLK $fp_cv_const_DT_BLK
+_ACEOF
+
+{ $as_echo "$as_me:${as_lineno-$LINENO}: checking value of DT_REG" >&5
+$as_echo_n "checking value of DT_REG... " >&6; }
+if ${fp_cv_const_DT_REG+:} false; then :
+  $as_echo_n "(cached) " >&6
+else
+  if ac_fn_c_compute_int "$LINENO" "DT_REG" "fp_check_const_result"        "
+#if HAVE_STRUCT_DIRENT_D_TYPE
+#include <dirent.h>
+#endif
+"; then :
+
+else
+  fp_check_const_result=-6
+fi
+
+fp_cv_const_DT_REG=$fp_check_const_result
+fi
+{ $as_echo "$as_me:${as_lineno-$LINENO}: result: $fp_cv_const_DT_REG" >&5
+$as_echo "$fp_cv_const_DT_REG" >&6; }
+cat >>confdefs.h <<_ACEOF
+#define CONST_DT_REG $fp_cv_const_DT_REG
+_ACEOF
+
+{ $as_echo "$as_me:${as_lineno-$LINENO}: checking value of DT_LNK" >&5
+$as_echo_n "checking value of DT_LNK... " >&6; }
+if ${fp_cv_const_DT_LNK+:} false; then :
+  $as_echo_n "(cached) " >&6
+else
+  if ac_fn_c_compute_int "$LINENO" "DT_LNK" "fp_check_const_result"        "
+#if HAVE_STRUCT_DIRENT_D_TYPE
+#include <dirent.h>
+#endif
+"; then :
+
+else
+  fp_check_const_result=-7
+fi
+
+fp_cv_const_DT_LNK=$fp_check_const_result
+fi
+{ $as_echo "$as_me:${as_lineno-$LINENO}: result: $fp_cv_const_DT_LNK" >&5
+$as_echo "$fp_cv_const_DT_LNK" >&6; }
+cat >>confdefs.h <<_ACEOF
+#define CONST_DT_LNK $fp_cv_const_DT_LNK
+_ACEOF
+
+{ $as_echo "$as_me:${as_lineno-$LINENO}: checking value of DT_SOCK" >&5
+$as_echo_n "checking value of DT_SOCK... " >&6; }
+if ${fp_cv_const_DT_SOCK+:} false; then :
+  $as_echo_n "(cached) " >&6
+else
+  if ac_fn_c_compute_int "$LINENO" "DT_SOCK" "fp_check_const_result"        "
+#if HAVE_STRUCT_DIRENT_D_TYPE
+#include <dirent.h>
+#endif
+"; then :
+
+else
+  fp_check_const_result=-8
+fi
+
+fp_cv_const_DT_SOCK=$fp_check_const_result
+fi
+{ $as_echo "$as_me:${as_lineno-$LINENO}: result: $fp_cv_const_DT_SOCK" >&5
+$as_echo "$fp_cv_const_DT_SOCK" >&6; }
+cat >>confdefs.h <<_ACEOF
+#define CONST_DT_SOCK $fp_cv_const_DT_SOCK
+_ACEOF
+
+{ $as_echo "$as_me:${as_lineno-$LINENO}: checking value of DT_WHT" >&5
+$as_echo_n "checking value of DT_WHT... " >&6; }
+if ${fp_cv_const_DT_WHT+:} false; then :
+  $as_echo_n "(cached) " >&6
+else
+  if ac_fn_c_compute_int "$LINENO" "DT_WHT" "fp_check_const_result"        "
+#if HAVE_STRUCT_DIRENT_D_TYPE
+#include <dirent.h>
+#endif
+"; then :
+
+else
+  fp_check_const_result=-9
+fi
+
+fp_cv_const_DT_WHT=$fp_check_const_result
+fi
+{ $as_echo "$as_me:${as_lineno-$LINENO}: result: $fp_cv_const_DT_WHT" >&5
+$as_echo "$fp_cv_const_DT_WHT" >&6; }
+cat >>confdefs.h <<_ACEOF
+#define CONST_DT_WHT $fp_cv_const_DT_WHT
+_ACEOF
+
+
 for ac_func in getgrgid_r getgrnam_r getpwnam_r getpwuid_r getpwnam getpwuid
 do :
   as_ac_var=`$as_echo "ac_cv_func_$ac_func" | $as_tr_sh`
@@ -4340,6 +4736,64 @@ if (eval "$ac_cpp conftest.$ac_ext") 2>&5 |
 $as_echo "yes" >&6; }
 
 $as_echo "#define HAVE_F_GETLK 1" >>confdefs.h
+
+
+else
+
+  { $as_echo "$as_me:${as_lineno-$LINENO}: result: no" >&5
+$as_echo "no" >&6; }
+
+fi
+rm -f conftest*
+
+
+{ $as_echo "$as_me:${as_lineno-$LINENO}: checking for O_DIRECT open flag" >&5
+$as_echo_n "checking for O_DIRECT open flag... " >&6; }
+cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+/* end confdefs.h.  */
+
+ #include <fcntl.h>
+ #ifdef O_DIRECT
+        yes
+ #endif
+
+_ACEOF
+if (eval "$ac_cpp conftest.$ac_ext") 2>&5 |
+  $EGREP "yes" >/dev/null 2>&1; then :
+
+  { $as_echo "$as_me:${as_lineno-$LINENO}: result: yes" >&5
+$as_echo "yes" >&6; }
+
+$as_echo "#define HAVE_O_DIRECT 1" >>confdefs.h
+
+
+else
+
+  { $as_echo "$as_me:${as_lineno-$LINENO}: result: no" >&5
+$as_echo "no" >&6; }
+
+fi
+rm -f conftest*
+
+
+{ $as_echo "$as_me:${as_lineno-$LINENO}: checking for F_NOCACHE from fcntl.h" >&5
+$as_echo_n "checking for F_NOCACHE from fcntl.h... " >&6; }
+cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+/* end confdefs.h.  */
+
+ #include <fcntl.h>
+ #ifdef F_NOCACHE
+        yes
+ #endif
+
+_ACEOF
+if (eval "$ac_cpp conftest.$ac_ext") 2>&5 |
+  $EGREP "yes" >/dev/null 2>&1; then :
+
+  { $as_echo "$as_me:${as_lineno-$LINENO}: result: yes" >&5
+$as_echo "yes" >&6; }
+
+$as_echo "#define HAVE_F_NOCACHE 1" >>confdefs.h
 
 
 else

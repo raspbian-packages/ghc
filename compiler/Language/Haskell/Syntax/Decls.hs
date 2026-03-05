@@ -30,7 +30,7 @@ module Language.Haskell.Syntax.Decls (
   HsDecl(..), LHsDecl, HsDataDefn(..), HsDeriving, LHsFunDep, FunDep(..),
   HsDerivingClause(..), LHsDerivingClause, DerivClauseTys(..), LDerivClauseTys,
   NewOrData(..), DataDefnCons(..), dataDefnConsNewOrData,
-  isTypeDataDefnCons,
+  isTypeDataDefnCons, firstDataDefnCon,
   StandaloneKindSig(..), LStandaloneKindSig,
 
   -- ** Class or type declarations
@@ -45,11 +45,11 @@ module Language.Haskell.Syntax.Decls (
   FamilyDecl(..), LFamilyDecl,
 
   -- ** Instance declarations
-  InstDecl(..), LInstDecl, FamilyInfo(..),
+  InstDecl(..), LInstDecl, FamilyInfo(..), familyInfoTyConFlavour,
   TyFamInstDecl(..), LTyFamInstDecl,
   TyFamDefltDecl, LTyFamDefltDecl,
   DataFamInstDecl(..), LDataFamInstDecl,
-  FamEqn(..), TyFamInstEqn, LTyFamInstEqn, HsTyPats,
+  FamEqn(..), TyFamInstEqn, LTyFamInstEqn, HsFamEqnPats,
   LClsInstDecl, ClsInstDecl(..),
 
   -- ** Standalone deriving declarations
@@ -70,7 +70,8 @@ module Language.Haskell.Syntax.Decls (
   CImportSpec(..),
   -- ** Data-constructor declarations
   ConDecl(..), LConDecl,
-  HsConDeclH98Details, HsConDeclGADTDetails(..),
+  HsConDeclH98Details,
+  HsConDeclGADTDetails(..), XPrefixConGADT, XRecConGADT, XXConDeclGADTDetails,
   -- ** Document comments
   DocDecl(..), LDocDecl, docDeclDoc,
   -- ** Deprecations
@@ -94,17 +95,18 @@ import {-# SOURCE #-} Language.Haskell.Syntax.Expr
         -- Because Expr imports Decls via HsBracket
 
 import Language.Haskell.Syntax.Binds
-import Language.Haskell.Syntax.Concrete
 import Language.Haskell.Syntax.Extension
 import Language.Haskell.Syntax.Type
 import Language.Haskell.Syntax.Basic (Role)
 
-import GHC.Types.Basic (TopLevelFlag, OverlapMode, RuleName, Activation)
+import GHC.Types.Basic (TopLevelFlag, OverlapMode, RuleName, Activation
+                       ,TyConFlavour(..), TypeOrData(..))
 import GHC.Types.ForeignCall (CType, CCallConv, Safety, Header, CLabelString, CCallTarget, CExportSpec)
 import GHC.Types.Fixity (LexicalFixity)
 
 import GHC.Core.Type (Specificity)
 import GHC.Unit.Module.Warnings (WarningTxt)
+import GHC.Utils.Panic.Plain ( assert )
 
 import GHC.Hs.Doc (LHsDoc) -- ROMES:TODO Discuss in #21592 whether this is parsed AST or base AST
 
@@ -455,8 +457,6 @@ data TyClDecl pass
     --                          'GHC.Parser.Annotation.AnnRarrow'
     -- For details on above see Note [exact print annotations] in GHC.Parser.Annotation
   | ClassDecl { tcdCExt    :: XClassDecl pass,         -- ^ Post renamer, FVs
-                tcdLayout  :: !(LayoutInfo pass),      -- ^ Explicit or virtual braces
-                              -- See Note [Class LayoutInfo]
                 tcdCtxt    :: Maybe (LHsContext pass), -- ^ Context...
                 tcdLName   :: LIdP pass,               -- ^ Name of the class
                 tcdTyVars  :: LHsQTyVars pass,         -- ^ Class type variables
@@ -499,9 +499,9 @@ c.f. Note [Associated type tyvar names] in GHC.Core.Class
      Note [Family instance declaration binders]
 -}
 
-{- Note [Class LayoutInfo]
-~~~~~~~~~~~~~~~~~~~~~~~~~~
-The LayoutInfo is used to associate Haddock comments with parts of the declaration.
+{- Note [Class EpLayout]
+~~~~~~~~~~~~~~~~~~~~~~~~
+The EpLayout is used to associate Haddock comments with parts of the declaration.
 Compare the following examples:
 
     class C a where
@@ -580,7 +580,8 @@ declaration before checking all of the others, supporting polymorphic recursion.
 See https://gitlab.haskell.org/ghc/ghc/wikis/ghc-kinds/kind-inference#proposed-new-strategy
 and #9200 for lots of discussion of how we got here.
 
-The detection of CUSKs is enabled by the -XCUSKs extension, switched on by default.
+The detection of CUSKs is enabled by the -XCUSKs extension, switched off by default
+in GHC2021 and on in Haskell98/2010.
 Under -XNoCUSKs, all declarations are treated as if they have no CUSK.
 See https://github.com/ghc-proposals/ghc-proposals/blob/master/proposals/0036-kind-signatures.rst
 
@@ -862,6 +863,28 @@ data FamilyInfo pass
      -- said "type family Foo x where .."
   | ClosedTypeFamily (Maybe [LTyFamInstEqn pass])
 
+familyInfoTyConFlavour
+  :: Maybe tc    -- ^ Just cls <=> this is an associated family of class cls
+  -> FamilyInfo pass
+  -> TyConFlavour tc
+familyInfoTyConFlavour mb_parent_tycon info =
+  case info of
+    DataFamily         -> OpenFamilyFlavour IAmData mb_parent_tycon
+    OpenTypeFamily     -> OpenFamilyFlavour IAmType mb_parent_tycon
+    ClosedTypeFamily _ -> assert (isNothing mb_parent_tycon)
+                          -- See Note [Closed type family mb_parent_tycon]
+                          ClosedTypeFamilyFlavour
+
+{- Note [Closed type family mb_parent_tycon]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+There's no way to write a closed type family inside a class declaration:
+
+  class C a where
+    type family F a where  -- error: parse error on input ‘where’
+
+In fact, it is not clear what the meaning of such a declaration would be.
+Therefore, 'mb_parent_tycon' of any closed type family has to be Nothing.
+-}
 
 {- *********************************************************************
 *                                                                      *
@@ -1015,6 +1038,11 @@ isTypeDataDefnCons :: DataDefnCons a -> Bool
 isTypeDataDefnCons (NewTypeCon _) = False
 isTypeDataDefnCons (DataTypeCons is_type_data _) = is_type_data
 
+-- | Retrieve the first data constructor in a 'DataDefnCons' (if one exists).
+firstDataDefnCon :: DataDefnCons a -> Maybe a
+firstDataDefnCon (NewTypeCon con) = Just con
+firstDataDefnCon (DataTypeCons _ cons) = listToMaybe cons
+
 -- | Located data Constructor Declaration
 type LConDecl pass = XRec pass (ConDecl pass)
       -- ^ May have 'GHC.Parser.Annotation.AnnKeywordId' : 'GHC.Parser.Annotation.AnnSemi' when
@@ -1051,7 +1079,6 @@ data ConDecl pass
   = ConDeclGADT
       { con_g_ext   :: XConDeclGADT pass
       , con_names   :: NonEmpty (LIdP pass)
-      , con_dcolon  :: !(LHsUniToken "::" "∷" pass)
       -- The following fields describe the type after the '::'
       -- See Note [GADT abstract syntax]
       , con_bndrs   :: XRec pass (HsOuterSigTyVarBndrs pass)
@@ -1212,8 +1239,13 @@ type HsConDeclH98Details pass
 -- derived Show instances—see Note [Infix GADT constructors] in
 -- GHC.Tc.TyCl—but that is an orthogonal concern.)
 data HsConDeclGADTDetails pass
-   = PrefixConGADT [HsScaled pass (LBangType pass)]
-   | RecConGADT (XRec pass [LConDeclField pass]) (LHsUniToken "->" "→" pass)
+   = PrefixConGADT !(XPrefixConGADT pass) [HsScaled pass (LBangType pass)]
+   | RecConGADT !(XRecConGADT pass) (XRec pass [LConDeclField pass])
+   | XConDeclGADTDetails !(XXConDeclGADTDetails pass)
+
+type family XPrefixConGADT       p
+type family XRecConGADT          p
+type family XXConDeclGADTDetails p
 
 {-
 ************************************************************************
@@ -1253,8 +1285,12 @@ type LTyFamInstEqn pass = XRec pass (TyFamInstEqn pass)
 
 -- For details on above see Note [exact print annotations] in GHC.Parser.Annotation
 
--- | Haskell Type Patterns
-type HsTyPats pass = [LHsTypeArg pass]
+-- | HsFamEqnPats represents patterns on the left-hand side of a type instance,
+-- e.g. `type instance F @k (a :: k) = a` has patterns `@k` and `(a :: k)`.
+--
+-- HsFamEqnPats used to be called HsTyPats but it was renamed to avoid confusion
+-- with a different notion of type patterns, see #23657.
+type HsFamEqnPats pass = [LHsTypeArg pass]
 
 {- Note [Family instance declaration binders]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1344,7 +1380,7 @@ data FamEqn pass rhs
        { feqn_ext    :: XCFamEqn pass rhs
        , feqn_tycon  :: LIdP pass
        , feqn_bndrs  :: HsOuterFamEqnTyVarBndrs pass -- ^ Optional quantified type vars
-       , feqn_pats   :: HsTyPats pass
+       , feqn_pats   :: HsFamEqnPats pass
        , feqn_fixity :: LexicalFixity -- ^ Fixity used in the declaration
        , feqn_rhs    :: rhs
        }
@@ -1598,7 +1634,7 @@ data RuleDecl pass
        { rd_ext  :: XHsRule pass
            -- ^ After renamer, free-vars from the LHS and RHS
        , rd_name :: XRec pass RuleName
-           -- ^ Note [Pragma source text] in "GHC.Types.Basic"
+           -- ^ Note [Pragma source text] in "GHC.Types.SourceText"
        , rd_act  :: Activation
        , rd_tyvs :: Maybe [LHsTyVarBndr () (NoGhcTc pass)]
            -- ^ Forall'd type vars

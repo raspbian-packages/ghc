@@ -9,7 +9,7 @@
 -- The 'CoreRule' datatype itself is declared elsewhere.
 module GHC.Core.Rules (
         -- ** Looking up rules
-        lookupRule,
+        lookupRule, matchExprs,
 
         -- ** RuleBase, RuleEnv
         RuleBase, RuleEnv(..), mkRuleEnv, emptyRuleEnv,
@@ -41,13 +41,13 @@ import GHC.Unit.Module.Env
 import GHC.Unit.Module.ModGuts( ModGuts(..) )
 import GHC.Unit.Module.Deps( Dependencies(..) )
 
-import GHC.Driver.Session( DynFlags )
+import GHC.Driver.DynFlags( DynFlags )
 import GHC.Driver.Ppr( showSDoc )
 
 import GHC.Core         -- All of it
 import GHC.Core.Subst
 import GHC.Core.SimpleOpt ( exprIsLambda_maybe )
-import GHC.Core.FVs       ( exprFreeVars, exprsFreeVars, bindFreeVars
+import GHC.Core.FVs       ( exprFreeVars, bindFreeVars
                           , rulesFreeVarsDSet, exprsOrphNames )
 import GHC.Core.Utils     ( exprType, mkTick, mkTicks
                           , stripTicksTopT, stripTicksTopE
@@ -62,7 +62,8 @@ import GHC.Core.Coercion as Coercion
 import GHC.Core.Tidy     ( tidyRules )
 import GHC.Core.Map.Expr ( eqCoreExpr )
 import GHC.Core.Opt.Arity( etaExpandToJoinPointRule )
-import GHC.Core.Opt.OccurAnal ( occurAnalyseExpr )
+import GHC.Core.Make     ( mkCoreLams )
+import GHC.Core.Opt.OccurAnal( occurAnalyseExpr )
 
 import GHC.Tc.Utils.TcType  ( tcSplitTyConApp_maybe )
 import GHC.Builtin.Types    ( anyTypeOfKind )
@@ -83,7 +84,9 @@ import GHC.Types.Basic
 import GHC.Data.FastString
 import GHC.Data.Maybe
 import GHC.Data.Bag
+import GHC.Data.List.SetOps( hasNoDups )
 
+import GHC.Utils.FV( filterFV, fvVarSet )
 import GHC.Utils.Misc as Utils
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
@@ -218,9 +221,9 @@ mkSpecRule :: DynFlags -> Module -> Bool -> Activation -> SDoc
            -> Id -> [CoreBndr] -> [CoreExpr] -> CoreExpr -> CoreRule
 -- Make a specialisation rule, for Specialise or SpecConstr
 mkSpecRule dflags this_mod is_auto inl_act herald fn bndrs args rhs
-  = case isJoinId_maybe fn of
-      Just join_arity -> etaExpandToJoinPointRule join_arity rule
-      Nothing         -> rule
+  = case idJoinPointHood fn of
+      JoinPoint join_arity -> etaExpandToJoinPointRule join_arity rule
+      NotJoinPoint         -> rule
   where
     rule = mkRule this_mod is_auto is_local
                   rule_name
@@ -441,23 +444,39 @@ emptyRuleEnv = RuleEnv { re_local_rules   = emptyNameEnv
 getRules :: RuleEnv -> Id -> [CoreRule]
 -- Given a RuleEnv and an Id, find the visible rules for that Id
 -- See Note [Where rules are found]
-getRules (RuleEnv { re_local_rules   = local_rules
-                  , re_home_rules    = home_rules
-                  , re_eps_rules     = eps_rules
+--
+-- This function is quite heavily used, so it's worth trying to make it efficient
+getRules (RuleEnv { re_local_rules   = local_rule_base
+                  , re_home_rules    = home_rule_base
+                  , re_eps_rules     = eps_rule_base
                   , re_visible_orphs = orphs }) fn
 
   | Just {} <- isDataConId_maybe fn   -- Short cut for data constructor workers
   = []                                -- and wrappers, which never have any rules
 
-  | otherwise
-  = idCoreRules fn          ++
-    get local_rules         ++
-    find_visible home_rules ++
-    find_visible eps_rules
+  | Just export_flag <- isLocalId_maybe fn
+  = -- LocalIds can't have rules in the local_rule_base (used for imported fns)
+    -- nor external packages; but there can (just) be rules in another module
+    -- in the home package, if it is exported
+    case export_flag of
+      NotExported -> idCoreRules fn
+      Exported -> case get home_rule_base of
+          []           -> idCoreRules fn
+          home_rules   -> drop_orphs home_rules ++ idCoreRules fn
 
+  | otherwise
+  = -- This case expression is a fast path, to avoid calling the
+    -- recursive (++) in the common case where there are no rules at all
+    case (get local_rule_base, get home_rule_base, get eps_rule_base) of
+      ([], [], [])                         -> idCoreRules fn
+      (local_rules, home_rules, eps_rules) -> local_rules           ++
+                                              drop_orphs home_rules ++
+                                              drop_orphs eps_rules  ++
+                                              idCoreRules fn
   where
     fn_name = idName fn
-    find_visible rb = filter (ruleIsVisible orphs) (get rb)
+    drop_orphs [] = []  -- Fast path; avoid invoking recursive filter
+    drop_orphs xs = filter (ruleIsVisible orphs) xs
     get rb = lookupNameEnv rb fn_name `orElse` []
 
 ruleIsVisible :: ModuleSet -> CoreRule -> Bool
@@ -586,10 +605,8 @@ isMoreSpecific :: InScopeSet -> CoreRule -> CoreRule -> Bool
 isMoreSpecific _        (BuiltinRule {}) _                = False
 isMoreSpecific _        (Rule {})        (BuiltinRule {}) = True
 isMoreSpecific in_scope (Rule { ru_bndrs = bndrs1, ru_args = args1 })
-                        (Rule { ru_bndrs = bndrs2, ru_args = args2
-                              , ru_name = rule_name2, ru_rhs = rhs2 })
-  = isJust (matchN in_scope_env
-                   rule_name2 bndrs2 args2 args1 rhs2)
+                        (Rule { ru_bndrs = bndrs2, ru_args = args2 })
+  = isJust (matchExprs in_scope_env bndrs2 args2 args1)
   where
    full_in_scope = in_scope `extendInScopeSetList` bndrs1
    in_scope_env  = ISE full_in_scope noUnfoldingFun
@@ -702,15 +719,23 @@ matchN  :: InScopeEnv
 -- trailing ones, returning the result of applying the rule to a prefix
 -- of the actual arguments.
 
-matchN (ISE in_scope id_unf) rule_name tmpl_vars tmpl_es target_es rhs
+matchN ise _rule_name tmpl_vars tmpl_es target_es rhs
+  = do { (bind_wrapper, matched_es) <- matchExprs ise tmpl_vars tmpl_es target_es
+       ; return (bind_wrapper $
+                 mkLams tmpl_vars rhs `mkApps` matched_es) }
+
+matchExprs :: InScopeEnv -> [Var] -> [CoreExpr] -> [CoreExpr]
+           -> Maybe (BindWrapper, [CoreExpr])  -- 1-1 with the [Var]
+matchExprs (ISE in_scope id_unf) tmpl_vars tmpl_es target_es
   = do  { rule_subst <- match_exprs init_menv emptyRuleSubst tmpl_es target_es
         ; let (_, matched_es) = mapAccumL (lookup_tmpl rule_subst)
                                           (mkEmptySubst in_scope) $
                                 tmpl_vars `zip` tmpl_vars1
-              bind_wrapper = rs_binds rule_subst
+
+        ; let bind_wrapper = rs_binds rule_subst
                              -- Floated bindings; see Note [Matching lets]
-       ; return (bind_wrapper $
-                 mkLams tmpl_vars rhs `mkApps` matched_es) }
+
+        ; return (bind_wrapper, matched_es) }
   where
     (init_rn_env, tmpl_vars1) = mapAccumL rnBndrL (mkRnEnv2 in_scope) tmpl_vars
                   -- See Note [Cloning the template binders]
@@ -721,7 +746,7 @@ matchN (ISE in_scope id_unf) rule_name tmpl_vars tmpl_es target_es rhs
                    , rv_unf   = id_unf }
 
     lookup_tmpl :: RuleSubst -> Subst -> (InVar,OutVar) -> (Subst, CoreExpr)
-                   -- Need to return a RuleSubst solely for the benefit of mk_fake_ty
+                   -- Need to return a RuleSubst solely for the benefit of fake_ty
     lookup_tmpl (RS { rs_tv_subst = tv_subst, rs_id_subst = id_subst })
                 tcv_subst (tmpl_var, tmpl_var1)
         | isId tmpl_var1
@@ -750,7 +775,6 @@ matchN (ISE in_scope id_unf) rule_name tmpl_vars tmpl_es target_es rhs
     unbound tmpl_var
        = pprPanic "Template variable unbound in rewrite rule" $
          vcat [ text "Variable:" <+> ppr tmpl_var <+> dcolon <+> ppr (varType tmpl_var)
-              , text "Rule" <+> pprRuleName rule_name
               , text "Rule bndrs:" <+> ppr tmpl_vars
               , text "LHS args:" <+> ppr tmpl_es
               , text "Actual args:" <+> ppr target_es ]
@@ -892,8 +916,13 @@ see `init_menv` in `matchN`.
 -- * The BindWrapper in a RuleSubst are the bindings floated out
 --   from nested matches; see the Let case of match, below
 --
-data RuleSubst = RS { rs_tv_subst :: TvSubstEnv   -- Range is the
-                    , rs_id_subst :: IdSubstEnv   --   template variables
+data RuleSubst = RS { -- Substitution; applied only to the template, not the target
+                      -- Domain is the template variables
+                      -- Range never includes template variables
+                      rs_tv_subst :: TvSubstEnv
+                    , rs_id_subst :: IdSubstEnv
+
+                      -- Floated bindings
                     , rs_binds    :: BindWrapper  -- Floated bindings
                     , rs_bndrs    :: [Var]        -- Variables bound by floated lets
                     }
@@ -937,9 +966,69 @@ where 'co' is non-reflexive, we simply fail.  You might wonder about
 but the Simplifer pushes the casts in an application to to the
 right, if it can, so this doesn't really arise.
 
+Note [Casts in the template]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+This Note concerns `matchTemplateCast`.  Consider the definition
+  f x = e,
+and SpecConstr on call pattern
+  f ((e1,e2) |> co)
+
+The danger is that We'll make a RULE
+   RULE forall a,b,g.  f ((a,b)|> g) = $sf a b g
+   $sf a b g = e[ ((a,b)|> g) / x ]
+
+This requires the rule-matcher to bind the coercion variable `g`.
+That is Very Deeply Suspicious:
+
+* It would be unreasonable to match on a structured coercion in a pattern,
+  such as    RULE   forall g.  f (x |> Sym g) = ...
+  because the strucure of a coercion is arbitrary and may change -- it's their
+  /type/ that matters.
+
+* We considered insisting that in a template, in a cast (e |> co), the the cast
+  `co` is always a /variable/ cv.  That looks a bit more plausible, but #23209
+  (and related tickets) shows that it's very fragile.  For example suppose `e`
+  is a variable `f`, and the simplifier has an unconditional substitution
+     [f :-> g |> co2]
+  Now the rule LHS becomes (f |> (co2 ; cv)); not a coercion variable any more!
+
+In short, it is Very Deeply Suspicious for a rule to quantify over a coercion
+variable.  And SpecConstr no longer does so: see Note [SpecConstr and casts] in
+SpecConstr.
+
+It is, however, OK for a cast to appear in a template.  For example
+    newtype N a = MkN (a,a)    -- Axiom ax:N a :: (a,a) ~R N a
+    f :: N a -> bah
+    RULE forall b x:b y:b. f @b ((x,y) |> (axN @b)) = ...
+
+When matching we can just move these casts to the other side:
+    match (tmpl |> co) tgt  -->   match tmpl (tgt |> sym co)
+See matchTemplateCast.
+
+Wrinkles:
+
+(CT1) We need to be careful about scoping, and to match left-to-right, so that we
+  know the substitution [a :-> b] before we meet (co :: (a,a) ~R N a), and so we
+  can apply that substitition
+
+(CT2) Annoyingly, we still want support one case in which the RULE quantifies
+  over a coercion variable: the dreaded map/coerce RULE.
+  See Note [Getting the map/coerce RULE to work] in GHC.Core.SimpleOpt.
+
+  Since that can happen, matchTemplateCast laboriously checks whether the
+  coercion mentions a template coercion variable; and if so does the Very Deeply
+  Suspicious `match_co` instead.  It works fine for map/coerce, where the
+  coercion is always a variable and will (robustly) remain so.
+
+See also
+* Note [Coercion arguments]
+* Note [Matching coercion variables] in GHC.Core.Unify.
+* Note [Cast swizzling on rule LHSs] in GHC.Core.Opt.Simplify.Utils:
+  sm_cast_swizzle is switched off in the template of a RULE
+
 Note [Coercion arguments]
 ~~~~~~~~~~~~~~~~~~~~~~~~~
-What if we have (f co) in the template, where the 'co' is a coercion
+What if we have (f (Coercion co)) in the template, where the 'co' is a coercion
 argument to f?  Right now we have nothing in place to ensure that a
 coercion /argument/ in the template is a variable.  We really should,
 perhaps by abstracting over that variable.
@@ -949,33 +1038,6 @@ C.f. the treatment of dictionaries in GHC.HsToCore.Binds.decompseRuleLhs.
 For now, though, we simply behave badly, by failing in match_co.
 We really should never rely on matching the structure of a coercion
 (which is just a proof).
-
-Note [Casts in the template]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Consider the definition
-  f x = e,
-and SpecConstr on call pattern
-  f ((e1,e2) |> co)
-
-We'll make a RULE
-   RULE forall a,b,g.  f ((a,b)|> g) = $sf a b g
-   $sf a b g = e[ ((a,b)|> g) / x ]
-
-So here is the invariant:
-
-  In the template, in a cast (e |> co),
-  the cast `co` is always a /variable/.
-
-Matching should bind that variable to an actual coercion, so that we
-can use it in $sf.  So a Cast on the LHS (the template) calls
-match_co, which succeeds when the template cast is a variable -- which
-it always is.  That is why match_co has so few cases.
-
-See also
-* Note [Coercion arguments]
-* Note [Matching coercion variables] in GHC.Core.Unify.
-* Note [Cast swizzling on rule LHSs] in GHC.Core.Opt.Simplify.Utils:
-  sm_cast_swizzle is switched off in the template of a RULE
 -}
 
 ----------------------
@@ -1037,14 +1099,7 @@ match renv subst e1 (Cast e2 co2) mco
     -- This is important: see Note [Cancel reflexive casts]
 
 match renv subst (Cast e1 co1) e2 mco
-  = -- See Note [Casts in the template]
-    do { let co2 = case mco of
-                     MRefl   -> mkRepReflCo (exprType e2)
-                     MCo co2 -> co2
-       ; subst1 <- match_co renv subst co1 co2
-         -- If match_co succeeds, then (exprType e1) = (exprType e2)
-         -- Hence the MRefl in the next line
-       ; match renv subst1 e1 e2 MRefl }
+  = matchTemplateCast renv subst e1 co1 e2 mco
 
 ------------------------ Literals ---------------------
 match _ subst (Lit lit1) (Lit lit2) mco
@@ -1070,6 +1125,165 @@ match renv subst e1 (Var v2) mco  -- Note [Expanding variables]
         -- because of the not-inRnEnvR
 
 ------------------------ Applications ---------------------
+-- See Note [Matching higher order patterns]
+match renv@(RV { rv_tmpls = tmpls, rv_lcl = rn_env })
+      subst  e1@App{} e2
+      MRefl               -- Like the App case we insist on Refl here
+                          -- See Note [Casts in the target]
+  | (Var f, args) <- collectArgs e1
+  , let f' = rnOccL rn_env f   -- See similar rnOccL in match_var
+  , f' `elemVarSet` tmpls                     -- (HOP1)
+  , Just vs2 <- traverse arg_as_lcl_var args  -- (HOP2), (HOP3)
+  , hasNoDups vs2                             -- (HOP4)
+  , not can_decompose_app_instead
+  = match_tmpl_var renv subst f' (mkCoreLams vs2 e2)
+    -- match_tmpl_var checks (HOP5) and (HOP6)
+  where
+    arg_as_lcl_var :: CoreExpr -> Maybe Var
+    arg_as_lcl_var (Var v)
+      | Just v' <- rnOccL_maybe rn_env v
+      , not (v' `elemVarSet` tmpls)  -- rnEnvL contains the template variables
+      = Just (to_target v')          -- to_target: see (W1)
+                                     --   in Note [Matching higher order patterns]
+    arg_as_lcl_var _ = Nothing
+
+    can_decompose_app_instead -- Template (e1 v), target (e2 v), and v # fvs(e2)
+      = case (e1, e2) of      -- See (W2) in Note [Matching higher order patterns]
+           (App _ (Var v1), App f2 (Var v2))
+             -> rnOccL rn_env v1 == rnOccR rn_env v2
+                && not (v2 `elemVarSet` exprFreeVars f2)
+           _ -> False
+
+    ----------------
+    -- to_target: see (W1) in Note [Matching higher order patterns]
+    to_target :: Var -> Var   -- From canonical variable back to target-expr variable
+    to_target v = lookupVarEnv rev_envR v `orElse` v
+
+    rev_envR :: VarEnv Var   -- Inverts rnEnvR: from canonical variable
+                             -- back to target-expr variable
+    rev_envR = nonDetStrictFoldVarEnv_Directly add_one emptyVarEnv (rnEnvR rn_env)
+    add_one uniq var env = extendVarEnv env var (var `setVarUnique` uniq)
+
+{- Note [Matching higher order patterns]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Higher order patterns provide a limited form of higher order matching.
+See GHC Proposal #555
+  https://github.com/ghc-proposals/ghc-proposals/blob/master/proposals/0555-template-patterns.rst
+and #22465 for more details and related work.
+
+Consider the potential match:
+
+   Template: forall f. foo (\x -> f x)
+   Target:             foo (\x -> x*2 + x)
+
+The expression `x*2 + x` in the target is not literally an application of a
+function to the variable `x`, so the simple application rule does not apply.
+However, we can match them modulo beta equivalence with the substitution:
+
+   [f :-> \x -> x*2 + x]
+
+The general problem of higher order matching is tricky to implement, but
+the subproblem which we call /higher order pattern matching/ is sufficient
+for the given example and much easier to implement.
+
+Design:
+
+We start with terminology.
+
+* /Template variables/. The forall'd variables are called the template
+  variables. In the example match above, `f` is a template variable.
+
+* /Local binders/. The local binders of a rule are the variables bound
+  inside the template. In the example match above, `x` is a local binder.
+  Note that local binders can be term variables and type variables.
+
+A /higher order pattern/ (HOP) is a sub-expression of the template,
+of form (f x y z) where:
+
+* (HOP1) f is a template variable
+* (HOP2) x, y, z are local binders (like y in rule "wombat" above; see definitions).
+* (HOP3) The arguments x, y, z are term variables
+* (HOP4) The arguments x, y, z are distinct (no duplicates)
+
+Matching of higher order patterns (HOP-matching). A higher order pattern (f x y z)
+(in the template) matches any target expression e provided:
+
+* (HOP5) The target has the same type as the template
+* (HOP6) No local binder is free in e, other than x, y, z.
+
+If these two condition hold, the higher order pattern (f x y z) matches
+the target expression e, yielding the substitution [f :-> \x y z. e].
+Notice that this substitution is type preserving, and the RHS
+of the substitution has no free local binders.
+
+HOP matching is small enough to be done in-line in the `match` function.
+Two wrinkles:
+
+(W1) Consider the potential match:
+        Template:    forall f. foo (\x -> f x)
+        Target:                foo (\y -> (y, y))
+     During matching we make `x` the canonical variable for the lambdas
+     and then we see:
+        Template:    f x       rnEnvL = []
+        Target:      (y, y)    rnEnvR = [y :-> x]
+     We could bind [f :-> \x. (x,x)], by applying rnEnvR substitution to the target
+     expression.  But that is tiresome (a) because it involves a traversal, and
+     (b) because rnEnvR is a VarEnv Var, and we don't have a substitution function
+     for that.
+
+     So instead, we invert rnEnvR, and apply it to the binders, to get
+     [f :-> \y. (y,y)].  This is done by `to_target` in the HOP-matching case.
+     It takes a little bit of thinking to be sure this will work right in the case
+     of shadowing.  E.g.  Template (\x y. f x y)   Target  (\p p. p*p)
+     Here rnEnvR will be just [p :-> y], so after inversion we'll get
+          [f :-> \x p. p*p]
+     but that is fine.
+
+(W2) This wrinkle concerns the overlp between the new HOP rule and the existing
+     decompose-application rule.  See 3.1 of GHC Proposal #555 for a discussion.
+
+     Consider potential match:
+        Template: forall f.   foo (\x y. Just (f y x))
+        Target:               foo (\p q. Just (h (1+q) p)))
+     During matching we will encounter:
+        Template:    f x y
+        Target:      h (1+q) p    rnEnvR = [p:->x, q:->y]
+     The rnEnvR renaming `[p:->x, q:->y]` is done by the matcher (today) on the fly,
+     to make the bound variables of the template and target "line up".
+     But now we can:
+     * Either use the new HOP rule to succeed with
+          [f :-> \x y. h (1+x) y]
+     * Or use the existing decompose-application rule to match
+          (f x) against (h (1+q)) and `y` against `p`.
+       This will succeed with
+          [f :-> \y. h (1+y)]
+
+     Note that the result of the HOP rule will always be eta-equivalent to
+     the result of the decompose-application rule.  But the proposal specifies
+     that we should use the decompose-application rule because it involves
+     less eta-expansion.
+
+     But take care:
+        Template: forall f.   foo (\x y. Just (f y x))
+        Target:               foo (\p q. Just (h (p+q) p)))
+     Then during matching we will encounter:
+        Template:    f x y
+        Target:      h (p+q) p      rnEnvR = [p:->x, q:->y]
+     Now, we cannot use the decompose-application rule, because p is free in
+     (h (p+q)). So, we can only use the new HOP rule.
+
+(W3) You might wonder if a HOP can have /type/ arguments, thus (in Core)
+        RULE forall h.
+             f (\(MkT @b (d::Num b) (x::b)) -> h @b d x) = ...
+     where the HOP is (h @b d x). In principle this might be possible, but
+     it seems fragile; e.g. we would still need to insist that the (invisible)
+     @b was a type variable.  And since `h` gets a polymoprhic type, that
+     type would have to be declared by the programmer.
+
+     Maybe one day.  But for now, we insist (in `arg_as_lcl_var`)that a HOP
+     has only term-variable arguments.
+-}
+
 -- Note the match on MRefl!  We fail if there is a cast in the target
 --     (e1 e2) ~ (d1 d2) |> co
 -- See Note [Cancel reflexive casts]: in the Cast equations for 'match'
@@ -1108,7 +1322,7 @@ match renv subst (Lam x1 e1) e2 mco
         in_scope_env = ISE in_scope (rv_unf renv)
         -- extendInScopeSetSet: The InScopeSet of rn_env is not necessarily
         -- a superset of the free vars of e2; it is only guaranteed a superset of
-        -- applyng the (rnEnvR rn_env) substitution to e2. But exprIsLambda_maybe
+        -- applying the (rnEnvR rn_env) substitution to e2. But exprIsLambda_maybe
         -- wants an in-scope set that includes all the free vars of its argument.
         -- Hence adding adding (exprFreeVars casted_e2) to the in-scope set (#23630)
   , Just (x2, e2', ts) <- exprIsLambda_maybe in_scope_env casted_e2
@@ -1267,6 +1481,40 @@ Hence
 -}
 
 -------------
+matchTemplateCast
+    :: RuleMatchEnv -> RuleSubst
+    -> CoreExpr -> Coercion
+    -> CoreExpr -> MCoercion
+    -> Maybe RuleSubst
+matchTemplateCast renv subst e1 co1 e2 mco
+  | isEmptyVarSet $ fvVarSet $
+    filterFV (`elemVarSet` rv_tmpls renv) $    -- Check that the coercion does not
+    tyCoFVsOfCo substed_co                     -- mention any of the template variables
+  = -- This is the good path
+    -- See Note [Casts in the template]
+    match renv subst e1 e2 (checkReflexiveMCo (mkTransMCoL mco (mkSymCo substed_co)))
+
+  | otherwise
+  = -- This is the Deeply Suspicious Path
+    do { let co2 = case mco of
+                     MRefl   -> mkRepReflCo (exprType e2)
+                     MCo co2 -> co2
+       ; subst1 <- match_co renv subst co1 co2
+         -- If match_co succeeds, then (exprType e1) = (exprType e2)
+         -- Hence the MRefl in the next line
+       ; match renv subst1 e1 e2 MRefl }
+  where
+    substed_co = substCo current_subst co1
+
+    current_subst :: Subst
+    current_subst = mkTCvSubst (rnInScopeSet (rv_lcl renv))
+                               (rs_tv_subst subst)
+                               emptyCvSubstEnv
+       -- emptyCvSubstEnv: ugh!
+       -- If there were any CoVar substitutions they would be in
+       -- rs_id_subst; but we don't expect there to be any; see
+       -- Note [Casts in the template]
+
 match_co :: RuleMatchEnv
          -> RuleSubst
          -> Coercion
@@ -1378,7 +1626,7 @@ match_tmpl_var renv@(RV { rv_lcl = rn_env, rv_fltR = flt_env })
   -- if the right side of the env is empty.
   | anyInRnEnvR rn_env (exprFreeVars e2)
   = Nothing     -- Skolem-escape failure
-                -- e.g. match forall a. (\x-> a x) against (\y. y y)
+                -- e.g. match forall a. (\x -> a) against (\y -> y)
 
   | Just e1' <- lookupVarEnv id_subst v1'
   = if eqCoreExpr e1' e2'
@@ -1398,6 +1646,7 @@ match_tmpl_var renv@(RV { rv_lcl = rn_env, rv_fltR = flt_env })
          -- because no free var of e2' is in the rnEnvR of the envt
 
 ------------------------------------------
+
 match_ty :: RuleMatchEnv
          -> RuleSubst
          -> Type                -- Template
@@ -1409,12 +1658,13 @@ match_ty :: RuleMatchEnv
 --      newtype T = MkT Int
 -- We only want to replace (f T) with f', not (f Int).
 
-match_ty renv subst ty1 ty2
-  = do  { tv_subst'
-            <- Unify.ruleMatchTyKiX (rv_tmpls renv) (rv_lcl renv) tv_subst ty1 ty2
+match_ty (RV { rv_tmpls = tmpls, rv_lcl = rn_env })
+         subst@(RS { rs_tv_subst = tv_subst })
+         ty1 ty2
+  = do  { tv_subst' <- Unify.ruleMatchTyKiX tmpls rn_env tv_subst ty1 ty2
+               -- NB: ruleMatchTyKiX applis tv_subst to ty1 only
+               --     and of course only binds 'tmpls'
         ; return (subst { rs_tv_subst = tv_subst' }) }
-  where
-    tv_subst = rs_tv_subst subst
 
 {- Note [Matching variable types]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1637,41 +1887,59 @@ ruleCheckProgram ropts phase rule_pat rules binds
           vcat [ p $$ line | p <- bagToList results ]
          ]
   where
+    line = text (replicate 20 '-')
     env = RuleCheckEnv { rc_is_active = isActive phase
                        , rc_id_unf    = idUnfolding     -- Not quite right
                                                         -- Should use activeUnfolding
                        , rc_pattern   = rule_pat
                        , rc_rules     = rules
                        , rc_ropts     = ropts
-                       }
-    results = unionManyBags (map (ruleCheckBind env) binds)
-    line = text (replicate 20 '-')
+                       , rc_in_scope  = emptyInScopeSet }
 
-data RuleCheckEnv = RuleCheckEnv {
-    rc_is_active :: Activation -> Bool,
-    rc_id_unf  :: IdUnfoldingFun,
-    rc_pattern :: String,
-    rc_rules :: Id -> [CoreRule],
-    rc_ropts :: RuleOpts
-}
+    results = go env binds
 
-ruleCheckBind :: RuleCheckEnv -> CoreBind -> Bag SDoc
+    go _   []           = emptyBag
+    go env (bind:binds) = let (env', ds) = ruleCheckBind env bind
+                          in ds `unionBags` go env' binds
+
+data RuleCheckEnv = RuleCheckEnv
+    { rc_is_active :: Activation -> Bool
+    , rc_id_unf    :: IdUnfoldingFun
+    , rc_pattern   :: String
+    , rc_rules     :: Id -> [CoreRule]
+    , rc_ropts     :: RuleOpts
+    , rc_in_scope  :: InScopeSet }
+
+extendInScopeRC :: RuleCheckEnv -> Var -> RuleCheckEnv
+extendInScopeRC env@(RuleCheckEnv { rc_in_scope = in_scope }) v
+  = env { rc_in_scope = in_scope `extendInScopeSet` v }
+
+extendInScopeListRC :: RuleCheckEnv -> [Var] -> RuleCheckEnv
+extendInScopeListRC env@(RuleCheckEnv { rc_in_scope = in_scope }) vs
+  = env { rc_in_scope = in_scope `extendInScopeSetList` vs }
+
+ruleCheckBind :: RuleCheckEnv -> CoreBind -> (RuleCheckEnv, Bag SDoc)
    -- The Bag returned has one SDoc for each call site found
-ruleCheckBind env (NonRec _ r) = ruleCheck env r
-ruleCheckBind env (Rec prs)    = unionManyBags [ruleCheck env r | (_,r) <- prs]
+ruleCheckBind env (NonRec b r) = (env `extendInScopeRC` b, ruleCheck env r)
+ruleCheckBind env (Rec prs)    = (env', unionManyBags (map (ruleCheck env') rhss))
+                               where
+                                 (bs, rhss) = unzip prs
+                                 env' = env `extendInScopeListRC` bs
 
 ruleCheck :: RuleCheckEnv -> CoreExpr -> Bag SDoc
-ruleCheck _   (Var _)       = emptyBag
-ruleCheck _   (Lit _)       = emptyBag
-ruleCheck _   (Type _)      = emptyBag
-ruleCheck _   (Coercion _)  = emptyBag
-ruleCheck env (App f a)     = ruleCheckApp env (App f a) []
-ruleCheck env (Tick _ e)  = ruleCheck env e
-ruleCheck env (Cast e _)    = ruleCheck env e
-ruleCheck env (Let bd e)    = ruleCheckBind env bd `unionBags` ruleCheck env e
-ruleCheck env (Lam _ e)     = ruleCheck env e
-ruleCheck env (Case e _ _ as) = ruleCheck env e `unionBags`
-                                unionManyBags [ruleCheck env r | Alt _ _ r <- as]
+ruleCheck _   (Var _)         = emptyBag
+ruleCheck _   (Lit _)         = emptyBag
+ruleCheck _   (Type _)        = emptyBag
+ruleCheck _   (Coercion _)    = emptyBag
+ruleCheck env (App f a)       = ruleCheckApp env (App f a) []
+ruleCheck env (Tick _ e)      = ruleCheck env e
+ruleCheck env (Cast e _)      = ruleCheck env e
+ruleCheck env (Let bd e)      = let (env', ds) = ruleCheckBind env bd
+                                in  ds `unionBags` ruleCheck env' e
+ruleCheck env (Lam b e)       = ruleCheck (env `extendInScopeRC` b) e
+ruleCheck env (Case e b _ as) = ruleCheck env e `unionBags`
+                                unionManyBags [ruleCheck (env `extendInScopeListRC` (b:bs)) r
+                                              | Alt _ bs r <- as]
 
 ruleCheckApp :: RuleCheckEnv -> Expr CoreBndr -> [Arg CoreBndr] -> Bag SDoc
 ruleCheckApp env (App f a) as = ruleCheck env a `unionBags` ruleCheckApp env f (a:as)
@@ -1695,8 +1963,9 @@ ruleAppCheck_help env fn args rules
     vcat [text "Expression:" <+> ppr (mkApps (Var fn) args),
           vcat (map check_rule rules)]
   where
-    n_args = length args
-    i_args = args `zip` [1::Int ..]
+    in_scope = rc_in_scope env
+    n_args   = length args
+    i_args   = args `zip` [1::Int ..]
     rough_args = map roughTopName args
 
     check_rule rule = rule_herald rule <> colon <+> rule_info (rc_ropts env) rule
@@ -1726,10 +1995,8 @@ ruleAppCheck_help env fn args rules
           mismatches   = [i | (rule_arg, (arg,i)) <- rule_args `zip` i_args,
                               not (isJust (match_fn rule_arg arg))]
 
-          lhs_fvs = exprsFreeVars rule_args     -- Includes template tyvars
           match_fn rule_arg arg = match renv emptyRuleSubst rule_arg arg MRefl
                 where
-                  in_scope = mkInScopeSet (lhs_fvs `unionVarSet` exprFreeVars arg)
                   renv = RV { rv_lcl   = mkRnEnv2 in_scope
                             , rv_tmpls = mkVarSet rule_bndrs
                             , rv_fltR  = mkEmptySubst in_scope

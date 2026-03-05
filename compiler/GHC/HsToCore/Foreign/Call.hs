@@ -42,10 +42,9 @@ import GHC.Builtin.Types
 import GHC.Types.Basic
 import GHC.Types.Literal
 import GHC.Builtin.Names
-import GHC.Driver.Session
+import GHC.Driver.DynFlags
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
-import GHC.Utils.Panic.Plain
 
 import Data.Maybe
 

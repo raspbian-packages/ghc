@@ -228,7 +228,7 @@ eqDeBruijnType env_t1@(D env1 t1) env_t2@(D env2 t2) =
     andEq TEQX e = hasCast e
     andEq TEQ  e = e
 
-    -- See Note [Comparing nullary type synonyms] in GHC.Core.Type
+    -- See Note [Comparing nullary type synonyms] in GHC.Core.TyCo.Compare
     go (D _ (TyConApp tc1 [])) (D _ (TyConApp tc2 []))
       | tc1 == tc2
       = TEQ
@@ -397,7 +397,7 @@ xtTyLit l f m =
     CharTyLit n -> m { tlm_char = Map.alter f n (tlm_char m) }
 
 foldTyLit :: (a -> b -> b) -> TyLitMap a -> b -> b
-foldTyLit l m = flip (foldUFM l) (tlm_string m)
+foldTyLit l m = flip (nonDetFoldUFM l) (tlm_string m)
               . flip (Map.foldr l) (tlm_number m)
               . flip (Map.foldr l) (tlm_char m)
 

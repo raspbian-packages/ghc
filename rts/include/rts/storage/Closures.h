@@ -29,6 +29,7 @@ typedef struct {
   union {
     StgWord trav;             /* Heap traversal */
     StgWord ldvw;             /* Lag/Drag/Void Word */
+    StgWord era;              /* User-era */
   } hp;
     // Heap profiling header. This field is shared among the various heap
     // profiling modes. Currently it is used by ProfHeap.c for Lag/Drag/Void
@@ -211,8 +212,7 @@ typedef struct {
 // An array of heap objects, ie Array# v and MutableArray# v
 //
 // Closure types: MUT_ARR_PTRS_CLEAN, MUT_ARR_PTRS_DIRTY,
-// MUT_ARR_PTRS_FROZEN_DIRTY, MUT_ARR_PTRS_FROZEN_CLEAN, MUT_VAR_CLEAN,
-// MUT_VAR_DIRTY
+// MUT_ARR_PTRS_FROZEN_DIRTY, MUT_ARR_PTRS_FROZEN_CLEAN
 typedef struct _StgMutArrPtrs {
     StgHeader   header;
     StgWord     ptrs;
@@ -262,6 +262,13 @@ typedef struct _StgUpdateFrame {
     StgClosure *updatee;
 } StgUpdateFrame;
 
+// Thunk update frame
+//
+// Closure types: RET_SMALL
+typedef struct _StgOrigThunkInfoFrame {
+    StgHeader  header;
+    StgInfoTable *info_ptr;
+} StgOrigThunkInfoFrame;
 
 // Closure types: RET_SMALL
 typedef struct {

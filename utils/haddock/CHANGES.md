@@ -1,15 +1,28 @@
-## Changes in 2.29.2
- * Revert "Fix #783 Don't show button if --quickjump not present",
-   which broke quickjump functionality.
+## Changes in 2.31.1
 
-## Changes in 2.29.1
- * Fix build on GHC 9.2
+  * Don't warn about missing link destinations for derived names (GHC #26114)
 
-## Changes in 2.29.0
- * Fixes for memory leaks and performance improvements
+  * Document instances from other packages (GHC #25147, #26079)
+
+  * Fix links to type operators (GHC #26032)
+
+  * Fix math parsing after certain characters (GHC #26034)
+
+  * Fix a panic with TypeData and TypeFamilies extensions (GHC #25739)
 
 ## Changes in 2.28.0
- * Support qualified and unqualified names in `--ignore-link-symbol`
+ * `hi-haddock` is integrated, which means docstrings are no longer extracted
+   through typchecked module results. Instead, docstrings are taken from Haskell
+   interface (`.hi`) files.
+
+ * Support qualified and unqualified names in `--ignore-link-symbol`.
+
+ * Add `--trace-args` flag which prints arguments to standard output. This is
+   useful for examining arguments passed when Haddock is invoked through `cabal
+   haddock`, as `cabal` uses temporary response files to pass arguments to
+   Haddock.
+
+ * Avoid recompilation due to changes in optimization flags.
 
 ## Changes in 2.24.0
 

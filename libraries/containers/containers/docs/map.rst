@@ -77,11 +77,11 @@ The following GHCi session shows some of the basic map functionality::
     > fromList [(1,"one"),(2,"two"),(3,"new three"),(4,"newer four")]
 
 .. TIP:: You can use the `OverloadedLists
-	 <https://ghc.haskell.org/trac/ghc/wiki/OverloadedLists>`_ extension so
-	 you don't need to write ``fromList [1, 2, 3]`` everywhere; instead you
-	 can just write ``[1, 2, 3]`` and if the function is expecting a map it
-	 will be converted automatically! The code here will continue to use
-	 ``fromList`` for clarity though.
+	 <https://downloads.haskell.org/ghc/latest/docs/users_guide/exts/overloaded_lists.html>`_
+     extension so you don't need to write ``fromList [1, 2, 3]`` everywhere;
+     instead you can just write ``[1, 2, 3]`` and if the function is
+     expecting a map it will be converted automatically! The code here
+     will continue to use ``fromList`` for clarity though.
 
 
 Importing Map and IntMap
@@ -202,6 +202,10 @@ values with the same key.
     Map.fromListWith (++) [(1, "a"), (1, "b"), (2, "x"), (2, "y")]
     > fromList [(1,"ba"),(2,"yx")]
 
+.. TIP::
+   Read the documentation of :haddock_short:`/Data.Map.Strict#fromListWith`
+   to avoid accidental ``O(n²)`` performance when writing patterns
+   such as ``fromListWith (++)``.
 
 
 Create a list from a map

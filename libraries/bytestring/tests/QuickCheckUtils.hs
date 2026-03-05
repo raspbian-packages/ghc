@@ -1,12 +1,13 @@
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE FlexibleInstances #-}
-{-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE DataKinds #-}
+{-# LANGUAGE UndecidableInstances #-}
 
 module QuickCheckUtils
   ( Char8(..)
   , String8(..)
   , CByteString(..)
   , Sqrt(..)
+  , int64OK
+  , tooStrictErr
   ) where
 
 import Test.Tasty.QuickCheck
@@ -18,6 +19,8 @@ import Data.Word
 import Data.Int
 import System.IO
 import Foreign.C (CChar)
+import GHC.TypeLits (TypeError, ErrorMessage(..))
+import GHC.Stack (withFrozenCallStack, HasCallStack)
 
 import qualified Data.ByteString.Short as SB
 import qualified Data.ByteString      as P
@@ -50,6 +53,8 @@ instance Arbitrary L.ByteString where
                                             vectorOf numChunks
                                                      (sizedByteString
                                                           (n `div` numChunks))
+
+  shrink = map L.fromChunks . shrink . L.toChunks
 
 instance CoArbitrary L.ByteString where
   coarbitrary s = coarbitrary (L.unpack s)
@@ -112,3 +117,26 @@ instance Arbitrary SB.ShortByteString where
 
 instance CoArbitrary SB.ShortByteString where
   coarbitrary s = coarbitrary (SB.unpack s)
+
+-- | This /poison instance/ exists to make accidental mis-use
+-- of the @Arbitrary Int64@ instance a bit less likely.
+instance {-# OVERLAPPING #-}
+  TypeError (Text "Found a test taking a raw Int64 argument."
+    :$$: Text "'instance Arbitrary Int64' by default is likely to"
+    :$$: Text "produce very large numbers after the first few tests,"
+    :$$: Text "which doesn't make great indices into a LazyByteString."
+    :$$: Text "For indices, try 'intToIndexTy' in Properties/ByteString.hs."
+    :$$: Text ""
+    :$$: Text "If very few small-numbers tests is OK, use"
+    :$$: Text "'int64OK' to bypass this poison-instance."
+  ) => Testable (Int64 -> prop) where
+  property = error "poison instance Testable (Int64 -> prop)"
+
+-- | Use this to bypass the poison instance for @Testable (Int64 -> prop)@
+-- defined in "QuickCheckUtils".
+int64OK :: (Arbitrary a, Show a, Testable b) => (a -> b) -> Property
+int64OK f = propertyForAllShrinkShow arbitrary shrink (\v -> [show v]) f
+
+tooStrictErr :: forall a. HasCallStack => a
+tooStrictErr = withFrozenCallStack $
+  error "A lazy sub-expression was unexpectedly evaluated"

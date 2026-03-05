@@ -1,3 +1,119 @@
+[0.12.2.0] — December 2024
+
+* Bug fixes:
+  * [`Builder`: avoid unsound buffer reuse, introduced in `bytestring-0.11.5.0`](https://github.com/haskell/bytestring/pull/691)
+  * [Fix several bugs around the `byteString` family of `Builders`](https://github.com/haskell/bytestring/pull/671)
+  * [Make `Data.ByteString.Lazy.zipWith` properly lazy](https://github.com/haskell/bytestring/pull/668)
+* API additions:
+  * [Add `instance IsList Builder`](https://github.com/haskell/bytestring/pull/672)
+  * [Add `instance NFData BufferRange` and `instance NFData Buffer`](https://github.com/haskell/bytestring/pull/680)
+  * [Export `toLazyByteString` from `Data.ByteString.Builder.Internal`](https://github.com/haskell/bytestring/pull/672)
+* Performance improvements:
+  * [Remove another dead branch from `toStrict`](https://github.com/haskell/bytestring/pull/663)
+* Miscellaneous:
+  * [Remove support for GHC < 8.4](https://github.com/haskell/bytestring/pull/682)
+  * Various documentation improvements ([1](https://github.com/haskell/bytestring/pull/683), [2](https://github.com/haskell/bytestring/pull/692))
+<!--
+* Internal stuff:
+  * Various CI tweaks ([1](https://github.com/haskell/bytestring/pull/670), [2](https://github.com/haskell/bytestring/pull/681), [3](https://github.com/haskell/bytestring/pull/686), [4](https://github.com/haskell/bytestring/pull/656), [5](https://github.com/haskell/bytestring/pull/693), [6](https://github.com/haskell/bytestring/pull/699), [7](https://github.com/haskell/bytestring/pull/700))
+  * [Use `default-extensions` to tidy up a bit](https://github.com/haskell/bytestring/pull/669)
+  * [Remove `includes` from Cabal file](https://github.com/haskell/bytestring/pull/685)
+  * [Improve benchmarks for small `Builders`](https://github.com/haskell/bytestring/pull/680)
+  * [Add a constraint reflecting](https://github.com/haskell/bytestring/pull/698) [#665](https://github.com/haskell/bytestring/issues/665) [to the package description](https://github.com/haskell/bytestring/pull/698)
+-->
+
+[0.12.2.0]: https://github.com/haskell/bytestring/compare/0.12.1.0...0.12.2.0
+
+[0.12.1.0] — February 2024
+
+* [Provisional support has been added for using `bytestring` with GHC's JavaScript back-end.](https://github.com/haskell/bytestring/pull/631)
+  * This support is relatively un-tested and un-optimised. There may be bugs! Please report any you discover to [`bytestring`'s issue tracker](https://github.com/haskell/bytestring/issues).
+  * The JavaScript back-end's limited support for the Haskell-C foreign function interface would previously result in many operations failing with errors like `ReferenceError: h$fps_count is not defined`.
+  * The new `pure-haskell` package flag allows the new fallback Haskell implementations (used to support the JavaScript backend) to be used on most other platforms as well.
+* Bug fixes:
+  * [`stimes 0 sbs :: ShortByteString` now returns the empty `ShortByteString` instead of throwing an exception](https://github.com/haskell/bytestring/pull/611)
+  * [`stimes 0 b :: Builder` now returns the empty `Builder` instead of throwing an exception](https://github.com/haskell/bytestring/pull/611)
+  * [Several alignment-related bug fixes](https://github.com/haskell/bytestring/pull/587)
+  * [Fix a bug in `isValidUtf8`](https://github.com/haskell/bytestring/pull/621)
+  * [`sconcat @ShortByteString` is no longer terribly inefficient](https://github.com/haskell/bytestring/pull/650)
+  * [Fix the type on the foreign import used for `Data.ByteString.Short.elemIndex`](https://github.com/haskell/bytestring/pull/661)
+  * [Ensure that the result of `fromShort` is protected by `mkDeferredByteString`](https://github.com/haskell/bytestring/pull/662)
+* Behavior changes:
+  * [The `Data.Data.Data` instances for `StrictByteString` and `LazyByteString` have been changed:](https://github.com/haskell/bytestring/pull/614)
+    * `toConstr` now returns the a `pack` pseudo-constructor instead of throwing an exception.
+    * Due to this pseudo-constructor, `gunfold` can now be meaningfully used at these types. (Previously, it would always raise an exception.)
+    * These changes allow `syb:Data.Generics.Text.gshow` to be meaningfully used at types containing `ByteString`s.
+  * [A derived `instance Generic ShortByteString` has been added.](https://github.com/haskell/bytestring/pull/662)
+  * [`sconcat @Builder` is now lazy in the tail of its input](https://github.com/haskell/bytestring/pull/650)
+* Deprecations:
+  * [`Data.ByteString.Builder.Prim.Internal.storableToF`](https://github.com/haskell/bytestring/pull/649)
+* Performance improvements:
+  * Various raw-binary `Builder` primitives like `intHost` or `word32BE` are much less inefficient on architectures not known to support unaligned writes. ([1](https://github.com/haskell/bytestring/pull/587), [2](https://github.com/haskell/bytestring/pull/645))
+  * [Hexadecimal encoding suffers one indirection fewer](https://github.com/haskell/bytestring/pull/624)
+  * [`Data.ByteString.Lazy.takeEnd` is somewhat faster](https://github.com/haskell/bytestring/pull/629)
+  * [`Data.ByteString.Lazy.dropEnd` is much faster](https://github.com/haskell/bytestring/pull/629)
+* Miscellaneous:
+  * Various documentation improvements ([1](https://github.com/haskell/bytestring/pull/628), [2](https://github.com/haskell/bytestring/pull/609), [3](https://github.com/haskell/bytestring/pull/612), [4](https://github.com/haskell/bytestring/pull/623), [5](https://github.com/haskell/bytestring/pull/654))
+  * [Eta-expand `Data.ByteString.Builder.Internal.empty`](https://github.com/haskell/bytestring/pull/616)
+    * This can variously help or hurt performance; it undoes the performance changes caused by [CLC proposal 132](https://github.com/haskell/core-libraries-committee/issues/132) with ghc-9.8 and restores the baseline performance seen with older GHCs.
+<!--
+* Internal stuff:
+  * [Delete cabal.project](https://github.com/haskell/bytestring/pull/613)
+  * Remove some non-exposed data declarations from internal modules:
+    * [`Data.ByteString.Short.Internal.BA`](https://github.com/haskell/bytestring/pull/615)
+    * [`Data.ByteString.Short.Internal.MBA`](https://github.com/haskell/bytestring/pull/617)
+  * Various CI tweaks ([1](https://github.com/haskell/bytestring/pull/626), [2](https://github.com/haskell/bytestring/pull/651))
+  * [Use `NonEmpty` to prune dead code in `integerDec`](https://github.com/haskell/bytestring/pull/655)
+    * This might have a performance impact due to result unboxing (CPR).
+  * [Consolidate internal CPP for byte-order/endianness](https://github.com/haskell/bytestring/pull/659)
+  * [Remove remaining uses of FFI under -fpure-haskell](https://github.com/haskell/bytestring/pull/660)
+    * Doesn't warrant a separate visible changelog entry from #631.
+-->
+
+[0.12.1.0]: https://github.com/haskell/bytestring/compare/0.12.0.2...0.12.1.0
+
+[0.12.0.2] — August 2023
+
+* Bug fixes:
+  * [Fix `clockid_t`-related build failures on some platforms](https://github.com/haskell/bytestring/pull/607)
+
+[0.12.0.2]: https://github.com/haskell/bytestring/compare/0.12.0.1...0.12.0.2
+
+[0.12.0.1] — August 2023
+
+* Bug fixes:
+  * [Work around a GHC runtime linker issue on i386/PowerPC](https://github.com/haskell/bytestring/pull/604)
+
+[0.12.0.1]: https://github.com/haskell/bytestring/compare/0.12.0.0...0.12.0.1
+
+[0.12.0.0] — July 2023
+
+* __Breaking Changes__:
+  * [`readInt` returns `Nothing`, if the sequence of digits cannot be represented by an `Int`, instead of overflowing silently](https://github.com/haskell/bytestring/pull/309)
+  * [Remove `zipWith` rewrite rule](https://github.com/haskell/bytestring/pull/387)
+  * [`ShortByteString` is now a wrapper around `Data.Array.Byte.ByteArray` instead of `ByteArray#` directly](https://github.com/haskell/bytestring/pull/410)
+    * As a compatibility measure, `SBS` remains available as a pattern synonym.
+    * The compatibility package `data-array-byte` is used when `base` does not provide `Data.Array.Byte`.
+  * [`fromListN` from `instance IsList ShortByteString` now throws an exception if the first argument does not match the length of the second](https://github.com/haskell/bytestring/pull/410)
+    * Previously, it would ignore the first argument entirely.
+* Bug fixes:
+  * Size-related calculations are more resistant to `Int` overflow in the following places:
+    * [`Data.ByteString.intercalate`](https://github.com/haskell/bytestring/pull/468)
+    * [`stimes @StrictByteString`](https://github.com/haskell/bytestring/pull/443)
+    * [`Data.ByteString.Short.concat`](https://github.com/haskell/bytestring/pull/443)
+    * [`Data.ByteString.Short.append`](https://github.com/haskell/bytestring/pull/443)
+    * [`Data.ByteString.Short.snoc`](https://github.com/haskell/bytestring/pull/599)
+    * [`Data.ByteString.Short.cons`](https://github.com/haskell/bytestring/pull/599)
+* API additions:
+  * [New sized and/or unsigned variants of `readInt` and `readInteger`](https://github.com/haskell/bytestring/pull/438)
+  * [`Data.ByteString.Internal` now provides `SizeOverflowException`, `overflowError`, and `checkedMultiply`](https://github.com/haskell/bytestring/pull/443)
+* Deprecations:
+  * `Data.ByteString.getLine`: prefer `Data.ByteString.Char8.getLine`
+  * `Data.ByteString.hGetLine`: prefer `Data.ByteString.Char8.hGetLine`
+
+
+[0.12.0.0]: https://github.com/haskell/bytestring/compare/0.11.5.0...0.12.0.0
+
 [0.11.5.3] — October 2023
 
 * Bug fixes:

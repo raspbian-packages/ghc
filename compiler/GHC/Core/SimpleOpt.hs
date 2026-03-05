@@ -49,7 +49,6 @@ import GHC.Unit.Module ( Module )
 import GHC.Utils.Encoding
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
-import GHC.Utils.Panic.Plain
 import GHC.Utils.Misc
 import GHC.Data.Maybe       ( orElse )
 import GHC.Data.Graph.UnVar
@@ -263,7 +262,6 @@ simple_opt_expr env expr
 
     go lam@(Lam {})     = go_lam env [] lam
     go (Case e b ty as)
-       -- See Note [Getting the map/coerce RULE to work]
       | isDeadBinder b
       , Just (_, [], con, _tys, es) <- exprIsConApp_maybe in_scope_env e'
         -- We don't need to be concerned about floats when looking for coerce.
@@ -476,7 +474,7 @@ simple_bind_pair env@(SOE { soe_inl = inl_env, soe_subst = subst })
     occ        = idOccInfo in_bndr
     in_scope   = getSubstInScope subst
 
-    out_rhs | Just join_arity <- isJoinId_maybe in_bndr
+    out_rhs | JoinPoint join_arity <- idJoinPointHood in_bndr
             = simple_join_rhs join_arity
             | otherwise
             = simple_opt_clo in_scope clo
@@ -497,13 +495,20 @@ simple_bind_pair env@(SOE { soe_inl = inl_env, soe_subst = subst })
        | otherwise                = True
 
         -- Unconditionally safe to inline
-    safe_to_inline :: OccInfo -> Bool
-    safe_to_inline IAmALoopBreaker{}                  = False
-    safe_to_inline IAmDead                            = True
-    safe_to_inline OneOcc{ occ_in_lam = NotInsideLam
-                         , occ_n_br = 1 }             = True
-    safe_to_inline OneOcc{}                           = False
-    safe_to_inline ManyOccs{}                         = False
+safe_to_inline :: OccInfo -> Bool
+safe_to_inline IAmALoopBreaker{}                  = False
+safe_to_inline IAmDead                            = True
+safe_to_inline OneOcc{ occ_in_lam = NotInsideLam
+                     , occ_n_br = 1 }             = True
+safe_to_inline OneOcc{}                           = False
+safe_to_inline ManyOccs{}                         = False
+
+do_beta_by_substitution :: Id -> CoreExpr -> Bool
+-- True <=> you can inline (bndr = rhs) by substitution
+-- See Note [Exploit occ-info in exprIsConApp_maybe]
+do_beta_by_substitution bndr rhs
+  = exprIsTrivial rhs                   -- Can duplicate
+    || safe_to_inline (idOccInfo bndr)  -- Occurs at most once
 
 -------------------
 simple_out_bind :: TopLevelFlag
@@ -813,35 +818,40 @@ The naive core produced for this is
 
 This matches literal uses of `map coerce` in code, but that's not what we
 want. We want it to match, say, `map MkAge` (where newtype Age = MkAge Int)
-too. Some of this is addressed by compulsorily unfolding coerce on the LHS,
-yielding
+too.  Achieving all this is surprisingly tricky:
 
-  forall a b (dict :: Coercible * a b).
-    map @a @b (\(x :: a) -> case dict of
-      MkCoercible (co :: a ~R# b) -> x |> co) = ...
+(MC1) We must compulsorily unfold MkAge to a cast.
+      See Note [Compulsory newtype unfolding] in GHC.Types.Id.Make
 
-Getting better. But this isn't exactly what gets produced. This is because
-Coercible essentially has ~R# as a superclass, and superclasses get eagerly
-extracted during solving. So we get this:
+(MC2) We must compulsorily unfolding coerce on the rule LHS, yielding
+        forall a b (dict :: Coercible * a b).
+          map @a @b (\(x :: a) -> case dict of
+            MkCoercible (co :: a ~R# b) -> x |> co) = ...
 
-  forall a b (dict :: Coercible * a b).
-    case Coercible_SCSel @* @a @b dict of
-      _ [Dead] -> map @a @b (\(x :: a) -> case dict of
-                               MkCoercible (co :: a ~R# b) -> x |> co) = ...
+  Getting better. But this isn't exactly what gets produced. This is because
+  Coercible essentially has ~R# as a superclass, and superclasses get eagerly
+  extracted during solving. So we get this:
 
-Unfortunately, this still abstracts over a Coercible dictionary. We really
-want it to abstract over the ~R# evidence. So, we have Desugar.unfold_coerce,
-which transforms the above to (see also Note [Desugaring coerce as cast] in
-Desugar)
+    forall a b (dict :: Coercible * a b).
+      case Coercible_SCSel @* @a @b dict of
+        _ [Dead] -> map @a @b (\(x :: a) -> case dict of
+                                 MkCoercible (co :: a ~R# b) -> x |> co) = ...
 
-  forall a b (co :: a ~R# b).
-    let dict = MkCoercible @* @a @b co in
-    case Coercible_SCSel @* @a @b dict of
-      _ [Dead] -> map @a @b (\(x :: a) -> case dict of
-         MkCoercible (co :: a ~R# b) -> x |> co) = let dict = ... in ...
+  Unfortunately, this still abstracts over a Coercible dictionary. We really
+  want it to abstract over the ~R# evidence. So, we have Desugar.unfold_coerce,
+  which transforms the above to
+  Desugar)
 
-Now, we need simpleOptExpr to fix this up. It does so by taking three
-separate actions:
+    forall a b (co :: a ~R# b).
+      let dict = MkCoercible @* @a @b co in
+      case Coercible_SCSel @* @a @b dict of
+        _ [Dead] -> map @a @b (\(x :: a) -> case dict of
+           MkCoercible (co :: a ~R# b) -> x |> co) = let dict = ... in ...
+
+  See Note [Desugaring coerce as cast] in GHC.HsToCore
+
+(MC3) Now, we need simpleOptExpr to fix this up. It does so by taking three
+  separate actions:
   1. Inline certain non-recursive bindings. The choice whether to inline
      is made in simple_bind_pair. Note the rather specific check for
      MkCoercible in there.
@@ -852,6 +862,10 @@ separate actions:
   3. Look for case expressions that unpack something that was
      just packed and inline them. This is also done in simple_opt_expr's
      `go` function.
+
+(MC4) The map/coerce rule is the only compelling reason for having a RULE that
+  quantifies over a coercion variable, something that is otherwise Very Deeply
+  Suspicous.  See Note [Casts in the template] in GHC.Core.Rules. Ugh!
 
 This is all a fair amount of special-purpose hackery, but it's for
 a good cause. And it won't hurt other RULES and such that it comes across.
@@ -1078,6 +1092,45 @@ will happen the next time either.
 
 See test T16254, which checks the behavior of newtypes.
 
+Note [Exploit occ-info in exprIsConApp_maybe]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Suppose (#23159) we have a simple data constructor wrapper like this (this one
+might have come from a data family instance):
+   $WK x y = K x y |> co
+Now suppose the simplifier sees
+   case ($WK e1 e2) |> co2 of
+      K p q ->  case q of ...
+
+`exprIsConApp_maybe` expands the wrapper on the fly
+(see Note [beta-reduction in exprIsConApp_maybe]). It effectively expands
+that ($WK e1 e2) to
+   let x = e1; y = e2 in K x y |> co
+
+So the Simplifier might end up producing this:
+   let x = e1; y = e2
+   in case x of ...
+
+But suppose `q` was used just once in the body of the `K p q` alternative; we
+don't want to wait a whole Simplifier iteration to inline that `x`.  (e1 might
+be another constructor for example.)  This would happen if `exprIsConApp_maybe`
+we created a let for every (non-trivial) argument.  So let's not do that when
+the binder is used just once!
+
+Instead, take advantage of the occurrence-info on `x` and `y` in the unfolding
+of `$WK`.  Since in `$WK` both `x` and `y` occur once, we want to effectively
+expand `($WK e1 e2)` to `(K e1 e2 |> co)`.  Hence in
+`do_beta_by_substitution` we say "yes" if
+
+  (a) the RHS is trivial (so we can duplicate it);
+      see call to `exprIsTrivial`
+or
+  (b) the binder occurs at most once (so there is no worry about duplication);
+      see call to `safe_to_inline`.
+
+To see this in action, look at testsuite/tests/perf/compiler/T15703.  The
+initial Simlifier run takes 5 iterations without (b), but only 3 when we add
+(b).
+
 Note [Don't float join points]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 exprIsConApp_maybe should succeed on
@@ -1228,7 +1281,7 @@ exprIsConApp_maybe ise@(ISE in_scope id_unf) expr
        = go subst floats fun (CC (subst_expr subst arg : args) co)
 
     go subst floats (Lam bndr body) (CC (arg:args) co)
-       | exprIsTrivial arg          -- Don't duplicate stuff!
+       | do_beta_by_substitution bndr arg
        = go (extend subst bndr arg) floats body (CC args co)
        | otherwise
        = let (subst', bndr') = subst_bndr subst bndr

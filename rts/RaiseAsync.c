@@ -8,6 +8,7 @@
 
 #include "rts/PosixSource.h"
 #include "Rts.h"
+#include "RtsFlags.h"
 
 #include "sm/Storage.h"
 #include "Threads.h"
@@ -238,7 +239,7 @@ throwToMsg (Capability *cap, MessageThrowTo *msg)
     goto check_target;
 
 retry:
-    write_barrier();
+    RELEASE_FENCE();
     debugTrace(DEBUG_sched, "throwTo: retrying...");
 
 check_target:
@@ -266,7 +267,7 @@ check_target:
         return THROWTO_BLOCKED;
     }
 
-    status = target->why_blocked;
+    status = ACQUIRE_LOAD(&target->why_blocked);
 
     switch (status) {
     case NotBlocked:
@@ -728,7 +729,7 @@ removeFromQueues(Capability *cap, StgTSO *tso)
   }
 
  done:
-  tso->why_blocked = NotBlocked;
+  RELAXED_STORE(&tso->why_blocked, NotBlocked);
   appendToRunQueue(cap, tso);
 }
 
@@ -874,10 +875,11 @@ raiseAsync(Capability *cap, StgTSO *tso, StgClosure *exception,
                 ap->payload[i] = (StgClosure *)*sp++;
             }
 
-            write_barrier(); // XXX: Necessary?
             SET_HDR(ap,&stg_AP_STACK_info,
                     ((StgClosure *)frame)->header.prof.ccs /* ToDo */);
-            TICK_ALLOC_UP_THK(WDS(words+1),0);
+            // N.B. This will be made visible by updateThunk below, which
+            // implies a release memory barrier.
+            TICK_ALLOC_UP_THK(AP_STACK_sizeW(words),0);
 
             //IF_DEBUG(scheduler,
             //       debugBelch("sched: Updating ");
@@ -927,7 +929,7 @@ raiseAsync(Capability *cap, StgTSO *tso, StgClosure *exception,
             }
 
             SET_HDR(ap,&stg_AP_STACK_NOUPD_info,stack->header.prof.ccs);
-            TICK_ALLOC_SE_THK(WDS(words+1),0);
+            TICK_ALLOC_SE_THK(AP_STACK_sizeW(words),0);
 
             stack->sp = sp;
             threadStackUnderflow(cap,tso);

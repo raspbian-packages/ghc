@@ -29,16 +29,7 @@ void *stgMallocBytes(size_t n, char *msg)
  * See: https://gitlab.haskell.org/ghc/ghc/-/issues/22380
  */
 
-void *stgReallocBytes(void *p, size_t n, char *msg)
-    STG_MALLOC1(stgFree)
-    STG_ALLOC_SIZE1(2)
-    STG_RETURNS_NONNULL;
-/* Note: `stgRallocBytes` can *not* be tagged as `STG_MALLOC`
- * since its return value *can* alias an existing pointer (i.e.,
- * the given pointer `p`).
- * See the documentation of the `malloc` attribute in the GCC manual
- * for more information.
- */
+void *stgReallocBytes(void *p, size_t n, char *msg);
 
 void *stgCallocBytes(size_t count, size_t size, char *msg)
     STG_MALLOC STG_MALLOC1(stgFree)
@@ -70,5 +61,8 @@ void checkFPUStack(void);
 
 #define xstr(s) str(s)
 #define str(s) #s
+
+// Drop the given extension from a filepath.
+void dropExtension(char *path, const char *extension);
 
 #include "EndPrivate.h"

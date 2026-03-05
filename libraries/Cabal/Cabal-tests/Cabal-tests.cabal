@@ -1,7 +1,7 @@
 cabal-version: 2.2
 name:          Cabal-tests
 version:       3
-copyright:     2003-2023, Cabal Development Team (see AUTHORS file)
+copyright:     2003-2024, Cabal Development Team (see AUTHORS file)
 license:       BSD-3-Clause
 license-file:  LICENSE
 author:        Cabal Development Team <cabal-devel@haskell.org>
@@ -18,6 +18,12 @@ source-repository head
   location: https://github.com/haskell/cabal/
   subdir:   Cabal-tests
 
+-- Common utilities which can be used by all tests.
+library
+  hs-source-dirs: lib
+  exposed-modules: Test.Utils.TempTestDir
+  build-depends: base, directory, Cabal, filepath, exceptions
+
 -- Small, fast running tests.
 test-suite unit-tests
   type:             exitcode-stdio-1.0
@@ -29,6 +35,7 @@ test-suite unit-tests
     UnitTests.Distribution.Compat.Graph
     UnitTests.Distribution.Compat.Time
     UnitTests.Distribution.Described
+    UnitTests.Distribution.PackageDescription.Check
     UnitTests.Distribution.PkgconfigVersion
     UnitTests.Distribution.Simple.Command
     UnitTests.Distribution.Simple.Glob
@@ -51,13 +58,14 @@ test-suite unit-tests
   build-depends:
       array
     , async               >=2.2.2 && <2.3
-    , base                >=4.9     && <5
+    , base                >=4.11    && <5
     , binary
     , bytestring
     , Cabal
     , Cabal-described
     , Cabal-syntax
     , Cabal-QuickCheck
+    , Cabal-tests
     , containers
     , deepseq
     , Diff                >=0.4   && <0.6
@@ -70,7 +78,7 @@ test-suite unit-tests
     , tagged
     , tasty               >=1.2.3 && <1.6
     , tasty-hunit
-    , tasty-quickcheck
+    , tasty-quickcheck    <0.11
     , temporary
     , text
     , transformers
@@ -180,7 +188,7 @@ test-suite rpmvercmp
       QuickCheck
     , tasty             >=1.2.3 && <1.6
     , tasty-hunit
-    , tasty-quickcheck
+    , tasty-quickcheck  <0.11
 
   c-sources:        tests/cbits/rpmvercmp.c
   cc-options:       -Wall

@@ -8,8 +8,10 @@ import GHC.Prelude
 
 import GHC.Core (CoreRule, CoreExpr, RuleName)
 import GHC.Core.DataCon
+import GHC.Core.ConLike
 import GHC.Core.Type
-import GHC.Driver.Session
+import GHC.Driver.DynFlags (DynFlags, xopt)
+import GHC.Driver.Flags (WarningFlag)
 import GHC.Hs
 import GHC.HsToCore.Pmc.Solver.Types
 import GHC.Types.Basic (Activation)
@@ -29,7 +31,7 @@ type MaxPmCheckModels = Int
 -- | Diagnostics messages emitted during desugaring.
 data DsMessage
   -- | Simply wraps a generic 'Diagnostic' message.
-  = DsUnknownMessage UnknownDiagnostic
+  = DsUnknownMessage (UnknownDiagnostic (DiagnosticOpts DsMessage))
 
     {-| DsEmptyEnumeration is a warning (controlled by the -Wempty-enumerations flag) that is
         emitted if an enumeration is empty.
@@ -84,18 +86,18 @@ data DsMessage
 
   -- FIXME(adn) Use a proper type instead of 'SDoc', but unfortunately
   -- 'SrcInfo' gives us an 'SDoc' to begin with.
-  | DsRedundantBangPatterns !(HsMatchContext GhcRn) !SDoc
+  | DsRedundantBangPatterns !HsMatchContextRn !SDoc
 
   -- FIXME(adn) Use a proper type instead of 'SDoc', but unfortunately
   -- 'SrcInfo' gives us an 'SDoc' to begin with.
-  | DsOverlappingPatterns !(HsMatchContext GhcRn) !SDoc
+  | DsOverlappingPatterns !HsMatchContextRn !SDoc
 
   -- FIXME(adn) Use a proper type instead of 'SDoc'
-  | DsInaccessibleRhs !(HsMatchContext GhcRn) !SDoc
+  | DsInaccessibleRhs !HsMatchContextRn !SDoc
 
   | DsMaxPmCheckModelsReached !MaxPmCheckModels
 
-  | DsNonExhaustivePatterns !(HsMatchContext GhcRn)
+  | DsNonExhaustivePatterns !HsMatchContextRn
                             !ExhaustivityCheckType
                             !MaxUncoveredPatterns
                             [Id]
@@ -146,6 +148,23 @@ data DsMessage
                                 !RuleName -- the \"bad\" rule
                                 !Var
 
+  {-| DsIncompleteRecordSelector is a warning triggered when we are not certain whether
+      a record selector application will be successful. Currently, this means that
+      the warning is triggered when there is a record selector of a data type that
+      does not have that field in all its constructors.
+
+      Example(s):
+      data T = T1 | T2 {x :: Bool}
+      f :: T -> Bool
+      f a = x a
+
+     Test cases:
+       DsIncompleteRecSel1
+       DsIncompleteRecSel2
+       DsIncompleteRecSel3
+  -}
+  | DsIncompleteRecordSelector !Name ![ConLike] !Bool
+
   deriving Generic
 
 -- The positional number of the argument for an expression (first, second, third, etc)
@@ -154,7 +173,7 @@ newtype DsArgNum = DsArgNum Int
 -- | Why TemplateHaskell rejected the splice. Used in the 'DsNotYetHandledByTH'
 -- constructor of a 'DsMessage'.
 data ThRejectionReason
-  = ThAmbiguousRecordUpdates !(HsRecUpdField GhcRn)
+  = ThAmbiguousRecordUpdates !(HsRecUpdField GhcRn GhcRn)
   | ThAbstractClosedTypeFamily !(LFamilyDecl GhcRn)
   | ThForeignLabel !CLabelString
   | ThForeignExport !(LForeignDecl GhcRn)

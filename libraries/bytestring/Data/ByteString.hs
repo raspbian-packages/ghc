@@ -1,11 +1,6 @@
-{-# OPTIONS_HADDOCK prune #-}
 {-# LANGUAGE Trustworthy #-}
 
-{-# LANGUAGE BangPatterns #-}
-{-# LANGUAGE MagicHash #-}
-{-# LANGUAGE NamedFieldPuns #-}
-{-# LANGUAGE TupleSections #-}
-{-# LANGUAGE TypeApplications #-}
+{-# OPTIONS_HADDOCK prune #-}
 
 -- |
 -- Module      : Data.ByteString
@@ -46,6 +41,22 @@ module Data.ByteString (
         -- * Strict @ByteString@
         ByteString,
         StrictByteString,
+
+        -- ** Heap fragmentation
+        -- | With GHC, the 'ByteString' representation uses /pinned memory/,
+        -- meaning it cannot be moved by GC. While this is ideal for use with
+        -- the foreign function interface and is usually efficient, this
+        -- representation may lead to issues with heap fragmentation and wasted
+        -- space if the program selectively retains a fraction of many small
+        -- 'ByteString's, keeping them live in memory over long durations.
+        --
+        -- While 'ByteString' is indispensable when working with large blobs of
+        -- data and especially when interfacing with native C libraries, be sure
+        -- to also check the 'Data.ByteString.Short.ShortByteString' type.
+        -- As a type backed by /unpinned/ memory, @ShortByteString@ behaves
+        -- similarly to @Text@ (from the @text@ package) on the heap, completely
+        -- avoids fragmentation issues, and in many use-cases may better suit
+        -- your bytestring-storage needs.
 
         -- * Introducing and eliminating 'ByteString's
         empty,
@@ -248,7 +259,6 @@ import Control.Exception        (IOException, catch, finally, assert, throwIO)
 import Control.Monad            (when)
 
 import Foreign.C.String         (CString, CStringLen)
-import Foreign.C.Types          (CSize (CSize), CInt (CInt))
 import Foreign.ForeignPtr       (ForeignPtr, touchForeignPtr)
 import Foreign.ForeignPtr.Unsafe(unsafeForeignPtrToPtr)
 import Foreign.Marshal.Alloc    (allocaBytes)
@@ -380,16 +390,16 @@ infixl 5 `snoc`
 -- | /O(n)/ 'cons' is analogous to (:) for lists, but of different
 -- complexity, as it requires making a copy.
 cons :: Word8 -> ByteString -> ByteString
-cons c (BS x l) = unsafeCreateFp (l+1) $ \p -> do
+cons c (BS x len) = unsafeCreateFp (checkedAdd "cons" len 1) $ \p -> do
         pokeFp p c
-        memcpyFp (p `plusForeignPtr` 1) x l
+        memcpyFp (p `plusForeignPtr` 1) x len
 {-# INLINE cons #-}
 
 -- | /O(n)/ Append a byte to the end of a 'ByteString'
 snoc :: ByteString -> Word8 -> ByteString
-snoc (BS x l) c = unsafeCreateFp (l+1) $ \p -> do
-        memcpyFp p x l
-        pokeFp (p `plusForeignPtr` l) c
+snoc (BS x len) c = unsafeCreateFp (checkedAdd "snoc" len 1) $ \p -> do
+        memcpyFp p x len
+        pokeFp (p `plusForeignPtr` len) c
 {-# INLINE snoc #-}
 
 -- | /O(1)/ Extract the first element of a ByteString, which must be non-empty.
@@ -773,7 +783,7 @@ scanl
     -- ^ input of length n
     -> ByteString
     -- ^ output of length n+1
-scanl f v = \(BS a len) -> unsafeCreateFp (len+1) $ \q -> do
+scanl f v = \(BS a len) -> unsafeCreateFp (checkedAdd "scanl" len 1) $ \q -> do
          -- see fold inlining
         pokeFp q v
         let
@@ -817,7 +827,7 @@ scanr
     -- ^ input of length n
     -> ByteString
     -- ^ output of length n+1
-scanr f v = \(BS a len) -> unsafeCreateFp (len+1) $ \b -> do
+scanr f v = \(BS a len) -> unsafeCreateFp (checkedAdd "scanr" len 1) $ \b -> do
          -- see fold inlining
         pokeFpByteOff b len v
         let
@@ -1062,7 +1072,7 @@ breakByte c p = case elemIndex c p of
 -- | Returns the longest (possibly empty) suffix of elements which __do not__
 -- satisfy the predicate and the remainder of the string.
 --
--- 'breakEnd' @p@ is equivalent to @'spanEnd' (not . p)@ and to @('takeWhileEnd' (not . p) &&& 'dropWhileEnd' (not . p))@.
+-- 'breakEnd' @p@ is equivalent to @'spanEnd' (not . p)@ and to @('dropWhileEnd' (not . p) &&& 'takeWhileEnd' (not . p))@.
 --
 breakEnd :: (Word8 -> Bool) -> ByteString -> (ByteString, ByteString)
 breakEnd  p ps = splitAt (findFromEndUntil p ps) ps
@@ -1107,7 +1117,7 @@ spanByte c ps@(BS x l) =
 -- | Returns the longest (possibly empty) suffix of elements
 -- satisfying the predicate and the remainder of the string.
 --
--- 'spanEnd' @p@ is equivalent to @'breakEnd' (not . p)@ and to @('takeWhileEnd' p &&& 'dropWhileEnd' p)@.
+-- 'spanEnd' @p@ is equivalent to @'breakEnd' (not . p)@ and to @('dropWhileEnd' p &&& 'takeWhileEnd' p)@.
 --
 -- We have
 --
@@ -1228,8 +1238,9 @@ intercalate (BS sepPtr sepLen) (BS hPtr hLen : t) =
             go (destPtr' `plusForeignPtr` chunkLen) chunks
       go (dstPtr0 `plusForeignPtr` hLen) t
   where
-  totalLen = List.foldl' (\acc (BS _ chunkLen) -> acc + chunkLen + sepLen) hLen t
-{-# INLINE intercalate #-}
+  totalLen = List.foldl' (\acc chunk -> acc +! sepLen +! length chunk) hLen t
+  (+!) = checkedAdd "intercalate"
+{-# INLINABLE intercalate #-}
 
 -- ---------------------------------------------------------------------
 -- Indexing ByteStrings
@@ -1545,17 +1556,6 @@ isValidUtf8 (BS ptr len) = accursedUnutterablePerformIO $ unsafeWithForeignPtr p
      else cIsValidUtf8Safe p (fromIntegral len)
   pure $ i /= 0
 
--- We import bytestring_is_valid_utf8 both unsafe and safe. For small inputs
--- we can use the unsafe version to get a bit more performance, but for large
--- inputs the safe version should be used to avoid GC synchronization pauses
--- in multithreaded contexts.
-
-foreign import ccall unsafe "bytestring_is_valid_utf8" cIsValidUtf8
-  :: Ptr Word8 -> CSize -> IO CInt
-
-foreign import ccall safe "bytestring_is_valid_utf8" cIsValidUtf8Safe
-  :: Ptr Word8 -> CSize -> IO CInt
-
 -- | Break a string on a substring, returning a pair of the part of the
 -- string prior to the match, and the rest of the string.
 --
@@ -1680,11 +1680,6 @@ packZipWith f (BS a l) (BS b m) = unsafeDupablePerformIO $
     len = min l m
 {-# INLINE packZipWith #-}
 
-{-# RULES
-"ByteString specialise zipWith" forall (f :: Word8 -> Word8 -> Word8) p q .
-    zipWith f p q = unpack (packZipWith f p q)
-  #-}
-
 -- | /O(n)/ 'unzip' transforms a list of pairs of bytes into a pair of
 -- ByteStrings. Note that this performs two 'pack' operations.
 unzip :: [(Word8,Word8)] -> (ByteString,ByteString)
@@ -1785,9 +1780,13 @@ useAsCString (BS fp l) action =
     pokeByteOff buf l (0::Word8)
     action (castPtr buf)
 
--- | /O(n) construction/ Use a @ByteString@ with a function requiring a @CStringLen@.
--- As for @useAsCString@ this function makes a copy of the original @ByteString@.
+-- | /O(n) construction/ Use a @ByteString@ with a function requiring a 'CStringLen'.
+-- As for 'useAsCString' this function makes a copy of the original @ByteString@.
 -- It must not be stored or used after the subcomputation finishes.
+--
+-- Beware that this function is not required to add a terminating @\NUL@ byte at the end of the 'CStringLen' it provides.
+-- If you need to construct a pointer to a null-terminated sequence, use 'useAsCString'
+-- (and measure length independently if desired).
 useAsCStringLen :: ByteString -> (CStringLen -> IO a) -> IO a
 useAsCStringLen p@(BS _ l) f = useAsCString p $ \cstr -> f (cstr,l)
 
@@ -1830,8 +1829,11 @@ copy (BS x l) = unsafeCreateFp l $ \p -> memcpyFp p x l
 getLine :: IO ByteString
 getLine = hGetLine stdin
 
--- | Read a line from a handle
+{-# DEPRECATED getLine
+     "Deprecated since @bytestring-0.12@. Use 'Data.ByteString.Char8.getLine' instead. (Functions that rely on ASCII encodings belong in \"Data.ByteString.Char8\")"
+  #-}
 
+-- | Read a line from a handle
 hGetLine :: Handle -> IO ByteString
 hGetLine h =
   wantReadableHandle_ "Data.ByteString.hGetLine" h $
@@ -1877,6 +1879,10 @@ hGetLine h =
             if c == fromIntegral (ord '\n')
                 then return r -- NB. not r+1: don't include the '\n'
                 else findEOL (r+1) w raw
+
+{-# DEPRECATED hGetLine
+     "Deprecated since @bytestring-0.12@. Use 'Data.ByteString.Char8.hGetLine' instead. (Functions that rely on ASCII encodings belong in \"Data.ByteString.Char8\")"
+  #-}
 
 mkPS :: RawBuffer Word8 -> Int -> Int -> IO ByteString
 mkPS buf start end =

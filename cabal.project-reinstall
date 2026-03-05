@@ -24,11 +24,11 @@ packages: ./compiler
           ./libraries/directory
           ./libraries/hpc
           -- ./libraries/integer-gmp
-          ./libraries/libiserv/
           ./libraries/mtl/
           ./libraries/parsec/
           -- ./libraries/pretty/
           ./libraries/process/
+          ./libraries/semaphore-compat
           ./libraries/stm
           -- ./libraries/template-haskell/
           ./libraries/terminfo/

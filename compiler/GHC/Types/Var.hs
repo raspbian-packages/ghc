@@ -5,9 +5,9 @@
 \section{@Vars@: Variables}
 -}
 
-{-# LANGUAGE FlexibleContexts, MultiWayIf, FlexibleInstances, DeriveDataTypeable,
-             PatternSynonyms, BangPatterns #-}
+{-# LANGUAGE MultiWayIf, PatternSynonyms #-}
 {-# OPTIONS_GHC -Wno-incomplete-record-updates #-}
+{-# LANGUAGE DeriveFunctor #-}
 
 -- |
 -- #name_types#
@@ -61,7 +61,7 @@ module GHC.Types.Var (
 
         -- ** Predicates
         isId, isTyVar, isTcTyVar,
-        isLocalVar, isLocalId, isCoVar, isNonCoVarId, isTyCoVar,
+        isLocalVar, isLocalId, isLocalId_maybe, isCoVar, isNonCoVarId, isTyCoVar,
         isGlobalId, isExportedId,
         mustHaveLocalBinding,
 
@@ -69,6 +69,8 @@ module GHC.Types.Var (
         ForAllTyFlag(Invisible,Required,Specified,Inferred),
         Specificity(..),
         isVisibleForAllTyFlag, isInvisibleForAllTyFlag, isInferredForAllTyFlag,
+        isSpecifiedForAllTyFlag,
+        coreTyLamForAllTyFlag,
 
         -- * FunTyFlag
         FunTyFlag(..), isVisibleFunArg, isInvisibleFunArg, isFUNArg,
@@ -90,9 +92,12 @@ module GHC.Types.Var (
         binderVar, binderVars, binderFlag, binderFlags, binderType,
         mkForAllTyBinder, mkForAllTyBinders,
         mkTyVarBinder, mkTyVarBinders,
-        isTyVarBinder,
+        isVisibleForAllTyBinder, isInvisibleForAllTyBinder, isTyVarBinder,
         tyVarSpecToBinder, tyVarSpecToBinders, tyVarReqToBinder, tyVarReqToBinders,
         mapVarBndr, mapVarBndrs,
+
+        -- ** ExportFlag
+        ExportFlag(..),
 
         -- ** Constructing TyVar's
         mkTyVar, mkTcTyVar,
@@ -117,15 +122,15 @@ import {-# SOURCE #-}   GHC.Types.Id.Info( IdDetails, IdInfo, coVarDetails, isCo
 import {-# SOURCE #-}   GHC.Builtin.Types ( manyDataConTy )
 import GHC.Types.Name hiding (varName)
 import GHC.Types.Unique ( Uniquable, Unique, getKey, getUnique
-                        , mkUniqueGrimily, nonDetCmpUnique )
+                        , nonDetCmpUnique )
 import GHC.Types.Basic( TypeOrConstraint(..) )
 import GHC.Utils.Misc
 import GHC.Utils.Binary
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
-import GHC.Utils.Panic.Plain
 
 import Data.Data
+import Control.DeepSeq
 
 {-
 ************************************************************************
@@ -247,7 +252,7 @@ data Var
   = TyVar {  -- Type and kind variables
              -- see Note [Kind and type variables]
         varName    :: !Name,
-        realUnique :: {-# UNPACK #-} !Int,
+        realUnique :: {-# UNPACK #-} !Unique,
                                      -- ^ Key for fast comparison
                                      -- Identical to the Unique in the name,
                                      -- cached here for speed
@@ -258,14 +263,14 @@ data Var
                                         -- Used for kind variables during
                                         -- inference, as well
         varName        :: !Name,
-        realUnique     :: {-# UNPACK #-} !Int,
+        realUnique     :: {-# UNPACK #-} !Unique,
         varType        :: Kind,
         tc_tv_details  :: TcTyVarDetails
   }
 
   | Id {
         varName    :: !Name,
-        realUnique :: {-# UNPACK #-} !Int,
+        realUnique :: {-# UNPACK #-} !Unique,
         varType    :: Type,
         varMult    :: Mult,             -- See Note [Multiplicity of let binders]
         idScope    :: IdScope,
@@ -317,7 +322,10 @@ A LocalId is
   * or defined at top level in the module being compiled
   * always treated as a candidate by the free-variable finder
 
-After CoreTidy, top-level LocalIds are turned into GlobalIds
+In the output of CoreTidy, top level Ids are all GlobalIds, which are then
+serialised into interface files. Do note however that CorePrep may introduce new
+LocalIds for local floats (even at the top level). These will be visible in STG
+and end up in generated code.
 
 Note [Multiplicity of let binders]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -374,10 +382,10 @@ instance Eq Var where
     a == b = realUnique a == realUnique b
 
 instance Ord Var where
-    a <= b = realUnique a <= realUnique b
-    a <  b = realUnique a <  realUnique b
-    a >= b = realUnique a >= realUnique b
-    a >  b = realUnique a >  realUnique b
+    a <= b = getKey (realUnique a) <= getKey (realUnique b)
+    a <  b = getKey (realUnique a) <  getKey (realUnique b)
+    a >= b = getKey (realUnique a) >= getKey (realUnique b)
+    a >  b = getKey (realUnique a) >  getKey (realUnique b)
     a `compare` b = a `nonDetCmpVar` b
 
 -- | Compare Vars by their Uniques.
@@ -397,7 +405,7 @@ instance HasOccName Var where
   occName = nameOccName . varName
 
 varUnique :: Var -> Unique
-varUnique var = mkUniqueGrimily (realUnique var)
+varUnique var = realUnique var
 
 varMultMaybe :: Id -> Maybe Mult
 varMultMaybe (Id { varMult = mult }) = Just mult
@@ -405,12 +413,12 @@ varMultMaybe _ = Nothing
 
 setVarUnique :: Var -> Unique -> Var
 setVarUnique var uniq
-  = var { realUnique = getKey uniq,
+  = var { realUnique = uniq,
           varName = setNameUnique (varName var) uniq }
 
 setVarName :: Var -> Name -> Var
 setVarName var new_name
-  = var { realUnique = getKey (getUnique new_name),
+  = var { realUnique = getUnique new_name,
           varName = new_name }
 
 setVarType :: Var -> Type -> Var
@@ -453,7 +461,7 @@ updateVarTypeM upd var
 -- permitted by request ('Specified') (visible type application), or
 -- prohibited entirely from appearing in source Haskell ('Inferred')?
 -- See Note [VarBndrs, ForAllTyBinders, TyConBinders, and visibility] in "GHC.Core.TyCo.Rep"
-data ForAllTyFlag = Invisible Specificity
+data ForAllTyFlag = Invisible !Specificity
                   | Required
   deriving (Eq, Ord, Data)
   -- (<) on ForAllTyFlag means "is less visible than"
@@ -487,6 +495,17 @@ isInferredForAllTyFlag :: ForAllTyFlag -> Bool
 isInferredForAllTyFlag (Invisible InferredSpec) = True
 isInferredForAllTyFlag _                        = False
 
+isSpecifiedForAllTyFlag :: ForAllTyFlag -> Bool
+-- More restrictive than isInvisibleForAllTyFlag
+isSpecifiedForAllTyFlag (Invisible SpecifiedSpec) = True
+isSpecifiedForAllTyFlag _                         = False
+
+coreTyLamForAllTyFlag :: ForAllTyFlag
+-- ^ The ForAllTyFlag on a (Lam a e) term, where `a` is a type variable.
+-- If you want other ForAllTyFlag, use a cast.
+-- See Note [Required foralls in Core] in GHC.Core.TyCo.Rep
+coreTyLamForAllTyFlag = Specified
+
 instance Outputable ForAllTyFlag where
   ppr Required  = text "[req]"
   ppr Specified = text "[spec]"
@@ -513,6 +532,13 @@ instance Binary ForAllTyFlag where
       0 -> return Required
       1 -> return Specified
       _ -> return Inferred
+
+instance NFData Specificity where
+  rnf SpecifiedSpec = ()
+  rnf InferredSpec = ()
+instance NFData ForAllTyFlag where
+  rnf (Invisible spec) = rnf spec
+  rnf Required = ()
 
 {- *********************************************************************
 *                                                                      *
@@ -687,10 +713,6 @@ Currently there are nine different uses of 'VarBndr':
 * TyCon.TyConBinder = VarBndr TyVar TyConBndrVis
   Binders of a TyCon; see TyCon in GHC.Core.TyCon
 
-* TyCon.TyConPiTyBinder = VarBndr TyCoVar TyConBndrVis
-  Binders of a PromotedDataCon
-  See Note [Promoted GADT data constructors] in GHC.Core.TyCon
-
 * IfaceType.IfaceForAllBndr     = VarBndr IfaceBndr ForAllTyFlag
 * IfaceType.IfaceForAllSpecBndr = VarBndr IfaceBndr Specificity
 * IfaceType.IfaceTyConBinder    = VarBndr IfaceBndr TyConBndrVis
@@ -708,8 +730,8 @@ data VarBndr var argf = Bndr var argf
 --
 -- A 'TyVarBinder' is a binder with only TyVar
 type ForAllTyBinder = VarBndr TyCoVar ForAllTyFlag
-type InvisTyBinder  = VarBndr TyCoVar   Specificity
-type ReqTyBinder    = VarBndr TyCoVar   ()
+type InvisTyBinder  = VarBndr TyCoVar Specificity
+type ReqTyBinder    = VarBndr TyCoVar ()
 
 type TyVarBinder    = VarBndr TyVar   ForAllTyFlag
 type InvisTVBinder  = VarBndr TyVar   Specificity
@@ -726,6 +748,12 @@ tyVarReqToBinders = map tyVarReqToBinder
 
 tyVarReqToBinder :: VarBndr a () -> VarBndr a ForAllTyFlag
 tyVarReqToBinder (Bndr tv _) = Bndr tv Required
+
+isVisibleForAllTyBinder :: ForAllTyBinder -> Bool
+isVisibleForAllTyBinder (Bndr _ vis) = isVisibleForAllTyFlag vis
+
+isInvisibleForAllTyBinder :: ForAllTyBinder -> Bool
+isInvisibleForAllTyBinder (Bndr _ vis) = isInvisibleForAllTyFlag vis
 
 binderVar :: VarBndr tv argf -> tv
 binderVar (Bndr v _) = v
@@ -892,7 +920,7 @@ Wrinkles
 
 
 Note [VarBndrs, ForAllTyBinders, TyConBinders, and visibility]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 * A ForAllTy (used for both types and kinds) contains a ForAllTyBinder.
   Each ForAllTyBinder
       Bndr a tvis
@@ -915,8 +943,7 @@ This table summarises the visibility rules:
 |  tvis = Inferred:            f :: forall {a}. type    Arg not allowed:  f
                                f :: forall {co}. type   Arg not allowed:  f
 |  tvis = Specified:           f :: forall a. type      Arg optional:     f  or  f @Int
-|  tvis = Required:            T :: forall k -> type    Arg required:     T *
-|    This last form is illegal in terms: See Note [No Required PiTyBinder in terms]
+|  tvis = Required:            f :: forall k -> type    Arg required:     f (type Int)
 |
 | Bndr k cvis :: TyConBinder, in the TyConBinders of a TyCon
 |  cvis :: TyConBndrVis
@@ -947,22 +974,28 @@ This table summarises the visibility rules:
      f3 :: forall a. a -> a; f3 x = x
   So f3 gets the type f3 :: forall a. a -> a, with 'a' Specified
 
+* Required.  Function defn, with signature (explicit forall):
+     f4 :: forall a -> a -> a; f4 (type _) x = x
+  So f4 gets the type f4 :: forall a -> a -> a, with 'a' Required
+  This is the experimental RequiredTypeArguments extension,
+  see GHC Proposal #281 "Visible forall in types of terms"
+
 * Inferred.  Function defn, with signature (explicit forall), marked as inferred:
-     f4 :: forall {a}. a -> a; f4 x = x
-  So f4 gets the type f4 :: forall {a}. a -> a, with 'a' Inferred
+     f5 :: forall {a}. a -> a; f5 x = x
+  So f5 gets the type f5 :: forall {a}. a -> a, with 'a' Inferred
   It's Inferred because the user marked it as such, even though it does appear
-  in the user-written signature for f4
+  in the user-written signature for f5
 
 * Inferred/Specified.  Function signature with inferred kind polymorphism.
-     f5 :: a b -> Int
-  So 'f5' gets the type f5 :: forall {k} (a:k->*) (b:k). a b -> Int
+     f6 :: a b -> Int
+  So 'f6' gets the type f6 :: forall {k} (a :: k -> Type) (b :: k). a b -> Int
   Here 'k' is Inferred (it's not mentioned in the type),
   but 'a' and 'b' are Specified.
 
 * Specified.  Function signature with explicit kind polymorphism
-     f6 :: a (b :: k) -> Int
+     f7 :: a (b :: k) -> Int
   This time 'k' is Specified, because it is mentioned explicitly,
-  so we get f6 :: forall (k:*) (a:k->*) (b:k). a b -> Int
+  so we get f7 :: forall (k :: Type) (a :: k -> Type) (b :: k). a b -> Int
 
 * Similarly pattern synonyms:
   Inferred - from inferred types (e.g. no pattern type signature)
@@ -1022,7 +1055,7 @@ See also Note [Required, Specified, and Inferred for types] in GHC.Tc.TyCl
                const :: forall a b. a -> b -> a
 
  Inferred: like Specified, but every binder is written in braces:
-               f :: forall {k} (a:k). S k a -> Int
+               f :: forall {k} (a :: k). S k a -> Int
 
  Required: binders are put between `forall` and `->`:
               T :: forall k -> *
@@ -1034,19 +1067,6 @@ See also Note [Required, Specified, and Inferred for types] in GHC.Tc.TyCl
 
 * Inferred variables correspond to "generalized" variables from the
   Visible Type Applications paper (ESOP'16).
-
-Note [No Required PiTyBinder in terms]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-We don't allow Required foralls for term variables, including pattern
-synonyms and data constructors.  Why?  Because then an application
-would need a /compulsory/ type argument (possibly without an "@"?),
-thus (f Int); and we don't have concrete syntax for that.
-
-We could change this decision, but Required, Named PiTyBinders are rare
-anyway.  (Most are Anons.)
-
-However the type of a term can (just about) have a required quantifier;
-see Note [Required quantifiers in the type of a term] in GHC.Tc.Gen.Expr.
 -}
 
 
@@ -1084,7 +1104,7 @@ updateTyVarKindM update tv
 
 mkTyVar :: Name -> Kind -> TyVar
 mkTyVar name kind = TyVar { varName    = name
-                          , realUnique = getKey (nameUnique name)
+                          , realUnique = nameUnique name
                           , varType  = kind
                           }
 
@@ -1092,7 +1112,7 @@ mkTcTyVar :: Name -> Kind -> TcTyVarDetails -> TyVar
 mkTcTyVar name kind details
   = -- NB: 'kind' may be a coercion kind; cf, 'GHC.Tc.Utils.TcMType.newMetaCoVar'
     TcTyVar {   varName    = name,
-                realUnique = getKey (nameUnique name),
+                realUnique = nameUnique name,
                 varType  = kind,
                 tc_tv_details = details
         }
@@ -1148,7 +1168,7 @@ mkExportedLocalVar details name ty info
 mk_id :: Name -> Mult -> Type -> IdScope -> IdDetails -> IdInfo -> Id
 mk_id name !w ty scope details info
   = Id { varName    = name,
-         realUnique = getKey (nameUnique name),
+         realUnique = nameUnique name,
          varMult    = w,
          varType    = ty,
          idScope    = scope,
@@ -1248,6 +1268,10 @@ isNonCoVarId _                             = False
 isLocalId :: Var -> Bool
 isLocalId (Id { idScope = LocalId _ }) = True
 isLocalId _                            = False
+
+isLocalId_maybe :: Var -> Maybe ExportFlag
+isLocalId_maybe (Id { idScope = LocalId ef }) = Just ef
+isLocalId_maybe _                             = Nothing
 
 -- | 'isLocalVar' returns @True@ for type variables as well as local 'Id's
 -- These are the variables that we need to pay attention to when finding free

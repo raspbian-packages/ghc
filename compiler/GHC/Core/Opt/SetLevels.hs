@@ -15,7 +15,7 @@
    outwards (@FloatOut@).
 
 2. We also let-ify many expressions (notably case scrutinees), so they
-   will have a fighting chance of being floated sensible.
+   will have a fighting chance of being floated sensibly.
 
 3. Note [Need for cloning during float-out]
    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -44,13 +44,33 @@
         case x of wild { p -> ...wild... }
    we substitute x for wild in the RHS of the case alternatives:
         case x of wild { p -> ...x... }
-   This means that a sub-expression involving x is not "trapped" inside the RHS.
+   This means that a sub-expression involving x is not "trapped" inside the RHS
+   (i.e. it can now be floated out, whereas if it mentioned wild it could not).
    And it's not inconvenient because we already have a substitution.
 
-  Note that this is EXACTLY BACKWARDS from the what the simplifier does.
-  The simplifier tries to get rid of occurrences of x, in favour of wild,
-  in the hope that there will only be one remaining occurrence of x, namely
-  the scrutinee of the case, and we can inline it.
+   For example, consider:
+
+      f x = letrec go y = case x of z { (a,b) -> ...(expensive z)... }
+              in ...
+
+   If we do the reverse binder-swap we get
+
+      f x = letrec go y = case x of z { (a,b) -> ...(expensive x)... }
+              in ...
+
+   and now we can float out:
+
+      f x = let t = expensive x
+              in letrec go y = case x of z { (a,b) -> ...(t)... }
+              in ...
+
+   Now (expensive x) is computed once, rather than once each time around the 'go' loop.
+
+   Note that this is EXACTLY BACKWARDS from the what the simplifier does.
+   The simplifier tries to get rid of occurrences of x, in favour of wild,
+   in the hope that there will only be one remaining occurrence of x, namely
+   the scrutinee of the case, and we can inline it.
+
 -}
 
 module GHC.Core.Opt.SetLevels (
@@ -67,12 +87,7 @@ import GHC.Prelude
 
 import GHC.Core
 import GHC.Core.Opt.Monad ( FloatOutSwitches(..) )
-import GHC.Core.Utils   ( exprType, exprIsHNF
-                        , exprOkForSpeculation
-                        , exprIsTopLevelBindable
-                        , collectMakeStaticArgs
-                        , mkLamTypes, extendInScopeSetBndrs
-                        )
+import GHC.Core.Utils
 import GHC.Core.Opt.Arity   ( exprBotStrictness_maybe, isOneShotBndr )
 import GHC.Core.FVs     -- all of it
 import GHC.Core.Subst
@@ -110,7 +125,6 @@ import GHC.Utils.FV
 import GHC.Utils.Misc
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
-import GHC.Utils.Panic.Plain
 
 import Data.Maybe
 
@@ -302,7 +316,7 @@ lvl_top :: LevelEnv -> RecFlag -> Id -> CoreExpr
 --     there is no need call substAndLvlBndrs here
 lvl_top env is_rec bndr rhs
   = do { rhs' <- lvlRhs env is_rec (isDeadEndId bndr)
-                                   Nothing  -- Not a join point
+                                   NotJoinPoint
                                    (freeVars rhs)
        ; return (stayPut tOP_LEVEL bndr, rhs') }
 
@@ -514,7 +528,7 @@ Things to note:
 
  * The test we perform is exprIsHNF, and /not/ exprOkForSpeculation.
 
-     - exrpIsHNF catches the key case of an evaluated variable
+     - exprIsHNF catches the key case of an evaluated variable
 
      - exprOkForSpeculation is /false/ of an evaluated variable;
        See Note [exprOkForSpeculation and evaluated variables] in GHC.Core.Utils
@@ -629,7 +643,8 @@ lvlMFE env strict_ctxt e@(_, AnnCase {})
   = lvlExpr env e     -- See Note [Case MFEs]
 
 lvlMFE env strict_ctxt ann_expr
-  |  floatTopLvlOnly env && not (isTopLvl dest_lvl)
+  | not float_me
+  || floatTopLvlOnly env && not (isTopLvl dest_lvl)
          -- Only floating to the top level is allowed.
   || hasFreeJoin env fvs   -- If there is a free join, don't float
                            -- See Note [Free join points]
@@ -638,17 +653,18 @@ lvlMFE env strict_ctxt ann_expr
          -- how it will be represented at runtime.
          -- See Note [Representation polymorphism invariants] in GHC.Core
   || notWorthFloating expr abs_vars
-  || not float_me
-  =     -- Don't float it out
+         -- Test notWorhtFloating last;
+         -- See Note [Large free-variable sets]
+  = -- Don't float it out
     lvlExpr env ann_expr
 
   |  float_is_new_lam || exprIsTopLevelBindable expr expr_ty
          -- No wrapping needed if the type is lifted, or is a literal string
          -- or if we are wrapping it in one or more value lambdas
   = do { expr1 <- lvlFloatRhs abs_vars dest_lvl rhs_env NonRecursive
-                              is_bot_lam join_arity_maybe ann_expr
+                              is_bot_lam NotJoinPoint ann_expr
                   -- Treat the expr just like a right-hand side
-       ; var <- newLvlVar expr1 join_arity_maybe is_mk_static
+       ; var <- newLvlVar expr1 NotJoinPoint is_mk_static
        ; let var2 = annotateBotStr var float_n_lams mb_bot_str
        ; return (Let (NonRec (TB var2 (FloatMe dest_lvl)) expr1)
                      (mkVarApps (Var var2) abs_vars)) }
@@ -669,7 +685,7 @@ lvlMFE env strict_ctxt ann_expr
                          Case expr1 (stayPut l1r ubx_bndr) box_ty
                              [Alt DEFAULT [] (App boxing_expr (Var ubx_bndr))]
 
-       ; var <- newLvlVar float_rhs Nothing is_mk_static
+       ; var <- newLvlVar float_rhs NotJoinPoint is_mk_static
        ; let l1u      = incMinorLvlFrom env
              use_expr = Case (mkVarApps (Var var) abs_vars)
                              (stayPut l1u bx_bndr) expr_ty
@@ -705,8 +721,6 @@ lvlMFE env strict_ctxt ann_expr
     float_n_lams     = count isId abs_vars
 
     (rhs_env, abs_vars_w_lvls) = lvlLamBndrs env dest_lvl abs_vars
-
-    join_arity_maybe = Nothing
 
     is_mk_static = isJust (collectMakeStaticArgs expr)
         -- Yuk: See Note [Grand plan for static forms] in GHC.Iface.Tidy.StaticPtrTable
@@ -809,6 +823,28 @@ It's controlled by a flag (floatConsts), because doing this too
 early loses opportunities for RULES which (needless to say) are
 important in some nofib programs (gcd is an example).  [SPJ note:
 I think this is obsolete; the flag seems always on.]
+
+Note [Large free-variable sets]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In #24471 we had something like
+     x1 = I# 1
+     ...
+     x1000 = I# 1000
+     foo = f x1 (f x2 (f x3 ....))
+So every sub-expression in `foo` has lots and lots of free variables.  But
+none of these sub-expressions float anywhere; the entire float-out pass is a
+no-op.
+
+In lvlMFE, we want to find out quickly if the MFE is not-floatable; that is
+the common case.  In #24471 it turned out that we were testing `abs_vars` (a
+relatively complicated calculation that takes at least O(n-free-vars) time to
+compute) for every sub-expression.
+
+Better instead to test `float_me` early. That still involves looking at
+dest_lvl, which means looking at every free variable, but the constant factor
+is a lot better.
+
+ToDo: find a way to fix the bad asymptotic complexity.
 
 Note [Floating join point bindings]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -955,6 +991,11 @@ But, as ever, we need to be careful:
     as /another/ MFE, so we tell lvlFloatRhs not to do that, via the is_bot
     argument.
 
+    Do /not/ do this for bottoming /join-point/ bindings.   They may call other
+    join points (#24768), and floating to the top would abstract over those join
+    points, which we should never do.
+
+
 See Maessen's paper 1999 "Bottom extraction: factoring error handling out
 of functional programs" (unpublished I think).
 
@@ -1028,25 +1069,25 @@ notWorthFloating :: CoreExpr -> [Var] -> Bool
 notWorthFloating e abs_vars
   = go e (count isId abs_vars)
   where
-    go (Var {}) n    = n >= 0
-    go (Lit lit) n   = assert (n==0) $
-                       litIsTrivial lit   -- Note [Floating literals]
-    go (Tick t e) n  = not (tickishIsCode t) && go e n
-    go (Cast e _)  n = go e n
+    go (Var {}) n               = n >= 0
+    go (Lit lit) n              = assert (n==0) $
+                                  litIsTrivial lit   -- Note [Floating literals]
+    go (Type {}) _              = True
+    go (Coercion {}) _          = True
     go (App e arg) n
        -- See Note [Floating applications to coercions]
-       | Type {} <- arg = go e n
-       | n==0           = False
-       | is_triv arg    = go e (n-1)
-       | otherwise      = False
-    go _ _              = False
-
-    is_triv (Lit {})              = True        -- Treat all literals as trivial
-    is_triv (Var {})              = True        -- (ie not worth floating)
-    is_triv (Cast e _)            = is_triv e
-    is_triv (App e (Type {}))     = is_triv e   -- See Note [Floating applications to coercions]
-    is_triv (Tick t e)            = not (tickishIsCode t) && is_triv e
-    is_triv _                     = False
+       | not (isRuntimeArg arg) = go e n
+       | n==0                   = False
+       | exprIsTrivial arg      = go e (n-1) -- NB: exprIsTrivial arg = go arg 0
+       | otherwise              = False
+    go (Tick t e) n             = not (tickishIsCode t) && go e n
+    go (Cast e _)  n            = go e n
+    go (Case e b _ as) n
+      | null as
+      = go e n     -- See Note [Empty case is trivial]
+      | Just rhs <- isUnsafeEqualityCase e b as
+      = go rhs n   -- See (U2) of Note [Implementing unsafeCoerce] in base:Unsafe.Coerce
+    go _ _                      = False
 
 {-
 Note [Floating literals]
@@ -1152,13 +1193,15 @@ lvlBind env (AnnNonRec bndr rhs)
 
     deann_rhs  = deAnnotate rhs
     mb_bot_str = exprBotStrictness_maybe deann_rhs
-    is_bot_lam = isJust mb_bot_str
+    is_bot_lam = not is_join && isJust mb_bot_str
         -- is_bot_lam: looks like (\xy. bot), maybe zero lams
-        -- NB: not isBottomThunk!  See Note [Bottoming floats] point (3)
+        -- NB: not isBottomThunk!
+        -- NB: not is_join: don't send bottoming join points to the top.
+        -- See Note [Bottoming floats] point (3)
 
     n_extra    = count isId abs_vars
-    mb_join_arity = isJoinId_maybe bndr
-    is_join       = isJust mb_join_arity
+    mb_join_arity = idJoinPointHood bndr
+    is_join       = isJoinPoint mb_join_arity
 
 lvlBind env (AnnRec pairs)
   |  floatTopLvlOnly env && not (isTopLvl dest_lvl)
@@ -1173,7 +1216,7 @@ lvlBind env (AnnRec pairs)
   =    -- No float
     do { let bind_lvl       = incMinorLvl (le_ctxt_lvl env)
              (env', bndrs') = substAndLvlBndrs Recursive env bind_lvl bndrs
-             lvl_rhs (b,r)  = lvlRhs env' Recursive is_bot (isJoinId_maybe b) r
+             lvl_rhs (b,r)  = lvlRhs env' Recursive is_bot (idJoinPointHood b) r
        ; rhss' <- mapM lvl_rhs pairs
        ; return (Rec (bndrs' `zip` rhss'), env') }
 
@@ -1236,8 +1279,8 @@ lvlBind env (AnnRec pairs)
                                         is_bot (get_join bndr)
                                         rhs
 
-    get_join bndr | need_zap  = Nothing
-                  | otherwise = isJoinId_maybe bndr
+    get_join bndr | need_zap  = NotJoinPoint
+                  | otherwise = idJoinPointHood bndr
     need_zap = dest_lvl `ltLvl` joinCeilingLevel env
 
         -- Finding the free vars of the binding group is annoying
@@ -1264,7 +1307,7 @@ profitableFloat env dest_lvl
 lvlRhs :: LevelEnv
        -> RecFlag
        -> Bool               -- Is this a bottoming function
-       -> Maybe JoinArity
+       -> JoinPointHood
        -> CoreExprWithFVs
        -> LvlM LevelledExpr
 lvlRhs env rec_flag is_bot mb_join_arity expr
@@ -1273,7 +1316,7 @@ lvlRhs env rec_flag is_bot mb_join_arity expr
 
 lvlFloatRhs :: [OutVar] -> Level -> LevelEnv -> RecFlag
             -> Bool   -- Binding is for a bottoming function
-            -> Maybe JoinArity
+            -> JoinPointHood
             -> CoreExprWithFVs
             -> LvlM (Expr LevelledBndr)
 -- Ignores the le_ctxt_lvl in env; treats dest_lvl as the baseline
@@ -1284,13 +1327,13 @@ lvlFloatRhs abs_vars dest_lvl env rec is_bot mb_join_arity rhs
                   else lvlExpr body_env      body
        ; return (mkLams bndrs' body') }
   where
-    (bndrs, body)     | Just join_arity <- mb_join_arity
+    (bndrs, body)     | JoinPoint join_arity <- mb_join_arity
                       = collectNAnnBndrs join_arity rhs
                       | otherwise
                       = collectAnnBndrs rhs
     (env1, bndrs1)    = substBndrsSL NonRecursive env bndrs
     all_bndrs         = abs_vars ++ bndrs1
-    (body_env, bndrs') | Just _ <- mb_join_arity
+    (body_env, bndrs') | JoinPoint {} <- mb_join_arity
                       = lvlJoinBndrs env1 dest_lvl rec all_bndrs
                       | otherwise
                       = case lvlLamBndrs env1 dest_lvl all_bndrs of
@@ -1721,14 +1764,14 @@ newPolyBndrs dest_lvl
     -- but we may need to adjust its arity
     dest_is_top = isTopLvl dest_lvl
     transfer_join_info bndr new_bndr
-      | Just join_arity <- isJoinId_maybe bndr
+      | JoinPoint join_arity <- idJoinPointHood bndr
       , not dest_is_top
       = new_bndr `asJoinId` join_arity + length abs_vars
       | otherwise
       = new_bndr
 
 newLvlVar :: LevelledExpr        -- The RHS of the new binding
-          -> Maybe JoinArity     -- Its join arity, if it is a join point
+          -> JoinPointHood       -- Its join arity, if it is a join point
           -> Bool                -- True <=> the RHS looks like (makeStatic ...)
           -> LvlM Id
 newLvlVar lvld_rhs join_arity_maybe is_mk_static
@@ -1752,13 +1795,12 @@ newLvlVar lvld_rhs join_arity_maybe is_mk_static
 cloneCaseBndrs :: LevelEnv -> Level -> [Var] -> LvlM (LevelEnv, [Var])
 cloneCaseBndrs env@(LE { le_subst = subst, le_lvl_env = lvl_env, le_env = id_env })
                new_lvl vs
-  = do { us <- getUniqueSupplyM
-       ; let (subst', vs') = cloneBndrs subst us vs
+  = do { (subst', vs') <- cloneBndrs subst vs
              -- N.B. We are not moving the body of the case, merely its case
              -- binders.  Consequently we should *not* set le_ctxt_lvl and
              -- le_join_ceil.  See Note [Setting levels when floating
              -- single-alternative cases].
-             env' = env { le_lvl_env   = addLvls new_lvl lvl_env vs'
+       ; let env' = env { le_lvl_env   = addLvls new_lvl lvl_env vs'
                         , le_subst     = subst'
                         , le_env       = foldl' add_id id_env (vs `zip` vs') }
 
@@ -1773,13 +1815,12 @@ cloneLetVars :: RecFlag -> LevelEnv -> Level -> [InVar]
 cloneLetVars is_rec
           env@(LE { le_subst = subst, le_lvl_env = lvl_env, le_env = id_env })
           dest_lvl vs
-  = do { us <- getUniqueSupplyM
-       ; let vs1  = map zap vs
-                      -- See Note [Zapping the demand info]
-             (subst', vs2) = case is_rec of
-                               NonRecursive -> cloneBndrs      subst us vs1
-                               Recursive    -> cloneRecIdBndrs subst us vs1
-             prs  = vs `zip` vs2
+  = do { let vs1  = map zap vs
+       ; (subst', vs2) <- case is_rec of
+                            NonRecursive -> cloneBndrs      subst vs1
+                            Recursive    -> cloneRecIdBndrs subst vs1
+
+       ; let prs  = vs `zip` vs2
              env' = env { le_lvl_env = addLvls dest_lvl lvl_env vs2
                         , le_subst   = subst'
                         , le_env     = foldl' add_id id_env prs }
@@ -1787,9 +1828,12 @@ cloneLetVars is_rec
        ; return (env', vs2) }
   where
     zap :: Var -> Var
-    zap v | isId v    = zap_join (zapIdDemandInfo v)
+    -- See Note [Floatifying demand info when floating]
+    -- and Note [Zapping JoinId when floating]
+    zap v | isId v    = zap_join (floatifyIdDemandInfo v)
           | otherwise = v
 
+    -- See Note [Zapping JoinId when floating]
     zap_join | isTopLvl dest_lvl = zapJoinId
              | otherwise         = id
 
@@ -1798,16 +1842,38 @@ add_id id_env (v, v1)
   | isTyVar v = delVarEnv    id_env v
   | otherwise = extendVarEnv id_env v ([v1], assert (not (isCoVar v1)) $ Var v1)
 
-{-
-Note [Zapping the demand info]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-VERY IMPORTANT: we must zap the demand info if the thing is going to
-float out, because it may be less demanded than at its original
-binding site.  Eg
-   f :: Int -> Int
-   f x = let v = 3*4 in v+x
-Here v is strict; but if we float v to top level, it isn't any more.
+{- Note [Zapping JoinId when floating]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+If we are floating a join point, it won't be one anymore, so we zap
+the join point information.
 
-Similarly, if we're floating a join point, it won't be one anymore, so we zap
-join point information as well.
+Note [Floatifying demand info when floating]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+When floating we must lazify the outer demand info on the Id
+because it may be less demanded than at its original binding site.
+For example:
+     f :: Int -> Int
+     f x = let v = 3*4 in v+x
+Here v is strict and used at most once; but if we float v to top level,
+that isn't true any more. Specifically, we lose track of v's cardinality info:
+  * if `f` is called multiple times, then `v` is used more than once
+  * if `f` is never called, then `v` is never evaluated.
+
+But NOTE that we only need to adjust the /top-level/ cardinality info.
+For example
+     let x = (e1,e2)
+     in ...(case x of (a,b) -> a+b)...
+If we float x outwards, it may no longer be strict, but IF it is ever
+evaluated THEN its components will be evaluated.  So we to lazify and
+many-ify its demand-info, not discard it entirely.
+
+Same if we have
+     let f = \x y . blah
+     in ...(f a b)...(f c d)...
+Here `f` will get a demand like SC(S,C(1,L)). If we float it out, we can
+keep that `1C` called-once inner demand. It's only the outer strictness
+that we kill.
+
+Conclusion: to floatify a demand, just do `multDmd C_0N` to reflect the
+fact that `v` may be used any number of times, from zero upwards.
 -}

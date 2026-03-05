@@ -5,6 +5,7 @@
 {-# LANGUAGE ExistentialQuantification #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE GADTs #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeFamilyDependencies #-}
 {-# LANGUAGE UndecidableInstances #-} -- Wrinkle in Note [Trees That Grow]
@@ -24,7 +25,6 @@ import Language.Haskell.Syntax.Basic
 import Language.Haskell.Syntax.Decls
 import Language.Haskell.Syntax.Pat
 import Language.Haskell.Syntax.Lit
-import Language.Haskell.Syntax.Concrete
 import Language.Haskell.Syntax.Extension
 import Language.Haskell.Syntax.Type
 import Language.Haskell.Syntax.Binds
@@ -39,7 +39,6 @@ import GHC.Data.FastString (FastString)
 -- libraries:
 import Data.Data hiding (Fixity(..))
 import Data.Bool
-import Data.Either
 import Data.Eq
 import Data.Maybe
 import Data.List.NonEmpty ( NonEmpty )
@@ -147,6 +146,19 @@ type LHsRecProj p arg = XRec p (RecProj p arg)
 type RecUpdProj p = RecProj p (LHsExpr p)
 type LHsRecUpdProj p = XRec p (RecUpdProj p)
 
+-- | Haskell Record Update Fields.
+data LHsRecUpdFields p where
+  -- | A regular (non-overloaded) record update.
+  RegularRecUpdFields
+    :: { xRecUpdFields :: XLHsRecUpdLabels p
+       , recUpdFields  :: [LHsRecUpdField p p] }
+    -> LHsRecUpdFields p
+  -- | An overloaded record update.
+  OverloadedRecUpdFields
+    :: { xOLRecUpdFields :: XLHsOLRecUpdLabels p
+       , olRecUpdFields  :: [LHsRecUpdProj p] }
+    -> LHsRecUpdFields p
+
 {-
 ************************************************************************
 *                                                                      *
@@ -227,7 +239,7 @@ this if both data types are declared in the same module.
 
 NB 2: The notation getField @"size" e is short for
 HsApp (HsAppType (HsVar "getField") (HsWC (HsTyLit (HsStrTy "size")) [])) e.
-We track the original parsed syntax via HsExpanded.
+We track the original parsed syntax via ExpandedThingRn.
 
 -}
 
@@ -283,16 +295,7 @@ data HsExpr p
   | HsLit     (XLitE p)
               (HsLit p)      -- ^ Simple (non-overloaded) literals
 
-  | HsLam     (XLam p)
-              (MatchGroup p (LHsExpr p))
-                       -- ^ Lambda abstraction. Currently always a single match
-       --
-       -- - 'GHC.Parser.Annotation.AnnKeywordId' : 'GHC.Parser.Annotation.AnnLam',
-       --       'GHC.Parser.Annotation.AnnRarrow',
-
-       -- For details on above see Note [exact print annotations] in GHC.Parser.Annotation
-
-  -- | Lambda-case
+  -- | Lambda, Lambda-case, and Lambda-cases
   --
   -- - 'GHC.Parser.Annotation.AnnKeywordId' : 'GHC.Parser.Annotation.AnnLam',
   --           'GHC.Parser.Annotation.AnnCase','GHC.Parser.Annotation.AnnOpen',
@@ -302,13 +305,22 @@ data HsExpr p
   --           'GHC.Parser.Annotation.AnnClose'
 
   -- For details on above see Note [exact print annotations] in GHC.Parser.Annotation
-  | HsLamCase (XLamCase p) LamCaseVariant (MatchGroup p (LHsExpr p))
+  | HsLam     (XLam p)
+              HsLamVariant -- ^ Tells whether this is for lambda, \case, or \cases
+              (MatchGroup p (LHsExpr p))
+                       -- ^ LamSingle: one match of arity >= 1
+                       --   LamCase: many arity-1 matches
+                       --   LamCases: many matches of uniform arity >= 1
+       --
+       -- - 'GHC.Parser.Annotation.AnnKeywordId' : 'GHC.Parser.Annotation.AnnLam',
+       --       'GHC.Parser.Annotation.AnnRarrow',
+
+       -- For details on above see Note [exact print annotations] in GHC.Parser.Annotation
 
   | HsApp     (XApp p) (LHsExpr p) (LHsExpr p) -- ^ Application
 
   | HsAppType (XAppTypeE p) -- After typechecking: the type argument
               (LHsExpr p)
-             !(LHsToken "@" p)
               (LHsWcType (NoGhcTc p))  -- ^ Visible type application
        --
        -- Explicit type argument; e.g  f @Int x y
@@ -342,9 +354,7 @@ data HsExpr p
 
   -- For details on above see Note [exact print annotations] in GHC.Parser.Annotation
   | HsPar       (XPar p)
-               !(LHsToken "(" p)
                 (LHsExpr p)  -- ^ Parenthesised expr; see Note [Parens in HsSyn]
-               !(LHsToken ")" p)
 
   | SectionL    (XSectionL p)
                 (LHsExpr p)    -- operand; see Note [Sections in HsSyn]
@@ -415,9 +425,7 @@ data HsExpr p
 
   -- For details on above see Note [exact print annotations] in GHC.Parser.Annotation
   | HsLet       (XLet p)
-               !(LHsToken "let" p)
                 (HsLocalBinds p)
-               !(LHsToken "in" p)
                 (LHsExpr  p)
 
   -- | - 'GHC.Parser.Annotation.AnnKeywordId' : 'GHC.Parser.Annotation.AnnDo',
@@ -463,7 +471,7 @@ data HsExpr p
   | RecordUpd
       { rupd_ext  :: XRecordUpd p
       , rupd_expr :: LHsExpr p
-      , rupd_flds :: Either [LHsRecUpdField p] [LHsRecUpdProj p]
+      , rupd_flds :: LHsRecUpdFields p
       }
   -- For a type family, the arg types are of the *instance* tycon,
   -- not the family tycon
@@ -566,9 +574,14 @@ data HsExpr p
   -- Expressions annotated with pragmas, written as {-# ... #-}
   | HsPragE (XPragE p) (HsPragE p) (LHsExpr p)
 
+  -- Embed the syntax of types into expressions.
+  -- Used with RequiredTypeArguments, e.g. fn (type (Int -> Bool))
+  | HsEmbTy   (XEmbTy p)
+              (LHsWcType (NoGhcTc p))
+
   | XExpr       !(XXExpr p)
   -- Note [Trees That Grow] in Language.Haskell.Syntax.Extension for the
-  -- general idea, and Note [Rebindable syntax and HsExpansion] in GHC.Hs.Expr
+  -- general idea, and Note [Rebindable syntax and XXExprGhcRn] in GHC.Hs.Expr
   -- for an example of how we use it.
 
 -- ---------------------------------------------------------------------
@@ -617,9 +630,10 @@ data HsTupArg id
                              -- in Language.Haskell.Syntax.Extension
 
 -- | Which kind of lambda case are we dealing with?
-data LamCaseVariant
-  = LamCase -- ^ `\case`
-  | LamCases -- ^ `\cases`
+data HsLamVariant
+  = LamSingle  -- ^ `\p -> e`
+  | LamCase    -- ^ `\case pi -> ei `
+  | LamCases   -- ^ `\cases psi -> ei`
   deriving (Data, Eq)
 
 {-
@@ -826,17 +840,21 @@ data HsCmd id
                 (LHsCmd id)
                 (LHsExpr id)
 
-  | HsCmdLam    (XCmdLam id)
-                (MatchGroup id (LHsCmd id))     -- kappa
-       -- ^ - 'GHC.Parser.Annotation.AnnKeywordId' : 'GHC.Parser.Annotation.AnnLam',
-       --       'GHC.Parser.Annotation.AnnRarrow',
+  -- | Lambda-case
+  --
+  -- - 'GHC.Parser.Annotation.AnnKeywordId' : 'GHC.Parser.Annotation.AnnLam',
+  --     'GHC.Parser.Annotation.AnnCase','GHC.Parser.Annotation.AnnOpen' @'{'@,
+  --     'GHC.Parser.Annotation.AnnClose' @'}'@
+  -- - 'GHC.Parser.Annotation.AnnKeywordId' : 'GHC.Parser.Annotation.AnnLam',
+  --     'GHC.Parser.Annotation.AnnCases','GHC.Parser.Annotation.AnnOpen' @'{'@,
+  --     'GHC.Parser.Annotation.AnnClose' @'}'@
 
-       -- For details on above see Note [exact print annotations] in GHC.Parser.Annotation
+  -- For details on above see Note [exact print annotations] in GHC.Parser.Annotation
+  | HsCmdLam (XCmdLamCase id) HsLamVariant
+             (MatchGroup id (LHsCmd id)) -- bodies are HsCmd's
 
   | HsCmdPar    (XCmdPar id)
-               !(LHsToken "(" id)
                 (LHsCmd id)                     -- parenthesised command
-               !(LHsToken ")" id)
     -- ^ - 'GHC.Parser.Annotation.AnnKeywordId' : 'GHC.Parser.Annotation.AnnOpen' @'('@,
     --             'GHC.Parser.Annotation.AnnClose' @')'@
 
@@ -851,19 +869,6 @@ data HsCmd id
 
     -- For details on above see Note [exact print annotations] in GHC.Parser.Annotation
 
-  -- | Lambda-case
-  --
-  -- - 'GHC.Parser.Annotation.AnnKeywordId' : 'GHC.Parser.Annotation.AnnLam',
-  --     'GHC.Parser.Annotation.AnnCase','GHC.Parser.Annotation.AnnOpen' @'{'@,
-  --     'GHC.Parser.Annotation.AnnClose' @'}'@
-  -- - 'GHC.Parser.Annotation.AnnKeywordId' : 'GHC.Parser.Annotation.AnnLam',
-  --     'GHC.Parser.Annotation.AnnCases','GHC.Parser.Annotation.AnnOpen' @'{'@,
-  --     'GHC.Parser.Annotation.AnnClose' @'}'@
-
-  -- For details on above see Note [exact print annotations] in GHC.Parser.Annotation
-  | HsCmdLamCase (XCmdLamCase id) LamCaseVariant
-                 (MatchGroup id (LHsCmd id)) -- bodies are HsCmd's
-
   | HsCmdIf     (XCmdIf id)
                 (SyntaxExpr id)         -- cond function
                 (LHsExpr id)            -- predicate
@@ -877,9 +882,7 @@ data HsCmd id
     -- For details on above see Note [exact print annotations] in GHC.Parser.Annotation
 
   | HsCmdLet    (XCmdLet id)
-               !(LHsToken "let" id)
                 (HsLocalBinds id)      -- let(rec)
-               !(LHsToken "in" id)
                 (LHsCmd  id)
     -- ^ - 'GHC.Parser.Annotation.AnnKeywordId' : 'GHC.Parser.Annotation.AnnLet',
     --       'GHC.Parser.Annotation.AnnOpen' @'{'@,
@@ -974,10 +977,9 @@ type LMatch id body = XRec id (Match id body)
 -- For details on above see Note [exact print annotations] in GHC.Parser.Annotation
 data Match p body
   = Match {
-        m_ext :: XCMatch p body,
-        m_ctxt :: HsMatchContext p,
-          -- See Note [m_ctxt in Match]
-        m_pats :: [LPat p], -- The patterns
+        m_ext   :: XCMatch p body,
+        m_ctxt  :: HsMatchContext (LIdP (NoGhcTc p)), -- See Note [m_ctxt in Match]
+        m_pats  :: [LPat p],                          -- The patterns
         m_grhss :: (GRHSs p body)
   }
   | XMatch !(XXMatch p body)
@@ -985,7 +987,6 @@ data Match p body
 {-
 Note [m_ctxt in Match]
 ~~~~~~~~~~~~~~~~~~~~~~
-
 A Match can occur in a number of contexts, such as a FunBind, HsCase, HsLam and
 so on.
 
@@ -1014,9 +1015,6 @@ annotations
     (&&&  ) [] [] =  []
     xs    &&&   [] =  xs
     (  &&&  ) [] ys =  ys
-
-
-
 -}
 
 
@@ -1530,21 +1528,19 @@ data ArithSeqInfo id
 --
 -- Context of a pattern match. This is more subtle than it would seem. See
 -- Note [FunBind vs PatBind].
-data HsMatchContext p
+data HsMatchContext fn
   = FunRhs
     -- ^ A pattern matching on an argument of a
     -- function binding
-      { mc_fun        :: LIdP (NoGhcTc p)    -- ^ function binder of @f@
-                                             -- See Note [mc_fun field of FunRhs]
-                                             -- See #20415 for a long discussion about
-                                             -- this field and why it uses NoGhcTc.
+      { mc_fun        :: fn    -- ^ function binder of @f@
+                               -- See Note [mc_fun field of FunRhs]
+                               -- See #20415 for a long discussion about this field
       , mc_fixity     :: LexicalFixity -- ^ fixing of @f@
       , mc_strictness :: SrcStrictness -- ^ was @f@ banged?
                                        -- See Note [FunBind vs PatBind]
       }
-  | LambdaExpr                  -- ^Patterns of a lambda
   | CaseAlt                     -- ^Patterns and guards in a case alternative
-  | LamCaseAlt LamCaseVariant   -- ^Patterns and guards in @\case@ and @\cases@
+  | LamAlt HsLamVariant         -- ^Patterns and guards in @\@, @\case@ and @\cases@
   | IfAlt                       -- ^Guards of a multi-way if alternative
   | ArrowMatchCtxt              -- ^A pattern match inside arrow notation
       HsArrowMatchContext
@@ -1557,48 +1553,57 @@ data HsMatchContext p
                                 --    tell matchWrapper what sort of
                                 --    runtime error message to generate]
 
-  | StmtCtxt (HsStmtContext p)  -- ^Pattern of a do-stmt, list comprehension,
-                                -- pattern guard, etc
+  | StmtCtxt (HsStmtContext fn)  -- ^Pattern of a do-stmt, list comprehension,
+                                 --  pattern guard, etc
 
   | ThPatSplice            -- ^A Template Haskell pattern splice
   | ThPatQuote             -- ^A Template Haskell pattern quotation [p| (a,b) |]
   | PatSyn                 -- ^A pattern synonym declaration
+  | LazyPatCtx             -- ^An irrefutable pattern
 
-{-
-Note [mc_fun field of FunRhs]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-The mc_fun field of FunRhs has type `LIdP (NoGhcTc p)`, which means it will be
-a `RdrName` in pass `GhcPs`, a `Name` in `GhcRn`, and (importantly) still a
-`Name` in `GhcTc` -- not an `Id`.  See Note [NoGhcTc] in GHC.Hs.Extension.
+{- Note [mc_fun field of FunRhs]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+HsMatchContext is parameterised over `fn`, the function binder stored in `FunRhs`.
+This makes pretty printing easy.
 
-Why a `Name` in the typechecker phase?  Because:
-* A `Name` is all we need, as it turns out.
-* Using an `Id` involves knot-tying in the monad, which led to #22695.
+In the use of `HsMatchContext` in `Match`, it is parameterised thus:
+    data Match p body = Match { m_ctxt  :: HsMatchContext (LIdP (NoGhcTc p)), ... }
+So in a Match, the mc_fun field `FunRhs` will be a `RdrName` in pass `GhcPs`, a `Name`
+in `GhcRn`, and (importantly) still a `Name` in `GhcTc` -- not an `Id`.
+See Note [NoGhcTc] in GHC.Hs.Extension.
+
+* Why a `Name` in the typechecker phase?  Because:
+  * A `Name` is all we need, as it turns out.
+  * Using an `Id` involves knot-tying in the monad, which led to #22695.
+
+* Why a /located/ name?  Because we want to record the location of the Id
+  on the LHS of /this/ match.  See Note [m_ctxt in Match].  Example:
+    (&&&) [] [] = []
+    xs  &&&  [] = xs
+  The two occurrences of `&&&` have different locations.
+
+* Why parameterise `HsMatchContext` over `fn` rather than over the pass `p`?
+  Because during typechecking (specifically GHC.Tc.Gen.Match.tcMatch) we need to convert
+     HsMatchContext (LIdP (NoGhcTc GhcRn)) --> HsMatchContext (LIdP (NoGhcTc GhcTc))
+  With this parameterisation it's easy; if it was parametersed over `p` we'd  need
+  a recursive traversal of the HsMatchContext.
 
 See #20415 for a long discussion.
-
 -}
 
-isPatSynCtxt :: HsMatchContext p -> Bool
-isPatSynCtxt ctxt =
-  case ctxt of
-    PatSyn -> True
-    _      -> False
-
 -- | Haskell Statement Context.
-data HsStmtContext p
-  = HsDoStmt HsDoFlavour             -- ^Context for HsDo (do-notation and comprehensions)
-  | PatGuard (HsMatchContext p)      -- ^Pattern guard for specified thing
-  | ParStmtCtxt (HsStmtContext p)    -- ^A branch of a parallel stmt
-  | TransStmtCtxt (HsStmtContext p)  -- ^A branch of a transform stmt
-  | ArrowExpr                        -- ^do-notation in an arrow-command context
+data HsStmtContext fn
+  = HsDoStmt HsDoFlavour              -- ^ Context for HsDo (do-notation and comprehensions)
+  | PatGuard (HsMatchContext fn)      -- ^ Pattern guard for specified thing
+  | ParStmtCtxt (HsStmtContext fn)    -- ^ A branch of a parallel stmt
+  | TransStmtCtxt (HsStmtContext fn)  -- ^ A branch of a transform stmt
+  | ArrowExpr                         -- ^ do-notation in an arrow-command context
 
 -- | Haskell arrow match context.
 data HsArrowMatchContext
   = ProcExpr                       -- ^ A proc expression
   | ArrowCaseAlt                   -- ^ A case alternative inside arrow notation
-  | ArrowLamCaseAlt LamCaseVariant -- ^ A \case or \cases alternative inside arrow notation
-  | KappaExpr                      -- ^ An arrow kappa abstraction
+  | ArrowLamAlt HsLamVariant       -- ^ A \, \case or \cases alternative inside arrow notation
 
 data HsDoFlavour
   = DoExpr (Maybe ModuleName)        -- ^[ModuleName.]do { ... }
@@ -1606,14 +1611,21 @@ data HsDoFlavour
   | GhciStmtCtxt                     -- ^A command-line Stmt in GHCi pat <- rhs
   | ListComp
   | MonadComp
+  deriving (Eq, Data)
 
-qualifiedDoModuleName_maybe :: HsStmtContext p -> Maybe ModuleName
+qualifiedDoModuleName_maybe :: HsStmtContext fn -> Maybe ModuleName
 qualifiedDoModuleName_maybe ctxt = case ctxt of
   HsDoStmt (DoExpr m) -> m
   HsDoStmt (MDoExpr m) -> m
   _ -> Nothing
 
-isComprehensionContext :: HsStmtContext id -> Bool
+isPatSynCtxt :: HsMatchContext fn -> Bool
+isPatSynCtxt ctxt =
+  case ctxt of
+    PatSyn -> True
+    _      -> False
+
+isComprehensionContext :: HsStmtContext fn -> Bool
 -- Uses comprehension syntax [ e | quals ]
 isComprehensionContext (ParStmtCtxt c)   = isComprehensionContext c
 isComprehensionContext (TransStmtCtxt c) = isComprehensionContext c
@@ -1629,7 +1641,7 @@ isDoComprehensionContext ListComp = True
 isDoComprehensionContext MonadComp = True
 
 -- | Is this a monadic context?
-isMonadStmtContext :: HsStmtContext id -> Bool
+isMonadStmtContext :: HsStmtContext fn -> Bool
 isMonadStmtContext (ParStmtCtxt ctxt)   = isMonadStmtContext ctxt
 isMonadStmtContext (TransStmtCtxt ctxt) = isMonadStmtContext ctxt
 isMonadStmtContext (HsDoStmt flavour) = isMonadDoStmtContext flavour
@@ -1643,7 +1655,7 @@ isMonadDoStmtContext DoExpr{}     = True
 isMonadDoStmtContext MDoExpr{}    = True
 isMonadDoStmtContext GhciStmtCtxt = True
 
-isMonadCompContext :: HsStmtContext id -> Bool
+isMonadCompContext :: HsStmtContext fn -> Bool
 isMonadCompContext (HsDoStmt flavour)   = isMonadDoCompContext flavour
 isMonadCompContext (ParStmtCtxt _)   = False
 isMonadCompContext (TransStmtCtxt _) = False

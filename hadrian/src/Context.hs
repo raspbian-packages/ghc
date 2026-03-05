@@ -3,13 +3,13 @@ module Context (
     Context (..), vanillaContext, stageContext,
 
     -- * Expressions
-    getStage, getPackage, getWay, getStagedSettingList, getBuildPath, getPackageDbLoc,
+    getStage, getPackage, getWay, getBuildPath, getPackageDbLoc, getStagedTarget,
 
     -- * Paths
     contextDir, buildPath, buildDir, pkgInplaceConfig, pkgSetupConfigFile, pkgSetupConfigDir,
     pkgHaddockFile, pkgRegisteredLibraryFile, pkgRegisteredLibraryFileName,
     pkgLibraryFile, pkgGhciLibraryFile,
-    pkgConfFile, pkgStampFile, resourcePath, objectPath, contextPath, getContextPath, libPath, distDir,
+    pkgConfFile, pkgStampFile, resourcePath, objectPath, contextPath, getContextPath, libPath, distDir, distDynDir,
     haddockStatsFilesDir
     ) where
 
@@ -19,6 +19,9 @@ import Context.Type
 import Hadrian.Expression
 import Hadrian.Haskell.Cabal
 import Oracles.Setting
+import GHC.Toolchain.Target (Target(..))
+import Hadrian.Oracles.Cabal
+import Hadrian.Haskell.Cabal.Type
 
 -- | Most targets are built only one way, hence the notion of 'vanillaContext'.
 vanillaContext :: Stage -> Package -> Context
@@ -47,9 +50,9 @@ getPackage = package <$> getContext
 getWay :: Expr Context b Way
 getWay = way <$> getContext
 
--- | Get a list of configuration settings for the current stage.
-getStagedSettingList :: (Stage -> SettingList) -> Args Context b
-getStagedSettingList f = getSettingList . f =<< getStage
+-- | Get the 'Target' configuration of the current stage
+getStagedTarget :: Expr Context b Target
+getStagedTarget = expr . targetStage =<< getStage
 
 -- | Path to the directory containing the final artifact in a given 'Context'.
 libPath :: Context -> Action FilePath
@@ -60,25 +63,25 @@ libPath Context {..} = buildRoot <&> (-/- (stageString stage -/- "lib"))
 --
 -- We preform some renaming to accommodate Cabal's slightly different naming
 -- conventions (see 'cabalOsString' and 'cabalArchString').
-distDir :: Stage -> Action FilePath
-distDir st = do
-    let (os,arch) = case st of
-            Stage0 {} -> (HostOs , HostArch)
-            _      -> (TargetOs, TargetArch)
-    version        <- ghcVersionStage st
-    hostOs         <- cabalOsString <$> setting os
-    hostArch       <- cabalArchString <$> setting arch
-    return $ hostArch ++ "-" ++ hostOs ++ "-ghc-" ++ version
+distDir :: Context -> Action FilePath
+distDir c = do
+    cd <- readContextData c
+    return (contextLibdir cd)
 
-pkgFileName :: Package -> String -> String -> Action FilePath
-pkgFileName package prefix suffix = do
-    pid  <- pkgIdentifier package
+distDynDir :: Context -> Action FilePath
+distDynDir c = do
+    cd <- readContextData c
+    return (contextDynLibdir cd)
+
+pkgFileName :: Context -> Package -> String -> String -> Action FilePath
+pkgFileName context package prefix suffix = do
+    pid  <- pkgUnitId (stage context) package
     return $ prefix ++ pid ++ suffix
 
 pkgFile :: Context -> String -> String -> Action FilePath
 pkgFile context@Context {..} prefix suffix = do
     path <- buildPath context
-    fileName <- pkgFileName package prefix suffix
+    fileName <- pkgFileName context package prefix suffix
     return $ path -/- fileName
 
 -- | Path to inplace package configuration file of a given 'Context'.
@@ -97,7 +100,7 @@ pkgSetupConfigFile context = pkgSetupConfigDir context <&> (-/- "setup-config")
 pkgHaddockFile :: Context -> Action FilePath
 pkgHaddockFile Context {..} = do
     root <- buildRoot
-    version <- pkgIdentifier package
+    version <- pkgUnitId stage package
     return $ root -/- "doc/html/libraries" -/- version -/- pkgName package <.> "haddock"
 
 -- | Path to the registered ghc-pkg library file of a given 'Context', e.g.:
@@ -105,19 +108,18 @@ pkgHaddockFile Context {..} = do
 -- @_build/stage1/lib/x86_64-linux-ghc-8.9.0/array-0.5.1.0/libHSarray-0.5.4.0.a@
 pkgRegisteredLibraryFile :: Context -> Action FilePath
 pkgRegisteredLibraryFile context@Context {..} = do
-    libDir    <- libPath context
-    pkgId     <- pkgIdentifier package
     fileName  <- pkgRegisteredLibraryFileName context
-    distDir   <- distDir stage
+    distDir   <- distDir context
+    distDynDir  <- distDynDir context
     return $ if Dynamic `wayUnit` way
-        then libDir -/- distDir -/- fileName
-        else libDir -/- distDir -/- pkgId -/- fileName
+        then distDynDir -/- fileName
+        else distDir -/- fileName
 
 -- | Just the final filename portion of pkgRegisteredLibraryFile
 pkgRegisteredLibraryFileName :: Context -> Action FilePath
-pkgRegisteredLibraryFileName Context{..} = do
+pkgRegisteredLibraryFileName context@Context{..} = do
     extension <- libsuf stage way
-    pkgFileName package "libHS" extension
+    pkgFileName context package "libHS" extension
 
 
 -- | Path to the library file of a given 'Context', e.g.:
@@ -137,7 +139,7 @@ pkgGhciLibraryFile context@Context {..} = do
 -- | Path to the configuration file of a given 'Context'.
 pkgConfFile :: Context -> Action FilePath
 pkgConfFile Context {..} = do
-    pid  <- pkgIdentifier package
+    pid  <- pkgUnitId stage package
     dbPath <- packageDbPath (PackageDbLoc stage iplace)
     return $ dbPath -/- pid <.> "conf"
 

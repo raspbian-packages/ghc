@@ -3,9 +3,12 @@
              RankNTypes, RoleAnnotations, ScopedTypeVariables,
              MagicHash, KindSignatures, PolyKinds, TypeApplications, DataKinds,
              GADTs, UnboxedTuples, UnboxedSums, TypeOperators,
-             Trustworthy, DeriveFunctor, BangPatterns, RecordWildCards, ImplicitParams #-}
+             Trustworthy, DeriveFunctor, DeriveTraversable,
+             BangPatterns, RecordWildCards, ImplicitParams #-}
 
 {-# OPTIONS_GHC -fno-warn-inline-rule-shadowing #-}
+{-# LANGUAGE TemplateHaskellQuotes #-}
+{-# LANGUAGE StandaloneKindSignatures #-}
 
 -----------------------------------------------------------------------------
 -- |
@@ -31,6 +34,7 @@ module Language.Haskell.TH.Syntax
     -- $infix
     ) where
 
+import qualified Data.Fixed as Fixed
 import Data.Data hiding (Fixity(..))
 import Data.IORef
 import System.IO.Unsafe ( unsafePerformIO )
@@ -53,7 +57,8 @@ import Data.Ratio
 import GHC.CString      ( unpackCString# )
 import GHC.Generics     ( Generic )
 import GHC.Types        ( Int(..), Word(..), Char(..), Double(..), Float(..),
-                          TYPE, RuntimeRep(..) )
+                          TYPE, RuntimeRep(..), Levity(..), Multiplicity (..) )
+import qualified Data.Kind as Kind (Type)
 import GHC.Prim         ( Int#, Word#, Char#, Double#, Float#, Addr# )
 import GHC.Ptr          ( Ptr, plusPtr )
 import GHC.Lexeme       ( startsVarSym, startsVarId )
@@ -64,13 +69,7 @@ import Prelude hiding (Applicative(..))
 import Foreign.ForeignPtr
 import Foreign.C.String
 import Foreign.C.Types
-import GHC.Stack
 
-#if __GLASGOW_HASKELL__ >= 901
-import GHC.Types ( Levity(..) )
-#endif
-
-#if __GLASGOW_HASKELL__ >= 903
 import Data.Array.Byte (ByteArray(..))
 import GHC.Exts
   ( ByteArray#, unsafeFreezeByteArray#, copyAddrToByteArray#, newByteArray#
@@ -78,7 +77,6 @@ import GHC.Exts
   , copyByteArray#, newPinnedByteArray#)
 import GHC.ForeignPtr (ForeignPtr(..), ForeignPtrContents(..))
 import GHC.ST (ST(..), runST)
-#endif
 
 -----------------------------------------------------
 --
@@ -330,43 +328,14 @@ instance Quote Q where
 --
 -----------------------------------------------------
 
+type TExp :: TYPE r -> Kind.Type
 type role TExp nominal   -- See Note [Role of TExp]
-newtype TExp (a :: TYPE (r :: RuntimeRep)) = TExp
+newtype TExp a = TExp
   { unType :: Exp -- ^ Underlying untyped Template Haskell expression
   }
--- ^ Represents an expression which has type @a@. Built on top of 'Exp', typed
--- expressions allow for type-safe splicing via:
+-- ^ Typed wrapper around an 'Exp'.
 --
---   - typed quotes, written as @[|| ... ||]@ where @...@ is an expression; if
---     that expression has type @a@, then the quotation has type
---     @'Q' ('TExp' a)@
---
---   - typed splices inside of typed quotes, written as @$$(...)@ where @...@
---     is an arbitrary expression of type @'Q' ('TExp' a)@
---
--- Traditional expression quotes and splices let us construct ill-typed
--- expressions:
---
--- >>> fmap ppr $ runQ [| True == $( [| "foo" |] ) |]
--- GHC.Types.True GHC.Classes.== "foo"
--- >>> GHC.Types.True GHC.Classes.== "foo"
--- <interactive> error:
---     • Couldn't match expected type ‘Bool’ with actual type ‘[Char]’
---     • In the second argument of ‘(==)’, namely ‘"foo"’
---       In the expression: True == "foo"
---       In an equation for ‘it’: it = True == "foo"
---
--- With typed expressions, the type error occurs when /constructing/ the
--- Template Haskell expression:
---
--- >>> fmap ppr $ runQ [|| True == $$( [|| "foo" ||] ) ||]
--- <interactive> error:
---     • Couldn't match type ‘[Char]’ with ‘Bool’
---       Expected type: Q (TExp Bool)
---         Actual type: Q (TExp [Char])
---     • In the Template Haskell quotation [|| "foo" ||]
---       In the expression: [|| "foo" ||]
---       In the Template Haskell splice $$([|| "foo" ||])
+-- This is the typed representation of terms produced by typed quotes.
 --
 -- Representation-polymorphic since /template-haskell-2.16.0.0/.
 
@@ -394,20 +363,76 @@ unsafeTExpCoerce m = do { e <- m
 TExp's argument must have a nominal role, not phantom as would
 be inferred (#8459).  Consider
 
-  e :: TExp Age
-  e = MkAge 3
+  e :: Code Q Age
+  e = [|| MkAge 3 ||]
 
   foo = $(coerce e) + 4::Int
 
 The splice will evaluate to (MkAge 3) and you can't add that to
-4::Int. So you can't coerce a (TExp Age) to a (TExp Int). -}
+4::Int. So you can't coerce a (Code Q Age) to a (Code Q Int). -}
 
 -- Code constructor
-
+#if __GLASGOW_HASKELL__ >= 909
+type Code :: (Kind.Type -> Kind.Type) -> forall r. TYPE r -> Kind.Type
+  -- See Note [Foralls to the right in Code]
+#else
+type Code :: (Kind.Type -> Kind.Type) -> TYPE r -> Kind.Type
+#endif
 type role Code representational nominal   -- See Note [Role of TExp]
-newtype Code m (a :: TYPE (r :: RuntimeRep)) = Code
+newtype Code m a = Code
   { examineCode :: m (TExp a) -- ^ Underlying monadic value
   }
+-- ^ Represents an expression which has type @a@, built in monadic context @m@. Built on top of 'TExp', typed
+-- expressions allow for type-safe splicing via:
+--
+--   - typed quotes, written as @[|| ... ||]@ where @...@ is an expression; if
+--     that expression has type @a@, then the quotation has type
+--     @Quote m => Code m a@
+--
+--   - typed splices inside of typed quotes, written as @$$(...)@ where @...@
+--     is an arbitrary expression of type @Quote m => Code m a@
+--
+-- Traditional expression quotes and splices let us construct ill-typed
+-- expressions:
+--
+-- >>> fmap ppr $ runQ (unTypeCode [| True == $( [| "foo" |] ) |])
+-- GHC.Types.True GHC.Classes.== "foo"
+-- >>> GHC.Types.True GHC.Classes.== "foo"
+-- <interactive> error:
+--     • Couldn't match expected type ‘Bool’ with actual type ‘[Char]’
+--     • In the second argument of ‘(==)’, namely ‘"foo"’
+--       In the expression: True == "foo"
+--       In an equation for ‘it’: it = True == "foo"
+--
+-- With typed expressions, the type error occurs when /constructing/ the
+-- Template Haskell expression:
+--
+-- >>> fmap ppr $ runQ (unTypeCode [|| True == $$( [|| "foo" ||] ) ||])
+-- <interactive> error:
+--     • Couldn't match type ‘[Char]’ with ‘Bool’
+--       Expected type: Code Q Bool
+--         Actual type: Code Q [Char]
+--     • In the Template Haskell quotation [|| "foo" ||]
+--       In the expression: [|| "foo" ||]
+--       In the Template Haskell splice $$([|| "foo" ||])
+
+
+{- Note [Foralls to the right in Code]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Code has the following type signature:
+   type Code :: (Kind.Type -> Kind.Type) -> forall r. TYPE r -> Kind.Type
+
+This allows us to write
+   data T (f :: forall r . (TYPE r) -> Type) = MkT (f Int) (f Int#)
+
+   tcodeq :: T (Code Q)
+   tcodeq = MkT [||5||] [||5#||]
+
+If we used the slightly more straightforward signature
+   type Code :: foral r. (Kind.Type -> Kind.Type) -> TYPE r -> Kind.Type
+
+then the example above would become ill-typed.  (See #23592 for some discussion.)
+-}
 
 -- | Unsafely convert an untyped code representation into a typed code
 -- representation.
@@ -656,7 +681,7 @@ instance heads which unify with @nm tys@, they need not actually be satisfiable.
     @B@ themselves implement 'Eq'
 
   - @reifyInstances ''Show [ 'VarT' ('mkName' "a") ]@ produces every available
-    instance of 'Eq'
+    instance of 'Show'
 
 There is one edge case: @reifyInstances ''Typeable tys@ currently always
 produces an empty list (no matter what @tys@ are given).
@@ -758,7 +783,7 @@ runIO m = Q (qRunIO m)
 -- assumption from splices that they will be executed in the directory where the
 -- cabal file resides. Projects such as haskell-language-server can't and don't
 -- change directory when compiling files but instead set the -package-root flag
--- appropiately.
+-- appropriately.
 getPackageRoot :: Q FilePath
 getPackageRoot = Q qGetPackageRoot
 
@@ -898,7 +923,7 @@ extsEnabled = Q qExtsEnabled
 putDoc :: DocLoc -> String -> Q ()
 putDoc t s = Q (qPutDoc t s)
 
--- | Retreives the Haddock documentation at the specified location, if one
+-- | Retrieves the Haddock documentation at the specified location, if one
 -- exists.
 -- It can be used to read documentation on things defined outside of the current
 -- module, provided that those modules were compiled with the @-haddock@ flag.
@@ -957,7 +982,7 @@ sequenceQ = sequence
 -- Haskell quotation is bound outside the Oxford brackets (@[| ... |]@ or
 -- @[|| ... ||]@) but not at the top level. As an example:
 --
--- > add1 :: Int -> Q (TExp Int)
+-- > add1 :: Int -> Code Q Int
 -- > add1 x = [|| x + 1 ||]
 --
 -- Template Haskell has no way of knowing what value @x@ will take on at
@@ -965,7 +990,7 @@ sequenceQ = sequence
 --
 -- A 'Lift' instance must satisfy @$(lift x) ≡ x@ and @$$(liftTyped x) ≡ x@
 -- for all @x@, where @$(...)@ and @$$(...)@ are Template Haskell splices.
--- It is additionally expected that @'lift' x ≡ 'unTypeQ' ('liftTyped' x)@.
+-- It is additionally expected that @'lift' x ≡ 'unTypeCode' ('liftTyped' x)@.
 --
 -- 'Lift' instances can be derived automatically by use of the @-XDeriveLift@
 -- GHC language extension:
@@ -983,11 +1008,7 @@ class Lift (t :: TYPE r) where
   -- | Turn a value into a Template Haskell expression, suitable for use in
   -- a splice.
   lift :: Quote m => t -> m Exp
-#if __GLASGOW_HASKELL__ >= 901
   default lift :: (r ~ ('BoxedRep 'Lifted), Quote m) => t -> m Exp
-#else
-  default lift :: (r ~ 'LiftedRep, Quote m) => t -> m Exp
-#endif
   lift = unTypeCode . liftTyped
 
   -- | Turn a value into a Template Haskell typed expression, suitable for use
@@ -1056,6 +1077,14 @@ instance Lift Natural where
   liftTyped x = unsafeCodeCoerce (lift x)
   lift x = return (LitE (IntegerL (fromIntegral x)))
 
+instance Lift (Fixed.Fixed a) where
+  liftTyped x = unsafeCodeCoerce (lift x)
+  lift (Fixed.MkFixed x) = do
+    ex <- lift x
+    return (ConE mkFixedName `AppE` ex)
+    where
+      mkFixedName = 'Fixed.MkFixed
+
 instance Integral a => Lift (Ratio a) where
   liftTyped x = unsafeCodeCoerce (lift x)
   lift x = return (LitE (RationalL (toRational x)))
@@ -1102,8 +1131,6 @@ instance Lift Addr# where
   lift x
     = return (LitE (StringPrimL (map (fromIntegral . ord) (unpackCString# x))))
 
-#if __GLASGOW_HASKELL__ >= 903
-
 -- |
 -- @since 2.19.0.0
 instance Lift ByteArray where
@@ -1125,19 +1152,8 @@ instance Lift ByteArray where
       ptr :: ForeignPtr Word8
       ptr = ForeignPtr (byteArrayContents# pb) (PlainPtr (unsafeCoerce# pb))
 
-
--- We can't use a TH quote in this module because we're in the template-haskell
--- package, so we conconct this quite defensive solution to make the correct name
--- which will work if the package name or module name changes in future.
 addrToByteArrayName :: Name
-addrToByteArrayName = helper
-  where
-    helper :: HasCallStack => Name
-    helper =
-      case getCallStack ?callStack of
-        [] -> error "addrToByteArrayName: empty call stack"
-        (_, SrcLoc{..}) : _ -> mkNameG_v srcLocPackage srcLocModule "addrToByteArray"
-
+addrToByteArrayName = 'addrToByteArray
 
 addrToByteArray :: Int -> Addr# -> ByteArray
 addrToByteArray (I# len) addr = runST $ ST $
@@ -1145,8 +1161,6 @@ addrToByteArray (I# len) addr = runST $ ST $
     (# s', mb #) -> case copyAddrToByteArray# addr mb 0# len s' of
       s'' -> case unsafeFreezeByteArray# mb s'' of
         (# s''', ret #) -> (# s''', ByteArray ret #)
-
-#endif
 
 instance Lift a => Lift (Maybe a) where
   liftTyped x = unsafeCodeCoerce (lift x)
@@ -1357,23 +1371,24 @@ instance (Lift a, Lift b, Lift c, Lift d, Lift e, Lift f, Lift g)
 
 
 trueName, falseName :: Name
-trueName  = mkNameG DataName "ghc-prim" "GHC.Types" "True"
-falseName = mkNameG DataName "ghc-prim" "GHC.Types" "False"
+trueName  = 'True
+falseName = 'False
 
 nothingName, justName :: Name
-nothingName = mkNameG DataName "base" "GHC.Maybe" "Nothing"
-justName    = mkNameG DataName "base" "GHC.Maybe" "Just"
+nothingName = 'Nothing
+justName    = 'Just
 
 leftName, rightName :: Name
-leftName  = mkNameG DataName "base" "Data.Either" "Left"
-rightName = mkNameG DataName "base" "Data.Either" "Right"
+leftName  = 'Left
+rightName = 'Right
 
 nonemptyName :: Name
-nonemptyName = mkNameG DataName "base" "GHC.Base" ":|"
+nonemptyName = '(:|)
 
 oneName, manyName :: Name
-oneName  = mkNameG DataName "ghc-prim" "GHC.Types" "One"
-manyName = mkNameG DataName "ghc-prim" "GHC.Types" "Many"
+oneName  = 'One
+manyName = 'Many
+
 -----------------------------------------------------
 --
 --              Generic Lift implementations
@@ -1416,7 +1431,7 @@ dataToQa mkCon mkLit appCon antiQ t =
                       con@('(':_) -> Name (mkOccName con)
                                           (NameG DataName
                                                 (mkPkgName "ghc-prim")
-                                                (mkModName "GHC.Tuple.Prim"))
+                                                (mkModName "GHC.Tuple"))
 
                       -- Tricky case: see Note [Data for non-algebraic types]
                       fun@(x:_)   | startsVarSym x || startsVarId x
@@ -1488,8 +1503,9 @@ dataToExpQ = dataToQa varOrConE litE (foldl appE)
           -- See #10796.
           varOrConE s =
             case nameSpace s of
-                 Just VarName  -> return (VarE s)
-                 Just DataName -> return (ConE s)
+                 Just VarName      -> return (VarE s)
+                 Just (FldName {}) -> return (VarE s)
+                 Just DataName     -> return (ConE s)
                  _ -> error $ "Can't construct an expression from name "
                            ++ showName s
           appE x y = do { a <- x; b <- y; return (AppE a b)}
@@ -1665,6 +1681,14 @@ data NameSpace = VarName        -- ^ Variables
                | DataName       -- ^ Data constructors
                | TcClsName      -- ^ Type constructors and classes; Haskell has them
                                 -- in the same name space for now.
+               | FldName
+                 { fldParent :: !String
+                   -- ^ The textual name of the parent of the field.
+                   --
+                   --   - For a field of a datatype, this is the name of the first constructor
+                   --     of the datatype (regardless of whether this constructor has this field).
+                   --   - For a field of a pattern synonym, this is the name of the pattern synonym.
+                 }
                deriving( Eq, Ord, Show, Data, Generic )
 
 -- | @Uniq@ is used by GHC to distinguish names from each other.
@@ -1824,6 +1848,13 @@ mkNameG_v  = mkNameG VarName
 mkNameG_tc = mkNameG TcClsName
 mkNameG_d  = mkNameG DataName
 
+mkNameG_fld :: String -- ^ package
+            -> String -- ^ module
+            -> String -- ^ parent (first constructor of parent type)
+            -> String -- ^ field name
+            -> Name
+mkNameG_fld pkg modu con occ = mkNameG (FldName con) pkg modu occ
+
 data NameIs = Alone | Applied | Infix
 
 showName :: Name -> String
@@ -1847,11 +1878,11 @@ showName' ni nm
         -- We may well want to distinguish them in the end.
         -- Ditto NameU and NameL
         nms = case nm of
-                    Name occ NameS         -> occString occ
-                    Name occ (NameQ m)     -> modString m ++ "." ++ occString occ
-                    Name occ (NameG _ _ m) -> modString m ++ "." ++ occString occ
-                    Name occ (NameU u)     -> occString occ ++ "_" ++ show u
-                    Name occ (NameL u)     -> occString occ ++ "_" ++ show u
+          Name occ NameS          -> occString occ
+          Name occ (NameQ m)      -> modString m ++ "." ++ occString occ
+          Name occ (NameG _ _ m) -> modString m ++ "." ++ occString occ
+          Name occ (NameU u)      -> occString occ ++ "_" ++ show u
+          Name occ (NameL u)      -> occString occ ++ "_" ++ show u
 
         pnam = classify nms
 
@@ -1892,13 +1923,19 @@ mk_tup_name n space boxed
     withParens thing
       | boxed     = "("  ++ thing ++ ")"
       | otherwise = "(#" ++ thing ++ "#)"
-    tup_occ | n == 1    = if boxed then solo else "Solo#"
+    tup_occ | n == 0, space == TcClsName = if boxed then "Unit" else "Unit#"
+            | n == 1 = if boxed then solo else unboxed_solo
+            | space == TcClsName = "Tuple" ++ show n ++ if boxed then "" else "#"
             | otherwise = withParens (replicate n_commas ',')
     n_commas = n - 1
-    tup_mod  = mkModName "GHC.Tuple.Prim"
+    tup_mod  = mkModName (if boxed then "GHC.Tuple" else "GHC.Types")
     solo
       | space == DataName = "MkSolo"
       | otherwise = "Solo"
+
+    unboxed_solo
+      | space == DataName = "(# #)"
+      | otherwise = "Solo#"
 
 -- Unboxed sum data and type constructors
 -- | Unboxed sum data constructor
@@ -1918,7 +1955,7 @@ unboxedSumDataName alt arity
 
   | otherwise
   = Name (mkOccName sum_occ)
-         (NameG DataName (mkPkgName "ghc-prim") (mkModName "GHC.Prim"))
+         (NameG DataName (mkPkgName "ghc-prim") (mkModName "GHC.Types"))
 
   where
     prefix     = "unboxedSumDataName: "
@@ -1937,11 +1974,11 @@ unboxedSumTypeName arity
 
   | otherwise
   = Name (mkOccName sum_occ)
-         (NameG TcClsName (mkPkgName "ghc-prim") (mkModName "GHC.Prim"))
+         (NameG TcClsName (mkPkgName "ghc-prim") (mkModName "GHC.Types"))
 
   where
     -- Synced with the definition of mkSumTyConOcc in GHC.Builtin.Types
-    sum_occ = '(' : '#' : replicate (arity - 1) '|' ++ "#)"
+    sum_occ = "Sum" ++ show arity ++ "#"
 
 -----------------------------------------------------
 --              Locations
@@ -2262,6 +2299,8 @@ data Pat
   | ListP [ Pat ]                   -- ^ @{ [1,2,3] }@
   | SigP Pat Type                   -- ^ @{ p :: t }@
   | ViewP Exp Pat                   -- ^ @{ e -> p }@
+  | TypeP Type                      -- ^ @{ type p }@
+  | InvisP Type                     -- ^ @{ @p }@
   deriving( Show, Eq, Ord, Data, Generic )
 
 type FieldPat = (Name,Pat)
@@ -2359,6 +2398,9 @@ data Exp
   | ImplicitParamVarE String           -- ^ @{ ?x }@ ( Implicit parameter )
   | GetFieldE Exp String               -- ^ @{ exp.field }@ ( Overloaded Record Dot )
   | ProjectionE (NonEmpty String)      -- ^ @(.x)@ or @(.x.y)@ (Record projections)
+  | TypedBracketE Exp                  -- ^ @[|| e ||]@
+  | TypedSpliceE Exp                   -- ^ @$$e@
+  | TypeE Type                         -- ^ @{ type t }@
   deriving( Show, Eq, Ord, Data, Generic )
 
 type FieldExp = (Name,Exp)
@@ -2392,22 +2434,22 @@ data Range = FromR Exp | FromThenR Exp Exp
 data Dec
   = FunD Name [Clause]            -- ^ @{ f p1 p2 = b where decs }@
   | ValD Pat Body [Dec]           -- ^ @{ p = b where decs }@
-  | DataD Cxt Name [TyVarBndr ()]
+  | DataD Cxt Name [TyVarBndr BndrVis]
           (Maybe Kind)            -- Kind signature (allowed only for GADTs)
           [Con] [DerivClause]
                                   -- ^ @{ data Cxt x => T x = A x | B (T x)
                                   --       deriving (Z,W)
                                   --       deriving stock Eq }@
-  | NewtypeD Cxt Name [TyVarBndr ()]
+  | NewtypeD Cxt Name [TyVarBndr BndrVis]
              (Maybe Kind)         -- Kind signature
              Con [DerivClause]    -- ^ @{ newtype Cxt x => T x = A (B x)
                                   --       deriving (Z,W Q)
                                   --       deriving stock Eq }@
-  | TypeDataD Name [TyVarBndr ()]
+  | TypeDataD Name [TyVarBndr BndrVis]
           (Maybe Kind)            -- Kind signature (allowed only for GADTs)
           [Con]                   -- ^ @{ type data T x = A x | B (T x) }@
-  | TySynD Name [TyVarBndr ()] Type -- ^ @{ type T x = (x,x) }@
-  | ClassD Cxt Name [TyVarBndr ()]
+  | TySynD Name [TyVarBndr BndrVis] Type -- ^ @{ type T x = (x,x) }@
+  | ClassD Cxt Name [TyVarBndr BndrVis]
          [FunDep] [Dec]           -- ^ @{ class Eq a => Ord a where ds }@
   | InstanceD (Maybe Overlap) Cxt Type [Dec]
                                   -- ^ @{ instance {\-\# OVERLAPS \#-\}
@@ -2417,14 +2459,15 @@ data Dec
   | ForeignD Foreign              -- ^ @{ foreign import ... }
                                   --{ foreign export ... }@
 
-  | InfixD Fixity Name            -- ^ @{ infix 3 foo }@
+  | InfixD Fixity NamespaceSpecifier Name
+                                  -- ^ @{ infix 3 data foo }@
   | DefaultD [Type]               -- ^ @{ default (Integer, Double) }@
 
   -- | pragmas
   | PragmaD Pragma                -- ^ @{ {\-\# INLINE [1] foo \#-\} }@
 
   -- | data families (may also appear in [Dec] of 'ClassD' and 'InstanceD')
-  | DataFamilyD Name [TyVarBndr ()]
+  | DataFamilyD Name [TyVarBndr BndrVis]
                (Maybe Kind)
          -- ^ @{ data family T a b c :: * }@
 
@@ -2472,6 +2515,18 @@ data Dec
       --
       -- Implicit parameter binding declaration. Can only be used in let
       -- and where clauses which consist entirely of implicit bindings.
+  deriving( Show, Eq, Ord, Data, Generic )
+
+-- | A way to specify a namespace to look in when GHC needs to find
+--   a name's source
+data NamespaceSpecifier
+  = NoNamespaceSpecifier   -- ^ Name may be everything; If there are two
+                           --   names in different namespaces, then consider both
+  | TypeNamespaceSpecifier -- ^ Name should be a type-level entity, such as a
+                           --   data type, type alias, type family, type class,
+                           --   or type variable
+  | DataNamespaceSpecifier -- ^ Name should be a term-level entity, such as a
+                           --   function, data constructor, or pattern synonym
   deriving( Show, Eq, Ord, Data, Generic )
 
 -- | Varieties of allowed instance overlap.
@@ -2548,7 +2603,7 @@ type PatSynType = Type
 -- @TypeFamilyHead@ is defined to be the elements of the declaration
 -- between @type family@ and @where@.
 data TypeFamilyHead =
-  TypeFamilyHead Name [TyVarBndr ()] FamilyResultSig (Maybe InjectivityAnn)
+  TypeFamilyHead Name [TyVarBndr BndrVis] FamilyResultSig (Maybe InjectivityAnn)
   deriving( Show, Eq, Ord, Data, Generic )
 
 -- | One equation of a type family instance or closed type family. The
@@ -2594,6 +2649,8 @@ data Pragma = InlineP         Name Inline RuleMatch Phases
             | LineP           Int String
             | CompleteP       [Name] (Maybe Name)
                 -- ^ @{ {\-\# COMPLETE C_1, ..., C_i [ :: T ] \#-} }@
+            | SCCP            Name (Maybe String)
+                -- ^ @{ {\-\# SCC fun "optional_name" \#-} }@
         deriving( Show, Eq, Ord, Data, Generic )
 
 data Inline = NoInline
@@ -2658,7 +2715,7 @@ data DecidedStrictness = DecidedLazy -- ^ Field inferred to not have a bang.
                        | DecidedUnpack -- ^ Field inferred to be unpacked.
         deriving (Show, Eq, Ord, Data, Generic)
 
--- | A single data constructor.
+-- | A data constructor.
 --
 -- The constructors for 'Con' can roughly be divided up into two categories:
 -- those for constructors with \"vanilla\" syntax ('NormalC', 'RecC', and
@@ -2691,16 +2748,36 @@ data DecidedStrictness = DecidedLazy -- ^ Field inferred to not have a bang.
 -- Multiplicity annotations for data types are currently not supported
 -- in Template Haskell (i.e. all fields represented by Template Haskell
 -- will be linear).
-data Con = NormalC Name [BangType]       -- ^ @C Int a@
-         | RecC Name [VarBangType]       -- ^ @C { v :: Int, w :: a }@
-         | InfixC BangType Name BangType -- ^ @Int :+ a@
-         | ForallC [TyVarBndr Specificity] Cxt Con -- ^ @forall a. Eq a => C [a]@
-         | GadtC [Name] [BangType]
-                 Type                    -- See Note [GADT return type]
-                                         -- ^ @C :: a -> b -> T b Int@
-         | RecGadtC [Name] [VarBangType]
-                    Type                 -- See Note [GADT return type]
-                                         -- ^ @C :: { v :: Int } -> T b Int@
+data Con =
+  -- | @C Int a@
+    NormalC Name [BangType]
+
+  -- | @C { v :: Int, w :: a }@
+  | RecC Name [VarBangType]
+
+  -- | @Int :+ a@
+  | InfixC BangType Name BangType
+
+  -- | @forall a. Eq a => C [a]@
+  | ForallC [TyVarBndr Specificity] Cxt Con
+
+  -- @C :: a -> b -> T b Int@
+  | GadtC [Name]
+            -- ^ The list of constructors, corresponding to the GADT constructor
+            -- syntax @C1, C2 :: a -> T b@.
+            --
+            -- Invariant: the list must be non-empty.
+          [BangType] -- ^ The constructor arguments
+          Type -- ^ See Note [GADT return type]
+
+  -- | @C :: { v :: Int } -> T b Int@
+  | RecGadtC [Name]
+             -- ^ The list of constructors, corresponding to the GADT record
+             -- constructor syntax @C1, C2 :: { fld :: a } -> T b@.
+             --
+             -- Invariant: the list must be non-empty.
+             [VarBangType] -- ^ The constructor arguments
+             Type -- ^ See Note [GADT return type]
         deriving (Show, Eq, Ord, Data, Generic)
 
 -- Note [GADT return type]
@@ -2804,9 +2881,19 @@ data Specificity = SpecifiedSpec          -- ^ @a@
                  | InferredSpec           -- ^ @{a}@
       deriving( Show, Eq, Ord, Data, Generic )
 
+-- | The @flag@ type parameter is instantiated to one of the following types:
+--
+--   * 'Specificity' (examples: 'ForallC', 'ForallT')
+--   * 'BndrVis' (examples: 'DataD', 'ClassD', etc.)
+--   * '()', a catch-all type for other forms of binders, including 'ForallVisT', 'DataInstD', 'RuleP', and 'TyVarSig'
+--
 data TyVarBndr flag = PlainTV  Name flag      -- ^ @a@
                     | KindedTV Name flag Kind -- ^ @(a :: k)@
-      deriving( Show, Eq, Ord, Data, Generic, Functor )
+      deriving( Show, Eq, Ord, Data, Generic, Functor, Foldable, Traversable )
+
+data BndrVis = BndrReq                    -- ^ @a@
+             | BndrInvis                  -- ^ @\@a@
+      deriving( Show, Eq, Ord, Data, Generic )
 
 -- | Type family result signature
 data FamilyResultSig = NoSig              -- ^ no signature
@@ -2897,3 +2984,15 @@ cmpEq _  = False
 thenCmp :: Ordering -> Ordering -> Ordering
 thenCmp EQ o2 = o2
 thenCmp o1 _  = o1
+
+get_cons_names :: Con -> [Name]
+get_cons_names (NormalC n _)     = [n]
+get_cons_names (RecC n _)        = [n]
+get_cons_names (InfixC _ n _)    = [n]
+get_cons_names (ForallC _ _ con) = get_cons_names con
+-- GadtC can have multiple names, e.g
+-- > data Bar a where
+-- >   MkBar1, MkBar2 :: a -> Bar a
+-- Will have one GadtC with [MkBar1, MkBar2] as names
+get_cons_names (GadtC ns _ _)    = ns
+get_cons_names (RecGadtC ns _ _) = ns

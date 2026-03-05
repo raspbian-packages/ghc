@@ -11,6 +11,7 @@
 #include "Rts.h"
 #include "Hash.h"
 #include "linker/M32Alloc.h"
+#include "linker/ProddableBlocks.h"
 
 #if RTS_LINKER_USE_MMAP
 #include <sys/mman.h>
@@ -64,6 +65,8 @@ typedef enum _SymType {
     SYM_TYPE_DUP_DISCARD = 1 << 3, /* the symbol is a symbol in a BFD import library
                                       however if a duplicate is found with a mismatching
                                       SymType then discard this one.  */
+    SYM_TYPE_HIDDEN = 1 << 4, /* the symbol is hidden and should not be exported */
+
 } SymType;
 
 
@@ -190,14 +193,6 @@ struct _Section {
   struct SectionFormatInfo* info;
 };
 
-typedef
-   struct _ProddableBlock {
-      void* start;
-      int   size;
-      struct _ProddableBlock* next;
-   }
-   ProddableBlock;
-
 typedef struct _Segment {
     void *start;                /* page aligned start address of a segment */
     size_t size;                /* page rounded size of a segment */
@@ -313,7 +308,13 @@ struct _ObjectCode {
     struct _ObjectCode *next_loaded_object;
 
     // Mark bit
+    // N.B. This is a full word as we CAS it.
     StgWord mark;
+
+    // Can this object be safely unloaded? Not true for
+    // dynamic objects when dlinfo is not available as
+    // we cannot determine liveness.
+    bool unloadable;
 
     // Set of dependencies (ObjectCode*) of the object file. Traverse
     // dependencies using `iterHashTable`.
@@ -334,7 +335,7 @@ struct _ObjectCode {
     /* SANITY CHECK ONLY: a list of the only memory regions which may
        safely be prodded during relocation.  Any attempt to prod
        outside one of these is an error in the linker. */
-    ProddableBlock* proddables;
+    ProddableBlockSet proddables;
 
 #if defined(NEED_SYMBOL_EXTRAS)
     SymbolExtra    *symbol_extras;
@@ -376,7 +377,9 @@ struct _ObjectCode {
     /* handle returned from dlopen */
     void *dlopen_handle;
 
-    /* virtual memory ranges of loaded code */
+    /* virtual memory ranges of loaded code. NULL if no range information is
+     * available (e.g. if dlinfo is unavailable on the current platform).
+     */
     NativeCodeRange *nc_ranges;
 };
 
@@ -404,10 +407,6 @@ extern Elf_Word shndx_table_uninit_label;
 
 #if defined(THREADED_RTS)
 extern Mutex linker_mutex;
-
-#if defined(OBJFORMAT_ELF) || defined(OBJFORMAT_MACHO)
-extern Mutex dl_mutex;
-#endif
 #endif /* THREADED_RTS */
 
 /* Type of an initializer */
@@ -447,10 +446,6 @@ void exitLinker( void );
 
 void freeObjectCode (ObjectCode *oc);
 SymbolAddr* loadSymbol(SymbolName *lbl, RtsSymbolInfo *pinfo);
-
-void addProddableBlock ( ObjectCode* oc, void* start, int size );
-void checkProddableBlock (ObjectCode *oc, void *addr, size_t size );
-void freeProddableBlocks (ObjectCode *oc);
 
 void addSection (Section *s, SectionKind kind, SectionAlloc alloc,
                  void* start, StgWord size, StgWord mapped_offset,
@@ -507,9 +502,9 @@ HsInt loadArchive_ (pathchar *path);
 #define USE_CONTIGUOUS_MMAP 0
 #endif
 
-
 HsInt isAlreadyLoaded( pathchar *path );
 OStatus getObjectLoadStatus_ (pathchar *path);
+ObjectCode *lookupObjectByPath(pathchar *path);
 HsInt loadOc( ObjectCode* oc );
 ObjectCode* mkOc( ObjectType type, pathchar *path, char *image, int imageSize,
                   bool mapped, pathchar *archiveMemberName,

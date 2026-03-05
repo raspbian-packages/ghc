@@ -1,4 +1,4 @@
-{-# LANGUAGE MultiWayIf #-}
+{-# LANGUAGE MultiWayIf, LambdaCase #-}
 
 {-|
 Module      : GHC.Driver.Backend
@@ -58,8 +58,6 @@ module GHC.Driver.Backend
    , DefunctionalizedCodeOutput(..)
      -- *** Back-end functions for assembly
    , DefunctionalizedPostHscPipeline(..)
-   , DefunctionalizedAssemblerProg(..)
-   , DefunctionalizedAssemblerInfoGetter(..)
      -- *** Other back-end functions
    , DefunctionalizedCDefs(..)
      -- ** Names of back ends (for API clients of version 9.4 or earlier)
@@ -87,15 +85,13 @@ module GHC.Driver.Backend
    , backendUnregisterisedAbiOnly
    , backendGeneratesHc
    , backendSptIsDynamic
-   , backendWantsBreakpointTicks
+   , backendSupportsBreakpoints
    , backendForcesOptimization0
    , backendNeedsFullWays
    , backendSpecialModuleSource
    , backendSupportsHpc
    , backendSupportsCImport
    , backendSupportsCExport
-   , backendAssemblerProg
-   , backendAssemblerInfoGetter
    , backendCDefs
    , backendCodeOutput
    , backendUseJSLinker
@@ -348,40 +344,6 @@ data PrimitiveImplementation
   deriving Show
 
 
--- | Names a function that runs the assembler, of this type:
---
--- > Logger -> DynFlags -> Platform -> [Option] -> IO ()
---
--- The functions so named are defined in "GHC.Driver.Pipeline.Execute".
-
-data DefunctionalizedAssemblerProg
-  = StandardAssemblerProg
-       -- ^ Use the standard system assembler
-  | JSAssemblerProg
-       -- ^ JS Backend compile to JS via Stg, and so does not use any assembler
-  | DarwinClangAssemblerProg
-       -- ^ If running on Darwin, use the assembler from the @clang@
-       -- toolchain.  Otherwise use the standard system assembler.
-
-
-
--- | Names a function that discover from what toolchain the assembler
--- is coming, of this type:
---
--- > Logger -> DynFlags -> Platform -> IO CompilerInfo
---
--- The functions so named are defined in "GHC.Driver.Pipeline.Execute".
-
-data DefunctionalizedAssemblerInfoGetter
-  = StandardAssemblerInfoGetter
-       -- ^ Interrogate the standard system assembler
-  | JSAssemblerInfoGetter
-       -- ^ If using the JS backend; return 'Emscripten'
-  | DarwinClangAssemblerInfoGetter
-       -- ^ If running on Darwin, return `Clang`; otherwise
-       -- interrogate the standard system assembler.
-
-
 -- | Names a function that generates code and writes the results to a
 --  file, of this type:
 --
@@ -551,17 +513,14 @@ backendRespectsSpecialise (Named NoBackend)   = False
 
 -- | This back end wants the `mi_globals` field of a
 -- `ModIface` to be populated (with the top-level bindings
--- of the original source).  True for the interpreter, and
--- also true for "no backend", which is used by Haddock.
--- (After typechecking a module, Haddock wants access to
--- the module's `GlobalRdrEnv`.)
+-- of the original source).  Only true for the interpreter.
 backendWantsGlobalBindings :: Backend -> Bool
 backendWantsGlobalBindings (Named NCG)         = False
 backendWantsGlobalBindings (Named LLVM)        = False
 backendWantsGlobalBindings (Named ViaC)        = False
 backendWantsGlobalBindings (Named JavaScript)  = False
+backendWantsGlobalBindings (Named NoBackend)   = False
 backendWantsGlobalBindings (Named Interpreter) = True
-backendWantsGlobalBindings (Named NoBackend)   = True
 
 -- | The back end targets a technology that implements
 -- `switch` natively.  (For example, LLVM or C.) Therefore
@@ -691,16 +650,16 @@ backendSptIsDynamic (Named JavaScript)  = False
 backendSptIsDynamic (Named Interpreter) = True
 backendSptIsDynamic (Named NoBackend)   = False
 
--- | If this flag is set, then "GHC.HsToCore.Ticks"
--- inserts `Breakpoint` ticks.  Used only for the
--- interpreter.
-backendWantsBreakpointTicks :: Backend -> Bool
-backendWantsBreakpointTicks (Named NCG)         = False
-backendWantsBreakpointTicks (Named LLVM)        = False
-backendWantsBreakpointTicks (Named ViaC)        = False
-backendWantsBreakpointTicks (Named JavaScript)  = False
-backendWantsBreakpointTicks (Named Interpreter) = True
-backendWantsBreakpointTicks (Named NoBackend)   = False
+-- | If this flag is unset, then the driver ignores the flag @-fbreak-points@,
+-- since backends other than the interpreter tend to panic on breakpoints.
+backendSupportsBreakpoints :: Backend -> Bool
+backendSupportsBreakpoints = \case
+  Named NCG         -> False
+  Named LLVM        -> False
+  Named ViaC        -> False
+  Named JavaScript  -> False
+  Named Interpreter -> True
+  Named NoBackend   -> False
 
 -- | If this flag is set, then the driver forces the
 -- optimization level to 0, issuing a warning message if
@@ -769,45 +728,6 @@ backendSupportsCExport (Named ViaC)        = True
 backendSupportsCExport (Named JavaScript)  = True
 backendSupportsCExport (Named Interpreter) = False
 backendSupportsCExport (Named NoBackend)   = True
-
--- | This (defunctionalized) function runs the assembler
--- used on the code that is written by this back end.  A
--- program determined by a combination of back end,
--- `DynFlags`, and `Platform` is run with the given
--- `Option`s.
---
--- The function's type is
--- @
--- Logger -> DynFlags -> Platform -> [Option] -> IO ()
--- @
---
--- This field is usually defaulted.
-backendAssemblerProg :: Backend -> DefunctionalizedAssemblerProg
-backendAssemblerProg (Named NCG)  = StandardAssemblerProg
-backendAssemblerProg (Named LLVM) = DarwinClangAssemblerProg
-backendAssemblerProg (Named ViaC) = StandardAssemblerProg
-backendAssemblerProg (Named JavaScript)  = JSAssemblerProg
-backendAssemblerProg (Named Interpreter) = StandardAssemblerProg
-backendAssemblerProg (Named NoBackend)   = StandardAssemblerProg
-
--- | This (defunctionalized) function is used to retrieve
--- an enumeration value that characterizes the C/assembler
--- part of a toolchain.  The function caches the info in a
--- mutable variable that is part of the `DynFlags`.
---
--- The function's type is
--- @
--- Logger -> DynFlags -> Platform -> IO CompilerInfo
--- @
---
--- This field is usually defaulted.
-backendAssemblerInfoGetter :: Backend -> DefunctionalizedAssemblerInfoGetter
-backendAssemblerInfoGetter (Named NCG)         = StandardAssemblerInfoGetter
-backendAssemblerInfoGetter (Named LLVM)        = DarwinClangAssemblerInfoGetter
-backendAssemblerInfoGetter (Named ViaC)        = StandardAssemblerInfoGetter
-backendAssemblerInfoGetter (Named JavaScript)  = JSAssemblerInfoGetter
-backendAssemblerInfoGetter (Named Interpreter) = StandardAssemblerInfoGetter
-backendAssemblerInfoGetter (Named NoBackend)   = StandardAssemblerInfoGetter
 
 -- | When using this back end, it may be necessary or
 -- advisable to pass some `-D` options to a C compiler.

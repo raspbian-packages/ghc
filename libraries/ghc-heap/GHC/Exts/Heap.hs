@@ -120,7 +120,7 @@ instance Word64# ~ a => HasHeapRep (a :: TYPE 'Word64Rep) where
 
 instance Addr# ~ a => HasHeapRep (a :: TYPE 'AddrRep) where
     getClosureData x = return $
-        AddrClosure { ptipe = PAddr, addrVal = I# (unsafeCoerce# x) }
+        AddrClosure { ptipe = PAddr, addrVal = Ptr x }
 
 instance Float# ~ a => HasHeapRep (a :: TYPE 'FloatRep) where
     getClosureData x = return $
@@ -317,8 +317,9 @@ getClosureDataFromHeapRepPrim getConDesc decodeCCS itbl heapRep pts = do
             _ -> fail $ "Expected at least 3 ptrs to MVAR, found "
                         ++ show (length pts)
 
-        BLOCKING_QUEUE ->
-            pure $ OtherClosure itbl pts rawHeapWords
+        BLOCKING_QUEUE
+          | [_link, bh, _owner, msg] <- pts ->
+            pure $ BlockingQueueClosure itbl _link bh _owner msg
 
         WEAK -> case pts of
             pts0 : pts1 : pts2 : pts3 : rest -> pure $ WeakClosure

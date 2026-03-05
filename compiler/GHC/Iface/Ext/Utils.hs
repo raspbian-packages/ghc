@@ -9,7 +9,7 @@ module GHC.Iface.Ext.Utils where
 import GHC.Prelude
 
 import GHC.Core.Map.Type
-import GHC.Driver.Session    ( DynFlags )
+import GHC.Driver.DynFlags    ( DynFlags )
 import GHC.Driver.Ppr
 import GHC.Data.FastString   ( FastString, mkFastString )
 import GHC.Iface.Type
@@ -107,7 +107,13 @@ data EvidenceInfo a
   , evidenceSpan :: RealSrcSpan
   , evidenceType :: a
   , evidenceDetails :: Maybe (EvVarSource, Scope, Maybe Span)
-  } deriving (Eq,Ord,Functor)
+  } deriving (Eq, Functor)
+
+instance Ord a => Ord (EvidenceInfo a) where
+  compare (EvidenceInfo name span typ dets) (EvidenceInfo name' span' typ' dets') =
+    case stableNameCmp name name' of
+      EQ -> compare (span, typ, dets) (span', typ', dets')
+      r -> r
 
 instance (Outputable a) => Outputable (EvidenceInfo a) where
   ppr (EvidenceInfo name span typ dets) =
@@ -527,21 +533,14 @@ locOnly (RealSrcSpan span _) = do
   pure [Node e span []]
 locOnly _ = pure []
 
-mkScopeA :: SrcSpanAnn' ann -> Scope
-mkScopeA l = mkScope (locA l)
+locOnlyE :: Monad m => EpaLocation -> ReaderT NodeOrigin m [HieAST a]
+locOnlyE (EpaSpan s) = locOnly s
+locOnlyE _ = pure []
 
-mkScope :: SrcSpan -> Scope
-mkScope (RealSrcSpan sp _) = LocalScope sp
-mkScope _ = NoScope
-
-mkLScope :: Located a -> Scope
-mkLScope = mkScope . getLoc
-
-mkLScopeA :: GenLocated (SrcSpanAnn' a) e -> Scope
-mkLScopeA = mkScope . locA . getLoc
-
-mkLScopeN :: LocatedN a -> Scope
-mkLScopeN = mkScope . getLocA
+mkScope :: (HasLoc a) => a -> Scope
+mkScope a = case getHasLoc a of
+              (RealSrcSpan sp _) -> LocalScope sp
+              _ -> NoScope
 
 combineScopes :: Scope -> Scope -> Scope
 combineScopes ModuleScope _ = ModuleScope
@@ -557,8 +556,8 @@ mkSourcedNodeInfo org ni = SourcedNodeInfo $ M.singleton org ni
 {-# INLINEABLE makeNodeA #-}
 makeNodeA
   :: (Monad m, Data a)
-  => a                       -- ^ helps fill in 'nodeAnnotations' (with 'Data')
-  -> SrcSpanAnn' ann         -- ^ return an empty list if this is unhelpful
+  => a                 -- ^ helps fill in 'nodeAnnotations' (with 'Data')
+  -> EpAnn ann         -- ^ return an empty list if this is unhelpful
   -> ReaderT NodeOrigin m [HieAST b]
 makeNodeA x spn = makeNode x (locA spn)
 

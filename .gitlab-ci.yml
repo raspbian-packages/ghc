@@ -2,11 +2,11 @@ variables:
   GIT_SSL_NO_VERIFY: "1"
 
   # Commit of ghc/ci-images repository from which to pull Docker images
-  DOCKER_REV: 572353e0644044fe3a5465bba4342a9a0b0eb60e
+  DOCKER_REV: a9297a370025101b479cfd4977f8f910814e03ab
 
   # Sequential version number of all cached things.
   # Bump to invalidate GitLab CI cache.
-  CACHE_REV: 10
+  CACHE_REV: 11
 
   # Disable shallow clones; they break our linting rules
   GIT_DEPTH: 0
@@ -57,35 +57,54 @@ stages:
 # Note [The CI Story]
 # ~~~~~~~~~~~~~~~~~~~
 #
-# There are two different types of pipelines:
+# There are a few different types of pipelines. Among them:
 #
-#  - marge-bot merges to `master`. Here we perform an exhaustive validation
+# 1. marge-bot merges to `master`. Here we perform an exhaustive validation
 #    across all of the platforms which we support. In addition, we push
 #    performance metric notes upstream, providing a persistent record of the
 #    performance characteristics of the compiler.
 #
-#  - merge requests. Here we perform a slightly less exhaustive battery of
+# 2. merge requests. Here we perform a slightly less exhaustive battery of
 #    testing. Namely we omit some configurations (e.g. the unregisterised job).
 #    These use the merge request's base commit for performance metric
 #    comparisons.
 #
-
+# These and other pipelines are defined implicitly by the rules of individual
+# jobs.
+#
+# At the top level, however, we can declare that pipelines (of whatever type)
+# only run when:
+#
+# 1. Processing a merge request (as mentioned above)
+#
+# 2. Processing a tag
+#
+# 3. Pushing to master on the root ghc/ghc repo (as mentioned above)
+#
+# 4. Pushing to a release branch on the root ghc/ghc repo
+#
+# 5. Somebody manually triggers a pipeline from the GitLab UI
+#
+# In particular, note that pipelines don't automatically run just when changes
+# are pushed to a feature branch.
 workflow:
-  # N.B. Don't run on wip/ branches, instead on run on merge requests.
   rules:
     - if: $CI_MERGE_REQUEST_ID
     - if: $CI_COMMIT_TAG
-    - if: '$CI_COMMIT_BRANCH == "master"'
-    - if: '$CI_COMMIT_BRANCH =~ /ghc-[0-9]+\.[0-9]+/'
+    # N.B.: If we weren't explicit about CI_PROJECT_ID, the following rule would
+    # cause a duplicate pipeline for merge requests coming from the master
+    # branch of a fork.
+    - if: $CI_PROJECT_ID == "1" && $CI_COMMIT_BRANCH == "master"
+    - if: $CI_PROJECT_ID == "1" && $CI_COMMIT_BRANCH =~ /ghc-[0-9]+\.[0-9]+/
     - if: '$CI_PIPELINE_SOURCE == "web"'
 
 # which versions of GHC to allow bootstrap with
 .bootstrap_matrix : &bootstrap_matrix
   matrix:
-    - GHC_VERSION: 9.2.5
-      DOCKER_IMAGE: "registry.gitlab.haskell.org/ghc/ci-images/x86_64-linux-deb10-ghc9_2:$DOCKER_REV"
-    - GHC_VERSION: 9.4.3
-      DOCKER_IMAGE: "registry.gitlab.haskell.org/ghc/ci-images/x86_64-linux-deb10:$DOCKER_REV"
+    - GHC_VERSION: 9.6.4
+      DOCKER_IMAGE: "registry.gitlab.haskell.org/ghc/ci-images/x86_64-linux-deb10-ghc9_6:$DOCKER_REV"
+    - GHC_VERSION: 9.8.1
+      DOCKER_IMAGE: "registry.gitlab.haskell.org/ghc/ci-images/x86_64-linux-deb10-ghc9_8:$DOCKER_REV"
 
 # Allow linters to fail on draft MRs.
 # This must be explicitly transcluded in lint jobs which
@@ -122,6 +141,12 @@ workflow:
     expire_in: 1 year
   rules:
     - if: '$RELEASE_JOB == "yes"'
+
+.full-ci: &full-ci
+  - if: '$CI_MERGE_REQUEST_LABELS =~ /.*full-ci.*/'
+  - if: '$CI_MERGE_REQUEST_LABELS =~ /.*marge_bot_batch_merge_job.*/'
+  - if: '$CI_COMMIT_BRANCH == "master"'
+  - if: '$CI_COMMIT_BRANCH =~ /ghc-[0-9]+\.[0-9]+/'
 
 ############################################################
 # Runner Tags
@@ -264,7 +289,7 @@ lint-author:
     - *drafts-can-fail-lint
 
 lint-ci-config:
-  image: nixos/nix:2.12.0
+  image: nixos/nix:2.25.2
   extends: .lint
   # We don't need history/submodules in this job
   variables:
@@ -272,11 +297,29 @@ lint-ci-config:
     GIT_SUBMODULE_STRATEGY: none
   before_script:
     - echo "experimental-features = nix-command flakes" >> /etc/nix/nix.conf
-    - nix-channel --update
+    # Note [Nix-in-Docker]
+    # ~~~~~~~~~~~~~~~~~~~~
+    # The nixos/nix default config is max-jobs=1 and cores=$(logical
+    # cores num) which doesn't play nice with our $CPUS convention. We
+    # fix it before invoking any nix build to avoid oversubscribing
+    # while allowing a reasonable degree of parallelism.
+    # FIXME: Disabling build-users-group=nixbld is a workaround for a Nix-in-Docker issue. See
+    # https://gitlab.haskell.org/ghc/head.hackage/-/issues/38#note_560487 for
+    # discussion.
+    - echo "cores = $CPUS" >> /etc/nix/nix.conf
+    - echo "max-jobs = $CPUS" >> /etc/nix/nix.conf
+    - nix run nixpkgs#gnused -- -i -e 's/ nixbld//' /etc/nix/nix.conf
   script:
-    - .gitlab/generate_jobs
+    - nix run .gitlab/generate-ci#generate-jobs
     # 1 if .gitlab/generate_jobs changed the output of the generated config
     - nix shell nixpkgs#git -c git diff --exit-code
+    # And run this to generate the .gitlab/jobs-metadata.json
+    - nix run .gitlab/generate-ci#generate-job-metadata
+  artifacts:
+    when: always
+    paths:
+      - .gitlab/jobs-metadata.json
+      - .gitlab/jobs.yaml
   dependencies: []
 
 lint-submods:
@@ -329,7 +372,8 @@ lint-submods-branch:
     paths:
       - cabal-cache
 
-hlint-ghc-and-base:
+# Disabled due to #22830
+.hlint-ghc-and-base:
   extends: .lint-params
   image: "registry.gitlab.haskell.org/ghc/ci-images/linters:$DOCKER_REV"
   variables:
@@ -337,6 +381,8 @@ hlint-ghc-and-base:
   script:
     - .gitlab/ci.sh setup
     - .gitlab/ci.sh configure
+    - .gitlab/ci.sh run_hadrian lint:ghc-internal
+    - .gitlab/ci.sh run_hadrian lint:ghc-experimental
     - .gitlab/ci.sh run_hadrian lint:base
     - .gitlab/ci.sh run_hadrian lint:compiler
 
@@ -362,8 +408,12 @@ hadrian-ghc-in-ghci:
     - git clean -xdf && git submodule foreach git clean -xdf
     - .gitlab/ci.sh setup
     - .gitlab/ci.sh configure
+    # Enable -Werror when building hadrian
+    - "echo 'package hadrian'  > hadrian/cabal.project.local"
+    - "echo '  ghc-options: -Werror'  >> hadrian/cabal.project.local"
     # Load ghc-in-ghci then immediately exit and check the modules loaded
-    - echo ":q" | hadrian/ghci -j`mk/detect-cpu-count.sh`| tail -n2 | grep "Ok,"
+    - export CORES="$(mk/detect-cpu-count.sh)"
+    - echo ":q" | HADRIAN_ARGS=-j$CORES hadrian/ghci -j$CORES | tail -n2 | grep "Ok,"
   after_script:
     - .gitlab/ci.sh save_cache
     - cat ci-timings
@@ -414,14 +464,17 @@ hadrian-multi:
     - .gitlab/ci.sh configure
     # Now GHC means, use this GHC for hadrian
     - export GHC=$BOOT_HC
+    - export CORES="$(mk/detect-cpu-count.sh)"
     # Load hadrian-multi then immediately exit and check the modules loaded
-    - echo ":q" | hadrian/ghci-multi -j`mk/detect-cpu-count.sh`| tail -n2 | grep "Ok,"
+    - echo ":q" | HADRIAN_ARGS=-j$CORES hadrian/ghci-multi -j$CORES | tail -n2 | grep "Ok,"
   after_script:
     - .gitlab/ci.sh save_cache
   cache:
     key: hadrian-ghci-$CACHE_REV
     paths:
       - cabal-cache
+  rules:
+    - *full-ci
 
 ############################################################
 # stack-hadrian-build
@@ -442,16 +495,21 @@ stack-hadrian-build:
 # Testing reinstallable ghc codepath
 ####################################
 
-test-cabal-reinstall-x86_64-linux-deb10:
-  extends: nightly-x86_64-linux-deb10-validate
-  stage: full-build
-  variables:
-    REINSTALL_GHC: "yes"
-    BUILD_FLAVOUR: validate
-    TEST_ENV: "x86_64-linux-deb10-cabal-install"
-  rules:
-    - if: $NIGHTLY
-    - if: '$CI_MERGE_REQUEST_LABELS =~ /.*test-reinstall.*/'
+# As documented on the original ticket #19896, this feature already has a long
+# way to go before it can actually be used. Meanwhile, parts of it have
+# bit-rotted, possibly related to some Cabal change. The job is disabled for
+# now.
+#
+# test-cabal-reinstall-x86_64-linux-deb10:
+#   extends: nightly-x86_64-linux-deb10-validate
+#   stage: full-build
+#   variables:
+#     REINSTALL_GHC: "yes"
+#     BUILD_FLAVOUR: validate
+#     TEST_ENV: "x86_64-linux-deb10-cabal-install"
+#   rules:
+#     - if: $NIGHTLY
+#     - if: '$CI_MERGE_REQUEST_LABELS =~ /.*test-reinstall.*/'
 
 ########################################
 # Testing ABI is invariant across builds
@@ -477,6 +535,9 @@ abi-test-nightly:
     paths:
       - out
   rules:
+    # This job is broken. Disabling it until some kind soul can finish its
+    # implementation. #23269
+    - when: never
     - if: $NIGHTLY
 
 ############################################################
@@ -508,12 +569,17 @@ doc-tarball:
     LINUX_BINDIST: "ghc-x86_64-linux-deb10.tar.xz"
     WINDOWS_BINDIST: "ghc-x86_64-windows.tar.xz"
   artifacts:
+    expose_as: "Documentation Preview"
     paths:
       - haddock.html.tar.xz
+      - docs/haddock/
       - libraries.html.tar.xz
+      - docs/libraries/
       - users_guide.html.tar.xz
-      - index.html
-      - "*.pdf"
+      - docs/users_guide/
+      - docs/index.html
+      - Haddock.pdf
+      - users_guide.pdf
   script:
     - |
       mv "ghc-x86_64-linux-deb10-numa-slow-validate.tar.xz" "$LINUX_BINDIST" \
@@ -533,8 +599,8 @@ doc-tarball:
       fi
     - rm -Rf docs
     - bash -ex distrib/mkDocs/mkDocs $LINUX_BINDIST $WINDOWS_BINDIST
+    - mv docs/*.tar.xz docs/*.pdf .
     - ls -lh
-    - mv docs/*.tar.xz docs/index.html .
 
 hackage-doc-tarball:
   stage: packaging
@@ -589,6 +655,7 @@ source-tarball:
     - if: $NIGHTLY
     - if: '$RELEASE_JOB == "yes"'
     - if: '$CI_MERGE_REQUEST_LABELS =~ /.*test-bootstrap.*/'
+    - *full-ci
 
 generate-hadrian-bootstrap-sources:
   stage: full-build
@@ -607,6 +674,7 @@ generate-hadrian-bootstrap-sources:
     - if: $NIGHTLY
     - if: '$RELEASE_JOB == "yes"'
     - if: '$CI_MERGE_REQUEST_LABELS =~ /.*test-bootstrap.*/'
+    - *full-ci
 
 
 package-hadrian-bootstrap-sources:
@@ -624,6 +692,7 @@ package-hadrian-bootstrap-sources:
     - if: $NIGHTLY
     - if: '$RELEASE_JOB == "yes"'
     - if: '$CI_MERGE_REQUEST_LABELS =~ /.*test-bootstrap.*/'
+    - *full-ci
 
 test-bootstrap:
   stage: full-build
@@ -645,7 +714,10 @@ test-bootstrap:
     - .gitlab/ci.sh setup
     # Bootstrapping should not depend on HAPPY or ALEX so set them to false
     # so the build fails if they are invoked.
-    - export HAPPY=/bin/false; export ALEX=/bin/false
+    - unset HAPPY; unset ALEX
+    # Check the commands are not available, parens are crucial to start a subshell
+    - (! command -v alex --version)
+    - (! command -v happy --version)
     - .gitlab/ci.sh configure
     - .gitlab/ci.sh build_hadrian
     - .gitlab/ci.sh test_hadrian
@@ -660,6 +732,7 @@ test-bootstrap:
   rules:
     - if: $NIGHTLY
     - if: '$CI_MERGE_REQUEST_LABELS =~ /.*test-bootstrap.*/'
+    - *full-ci
     - if: '$RELEASE_JOB == "yes"'
       when: always
       variables:
@@ -708,6 +781,12 @@ hackage-lint:
     - job: nightly-x86_64-linux-deb10-numa-slow-validate
       optional: true
       artifacts: false
+    - job: nightly-aarch64-linux-deb10-validate
+      optional: true
+      artifacts: false
+    - job: aarch64-linux-deb10-validate
+      optional: true
+      artifacts: false
   extends: .hackage
   variables:
     SLOW_VALIDATE: 1
@@ -721,6 +800,9 @@ hackage-lint:
 hackage-label-lint:
   needs:
     - job: x86_64-linux-deb10-numa-slow-validate
+      optional: true
+      artifacts: false
+    - job: aarch64-linux-deb10-validate
       optional: true
       artifacts: false
   extends: .hackage
@@ -737,6 +819,9 @@ nightly-hackage-lint:
     - job: nightly-x86_64-linux-deb10-numa-slow-validate
       optional: true
       artifacts: false
+    - job: nightly-aarch64-linux-deb10-validate
+      optional: true
+      artifacts: false
   rules:
     - if: $NIGHTLY
       variables:
@@ -749,6 +834,9 @@ nightly-hackage-lint:
 nightly-hackage-perf:
   needs:
     - job: nightly-x86_64-linux-fedora33-release
+      optional: true
+      artifacts: false
+    - job: nightly-aarch64-linux-deb10-validate
       optional: true
       artifacts: false
   rules:
@@ -767,6 +855,9 @@ release-hackage-lint:
     - job: release-x86_64-linux-fedora33-release
       optional: true
       artifacts: false
+    - job: release-aarch64-linux-deb10-release+no_split_sections
+      optional: true
+      artifacts: false
   rules:
     - if: '$RELEASE_JOB == "yes"'
   extends: .hackage
@@ -777,6 +868,60 @@ release-hackage-lint:
   variables:
     # No slow-validate bindist on release pipeline
     EXTRA_HC_OPTS: "-dlint"
+
+############################################################
+# Testing via test-primops
+############################################################
+
+# Triggering jobs in the ghc/test-primops project
+
+.test-primops:
+  stage: testing
+  variables:
+    UPSTREAM_PROJECT_PATH: "$CI_PROJECT_PATH"
+    UPSTREAM_PROJECT_ID: "$CI_PROJECT_ID"
+    UPSTREAM_PIPELINE_ID: "$CI_PIPELINE_ID"
+  trigger:
+    project: "ghc/test-primops"
+    branch: "upstream-testing"
+    strategy: "depend"
+
+.test-primops-validate-template:
+  needs:
+    - job: x86_64-linux-deb10-validate+debug_info
+      artifacts: false
+    - job: aarch64-linux-deb10-validate
+      artifacts: false
+    - job: aarch64-darwin-validate
+      artifacts: false
+    - job: x86_64-darwin-validate
+      artifacts: false
+  extends: .test-primops
+
+test-primops-label:
+  extends: .test-primops-validate-template
+  rules:
+    - if: '$CI_MERGE_REQUEST_LABELS =~ /.*test-primops.*/'
+
+test-primops-nightly:
+  extends: .test-primops
+  needs:
+    - job: nightly-x86_64-linux-deb10-validate
+      artifacts: false
+    - job: nightly-aarch64-linux-deb10-validate
+      artifacts: false
+    - job: nightly-aarch64-darwin-validate
+      artifacts: false
+    - job: nightly-x86_64-darwin-validate
+      artifacts: false
+  rules:
+    - if: $NIGHTLY
+
+test-primops-release:
+  extends: .test-primops
+  allow_failure: true
+  rules:
+    - if: '$RELEASE_JOB == "yes"'
 
 ############################################################
 # Nofib testing
@@ -799,10 +944,7 @@ perf-nofib:
   image: "registry.gitlab.haskell.org/ghc/ci-images/x86_64-linux-fedora33:$DOCKER_REV"
   rules:
     - when: never
-    - if: $CI_MERGE_REQUEST_ID
-    - if: '$CI_COMMIT_BRANCH == "master"'
-    - if: '$CI_COMMIT_BRANCH =~ /ghc-[0.9]+\.[0-9]+/'
-    - if: '$CI_MERGE_REQUEST_LABELS !~ /.*fast-ci.*/'
+    - *full-ci
   tags:
     - x86_64-linux
   before_script:
@@ -844,10 +986,6 @@ perf:
       optional: true
   dependencies: null
   image: "registry.gitlab.haskell.org/ghc/ci-images/x86_64-linux-fedora33:$DOCKER_REV"
-  rules:
-    - if: $CI_MERGE_REQUEST_ID
-    - if: '$CI_COMMIT_BRANCH == "master"'
-    - if: '$CI_COMMIT_BRANCH =~ /ghc-[0.9]+\.[0-9]+/'
   tags:
     - x86_64-linux-perf
   script:
@@ -869,7 +1007,7 @@ perf:
     paths:
       - out
   rules:
-    - if: '$CI_MERGE_REQUEST_LABELS !~ /.*fast-ci.*/'
+    - *full-ci
 
 ############################################################
 # ABI testing
@@ -909,7 +1047,7 @@ abi-test:
     paths:
       - out
   rules:
-    - if: '$CI_MERGE_REQUEST_LABELS !~ /.*fast-ci.*/'
+    - *full-ci
 
 
 ############################################################
@@ -972,13 +1110,10 @@ project-version:
   artifacts:
     paths:
       - version.sh
-  rules:
-    - if: '$NIGHTLY'
-    - if: '$RELEASE_JOB == "yes"'
 
 .ghcup-metadata:
   stage: deploy
-  image: "nixos/nix:2.12.0"
+  image: nixos/nix:2.25.2
   dependencies: null
   tags:
     - x86_64-linux
@@ -987,15 +1122,20 @@ project-version:
     GIT_SUBMODULE_STRATEGY: "none"
   before_script:
     - echo "experimental-features = nix-command flakes" >> /etc/nix/nix.conf
+    # FIXME: See Note [Nix-in-Docker]
+    - echo "cores = $CPUS" >> /etc/nix/nix.conf
+    - echo "max-jobs = $CPUS" >> /etc/nix/nix.conf
+    - nix run nixpkgs#gnused -- -i -e 's/ nixbld//' /etc/nix/nix.conf
     - nix-channel --update
     - cat version.sh
     # Calculate the project version
     - . ./version.sh
 
-    # Download existing ghcup metadata
-    - nix shell --extra-experimental-features nix-command --extra-experimental-features flakes nixpkgs#wget -c wget "https://raw.githubusercontent.com/haskell/ghcup-metadata/develop/ghcup-0.0.7.yaml"
+    # Download existing ghcup metadata for the correct year
+    - PipelineYear="$(date -d $CI_PIPELINE_CREATED_AT +%Y)"
+    - nix shell nixpkgs#wget -c wget "https://ghc.gitlab.haskell.org/ghcup-metadata/ghcup-nightlies-$PipelineYear-0.0.7.yaml" -O ghcup-0.0.7.yaml
 
-    - .gitlab/generate_job_metadata
+    - nix run .gitlab/generate-ci#generate-job-metadata
 
   artifacts:
     paths:
@@ -1007,8 +1147,6 @@ ghcup-metadata-nightly:
   # Explicit needs for validate pipeline because we only need certain bindists
   needs:
     - job: nightly-x86_64-linux-fedora33-release
-      artifacts: false
-    - job: nightly-x86_64-linux-centos7-validate
       artifacts: false
     - job: nightly-x86_64-linux-ubuntu20_04-validate
       artifacts: false
@@ -1026,7 +1164,7 @@ ghcup-metadata-nightly:
       artifacts: false
     - job: nightly-x86_64-linux-deb9-validate
       artifacts: false
-    - job: nightly-i386-linux-deb9-validate
+    - job: nightly-i386-linux-deb10-validate
       artifacts: false
     - job: nightly-x86_64-linux-deb10-validate
       artifacts: false
@@ -1038,15 +1176,46 @@ ghcup-metadata-nightly:
       artifacts: false
     - job: project-version
   script:
-    - nix shell --extra-experimental-features nix-command -f .gitlab/rel_eng -c ghcup-metadata --metadata ghcup-0.0.7.yaml --pipeline-id="$CI_PIPELINE_ID" --version="$ProjectVersion" > "metadata_test.yaml"
+    - nix shell -f .gitlab/rel_eng -c ghcup-metadata --metadata ghcup-0.0.7.yaml --date="$(date -d $CI_PIPELINE_CREATED_AT +%Y-%m-%d)" --pipeline-id="$CI_PIPELINE_ID" --version="$ProjectVersion" > "metadata_test.yaml"
   rules:
     - if: $NIGHTLY
+
+# Update the ghcup metadata with information about this nightly pipeline
+ghcup-metadata-nightly-push:
+  stage: deploy
+  image: "registry.gitlab.haskell.org/ghc/ci-images/x86_64-linux-fedora33:$DOCKER_REV"
+  dependencies: null
+  tags:
+    - x86_64-linux
+  variables:
+    BUILD_FLAVOUR: default
+    GIT_SUBMODULE_STRATEGY: "none"
+  needs:
+    - job: ghcup-metadata-nightly
+      artifacts: true
+  script:
+    - git clone https://gitlab.haskell.org/ghc/ghcup-metadata.git
+    - PipelineYear="$(date -d $CI_PIPELINE_CREATED_AT +%Y)"
+    - cp metadata_test.yaml "ghcup-metadata/ghcup-nightlies-$PipelineYear-0.0.7.yaml"
+    - cp metadata_test.yaml "ghcup-metadata/ghcup-nightlies-0.0.7.yaml"
+    - cd ghcup-metadata
+    - git config user.email "ghc-ci@gitlab-haskell.org"
+    - git config user.name "GHC GitLab CI"
+    - git remote add gitlab_origin https://oauth2:$PROJECT_PUSH_TOKEN@gitlab.haskell.org/ghc/ghcup-metadata.git
+    - git add .
+    - git commit -m "Update metadata"
+    - git push gitlab_origin HEAD:updates
+  rules:
+    # Only run the update on scheduled nightly pipelines, ie once a day
+    - if: $NIGHTLY && $CI_PIPELINE_SOURCE == "schedule" && $CI_COMMIT_BRANCH == "master"
+
 
 ghcup-metadata-release:
   # No explicit needs for release pipeline as we assume we need everything and everything will pass.
   extends: .ghcup-metadata
   script:
-    - nix shell --extra-experimental-features nix-command -f .gitlab/rel_eng -c ghcup-metadata --release-mode --metadata ghcup-0.0.7.yaml --pipeline-id="$CI_PIPELINE_ID" --version="$ProjectVersion" > "metadata_test.yaml"
+    - nix shell -f .gitlab/rel_eng -c ghcup-metadata --release-mode --metadata ghcup-0.0.7.yaml --date="$(date -d $CI_PIPELINE_CREATED_AT +%Y-%m-%d)" --pipeline-id="$CI_PIPELINE_ID" --version="$ProjectVersion" --fragment
+    - nix shell -f .gitlab/rel_eng -c ghcup-metadata --release-mode --metadata ghcup-0.0.7.yaml --date="$(date -d $CI_PIPELINE_CREATED_AT +%Y-%m-%d)" --pipeline-id="$CI_PIPELINE_ID" --version="$ProjectVersion" > "metadata_test.yaml"
   rules:
     - if: '$RELEASE_JOB == "yes"'
 
@@ -1057,10 +1226,17 @@ ghcup-metadata-release:
     UPSTREAM_PROJECT_ID: "$CI_PROJECT_ID"
     UPSTREAM_PIPELINE_ID: "$CI_PIPELINE_ID"
     RELEASE_JOB: "$RELEASE_JOB"
+  # Do not inherit global variables (such as CONFIGURE_ARGS) as these take
+  # precedence over the variables defined in the downstream job.
+  inherit:
+    variables: false
   trigger:
     project: "ghc/ghcup-ci"
     branch: "upstream-testing"
     strategy: "depend"
+    forward:
+        yaml_variables: true
+        pipeline_variables: false
 
 ghcup-metadata-testing-nightly:
   needs:
@@ -1083,4 +1259,3 @@ ghcup-metadata-testing-release:
   rules:
     - if: '$RELEASE_JOB == "yes"'
   when: manual
-

@@ -21,25 +21,29 @@ module GHC.Hs.ImpExp
     , module GHC.Hs.ImpExp
     ) where
 
-import GHC.Prelude
-
-import GHC.Types.SourceText   ( SourceText(..) )
-import GHC.Types.FieldLabel   ( FieldLabel )
-
-import GHC.Utils.Outputable
-import GHC.Utils.Panic
-import GHC.Types.SrcLoc
-import GHC.Parser.Annotation
-import GHC.Hs.Extension
-import GHC.Types.Name
-import GHC.Types.PkgQual
-
-import Data.Data
-import Data.Maybe
-
 import Language.Haskell.Syntax.Extension
 import Language.Haskell.Syntax.Module.Name
 import Language.Haskell.Syntax.ImpExp
+
+import GHC.Prelude
+
+import GHC.Types.SourceText   ( SourceText(..) )
+import GHC.Types.SrcLoc
+import GHC.Types.Name
+import GHC.Types.PkgQual
+
+import GHC.Parser.Annotation
+import GHC.Hs.Extension
+
+import GHC.Utils.Outputable
+import GHC.Utils.Panic
+
+import GHC.Unit.Module.Warnings
+
+import Data.Data
+import Data.Maybe
+import GHC.Hs.Doc (LHsDoc)
+
 
 {-
 ************************************************************************
@@ -77,7 +81,7 @@ type instance ImportDeclPkgQual GhcTc = PkgQual
 type instance XCImportDecl  GhcPs = XImportDeclPass
 type instance XCImportDecl  GhcRn = XImportDeclPass
 type instance XCImportDecl  GhcTc = DataConCantHappen
-                                 -- Note [Pragma source text] in GHC.Types.SourceText
+                                 -- Note [Pragma source text] in "GHC.Types.SourceText"
 
 data XImportDeclPass = XImportDeclPass
     { ideclAnn        :: EpAnn EpAnnImportDecl
@@ -116,6 +120,8 @@ data EpAnnImportDecl = EpAnnImportDecl
   , importDeclAnnAs        :: Maybe EpaLocation
   } deriving (Data)
 
+instance NoAnn EpAnnImportDecl where
+  noAnn = EpAnnImportDecl noAnn  Nothing  Nothing  Nothing  Nothing  Nothing
 -- ---------------------------------------------------------------------
 
 simpleImportDecl :: ModuleName -> ImportDecl GhcPs
@@ -170,7 +176,7 @@ instance (OutputableBndrId p
                                 GhcTc -> dataConCantHappen ext
             in case mSrcText of
                   NoSourceText   -> text "{-# SOURCE #-}"
-                  SourceText src -> text src <+> text "#-}"
+                  SourceText src -> ftext src <+> text "#-}"
         ppr_imp _ NotBoot = empty
 
         pp_spec Nothing             = empty
@@ -197,20 +203,39 @@ type instance Anno (IEWrappedName (GhcPass _)) = SrcSpanAnnA
 
 type instance Anno (IE (GhcPass p)) = SrcSpanAnnA
 
-type instance XIEVar             GhcPs = NoExtField
-type instance XIEVar             GhcRn = NoExtField
-type instance XIEVar             GhcTc = NoExtField
+-- The additional field of type 'Maybe (WarningTxt pass)' holds information
+-- about export deprecation annotations and is thus set to Nothing when `IE`
+-- is used in an import list (since export deprecation can only be used in exports)
+type instance XIEVar       GhcPs = Maybe (LWarningTxt GhcPs)
+type instance XIEVar       GhcRn = Maybe (LWarningTxt GhcRn)
+type instance XIEVar       GhcTc = NoExtField
 
-type instance XIEThingAbs        (GhcPass _) = EpAnn [AddEpAnn]
-type instance XIEThingAll        (GhcPass _) = EpAnn [AddEpAnn]
+-- The additional field of type 'Maybe (WarningTxt pass)' holds information
+-- about export deprecation annotations and is thus set to Nothing when `IE`
+-- is used in an import list (since export deprecation can only be used in exports)
+type instance XIEThingAbs  GhcPs = (Maybe (LWarningTxt GhcPs), [AddEpAnn])
+type instance XIEThingAbs  GhcRn = (Maybe (LWarningTxt GhcRn), [AddEpAnn])
+type instance XIEThingAbs  GhcTc = [AddEpAnn]
 
--- See Note [IEThingWith]
-type instance XIEThingWith       (GhcPass 'Parsed)      = EpAnn [AddEpAnn]
-type instance XIEThingWith       (GhcPass 'Renamed)     = [Located FieldLabel]
-type instance XIEThingWith       (GhcPass 'Typechecked) = NoExtField
+-- The additional field of type 'Maybe (WarningTxt pass)' holds information
+-- about export deprecation annotations and is thus set to Nothing when `IE`
+-- is used in an import list (since export deprecation can only be used in exports)
+type instance XIEThingAll  GhcPs = (Maybe (LWarningTxt GhcPs), [AddEpAnn])
+type instance XIEThingAll  GhcRn = (Maybe (LWarningTxt GhcRn), [AddEpAnn])
+type instance XIEThingAll  GhcTc = [AddEpAnn]
 
-type instance XIEModuleContents  GhcPs = EpAnn [AddEpAnn]
-type instance XIEModuleContents  GhcRn = NoExtField
+-- The additional field of type 'Maybe (WarningTxt pass)' holds information
+-- about export deprecation annotations and is thus set to Nothing when `IE`
+-- is used in an import list (since export deprecation can only be used in exports)
+type instance XIEThingWith GhcPs = (Maybe (LWarningTxt GhcPs), [AddEpAnn])
+type instance XIEThingWith GhcRn = (Maybe (LWarningTxt GhcRn), [AddEpAnn])
+type instance XIEThingWith GhcTc = [AddEpAnn]
+
+-- The additional field of type 'Maybe (WarningTxt pass)' holds information
+-- about export deprecation annotations and is thus set to Nothing when `IE`
+-- is used in an import list (since export deprecation can only be used in exports)
+type instance XIEModuleContents  GhcPs = (Maybe (LWarningTxt GhcPs), [AddEpAnn])
+type instance XIEModuleContents  GhcRn = Maybe (LWarningTxt GhcRn)
 type instance XIEModuleContents  GhcTc = NoExtField
 
 type instance XIEGroup           (GhcPass _) = NoExtField
@@ -220,50 +245,38 @@ type instance XXIE               (GhcPass _) = DataConCantHappen
 
 type instance Anno (LocatedA (IE (GhcPass p))) = SrcSpanAnnA
 
-{-
-Note [IEThingWith]
-~~~~~~~~~~~~~~~~~~
-A definition like
-
-    {-# LANGUAGE DuplicateRecordFields #-}
-    module M ( T(MkT, x) ) where
-      data T = MkT { x :: Int }
-
-gives rise to this in the output of the parser:
-
-    IEThingWith NoExtField T [MkT, x] NoIEWildcard
-
-But in the renamer we need to attach the correct field label,
-because the selector Name is mangled (see Note [FieldLabel] in
-GHC.Types.FieldLabel).  Hence we change this to:
-
-    IEThingWith [FieldLabel "x" True $sel:x:MkT)] T [MkT] NoIEWildcard
-
-using the TTG extension field to store the list of fields in renamed syntax
-only.  (Record fields always appear in this list, regardless of whether
-DuplicateRecordFields was in use at the definition site or not.)
-
-See Note [Representing fields in AvailInfo] in GHC.Types.Avail for more details.
--}
-
 ieName :: IE (GhcPass p) -> IdP (GhcPass p)
-ieName (IEVar _ (L _ n))            = ieWrappedName n
-ieName (IEThingAbs  _ (L _ n))      = ieWrappedName n
-ieName (IEThingWith _ (L _ n) _ _)  = ieWrappedName n
-ieName (IEThingAll  _ (L _ n))      = ieWrappedName n
+ieName (IEVar _ (L _ n) _)           = ieWrappedName n
+ieName (IEThingAbs  _ (L _ n) _)     = ieWrappedName n
+ieName (IEThingWith _ (L _ n) _ _ _) = ieWrappedName n
+ieName (IEThingAll  _ (L _ n) _)     = ieWrappedName n
 ieName _ = panic "ieName failed pattern match!"
 
 ieNames :: IE (GhcPass p) -> [IdP (GhcPass p)]
-ieNames (IEVar       _ (L _ n)   )   = [ieWrappedName n]
-ieNames (IEThingAbs  _ (L _ n)   )   = [ieWrappedName n]
-ieNames (IEThingAll  _ (L _ n)   )   = [ieWrappedName n]
-ieNames (IEThingWith _ (L _ n) _ ns) = ieWrappedName n
-                                     : map (ieWrappedName . unLoc) ns
--- NB the above case does not include names of field selectors
+ieNames (IEVar       _ (L _ n) _)      = [ieWrappedName n]
+ieNames (IEThingAbs  _ (L _ n) _)      = [ieWrappedName n]
+ieNames (IEThingAll  _ (L _ n) _)      = [ieWrappedName n]
+ieNames (IEThingWith _ (L _ n) _ ns _) = ieWrappedName n : map (ieWrappedName . unLoc) ns
 ieNames (IEModuleContents {})     = []
 ieNames (IEGroup          {})     = []
 ieNames (IEDoc            {})     = []
 ieNames (IEDocNamed       {})     = []
+
+ieDeprecation :: forall p. IsPass p => IE (GhcPass p) -> Maybe (WarningTxt (GhcPass p))
+ieDeprecation = fmap unLoc . ie_deprecation (ghcPass @p)
+  where
+    ie_deprecation :: GhcPass p -> IE (GhcPass p) -> Maybe (LWarningTxt (GhcPass p))
+    ie_deprecation GhcPs (IEVar xie _ _) = xie
+    ie_deprecation GhcPs (IEThingAbs (xie, _) _ _) = xie
+    ie_deprecation GhcPs (IEThingAll (xie, _) _ _) = xie
+    ie_deprecation GhcPs (IEThingWith (xie, _) _ _ _ _) = xie
+    ie_deprecation GhcPs (IEModuleContents (xie, _) _) = xie
+    ie_deprecation GhcRn (IEVar xie _ _) = xie
+    ie_deprecation GhcRn (IEThingAbs (xie, _) _ _) = xie
+    ie_deprecation GhcRn (IEThingAll (xie, _) _ _) = xie
+    ie_deprecation GhcRn (IEThingWith (xie, _) _ _ _ _) = xie
+    ie_deprecation GhcRn (IEModuleContents xie _) = xie
+    ie_deprecation _ _ = Nothing
 
 ieWrappedLName :: IEWrappedName (GhcPass p) -> LIdP (GhcPass p)
 ieWrappedLName (IEName    _ (L l n)) = L l n
@@ -288,13 +301,31 @@ replaceWrappedName (IEType    r (L l _)) n = IEType    r (L l n)
 replaceLWrappedName :: LIEWrappedName GhcPs -> IdP GhcRn -> LIEWrappedName GhcRn
 replaceLWrappedName (L l n) n' = L l (replaceWrappedName n n')
 
+exportDocstring :: LHsDoc pass -> SDoc
+exportDocstring doc = braces (text "docstring: " <> ppr doc)
+
 instance OutputableBndrId p => Outputable (IE (GhcPass p)) where
-    ppr (IEVar       _     var) = ppr (unLoc var)
-    ppr (IEThingAbs  _   thing) = ppr (unLoc thing)
-    ppr (IEThingAll  _   thing) = hcat [ppr (unLoc thing), text "(..)"]
-    ppr (IEThingWith flds thing wc withs)
-        = ppr (unLoc thing) <> parens (fsep (punctuate comma
-                                              (ppWiths ++ ppFields) ))
+    ppr ie@(IEVar       _     var doc) =
+      sep $ catMaybes [ ppr <$> ieDeprecation ie
+                      , Just $ ppr (unLoc var)
+                      , exportDocstring <$> doc
+                      ]
+    ppr ie@(IEThingAbs  _   thing doc) =
+      sep $ catMaybes [ ppr <$> ieDeprecation ie
+                      , Just $ ppr (unLoc thing)
+                      , exportDocstring <$> doc
+                      ]
+    ppr ie@(IEThingAll  _   thing doc) =
+      sep $ catMaybes [ ppr <$> ieDeprecation ie
+                      , Just $ hcat [ppr (unLoc thing)
+                      , text "(..)"]
+                      , exportDocstring <$> doc
+                      ]
+    ppr ie@(IEThingWith _ thing wc withs doc) =
+      sep $ catMaybes [ ppr <$> ieDeprecation ie
+                      , Just $ ppr (unLoc thing) <> parens (fsep (punctuate comma ppWiths))
+                      , exportDocstring <$> doc
+                      ]
       where
         ppWiths =
           case wc of
@@ -303,12 +334,8 @@ instance OutputableBndrId p => Outputable (IE (GhcPass p)) where
               IEWildcard pos ->
                 let (bs, as) = splitAt pos (map (ppr . unLoc) withs)
                 in bs ++ [text ".."] ++ as
-        ppFields =
-          case ghcPass @p of
-            GhcRn -> map ppr flds
-            _     -> []
-    ppr (IEModuleContents _ mod')
-        = text "module" <+> ppr mod'
+    ppr ie@(IEModuleContents _ mod')
+        = sep $ catMaybes [ppr <$> ieDeprecation ie, Just $ text "module" <+> ppr mod']
     ppr (IEGroup _ n _)           = text ("<IEGroup: " ++ show n ++ ">")
     ppr (IEDoc _ doc)             = ppr doc
     ppr (IEDocNamed _ string)     = text ("<IEDocNamed: " ++ string ++ ">")

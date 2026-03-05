@@ -1,4 +1,7 @@
 {-# LANGUAGE DeriveDataTypeable #-}
+{-# LANGUAGE ViewPatterns #-}
+{-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE RecordWildCards #-}
 
 -- | Source text
 --
@@ -38,6 +41,7 @@ import Data.Function (on)
 import Data.Data
 import GHC.Real ( Ratio(..) )
 import GHC.Types.SrcLoc
+import Control.DeepSeq
 
 {-
 Note [Pragma source text]
@@ -95,7 +99,7 @@ For OverLitVal
 
  -- Note [Literal source text],[Pragma source text]
 data SourceText
-   = SourceText String
+   = SourceText FastString
    | NoSourceText
       -- ^ For when code is generated, e.g. TH,
       -- deriving. The pretty printer will then make
@@ -103,8 +107,13 @@ data SourceText
    deriving (Data, Show, Eq )
 
 instance Outputable SourceText where
-  ppr (SourceText s) = text "SourceText" <+> text s
+  ppr (SourceText s) = text "SourceText" <+> ftext s
   ppr NoSourceText   = text "NoSourceText"
+
+instance NFData SourceText where
+    rnf = \case
+        SourceText s -> rnf s
+        NoSourceText -> ()
 
 instance Binary SourceText where
   put_ bh NoSourceText = putByte bh 0
@@ -124,7 +133,7 @@ instance Binary SourceText where
 -- | Special combinator for showing string literals.
 pprWithSourceText :: SourceText -> SDoc -> SDoc
 pprWithSourceText NoSourceText     d = d
-pprWithSourceText (SourceText src) _ = text src
+pprWithSourceText (SourceText src) _ = ftext src
 
 ------------------------------------------------
 -- Literals
@@ -143,7 +152,7 @@ data IntegralLit = IL
    deriving (Data, Show)
 
 mkIntegralLit :: Integral a => a -> IntegralLit
-mkIntegralLit i = IL { il_text = SourceText (show i_integer)
+mkIntegralLit i = IL { il_text = SourceText (fsLit $ show i_integer)
                      , il_neg = i < 0
                      , il_value = i_integer }
   where
@@ -153,9 +162,9 @@ mkIntegralLit i = IL { il_text = SourceText (show i_integer)
 negateIntegralLit :: IntegralLit -> IntegralLit
 negateIntegralLit (IL text neg value)
   = case text of
-      SourceText ('-':src) -> IL (SourceText src)       False    (negate value)
-      SourceText      src  -> IL (SourceText ('-':src)) True     (negate value)
-      NoSourceText         -> IL NoSourceText          (not neg) (negate value)
+      SourceText (unconsFS -> Just ('-',src)) -> IL (SourceText src)                False    (negate value)
+      SourceText src                          -> IL (SourceText ('-' `consFS` src)) True     (negate value)
+      NoSourceText                            -> IL NoSourceText          (not neg) (negate value)
 
 -- | Fractional Literal
 --
@@ -206,7 +215,7 @@ rationalFromFractionalLit (FL _ _ i e expBase) =
   mkRationalWithExponentBase i e expBase
 
 mkTHFractionalLit :: Rational -> FractionalLit
-mkTHFractionalLit r =  FL { fl_text = SourceText (show (realToFrac r::Double))
+mkTHFractionalLit r =  FL { fl_text = SourceText (fsLit $ show (realToFrac r::Double))
                              -- Converting to a Double here may technically lose
                              -- precision (see #15502). We could alternatively
                              -- convert to a Rational for the most accuracy, but
@@ -222,13 +231,14 @@ mkTHFractionalLit r =  FL { fl_text = SourceText (show (realToFrac r::Double))
 negateFractionalLit :: FractionalLit -> FractionalLit
 negateFractionalLit (FL text neg i e eb)
   = case text of
-      SourceText ('-':src) -> FL (SourceText src)       False (negate i) e eb
-      SourceText      src  -> FL (SourceText ('-':src)) True  (negate i) e eb
+      SourceText (unconsFS -> Just ('-',src))
+                           -> FL (SourceText src)                False (negate i) e eb
+      SourceText      src  -> FL (SourceText ('-' `consFS` src)) True  (negate i) e eb
       NoSourceText         -> FL NoSourceText (not neg) (negate i) e eb
 
 -- | The integer should already be negated if it's negative.
 integralFractionalLit :: Bool -> Integer -> FractionalLit
-integralFractionalLit neg i = FL { fl_text = SourceText (show i)
+integralFractionalLit neg i = FL { fl_text = SourceText (fsLit $ show i)
                                  , fl_neg = neg
                                  , fl_signi = i :% 1
                                  , fl_exp = 0
@@ -238,7 +248,7 @@ integralFractionalLit neg i = FL { fl_text = SourceText (show i)
 mkSourceFractionalLit :: String -> Bool -> Integer -> Integer
                       -> FractionalExponentBase
                       -> FractionalLit
-mkSourceFractionalLit !str !b !r !i !ff = FL (SourceText str) b (r :% 1) i ff
+mkSourceFractionalLit !str !b !r !i !ff = FL (SourceText $ fsLit str) b (r :% 1) i ff
 
 {- Note [fractional exponent bases]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -258,7 +268,7 @@ instance Ord IntegralLit where
   compare = compare `on` il_value
 
 instance Outputable IntegralLit where
-  ppr (IL (SourceText src) _ _) = text src
+  ppr (IL (SourceText src) _ _) = ftext src
   ppr (IL NoSourceText _ value) = text (show value)
 
 
@@ -295,30 +305,17 @@ data StringLiteral = StringLiteral
                        { sl_st :: SourceText, -- literal raw source.
                                               -- See Note [Literal source text]
                          sl_fs :: FastString, -- literal string value
-                         sl_tc :: Maybe RealSrcSpan -- Location of
+                         sl_tc :: Maybe NoCommentsLocation
+                                                    -- Location of
                                                     -- possible
                                                     -- trailing comma
                        -- AZ: if we could have a LocatedA
                        -- StringLiteral we would not need sl_tc, but
                        -- that would cause import loops.
-
-                       -- AZ:2: sl_tc should be an EpaAnchor, to allow
-                       -- editing and reprinting the AST. Need a more
-                       -- robust solution.
-
                        } deriving Data
 
 instance Eq StringLiteral where
   (StringLiteral _ a _) == (StringLiteral _ b _) = a == b
 
 instance Outputable StringLiteral where
-  ppr sl = pprWithSourceText (sl_st sl) (ftext $ sl_fs sl)
-
-instance Binary StringLiteral where
-  put_ bh (StringLiteral st fs _) = do
-            put_ bh st
-            put_ bh fs
-  get bh = do
-            st <- get bh
-            fs <- get bh
-            return (StringLiteral st fs Nothing)
+  ppr sl = pprWithSourceText (sl_st sl) (doubleQuotes $ ftext $ sl_fs sl)

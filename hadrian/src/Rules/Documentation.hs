@@ -1,3 +1,5 @@
+{-# LANGUAGE GADTs #-}
+
 module Rules.Documentation (
     -- * Rules
     buildPackageDocumentation, documentationRules,
@@ -41,7 +43,7 @@ archiveRoot :: FilePath
 archiveRoot = docRoot -/- "archives"
 
 manPageBuildPath :: FilePath
-manPageBuildPath = docRoot -/- "users_guide/build-man/ghc.1"
+manPageBuildPath = "manpage" -/- "ghc.1"
 
 -- TODO: Get rid of this hack.
 docContext :: Context
@@ -74,13 +76,21 @@ needDocDeps = do
             [ ghcBoot
             , ghcBootTh
             , ghci
-            , libiserv
             , compiler
             , ghcHeap
             , templateHaskell
             ]
 
     need templatedCabalFiles
+    need [ "docs" -/- "users_guide" -/- file
+         | file <- [ "conf.py"
+                   , "flags.py"
+                   , "ghc_config.py"
+                   , "ghc_packages.py"
+                   , "utils.py"
+                   ]
+         ]
+
 
 -- | Build all documentation
 documentationRules :: Rules ()
@@ -157,6 +167,18 @@ checkSphinxWarnings out = do
 
     when ("reference target not found" `isInfixOf` log)
       $ fail "Undefined reference targets found in Sphinx log."
+
+    when ("undefined label:" `isInfixOf` log)
+      $ fail "Undefined labels found in Sphinx log."
+
+    when (any hasError (lines log))
+      $ fail "Errors found in the Sphinx log."
+    where
+        hasError line =
+            case words line of
+                _ : "ERROR:" : _ -> True
+                _ : "CRITICAL:" : _ -> True
+                _ -> False
 
 -- | Check that all GHC flags are documented in the users guide.
 checkUserGuideFlags :: FilePath -> Action ()
@@ -246,7 +268,6 @@ buildPackageDocumentation = do
     -- Per-package haddocks
     root -/- htmlRoot -/- "libraries/*/haddock-prologue.txt" %> \file -> do
         ctx <- pkgDocContext <$> getPkgDocTarget root file
-        -- This is how @ghc-cabal@ used to produces "haddock-prologue.txt" files.
         syn  <- pkgSynopsis    (Context.package ctx)
         desc <- pkgDescription (Context.package ctx)
         let prologue = if null desc then syn else desc
@@ -257,6 +278,15 @@ buildPackageDocumentation = do
         need [ takeDirectory file  -/- "haddock-prologue.txt"]
         haddocks <- haddockDependencies context
 
+        -- Build Haddock documentation
+        -- TODO: Pass the correct way from Rules via Context.
+        dynamicPrograms <- dynamicGhcPrograms =<< flavour
+        let haddockWay = if dynamicPrograms then dynamic else vanilla
+
+        -- Build the dependencies of the package we are going to build documentation for
+        dep_pkgs <- sequence [pkgConfFile (context { way = haddockWay, Context.package = p})
+                             | (p, _) <- haddocks]
+
         -- `ghc-prim` has a source file for 'GHC.Prim' which is generated just
         -- for Haddock. We need to 'union' (instead of '++') to avoid passing
         -- 'GHC.PrimopWrappers' (which unfortunately shows up in both
@@ -265,12 +295,8 @@ buildPackageDocumentation = do
         vanillaSrcs <- hsSources context
         let srcs = vanillaSrcs `union` generatedSrcs
 
-        need $ srcs ++ (map snd haddocks)
+        need $ srcs ++ (map snd haddocks) ++ dep_pkgs
 
-        -- Build Haddock documentation
-        -- TODO: Pass the correct way from Rules via Context.
-        dynamicPrograms <- dynamicGhcPrograms =<< flavour
-        let haddockWay = if dynamicPrograms then dynamic else vanilla
         statsFilesDir <- haddockStatsFilesDir
         createDirectory statsFilesDir
         build $ target (context {way = haddockWay}) (Haddock BuildPackage) srcs [file]
@@ -292,7 +318,7 @@ parsePkgDocTarget root = do
   _ <- Parsec.string root *> Parsec.optional (Parsec.char '/')
   _ <- Parsec.string (htmlRoot ++ "/")
   _ <- Parsec.string "libraries/"
-  (pkgname, _) <- parsePkgId <* Parsec.char '/'
+  (pkgname, _, _) <- parsePkgId <* Parsec.char '/'
   Parsec.choice
     [ Parsec.try (Parsec.string "haddock-prologue.txt")
         *> pure (HaddockPrologue pkgname)
@@ -308,11 +334,27 @@ getPkgDocTarget root path =
 
 -- | Build all PDF documentation
 buildPdfDocumentation :: Rules ()
-buildPdfDocumentation = mapM_ buildSphinxPdf docPaths
+buildPdfDocumentation = do
+    -- Note [Avoiding mktexfmt race]
+    -- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    -- We must ensure that the *first* xelatex invocation in the
+    -- build is performed serially (that is, not concurrently with
+    -- any other xelatex invocations) as mktexfmt does not handle
+    -- racing `mkdir` calls gracefully. However, we assume that
+    -- subsequent invocations are safe to run concurrently since the
+    -- initial call will have created the requisite directories (namely
+    -- $HOME/.texlive2020/texmf-var/web2c).
+    --
+    -- Fixes #25564.
+    let maxConcurrentReaders = 1000
+    xelatexMutex <- newResource "xelatex-mutex" maxConcurrentReaders
+    let rs = [(xelatexMutex, 1)]
+
+    mapM_ (buildSphinxPdf rs) docPaths
 
 -- | Compile a Sphinx ReStructured Text package to LaTeX
-buildSphinxPdf :: FilePath -> Rules ()
-buildSphinxPdf path = do
+buildSphinxPdf :: [(Resource, Int)] -> FilePath -> Rules ()
+buildSphinxPdf rs path = do
     root <- buildRootRules
     root -/- pdfRoot -/- path <.> "pdf" %> \file -> do
 
@@ -326,7 +368,8 @@ buildSphinxPdf path = do
             checkSphinxWarnings dir
 
             -- LaTeX "fixed point"
-            build $ target docContext Xelatex [path <.> "tex"] [dir]
+            -- See Note [Avoiding mktexfmt race] above.
+            buildWithResources rs $ target docContext Xelatex [path <.> "tex"] [dir]
             build $ target docContext Xelatex [path <.> "tex"] [dir]
             build $ target docContext Xelatex [path <.> "tex"] [dir]
             build $ target docContext Makeindex [path <.> "idx"] [dir]
@@ -342,6 +385,9 @@ buildSphinxInfoGuide = do
   root <- buildRootRules
   let path = "GHCUsersGuide"
   root -/- infoRoot -/- path <.> "info" %> \ file -> do
+
+        needDocDeps
+
         withTempDir $ \dir -> do
             let rstFilesDir = pathPath path
             rstFiles <- getDirectoryFiles rstFilesDir ["**/*.rst"]
@@ -352,7 +398,7 @@ buildSphinxInfoGuide = do
             -- default target of which actually produces the target
             -- for this build rule.
             let p = dir -/- path
-            let [texipath, infopath] = map (p <.>) ["texi", "info"]
+            let (texipath :& infopath :& _) = fmap (p <.>) ("texi" :& "info" :& Nil)
             build $ target docContext (Makeinfo) [texipath] [infopath]
             copyFileUntracked infopath file
 
@@ -377,6 +423,8 @@ buildManPage = do
     root <- buildRootRules
     root -/- manPageBuildPath %> \file -> do
         need ["docs/users_guide/ghc.rst"]
+        needDocDeps
+
         withTempDir $ \dir -> do
             build $ target docContext (Sphinx ManMode) ["docs/users_guide"] [dir]
             checkSphinxWarnings dir

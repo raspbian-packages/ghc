@@ -60,6 +60,7 @@ _*
 */ghc-stage1
 .shake.*
 .hadrian_ghci
+.hadrian_ghci_multi/
 .hie-bios
 
 # -----------------------------------------------------------------------------
@@ -97,6 +98,7 @@ _darcs/
 # -----------------------------------------------------------------------------
 # specific generated files
 
+/.gitlab/jobs-metadata.json
 /bindist-list
 /bindist-list.uniq
 /bindistprep/
@@ -110,11 +112,13 @@ _darcs/
 /compiler/ClosureTypes.h
 /compiler/FunTypes.h
 /compiler/MachRegs.h
-/compiler/ghc-llvm-version.h
+/compiler/MachRegs
+/compiler/GHC/CmmToLlvm/Version/Bounds.hs
 /compiler/ghc.cabal
 /compiler/ghc.cabal.old
 /distrib/configure.ac
 /distrib/ghc.iss
+/docs/index.html
 /docs/man
 /docs/users_guide/.log
 /docs/users_guide/users_guide
@@ -164,6 +168,9 @@ _darcs/
 /libraries/ghc-boot-th/ghc-boot-th.cabal
 /libraries/ghc-boot-th/ghc.mk
 /libraries/ghc-heap/ghc-heap.cabal
+/libraries/ghc-internal/ghc-internal.cabal
+/libraries/ghc-experimental/ghc-experimental.cabal
+/libraries/base/base.cabal
 /libraries/ghci/GNUmakefile
 /libraries/ghci/ghci.cabal
 /libraries/ghci/ghc.mk
@@ -181,8 +188,6 @@ _darcs/
 /linter.log
 /mk/are-validating.mk
 /mk/build.mk
-/mk/config.h
-/mk/config.h.in
 /mk/config.mk
 /mk/config.mk.old
 /mk/system-cxx-std-lib-1.0.conf
@@ -201,10 +206,9 @@ _darcs/
 /utils/runghc/runghc.cabal
 /utils/gen-dll/gen-dll.cabal
 /utils/ghc-pkg/ghc-pkg.cabal
-utils/lndir/fs.*
 utils/unlit/fs.*
-libraries/base/include/fs.h
-libraries/base/cbits/fs.c
+libraries/ghc-internal/include/fs.h
+libraries/ghc-internal/cbits/fs.c
 missing-win32-tarballs
 
 /extra-gcc-opts
@@ -238,6 +242,7 @@ ghc.nix/
 
 # direnv
 .envrc
+.direnv
 
 # Visual Studio Code
 .vscode

@@ -432,6 +432,8 @@ type family XDo             x
 type family XExplicitList   x
 type family XRecordCon      x
 type family XRecordUpd      x
+type family XLHsRecUpdLabels x
+type family XLHsOLRecUpdLabels x
 type family XGetField       x
 type family XProjection     x
 type family XExprWithTySig  x
@@ -445,6 +447,7 @@ type family XStatic         x
 type family XTick           x
 type family XBinTick        x
 type family XPragE          x
+type family XEmbTy          x
 type family XXExpr          x
 
 -- -------------------------------------
@@ -566,7 +569,13 @@ type family XHsStringPrim x
 type family XHsInt x
 type family XHsIntPrim x
 type family XHsWordPrim x
+type family XHsInt8Prim x
+type family XHsInt16Prim x
+type family XHsInt32Prim x
 type family XHsInt64Prim x
+type family XHsWord8Prim x
+type family XHsWord16Prim x
+type family XHsWord32Prim x
 type family XHsWord64Prim x
 type family XHsInteger x
 type family XHsRat x
@@ -598,6 +607,8 @@ type family XLitPat      x
 type family XNPat        x
 type family XNPlusKPat   x
 type family XSigPat      x
+type family XEmbTyPat    x
+type family XInvisPat    x
 type family XCoPat       x
 type family XXPat        x
 type family XHsFieldBind x
@@ -631,6 +642,11 @@ type family XXHsWildCardBndrs  x b
 -- HsPatSigType type families
 type family XHsPS x
 type family XXHsPatSigType x
+
+-- -------------------------------------
+-- HsTyPat type families
+type family XHsTP x
+type family XXHsTyPat x
 
 -- -------------------------------------
 -- HsType type families

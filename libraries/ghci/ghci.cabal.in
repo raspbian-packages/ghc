@@ -50,13 +50,17 @@ library
     if flag(internal-interpreter)
         CPP-Options: -DHAVE_INTERNAL_INTERPRETER
         exposed-modules:
-            GHCi.InfoTable
             GHCi.Run
             GHCi.CreateBCO
             GHCi.ObjLink
             GHCi.Signals
             GHCi.StaticPtrTable
             GHCi.TH
+            GHCi.Server
+
+        if !arch(javascript)
+          exposed-modules:
+            GHCi.InfoTable
 
     exposed-modules:
         GHCi.BreakArray
@@ -66,20 +70,21 @@ library
         GHCi.RemoteTypes
         GHCi.FFI
         GHCi.TH.Binary
+        GHCi.Utils
 
     Build-Depends:
         rts,
         array            == 0.5.*,
-        base             >= 4.8 && < 4.19,
-        ghc-prim         >= 0.5.0 && < 0.11,
+        base             >= 4.8 && < 4.21,
+        ghc-prim         >= 0.5.0 && < 0.13,
         binary           == 0.8.*,
-        bytestring       >= 0.10 && < 0.12,
-        containers       >= 0.5 && < 0.7,
-        deepseq          == 1.4.*,
-        filepath         == 1.4.*,
+        bytestring       >= 0.10 && < 0.13,
+        containers       >= 0.5 && < 0.8,
+        deepseq          >= 1.4 && < 1.6,
+        filepath         >= 1.4 && < 1.6,
         ghc-boot         == @ProjectVersionMunged@,
         ghc-heap         == @ProjectVersionMunged@,
-        template-haskell == 2.20.*,
+        template-haskell == 2.22.*,
         transformers     >= 0.5 && < 0.7
 
     if !os(windows)

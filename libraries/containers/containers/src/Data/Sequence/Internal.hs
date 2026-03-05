@@ -199,8 +199,8 @@ import Utils.Containers.Internal.Prelude hiding (
 #if MIN_VERSION_base(4,11,0)
     (<>),
 #endif
-    (<$>), foldMap, Monoid,
-    null, length, lookup, take, drop, splitAt, foldl, foldl1, foldr, foldr1,
+    (<$>), Monoid,
+    null, length, lookup, take, drop, splitAt,
     scanl, scanl1, scanr, scanr1, replicate, zip, zipWith, zip3, zipWith3,
     unzip, takeWhile, dropWhile, iterate, reverse, filter, mapM, sum, all)
 import Prelude ()
@@ -212,7 +212,7 @@ import Control.Monad (MonadPlus(..))
 import Data.Monoid (Monoid(..))
 import Data.Functor (Functor(..))
 import Utils.Containers.Internal.State (State(..), execState)
-import Data.Foldable (Foldable(foldl, foldl1, foldr, foldr1, foldMap, foldl', foldr'), toList)
+import Data.Foldable (foldr', toList)
 import qualified Data.Foldable as F
 
 import qualified Data.Semigroup as Semigroup
@@ -275,10 +275,8 @@ infixl 5 |>, :>
 infixr 5 :<|
 infixl 5 :|>
 
-#if __GLASGOW_HASKELL__ >= 801
 {-# COMPLETE (:<|), Empty #-}
 {-# COMPLETE (:|>), Empty #-}
-#endif
 
 -- | A bidirectional pattern synonym matching an empty sequence.
 --
@@ -529,9 +527,7 @@ instance Applicative Seq where
     pure = singleton
     xs *> ys = cycleNTimes (length xs) ys
     (<*>) = apSeq
-#if MIN_VERSION_base(4,10,0)
     liftA2 = liftA2Seq
-#endif
     xs <* ys = beforeSeq xs ys
 
 apSeq :: Seq (a -> b) -> Seq a -> Seq b
@@ -1711,7 +1707,8 @@ replicateA n x
   | otherwise   = error "replicateA takes a nonnegative integer argument"
 {-# SPECIALIZE replicateA :: Int -> State a b -> State a (Seq b) #-}
 
--- | 'replicateM' is a sequence counterpart of 'Control.Monad.replicateM'.
+-- | 'replicateM' is the @Seq@ counterpart of
+-- @Control.Monad.'Control.Monad.replicateM'@.
 --
 -- > replicateM n x = sequence (replicate n x)
 --
@@ -1888,7 +1885,8 @@ snocTree' (Deep s pr m (One a)) b =
 (><)            :: Seq a -> Seq a -> Seq a
 Seq xs >< Seq ys = Seq (appendTree0 xs ys)
 
--- The appendTree/addDigits gunk below is machine generated
+-- The appendTree/addDigits gunk below was originally machine generated via mkappend.hs,
+-- but has since been manually edited to include strictness annotations.
 
 appendTree0 :: FingerTree (Elem a) -> FingerTree (Elem a) -> FingerTree (Elem a)
 appendTree0 EmptyT xs =
@@ -4659,6 +4657,8 @@ splitMapNode splt f s (Node3 ns a b c) = Node3 ns (f first a) (f second b) (f th
 -- | @ 'mzipWith' = 'zipWith' @
 --
 -- @ 'munzip' = 'unzip' @
+--
+-- @since 0.5.10.1
 instance MonadZip Seq where
   mzipWith = zipWith
   munzip = unzip

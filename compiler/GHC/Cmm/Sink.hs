@@ -14,14 +14,13 @@ import GHC.Cmm.LRegSet
 import GHC.Cmm.Utils
 import GHC.Cmm.Dataflow.Block
 import GHC.Cmm.Dataflow.Label
-import GHC.Cmm.Dataflow.Collections
 import GHC.Cmm.Dataflow.Graph
 import GHC.Platform.Regs
 
 import GHC.Platform
 import GHC.Types.Unique.FM
 
-import qualified Data.IntSet as IntSet
+import qualified GHC.Data.Word64Set as Word64Set
 import Data.List (partition)
 import Data.Maybe
 
@@ -175,7 +174,7 @@ cmmSink platform graph = ofBlockList (g_entry graph) $ sink mapEmpty $ blocks
       -- Annotate the middle nodes with the registers live *after*
       -- the node.  This will help us decide whether we can inline
       -- an assignment in the current node or not.
-      live = IntSet.unions (map getLive succs)
+      live = Word64Set.unions (map getLive succs)
       live_middle = gen_killL platform last live
       ann_middles = annotate platform live_middle (blockToList middle)
 
@@ -188,7 +187,7 @@ cmmSink platform graph = ofBlockList (g_entry graph) $ sink mapEmpty $ blocks
       -- one predecessor), so identify the join points and the set
       -- of registers live in them.
       (joins, nonjoins) = partition (`mapMember` join_pts) succs
-      live_in_joins = IntSet.unions (map getLive joins)
+      live_in_joins = Word64Set.unions (map getLive joins)
 
       -- We do not want to sink an assignment into multiple branches,
       -- so identify the set of registers live in multiple successors.
@@ -215,7 +214,7 @@ cmmSink platform graph = ofBlockList (g_entry graph) $ sink mapEmpty $ blocks
             live_sets' | should_drop = live_sets
                        | otherwise   = map upd live_sets
 
-            upd set | r `elemLRegSet` set = set `IntSet.union` live_rhs
+            upd set | r `elemLRegSet` set = set `Word64Set.union` live_rhs
                     | otherwise          = set
 
             live_rhs = foldRegsUsed platform (flip insertLRegSet) emptyLRegSet rhs
@@ -244,7 +243,7 @@ isSmall _ = False
 --
 isTrivial :: Platform -> CmmExpr -> Bool
 isTrivial _ (CmmReg (CmmLocal _)) = True
-isTrivial platform (CmmReg (CmmGlobal r)) = -- see Note [Inline GlobalRegs?]
+isTrivial platform (CmmReg (CmmGlobal (GlobalRegUse r _))) = -- see Note [Inline GlobalRegs?]
   if isARM (platformArch platform)
   then True -- CodeGen.Platform.ARM does not have globalRegMaybe
   else isJust (globalRegMaybe platform r)
@@ -667,9 +666,9 @@ conflicts platform (r, rhs, addr) node
   , memConflicts addr (loadAddr platform addr' (cmmExprWidth platform e)) = True
 
   -- (4) an assignment to Hp/Sp conflicts with a heap/stack read respectively
-  | HeapMem    <- addr, CmmAssign (CmmGlobal Hp) _ <- node        = True
-  | StackMem   <- addr, CmmAssign (CmmGlobal Sp) _ <- node        = True
-  | SpMem{}    <- addr, CmmAssign (CmmGlobal Sp) _ <- node        = True
+  | HeapMem    <- addr, CmmAssign (CmmGlobal (GlobalRegUse Hp _)) _ <- node        = True
+  | StackMem   <- addr, CmmAssign (CmmGlobal (GlobalRegUse Sp _)) _ <- node        = True
+  | SpMem{}    <- addr, CmmAssign (CmmGlobal (GlobalRegUse Sp _)) _ <- node        = True
 
   -- (5) foreign calls clobber heap: see Note [Foreign calls clobber heap]
   | CmmUnsafeForeignCall{} <- node, memConflicts addr AnyMem      = True
@@ -703,9 +702,9 @@ conflicts platform (r, rhs, addr) node
 -- Cmm expression
 globalRegistersConflict :: Platform -> CmmExpr -> CmmNode e x -> Bool
 globalRegistersConflict platform expr node =
-    -- See Note [Inlining foldRegsDefd]
-    inline foldRegsDefd platform (\b r -> b || regUsedIn platform (CmmGlobal r) expr)
-                 False node
+   -- See Note [Inlining foldRegsDefd]
+   inline foldRegsDefd platform (\b r -> b || globalRegUsedIn platform r expr)
+                False node
 
 -- Returns True if node defines any local registers that are used in the
 -- Cmm expression
@@ -852,17 +851,17 @@ exprMem _        _                   = NoMem
 loadAddr :: Platform -> CmmExpr -> Width -> AbsMem
 loadAddr platform e w =
   case e of
-   CmmReg r       -> regAddr platform r 0 w
-   CmmRegOff r i  -> regAddr platform r i w
-   _other | regUsedIn platform spReg e -> StackMem
-          | otherwise                  -> AnyMem
+   CmmReg r       -> regAddr r 0 w
+   CmmRegOff r i  -> regAddr r i w
+   _other | regUsedIn platform (spReg platform) e -> StackMem
+          | otherwise                             -> AnyMem
 
-regAddr :: Platform -> CmmReg -> Int -> Width -> AbsMem
-regAddr _      (CmmGlobal Sp) i w = SpMem i (widthInBytes w)
-regAddr _      (CmmGlobal Hp) _ _ = HeapMem
-regAddr _      (CmmGlobal CurrentTSO) _ _ = HeapMem -- important for PrimOps
-regAddr platform r _ _ | isGcPtrType (cmmRegType platform r) = HeapMem -- yay! GCPtr pays for itself
-regAddr _      _ _ _ = AnyMem
+regAddr :: CmmReg -> Int -> Width -> AbsMem
+regAddr (CmmGlobal (GlobalRegUse Sp _)) i w = SpMem i (widthInBytes w)
+regAddr (CmmGlobal (GlobalRegUse Hp _)) _ _ = HeapMem
+regAddr (CmmGlobal (GlobalRegUse CurrentTSO _)) _ _ = HeapMem -- important for PrimOps
+regAddr r _ _ | isGcPtrType (cmmRegType r) = HeapMem -- yay! GCPtr pays for itself
+regAddr _ _ _ = AnyMem
 
 {-
 Note [Inline GlobalRegs?]

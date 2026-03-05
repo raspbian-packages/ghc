@@ -7,6 +7,8 @@
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE AllowAmbiguousTypes #-}
 {-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE PatternSynonyms #-}
 
 module GHC.Types.Error
    ( -- * Messages
@@ -19,6 +21,7 @@ module GHC.Types.Error
    , addMessage
    , unionMessages
    , unionManyMessages
+   , filterMessages
    , MsgEnvelope (..)
 
    -- * Classifying Messages
@@ -27,14 +30,22 @@ module GHC.Types.Error
    , Severity (..)
    , Diagnostic (..)
    , UnknownDiagnostic (..)
+   , mkSimpleUnknownDiagnostic
+   , mkUnknownDiagnostic
+   , embedUnknownDiagnostic
    , DiagnosticMessage (..)
-   , DiagnosticReason (..)
+   , DiagnosticReason (WarningWithFlag, ..)
+   , ResolvedDiagnosticReason(..)
    , DiagnosticHint (..)
    , mkPlainDiagnostic
    , mkPlainError
    , mkDecoratedDiagnostic
    , mkDecoratedError
 
+   , pprDiagnostic
+
+   , HasDefaultDiagnosticOpts(..)
+   , defaultDiagnosticOpts
    , NoDiagnosticOpts(..)
 
    -- * Hints and refactoring actions
@@ -91,19 +102,20 @@ import GHC.Data.FastString (unpackFS)
 import GHC.Data.StringBuffer (atLine, hGetStringBuffer, len, lexemeToString)
 import GHC.Utils.Json
 import GHC.Utils.Panic
-
+import GHC.Unit.Module.Warnings (WarningCategory)
 import Data.Bifunctor
-import Data.Foldable    ( fold )
+import Data.Foldable    ( fold, toList )
+import Data.List.NonEmpty ( NonEmpty (..) )
 import qualified Data.List.NonEmpty as NE
 import Data.List ( intercalate )
 import Data.Typeable ( Typeable )
 import Numeric.Natural ( Natural )
 import Text.Printf ( printf )
+import GHC.Version (cProjectVersion)
+import GHC.Types.Hint.Ppr () -- Outputtable instance
 
-{-
-Note [Messages]
-~~~~~~~~~~~~~~~
-
+{- Note [Messages]
+~~~~~~~~~~~~~~~~~~
 We represent the 'Messages' as a single bag of warnings and errors.
 
 The reason behind that is that there is a fluid relationship between errors
@@ -150,7 +162,13 @@ instance Diagnostic e => Outputable (Messages e) where
   ppr msgs = braces (vcat (map ppr_one (bagToList (getMessages msgs))))
      where
        ppr_one :: MsgEnvelope e -> SDoc
-       ppr_one envelope = pprDiagnostic (errMsgDiagnostic envelope)
+       ppr_one envelope =
+        vcat [ text "Resolved:" <+> ppr (errMsgReason envelope),
+               pprDiagnostic (errMsgDiagnostic envelope)
+             ]
+
+instance Diagnostic e => ToJson (Messages e) where
+  json msgs =  JSArray . toList $ json <$> getMessages msgs
 
 {- Note [Discarding Messages]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -179,6 +197,10 @@ unionMessages (Messages msgs1) (Messages msgs2) =
 unionManyMessages :: Foldable f => f (Messages e) -> Messages e
 unionManyMessages = fold
 
+filterMessages :: (MsgEnvelope e -> Bool) -> Messages e -> Messages e
+filterMessages f (Messages msgs) =
+  Messages (filterBag f msgs)
+
 -- | A 'DecoratedSDoc' is isomorphic to a '[SDoc]' but it carries the
 -- invariant that the input '[SDoc]' needs to be rendered /decorated/ into its
 -- final form, where the typical case would be adding bullets between each
@@ -206,6 +228,16 @@ mapDecoratedSDoc :: (SDoc -> SDoc) -> DecoratedSDoc -> DecoratedSDoc
 mapDecoratedSDoc f (Decorated s1) =
   Decorated (map f s1)
 
+class HasDefaultDiagnosticOpts opts where
+  defaultOpts :: opts
+
+
+defaultDiagnosticOpts :: forall opts . HasDefaultDiagnosticOpts (DiagnosticOpts opts) => DiagnosticOpts opts
+defaultDiagnosticOpts = defaultOpts @(DiagnosticOpts opts)
+
+
+
+
 -- | A class identifying a diagnostic.
 -- Dictionary.com defines a diagnostic as:
 --
@@ -215,11 +247,10 @@ mapDecoratedSDoc f (Decorated s1) =
 -- A 'Diagnostic' carries the /actual/ description of the message (which, in
 -- GHC's case, it can be an error or a warning) and the /reason/ why such
 -- message was generated in the first place.
-class Diagnostic a where
+class (HasDefaultDiagnosticOpts (DiagnosticOpts a)) => Diagnostic a where
 
   -- | Type of configuration options for the diagnostic.
   type DiagnosticOpts a
-  defaultDiagnosticOpts :: DiagnosticOpts a
 
   -- | Extract the error message text from a 'Diagnostic'.
   diagnosticMessage :: DiagnosticOpts a -> a -> DecoratedSDoc
@@ -247,21 +278,39 @@ class Diagnostic a where
   diagnosticCode    :: a -> Maybe DiagnosticCode
 
 -- | An existential wrapper around an unknown diagnostic.
-data UnknownDiagnostic where
-  UnknownDiagnostic :: (DiagnosticOpts a ~ NoDiagnosticOpts, Diagnostic a, Typeable a)
-                    => a -> UnknownDiagnostic
+data UnknownDiagnostic opts where
+  UnknownDiagnostic :: (Diagnostic a, Typeable a)
+                    => (opts -> DiagnosticOpts a) -- Inject the options of the outer context
+                                                  -- into the options for the wrapped diagnostic.
+                    -> a
+                    -> UnknownDiagnostic opts
 
-instance Diagnostic UnknownDiagnostic where
-  type DiagnosticOpts UnknownDiagnostic = NoDiagnosticOpts
-  defaultDiagnosticOpts = NoDiagnosticOpts
-  diagnosticMessage _ (UnknownDiagnostic diag) = diagnosticMessage NoDiagnosticOpts diag
-  diagnosticReason    (UnknownDiagnostic diag) = diagnosticReason  diag
-  diagnosticHints     (UnknownDiagnostic diag) = diagnosticHints   diag
-  diagnosticCode      (UnknownDiagnostic diag) = diagnosticCode    diag
+instance HasDefaultDiagnosticOpts opts => Diagnostic (UnknownDiagnostic opts) where
+  type DiagnosticOpts (UnknownDiagnostic opts) = opts
+  diagnosticMessage opts (UnknownDiagnostic f diag) = diagnosticMessage (f opts) diag
+  diagnosticReason    (UnknownDiagnostic _ diag) = diagnosticReason  diag
+  diagnosticHints     (UnknownDiagnostic _ diag) = diagnosticHints   diag
+  diagnosticCode      (UnknownDiagnostic _ diag) = diagnosticCode    diag
 
 -- A fallback 'DiagnosticOpts' which can be used when there are no options
 -- for a particular diagnostic.
 data NoDiagnosticOpts = NoDiagnosticOpts
+instance HasDefaultDiagnosticOpts NoDiagnosticOpts where
+  defaultOpts = NoDiagnosticOpts
+
+-- | Make a "simple" unknown diagnostic which doesn't have any configuration options.
+mkSimpleUnknownDiagnostic :: (Diagnostic a, Typeable a, DiagnosticOpts a ~ NoDiagnosticOpts) => a -> UnknownDiagnostic b
+mkSimpleUnknownDiagnostic = UnknownDiagnostic (const NoDiagnosticOpts)
+
+-- | Make an unknown diagnostic which uses the same options as the context it will be embedded into.
+mkUnknownDiagnostic :: (Typeable a, Diagnostic a) => a -> UnknownDiagnostic (DiagnosticOpts a)
+mkUnknownDiagnostic = UnknownDiagnostic id
+
+-- | Embed a more complicated diagnostic which requires a potentially different options type.
+embedUnknownDiagnostic :: (Diagnostic a, Typeable a) => (opts -> DiagnosticOpts a) -> a -> UnknownDiagnostic opts
+embedUnknownDiagnostic = UnknownDiagnostic
+
+--------------------------------------------------------------------------------
 
 pprDiagnostic :: forall e . Diagnostic e => e -> SDoc
 pprDiagnostic e = vcat [ ppr (diagnosticReason e)
@@ -276,7 +325,7 @@ instance Outputable DiagnosticHint where
 
 -- | A generic 'Diagnostic' message, without any further classification or
 -- provenance: By looking at a 'DiagnosticMessage' we don't know neither
--- /where/ it was generated nor how to intepret its payload (as it's just a
+-- /where/ it was generated nor how to interpret its payload (as it's just a
 -- structured document). All we can do is to print it out and look at its
 -- 'DiagnosticReason'.
 data DiagnosticMessage = DiagnosticMessage
@@ -287,7 +336,6 @@ data DiagnosticMessage = DiagnosticMessage
 
 instance Diagnostic DiagnosticMessage where
   type DiagnosticOpts DiagnosticMessage = NoDiagnosticOpts
-  defaultDiagnosticOpts = NoDiagnosticOpts
   diagnosticMessage _ = diagMessage
   diagnosticReason  = diagReason
   diagnosticHints   = diagHints
@@ -328,17 +376,74 @@ mkDecoratedError hints docs = DiagnosticMessage (mkDecorated docs) ErrorWithoutF
 data DiagnosticReason
   = WarningWithoutFlag
   -- ^ Born as a warning.
-  | WarningWithFlag !WarningFlag
+  | WarningWithFlags !(NE.NonEmpty WarningFlag)
   -- ^ Warning was enabled with the flag.
+  | WarningWithCategory !WarningCategory
+  -- ^ Warning was enabled with a custom category.
   | ErrorWithoutFlag
   -- ^ Born as an error.
   deriving (Eq, Show)
 
+-- | Like a 'DiagnosticReason', but resolved against a specific set of `DynFlags` to
+-- work out which warning flag actually enabled this warning.
+newtype ResolvedDiagnosticReason
+          = ResolvedDiagnosticReason { resolvedDiagnosticReason :: DiagnosticReason }
+
+-- | The single warning case 'DiagnosticReason' is very common.
+pattern WarningWithFlag :: WarningFlag -> DiagnosticReason
+pattern WarningWithFlag w = WarningWithFlags (w :| [])
+
+{-
+Note [Warnings controlled by multiple flags]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Diagnostics that started life as flag-controlled warnings have a
+'diagnosticReason' of 'WarningWithFlags', giving the flags that control the
+warning. Usually there is only one flag, but in a few cases multiple flags
+apply. Where there are more than one, they are listed highest-priority first.
+
+For example, the same exported binding may give rise to a warning if either
+`-Wmissing-signatures` or `-Wmissing-exported-signatures` is enabled. Here
+`-Wmissing-signatures` has higher priority, because we want to mention it if
+before are enabled.  See `missingSignatureWarningFlags` for the specific logic
+in this case.
+
+When reporting such a warning to the user, it is important to mention the
+correct flag (e.g. `-Wmissing-signatures` if it is enabled, or
+`-Wmissing-exported-signatures` if only the latter is enabled).  Thus
+`diag_reason_severity` filters the `DiagnosticReason` based on the currently
+active `DiagOpts`. For a `WarningWithFlags` it returns only the flags that are
+enabled; it leaves other `DiagnosticReason`s unchanged. This is then wrapped
+in a `ResolvedDiagnosticReason` newtype which records that this filtering has
+taken place.
+
+If we have `-Wmissing-signatures -Werror=missing-exported-signatures` we want
+the error to mention `-Werror=missing-exported-signatures` (even though
+`-Wmissing-signatures` would normally take precedence). Thus if there are any
+fatal warnings, `diag_reason_severity` returns those alone.
+
+The `MsgEnvelope` stores the filtered `ResolvedDiagnosticReason` listing only the
+relevant flags for subsequent display.
+
+
+Side note: we do not treat `-Wmissing-signatures` as a warning group that
+includes `-Wmissing-exported-signatures`, because
+
+  (a) this would require us to provide a flag for the complement, and
+
+  (b) currently, in `-Wmissing-exported-signatures -Wno-missing-signatures`, the
+      latter option does not switch off the former.
+-}
+
 instance Outputable DiagnosticReason where
   ppr = \case
     WarningWithoutFlag  -> text "WarningWithoutFlag"
-    WarningWithFlag wf  -> text ("WarningWithFlag " ++ show wf)
+    WarningWithFlags wf -> text ("WarningWithFlags " ++ show wf)
+    WarningWithCategory cat -> text "WarningWithCategory" <+> ppr cat
     ErrorWithoutFlag    -> text "ErrorWithoutFlag"
+
+instance Outputable ResolvedDiagnosticReason where
+  ppr = ppr . resolvedDiagnosticReason
 
 -- | An envelope for GHC's facts about a running program, parameterised over the
 -- /domain-specific/ (i.e. parsing, typecheck-renaming, etc) diagnostics.
@@ -354,6 +459,10 @@ data MsgEnvelope e = MsgEnvelope
    , errMsgContext     :: NamePprCtx
    , errMsgDiagnostic  :: e
    , errMsgSeverity    :: Severity
+   , errMsgReason      :: ResolvedDiagnosticReason
+      -- ^ The actual reason caused this message
+      --
+      -- See Note [Warnings controlled by multiple flags]
    } deriving (Functor, Foldable, Traversable)
 
 -- | The class for a diagnostic message. The main purpose is to classify a
@@ -372,7 +481,7 @@ data MessageClass
     -- ^ Log messages intended for end users.
     -- No file\/line\/column stuff.
 
-  | MCDiagnostic Severity DiagnosticReason (Maybe DiagnosticCode)
+  | MCDiagnostic Severity ResolvedDiagnosticReason (Maybe DiagnosticCode)
     -- ^ Diagnostics from the compiler. This constructor is very powerful as
     -- it allows the construction of a 'MessageClass' with a completely
     -- arbitrary permutation of 'Severity' and 'DiagnosticReason'. As such,
@@ -426,7 +535,7 @@ data Severity
   -- don't want to see. See Note [Suppressing Messages]
   | SevWarning
   | SevError
-  deriving (Eq, Show)
+  deriving (Eq, Ord, Show)
 
 instance Outputable Severity where
   ppr = \case
@@ -435,7 +544,9 @@ instance Outputable Severity where
     SevError   -> text "SevError"
 
 instance ToJson Severity where
-  json s = JSString (show s)
+  json SevIgnore = JSString "Ignore"
+  json SevWarning = JSString "Warning"
+  json SevError = JSString "Error"
 
 instance ToJson MessageClass where
   json MCOutput = JSString "MCOutput"
@@ -445,6 +556,45 @@ instance ToJson MessageClass where
   json MCInfo = JSString "MCInfo"
   json (MCDiagnostic sev reason code) =
     JSString $ renderWithContext defaultSDocContext (ppr $ text "MCDiagnostic" <+> ppr sev <+> ppr reason <+> ppr code)
+
+instance ToJson DiagnosticCode where
+  json c = JSInt (fromIntegral (diagnosticCodeNumber c))
+
+{- Note [Diagnostic Message JSON Schema]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The below instance of ToJson must conform to the JSON schema
+specified in docs/users_guide/diagnostics-as-json-schema-1_0.json.
+When the schema is altered, please bump the version.
+If the content is altered in a backwards compatible way,
+update the minor version (e.g. 1.3 ~> 1.4).
+If the content is breaking, update the major version (e.g. 1.3 ~> 2.3).
+When updating the schema, replace the above file and name it appropriately with
+the version appended, and change the documentation of the -fdiagnostics-as-json
+flag to reflect the new schema.
+To learn more about JSON schemas, check out the below link:
+https://json-schema.org
+-}
+
+schemaVersion :: String
+schemaVersion = "1.0"
+-- See Note [Diagnostic Message JSON Schema] before editing!
+instance Diagnostic e => ToJson (MsgEnvelope e) where
+  json m = JSObject [
+    ("version", JSString schemaVersion),
+    ("ghcVersion", JSString $ "ghc-" ++ cProjectVersion),
+    ("span", json $ errMsgSpan m),
+    ("severity", json $ errMsgSeverity m),
+    ("code", maybe JSNull json (diagnosticCode diag)),
+    ("message", JSArray $ map renderToJSString diagMsg),
+    ("hints", JSArray $ map (renderToJSString . ppr) (diagnosticHints diag) )
+    ]
+    where diag = errMsgDiagnostic m
+          opts = defaultDiagnosticOpts @e
+          style = mkErrStyle (errMsgContext m)
+          ctx = defaultSDocContext {sdocStyle = style }
+          diagMsg = filter (not . isEmpty ctx) (unDecorated (diagnosticMessage (opts) diag))
+          renderToJSString :: SDoc -> JsonDoc
+          renderToJSString = JSString . (renderWithContext ctx)
 
 instance Show (MsgEnvelope DiagnosticMessage) where
     show = showMsgEnvelope
@@ -494,12 +644,22 @@ mkLocMessageWarningGroups show_warn_groups msg_class locn msg
           warning_flag_doc =
             case msg_class of
               MCDiagnostic sev reason _code
-                | Just msg <- flag_msg sev reason -> brackets msg
-              _                                   -> empty
+                | Just msg <- flag_msg sev (resolvedDiagnosticReason reason)
+                  -> brackets msg
+              _   -> empty
+
+          ppr_with_hyperlink code =
+            -- this is a bit hacky, but we assume that if the terminal supports colors
+            -- then it should also support links
+            sdocOption (\ ctx -> sdocPrintErrIndexLinks ctx) $
+              \ use_hyperlinks ->
+                 if use_hyperlinks
+                 then ppr $ LinkedDiagCode code
+                 else ppr code
 
           code_doc =
             case msg_class of
-              MCDiagnostic _ _ (Just code) -> brackets (coloured msg_colour $ ppr code)
+              MCDiagnostic _ _ (Just code) -> brackets (ppr_with_hyperlink code)
               _                            -> empty
 
           flag_msg :: Severity -> DiagnosticReason -> Maybe SDoc
@@ -508,26 +668,32 @@ mkLocMessageWarningGroups show_warn_groups msg_class locn msg
             -- in a log file, e.g. with -ddump-tc-trace. It should not
             -- happen otherwise, though.
           flag_msg SevError WarningWithoutFlag = Just (col "-Werror")
-          flag_msg SevError (WarningWithFlag wflag) =
+          flag_msg SevError (WarningWithFlags (wflag :| _)) =
             let name = NE.head (warnFlagNames wflag) in
-            Just $ col ("-W" ++ name) <+> warn_flag_grp wflag
+            Just $ col ("-W" ++ name) <+> warn_flag_grp (smallestWarningGroups wflag)
                                       <> comma
                                       <+> col ("Werror=" ++ name)
+          flag_msg SevError   (WarningWithCategory cat) =
+            Just $ coloured msg_colour (text "-W" <> ppr cat)
+                       <+> warn_flag_grp smallestWarningGroupsForCategory
+                       <> comma
+                       <+> coloured msg_colour (text "-Werror=" <> ppr cat)
           flag_msg SevError   ErrorWithoutFlag   = Nothing
           flag_msg SevWarning WarningWithoutFlag = Nothing
-          flag_msg SevWarning (WarningWithFlag wflag) =
+          flag_msg SevWarning (WarningWithFlags (wflag :| _)) =
             let name = NE.head (warnFlagNames wflag) in
-            Just (col ("-W" ++ name) <+> warn_flag_grp wflag)
+            Just (col ("-W" ++ name) <+> warn_flag_grp (smallestWarningGroups wflag))
+          flag_msg SevWarning (WarningWithCategory cat) =
+            Just (coloured msg_colour (text "-W" <> ppr cat)
+                      <+> warn_flag_grp smallestWarningGroupsForCategory)
           flag_msg SevWarning ErrorWithoutFlag =
             pprPanic "SevWarning with ErrorWithoutFlag" $
               vcat [ text "locn:" <+> ppr locn
                    , text "msg:" <+> ppr msg ]
 
-          warn_flag_grp flag
-              | show_warn_groups =
-                    case smallestWarningGroups flag of
-                        [] -> empty
-                        groups -> text $ "(in " ++ intercalate ", " (map ("-W"++) groups) ++ ")"
+          warn_flag_grp groups
+              | show_warn_groups, not (null groups)
+                          = text $ "(in " ++ intercalate ", " (map (("-W"++) . warningGroupName) groups) ++ ")"
               | otherwise = empty
 
           -- Add prefixes, like    Foo.hs:34: warning:
@@ -645,7 +811,7 @@ later classify and report them appropriately (in the driver).
 -- | Returns 'True' if this is, intrinsically, a failure. See
 -- Note [Intrinsic And Extrinsic Failures].
 isIntrinsicErrorMessage :: Diagnostic e => MsgEnvelope e -> Bool
-isIntrinsicErrorMessage = (==) ErrorWithoutFlag . diagnosticReason . errMsgDiagnostic
+isIntrinsicErrorMessage = (==) ErrorWithoutFlag . resolvedDiagnosticReason . errMsgReason
 
 isWarningMessage :: Diagnostic e => MsgEnvelope e -> Bool
 isWarningMessage = not . isIntrinsicErrorMessage
@@ -695,8 +861,29 @@ data DiagnosticCode =
     , diagnosticCodeNumber    :: Natural
         -- ^ the actual diagnostic code
     }
+  deriving ( Eq, Ord )
+
+instance Show DiagnosticCode where
+  show (DiagnosticCode prefix c) =
+    prefix ++ "-" ++ printf "%05d" c
+      -- pad the numeric code to have at least 5 digits
 
 instance Outputable DiagnosticCode where
-  ppr (DiagnosticCode prefix c) =
-    text prefix <> text "-" <> text (printf "%05d" c)
-      -- pad the numeric code to have at least 5 digits
+  ppr code = text (show code)
+
+-- | A newtype that is a witness to the `-fprint-error-index-links` flag. It
+-- alters the @Outputable@ instance to emit @DiagnosticCode@ as ANSI hyperlinks
+-- to the HF error index
+newtype LinkedDiagCode = LinkedDiagCode DiagnosticCode
+
+instance Outputable LinkedDiagCode where
+  ppr (LinkedDiagCode d@DiagnosticCode{}) = linkEscapeCode d
+
+-- | Wrap the link in terminal escape codes specified by OSC 8.
+linkEscapeCode :: DiagnosticCode -> SDoc
+linkEscapeCode d = text "\ESC]8;;" <> hfErrorLink d -- make the actual link
+                   <> text "\ESC\\" <> ppr d <> text "\ESC]8;;\ESC\\" -- the rest is the visible text
+
+-- | create a link to the HF error index given an error code.
+hfErrorLink :: DiagnosticCode -> SDoc
+hfErrorLink errorCode = text "https://errors.haskell.org/messages/" <> ppr errorCode

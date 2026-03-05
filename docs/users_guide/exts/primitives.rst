@@ -12,12 +12,15 @@ you write will be optimised to the efficient unboxed version in any
 case. And if it isn't, we'd like to know about it.
 
 All these primitive data types and operations are exported by the
-library :base-ref:`GHC.Exts.`.
+module :base-ref:`GHC.Exts.`.
 
 If you want to mention any of the primitive data types or operations in
 your program, you must first import ``GHC.Exts`` to bring them into
 scope. Many of them have names ending in ``#``, and to mention such names
 you need the :extension:`MagicHash` extension.
+
+To enable defining literals for other primitive data types, see the
+:extension:`ExtendedLiterals` extension.
 
 The primops make extensive use of `unboxed types <#glasgow-unboxed>`__
 and `unboxed tuples <#unboxed-tuples>`__, which we briefly summarise
@@ -136,7 +139,7 @@ There are some restrictions on the use of primitive types:
 
          f x = let !(Foo a b, w) = ..rhs.. in ..body..
 
-   since ``b`` has type ``Int#``.
+   since ``b`` has type ``Int#``.  See :ref:`recursive-and-polymorphic-let-bindings`.
 
 .. _unboxed-tuples:
 
@@ -198,7 +201,8 @@ example desugars like this:
                 q = snd t
             in ..body..
 
-Indeed, the bindings can even be recursive.
+Indeed, the bindings can even be recursive.  See :ref:`recursive-and-polymorphic-let-bindings`
+for a more precise account.
 
 To refer to the unboxed tuple type constructors themselves, e.g. if you
 want to attach instances to them, use ``(# #)``, ``(#,#)``, ``(#,,#)``, etc.
@@ -377,7 +381,7 @@ only required for ``newtype instance`` declarations, such as ``FooKeyBoolC``
 and ``BarTypeWorkRepC`` above.
 
 This extension impacts the determination of whether or not a newtype has
-a Complete User-Specified Kind Signature (CUSK). The exact impact is specified
+a Complete User-Supplied Kind (CUSK). The exact impact is specified
 `the section on CUSKs <#complete-kind-signatures>`__.
 
 Unlifted Datatypes
@@ -434,11 +438,15 @@ You may even declare levity-polymorphic data types: ::
 While ``f`` above could reasonably be levity-polymorphic (as it evaluates its
 argument either way), GHC currently disallows the more general type
 ``PEither @l Int Bool -> Bool``. This is a consequence of the
-`representation-polymorphic binder restriction <#representation-polymorphism-restrictions>`__,
+`representation-polymorphic binder restriction <#representation-polymorphism-restrictions>`__.
 
-Due to :ghc-ticket:`19487`, it's
-currently not possible to declare levity-polymorphic data types with nullary
-data constructors. There's a workaround, though: ::
+Pattern matching against an unlifted data type work just like that for lifted
+types; but see :ref:`recursive-and-polymorphic-let-bindings` for the semantics of
+pattern bindings involving unlifted data types.
+
+Due to :ghc-ticket:`19487`, it is
+not currently possible to declare levity-polymorphic data types with nullary
+data constructors. There is a workaround, though: ::
 
   type T :: TYPE (BoxedRep l)
   data T where

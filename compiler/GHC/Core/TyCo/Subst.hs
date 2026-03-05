@@ -5,7 +5,6 @@ Type and Coercion - friends' interface
 -}
 
 
-{-# LANGUAGE BangPatterns #-}
 
 -- | Substitution into types and coercions.
 module GHC.Core.TyCo.Subst
@@ -14,14 +13,14 @@ module GHC.Core.TyCo.Subst
         Subst(..), TvSubstEnv, CvSubstEnv, IdSubstEnv,
         emptyIdSubstEnv, emptyTvSubstEnv, emptyCvSubstEnv, composeTCvSubst,
         emptySubst, mkEmptySubst, isEmptyTCvSubst, isEmptySubst,
-        mkSubst, mkTvSubst, mkCvSubst, mkIdSubst,
+        mkTCvSubst, mkTvSubst, mkCvSubst, mkIdSubst,
         getTvSubstEnv, getIdSubstEnv,
         getCvSubstEnv, getSubstInScope, setInScope, getSubstRangeTyCoFVs,
         isInScope, elemSubst, notElemSubst, zapSubst,
         extendSubstInScope, extendSubstInScopeList, extendSubstInScopeSet,
         extendTCvSubst, extendTCvSubstWithClone,
         extendCvSubst, extendCvSubstWithClone,
-        extendTvSubst, extendTvSubstBinderAndInScope, extendTvSubstWithClone,
+        extendTvSubst, extendTvSubstWithClone,
         extendTvSubstList, extendTvSubstAndInScope,
         extendTCvSubstList,
         unionSubst, zipTyEnv, zipCoEnv,
@@ -63,7 +62,7 @@ import {-# SOURCE #-} GHC.Core.Coercion
    , mkCoercionType
    , coercionKind, coercionLKind, coVarKindsTypesRole )
 import {-# SOURCE #-} GHC.Core.TyCo.Ppr ( pprTyVar )
-import {-# SOURCE #-} GHC.Core.Ppr ( )
+import {-# SOURCE #-} GHC.Core.Ppr ( ) -- instance Outputable CoreExpr
 import {-# SOURCE #-} GHC.Core ( CoreExpr )
 
 import GHC.Core.TyCo.Rep
@@ -82,7 +81,6 @@ import GHC.Types.Unique.FM
 import GHC.Types.Unique.Set
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
-import GHC.Utils.Panic.Plain
 
 import Data.List (mapAccumL)
 
@@ -272,8 +270,8 @@ isEmptyTCvSubst :: Subst -> Bool
 isEmptyTCvSubst (Subst _ _ tv_env cv_env)
   = isEmptyVarEnv tv_env && isEmptyVarEnv cv_env
 
-mkSubst :: InScopeSet -> TvSubstEnv -> CvSubstEnv -> IdSubstEnv -> Subst
-mkSubst in_scope tvs cvs ids = Subst in_scope ids tvs cvs
+mkTCvSubst :: InScopeSet -> TvSubstEnv -> CvSubstEnv -> Subst
+mkTCvSubst in_scope tvs cvs = Subst in_scope emptyIdSubstEnv tvs cvs
 
 mkIdSubst :: InScopeSet -> IdSubstEnv -> Subst
 mkIdSubst in_scope ids = Subst in_scope ids emptyTvSubstEnv emptyCvSubstEnv
@@ -374,22 +372,15 @@ extendTvSubst (Subst in_scope ids tvs cvs) tv ty
   = assert (isTyVar tv) $
     Subst in_scope ids (extendVarEnv tvs tv ty) cvs
 
-extendTvSubstBinderAndInScope :: Subst -> PiTyBinder -> Type -> Subst
-extendTvSubstBinderAndInScope subst (Named (Bndr v _)) ty
-  = assert (isTyVar v )
-    extendTvSubstAndInScope subst v ty
-extendTvSubstBinderAndInScope subst (Anon {}) _
-  = subst
-
 extendTvSubstWithClone :: Subst -> TyVar -> TyVar -> Subst
 -- Adds a new tv -> tv mapping, /and/ extends the in-scope set with the clone
 -- Does not look in the kind of the new variable;
 --   those variables should be in scope already
 extendTvSubstWithClone (Subst in_scope idenv tenv cenv) tv tv'
   = Subst (extendInScopeSet in_scope tv')
-             idenv
-             (extendVarEnv tenv tv (mkTyVarTy tv'))
-             cenv
+          idenv
+          (extendVarEnv tenv tv (mkTyVarTy tv'))
+          cenv
 
 -- | Add a substitution from a 'CoVar' to a 'Coercion' to the 'Subst':
 -- you must ensure that the in-scope set satisfies
@@ -535,7 +526,8 @@ Note [Sym and ForAllCo]
 In OptCoercion, we try to push "sym" out to the leaves of a coercion. But,
 how do we push sym into a ForAllCo? It's a little ugly.
 
-Here is the typing rule:
+Ignoring visibility, here is the typing rule
+(see Note [ForAllCo] in GHC.Core.TyCo.Rep).
 
 h : k1 ~# k2
 (tv : k1) |- g : ty1 ~# ty2
@@ -622,7 +614,7 @@ substTyWithUnchecked tvs tys
 -- Pre-condition: the 'in_scope' set should satisfy Note [The substitution
 -- invariant]; specifically it should include the free vars of 'tys',
 -- and of 'ty' minus the domain of the subst.
-substTyWithInScope :: InScopeSet -> [TyVar] -> [Type] -> Type -> Type
+substTyWithInScope :: HasDebugCallStack => InScopeSet -> [TyVar] -> [Type] -> Type -> Type
 substTyWithInScope in_scope tvs tys ty =
   assert (tvs `equalLength` tys )
   substTy (mkTvSubst in_scope tenv) ty
@@ -650,12 +642,12 @@ substTyWithCoVars :: [CoVar] -> [Coercion] -> Type -> Type
 substTyWithCoVars cvs cos = substTy (zipCvSubst cvs cos)
 
 -- | Type substitution, see 'zipTvSubst'
-substTysWith :: [TyVar] -> [Type] -> [Type] -> [Type]
+substTysWith :: HasDebugCallStack => [TyVar] -> [Type] -> [Type] -> [Type]
 substTysWith tvs tys = assert (tvs `equalLength` tys )
                        substTys (zipTvSubst tvs tys)
 
 -- | Type substitution, see 'zipTvSubst'
-substTysWithCoVars :: [CoVar] -> [Coercion] -> [Type] -> [Type]
+substTysWithCoVars :: HasDebugCallStack => [CoVar] -> [Coercion] -> [Type] -> [Type]
 substTysWithCoVars cvs cos = assert (cvs `equalLength` cos )
                              substTys (zipCvSubst cvs cos)
 
@@ -663,7 +655,7 @@ substTysWithCoVars cvs cos = assert (cvs `equalLength` cos )
 -- to the in-scope set. This is useful for the case when the free variables
 -- aren't already in the in-scope set or easily available.
 -- See also Note [The substitution invariant].
-substTyAddInScope :: Subst -> Type -> Type
+substTyAddInScope :: HasDebugCallStack => Subst -> Type -> Type
 substTyAddInScope subst ty =
   substTy (extendSubstInScopeSet subst $ tyCoVarsOfType ty) ty
 
@@ -715,7 +707,7 @@ checkValidSubst subst@(Subst in_scope _ tenv cenv) tys cos a
 -- Note [The substitution invariant].
 substTy :: HasDebugCallStack => Subst -> Type  -> Type
 substTy subst ty
-  | isEmptyTCvSubst    subst = ty
+  | isEmptyTCvSubst subst = ty
   | otherwise             = checkValidSubst subst [ty] [] $
                             subst_ty subst ty
 
@@ -726,8 +718,8 @@ substTy subst ty
 -- substTy and remove this function. Please don't use in new code.
 substTyUnchecked :: Subst -> Type -> Type
 substTyUnchecked subst ty
-                 | isEmptyTCvSubst subst    = ty
-                 | otherwise             = subst_ty subst ty
+  | isEmptyTCvSubst subst = ty
+  | otherwise             = subst_ty subst ty
 
 substScaledTy :: HasDebugCallStack => Subst -> Scaled Type -> Scaled Type
 substScaledTy subst scaled_ty = mapScaledType (substTy subst) scaled_ty
@@ -820,7 +812,7 @@ substTyVar (Subst _ _ tenv _) tv
       Nothing -> TyVarTy tv
 
 substTyVarToTyVar :: HasDebugCallStack => Subst -> TyVar -> TyVar
--- Apply the substitution, expecing the result to be a TyVarTy
+-- Apply the substitution, expecting the result to be a TyVarTy
 substTyVarToTyVar (Subst _ _ tenv _) tv
   = assert (isTyVar tv) $
     case lookupVarEnv tenv tv of
@@ -889,10 +881,10 @@ subst_co subst co
     go (TyConAppCo r tc args)= let args' = map go args
                                in  args' `seqList` mkTyConAppCo r tc args'
     go (AppCo co arg)        = (mkAppCo $! go co) $! go arg
-    go (ForAllCo tv kind_co co)
+    go (ForAllCo tv visL visR kind_co co)
       = case substForAllCoBndrUnchecked subst tv kind_co of
          (subst', tv', kind_co') ->
-          ((mkForAllCo $! tv') $! kind_co') $! subst_co subst' co
+          ((mkForAllCo $! tv') visL visR $! kind_co') $! subst_co subst' co
     go (FunCo r afl afr w co1 co2)   = ((mkFunCo2 r afl afr $! go w) $! go co1) $! go co2
     go (CoVarCo cv)          = substCoVar subst cv
     go (AxiomInstCo con ind cos) = mkAxiomInstCo con ind $! map go cos
@@ -912,7 +904,6 @@ subst_co subst co
     go_prov (PhantomProv kco)    = PhantomProv (go kco)
     go_prov (ProofIrrelProv kco) = ProofIrrelProv (go kco)
     go_prov p@(PluginProv _)     = p
-    go_prov p@(CorePrepProv _)   = p
 
     -- See Note [Substituting in a coercion hole]
     go_hole h@(CoercionHole { ch_co_var = cv })

@@ -28,12 +28,14 @@ void initTracing (void);
 void endTracing  (void);
 void freeTracing (void);
 void resetTracing (void);
-void tracingAddCapapilities (uint32_t from, uint32_t to);
+void tracingAddCapabilities (uint32_t from, uint32_t to);
 
 #endif /* TRACING */
 
 typedef StgWord32 CapsetID;
+#if !defined(__cplusplus)
 typedef StgWord16 CapsetType;
+#endif
 enum CapsetType { CapsetTypeCustom = CAPSET_TYPE_CUSTOM,
                   CapsetTypeOsProcess = CAPSET_TYPE_OSPROCESS,
                   CapsetTypeClockdomain = CAPSET_TYPE_CLOCKDOMAIN };
@@ -327,8 +329,9 @@ void traceConcSyncEnd(void);
 void traceConcSweepBegin(void);
 void traceConcSweepEnd(void);
 void traceConcUpdRemSetFlush(Capability *cap);
-void traceNonmovingHeapCensus(uint32_t log_blk_size,
+void traceNonmovingHeapCensus(uint16_t blk_size,
                               const struct NonmovingAllocCensus *census);
+void traceNonmovingPrunedSegments(uint32_t pruned_segments, uint32_t free_segments);
 
 void traceIPE(const InfoProvEnt *ipe);
 void flushTrace(void);

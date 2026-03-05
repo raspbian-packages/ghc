@@ -3,6 +3,9 @@
 {-# LANGUAGE OverloadedStrings          #-}
 {-# LANGUAGE Rank2Types                 #-}
 {-# LANGUAGE ScopedTypeVariables        #-}
+{-# LANGUAGE ViewPatterns               #-}
+{-# LANGUAGE MagicHash                  #-}
+{-# LANGUAGE MultiWayIf                 #-}
 
 -- only for DB.Binary instances on Module
 {-# OPTIONS_GHC -fno-warn-orphans #-}
@@ -20,40 +23,40 @@
 -- Stability   :  experimental
 --
 --  Serialization/deserialization of binary .o files for the JavaScript backend
---  The .o files contain dependency information and generated code.
---  All strings are mapped to a central string table, which helps reduce
---  file size and gives us efficient hash consing on read
---
---  Binary intermediate JavaScript object files:
---   serialized [Text] -> ([ClosureInfo], JStat) blocks
---
---  file layout:
---   - magic "GHCJSOBJ"
---   - compiler version tag
---   - module name
---   - offsets of string table
---   - dependencies
---   - offset of the index
---   - unit infos
---   - index
---   - string table
 --
 -----------------------------------------------------------------------------
 
 module GHC.StgToJS.Object
-  ( putObject
+  ( ObjectKind(..)
+  , getObjectKind
+  , getObjectKindBS
+  -- * JS object
+  , JSOptions(..)
+  , defaultJSOptions
+  , getOptionsFromJsFile
+  , writeJSObject
+  , readJSObject
+  , parseJSObject
+  , parseJSObjectBS
+  -- * HS object
+  , putObject
   , getObjectHeader
   , getObjectBody
   , getObject
   , readObject
-  , getObjectUnits
-  , readObjectUnits
-  , readObjectDeps
-  , isGlobalUnit
-  , isJsObjectFile
+  , getObjectBlocks
+  , readObjectBlocks
+  , readObjectBlockInfo
+  , isGlobalBlock
   , Object(..)
   , IndexEntry(..)
-  , Deps (..), BlockDeps (..), DepsLocation (..)
+  , LocatedBlockInfo (..)
+  , BlockInfo (..)
+  , BlockDeps (..)
+  , BlockLocation (..)
+  , BlockId
+  , BlockIds
+  , BlockRef (..)
   , ExportedFun (..)
   )
 where
@@ -67,17 +70,20 @@ import           Data.Int
 import           Data.IntSet (IntSet)
 import qualified Data.IntSet as IS
 import           Data.List (sortOn)
+import qualified Data.List as List
 import           Data.Map (Map)
 import qualified Data.Map as M
 import           Data.Word
-import           Data.Char
-import Foreign.Storable
-import Foreign.Marshal.Array
+import           Data.Semigroup
+import qualified Data.ByteString          as B
+import qualified Data.ByteString.Unsafe   as B
+import Data.Char (isSpace)
 import System.IO
 
 import GHC.Settings.Constants (hiVersion)
 
-import GHC.JS.Syntax
+import GHC.JS.Ident
+import qualified GHC.JS.Syntax as Sat
 import GHC.StgToJS.Types
 
 import GHC.Unit.Module
@@ -85,74 +91,153 @@ import GHC.Unit.Module
 import GHC.Data.FastString
 
 import GHC.Types.Unique.Map
-import GHC.Float (castDoubleToWord64, castWord64ToDouble)
 
 import GHC.Utils.Binary hiding (SymbolTable)
 import GHC.Utils.Outputable (ppr, Outputable, hcat, vcat, text, hsep)
 import GHC.Utils.Monad (mapMaybeM)
+import GHC.Utils.Panic
+import GHC.Utils.Misc (dropWhileEndLE)
+import System.IO.Unsafe
+import qualified Control.Exception as Exception
 
--- | An object file
+----------------------------------------------
+-- The JS backend supports 3 kinds of objects:
+--   1. HS objects: produced from Haskell sources
+--   2. JS objects: produced from JS sources
+--   3. Cc objects: produced by emcc (e.g. from C sources)
+--
+-- They all have a different header that allows them to be distinguished.
+-- See ObjectKind type.
+----------------------------------------------
+
+-- | Different kinds of object (.o) supported by the JS backend
+data ObjectKind
+  = ObjJs -- ^ JavaScript source embedded in a .o
+  | ObjHs -- ^ JS backend object for Haskell code
+  | ObjCc -- ^ Wasm module object as produced by emcc
+  deriving (Show,Eq,Ord)
+
+-- | Get the kind of a file object, if any
+getObjectKind :: FilePath -> IO (Maybe ObjectKind)
+getObjectKind fp = withBinaryFile fp ReadMode $ \h -> do
+  let !max_header_length = max (B.length jsHeader)
+                           $ max (B.length wasmHeader)
+                                 (B.length hsHeader)
+
+  bs <- B.hGet h max_header_length
+  pure $! getObjectKindBS bs
+
+-- | Get the kind of an object stored in a bytestring, if any
+getObjectKindBS :: B.ByteString -> Maybe ObjectKind
+getObjectKindBS bs
+  | jsHeader   `B.isPrefixOf` bs = Just ObjJs
+  | hsHeader   `B.isPrefixOf` bs = Just ObjHs
+  | wasmHeader `B.isPrefixOf` bs = Just ObjCc
+  | otherwise                    = Nothing
+
+-- Header added to JS sources to discriminate them from other object files.
+-- They all have .o extension but JS sources have this header.
+jsHeader :: B.ByteString
+jsHeader = unsafePerformIO $ B.unsafePackAddressLen 8 "GHCJS_JS"#
+
+hsHeader :: B.ByteString
+hsHeader = unsafePerformIO $ B.unsafePackAddressLen 8 "GHCJS_HS"#
+
+wasmHeader :: B.ByteString
+wasmHeader = unsafePerformIO $ B.unsafePackAddressLen 4 "\0asm"#
+
+
+
+------------------------------------------------
+-- HS objects
+--
+--  file layout:
+--   - magic "GHCJS_HS"
+--   - compiler version tag
+--   - module name
+--   - offsets of string table
+--   - dependencies
+--   - offset of the index
+--   - unit infos
+--   - index
+--   - string table
+--
+------------------------------------------------
+
+-- | A HS object file
 data Object = Object
   { objModuleName    :: !ModuleName
     -- ^ name of the module
   , objHandle        :: !BinHandle
-    -- ^ BinHandle that can be used to read the ObjUnits
-  , objPayloadOffset :: !(Bin ObjUnit)
+    -- ^ BinHandle that can be used to read the ObjBlocks
+  , objPayloadOffset :: !(Bin ObjBlock)
     -- ^ Offset of the payload (units)
-  , objDeps          :: !Deps
-    -- ^ Dependencies
+  , objBlockInfo     :: !BlockInfo
+    -- ^ Information about blocks
   , objIndex         :: !Index
-    -- ^ The Index, serialed unit indices and their linkable units
+    -- ^ Block index: symbols per block and block offset in the object file
   }
 
 type BlockId  = Int
 type BlockIds = IntSet
 
--- | dependencies for a single module
-data Deps = Deps
-  { depsModule          :: !Module
-      -- ^ module
-  , depsRequired        :: !BlockIds
+-- | Information about blocks (linkable units)
+data BlockInfo = BlockInfo
+  { bi_module     :: !Module
+      -- ^ Module they were generated from
+  , bi_must_link  :: !BlockIds
       -- ^ blocks that always need to be linked when this object is loaded (e.g.
       -- everything that contains initializer code or foreign exports)
-  , depsHaskellExported :: !(Map ExportedFun BlockId)
+  , bi_exports    :: !(Map ExportedFun BlockId)
       -- ^ exported Haskell functions -> block
-  , depsBlocks          :: !(Array BlockId BlockDeps)
-      -- ^ info about each block
+  , bi_block_deps :: !(Array BlockId BlockDeps)
+      -- ^ dependencies of each block
   }
 
-instance Outputable Deps where
+data LocatedBlockInfo = LocatedBlockInfo
+  { lbi_loc  :: !BlockLocation -- ^ Where to find the blocks
+  , lbi_info :: !BlockInfo     -- ^ Block information
+  }
+
+instance Outputable BlockInfo where
   ppr d = vcat
-    [ hcat [ text "module: ", pprModule (depsModule d) ]
-    , hcat [ text "exports: ", ppr (M.keys (depsHaskellExported d)) ]
+    [ hcat [ text "module: ", pprModule (bi_module d) ]
+    , hcat [ text "exports: ", ppr (M.keys (bi_exports d)) ]
     ]
 
--- | Where are the dependencies
-data DepsLocation
+-- | Where are the blocks
+data BlockLocation
   = ObjectFile  FilePath       -- ^ In an object file at path
   | ArchiveFile FilePath       -- ^ In a Ar file at path
   | InMemory    String Object  -- ^ In memory
 
-instance Outputable DepsLocation where
+instance Outputable BlockLocation where
   ppr = \case
     ObjectFile fp  -> hsep [text "ObjectFile", text fp]
     ArchiveFile fp -> hsep [text "ArchiveFile", text fp]
     InMemory s o   -> hsep [text "InMemory", text s, ppr (objModuleName o)]
 
+-- | A @BlockRef@ is a pair of a module and the index of the block in the
+-- object file
+data BlockRef = BlockRef
+  { block_ref_mod :: !Module  -- ^ Module
+  , block_ref_idx :: !BlockId -- ^ Block index in the object file
+  }
+  deriving (Eq,Ord)
+
 data BlockDeps = BlockDeps
-  { blockBlockDeps       :: [Int]         -- ^ dependencies on blocks in this object
+  { blockBlockDeps       :: [BlockId]     -- ^ dependencies on blocks in this object
   , blockFunDeps         :: [ExportedFun] -- ^ dependencies on exported symbols in other objects
   -- , blockForeignExported :: [ExpFun]
   -- , blockForeignImported :: [ForeignRef]
   }
 
-{- | we use the convention that the first unit (0) is a module-global
-     unit that's always included when something from the module
-     is loaded. everything in a module implicitly depends on the
-     global block. the global unit itself can't have dependencies
- -}
-isGlobalUnit :: Int -> Bool
-isGlobalUnit n = n == 0
+-- | we use the convention that the first block (0) is a module-global block
+-- that's always included when something from the module is loaded. everything
+-- in a module implicitly depends on the global block. The global block itself
+-- can't have dependencies
+isGlobalBlock :: BlockId -> Bool
+isGlobalBlock n = n == 0
 
 -- | Exported Functions
 data ExportedFun = ExportedFun
@@ -166,10 +251,10 @@ instance Outputable ExportedFun where
     , hcat [ text "symbol: ", ppr f ]
     ]
 
--- | Write an ObjUnit, except for the top level symbols which are stored in the
+-- | Write an ObjBlock, except for the top level symbols which are stored in the
 -- index
-putObjUnit :: BinHandle -> ObjUnit -> IO ()
-putObjUnit bh (ObjUnit _syms b c d e f g) = do
+putObjBlock :: BinHandle -> ObjBlock -> IO ()
+putObjBlock bh (ObjBlock _syms b c d e f g) = do
     put_ bh b
     put_ bh c
     lazyPut bh d
@@ -177,17 +262,17 @@ putObjUnit bh (ObjUnit _syms b c d e f g) = do
     put_ bh f
     put_ bh g
 
--- | Read an ObjUnit and associate it to the given symbols (that must have been
+-- | Read an ObjBlock and associate it to the given symbols (that must have been
 -- read from the index)
-getObjUnit :: [FastString] -> BinHandle -> IO ObjUnit
-getObjUnit syms bh = do
+getObjBlock :: [FastString] -> BinHandle -> IO ObjBlock
+getObjBlock syms bh = do
     b <- get bh
     c <- get bh
     d <- lazyGet bh
     e <- get bh
     f <- get bh
     g <- get bh
-    pure $ ObjUnit
+    pure $ ObjBlock
       { oiSymbols  = syms
       , oiClInfo   = b
       , oiStatic   = c
@@ -198,22 +283,17 @@ getObjUnit syms bh = do
       }
 
 
--- | A tag that determines the kind of payload in the .o file. See
--- @StgToJS.Linker.Arhive.magic@ for another kind of magic
-magic :: String
-magic = "GHCJSOBJ"
-
--- | Serialized unit indexes and their exported symbols
--- (the first unit is module-global)
+-- | Serialized block indexes and their exported symbols
+-- (the first block is module-global)
 type Index = [IndexEntry]
 data IndexEntry = IndexEntry
-  { idxSymbols :: ![FastString]  -- ^ Symbols exported by a unit
-  , idxOffset  :: !(Bin ObjUnit) -- ^ Offset of the unit in the object file
+  { idxSymbols :: ![FastString]  -- ^ Symbols exported by a block
+  , idxOffset  :: !(Bin ObjBlock) -- ^ Offset of the block in the object file
   }
 
 
 --------------------------------------------------------------------------------
--- Essential oeprations on Objects
+-- Essential operations on Objects
 --------------------------------------------------------------------------------
 
 -- | Given a handle to a Binary payload, add the module, 'mod_name', its
@@ -221,11 +301,11 @@ data IndexEntry = IndexEntry
 putObject
   :: BinHandle
   -> ModuleName -- ^ module
-  -> Deps       -- ^ dependencies
-  -> [ObjUnit]  -- ^ linkable units and their symbols
+  -> BlockInfo  -- ^ block infos
+  -> [ObjBlock] -- ^ linkable units and their symbols
   -> IO ()
 putObject bh mod_name deps os = do
-  forM_ magic (putByte bh . fromIntegral . ord)
+  putByteString bh hsHeader
   put_ bh (show hiVersion)
 
   -- we store the module name as a String because we don't want to have to
@@ -243,42 +323,17 @@ putObject bh mod_name deps os = do
       idx <- forM os $ \o -> do
         p <- tellBin bh_fs
         -- write units without their symbols
-        putObjUnit bh_fs o
+        putObjBlock bh_fs o
         -- return symbols and offset to store in the index
         pure (oiSymbols o,p)
       pure idx
 
--- | Test if the object file is a JS object
-isJsObjectFile :: FilePath -> IO Bool
-isJsObjectFile fp = do
-  let !n = length magic
-  withBinaryFile fp ReadMode $ \hdl -> do
-    allocaArray n $ \ptr -> do
-      n' <- hGetBuf hdl ptr n
-      if (n' /= n)
-        then pure False
-        else checkMagic (peekElemOff ptr)
-
--- | Check magic
-checkMagic :: (Int -> IO Word8) -> IO Bool
-checkMagic get_byte = do
-  let go_magic !i = \case
-        []     -> pure True
-        (e:es) -> get_byte i >>= \case
-          c | fromIntegral (ord e) == c -> go_magic (i+1) es
-            | otherwise                 -> pure False
-  go_magic 0 magic
-
--- | Parse object magic
-getCheckMagic :: BinHandle -> IO Bool
-getCheckMagic bh = checkMagic (const (getByte bh))
-
 -- | Parse object header
 getObjectHeader :: BinHandle -> IO (Either String ModuleName)
 getObjectHeader bh = do
-  is_magic <- getCheckMagic bh
-  case is_magic of
-    False -> pure (Left "invalid magic header")
+  magic <- getByteString bh (B.length hsHeader)
+  case magic == hsHeader of
+    False -> pure (Left "invalid magic header for HS object")
     True  -> do
       is_correct_version <- ((== hiVersion) . read) <$> get bh
       case is_correct_version of
@@ -288,22 +343,22 @@ getObjectHeader bh = do
           pure (Right (mkModuleName (mod_name)))
 
 
--- | Parse object body. Must be called after a sucessful getObjectHeader
+-- | Parse object body. Must be called after a successful getObjectHeader
 getObjectBody :: BinHandle -> ModuleName -> IO Object
 getObjectBody bh0 mod_name = do
   -- Read the string table
   dict <- forwardGet bh0 (getDictionary bh0)
   let bh = setUserData bh0 $ noUserData { ud_get_fs = getDictFastString dict }
 
-  deps     <- get bh
-  idx      <- forwardGet bh (get bh)
+  block_info  <- get bh
+  idx         <- forwardGet bh (get bh)
   payload_pos <- tellBin bh
 
   pure $ Object
     { objModuleName    = mod_name
     , objHandle        = bh
     , objPayloadOffset = payload_pos
-    , objDeps          = deps
+    , objBlockInfo     = block_info
     , objIndex         = idx
     }
 
@@ -322,31 +377,31 @@ readObject file = do
   bh <- readBinMem file
   getObject bh
 
--- | Reads only the part necessary to get the dependencies
-readObjectDeps :: FilePath -> IO (Maybe Deps)
-readObjectDeps file = do
+-- | Reads only the part necessary to get the block info
+readObjectBlockInfo :: FilePath -> IO (Maybe BlockInfo)
+readObjectBlockInfo file = do
   bh <- readBinMem file
   getObject bh >>= \case
-    Just obj -> pure $! Just $! objDeps obj
+    Just obj -> pure $! Just $! objBlockInfo obj
     Nothing  -> pure Nothing
 
--- | Get units in the object file, using the given filtering function
-getObjectUnits :: Object -> (Word -> IndexEntry -> Bool) -> IO [ObjUnit]
-getObjectUnits obj pred = mapMaybeM read_entry (zip (objIndex obj) [0..])
+-- | Get blocks in the object file, using the given filtering function
+getObjectBlocks :: Object -> BlockIds -> IO [ObjBlock]
+getObjectBlocks obj bids = mapMaybeM read_entry (zip (objIndex obj) [0..])
   where
     bh = objHandle obj
-    read_entry (e@(IndexEntry syms offset),i)
-      | pred i e  = do
+    read_entry (IndexEntry syms offset,i)
+      | IS.member i bids = do
           seekBin bh offset
-          Just <$> getObjUnit syms bh
+          Just <$> getObjBlock syms bh
       | otherwise = pure Nothing
 
--- | Read units in the object file, using the given filtering function
-readObjectUnits :: FilePath -> (Word -> IndexEntry -> Bool) -> IO [ObjUnit]
-readObjectUnits file pred = do
+-- | Read blocks in the object file, using the given filtering function
+readObjectBlocks :: FilePath -> BlockIds -> IO [ObjBlock]
+readObjectBlocks file bids = do
   readObject file >>= \case
     Nothing  -> pure []
-    Just obj -> getObjectUnits obj pred
+    Just obj -> getObjectBlocks obj bids
 
 
 --------------------------------------------------------------------------------
@@ -378,13 +433,13 @@ instance Binary IndexEntry where
   put_ bh (IndexEntry a b) = put_ bh a >> put_ bh b
   get bh = IndexEntry <$> get bh <*> get bh
 
-instance Binary Deps where
-  put_ bh (Deps m r e b) = do
+instance Binary BlockInfo where
+  put_ bh (BlockInfo m r e b) = do
       put_ bh m
       put_ bh (map toI32 $ IS.toList r)
       put_ bh (map (\(x,y) -> (x, toI32 y)) $ M.toList e)
       put_ bh (elems b)
-  get bh = Deps <$> get bh
+  get bh = BlockInfo <$> get bh
              <*> (IS.fromList . map fromI32 <$> get bh)
              <*> (M.fromList . map (\(x,y) -> (x, fromI32 y)) <$> get bh)
              <*> ((\xs -> listArray (0, length xs - 1) xs) <$> get bh)
@@ -402,98 +457,87 @@ instance Binary ExpFun where
   put_ bh (ExpFun isIO args res) = put_ bh isIO >> put_ bh args >> put_ bh res
   get bh                        = ExpFun <$> get bh <*> get bh <*> get bh
 
-instance Binary JStat where
-  put_ bh (DeclStat i e)       = putByte bh 1  >> put_ bh i >> put_ bh e
-  put_ bh (ReturnStat e)       = putByte bh 2  >> put_ bh e
-  put_ bh (IfStat e s1 s2)     = putByte bh 3  >> put_ bh e  >> put_ bh s1 >> put_ bh s2
-  put_ bh (WhileStat b e s)    = putByte bh 4  >> put_ bh b  >> put_ bh e  >> put_ bh s
-  put_ bh (ForInStat b i e s)  = putByte bh 5  >> put_ bh b  >> put_ bh i  >> put_ bh e  >> put_ bh s
-  put_ bh (SwitchStat e ss s)  = putByte bh 6  >> put_ bh e  >> put_ bh ss >> put_ bh s
-  put_ bh (TryStat s1 i s2 s3) = putByte bh 7  >> put_ bh s1 >> put_ bh i  >> put_ bh s2 >> put_ bh s3
-  put_ bh (BlockStat xs)       = putByte bh 8  >> put_ bh xs
-  put_ bh (ApplStat e es)      = putByte bh 9  >> put_ bh e  >> put_ bh es
-  put_ bh (UOpStat o e)        = putByte bh 10 >> put_ bh o  >> put_ bh e
-  put_ bh (AssignStat e1 e2)   = putByte bh 11 >> put_ bh e1 >> put_ bh e2
-  put_ _  (UnsatBlock {})      = error "put_ bh JStat: UnsatBlock"
-  put_ bh (LabelStat l s)      = putByte bh 12 >> put_ bh l  >> put_ bh s
-  put_ bh (BreakStat ml)       = putByte bh 13 >> put_ bh ml
-  put_ bh (ContinueStat ml)    = putByte bh 14 >> put_ bh ml
+instance Binary Sat.JStat where
+  put_ bh (Sat.DeclStat i e)       = putByte bh 1  >> put_ bh i >> put_ bh e
+  put_ bh (Sat.ReturnStat e)       = putByte bh 2  >> put_ bh e
+  put_ bh (Sat.IfStat e s1 s2)     = putByte bh 3  >> put_ bh e  >> put_ bh s1 >> put_ bh s2
+  put_ bh (Sat.WhileStat b e s)    = putByte bh 4  >> put_ bh b  >> put_ bh e  >> put_ bh s
+  put_ bh (Sat.ForStat is c s bd)  = putByte bh 5 >> put_ bh is  >> put_ bh c >> put_ bh s >> put_ bh bd
+  put_ bh (Sat.ForInStat b i e s)  = putByte bh 6  >> put_ bh b  >> put_ bh i  >> put_ bh e  >> put_ bh s
+  put_ bh (Sat.SwitchStat e ss s)  = putByte bh 7  >> put_ bh e  >> put_ bh ss >> put_ bh s
+  put_ bh (Sat.TryStat s1 i s2 s3) = putByte bh 8  >> put_ bh s1 >> put_ bh i  >> put_ bh s2 >> put_ bh s3
+  put_ bh (Sat.BlockStat xs)       = putByte bh 9  >> put_ bh xs
+  put_ bh (Sat.ApplStat e es)      = putByte bh 10 >> put_ bh e  >> put_ bh es
+  put_ bh (Sat.UOpStat o e)        = putByte bh 11 >> put_ bh o  >> put_ bh e
+  put_ bh (Sat.AssignStat e1 op e2) = putByte bh 12 >> put_ bh e1 >> put_ bh op >> put_ bh e2
+  put_ bh (Sat.LabelStat l s)      = putByte bh 13 >> put_ bh l  >> put_ bh s
+  put_ bh (Sat.BreakStat ml)       = putByte bh 14 >> put_ bh ml
+  put_ bh (Sat.ContinueStat ml)    = putByte bh 15 >> put_ bh ml
+  put_ bh (Sat.FuncStat i is b)    = putByte bh 16 >> put_ bh i >> put_ bh is >> put_ bh b
   get bh = getByte bh >>= \case
-    1  -> DeclStat     <$> get bh <*> get bh
-    2  -> ReturnStat   <$> get bh
-    3  -> IfStat       <$> get bh <*> get bh <*> get bh
-    4  -> WhileStat    <$> get bh <*> get bh <*> get bh
-    5  -> ForInStat    <$> get bh <*> get bh <*> get bh <*> get bh
-    6  -> SwitchStat   <$> get bh <*> get bh <*> get bh
-    7  -> TryStat      <$> get bh <*> get bh <*> get bh <*> get bh
-    8  -> BlockStat    <$> get bh
-    9  -> ApplStat     <$> get bh <*> get bh
-    10 -> UOpStat      <$> get bh <*> get bh
-    11 -> AssignStat   <$> get bh <*> get bh
-    12 -> LabelStat    <$> get bh <*> get bh
-    13 -> BreakStat    <$> get bh
-    14 -> ContinueStat <$> get bh
+    1  -> Sat.DeclStat     <$> get bh <*> get bh
+    2  -> Sat.ReturnStat   <$> get bh
+    3  -> Sat.IfStat       <$> get bh <*> get bh <*> get bh
+    4  -> Sat.WhileStat    <$> get bh <*> get bh <*> get bh
+    5  -> Sat.ForStat      <$> get bh <*> get bh <*> get bh <*> get bh
+    6  -> Sat.ForInStat    <$> get bh <*> get bh <*> get bh <*> get bh
+    7  -> Sat.SwitchStat   <$> get bh <*> get bh <*> get bh
+    8  -> Sat.TryStat      <$> get bh <*> get bh <*> get bh <*> get bh
+    9  -> Sat.BlockStat    <$> get bh
+    10 -> Sat.ApplStat     <$> get bh <*> get bh
+    11 -> Sat.UOpStat      <$> get bh <*> get bh
+    12 -> Sat.AssignStat   <$> get bh <*> get bh <*> get bh
+    13 -> Sat.LabelStat    <$> get bh <*> get bh
+    14 -> Sat.BreakStat    <$> get bh
+    15 -> Sat.ContinueStat <$> get bh
+    16 -> Sat.FuncStat     <$> get bh <*> get bh <*> get bh
     n -> error ("Binary get bh JStat: invalid tag: " ++ show n)
 
-instance Binary JExpr where
-  put_ bh (ValExpr v)          = putByte bh 1 >> put_ bh v
-  put_ bh (SelExpr e i)        = putByte bh 2 >> put_ bh e  >> put_ bh i
-  put_ bh (IdxExpr e1 e2)      = putByte bh 3 >> put_ bh e1 >> put_ bh e2
-  put_ bh (InfixExpr o e1 e2)  = putByte bh 4 >> put_ bh o  >> put_ bh e1 >> put_ bh e2
-  put_ bh (UOpExpr o e)        = putByte bh 5 >> put_ bh o  >> put_ bh e
-  put_ bh (IfExpr e1 e2 e3)    = putByte bh 6 >> put_ bh e1 >> put_ bh e2 >> put_ bh e3
-  put_ bh (ApplExpr e es)      = putByte bh 7 >> put_ bh e  >> put_ bh es
-  put_ _  (UnsatExpr {})       = error "put_ bh JExpr: UnsatExpr"
-  get bh = getByte bh >>= \case
-    1 -> ValExpr   <$> get bh
-    2 -> SelExpr   <$> get bh <*> get bh
-    3 -> IdxExpr   <$> get bh <*> get bh
-    4 -> InfixExpr <$> get bh <*> get bh <*> get bh
-    5 -> UOpExpr   <$> get bh <*> get bh
-    6 -> IfExpr    <$> get bh <*> get bh <*> get bh
-    7 -> ApplExpr  <$> get bh <*> get bh
-    n -> error ("Binary get bh JExpr: invalid tag: " ++ show n)
 
-instance Binary JVal where
-  put_ bh (JVar i)      = putByte bh 1 >> put_ bh i
-  put_ bh (JList es)    = putByte bh 2 >> put_ bh es
-  put_ bh (JDouble d)   = putByte bh 3 >> put_ bh d
-  put_ bh (JInt i)      = putByte bh 4 >> put_ bh i
-  put_ bh (JStr xs)     = putByte bh 5 >> put_ bh xs
-  put_ bh (JRegEx xs)   = putByte bh 6 >> put_ bh xs
-  put_ bh (JHash m)     = putByte bh 7 >> put_ bh (sortOn (LexicalFastString . fst) $ nonDetEltsUniqMap m)
-  put_ bh (JFunc is s)  = putByte bh 8 >> put_ bh is >> put_ bh s
-  put_ _  (UnsatVal {}) = error "put_ bh JVal: UnsatVal"
+instance Binary Sat.JExpr where
+  put_ bh (Sat.ValExpr v)          = putByte bh 1 >> put_ bh v
+  put_ bh (Sat.SelExpr e i)        = putByte bh 2 >> put_ bh e  >> put_ bh i
+  put_ bh (Sat.IdxExpr e1 e2)      = putByte bh 3 >> put_ bh e1 >> put_ bh e2
+  put_ bh (Sat.InfixExpr o e1 e2)  = putByte bh 4 >> put_ bh o  >> put_ bh e1 >> put_ bh e2
+  put_ bh (Sat.UOpExpr o e)        = putByte bh 5 >> put_ bh o  >> put_ bh e
+  put_ bh (Sat.IfExpr e1 e2 e3)    = putByte bh 6 >> put_ bh e1 >> put_ bh e2 >> put_ bh e3
+  put_ bh (Sat.ApplExpr e es)      = putByte bh 7 >> put_ bh e  >> put_ bh es
   get bh = getByte bh >>= \case
-    1 -> JVar    <$> get bh
-    2 -> JList   <$> get bh
-    3 -> JDouble <$> get bh
-    4 -> JInt    <$> get bh
-    5 -> JStr    <$> get bh
-    6 -> JRegEx  <$> get bh
-    7 -> JHash . listToUniqMap <$> get bh
-    8 -> JFunc   <$> get bh <*> get bh
-    n -> error ("Binary get bh JVal: invalid tag: " ++ show n)
+    1 -> Sat.ValExpr   <$> get bh
+    2 -> Sat.SelExpr   <$> get bh <*> get bh
+    3 -> Sat.IdxExpr   <$> get bh <*> get bh
+    4 -> Sat.InfixExpr <$> get bh <*> get bh <*> get bh
+    5 -> Sat.UOpExpr   <$> get bh <*> get bh
+    6 -> Sat.IfExpr    <$> get bh <*> get bh <*> get bh
+    7 -> Sat.ApplExpr  <$> get bh <*> get bh
+    n -> error ("Binary get bh UnsatExpr: invalid tag: " ++ show n)
+
+
+instance Binary Sat.JVal where
+  put_ bh (Sat.JVar i)      = putByte bh 1 >> put_ bh i
+  put_ bh (Sat.JList es)    = putByte bh 2 >> put_ bh es
+  put_ bh (Sat.JDouble d)   = putByte bh 3 >> put_ bh d
+  put_ bh (Sat.JInt i)      = putByte bh 4 >> put_ bh i
+  put_ bh (Sat.JStr xs)     = putByte bh 5 >> put_ bh xs
+  put_ bh (Sat.JRegEx xs)   = putByte bh 6 >> put_ bh xs
+  put_ bh (Sat.JBool b)     = putByte bh 7 >> put_ bh b
+  put_ bh (Sat.JHash m)     = putByte bh 8 >> put_ bh (sortOn (LexicalFastString . fst) $ nonDetUniqMapToList m)
+  put_ bh (Sat.JFunc is s)  = putByte bh 9 >> put_ bh is >> put_ bh s
+  get bh = getByte bh >>= \case
+    1 -> Sat.JVar    <$> get bh
+    2 -> Sat.JList   <$> get bh
+    3 -> Sat.JDouble <$> get bh
+    4 -> Sat.JInt    <$> get bh
+    5 -> Sat.JStr    <$> get bh
+    6 -> Sat.JRegEx  <$> get bh
+    7 -> Sat.JBool   <$> get bh
+    8 -> Sat.JHash . listToUniqMap <$> get bh
+    9 -> Sat.JFunc   <$> get bh <*> get bh
+    n -> error ("Binary get bh Sat.JVal: invalid tag: " ++ show n)
 
 instance Binary Ident where
-  put_ bh (TxtI xs) = put_ bh xs
-  get bh = TxtI <$> get bh
-
--- we need to preserve NaN and infinities, unfortunately the Binary instance for Double does not do this
-instance Binary SaneDouble where
-  put_ bh (SaneDouble d)
-    | isNaN d               = putByte bh 1
-    | isInfinite d && d > 0 = putByte bh 2
-    | isInfinite d && d < 0 = putByte bh 3
-    | isNegativeZero d      = putByte bh 4
-    | otherwise             = putByte bh 5 >> put_ bh (castDoubleToWord64 d)
-  get bh = getByte bh >>= \case
-    1 -> pure $ SaneDouble (0    / 0)
-    2 -> pure $ SaneDouble (1    / 0)
-    3 -> pure $ SaneDouble ((-1) / 0)
-    4 -> pure $ SaneDouble (-0)
-    5 -> SaneDouble . castWord64ToDouble <$> get bh
-    n -> error ("Binary get bh SaneDouble: invalid tag: " ++ show n)
+  put_ bh (identFS -> xs) = put_ bh xs
+  get  bh                = global <$> get bh
 
 instance Binary ClosureInfo where
   put_ bh (ClosureInfo v regs name layo typ static) = do
@@ -504,7 +548,7 @@ instance Binary JSFFIType where
   put_ bh = putEnum bh
   get bh = getEnum bh
 
-instance Binary VarType where
+instance Binary JSRep where
   put_ bh = putEnum bh
   get bh = getEnum bh
 
@@ -516,11 +560,15 @@ instance Binary CIRegs where
     2 -> CIRegs <$> get bh <*> get bh
     n -> error ("Binary get bh CIRegs: invalid tag: " ++ show n)
 
-instance Binary JOp where
+instance Binary Sat.Op where
   put_ bh = putEnum bh
   get bh = getEnum bh
 
-instance Binary JUOp where
+instance Binary Sat.UOp where
+  put_ bh = putEnum bh
+  get bh = getEnum bh
+
+instance Binary Sat.AOp where
   put_ bh = putEnum bh
   get bh = getEnum bh
 
@@ -620,3 +668,134 @@ instance Binary StaticLit where
     6 -> BinLit    <$> get bh
     7 -> LabelLit  <$> get bh <*> get bh
     n -> error ("Binary get bh StaticLit: invalid tag " ++ show n)
+
+
+------------------------------------------------
+-- JS objects
+------------------------------------------------
+
+-- | Options obtained from pragmas in JS files
+data JSOptions = JSOptions
+  { enableCPP                  :: !Bool     -- ^ Enable CPP on the JS file
+  , emccExtraOptions           :: ![String] -- ^ Pass additional options to emcc at link time
+  , emccExportedFunctions      :: ![String] -- ^ Arguments for `-sEXPORTED_FUNCTIONS`
+  , emccExportedRuntimeMethods :: ![String] -- ^ Arguments for `-sEXPORTED_RUNTIME_METHODS`
+  }
+  deriving (Eq, Ord)
+
+
+instance Binary JSOptions where
+  put_ bh (JSOptions a b c d) = do
+    put_ bh a
+    put_ bh b
+    put_ bh c
+    put_ bh d
+  get bh = JSOptions <$> get bh <*> get bh <*> get bh <*> get bh
+
+instance Semigroup JSOptions where
+  a <> b = JSOptions
+    { enableCPP                  = enableCPP a || enableCPP b
+    , emccExtraOptions           = emccExtraOptions a ++ emccExtraOptions b
+    , emccExportedFunctions      = List.nub (List.sort (emccExportedFunctions a ++ emccExportedFunctions b))
+    , emccExportedRuntimeMethods = List.nub (List.sort (emccExportedRuntimeMethods a ++ emccExportedRuntimeMethods b))
+    }
+
+defaultJSOptions :: JSOptions
+defaultJSOptions = JSOptions
+  { enableCPP                  = False
+  , emccExtraOptions           = []
+  , emccExportedRuntimeMethods = []
+  , emccExportedFunctions      = []
+  }
+
+-- mimics `lines` implementation
+splitOnComma :: String -> [String]
+splitOnComma s = cons $ case break (== ',') s of
+                                   (l, s') -> (l, case s' of
+                                                    []      -> []
+                                                    _:s''   -> splitOnComma s'')
+  where
+    cons ~(h, t)        =  h : t
+
+
+
+-- | Get the JS option pragmas from .js files
+getJsOptions :: Handle -> IO JSOptions
+getJsOptions handle = do
+  hSetEncoding handle utf8
+  let trim = dropWhileEndLE isSpace . dropWhile isSpace
+  let go opts = do
+        hIsEOF handle >>= \case
+          True -> pure opts
+          False -> do
+            xs <- hGetLine handle
+            if not ("//#OPTIONS:" `List.isPrefixOf` xs)
+              then pure opts
+              else do
+                -- drop prefix and spaces
+                let ys = trim (drop 11 xs)
+                let opts' = if
+                      | ys == "CPP"
+                      -> opts {enableCPP = True}
+
+                      | Just s <- List.stripPrefix "EMCC:EXPORTED_FUNCTIONS=" ys
+                      , fns <- fmap trim (splitOnComma s)
+                      -> opts { emccExportedFunctions = emccExportedFunctions opts ++ fns }
+
+                      | Just s <- List.stripPrefix "EMCC:EXPORTED_RUNTIME_METHODS=" ys
+                      , fns <- fmap trim (splitOnComma s)
+                      -> opts { emccExportedRuntimeMethods = emccExportedRuntimeMethods opts ++ fns }
+
+                      | Just s <- List.stripPrefix "EMCC:EXTRA=" ys
+                      -> opts { emccExtraOptions = emccExtraOptions opts ++ [s] }
+
+                      | otherwise
+                      -> panic ("Unrecognized JS pragma: " ++ ys)
+
+                go opts'
+  go defaultJSOptions
+
+-- | Parse option pragma in JS file
+getOptionsFromJsFile :: FilePath     -- ^ Input file
+                     -> IO JSOptions -- ^ Parsed options.
+getOptionsFromJsFile filename
+    = Exception.bracket
+              (openBinaryFile filename ReadMode)
+              hClose
+              getJsOptions
+
+
+-- | Write a JS object (embed some handwritten JS code)
+writeJSObject :: JSOptions -> B.ByteString -> FilePath -> IO ()
+writeJSObject opts contents output_fn = do
+  bh <- openBinMem (B.length contents + 1000)
+
+  putByteString bh jsHeader
+  put_ bh opts
+  put_ bh contents
+
+  writeBinMem bh output_fn
+
+
+-- | Read a JS object from BinHandle
+parseJSObject :: BinHandle -> IO (JSOptions, B.ByteString)
+parseJSObject bh = do
+  magic <- getByteString bh (B.length jsHeader)
+  case magic == jsHeader of
+    False -> panic "invalid magic header for JS object"
+    True  -> do
+      opts     <- get bh
+      contents <- get bh
+      pure (opts,contents)
+
+-- | Read a JS object from ByteString
+parseJSObjectBS :: B.ByteString -> IO (JSOptions, B.ByteString)
+parseJSObjectBS bs = do
+  bh <- unsafeUnpackBinBuffer bs
+  parseJSObject bh
+
+-- | Read a JS object from file
+readJSObject :: FilePath -> IO (JSOptions, B.ByteString)
+readJSObject input_fn = do
+  bh <- readBinMem input_fn
+  parseJSObject bh

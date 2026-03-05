@@ -2,6 +2,8 @@
 {-# LANGUAGE RecordWildCards   #-}
 {-# LANGUAGE TypeFamilies      #-}
 
+{-# OPTIONS_GHC -Wno-orphans #-} -- instance NFData FieldLabel
+
 {-
 (c) The University of Glasgow 2006
 (c) The GRASP/AQUA Project, Glasgow University, 1992-1998
@@ -63,8 +65,10 @@ module GHC.Types.Name (
         -- ** Predicates on 'Name's
         isSystemName, isInternalName, isExternalName,
         isTyVarName, isTyConName, isDataConName,
-        isValName, isVarName, isDynLinkName,
-        isWiredInName, isWiredIn, isBuiltInSyntax,
+        isValName, isVarName, isDynLinkName, isFieldName,
+        isWiredInName, isWiredIn, isBuiltInSyntax, isTupleTyConName,
+        isSumTyConName,
+        isUnboxedTupleDataConLikeName,
         isHoleName,
         wiredInNameTyThing_maybe,
         nameIsLocalOrFrom, nameIsExternalOrFrom, nameIsHomePackage,
@@ -91,6 +95,7 @@ import GHC.Platform
 import GHC.Types.Name.Occurrence
 import GHC.Unit.Module
 import GHC.Unit.Home
+import GHC.Types.FieldLabel
 import GHC.Types.SrcLoc
 import GHC.Types.Unique
 import GHC.Utils.Misc
@@ -99,10 +104,13 @@ import GHC.Utils.Binary
 import GHC.Data.FastString
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
+import GHC.OldList (intersperse)
 
 import Control.DeepSeq
 import Data.Data
 import qualified Data.Semigroup as S
+import GHC.Types.Basic (Boxity(Boxed, Unboxed))
+import GHC.Builtin.Uniques (isTupleTyConUnique, isSumTyConUnique, isTupleDataConLikeUnique)
 
 {-
 ************************************************************************
@@ -138,12 +146,16 @@ data Name = Name
 -- See Note [About the NameSorts]
 data NameSort
   = External Module
+        -- Either an import from another module
+        -- or a top-level name
+        -- See Note [About the NameSorts]
 
   | WiredIn Module TyThing BuiltInSyntax
         -- A variant of External, for wired-in things
 
-  | Internal            -- A user-defined Id or TyVar
+  | Internal            -- A user-defined local Id or TyVar
                         -- defined in the module being compiled
+                        -- See Note [About the NameSorts]
 
   | System              -- A system-defined Id or TyVar.  Typically the
                         -- OccName is very uninformative (like 's')
@@ -156,6 +168,10 @@ instance Outputable NameSort where
 
 instance NFData Name where
   rnf Name{..} = rnf n_sort `seq` rnf n_occ `seq` n_uniq `seq` rnf n_loc
+
+-- Needs NFData Name, so the instance is here to avoid cyclic imports.
+instance NFData FieldLabel where
+  rnf (FieldLabel a b c) = rnf a `seq` rnf b `seq` rnf c
 
 instance NFData NameSort where
   rnf (External m) = rnf m
@@ -176,18 +192,18 @@ Note [Fast comparison for built-in Names]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Consider this wired-in Name in GHC.Builtin.Names:
 
-   int8TyConName = tcQual gHC_INT  (fsLit "Int8")  int8TyConKey
+   int8TyConName = tcQual gHC_INTERNAL_INT  (fsLit "Int8")  int8TyConKey
 
 Ultimately this turns into something like:
 
-   int8TyConName = Name gHC_INT (mkOccName ..."Int8") int8TyConKey
+   int8TyConName = Name gHC_INTERNAL_INT (mkOccName ..."Int8") int8TyConKey
 
 So a comparison like `x == int8TyConName` will turn into `getUnique x ==
 int8TyConKey`, nice and efficient.  But if the `n_occ` field is strict, that
 definition will look like:
 
-   int8TyCOnName = case (mkOccName..."Int8") of occ ->
-                   Name gHC_INT occ int8TyConKey
+   int8TyConName = case (mkOccName..."Int8") of occ ->
+                   Name gHC_INTERNAL_INT occ int8TyConKey
 
 and now the comparison will not optimise.  This matters even more when there are
 numerous comparisons (see #19386):
@@ -204,21 +220,32 @@ TL;DR: we make the `n_occ` field lazy.
 {-
 Note [About the NameSorts]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
+1.  Initially:
+    * All types, classes, data constructors get Extenal Names
+    * Top-level Ids (including locally-defined ones) get External Names,
+    * All other local (non-top-level) Ids get Internal names
 
-1.  Initially, top-level Ids (including locally-defined ones) get External names,
-    and all other local Ids get Internal names
+2.  In the Tidy phase (GHC.Iface.Tidy):
+      * An Id that is "externally-visible" is given an External Name,
+        even if the name was Internal up to that point
+      * An Id that is not externally visible is given an Internal Name.
+        even if the name was External up to that point
+    See GHC.Iface.Tidy.tidyTopName
 
-2.  In any invocation of GHC, an External Name for "M.x" has one and only one
+    An Id is externally visible if it is mentioned in the interface file; e.g.
+        - it is exported
+        - it is mentioned in an unfolding
+    See GHC.Iface.Tidy.chooseExternalIds
+
+3.  In any invocation of GHC, an External Name for "M.x" has one and only one
     unique.  This unique association is ensured via the Name Cache;
     see Note [The Name Cache] in GHC.Iface.Env.
 
-3.  Things with a External name are given C static labels, so they finally
-    appear in the .o file's symbol table.  They appear in the symbol table
-    in the form M.n.  If originally-local things have this property they
-    must be made @External@ first.
+4.  In code generation, things with a External name are given C static
+    labels, so they finally appear in the .o file's symbol table.  They
+    appear in the symbol table in the form M.n. That is why
+    externally-visible things are made External (see (2) above).
 
-4.  In the tidy-core phase, a External that is not visible to an importer
-    is changed to Internal, and a Internal that is visible is changed to External
 
 5.  A System Name differs in the following ways:
         a) has unique attached when printing dumps
@@ -230,13 +257,13 @@ Note [About the NameSorts]
     If any desugarer sys-locals have survived that far, they get changed to
     "ds1", "ds2", etc.
 
-Built-in syntax => It's a syntactic form, not "in scope" (e.g. [])
+6. A WiredIn Name is used for things (Id, TyCon) that are fully known to the compiler,
+   not read from an interface file. E.g. Bool, True, Int, Float, and many others.
 
-Wired-in thing  => The thing (Id, TyCon) is fully known to the compiler,
-                   not read from an interface file.
-                   E.g. Bool, True, Int, Float, and many others
+   A WiredIn Name contains contains a TyThing, so we don't have to look it up.
 
-All built-in syntax is for wired-in things.
+   The BuiltInSyntax flag => It's a syntactic form, not "in scope" (e.g. [])
+   All built-in syntax thigs are WiredIn.
 -}
 
 instance HasOccName Name where
@@ -281,6 +308,18 @@ wiredInNameTyThing_maybe _                                   = Nothing
 isBuiltInSyntax :: Name -> Bool
 isBuiltInSyntax (Name {n_sort = WiredIn _ _ BuiltInSyntax}) = True
 isBuiltInSyntax _                                           = False
+
+isTupleTyConName :: Name -> Bool
+isTupleTyConName = isJust . isTupleTyConUnique . getUnique
+
+isSumTyConName :: Name -> Bool
+isSumTyConName = isJust . isSumTyConUnique . getUnique
+
+-- | This matches a datacon as well as its worker and promoted tycon.
+isUnboxedTupleDataConLikeName :: Name -> Bool
+isUnboxedTupleDataConLikeName n
+  | Just (Unboxed, _) <- isTupleDataConLikeUnique (getUnique n) = True
+  | otherwise = False
 
 isExternalName (Name {n_sort = External _})    = True
 isExternalName (Name {n_sort = WiredIn _ _ _}) = True
@@ -338,8 +377,27 @@ is_interactive_or_from from mod = from == mod || isInteractiveModule mod
 
 -- Return the pun for a name if available.
 -- Used for pretty-printing under ListTuplePuns.
+-- Arity 1 is skipped here because unary tuples have no prefix representation,
+-- since that is occupied by the unit tuple.
 namePun_maybe :: Name -> Maybe FastString
-namePun_maybe name | getUnique name == getUnique listTyCon = Just (fsLit "[]")
+namePun_maybe name
+  | getUnique name == getUnique listTyCon = Just (fsLit "[]")
+
+  | Just (boxity, ar) <- isTupleTyConUnique (getUnique name)
+  , ar /= 1 =
+    let
+      (lpar, rpar) =
+        case boxity of
+          Boxed -> ("(", ")")
+          Unboxed -> ("(#", "#)")
+    in Just (fsLit $ lpar ++ commas ar ++ rpar)
+
+  | Just ar <- isSumTyConUnique (getUnique name)
+  = Just (fsLit $ "(# " ++ bars ar ++ " #)")
+  where
+    commas ar = replicate (ar-1) ','
+    bars ar = intersperse ' ' (replicate (ar-1) '|')
+
 namePun_maybe _ = Nothing
 
 nameIsLocalOrFrom :: Module -> Name -> Bool
@@ -423,6 +481,9 @@ isValName name = isValOcc (nameOccName name)
 
 isVarName :: Name -> Bool
 isVarName = isVarOcc . nameOccName
+
+isFieldName :: Name -> Bool
+isFieldName = isFieldOcc . nameOccName
 
 isSystemName (Name {n_sort = System}) = True
 isSystemName _                        = False
@@ -569,7 +630,7 @@ instance Eq Name where
 -- | __Caution__: This instance is implemented via `nonDetCmpUnique`, which
 -- means that the ordering is not stable across deserialization or rebuilds.
 --
--- See `nonDetCmpUnique` for further information, and trac #15240 for a bug
+-- See `nonDetCmpUnique` for further information, and #15240 for a bug
 -- caused by improper use of this instance.
 
 -- For a deterministic lexicographic ordering, use `stableNameCmp`.
@@ -627,21 +688,31 @@ instance OutputableBndr Name where
 
 pprName :: forall doc. IsLine doc => Name -> doc
 pprName name@(Name {n_sort = sort, n_uniq = uniq, n_occ = occ})
-  = docWithContext $ \ctx ->
-    let sty = sdocStyle ctx
-        debug = sdocPprDebug ctx
-        listTuplePuns = sdocListTuplePuns ctx
-    in handlePuns listTuplePuns (namePun_maybe name) $
-    case sort of
-      WiredIn mod _ builtin   -> pprExternal debug sty uniq mod occ True  builtin
-      External mod            -> pprExternal debug sty uniq mod occ False UserSyntax
-      System                  -> pprSystem   debug sty uniq occ
-      Internal                -> pprInternal debug sty uniq occ
+  = docWithStyle codeDoc normalDoc
   where
-    -- Print GHC.Types.List as [], etc.
-    handlePuns :: Bool -> Maybe FastString -> doc -> doc
-    handlePuns True (Just pun) _ = ftext pun
-    handlePuns _    _          r = r
+   codeDoc = case sort of
+               WiredIn mod _ _ -> pprModule mod <> char '_' <> z_occ
+               External mod    -> pprModule mod <> char '_' <> z_occ
+                                  -- In code style, always qualify
+                                  -- ToDo: maybe we could print all wired-in things unqualified
+                                  --       in code style, to reduce symbol table bloat?
+               System          -> pprUniqueAlways uniq
+               Internal        -> pprUniqueAlways uniq
+   z_occ = ztext $ zEncodeFS $ occNameMangledFS occ
+
+   normalDoc sty =
+     getPprDebug $ \debug ->
+     sdocOption sdocListTuplePuns $ \listTuplePuns ->
+       handlePuns listTuplePuns (namePun_maybe name) $
+       case sort of
+         WiredIn mod _ builtin   -> pprExternal debug sty uniq mod occ True  builtin
+         External mod            -> pprExternal debug sty uniq mod occ False UserSyntax
+         System                  -> pprSystem   debug sty uniq occ
+         Internal                -> pprInternal debug sty uniq occ
+
+   handlePuns :: Bool -> Maybe FastString -> SDoc -> SDoc
+   handlePuns True (Just pun) _ = ftext pun
+   handlePuns _    _          r = r
 {-# SPECIALISE pprName :: Name -> SDoc #-}
 {-# SPECIALISE pprName :: Name -> HLine #-} -- see Note [SPECIALIZE to HDoc] in GHC.Utils.Outputable
 
@@ -674,12 +745,8 @@ pprTickyName this_mod name
 pprNameUnqualified :: Name -> SDoc
 pprNameUnqualified Name { n_occ = occ } = ppr_occ_name occ
 
-pprExternal :: IsLine doc => Bool -> PprStyle -> Unique -> Module -> OccName -> Bool -> BuiltInSyntax -> doc
+pprExternal :: Bool -> PprStyle -> Unique -> Module -> OccName -> Bool -> BuiltInSyntax -> SDoc
 pprExternal debug sty uniq mod occ is_wired is_builtin
-  | codeStyle sty = pprModule mod <> char '_' <> ppr_z_occ_name occ
-        -- In code style, always qualify
-        -- ToDo: maybe we could print all wired-in things unqualified
-        --       in code style, to reduce symbol table bloat?
   | debug         = pp_mod <> ppr_occ_name occ
                      <> braces (hsep [if is_wired then text "(w)" else empty,
                                       pprNameSpaceBrief (occNameSpace occ),
@@ -695,9 +762,8 @@ pprExternal debug sty uniq mod occ is_wired is_builtin
     pp_mod = ppUnlessOption sdocSuppressModulePrefixes
                (pprModule mod <> dot)
 
-pprInternal :: IsLine doc => Bool -> PprStyle -> Unique -> OccName -> doc
+pprInternal :: Bool -> PprStyle -> Unique -> OccName -> SDoc
 pprInternal debug sty uniq occ
-  | codeStyle sty  = pprUniqueAlways uniq
   | debug          = ppr_occ_name occ <> braces (hsep [pprNameSpaceBrief (occNameSpace occ),
                                                        pprUnique uniq])
   | dumpStyle sty  = ppr_occ_name occ <> ppr_underscore_unique uniq
@@ -706,9 +772,8 @@ pprInternal debug sty uniq occ
   | otherwise      = ppr_occ_name occ   -- User style
 
 -- Like Internal, except that we only omit the unique in Iface style
-pprSystem :: IsLine doc => Bool -> PprStyle -> Unique -> OccName -> doc
-pprSystem debug sty uniq occ
-  | codeStyle sty  = pprUniqueAlways uniq
+pprSystem :: Bool -> PprStyle -> Unique -> OccName -> SDoc
+pprSystem debug _sty uniq occ
   | debug          = ppr_occ_name occ <> ppr_underscore_unique uniq
                      <> braces (pprNameSpaceBrief (occNameSpace occ))
   | otherwise      = ppr_occ_name occ <> ppr_underscore_unique uniq
@@ -717,7 +782,7 @@ pprSystem debug sty uniq occ
                                 -- so print the unique
 
 
-pprModulePrefix :: IsLine doc => PprStyle -> Module -> OccName -> doc
+pprModulePrefix :: PprStyle -> Module -> OccName -> SDoc
 -- Print the "M." part of a name, based on whether it's in scope or not
 -- See Note [Printing original names] in GHC.Types.Name.Ppr
 pprModulePrefix sty mod occ = ppUnlessOption sdocSuppressModulePrefixes $
@@ -728,28 +793,23 @@ pprModulePrefix sty mod occ = ppUnlessOption sdocSuppressModulePrefixes $
                           <> pprModuleName (moduleName mod) <> dot    -- scope either
       NameUnqual       -> empty                   -- In scope unqualified
 
-pprUnique :: IsLine doc => Unique -> doc
+pprUnique :: Unique -> SDoc
 -- Print a unique unless we are suppressing them
 pprUnique uniq
   = ppUnlessOption sdocSuppressUniques $
       pprUniqueAlways uniq
 
-ppr_underscore_unique :: IsLine doc => Unique -> doc
+ppr_underscore_unique :: Unique -> SDoc
 -- Print an underscore separating the name from its unique
 -- But suppress it if we aren't printing the uniques anyway
 ppr_underscore_unique uniq
   = ppUnlessOption sdocSuppressUniques $
       char '_' <> pprUniqueAlways uniq
 
-ppr_occ_name :: IsLine doc => OccName -> doc
+ppr_occ_name :: OccName -> SDoc
 ppr_occ_name occ = ftext (occNameFS occ)
         -- Don't use pprOccName; instead, just print the string of the OccName;
         -- we print the namespace in the debug stuff above
-
--- In code style, we Z-encode the strings.  The results of Z-encoding each FastString are
--- cached behind the scenes in the FastString implementation.
-ppr_z_occ_name :: IsLine doc => OccName -> doc
-ppr_z_occ_name occ = ztext (zEncodeFS (occNameFS occ))
 
 -- Prints (if mod information is available) "Defined at <loc>" or
 --  "Defined in <mod>" information for a Name.

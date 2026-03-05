@@ -1,3 +1,4 @@
+{- FOURMOLU_DISABLE -}
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE DeriveDataTypeable #-}
@@ -79,11 +80,11 @@ import Test.Tasty
 import Test.Tasty.HUnit
 import Test.Tasty.Options
 import Data.Tagged (Tagged(..))
-import qualified Data.List as L
 
 import qualified Data.ByteString as BS
 import Distribution.Client.GlobalFlags (GlobalFlags, globalNix)
 import Distribution.Simple.Flag (Flag (Flag, NoFlag))
+import Distribution.Types.ParStrat
 import Data.Maybe (fromJust)
 
 #if !MIN_VERSION_directory(1,2,7)
@@ -106,9 +107,7 @@ tests config =
     -- * normal success
     -- * dry-run tests with changes
   [ testGroup "Discovery and planning" $
-    [ testCase "find root"      testFindProjectRoot
-    , testCase "find root fail" testExceptionFindProjectRoot
-    , testCase "no package"    (testExceptionInFindingPackage config)
+    [ testCase "no package"    (testExceptionInFindingPackage config)
     , testCase "no package2"   (testExceptionInFindingPackage2 config)
     , testCase "proj conf1"    (testExceptionInProjectConfig config)
     ]
@@ -163,25 +162,6 @@ tests config =
     [ testCase "dependencies" (testHaddockProjectDependencies config)
     ]
   ]
-
-testFindProjectRoot :: Assertion
-testFindProjectRoot = do
-    Left (BadProjectRootExplicitFile file) <- findProjectRoot (Just testdir)
-                                                              (Just testfile)
-    file @?= testfile
-  where
-    testdir  = basedir </> "exception" </> "no-pkg2"
-    testfile = "bklNI8O1OpOUuDu3F4Ij4nv3oAqN"
-
-
-testExceptionFindProjectRoot :: Assertion
-testExceptionFindProjectRoot = do
-    Right (ProjectRootExplicit dir _) <- findProjectRoot (Just testdir) Nothing
-    cwd <- getCurrentDirectory
-    dir @?= cwd </> testdir
-  where
-    testdir = basedir </> "exception" </> "no-pkg2"
-
 
 testTargetSelectors :: (String -> IO ()) -> Assertion
 testTargetSelectors reportSubCase = do
@@ -280,11 +260,14 @@ testTargetSelectors reportSubCase = do
                                   ":pkg:q:lib:q:file:Q.y"
                      , "app/Main.hs", "p:app/Main.hs", "exe:ppexe:app/Main.hs", "p:ppexe:app/Main.hs",
                                   ":pkg:p:exe:ppexe:file:app/Main.hs"
+                     , "a p p/Main.hs", "p:a p p/Main.hs", "exe:pppexe:a p p/Main.hs", "p:pppexe:a p p/Main.hs",
+                                  ":pkg:p:exe:pppexe:file:a p p/Main.hs"
                      ]
        ts @?= replicate 5 (TargetComponent "p-0.1" (CLibName LMainLibName) (FileTarget "P"))
            ++ replicate 5 (TargetComponent "q-0.1" (CLibName LMainLibName) (FileTarget "QQ"))
            ++ replicate 5 (TargetComponent "q-0.1" (CLibName LMainLibName) (FileTarget "Q"))
            ++ replicate 5 (TargetComponent "p-0.1" (CExeName "ppexe") (FileTarget ("app" </> "Main.hs")))
+           ++ replicate 5 (TargetComponent "p-0.1" (CExeName "pppexe") (FileTarget ("a p p" </> "Main.hs")))
        -- Note there's a bit of an inconsistency here: for the single-part
        -- syntax the target has to point to a file that exists, whereas for
        -- all the other forms we don't require that.
@@ -298,9 +281,8 @@ testTargetSelectors reportSubCase = do
 testTargetSelectorBadSyntax :: Assertion
 testTargetSelectorBadSyntax = do
     (_, _, _, localPackages, _) <- configureProject testdir config
-    let targets = [ "foo bar",  " foo"
-                  , "foo:", "foo::bar"
-                  , "foo: ", "foo: :bar"
+    let targets = [ "foo:", "foo::bar"
+                  , " :foo", "foo: :bar"
                   , "a:b:c:d:e:f", "a:b:c:d:e:f:g:h" ]
     Left errs <- readTargetSelectors localPackages Nothing targets
     zipWithM_ (@?=) errs (map TargetSelectorUnrecognised targets)
@@ -771,9 +753,9 @@ testTargetProblemsRepl config reportSubCase = do
     reportSubCase "multiple-libs"
     assertProjectTargetProblems
       "targets/multiple-libs" config
-      CmdRepl.selectPackageTargets
+      (CmdRepl.selectPackageTargets (CmdRepl.MultiReplDecision Nothing False))
       CmdRepl.selectComponentTarget
-      [ ( flip CmdRepl.matchesMultipleProblem
+      [ ( flip (CmdRepl.matchesMultipleProblem (CmdRepl.MultiReplDecision Nothing False))
                [ AvailableTarget "p-0.1" (CLibName LMainLibName)
                    (TargetBuildable () TargetRequestedByDefault) True
                , AvailableTarget "q-0.1" (CLibName LMainLibName)
@@ -785,9 +767,9 @@ testTargetProblemsRepl config reportSubCase = do
     reportSubCase "multiple-exes"
     assertProjectTargetProblems
       "targets/multiple-exes" config
-      CmdRepl.selectPackageTargets
+      (CmdRepl.selectPackageTargets (CmdRepl.MultiReplDecision Nothing False))
       CmdRepl.selectComponentTarget
-      [ ( flip CmdRepl.matchesMultipleProblem
+      [ ( flip (CmdRepl.matchesMultipleProblem (CmdRepl.MultiReplDecision Nothing False))
                [ AvailableTarget "p-0.1" (CExeName "p2")
                    (TargetBuildable () TargetRequestedByDefault) True
                , AvailableTarget "p-0.1" (CExeName "p1")
@@ -799,9 +781,9 @@ testTargetProblemsRepl config reportSubCase = do
     reportSubCase "multiple-tests"
     assertProjectTargetProblems
       "targets/multiple-tests" config
-      CmdRepl.selectPackageTargets
+      (CmdRepl.selectPackageTargets (CmdRepl.MultiReplDecision Nothing False))
       CmdRepl.selectComponentTarget
-      [ ( flip CmdRepl.matchesMultipleProblem
+      [ ( flip (CmdRepl.matchesMultipleProblem (CmdRepl.MultiReplDecision Nothing False))
                [ AvailableTarget "p-0.1" (CTestName "p2")
                    (TargetBuildable () TargetNotRequestedByDefault) True
                , AvailableTarget "p-0.1" (CTestName "p1")
@@ -814,7 +796,7 @@ testTargetProblemsRepl config reportSubCase = do
     do (_,elaboratedPlan,_) <- planProject "targets/multiple-exes" config
        assertProjectDistinctTargets
          elaboratedPlan
-         CmdRepl.selectPackageTargets
+         (CmdRepl.selectPackageTargets (CmdRepl.MultiReplDecision Nothing False))
          CmdRepl.selectComponentTarget
          [ mkTargetComponent "p-0.1" (CExeName "p1")
          , mkTargetComponent "p-0.1" (CExeName "p2")
@@ -826,7 +808,7 @@ testTargetProblemsRepl config reportSubCase = do
     reportSubCase "libs-disabled"
     assertProjectTargetProblems
       "targets/libs-disabled" config
-      CmdRepl.selectPackageTargets
+      (CmdRepl.selectPackageTargets (CmdRepl.MultiReplDecision Nothing False))
       CmdRepl.selectComponentTarget
       [ ( flip TargetProblemNoneEnabled
                [ AvailableTarget "p-0.1" (CLibName LMainLibName) TargetNotBuildable True ]
@@ -836,7 +818,7 @@ testTargetProblemsRepl config reportSubCase = do
     reportSubCase "exes-disabled"
     assertProjectTargetProblems
       "targets/exes-disabled" config
-      CmdRepl.selectPackageTargets
+      (CmdRepl.selectPackageTargets (CmdRepl.MultiReplDecision Nothing False))
       CmdRepl.selectComponentTarget
       [ ( flip TargetProblemNoneEnabled
                [ AvailableTarget "p-0.1" (CExeName "p") TargetNotBuildable True
@@ -847,7 +829,7 @@ testTargetProblemsRepl config reportSubCase = do
     reportSubCase "test-only"
     assertProjectTargetProblems
       "targets/test-only" config
-      CmdRepl.selectPackageTargets
+      (CmdRepl.selectPackageTargets (CmdRepl.MultiReplDecision Nothing False))
       CmdRepl.selectComponentTarget
       [ ( flip TargetProblemNoneEnabled
                [ AvailableTarget "p-0.1" (CTestName "pexe")
@@ -859,7 +841,7 @@ testTargetProblemsRepl config reportSubCase = do
     reportSubCase "empty-pkg"
     assertProjectTargetProblems
       "targets/empty-pkg" config
-      CmdRepl.selectPackageTargets
+      (CmdRepl.selectPackageTargets (CmdRepl.MultiReplDecision Nothing False))
       CmdRepl.selectComponentTarget
       [ ( TargetProblemNoTargets, mkTargetPackage "p-0.1" )
       ]
@@ -869,7 +851,7 @@ testTargetProblemsRepl config reportSubCase = do
        -- by default we only get the lib
        assertProjectDistinctTargets
          elaboratedPlan
-         CmdRepl.selectPackageTargets
+         (CmdRepl.selectPackageTargets (CmdRepl.MultiReplDecision Nothing False))
          CmdRepl.selectComponentTarget
          [ TargetPackage TargetExplicitNamed ["p-0.1"] Nothing ]
          [ ("p-0.1-inplace", (CLibName LMainLibName)) ]
@@ -877,13 +859,13 @@ testTargetProblemsRepl config reportSubCase = do
        -- components even though we did not explicitly enable tests/benchmarks
        assertProjectDistinctTargets
          elaboratedPlan
-         CmdRepl.selectPackageTargets
+         (CmdRepl.selectPackageTargets (CmdRepl.MultiReplDecision Nothing False))
          CmdRepl.selectComponentTarget
          [ TargetPackage TargetExplicitNamed ["p-0.1"] (Just TestKind) ]
          [ ("p-0.1-inplace-a-testsuite", CTestName  "a-testsuite") ]
        assertProjectDistinctTargets
          elaboratedPlan
-         CmdRepl.selectPackageTargets
+         (CmdRepl.selectPackageTargets (CmdRepl.MultiReplDecision Nothing False))
          CmdRepl.selectComponentTarget
          [ TargetPackage TargetExplicitNamed ["p-0.1"] (Just BenchKind) ]
          [ ("p-0.1-inplace-a-benchmark", CBenchName "a-benchmark") ]
@@ -1456,9 +1438,11 @@ testSetupScriptStyles config reportSubCase = do
 
   let isOSX (Platform _ OSX) = True
       isOSX _ = False
+      compilerVer = compilerVersion (pkgConfigCompiler sharedConfig)
   -- Skip the Custom tests when the shipped Cabal library is buggy
-  unless (isOSX (pkgConfigPlatform sharedConfig)
-       && compilerVersion (pkgConfigCompiler sharedConfig) < mkVersion [7,10]) $ do
+  unless ((isOSX (pkgConfigPlatform sharedConfig) && (compilerVer < mkVersion [7,10]))
+       -- 9.10 ships Cabal 3.12.0.0 affected by #9940
+       || (mkVersion [9,10] <= compilerVer && compilerVer < mkVersion [9,11])) $ do
 
     (plan1, res1) <- executePlan plan0
     pkg1          <- expectPackageInstalled plan1 res1 pkgidA
@@ -1692,12 +1676,12 @@ configureProject testdir cliConfig = do
     cabalDirLayout <- defaultCabalDirLayout
 
     projectRootDir <- canonicalizePath (basedir </> testdir)
-    isexplict      <- doesFileExist (projectRootDir </> "cabal.project")
+    isexplict <- doesFileExist (projectRootDir </> defaultProjectFile)
+
     let projectRoot
-          | isexplict = ProjectRootExplicit projectRootDir
-                                           (projectRootDir </> "cabal.project")
+          | isexplict = ProjectRootExplicit projectRootDir defaultProjectFile
           | otherwise = ProjectRootImplicit projectRootDir
-        distDirLayout = defaultDistDirLayout projectRoot Nothing
+        distDirLayout = defaultDistDirLayout projectRoot Nothing Nothing
 
     -- Clear state between test runs. The state remains if the previous run
     -- ended in an exception (as we leave the files to help with debugging).
@@ -1747,7 +1731,7 @@ planProject testdir cliConfig = do
             elaboratedShared)
 
 executePlan :: PlanDetails -> IO (ElaboratedInstallPlan, BuildOutcomes)
-executePlan ((distDirLayout, cabalDirLayout, _, _, buildSettings),
+executePlan ((distDirLayout, cabalDirLayout, config, _, buildSettings),
              elaboratedPlan,
              elaboratedShared) = do
 
@@ -1773,13 +1757,14 @@ executePlan ((distDirLayout, cabalDirLayout, _, _, buildSettings),
 
     buildOutcomes <-
       rebuildTargets verbosity
+                     config
                      distDirLayout
                      (cabalStoreDirLayout cabalDirLayout)
                      elaboratedPlan''
                      elaboratedShared
                      pkgsBuildStatus
                      -- Avoid trying to use act-as-setup mode:
-                     buildSettings { buildSettingNumJobs = 1 }
+                     buildSettings { buildSettingNumJobs = Serial }
 
     return (elaboratedPlan'', buildOutcomes)
 
@@ -1789,7 +1774,7 @@ cleanProject testdir = do
     when alreadyExists $ removePathForcibly distDir
   where
     projectRoot    = ProjectRootImplicit (basedir </> testdir)
-    distDirLayout  = defaultDistDirLayout projectRoot Nothing
+    distDirLayout  = defaultDistDirLayout projectRoot Nothing Nothing
     distDir        = distDirectory distDirLayout
 
 
@@ -2093,6 +2078,7 @@ testConfigOptionComments = do
   "-- overwrite-policy" @=? findLineWith True "overwrite-policy" defaultConfigFile
   "-- install-method" @=? findLineWith True "install-method" defaultConfigFile
   "installdir"  @=? findLineWith False "installdir" defaultConfigFile
+  "-- token" @=? findLineWith True "token" defaultConfigFile
   "-- username" @=? findLineWith True "username" defaultConfigFile
   "-- password" @=? findLineWith True "password" defaultConfigFile
   "-- password-command" @=? findLineWith True "password-command" defaultConfigFile
@@ -2113,12 +2099,17 @@ testConfigOptionComments = do
   "  -- contents-location" @=? findLineWith True "contents-location" defaultConfigFile
   "  -- index-location" @=? findLineWith True "index-location" defaultConfigFile
   "  -- base-url" @=? findLineWith True "base-url" defaultConfigFile
+  "  -- output-dir" @=? findLineWith True "output-dir" defaultConfigFile
 
   "  -- interactive" @=? findLineWith True "interactive" defaultConfigFile
+  "  -- quiet" @=? findLineWith True "quiet" defaultConfigFile
+  "  -- no-comments" @=? findLineWith True "no-comments" defaultConfigFile
+  "  -- minimal" @=? findLineWith True "minimal" defaultConfigFile
   "  -- cabal-version" @=? findLineWith True "cabal-version" defaultConfigFile
   "  -- license" @=? findLineWith True "license" defaultConfigFile
   "  -- extra-doc-file" @=? findLineWith True "extra-doc-file" defaultConfigFile
   "  -- test-dir" @=? findLineWith True "test-dir" defaultConfigFile
+  "  -- simple" @=? findLineWith True "simple" defaultConfigFile
   "  -- language" @=? findLineWith True "language" defaultConfigFile
   "  -- application-dir" @=? findLineWith True "application-dir" defaultConfigFile
   "  -- source-dir" @=? findLineWith True "source-dir" defaultConfigFile
@@ -2192,9 +2183,10 @@ testConfigOptionComments = do
   where
     -- | Find lines containing a target string.
     findLineWith :: Bool -> String -> String -> String
-    findLineWith isComment target text
-      | not . null $ findLinesWith isComment target text = removeCommentValue . L.head $ findLinesWith isComment target text
-      | otherwise  = text
+    findLineWith isComment target text =
+      case findLinesWith isComment target text of
+        [] -> text
+        (l : _) -> removeCommentValue l
     findLinesWith :: Bool -> String -> String -> [String]
     findLinesWith isComment target
       | isComment = filter (isInfixOf (" " ++ target ++ ":")) . lines

@@ -43,6 +43,7 @@
 #include "Proftimer.h"
 #include "Schedule.h"
 #include "posix/Clock.h"
+#include <poll.h>
 
 #include <time.h>
 #if HAVE_SYS_TIME_H
@@ -61,13 +62,6 @@
 #endif
 #include <unistd.h>
 #include <fcntl.h>
-
-#if defined(HAVE_SYS_TIMERFD_H)
-#include <sys/timerfd.h>
-#define USE_TIMERFD_FOR_ITIMER 1
-#else
-#define USE_TIMERFD_FOR_ITIMER 0
-#endif
 
 /*
  * TFD_CLOEXEC has been added in Linux 2.6.26.
@@ -92,36 +86,16 @@ static Condition start_cond;
 static Mutex mutex;
 static OSThreadId thread;
 
-// file descriptor for the timer (Linux only)
-static int timerfd = -1;
-
 static void *itimer_thread_func(void *_handle_tick)
 {
     TickProc handle_tick = _handle_tick;
-    uint64_t nticks;
 
     // Relaxed is sufficient: If we don't see that exited was set in one iteration we will
     // see it next time.
     TSAN_ANNOTATE_BENIGN_RACE(&exited, "itimer_thread_func");
     while (!RELAXED_LOAD(&exited)) {
-        if (USE_TIMERFD_FOR_ITIMER) {
-            ssize_t r = read(timerfd, &nticks, sizeof(nticks));
-            if ((r == 0) && (errno == 0)) {
-               /* r == 0 is expected only for non-blocking fd (in which case
-                * errno should be EAGAIN) but we use a blocking fd.
-                *
-                * Due to a kernel bug (cf https://lkml.org/lkml/2019/8/16/335)
-                * on some platforms we could see r == 0 and errno == 0.
-                */
-               IF_DEBUG(scheduler, debugBelch("read(timerfd) returned 0 with errno=0. This is a known kernel bug. We just ignore it."));
-            }
-            else if (r != sizeof(nticks) && errno != EINTR) {
-               barf("Ticker: read(timerfd) failed with %s and returned %zd", strerror(errno), r);
-            }
-        } else {
-            if (rtsSleep(itimer_interval) != 0) {
-                sysErrorBelch("Ticker: sleep failed: %s", strerror(errno));
-            }
+        if (rtsSleep(itimer_interval) != 0) {
+            sysErrorBelch("Ticker: sleep failed: %s", strerror(errno));
         }
 
         // first try a cheap test
@@ -138,8 +112,6 @@ static void *itimer_thread_func(void *_handle_tick)
         }
     }
 
-    if (USE_TIMERFD_FOR_ITIMER)
-        close(timerfd);
     return NULL;
 }
 
@@ -157,35 +129,6 @@ initTicker (Time interval, TickProc handle_tick)
 
     initCondition(&start_cond);
     initMutex(&mutex);
-
-    /* Open the file descriptor for the timer synchronously.
-     *
-     * We used to do it in itimer_thread_func (i.e. in the timer thread) but it
-     * meant that some user code could run before it and get confused by the
-     * allocation of the timerfd.
-     *
-     * See hClose002 which unsafely closes a file descriptor twice expecting an
-     * exception the second time: it sometimes failed when the second call to
-     * "close" closed our own timerfd which inadvertently reused the same file
-     * descriptor closed by the first call! (see #20618)
-     */
-#if USE_TIMERFD_FOR_ITIMER
-    struct itimerspec it;
-    it.it_value.tv_sec  = TimeToSeconds(itimer_interval);
-    it.it_value.tv_nsec = TimeToNS(itimer_interval) % 1000000000;
-    it.it_interval = it.it_value;
-
-    timerfd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC);
-    if (timerfd == -1) {
-        barf("timerfd_create: %s", strerror(errno));
-    }
-    if (!TFD_CLOEXEC) {
-        fcntl(timerfd, F_SETFD, FD_CLOEXEC);
-    }
-    if (timerfd_settime(timerfd, 0, &it, NULL)) {
-        barf("timerfd_settime: %s", strerror(errno));
-    }
-#endif
 
     /*
      * Create the thread with all blockable signals blocked, leaving signal

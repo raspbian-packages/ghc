@@ -1,13 +1,11 @@
 {-# LANGUAGE ExistentialQuantification #-}
 module GHC.Tc.Errors.Hole.FitTypes (
   TypedHole (..), HoleFit (..), HoleFitCandidate (..),
-  CandPlugin, FitPlugin, HoleFitPlugin (..), HoleFitPluginR (..),
   hfIsLcl, pprHoleFitCand
   ) where
 
 import GHC.Prelude
 
-import GHC.Tc.Types
 import GHC.Tc.Types.Constraint
 import GHC.Tc.Utils.TcType
 
@@ -48,7 +46,7 @@ data HoleFitCandidate = IdHFCand Id             -- An id, like locals.
 instance Eq HoleFitCandidate where
   IdHFCand i1 == IdHFCand i2 = i1 == i2
   NameHFCand n1 == NameHFCand n2 = n1 == n2
-  GreHFCand gre1 == GreHFCand gre2 = gre_name gre1 == gre_name gre2
+  GreHFCand gre1 == GreHFCand gre2 = greName gre1 == greName gre2
   _ == _ = False
 
 instance Outputable HoleFitCandidate where
@@ -63,11 +61,11 @@ instance NamedThing HoleFitCandidate where
   getName hfc = case hfc of
                      IdHFCand cid -> idName cid
                      NameHFCand cname -> cname
-                     GreHFCand cgre -> greMangledName cgre
+                     GreHFCand cgre -> greName cgre
   getOccName hfc = case hfc of
                      IdHFCand cid -> occName cid
                      NameHFCand cname -> occName cname
-                     GreHFCand cgre -> occName (greMangledName cgre)
+                     GreHFCand cgre -> occName $ greName cgre
 
 instance HasOccName HoleFitCandidate where
   occName = getOccName
@@ -126,25 +124,3 @@ hfIsLcl hf@(HoleFit {}) = case hfCand hf of
 hfIsLcl _ = False
 
 
--- | A plugin for modifying the candidate hole fits *before* they're checked.
-type CandPlugin = TypedHole -> [HoleFitCandidate] -> TcM [HoleFitCandidate]
-
--- | A plugin for modifying hole fits  *after* they've been found.
-type FitPlugin =  TypedHole -> [HoleFit] -> TcM [HoleFit]
-
--- | A HoleFitPlugin is a pair of candidate and fit plugins.
-data HoleFitPlugin = HoleFitPlugin
-  { candPlugin :: CandPlugin
-  , fitPlugin :: FitPlugin }
-
--- | HoleFitPluginR adds a TcRef to hole fit plugins so that plugins can
--- track internal state. Note the existential quantification, ensuring that
--- the state cannot be modified from outside the plugin.
-data HoleFitPluginR = forall s. HoleFitPluginR
-  { hfPluginInit :: TcM (TcRef s)
-    -- ^ Initializes the TcRef to be passed to the plugin
-  , hfPluginRun :: TcRef s -> HoleFitPlugin
-    -- ^ The function defining the plugin itself
-  , hfPluginStop :: TcRef s -> TcM ()
-    -- ^ Cleanup of state, guaranteed to be called even on error
-  }

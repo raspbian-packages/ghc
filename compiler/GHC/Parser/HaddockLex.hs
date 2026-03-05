@@ -1,9 +1,7 @@
 {-# OPTIONS_GHC -fno-warn-unused-binds -fno-warn-missing-signatures #-}
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE MagicHash #-}
-{-# LINE 1 "_build/source-dist/ghc-9.6.6-src/ghc-9.6.6/compiler/GHC/Parser/HaddockLex.x" #-}
-{-# LANGUAGE BangPatterns #-}
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LINE 1 "_build/source-dist/ghc-9.10.3-src/ghc-9.10.3/compiler/GHC/Parser/HaddockLex.x" #-}
 {-# OPTIONS_GHC -funbox-strict-fields #-}
 
 module GHC.Parser.HaddockLex (lexHsDoc, lexStringLiteral) where
@@ -19,7 +17,6 @@ import GHC.Types.SourceText
 import GHC.Data.StringBuffer
 import qualified GHC.Data.Strict as Strict
 import GHC.Types.Name.Reader
-import GHC.Utils.Outputable
 import GHC.Utils.Error
 import GHC.Utils.Encoding
 import GHC.Hs.Extension
@@ -110,120 +107,6 @@ alex_actions = array (0 :: Int, 4)
   , (0,alex_action_1)
   ]
 
-{-# LINE 87 "_build/source-dist/ghc-9.6.6-src/ghc-9.6.6/compiler/GHC/Parser/HaddockLex.x" #-}
-data AlexInput = AlexInput
-  { alexInput_position     :: !RealSrcLoc
-  , alexInput_string       :: !ByteString
-  }
-
--- NB: As long as we don't use a left-context we don't need to track the
--- previous input character.
-alexInputPrevChar :: AlexInput -> Word8
-alexInputPrevChar = error "Left-context not supported"
-
-alexGetByte :: AlexInput -> Maybe (Word8, AlexInput)
-alexGetByte (AlexInput p s) = case utf8UnconsByteString s of
-  Nothing -> Nothing
-  Just (c,bs) -> Just (adjustChar c, AlexInput (advanceSrcLoc p c) bs)
-
-alexScanTokens :: RealSrcLoc -> ByteString -> [(RealSrcSpan, ByteString)]
-alexScanTokens start str0 = go (AlexInput start str0)
-  where go inp@(AlexInput pos str) =
-          case alexScan inp 0 of
-            AlexSkip  inp' _ln          -> go inp'
-            AlexToken inp'@(AlexInput _ str') _ act -> act pos (BS.length str - BS.length str') str : go inp'
-            AlexEOF                     -> []
-            AlexError (AlexInput p _) -> error $ "lexical error at " ++ show p
-
---------------------------------------------------------------------------------
-
--- | Extract identifier from Alex state.
-getIdentifier :: Int -- ^ adornment length
-              -> RealSrcLoc
-              -> Int
-                 -- ^ Token length
-              -> ByteString
-                 -- ^ The remaining input beginning with the found token
-              -> (RealSrcSpan, ByteString)
-getIdentifier !i !loc0 !len0 !s0 =
-    (mkRealSrcSpan loc1 loc2, ident)
-  where
-    (adornment, s1) = BS.splitAt i s0
-    ident = BS.take (len0 - 2*i) s1
-    loc1 = advanceSrcLocBS loc0 adornment
-    loc2 = advanceSrcLocBS loc1 ident
-
-advanceSrcLocBS :: RealSrcLoc -> ByteString -> RealSrcLoc
-advanceSrcLocBS !loc bs = case utf8UnconsByteString bs of
-  Nothing -> loc
-  Just (c, bs') -> advanceSrcLocBS (advanceSrcLoc loc c) bs'
-
--- | Lex 'StringLiteral' for warning messages
-lexStringLiteral :: P (LocatedN RdrName) -- ^ A precise identifier parser
-                 -> Located StringLiteral
-                 -> Located (WithHsDocIdentifiers StringLiteral GhcPs)
-lexStringLiteral identParser (L l sl@(StringLiteral _ fs _))
-  = L l (WithHsDocIdentifiers sl idents)
-  where
-    bs = bytesFS fs
-
-    idents = mapMaybe (uncurry (validateIdentWith identParser)) plausibleIdents
-
-    plausibleIdents :: [(SrcSpan,ByteString)]
-    plausibleIdents = case l of
-      RealSrcSpan span _ -> [(RealSrcSpan span' Strict.Nothing, tok) | (span', tok) <- alexScanTokens (realSrcSpanStart span) bs]
-      UnhelpfulSpan reason -> [(UnhelpfulSpan reason, tok) | (_, tok) <- alexScanTokens fakeLoc bs]
-
-    fakeLoc = mkRealSrcLoc nilFS 0 0
-
--- | Lex identifiers from a docstring.
-lexHsDoc :: P (LocatedN RdrName)      -- ^ A precise identifier parser
-         -> HsDocString
-         -> HsDoc GhcPs
-lexHsDoc identParser doc =
-    WithHsDocIdentifiers doc idents
-  where
-    docStrings = docStringChunks doc
-    idents = concat [mapMaybe maybeDocIdentifier (plausibleIdents doc) | doc <- docStrings]
-
-    maybeDocIdentifier :: (SrcSpan, ByteString) -> Maybe (Located RdrName)
-    maybeDocIdentifier = uncurry (validateIdentWith identParser)
-
-    plausibleIdents :: LHsDocStringChunk -> [(SrcSpan,ByteString)]
-    plausibleIdents (L (RealSrcSpan span _) (HsDocStringChunk s))
-      = [(RealSrcSpan span' Strict.Nothing, tok) | (span', tok) <- alexScanTokens (realSrcSpanStart span) s]
-    plausibleIdents (L (UnhelpfulSpan reason) (HsDocStringChunk s))
-      = [(UnhelpfulSpan reason, tok) | (_, tok) <- alexScanTokens fakeLoc s] -- preserve the original reason
-
-    fakeLoc = mkRealSrcLoc nilFS 0 0
-
-validateIdentWith :: P (LocatedN RdrName) -> SrcSpan -> ByteString -> Maybe (Located RdrName)
-validateIdentWith identParser mloc str0 =
-  let -- These ParserFlags should be as "inclusive" as possible, allowing
-      -- identifiers defined with any language extension.
-      pflags = mkParserOpts
-                 (EnumSet.fromList [LangExt.MagicHash])
-                 dopts
-                 []
-                 False False False False
-      dopts = DiagOpts
-        { diag_warning_flags = EnumSet.empty
-          , diag_fatal_warning_flags = EnumSet.empty
-          , diag_warn_is_error = False
-          , diag_reverse_errors = False
-          , diag_max_errors = Nothing
-          , diag_ppr_ctx = defaultSDocContext
-        }
-      buffer = stringBufferFromByteString str0
-      realSrcLc = case mloc of
-        RealSrcSpan loc _ -> realSrcSpanStart loc
-        UnhelpfulSpan _ -> mkRealSrcLoc nilFS 0 0
-      pstate = initParserState pflags buffer realSrcLc
-  in case unP identParser pstate of
-    POk _ name -> Just $ case mloc of
-       RealSrcSpan _ _ -> reLoc name
-       UnhelpfulSpan _ -> L mloc (unLoc name) -- Preserve the original reason
-    _ -> Nothing
 alex_action_0 = getIdentifier 1
 alex_action_1 = getIdentifier 2
 
@@ -393,9 +276,10 @@ alex_scan_tkn user__ orig_input len input__ s last_acc =
         let
                 base   = alexIndexInt32OffAddr alex_base s
                 offset = PLUS(base,ord_c)
-                check  = alexIndexInt16OffAddr alex_check offset
 
-                new_s = if GTE(offset,ILIT(0)) && EQ(check,ord_c)
+                new_s = if GTE(offset,ILIT(0))
+                          && let check  = alexIndexInt16OffAddr alex_check offset
+                             in  EQ(check,ord_c)
                           then alexIndexInt16OffAddr alex_table offset
                           else alexIndexInt16OffAddr alex_deflt s
         in
@@ -468,3 +352,110 @@ alexRightContext IBOX(sc) user__ _ _ input__ =
         -- match when checking the right context, just
         -- the first match will do.
 #endif
+{-# LINE 84 "_build/source-dist/ghc-9.10.3-src/ghc-9.10.3/compiler/GHC/Parser/HaddockLex.x" #-}
+data AlexInput = AlexInput
+  { alexInput_position     :: !RealSrcLoc
+  , alexInput_string       :: !ByteString
+  }
+
+-- NB: As long as we don't use a left-context we don't need to track the
+-- previous input character.
+alexInputPrevChar :: AlexInput -> Word8
+alexInputPrevChar = error "Left-context not supported"
+
+alexGetByte :: AlexInput -> Maybe (Word8, AlexInput)
+alexGetByte (AlexInput p s) = case utf8UnconsByteString s of
+  Nothing -> Nothing
+  Just (c,bs) -> Just (adjustChar c, AlexInput (advanceSrcLoc p c) bs)
+
+alexScanTokens :: RealSrcLoc -> ByteString -> [(RealSrcSpan, ByteString)]
+alexScanTokens start str0 = go (AlexInput start str0)
+  where go inp@(AlexInput pos str) =
+          case alexScan inp 0 of
+            AlexSkip  inp' _ln          -> go inp'
+            AlexToken inp'@(AlexInput _ str') _ act -> act pos (BS.length str - BS.length str') str : go inp'
+            AlexEOF                     -> []
+            AlexError (AlexInput p _) -> error $ "lexical error at " ++ show p
+
+--------------------------------------------------------------------------------
+
+-- | Extract identifier from Alex state.
+getIdentifier :: Int -- ^ adornment length
+              -> RealSrcLoc
+              -> Int
+                 -- ^ Token length
+              -> ByteString
+                 -- ^ The remaining input beginning with the found token
+              -> (RealSrcSpan, ByteString)
+getIdentifier !i !loc0 !len0 !s0 =
+    (mkRealSrcSpan loc1 loc2, ident)
+  where
+    (adornment, s1) = BS.splitAt i s0
+    ident = BS.take (len0 - 2*i) s1
+    loc1 = advanceSrcLocBS loc0 adornment
+    loc2 = advanceSrcLocBS loc1 ident
+
+advanceSrcLocBS :: RealSrcLoc -> ByteString -> RealSrcLoc
+advanceSrcLocBS !loc bs = case utf8UnconsByteString bs of
+  Nothing -> loc
+  Just (c, bs') -> advanceSrcLocBS (advanceSrcLoc loc c) bs'
+
+-- | Lex 'StringLiteral' for warning messages
+lexStringLiteral :: P (LocatedN RdrName) -- ^ A precise identifier parser
+                 -> Located StringLiteral
+                 -> Located (WithHsDocIdentifiers StringLiteral GhcPs)
+lexStringLiteral identParser (L l sl@(StringLiteral _ fs _))
+  = L l (WithHsDocIdentifiers sl idents)
+  where
+    bs = bytesFS fs
+
+    idents = mapMaybe (uncurry (validateIdentWith identParser)) plausibleIdents
+
+    plausibleIdents :: [(SrcSpan,ByteString)]
+    plausibleIdents = case l of
+      RealSrcSpan span _ -> [(RealSrcSpan span' Strict.Nothing, tok) | (span', tok) <- alexScanTokens (realSrcSpanStart span) bs]
+      UnhelpfulSpan reason -> [(UnhelpfulSpan reason, tok) | (_, tok) <- alexScanTokens fakeLoc bs]
+
+    fakeLoc = mkRealSrcLoc nilFS 0 0
+
+-- | Lex identifiers from a docstring.
+lexHsDoc :: P (LocatedN RdrName)      -- ^ A precise identifier parser
+         -> HsDocString
+         -> HsDoc GhcPs
+lexHsDoc identParser doc =
+    WithHsDocIdentifiers doc idents
+  where
+    docStrings = docStringChunks doc
+    idents = concat [mapMaybe maybeDocIdentifier (plausibleIdents doc) | doc <- docStrings]
+
+    maybeDocIdentifier :: (SrcSpan, ByteString) -> Maybe (Located RdrName)
+    maybeDocIdentifier = uncurry (validateIdentWith identParser)
+
+    plausibleIdents :: LHsDocStringChunk -> [(SrcSpan,ByteString)]
+    plausibleIdents (L (RealSrcSpan span _) (HsDocStringChunk s))
+      = [(RealSrcSpan span' Strict.Nothing, tok) | (span', tok) <- alexScanTokens (realSrcSpanStart span) s]
+    plausibleIdents (L (UnhelpfulSpan reason) (HsDocStringChunk s))
+      = [(UnhelpfulSpan reason, tok) | (_, tok) <- alexScanTokens fakeLoc s] -- preserve the original reason
+
+    fakeLoc = mkRealSrcLoc nilFS 0 0
+
+validateIdentWith :: P (LocatedN RdrName) -> SrcSpan -> ByteString -> Maybe (Located RdrName)
+validateIdentWith identParser mloc str0 =
+  let -- These ParserFlags should be as "inclusive" as possible, allowing
+      -- identifiers defined with any language extension.
+      pflags = mkParserOpts
+                 (EnumSet.fromList [LangExt.MagicHash])
+                 dopts
+                 []
+                 False False False False
+      dopts = emptyDiagOpts
+      buffer = stringBufferFromByteString str0
+      realSrcLc = case mloc of
+        RealSrcSpan loc _ -> realSrcSpanStart loc
+        UnhelpfulSpan _ -> mkRealSrcLoc nilFS 0 0
+      pstate = initParserState pflags buffer realSrcLc
+  in case unP identParser pstate of
+    POk _ name -> Just $ case mloc of
+       RealSrcSpan _ _ -> reLoc name
+       UnhelpfulSpan _ -> L mloc (unLoc name) -- Preserve the original reason
+    _ -> Nothing

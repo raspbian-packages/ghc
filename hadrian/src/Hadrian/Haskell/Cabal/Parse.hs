@@ -19,6 +19,7 @@ import Data.Bifunctor
 import Data.List.Extra
 import Development.Shake
 import qualified Distribution.Compat.Graph                     as Graph
+import qualified Distribution.Compat.Lens                      as CL
 import qualified Distribution.ModuleName                       as C
 import qualified Distribution.Package                          as C
 import qualified Distribution.PackageDescription               as C
@@ -37,6 +38,7 @@ import qualified Distribution.Simple.Utils                     as C
 import qualified Distribution.Simple.Program.Types             as C
 import qualified Distribution.Simple.Configure                 as C (getPersistBuildConfig)
 import qualified Distribution.Simple.Build                     as C
+import qualified Distribution.Types.BuildInfo.Lens             as CL (HasBuildInfo(..), traverseBuildInfos)
 import qualified Distribution.Types.ComponentLocalBuildInfo    as C
 import qualified Distribution.InstalledPackageInfo             as Installed
 import qualified Distribution.Simple.PackageIndex              as C
@@ -64,8 +66,6 @@ import Hadrian.Target
 import Base
 import Builder
 import Context
-import Flavour
-import Packages
 import Settings
 import Distribution.Simple.LocalBuildInfo
 import qualified Distribution.Simple.Register as C
@@ -73,6 +73,7 @@ import System.Directory (getCurrentDirectory)
 import qualified Distribution.InstalledPackageInfo as CP
 import Distribution.Simple.Utils (writeUTF8File)
 import Utilities
+import Packages
 
 
 -- | Parse the Cabal file of a given 'Package'. This operation is cached by the
@@ -128,6 +129,17 @@ biModules pd = go [ comp | comp@(bi,_,_,_) <-
     go [x] = x
     go _   = error "Cannot handle more than one buildinfo yet."
 
+-- Extra files needed prior to configuring.
+--
+-- These should be "static" source files: ones whose contents do not
+-- change based on the build configuration, and ones which are therefore
+-- also safe to include in sdists for package-level builds.
+--
+-- Put another way, while Hadrian knows these are generated, Cabal
+-- should just think they are regular source files.
+extraPreConfigureDeps :: [String]
+extraPreConfigureDeps = ["compiler/GHC/CmmToLlvm/Version/Bounds.hs"]
+
 -- TODO: Track command line arguments and package configuration flags.
 -- | Configure a package using the Cabal library by collecting all the command
 -- line arguments (to be passed to the setup script) and package configuration
@@ -141,41 +153,63 @@ configurePackage context@Context {..} = do
 
     -- Stage packages are those we have in this stage.
     stagePkgs <- stagePackages stage
+
+
+    -- Normally we will depend on Inplace package databases which enables
+    -- cross-package parallelism, but see #24436 for why we lineariese the build
+    -- of base and ghc-internal.
+    let forceBaseAfterGhcInternal dep =
+           if dep == ghcInternal && package == base
+              then Final
+              else iplace
+
+
+
     -- We'll need those packages in our package database.
-    deps <- sequence [ pkgConfFile (context { package = pkg })
+    deps <- sequence [ pkgConfFile (context { package = pkg, iplace = forceBaseAfterGhcInternal pkg })
                      | pkg <- depPkgs, pkg `elem` stagePkgs ]
-    need deps
+    need $ extraPreConfigureDeps ++ deps
 
     -- Figure out what hooks we need.
+    let configureFile = replaceFileName (pkgCabalFile package) "configure"
+        -- induce dependency on the file
+        autoconfUserHooks = do
+          need [configureFile]
+          pure C.autoconfUserHooks
     hooks <- case C.buildType (C.flattenPackageDescription gpd) of
-        C.Configure -> pure C.autoconfUserHooks
+        C.Configure -> autoconfUserHooks
+        C.Simple -> pure C.simpleUserHooks
+        C.Make -> fail "build-type: Make is not supported"
         -- The 'time' package has a 'C.Custom' Setup.hs, but it's actually
         -- 'C.Configure' plus a @./Setup test@ hook. However, Cabal is also
         -- 'C.Custom', but doesn't have a configure script.
         C.Custom -> do
-            configureExists <- doesFileExist $
-                replaceFileName (pkgCabalFile package) "configure"
-            pure $ if configureExists then C.autoconfUserHooks else C.simpleUserHooks
-        -- Not quite right, but good enough for us:
-        _ | package == rts ->
-            -- Don't try to do post configuration validation for 'rts'. This
-            -- will simply not work, due to the @ld-options@ and @Stg.h@.
-            pure $ C.simpleUserHooks { C.postConf = \_ _ _ _ -> return () }
-          | otherwise -> pure C.simpleUserHooks
+            configureExists <- doesFileExist configureFile
+            if configureExists then autoconfUserHooks else pure C.simpleUserHooks
 
     -- Compute the list of flags, and the Cabal configuration arguments
-    flavourArgs <- args <$> flavour
-    flagList    <- interpret (target context (Cabal Flags stage) [] []) flavourArgs
-    argList     <- interpret (target context (Cabal Setup stage) [] []) flavourArgs
+    flagList    <- interpret (target context (Cabal Flags stage) [] []) getArgs
+    argList     <- interpret (target context (Cabal Setup stage) [] []) getArgs
     trackArgsHash (target context (Cabal Flags stage) [] [])
     trackArgsHash (target context (Cabal Setup stage) [] [])
-    verbosity   <- getVerbosity
-    let v = if verbosity >= Diagnostic then "-v3" else "-v0"
+    verbosity <- getVerbosity
+    let v = shakeVerbosityToCabalFlag verbosity
         argList' = argList ++ ["--flags=" ++ unwords flagList, v]
+
     when (verbosity >= Verbose) $
         putProgressInfo $ "| Package " ++ quote (pkgName package) ++ " configuration flags: " ++ unwords argList'
+
+    -- See #24826 for why this workaround exists
+    -- In future `Cabal` versions we should pass the `--ignore-build-tools` flag when
+    -- calling configure.
+    -- See https://github.com/haskell/cabal/pull/10128
+    let gpdWithoutBuildTools =
+            CL.set (CL.traverseBuildInfos . CL.buildToolDepends) []
+          . CL.set (CL.traverseBuildInfos . CL.buildTools) []
+          $ gpd
+
     traced "cabal-configure" $
-        C.defaultMainWithHooksNoReadArgs hooks gpd argList'
+        C.defaultMainWithHooksNoReadArgs hooks gpdWithoutBuildTools argList'
 
     dir <- Context.buildPath context
     files <- liftIO $ getDirectoryFilesIO "." [ dir -/- "include" -/- "**"
@@ -193,12 +227,18 @@ copyPackage context@Context {..} = do
     ctxPath   <- Context.contextPath context
     pkgDbPath <- packageDbPath (PackageDbLoc stage iplace)
     verbosity <- getVerbosity
-    let v = if verbosity >= Diagnostic then "-v3" else "-v0"
+    let v = shakeVerbosityToCabalFlag verbosity
     traced "cabal-copy" $
         C.defaultMainWithHooksNoReadArgs C.autoconfUserHooks gpd
             [ "copy", "--builddir", ctxPath, "--target-package-db", pkgDbPath, v ]
 
-
+shakeVerbosityToCabalFlag :: Verbosity -> String
+shakeVerbosityToCabalFlag = \case
+    Diagnostic -> "-v2"
+    Verbose -> "-v1"
+    -- Normal levels should not produce output to stdout
+    Silent -> "-v0"
+    _ -> "-v1"
 
 -- | What type of file is Main
 data MainSourceType = HsMain | CppMain | CMain
@@ -214,17 +254,22 @@ resolveContextData context@Context {..} = do
     pdi <- liftIO $ getHookedBuildInfo [pkgPath package, cPath -/- "build"]
     let pd'  = C.updatePackageDescription pdi (C.localPkgDescr lbi)
         lbi' = lbi { C.localPkgDescr = pd' }
+    pkgDbPath <- packageDbPath (PackageDbLoc stage iplace)
 
     -- TODO: Get rid of deprecated 'externalPackageDeps' and drop -Wno-deprecations
     -- See: https://github.com/snowleopard/hadrian/issues/548
-    let extDeps      = externalPackageDeps lbi'
-        deps         = map (C.display . snd) extDeps
-        depDirect    = map (fromMaybe (error "resolveContextData: depDirect failed")
-                     . C.lookupUnitId (C.installedPkgs lbi') . fst) extDeps
-        depIds       = map (C.display . Installed.installedUnitId) depDirect
-        Just ghcProg = C.lookupProgram C.ghcProgram (C.withPrograms lbi')
-        depPkgs      = C.topologicalOrder (packageHacks (C.installedPkgs lbi'))
-        forDeps f    = concatMap f depPkgs
+    let extDeps   = externalPackageDeps lbi'
+        deps      = map (C.display . snd) extDeps
+        depDirect = map (fromMaybe (error "resolveContextData: depDirect failed")
+                  . C.lookupUnitId (C.installedPkgs lbi') . fst) extDeps
+        depIds    = map (C.display . Installed.installedUnitId) depDirect
+        ghcProg   =
+          case C.lookupProgram C.ghcProgram (C.withPrograms lbi') of
+            Just ghc -> ghc
+            Nothing  -> error "resolveContextData: failed to look up 'ghc'"
+
+        depPkgs   = C.topologicalOrder (packageHacks (C.installedPkgs lbi'))
+        forDeps f = concatMap f depPkgs
 
         -- Copied from Distribution.Simple.PreProcess.ppHsc2Hs
         packageHacks = case C.compilerFlavor (C.compiler lbi') of
@@ -257,6 +302,8 @@ resolveContextData context@Context {..} = do
           | takeExtension fp `elem` [".hs", ".lhs"] = HsMain
           | takeExtension fp `elem` [".cpp", ".cxx", ".c++"]= CppMain
           | otherwise = CMain
+
+        install_dirs = absoluteInstallDirs pd' lbi' (CopyToDb pkgDbPath)
 
         main_src = fmap (first C.display) mainIs
         cdata = ContextData
@@ -299,7 +346,10 @@ resolveContextData context@Context {..} = do
           , depLdOpts          = forDeps Installed.ldOptions
           , buildGhciLib       = C.withGHCiLib lbi'
           , frameworks         = C.frameworks buildInfo
-          , packageDescription = pd' }
+          , packageDescription = pd'
+          , contextLibdir      = libdir install_dirs
+          , contextDynLibdir   = dynlibdir install_dirs
+          }
 
       in return cdata
 
@@ -321,8 +371,11 @@ write_inplace_conf pkg_path res_path pd lbi = do
                   pkg_name = C.display (C.pkgName (CP.sourcePackageId installedPkgInfo))
                   final_ipi = installedPkgInfo {
                                  Installed.includeDirs = concatMap fixupIncludeDir (Installed.includeDirs installedPkgInfo),
-                                 Installed.libraryDirs = [ build_dir ],
-                                 Installed.libraryDynDirs = [ build_dir ],
+                                 Installed.libraryDirs = build_dir: (concatMap fixupIncludeDir (Installed.libraryDirs installedPkgInfo)) ,
+#if MIN_VERSION_Cabal(3,8,0)
+                                 Installed.libraryDirsStatic = build_dir: (concatMap fixupIncludeDir (Installed.libraryDirsStatic installedPkgInfo)) ,
+#endif
+                                 Installed.libraryDynDirs = build_dir : (concatMap fixupIncludeDir (Installed.libraryDynDirs installedPkgInfo)) ,
                                  Installed.dataDir = "${pkgroot}/../../../../" ++ pkg_path,
                                  Installed.haddockHTMLs = [build_dir ++ "/doc/html/" ++ C.display (CP.sourcePackageId installedPkgInfo)],
                                  Installed.haddockInterfaces = [build_dir ++ "/doc/html/" ++  pkg_name ++ "/" ++ pkg_name ++ ".haddock"],
@@ -343,7 +396,7 @@ registerPackage rs context = do
     need [setupConfig] -- This triggers 'configurePackage'
     pd <- packageDescription <$> readContextData context
     db_path <- packageDbPath (PackageDbLoc (stage context) (iplace context))
-    pid <- pkgIdentifier (package context)
+    pid <- pkgUnitId (stage context) (package context)
     -- Note: the @cPath@ is ignored. The path that's used is the 'buildDir' path
     -- from the local build info @lbi@.
     lbi <- liftIO $ C.getPersistBuildConfig cPath
@@ -355,11 +408,11 @@ registerPackage rs context = do
 -- This is copied and simplified from Cabal, because we want to install the package
 -- into a different package database to the one it was configured against.
 register :: FilePath
-         -> FilePath
+         -> String -- ^ Package Identifier
          -> C.PackageDescription
          -> LocalBuildInfo
          -> IO ()
-register pkg_db conf_file pd lbi
+register pkg_db pid pd lbi
   = withLibLBI pd lbi $ \lib clbi -> do
 
     when reloc $ error "register does not support reloc"
@@ -367,7 +420,7 @@ register pkg_db conf_file pd lbi
     writeRegistrationFile installedPkgInfo
 
   where
-    regFile             = conf_file
+    regFile   = pkg_db </> pid <.> "conf"
     reloc     = relocatable lbi
 
     generateRegistrationInfo pkg lbi lib clbi = do
@@ -375,7 +428,7 @@ register pkg_db conf_file pd lbi
       return (C.absoluteInstalledPackageInfo pkg abi_hash lib lbi clbi)
 
     writeRegistrationFile installedPkgInfo = do
-      writeUTF8File (pkg_db </> regFile <.> "conf") (CP.showInstalledPackageInfo installedPkgInfo)
+      writeUTF8File regFile (CP.showInstalledPackageInfo installedPkgInfo)
 
 
 -- | Build autogenerated files @autogen/cabal_macros.h@ and @autogen/Paths_*.hs@.

@@ -5,20 +5,13 @@
 {-# LANGUAGE CPP #-}
 
 #if !(MIN_VERSION_transformers(0,6,0))
-{-# OPTIONS_GHC -fno-warn-deprecations #-}
+{-# OPTIONS_GHC -Wno-deprecations #-}
 #endif
 
 module Control.Monad.Catch.Tests (tests) where
 
-#if defined(__GLASGOW_HASKELL__) && (__GLASGOW_HASKELL__ < 706)
-import Prelude hiding (catch)
-#endif
-
-#if !(MIN_VERSION_base(4,8,0))
-import Control.Applicative ((<*>))
-#endif
 import Control.Monad (unless)
-import Data.Data (Data, Typeable)
+import Data.Data (Data)
 import Data.IORef (newIORef, writeIORef, readIORef)
 
 import Control.Monad.Trans.Class (lift)
@@ -40,15 +33,15 @@ import qualified Control.Monad.Writer.Strict as StrictWriter
 import qualified Control.Monad.RWS.Lazy as LazyRWS
 import qualified Control.Monad.RWS.Strict as StrictRWS
 #if !(MIN_VERSION_transformers(0,6,0))
-import Control.Monad.Error (ErrorT(..))
-import Control.Monad.List (ListT(..))
+import Control.Monad.Trans.Error (ErrorT(..))
+import Control.Monad.Trans.List (ListT(..))
 #endif
 
 import Control.Monad.Catch
 import Control.Monad.Catch.Pure
 
 data TestException = TestException String
-    deriving (Show, Eq, Data, Typeable)
+    deriving (Show, Eq, Data)
 
 instance Exception TestException
 

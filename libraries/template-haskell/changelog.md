@@ -1,12 +1,52 @@
 # Changelog for [`template-haskell` package](http://hackage.haskell.org/package/template-haskell)
 
+## 2.22.0.0
+
+  * The kind of `Code` was changed from `forall r. (Type -> Type) -> TYPE r -> Type`
+    to `(Type -> Type) -> forall r. TYPE r -> Type`. This enables higher-kinded usage.
+
+  * Extend `Pat` with `TypeP` and `Exp` with `TypeE`,
+    introduce functions `typeP` and `typeE` (GHC Proposal #281).
+
+  * Extend `Pragma` with `SCCP`.
+
+  * Extend `Pat` with `InvisP`, introduce function `invisP`. (Ghc Proposal #448).
+
+  * Add a new data type `NamespaceSpecifier` to represent `type`/`data` namespace specifiers,
+    which can be used in conjunction with the `ExplicitNamespaces` extension:
+
+    * The `InfixD` constructor of the `Dec` data type now stores a `NamespaceSpecifier`.
+
+    * Add `infixLWithSpecD`, `infixRWithSpecD` and `infixNWithSpecD` functions, which
+      accept a `NamespaceSpecifier` as an argument.
+
+## 2.21.0.0
+
+  * Record fields now belong to separate `NameSpace`s, keyed by the parent of
+    the record field. This is the name of the first constructor of the parent type,
+    even if this constructor does not have the field in question.
+
+    This change enables TemplateHaskell support for `DuplicateRecordFields`.
+
+  * Add support for generating typed splices and brackets in untyped Template Haskell
+    Introduces `typedSpliceE :: Quote m => m Exp -> m Exp` and
+    `typedBracketE :: Quote m => m Exp -> m Exp`
+
+  * Add `BndrVis` to support invisible binders
+    in type declarations (GHC Proposal #425).
+
+  * The binder flag type in `plainTV` and `kindedTV` is generalized from `()`
+    to any data type with a `DefaultBndrFlag` instance, including `()`,
+    `Specificity`, and `BndrVis`.
+
 ## 2.20.0.0
 
-  * The `Ppr.pprInfixT` function has gained a `Precedence` argument. 
+  * The `Ppr.pprInfixT` function has gained a `Precedence` argument.
   * The values of named precedence levels like `Ppr.appPrec` have changed.
 
   * Add `TypeDataD` constructor to the `Dec` type for `type data`
     declarations (GHC proposal #106).
+  * Add `instance Lift (Fixed a)`
 
 ## 2.19.0.0
 

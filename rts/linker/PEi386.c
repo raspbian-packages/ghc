@@ -342,6 +342,98 @@
    Finally, we enter `ocResolve`, where we resolve relocations and and allocate
    jump islands (using the m32 allocator for backing storage) as necessary.
 
+   Note [Windows API Set]
+   ~~~~~~~~~~~~~~~~~~~~~~
+   Windows has a concept called API Sets [1][2] which is intended to be Windows's
+   equivalent to glibc's symbolic versioning.  It is also used to handle the API
+   surface difference between different device classes.  e.g. the API might be
+   handled differently between a desktop and tablet.
+
+   This is handled through two mechanisms:
+
+   1. Direct Forward:  These use import libraries to manage to first level
+      redirection.  So what used to be in ucrt.dll is now redirected based on
+      ucrt.lib.  Every API now points to a possible different set of API sets
+      each following the API set contract:
+
+      * The name must begin either with the string api- or ext-.
+      * Names that begin with api- represent APIs that exist on all Windows
+        editions that satisfy the API's version requirements.
+      * Names that begin with ext- represent APIs that may not exist on all
+        Windows editions.
+      * The name must end with the sequence l<n>-<n>-<n>, where n consists of
+        decimal digits.
+      * The body of the name can be alphanumeric characters, or dashes (-).
+      * The name is case insensitive.
+
+      Here are some examples of API set contract names:
+
+        - api-ms-win-core-ums-l1-1-0
+        - ext-ms-win-com-ole32-l1-1-5
+        - ext-ms-win-ntuser-window-l1-1-0
+        - ext-ms-win-ntuser-window-l1-1-1
+
+      Forward references don't require anything special from the calling
+      application in that the Windows loader through "LoadLibrary" will
+      automatically load the right reference for you if given an API set
+      name including the ".dll" suffix.  For example:
+
+      INFO: DLL api-ms-win-eventing-provider-l1-1-0.dll was redirected to C:\WINDOWS\SYSTEM32\kernelbase.dll by API set
+      INFO: DLL api-ms-win-core-apiquery-l1-1-0.dll was redirected to C:\WINDOWS\SYSTEM32\ntdll.dll by API set
+      INFO: DLL api-ms-win-core-processthreads-l1-1-3.dll was redirected to C:\WINDOWS\SYSTEM32\kernelbase.dll by API set
+      INFO: DLL api-ms-win-core-processthreads-l1-1-2.dll was redirected to C:\WINDOWS\SYSTEM32\kernelbase.dll by API set
+      INFO: DLL api-ms-win-core-processthreads-l1-1-1.dll was redirected to C:\WINDOWS\SYSTEM32\kernelbase.dll by API set
+      INFO: DLL api-ms-win-core-processthreads-l1-1-0.dll was redirected to C:\WINDOWS\SYSTEM32\kernelbase.dll by API set
+      INFO: DLL api-ms-win-core-registry-l1-1-0.dll was redirected to C:\WINDOWS\SYSTEM32\kernelbase.dll by API set
+      INFO: DLL api-ms-win-core-heap-l1-1-0.dll was redirected to C:\WINDOWS\SYSTEM32\kernelbase.dll by API set
+      INFO: DLL api-ms-win-core-heap-l2-1-0.dll was redirected to C:\WINDOWS\SYSTEM32\kernelbase.dll by API set
+      INFO: DLL api-ms-win-core-memory-l1-1-1.dll was redirected to C:\WINDOWS\SYSTEM32\kernelbase.dll by API set
+      INFO: DLL api-ms-win-core-memory-l1-1-0.dll was redirected to C:\WINDOWS\SYSTEM32\kernelbase.dll by API set
+      INFO: DLL api-ms-win-core-memory-l1-1-2.dll was redirected to C:\WINDOWS\SYSTEM32\kernelbase.dll by API set
+      INFO: DLL api-ms-win-core-handle-l1-1-0.dll was redirected to C:\WINDOWS\SYSTEM32\kernelbase.dll by API set
+
+      Which shows how the loader has redirected some of the references used
+      by ghci.
+
+      Historically though we've treated shared libs lazily.  We would load\
+      the shared library, but not resolve the symbol immediately and wait until
+      the symbol is requested to iterate in order through the shared libraries.
+
+      This assumes that you ever only had one version of a symbol.  i.e. we had
+      an assumption that all exported symbols in different shared libraries
+      should be the same, because most of the time they come from re-exporting
+      from a base library.  This is a bit of a weak assumption and doesn't hold
+      with API Sets.
+
+      For that reason the loader now resolves symbols immediately, and because
+      we now resolve using BIND_NOW we must make sure that a symbol loaded
+      through an OC has precedent because the BIND_NOW refernce was not asked
+      for.   For that reason we load the symbols for API sets with the
+      SYM_TYPE_DUP_DISCARD flag set.
+
+    2. Reverse forwarders:  This is when the application has a direct reference
+       to the old name of an API. e.g. if GHC still used "msvcrt.dll" or
+       "ucrt.dll" we would have had to deal with this case.  In this case the
+       loader intercepts the call and if it exists the dll is loaded.  There is
+       an extra indirection as you go from foo.dll => api-ms-foo-1.dll => foo_imp.dll
+
+       But if the API doesn't exist on the device it's resolved to a stub in the
+       API set that if called will result in an error should it be called [3].
+
+    This means that usages of GetProcAddress and LoadLibrary to check for the
+    existance of a function aren't safe, because they'll always succeed, but may
+    result in a pointer to the stub rather than the actual function.
+
+    WHat does this mean for the RTS linker? Nothing.  We don't have a fallback
+    for if the function doesn't exist.  The RTS is merely just executing what
+    it was told to run.  It's writers of libraries that have to be careful when
+    doing dlopen()/LoadLibrary.
+
+
+   [1] https://learn.microsoft.com/en-us/windows/win32/apiindex/windows-apisets
+   [2] https://mingwpy.github.io/ucrt.html#api-set-implementation
+   [3] https://learn.microsoft.com/en-us/windows/win32/apiindex/detect-api-set-availability
+
 */
 
 #include "Rts.h"
@@ -384,7 +476,7 @@ static size_t makeSymbolExtra_PEi386(
 #endif
 
 static void addDLLHandle(
-    pathchar* dll_name,
+    const pathchar* dll_name,
     HINSTANCE instance);
 
 static bool verifyCOFFHeader(
@@ -433,8 +525,52 @@ const int default_alignment = 8;
    the pointer as a redirect.  Essentially it's a DATA DLL reference.  */
 const void* __rts_iob_func = (void*)&__acrt_iob_func;
 
+/*
+ * Note [Avoiding repeated DLL loading]
+ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ * As LoadLibraryEx tends to be expensive and addDLL_PEi386 is called on every
+ * DLL-imported symbol, we use a hash-map to keep track of which DLLs have
+ * already been loaded. This hash-map is keyed on the dll_name passed to
+ * addDLL_PEi386 and is mapped to its HINSTANCE. This serves as a quick check
+ * to avoid repeated calls to LoadLibraryEx for the identical DLL. See #26009.
+ */
+
+typedef struct {
+    HashTable *hash;
+} LoadedDllCache;
+
+LoadedDllCache loaded_dll_cache;
+
+static void initLoadedDllCache(LoadedDllCache *cache) {
+    cache->hash = allocHashTable();
+}
+
+static int hash_path(const HashTable *table, StgWord w)
+{
+    const pathchar *key = (pathchar*) w;
+    return hashBuffer(table, key, sizeof(pathchar) * wcslen(key));
+}
+
+static int compare_path(StgWord key1, StgWord key2)
+{
+    return wcscmp((pathchar*) key1, (pathchar*) key2) == 0;
+}
+
+static void addLoadedDll(LoadedDllCache *cache, const pathchar *dll_name, HINSTANCE instance)
+{
+    insertHashTable_(cache->hash, (StgWord) dll_name, instance, hash_path);
+}
+
+static HINSTANCE isDllLoaded(const LoadedDllCache *cache, const pathchar *dll_name)
+{
+    void *result = lookupHashTable_(cache->hash, (StgWord) dll_name, hash_path, compare_path);
+    return (HINSTANCE) result;
+}
+
 void initLinker_PEi386(void)
 {
+    initLoadedDllCache(&loaded_dll_cache);
+
     if (!ghciInsertSymbolTable(WSTR("(GHCi/Ld special symbols)"),
                                symhash, "__image_base__",
                                GetModuleHandleW (NULL), HS_BOOL_TRUE,
@@ -446,10 +582,11 @@ void initLinker_PEi386(void)
     addDLLHandle(WSTR("*.exe"), GetModuleHandle(NULL));
 #endif
 
-  /* Register the cleanup routine as an exit handler,  this gives other exit handlers
-     a chance to run which may need linker information.  Exit handlers are ran in
-     reverse registration order so this needs to be before the linker loads anything.  */
-  atexit (exitLinker_PEi386);
+    /* Register the cleanup routine as an exit handler,  this gives other exit handlers
+     * a chance to run which may need linker information.  Exit handlers are ran in
+     * reverse registration order so this needs to be before the linker loads anything.
+     */
+    atexit (exitLinker_PEi386);
 }
 
 void exitLinker_PEi386(void)
@@ -460,7 +597,7 @@ void exitLinker_PEi386(void)
 static OpenedDLL* opened_dlls = NULL;
 
 /* Adds a DLL instance to the list of DLLs in which to search for symbols. */
-static void addDLLHandle(pathchar* dll_name, HINSTANCE instance) {
+static void addDLLHandle(const pathchar* dll_name, HINSTANCE instance) {
 
     /* At this point, we actually know what was loaded.
        So bail out if it's already been loaded.  */
@@ -799,14 +936,19 @@ uint8_t* getSymShortName ( COFF_HEADER_INFO *info, COFF_symbol* sym )
 }
 
 const char *
-addDLL_PEi386( pathchar *dll_name, HINSTANCE *loaded )
+addDLL_PEi386( const pathchar *dll_name, HINSTANCE *loaded )
 {
-   /* ------------------- Win32 DLL loader ------------------- */
+    /* ------------------- Win32 DLL loader ------------------- */
+    IF_DEBUG(linker, debugBelch("addDLL; dll_name = `%" PATH_FMT "'\n", dll_name));
 
-   pathchar*  buf;
-   HINSTANCE  instance;
-
-   IF_DEBUG(linker, debugBelch("addDLL; dll_name = `%" PATH_FMT "'\n", dll_name));
+    // See Note [Avoiding repeated DLL loading]
+    HINSTANCE instance = isDllLoaded(&loaded_dll_cache, dll_name);
+    if (instance) {
+        if (loaded) {
+            *loaded = instance;
+        }
+        return NULL;
+    }
 
     /* The file name has no suffix (yet) so that we can try
        both foo.dll and foo.drv
@@ -819,45 +961,32 @@ addDLL_PEi386( pathchar *dll_name, HINSTANCE *loaded )
         extension. */
 
     size_t bufsize = pathlen(dll_name) + 10;
-    buf = stgMallocBytes(bufsize * sizeof(wchar_t), "addDLL");
+    pathchar *buf = stgMallocBytes(bufsize * sizeof(wchar_t), "addDLL");
 
     /* These are ordered by probability of success and order we'd like them.  */
     const wchar_t *formats[] = { L"%ls.DLL", L"%ls.DRV", L"lib%ls.DLL", L"%ls" };
     const DWORD flags[] = { LOAD_LIBRARY_SEARCH_USER_DIRS | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS, 0 };
 
-    int cFormat, cFlag;
-    int flags_start = 1; /* Assume we don't support the new API.  */
-
-    /* Detect if newer API are available, if not, skip the first flags entry.  */
-    if (GetProcAddress((HMODULE)LoadLibraryW(L"Kernel32.DLL"), "AddDllDirectory")) {
-        flags_start = 0;
-    }
-
     /* Iterate through the possible flags and formats.  */
-    for (cFlag = flags_start; cFlag < 2; cFlag++)
-    {
-        for (cFormat = 0; cFormat < 4; cFormat++)
-        {
+    for (int cFlag = 0; cFlag < 2; cFlag++) {
+        for (int cFormat = 0; cFormat < 4; cFormat++) {
             snwprintf(buf, bufsize, formats[cFormat], dll_name);
             instance = LoadLibraryExW(buf, NULL, flags[cFlag]);
             if (instance == NULL) {
-                if (GetLastError() != ERROR_MOD_NOT_FOUND)
-                {
+                if (GetLastError() != ERROR_MOD_NOT_FOUND) {
                     goto error;
                 }
-            }
-            else
-            {
-                break; /* We're done. DLL has been loaded.  */
+            } else {
+                goto loaded; /* We're done. DLL has been loaded.  */
             }
         }
     }
 
-    /* Check if we managed to load the DLL.  */
-    if (instance == NULL) {
-        goto error;
-    }
+    // We failed to load
+    goto error;
 
+loaded:
+    addLoadedDll(&loaded_dll_cache, dll_name, instance);
     addDLLHandle(buf, instance);
     if (loaded) {
         *loaded = instance;
@@ -870,6 +999,7 @@ error:
     stgFree(buf);
 
     char* errormsg = stgMallocBytes(sizeof(char) * 80, "addDLL_PEi386");
+    if (loaded) *loaded = NULL;
     snprintf(errormsg, 80, "addDLL: %" PATH_FMT " or dependencies not loaded. (Win32 error %lu)", dll_name, GetLastError());
     /* LoadLibrary failed; return a ptr to the error msg. */
     return errormsg;
@@ -1017,7 +1147,11 @@ bool checkAndLoadImportLibrary( pathchar* arch_name, char* member_name, FILE* f 
     stgFree(dllName);
 
     IF_DEBUG(linker, debugBelch("loadArchive: read symbol %s from lib `%" PATH_FMT "'\n", symbol, dll));
-    const char* result = addDLL(dll);
+    // We must call `addDLL_PEi386` directly rather than `addDLL` because `addDLL`
+    // is now a wrapper around `loadNativeObj` which acquires a lock which we
+    // already have here.
+    HINSTANCE instance;
+    const char* result = addDLL_PEi386(dll, &instance);
 
     stgFree(image);
 
@@ -1031,6 +1165,28 @@ bool checkAndLoadImportLibrary( pathchar* arch_name, char* member_name, FILE* f 
     }
 
     stgFree(dll);
+
+    // See Note [Windows API Set]
+    // We must immediately tie the symbol to the shared library.  The easiest
+    // way is to load the symbol immediately. We already have all the
+    // information so might as well
+    SymbolAddr* sym = lookupSymbolInDLL_PEi386 (symbol, instance, dll, NULL);
+
+    // Could be an import descriptor etc, skip if no symbol.
+    if (!sym)
+      return true;
+
+    // The symbol must have been found, and we can add it to the RTS symbol table
+    IF_DEBUG(linker, debugBelch("checkAndLoadImportLibrary: resolved symbol %s to %p\n", symbol, sym));
+    // Because the symbol has been loaded before we actually need it, if a
+    // stronger reference wants to add a duplicate we should discard this
+    // one to preserve link order.
+    SymType symType = SYM_TYPE_DUP_DISCARD | SYM_TYPE_HIDDEN;
+    symType |= hdr.Type == IMPORT_OBJECT_CODE ? SYM_TYPE_CODE : SYM_TYPE_DATA;
+
+    if (!ghciInsertSymbolTable(dll, symhash, symbol, sym, false, symType, NULL))
+      return false;
+
     return true;
 }
 
@@ -1141,47 +1297,57 @@ SymbolAddr*
 lookupSymbolInDLLs ( const SymbolName* lbl, ObjectCode *dependent )
 {
     OpenedDLL* o_dll;
+    SymbolAddr* res;
+
+    for (o_dll = opened_dlls; o_dll != NULL; o_dll = o_dll->next)
+        if ((res = lookupSymbolInDLL_PEi386(lbl, o_dll->instance, o_dll->name, dependent)))
+            return res;
+    return NULL;
+}
+
+SymbolAddr*
+lookupSymbolInDLL_PEi386 ( const SymbolName* lbl, HINSTANCE instance, pathchar* dll_name STG_UNUSED, ObjectCode *dependent)
+{
     SymbolAddr* sym;
 
-    for (o_dll = opened_dlls; o_dll != NULL; o_dll = o_dll->next) {
-        /* debugBelch("look in %ls for %s\n", o_dll->name, lbl); */
+    /* debugBelch("look in %ls for %s\n", dll_name, lbl); */
 
-        sym = GetProcAddress(o_dll->instance, lbl+STRIP_LEADING_UNDERSCORE);
+    sym = GetProcAddress(instance, lbl+STRIP_LEADING_UNDERSCORE);
+    if (sym != NULL) {
+        /*debugBelch("found %s in %ls\n", lbl+STRIP_LEADING_UNDERSCORE,dll_name);*/
+        return sym;
+    }
+
+    // TODO: Drop this
+    /* Ticket #2283.
+       Long description: http://support.microsoft.com/kb/132044
+       tl;dr:
+         If C/C++ compiler sees __declspec(dllimport) ... foo ...
+         it generates call *__imp_foo, and __imp_foo here has exactly
+         the same semantics as in __imp_foo = GetProcAddress(..., "foo")
+     */
+    if (sym == NULL && strncmp (lbl, "__imp_", 6) == 0) {
+        sym = GetProcAddress(instance,
+                             lbl + 6 + STRIP_LEADING_UNDERSCORE);
         if (sym != NULL) {
-            /*debugBelch("found %s in %s\n", lbl+1,o_dll->name);*/
-            return sym;
-        }
-
-        // TODO: Drop this
-        /* Ticket #2283.
-           Long description: http://support.microsoft.com/kb/132044
-           tl;dr:
-             If C/C++ compiler sees __declspec(dllimport) ... foo ...
-             it generates call *__imp_foo, and __imp_foo here has exactly
-             the same semantics as in __imp_foo = GetProcAddress(..., "foo")
-         */
-        if (sym == NULL && strncmp (lbl, "__imp_", 6) == 0) {
-            sym = GetProcAddress(o_dll->instance,
-                                 lbl + 6 + STRIP_LEADING_UNDERSCORE);
-            if (sym != NULL) {
-                SymbolAddr** indirect = m32_alloc(dependent->rw_m32, sizeof(SymbolAddr*), 8);
-                if (indirect == NULL) {
-                    barf("lookupSymbolInDLLs: Failed to allocation indirection");
-                }
-                *indirect = sym;
-                IF_DEBUG(linker,
-                  debugBelch("warning: %s from %S is linked instead of %s\n",
-                             lbl+6+STRIP_LEADING_UNDERSCORE, o_dll->name, lbl));
-                return (void*) indirect;
-               }
-        }
-
-        sym = GetProcAddress(o_dll->instance, lbl);
-        if (sym != NULL) {
-            /*debugBelch("found %s in %s\n", lbl,o_dll->name);*/
-            return sym;
+            SymbolAddr** indirect = m32_alloc(dependent->rw_m32, sizeof(SymbolAddr*), 8);
+            if (indirect == NULL) {
+                barf("lookupSymbolInDLLs: Failed to allocation indirection");
+            }
+            *indirect = sym;
+            IF_DEBUG(linker,
+              debugBelch("warning: %s from %S is linked instead of %s\n",
+                         lbl+6+STRIP_LEADING_UNDERSCORE, dll_name, lbl));
+            return (void*) indirect;
            }
     }
+
+    sym = GetProcAddress(instance, lbl);
+    if (sym != NULL) {
+        /*debugBelch("found %s in %s\n", lbl,dll_name);*/
+        return sym;
+       }
+
     return NULL;
 }
 
@@ -1656,7 +1822,7 @@ ocGetNames_PEi386 ( ObjectCode* oc )
       }
 
       addSection(section, kind, SECTION_NOMEM, start, sz, 0, 0, 0);
-      addProddableBlock(oc, oc->sections[i].start, sz);
+      addProddableBlock(&oc->proddables, oc->sections[i].start, sz);
    }
 
    /* Copy exported symbols into the ObjectCode. */
@@ -1688,7 +1854,7 @@ ocGetNames_PEi386 ( ObjectCode* oc )
                   SECTIONKIND_RWDATA, SECTION_MALLOC,
                   bss, globalBssSize, 0, 0, 0);
        IF_DEBUG(linker_verbose, debugBelch("bss @ %p %" FMT_Word "\n", bss, globalBssSize));
-       addProddableBlock(oc, bss, globalBssSize);
+       addProddableBlock(&oc->proddables, bss, globalBssSize);
    } else {
        addSection(&oc->sections[oc->n_sections-1],
                   SECTIONKIND_OTHER, SECTION_NOMEM, NULL, 0, 0, 0, 0);
@@ -1782,6 +1948,27 @@ ocGetNames_PEi386 ( ObjectCode* oc )
           }
           if(NULL != targetSection)
               addr = (SymbolAddr*) ((size_t) targetSection->start + getSymValue(info, targetSym));
+          else
+            {
+                // Do the symbol lookup based on name, this follows Microsoft's weak external's
+                // format 3 specifications.  Example header generated:
+                // api-ms-win-crt-stdio-l1-1-0.dll:     file format pe-x86-64
+                //
+                // SYMBOL TABLE:
+                // [  0](sec -1)(fl 0x00)(ty    0)(scl   3) (nx 0) 0x0000000000000000 @comp.id
+                // [  1](sec -1)(fl 0x00)(ty    0)(scl   3) (nx 0) 0x0000000000000000 @feat.00
+                // [  2](sec  0)(fl 0x00)(ty    0)(scl   2) (nx 0) 0x0000000000000000 _write
+                // [  3](sec  0)(fl 0x00)(ty    0)(scl 105) (nx 1) 0x0000000000000000 write
+                // AUX lnno 3 size 0x0 tagndx 2
+                //
+                // https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#auxiliary-format-3-weak-externals
+                SymbolName *target_sname = get_sym_name (getSymShortName (info, targetSym), oc);
+                if (target_sname)
+                  addr = lookupSymbol_PEi386 (target_sname, oc, &type);
+
+                IF_DEBUG(linker, debugBelch("weak external symbol @ %s => %s resolved to %p\n", \
+                                            sname, target_sname, addr));
+            }
       }
       else if (  secNumber == IMAGE_SYM_UNDEFINED && symValue > 0) {
          /* This symbol isn't in any section at all, ie, global bss.
@@ -1865,6 +2052,7 @@ ocGetNames_PEi386 ( ObjectCode* oc )
           if (result != NULL || dllInstance == 0) {
               errorBelch("Could not load `%s'. Reason: %s\n",
                          (char*)dllName, result);
+              stgFree((void*)result);
               return false;
           }
 
@@ -1894,6 +2082,9 @@ ocGetNames_PEi386 ( ObjectCode* oc )
           sname[size-start]='\0';
           stgFree(tmp);
           sname = strdup (sname);
+          if(secNumber == IMAGE_SYM_UNDEFINED)
+            type |= SYM_TYPE_HIDDEN;
+
           if (!ghciInsertSymbolTable(oc->fileName, symhash, sname,
                                      addr, false, type, oc))
                return false;
@@ -1908,6 +2099,8 @@ ocGetNames_PEi386 ( ObjectCode* oc )
          && (!section || (section && section->kind != SECTIONKIND_IMPORT))) {
          /* debugBelch("addSymbol %p `%s' Weak:%lld \n", addr, sname, isWeak); */
          sname = strdup (sname);
+         if(secNumber == IMAGE_SYM_UNDEFINED)
+           type |= SYM_TYPE_HIDDEN;
          IF_DEBUG(linker_verbose, debugBelch("addSymbol %p `%s'\n", addr, sname));
          ASSERT(i < (uint32_t)oc->n_symbols);
          oc->symbols[i].name = sname;
@@ -1939,7 +2132,7 @@ static size_t
 makeSymbolExtra_PEi386( ObjectCode* oc, uint64_t index STG_UNUSED, size_t s, char* symbol STG_UNUSED, SymType type )
 {
     SymbolExtra *extra;
-    switch(type & ~SYM_TYPE_DUP_DISCARD) {
+    switch(type & ~(SYM_TYPE_DUP_DISCARD | SYM_TYPE_HIDDEN)) {
         case SYM_TYPE_CODE: {
             // jmp *-14(%rip)
             extra = m32_alloc(oc->rx_m32, sizeof(SymbolExtra), 8);
@@ -2059,7 +2252,7 @@ ocResolve_PEi386 ( ObjectCode* oc )
          IF_DEBUG(linker_verbose, debugBelch("S=%zx\n", S));
 
          /* All supported relocations write at least 4 bytes */
-         checkProddableBlock(oc, pP, 4);
+         checkProddableBlock(&oc->proddables, pP, 4);
          switch (reloc->Type) {
 #if defined(i386_HOST_ARCH)
             case IMAGE_REL_I386_DIR32:
@@ -2098,7 +2291,7 @@ ocResolve_PEi386 ( ObjectCode* oc )
             case 1: /* R_X86_64_64 (ELF constant 1) - IMAGE_REL_AMD64_ADDR64 (PE constant 1) */
                {
                    uint64_t A;
-                   checkProddableBlock(oc, pP, 8);
+                   checkProddableBlock(&oc->proddables, pP, 8);
                    A = *(uint64_t*)pP;
                    *(uint64_t *)pP = S + A;
                    break;
@@ -2133,6 +2326,15 @@ ocResolve_PEi386 ( ObjectCode* oc )
                        }
                    }
                    *(uint32_t *)pP = (uint32_t)v;
+                   break;
+               }
+            case 14: /* R_X86_64_PC64 (ELF constant 24) - IMAGE_REL_AMD64_SREL32 (PE constant 14) */
+               {
+                   /* mingw will emit this for a pc-rel 64 relocation */
+                   uint64_t A;
+                   checkProddableBlock(&oc->proddables, pP, 8);
+                   A = *(uint64_t*)pP;
+                   *(uint64_t *)pP = S + A - (intptr_t)pP;
                    break;
                }
             case 4: /* R_X86_64_PC32 (ELF constant 2) - IMAGE_REL_AMD64_REL32 (PE constant 4) */

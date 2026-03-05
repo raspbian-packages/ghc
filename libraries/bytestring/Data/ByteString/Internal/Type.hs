@@ -1,12 +1,14 @@
-{-# LANGUAGE CPP, ForeignFunctionInterface, BangPatterns #-}
-{-# LANGUAGE UnliftedFFITypes, MagicHash,
-            UnboxedTuples #-}
-{-# LANGUAGE TupleSections #-}
-{-# LANGUAGE TypeFamilies #-}
-{-# LANGUAGE PatternSynonyms, ViewPatterns #-}
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE Unsafe #-}
-{-# LANGUAGE TemplateHaskellQuotes #-}
+
 {-# OPTIONS_HADDOCK not-home #-}
+
+{-# LANGUAGE TemplateHaskellQuotes #-}
+{-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE UnliftedFFITypes #-}
+{-# LANGUAGE ViewPatterns #-}
+
+#include "bytestring-cpp-macros.h"
 
 -- |
 -- Module      : Data.ByteString.Internal.Type
@@ -78,7 +80,10 @@ module Data.ByteString.Internal.Type (
         memcpyFp,
         deferForeignPtrAvailability,
         unsafeDupablePerformIO,
+        SizeOverflowException,
+        overflowError,
         checkedAdd,
+        checkedMultiply,
 
         -- * Standard C Functions
         c_strlen,
@@ -95,7 +100,21 @@ module Data.ByteString.Internal.Type (
         c_maximum,
         c_minimum,
         c_count,
+        c_count_ba,
+        c_elem_index,
         c_sort,
+        c_int_dec,
+        c_int_dec_padded9,
+        c_uint_dec,
+        c_uint_hex,
+        c_long_long_int_dec,
+        c_long_long_int_dec_padded18,
+        c_long_long_uint_dec,
+        c_long_long_uint_hex,
+        cIsValidUtf8BA,
+        cIsValidUtf8BASafe,
+        cIsValidUtf8,
+        cIsValidUtf8Safe,
 
         -- * Chars
         w2c, c2w, isSpaceWord8, isSpaceChar8,
@@ -112,91 +131,82 @@ import Prelude hiding (concat, null)
 import qualified Data.List as List
 
 import Foreign.ForeignPtr       (ForeignPtr, withForeignPtr)
-import Foreign.Ptr              (Ptr, FunPtr, plusPtr)
+import Foreign.Ptr
 import Foreign.Storable         (Storable(..))
-import Foreign.C.Types          (CInt(..), CSize(..))
+import Foreign.C.Types
 import Foreign.C.String         (CString)
 import Foreign.Marshal.Utils
+import Foreign.Marshal.Alloc    (finalizerFree)
 
-#if MIN_VERSION_base(4,13,0)
-import Data.Semigroup           (Semigroup (sconcat, stimes))
-#else
-import Data.Semigroup           (Semigroup ((<>), sconcat, stimes))
+#if PURE_HASKELL
+import qualified Data.ByteString.Internal.Pure as Pure
+import Data.Bits                (toIntegralSized, Bits)
+import Data.Maybe               (fromMaybe)
+import Control.Monad            ((<$!>))
 #endif
+
+import Data.Semigroup           (Semigroup (..))
 import Data.List.NonEmpty       (NonEmpty ((:|)))
 
 import Control.DeepSeq          (NFData(rnf))
 
 import Data.String              (IsString(..))
 
-import Control.Exception        (assert)
+import Control.Exception        (assert, throw, Exception)
 
 import Data.Bits                ((.&.))
 import Data.Char                (ord)
 import Data.Word
 
-import Data.Data                (Data(..), mkNoRepType)
+import Data.Data                (Data(..), mkConstr, mkNoRepType, Constr, DataType, Fixity(Prefix), constrIndex)
 
-import GHC.Base                 (nullAddr#,realWorld#,unsafeChr)
-import GHC.Exts                 (IsList(..), Addr#, minusAddr#)
-import GHC.CString              (unpackCString#)
-import GHC.Magic                (runRW#, lazy)
+import GHC.Base                 (nullAddr#,realWorld#,unsafeChr,unpackCString#)
+import GHC.Exts                 (IsList(..), Addr#, minusAddr#, ByteArray#, runRW#, lazy)
+
+#if HS_timesInt2_PRIMOP_AVAILABLE
+import GHC.Exts                (timesInt2#)
+#else
+import GHC.Exts                ( timesWord2#
+                               , or#
+                               , uncheckedShiftRL#
+                               , int2Word#
+                               , word2Int#
+                               )
+import Data.Bits               (finiteBitSize)
+#endif
 
 import GHC.IO                   (IO(IO))
 import GHC.ForeignPtr           (ForeignPtr(ForeignPtr)
-#if __GLASGOW_HASKELL__ < 900
+#if !HS_cstringLength_AND_FinalPtr_AVAILABLE
                                 , newForeignPtr_
 #endif
                                 , mallocPlainForeignPtrBytes)
 
-#if MIN_VERSION_base(4,10,0)
 import GHC.ForeignPtr           (plusForeignPtr)
-#else
-import GHC.Prim                 (plusAddr#)
-#endif
 
-#if __GLASGOW_HASKELL__ >= 811
-import GHC.CString              (cstringLength#)
+#if HS_cstringLength_AND_FinalPtr_AVAILABLE
+import GHC.Exts                 (cstringLength#)
 import GHC.ForeignPtr           (ForeignPtrContents(FinalPtr))
 #else
 import GHC.Ptr                  (Ptr(..))
 #endif
 
-import GHC.Types                (Int (..))
+import GHC.Int                  (Int (..))
 
-#if MIN_VERSION_base(4,15,0)
+#if HS_unsafeWithForeignPtr_AVAILABLE
 import GHC.ForeignPtr           (unsafeWithForeignPtr)
 #endif
 
 import qualified Language.Haskell.TH.Lib as TH
 import qualified Language.Haskell.TH.Syntax as TH
 
-#if !MIN_VERSION_base(4,15,0)
+#if !HS_unsafeWithForeignPtr_AVAILABLE
 unsafeWithForeignPtr :: ForeignPtr a -> (Ptr a -> IO b) -> IO b
 unsafeWithForeignPtr = withForeignPtr
 #endif
 
 -- CFILES stuff is Hugs only
 {-# CFILES cbits/fpstring.c #-}
-
-#if !MIN_VERSION_base(4,10,0)
--- |Advances the given address by the given offset in bytes.
---
--- The new 'ForeignPtr' shares the finalizer of the original,
--- equivalent from a finalization standpoint to just creating another
--- reference to the original. That is, the finalizer will not be
--- called before the new 'ForeignPtr' is unreachable, nor will it be
--- called an additional time due to this call, and the finalizer will
--- be called with the same address that it would have had this call
--- not happened, *not* the new address.
-plusForeignPtr :: ForeignPtr a -> Int -> ForeignPtr b
-plusForeignPtr (ForeignPtr addr guts) (I# offset) = ForeignPtr (plusAddr# addr offset) guts
-{-# INLINE [0] plusForeignPtr #-}
-{-# RULES
-"ByteString plusForeignPtr/0" forall fp .
-   plusForeignPtr fp 0 = fp
- #-}
-#endif
 
 minusForeignPtr :: ForeignPtr a -> ForeignPtr b -> Int
 minusForeignPtr (ForeignPtr addr1 _) (ForeignPtr addr2 _)
@@ -295,9 +305,7 @@ type StrictByteString = ByteString
 pattern PS :: ForeignPtr Word8 -> Int -> Int -> ByteString
 pattern PS fp zero len <- BS fp ((0,) -> (zero, len)) where
   PS fp o len = BS (plusForeignPtr fp o) len
-#if __GLASGOW_HASKELL__ >= 802
 {-# COMPLETE PS #-}
-#endif
 
 instance Eq  ByteString where
     (==)    = eq
@@ -308,7 +316,8 @@ instance Ord ByteString where
 instance Semigroup ByteString where
     (<>)    = append
     sconcat (b:|bs) = concat (b:bs)
-    stimes  = times
+    {-# INLINE stimes #-}
+    stimes  = stimesPolymorphic
 
 instance Monoid ByteString where
     mempty  = empty
@@ -338,13 +347,22 @@ instance IsString ByteString where
 
 instance Data ByteString where
   gfoldl f z txt = z packBytes `f` unpackBytes txt
-  toConstr _     = error "Data.ByteString.ByteString.toConstr"
-  gunfold _ _    = error "Data.ByteString.ByteString.gunfold"
-  dataTypeOf _   = mkNoRepType "Data.ByteString.ByteString"
+  toConstr _     = packConstr
+  gunfold k z c = case constrIndex c of
+    1 -> k (z packBytes)
+    _ -> error "gunfold: unexpected constructor of strict ByteString"
+  dataTypeOf _   = byteStringDataType
+
+packConstr :: Constr
+packConstr = mkConstr byteStringDataType "pack" [] Prefix
+
+byteStringDataType :: DataType
+byteStringDataType = mkNoRepType "Data.ByteString.ByteString"
 
 -- | @since 0.11.2.0
 instance TH.Lift ByteString where
 #if MIN_VERSION_template_haskell(2,16,0)
+-- template-haskell-2.16 first ships with ghc-8.10
   lift (BS ptr len) = [| unsafePackLenLiteral |]
     `TH.appE` TH.litE (TH.integerL (fromIntegral len))
     `TH.appE` TH.litE (TH.BytesPrimL $ TH.Bytes ptr 0 (fromIntegral len))
@@ -355,8 +373,10 @@ instance TH.Lift ByteString where
 #endif
 
 #if MIN_VERSION_template_haskell(2,17,0)
+-- template-haskell-2.17 first ships with ghc-9.0
   liftTyped = TH.unsafeCodeCoerce . TH.lift
 #elif MIN_VERSION_template_haskell(2,16,0)
+-- template-haskell-2.16 first ships with ghc-8.10
   liftTyped = TH.unsafeTExpCoerce . TH.lift
 #endif
 
@@ -432,7 +452,7 @@ unsafePackLenChars len cs0 =
 --
 unsafePackAddress :: Addr# -> IO ByteString
 unsafePackAddress addr# = do
-#if __GLASGOW_HASKELL__ >= 811
+#if HS_cstringLength_AND_FinalPtr_AVAILABLE
     unsafePackLenAddress (I# (cstringLength# addr#)) addr#
 #else
     l <- c_strlen (Ptr addr#)
@@ -448,7 +468,7 @@ unsafePackAddress addr# = do
 -- @since 0.11.2.0
 unsafePackLenAddress :: Int -> Addr# -> IO ByteString
 unsafePackLenAddress len addr# = do
-#if __GLASGOW_HASKELL__ >= 811
+#if HS_cstringLength_AND_FinalPtr_AVAILABLE
     return (BS (ForeignPtr addr# FinalPtr) len)
 #else
     p <- newForeignPtr_ (Ptr addr#)
@@ -465,7 +485,7 @@ unsafePackLenAddress len addr# = do
 -- @since 0.11.1.0
 unsafePackLiteral :: Addr# -> ByteString
 unsafePackLiteral addr# =
-#if __GLASGOW_HASKELL__ >= 811
+#if HS_cstringLength_AND_FinalPtr_AVAILABLE
   unsafePackLenLiteral (I# (cstringLength# addr#)) addr#
 #else
   let len = accursedUnutterablePerformIO (c_strlen (Ptr addr#))
@@ -482,7 +502,7 @@ unsafePackLiteral addr# =
 -- @since 0.11.2.0
 unsafePackLenLiteral :: Int -> Addr# -> ByteString
 unsafePackLenLiteral len addr# =
-#if __GLASGOW_HASKELL__ >= 811
+#if HS_cstringLength_AND_FinalPtr_AVAILABLE
   BS (ForeignPtr addr# FinalPtr) len
 #else
   -- newForeignPtr_ allocates a MutVar# internally. If that MutVar#
@@ -575,7 +595,7 @@ unpackAppendCharsStrict (BS fp len) xs =
 
 -- | The 0 pointer. Used to indicate the empty Bytestring.
 nullForeignPtr :: ForeignPtr Word8
-#if __GLASGOW_HASKELL__ >= 811
+#if HS_cstringLength_AND_FinalPtr_AVAILABLE
 nullForeignPtr = ForeignPtr nullAddr# FinalPtr
 #else
 nullForeignPtr = ForeignPtr nullAddr# (error "nullForeignPtr")
@@ -637,30 +657,30 @@ unsafeCreateFpUptoN' l f = unsafeDupablePerformIO (createFpUptoN' l f)
 
 -- | Create ByteString of size @l@ and use action @f@ to fill its contents.
 createFp :: Int -> (ForeignPtr Word8 -> IO ()) -> IO ByteString
-createFp l action = do
-    fp <- mallocByteString l
+createFp len action = assert (len >= 0) $ do
+    fp <- mallocByteString len
     action fp
-    mkDeferredByteString fp l
+    mkDeferredByteString fp len
 {-# INLINE createFp #-}
 
 -- | Given a maximum size @l@ and an action @f@ that fills the 'ByteString'
 -- starting at the given 'Ptr' and returns the actual utilized length,
 -- @`createFpUptoN'` l f@ returns the filled 'ByteString'.
 createFpUptoN :: Int -> (ForeignPtr Word8 -> IO Int) -> IO ByteString
-createFpUptoN l action = do
-    fp <- mallocByteString l
-    l' <- action fp
-    assert (l' <= l) $ mkDeferredByteString fp l'
+createFpUptoN maxLen action = assert (maxLen >= 0) $ do
+    fp <- mallocByteString maxLen
+    len <- action fp
+    assert (0 <= len && len <= maxLen) $ mkDeferredByteString fp len
 {-# INLINE createFpUptoN #-}
 
 -- | Like 'createFpUptoN', but also returns an additional value created by the
 -- action.
 createFpUptoN' :: Int -> (ForeignPtr Word8 -> IO (Int, a)) -> IO (ByteString, a)
-createFpUptoN' l action = do
-    fp <- mallocByteString l
-    (l', res) <- action fp
-    bs <- mkDeferredByteString fp l'
-    assert (l' <= l) $ pure (bs, res)
+createFpUptoN' maxLen action = assert (maxLen >= 0) $ do
+    fp <- mallocByteString maxLen
+    (len, res) <- action fp
+    bs <- mkDeferredByteString fp len
+    assert (0 <= len && len <= maxLen) $ pure (bs, res)
 {-# INLINE createFpUptoN' #-}
 
 -- | Given the maximum size needed and a function to make the contents
@@ -672,22 +692,26 @@ createFpUptoN' l action = do
 -- ByteString functions, using Haskell or C functions to fill the space.
 --
 createFpAndTrim :: Int -> (ForeignPtr Word8 -> IO Int) -> IO ByteString
-createFpAndTrim l action = do
-    fp <- mallocByteString l
-    l' <- action fp
-    if assert (0 <= l' && l' <= l) $ l' >= l
-        then mkDeferredByteString fp l
-        else createFp l' $ \dest -> memcpyFp dest fp l'
+createFpAndTrim maxLen action = assert (maxLen >= 0) $ do
+    fp <- mallocByteString maxLen
+    len <- action fp
+    if assert (0 <= len && len <= maxLen) $ len >= maxLen
+        then mkDeferredByteString fp maxLen
+        else createFp len $ \dest -> memcpyFp dest fp len
 {-# INLINE createFpAndTrim #-}
 
 createFpAndTrim' :: Int -> (ForeignPtr Word8 -> IO (Int, Int, a)) -> IO (ByteString, a)
-createFpAndTrim' l action = do
-    fp <- mallocByteString l
-    (off, l', res) <- action fp
-    bs <- if assert (0 <= l' && l' <= l) $ l' >= l
-        then mkDeferredByteString fp l -- entire buffer used => offset is zero
-        else createFp l' $ \dest ->
-               memcpyFp dest (fp `plusForeignPtr` off) l'
+createFpAndTrim' maxLen action = assert (maxLen >= 0) $ do
+    fp <- mallocByteString maxLen
+    (off, len, res) <- action fp
+    assert (
+      0 <= len && len <= maxLen && -- length OK
+      (len == 0 || (0 <= off && off <= maxLen - len)) -- offset OK
+      ) $ pure ()
+    bs <- if len >= maxLen
+        then mkDeferredByteString fp maxLen -- entire buffer used => offset is zero
+        else createFp len $ \dest ->
+               memcpyFp dest (fp `plusForeignPtr` off) len
     return (bs, res)
 {-# INLINE createFpAndTrim' #-}
 
@@ -791,7 +815,7 @@ append :: ByteString -> ByteString -> ByteString
 append (BS _   0)    b                  = b
 append a             (BS _   0)    = a
 append (BS fp1 len1) (BS fp2 len2) =
-    unsafeCreateFp (len1+len2) $ \destptr1 -> do
+    unsafeCreateFp (checkedAdd "append" len1 len2) $ \destptr1 -> do
       let destptr2 = destptr1 `plusForeignPtr` len1
       memcpyFp destptr1 fp1 len1
       memcpyFp destptr2 fp2 len2
@@ -847,37 +871,80 @@ concat = \bss0 -> goLen0 bss0 bss0
    concat [x] = x
  #-}
 
--- | /O(log n)/ Repeats the given ByteString n times.
-times :: Integral a => a -> ByteString -> ByteString
-times n (BS fp len)
-  | n < 0 = error "stimes: non-negative multiplier expected"
+-- | Repeats the given ByteString n times.
+-- Polymorphic wrapper to make sure any generated
+-- specializations are reasonably small.
+stimesPolymorphic :: Integral a => a -> ByteString -> ByteString
+{-# INLINABLE stimesPolymorphic #-}
+stimesPolymorphic nRaw !bs = case checkedIntegerToInt n of
+  Just nInt
+    | nInt >= 0  -> stimesNonNegativeInt nInt bs
+    | otherwise  -> stimesNegativeErr
+  Nothing
+    | n < 0  -> stimesNegativeErr
+    | BS _ 0 <- bs  -> empty
+    | otherwise     -> stimesOverflowErr
+  where  n = toInteger nRaw
+  -- By exclusively using n instead of nRaw, the semantics are kept simple
+  -- and the likelihood of potentially dangerous mistakes minimized.
+
+
+{-
+Note [Float error calls out of INLINABLE things]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+If a function is marked INLINE or INLINABLE, then when ghc inlines or
+specializes it, it duplicates the function body exactly as written.
+
+This feature is useful for systems of rewrite rules, but sometimes
+comes at a code-size cost.  One situation where this cost generally
+comes with no compensating up-side is when the function in question
+calls `error` or something similar.
+
+Such an `error` call is not meaningfully improved by the extra context
+inlining or specialization provides, and if inlining or specialization
+happens in a different module from where the function was originally
+defined, CSE will not be able to de-duplicate the error call floated
+out of the inlined RHS and the error call floated out of the original
+RHS.  See also https://gitlab.haskell.org/ghc/ghc/-/issues/23823
+
+To mitigate this, we manually float the error calls out of INLINABLE
+functions when it is possible to do so.
+-}
+
+stimesNegativeErr :: ByteString
+-- See Note [Float error calls out of INLINABLE things]
+stimesNegativeErr
+  = errorWithoutStackTrace "stimes @ByteString: non-negative multiplier expected"
+
+stimesOverflowErr :: ByteString
+-- See Note [Float error calls out of INLINABLE things]
+stimesOverflowErr = overflowError "stimes"
+
+-- | Repeats the given ByteString n times.
+stimesNonNegativeInt :: Int -> ByteString -> ByteString
+stimesNonNegativeInt n (BS fp len)
   | n == 0 = empty
   | n == 1 = BS fp len
   | len == 0 = empty
-  | len == 1 = unsafeCreateFp size $ \destfptr -> do
+  | len == 1 = unsafeCreateFp n $ \destfptr -> do
       byte <- peekFp fp
       unsafeWithForeignPtr destfptr $ \destptr ->
-        fillBytes destptr byte (fromIntegral n)
+        fillBytes destptr byte n
   | otherwise = unsafeCreateFp size $ \destptr -> do
       memcpyFp destptr fp len
       fillFrom destptr len
   where
-    size = len * fromIntegral n
+    size = checkedMultiply "stimes" n len
+    halfSize = (size - 1) `div` 2 -- subtraction and division won't overflow
 
     fillFrom :: ForeignPtr Word8 -> Int -> IO ()
     fillFrom destptr copied
-      | 2 * copied <= size = do
+      | copied <= halfSize = do
         memcpyFp (destptr `plusForeignPtr` copied) destptr copied
         fillFrom destptr (copied * 2)
       | otherwise = memcpyFp (destptr `plusForeignPtr` copied) destptr (size - copied)
 
--- | Add two non-negative numbers. Errors out on overflow.                                   ...
-checkedAdd :: String -> Int -> Int -> Int
-checkedAdd fun x y
-  | r >= 0    = r
-  | otherwise = overflowError fun
-  where r = x + y
-{-# INLINE checkedAdd #-}
 
 ------------------------------------------------------------------------
 
@@ -912,8 +979,66 @@ isSpaceChar8 :: Char -> Bool
 isSpaceChar8 = isSpaceWord8 . c2w
 {-# INLINE isSpaceChar8 #-}
 
+------------------------------------------------------------------------
+
+-- | The type of exception raised by 'overflowError'
+-- and on failure by overflow-checked arithmetic operations.
+newtype SizeOverflowException
+  = SizeOverflowException String
+
+instance Show SizeOverflowException where
+  show (SizeOverflowException err) = err
+
+instance Exception SizeOverflowException
+
+-- | Raises a 'SizeOverflowException',
+-- with a message using the given function name.
 overflowError :: String -> a
-overflowError fun = error $ "Data.ByteString." ++ fun ++ ": size overflow"
+overflowError fun = throw $ SizeOverflowException msg
+  where msg = "Data.ByteString." ++ fun ++ ": size overflow"
+
+-- | Add two non-negative numbers.
+-- Calls 'overflowError' on overflow.
+checkedAdd :: String -> Int -> Int -> Int
+{-# INLINE checkedAdd #-}
+checkedAdd fun x y
+  -- checking "r < 0" here matches the condition in mallocPlainForeignPtrBytes,
+  -- helping the compiler see the latter is redundant in some places
+  | r < 0     = overflowError fun
+  | otherwise = r
+  where r = assert (min x y >= 0) $ x + y
+
+-- | Multiplies two non-negative numbers.
+-- Calls 'overflowError' on overflow.
+checkedMultiply :: String -> Int -> Int -> Int
+{-# INLINE checkedMultiply #-}
+checkedMultiply fun !x@(I# x#) !y@(I# y#) = assert (min x y >= 0) $
+#if HS_timesInt2_PRIMOP_AVAILABLE
+  case timesInt2# x# y# of
+    (# 0#, _, result #) -> I# result
+    _ -> overflowError fun
+#else
+  case timesWord2# (int2Word# x#) (int2Word# y#) of
+    (# hi, lo #) -> case or# hi (uncheckedShiftRL# lo shiftAmt) of
+      0## -> I# (word2Int# lo)
+      _   -> overflowError fun
+  where !(I# shiftAmt) = finiteBitSize (0 :: Word) - 1
+#endif
+
+
+-- | Attempts to convert an 'Integer' value to an 'Int', returning
+-- 'Nothing' if doing so would result in an overflow.
+checkedIntegerToInt :: Integer -> Maybe Int
+{-# INLINE checkedIntegerToInt #-}
+-- We could use Data.Bits.toIntegralSized, but this hand-rolled
+-- version is currently a bit faster as of GHC 9.2.
+-- It's even faster to just match on the Integer constructors, but
+-- we'd still need a fallback implementation for integer-simple.
+checkedIntegerToInt x
+  | x == toInteger res = Just res
+  | otherwise = Nothing
+  where  res = fromInteger x :: Int
+
 
 ------------------------------------------------------------------------
 
@@ -954,23 +1079,41 @@ accursedUnutterablePerformIO (IO m) = case m realWorld# of (# _, r #) -> r
 -- Standard C functions
 --
 
+memchr :: Ptr Word8 -> Word8 -> CSize -> IO (Ptr Word8)
+memcmp :: Ptr Word8 -> Ptr Word8 -> Int -> IO CInt
+{-# DEPRECATED memset "Use Foreign.Marshal.Utils.fillBytes instead" #-}
+-- | deprecated since @bytestring-0.11.5.0@
+memset :: Ptr Word8 -> Word8 -> CSize -> IO (Ptr Word8)
+
+#if !PURE_HASKELL
+
 foreign import ccall unsafe "string.h strlen" c_strlen
     :: CString -> IO CSize
 
-foreign import ccall unsafe "static stdlib.h &free" c_free_finalizer
-    :: FunPtr (Ptr Word8 -> IO ())
-
 foreign import ccall unsafe "string.h memchr" c_memchr
     :: Ptr Word8 -> CInt -> CSize -> IO (Ptr Word8)
-
-memchr :: Ptr Word8 -> Word8 -> CSize -> IO (Ptr Word8)
 memchr p w sz = c_memchr p (fromIntegral w) sz
 
 foreign import ccall unsafe "string.h memcmp" c_memcmp
     :: Ptr Word8 -> Ptr Word8 -> CSize -> IO CInt
-
-memcmp :: Ptr Word8 -> Ptr Word8 -> Int -> IO CInt
 memcmp p q s = c_memcmp p q (fromIntegral s)
+
+foreign import ccall unsafe "string.h memset" c_memset
+    :: Ptr Word8 -> CInt -> CSize -> IO (Ptr Word8)
+memset p w sz = c_memset p (fromIntegral w) sz
+
+#else
+
+c_strlen :: CString -> IO CSize
+c_strlen p = checkedCast <$!> Pure.strlen (castPtr p)
+
+memchr p w len = Pure.memchr p w (checkedCast len)
+
+memcmp p q s = checkedCast <$!> Pure.memcmp p q s
+
+memset p w len = p <$ fillBytes p w (checkedCast len)
+
+#endif
 
 {-# DEPRECATED memcpy "Use Foreign.Marshal.Utils.copyBytes instead" #-}
 -- | deprecated since @bytestring-0.11.5.0@
@@ -981,18 +1124,17 @@ memcpyFp :: ForeignPtr Word8 -> ForeignPtr Word8 -> Int -> IO ()
 memcpyFp fp fq s = unsafeWithForeignPtr fp $ \p ->
                      unsafeWithForeignPtr fq $ \q -> copyBytes p q s
 
-foreign import ccall unsafe "string.h memset" c_memset
-    :: Ptr Word8 -> CInt -> CSize -> IO (Ptr Word8)
+c_free_finalizer :: FunPtr (Ptr Word8 -> IO ())
+c_free_finalizer = finalizerFree
 
-{-# DEPRECATED memset "Use Foreign.Marshal.Utils.fillBytes instead" #-}
--- | deprecated since @bytestring-0.11.5.0@
-memset :: Ptr Word8 -> Word8 -> CSize -> IO (Ptr Word8)
-memset p w sz = c_memset p (fromIntegral w) sz
+
 
 -- ---------------------------------------------------------------------
 --
 -- Uses our C code
 --
+
+#if !PURE_HASKELL
 
 foreign import ccall unsafe "static fpstring.h fps_reverse" c_reverse
     :: Ptr Word8 -> Ptr Word8 -> CSize -> IO ()
@@ -1009,5 +1151,148 @@ foreign import ccall unsafe "static fpstring.h fps_minimum" c_minimum
 foreign import ccall unsafe "static fpstring.h fps_count" c_count
     :: Ptr Word8 -> CSize -> Word8 -> IO CSize
 
+-- fps_count works with both pointers and ByteArray#
+foreign import ccall unsafe "static fpstring.h fps_count" c_count_ba
+    :: ByteArray# -> CSize -> Word8 -> IO CSize
+
 foreign import ccall unsafe "static fpstring.h fps_sort" c_sort
     :: Ptr Word8 -> CSize -> IO ()
+
+foreign import ccall unsafe "static sbs_elem_index"
+    c_elem_index :: ByteArray# -> Word8 -> CSize -> IO CPtrdiff
+
+
+
+foreign import ccall unsafe "static _hs_bytestring_uint_dec" c_uint_dec
+    :: CUInt -> Ptr Word8 -> IO (Ptr Word8)
+
+foreign import ccall unsafe "static _hs_bytestring_long_long_uint_dec" c_long_long_uint_dec
+    :: CULLong -> Ptr Word8 -> IO (Ptr Word8)
+
+foreign import ccall unsafe "static _hs_bytestring_int_dec" c_int_dec
+    :: CInt -> Ptr Word8 -> IO (Ptr Word8)
+
+foreign import ccall unsafe "static _hs_bytestring_long_long_int_dec" c_long_long_int_dec
+    :: CLLong -> Ptr Word8 -> IO (Ptr Word8)
+
+foreign import ccall unsafe "static _hs_bytestring_uint_hex" c_uint_hex
+    :: CUInt -> Ptr Word8 -> IO (Ptr Word8)
+
+foreign import ccall unsafe "static _hs_bytestring_long_long_uint_hex" c_long_long_uint_hex
+    :: CULLong -> Ptr Word8 -> IO (Ptr Word8)
+
+foreign import ccall unsafe "static _hs_bytestring_int_dec_padded9"
+    c_int_dec_padded9 :: CInt -> Ptr Word8 -> IO ()
+
+foreign import ccall unsafe "static _hs_bytestring_long_long_int_dec_padded18"
+    c_long_long_int_dec_padded18 :: CLLong -> Ptr Word8 -> IO ()
+
+-- We import bytestring_is_valid_utf8 both unsafe and safe. For small inputs
+-- we can use the unsafe version to get a bit more performance, but for large
+-- inputs the safe version should be used to avoid GC synchronization pauses
+-- in multithreaded contexts.
+
+foreign import ccall unsafe "bytestring_is_valid_utf8" cIsValidUtf8BA
+  :: ByteArray# -> CSize -> IO CInt
+
+foreign import ccall safe "bytestring_is_valid_utf8" cIsValidUtf8BASafe
+  :: ByteArray# -> CSize -> IO CInt
+
+foreign import ccall unsafe "bytestring_is_valid_utf8" cIsValidUtf8
+  :: Ptr Word8 -> CSize -> IO CInt
+
+foreign import ccall safe "bytestring_is_valid_utf8" cIsValidUtf8Safe
+  :: Ptr Word8 -> CSize -> IO CInt
+
+
+#else
+
+----------------------------------------------------------------
+-- Haskell version of functions in fpstring.c
+----------------------------------------------------------------
+
+-- | Reverse n-bytes from the second pointer into the first
+c_reverse :: Ptr Word8 -> Ptr Word8 -> CSize -> IO ()
+c_reverse p1 p2 sz = Pure.reverseBytes p1 p2 (checkedCast sz)
+
+-- | find maximum char in a packed string
+c_maximum :: Ptr Word8 -> CSize -> IO Word8
+c_maximum ptr sz = Pure.findMaximum ptr (checkedCast sz)
+
+-- | find minimum char in a packed string
+c_minimum :: Ptr Word8 -> CSize -> IO Word8
+c_minimum ptr sz = Pure.findMinimum ptr (checkedCast sz)
+
+-- | count the number of occurrences of a char in a string
+c_count :: Ptr Word8 -> CSize -> Word8 -> IO CSize
+c_count ptr sz c = checkedCast <$!> Pure.countOcc ptr (checkedCast sz) c
+
+-- | count the number of occurrences of a char in a string
+c_count_ba :: ByteArray# -> Int -> Word8 -> IO CSize
+c_count_ba ba o c = checkedCast <$!> Pure.countOccBA ba o c
+
+-- | duplicate a string, interspersing the character through the elements of the
+-- duplicated string
+c_intersperse :: Ptr Word8 -> Ptr Word8 -> CSize -> Word8 -> IO ()
+c_intersperse p1 p2 sz e = Pure.intersperse p1 p2 (checkedCast sz) e
+
+-- | Quick sort bytes
+c_sort :: Ptr Word8 -> CSize -> IO ()
+c_sort ptr sz = Pure.quickSort ptr (checkedCast sz)
+
+c_elem_index :: ByteArray# -> Word8 -> CSize -> IO CPtrdiff
+c_elem_index ba e sz = checkedCast <$!> Pure.elemIndex ba e (checkedCast sz)
+
+cIsValidUtf8BA :: ByteArray# -> CSize -> IO CInt
+cIsValidUtf8BA ba sz = bool_to_cint <$> Pure.isValidUtf8BA ba (checkedCast sz)
+
+cIsValidUtf8 :: Ptr Word8 -> CSize -> IO CInt
+cIsValidUtf8 ptr sz = bool_to_cint <$> Pure.isValidUtf8 ptr (checkedCast sz)
+
+-- Pure module is compiled with `-fno-omit-yields` so it's always safe (it won't
+-- block on large inputs)
+
+cIsValidUtf8BASafe :: ByteArray# -> CSize -> IO CInt
+cIsValidUtf8BASafe = cIsValidUtf8BA
+
+cIsValidUtf8Safe :: Ptr Word8 -> CSize -> IO CInt
+cIsValidUtf8Safe = cIsValidUtf8
+
+bool_to_cint :: Bool -> CInt
+bool_to_cint True = 1
+bool_to_cint False = 0
+
+checkedCast :: (Bits a, Bits b, Integral a, Integral b) => a -> b
+checkedCast x =
+  fromMaybe (errorWithoutStackTrace "checkedCast: overflow")
+            (toIntegralSized x)
+
+----------------------------------------------------------------
+-- Haskell version of functions in itoa.c
+----------------------------------------------------------------
+
+c_int_dec :: CInt -> Ptr Word8 -> IO (Ptr Word8)
+c_int_dec = Pure.encodeSignedDec
+
+c_long_long_int_dec :: CLLong -> Ptr Word8 -> IO (Ptr Word8)
+c_long_long_int_dec = Pure.encodeSignedDec
+
+c_uint_dec :: CUInt -> Ptr Word8 -> IO (Ptr Word8)
+c_uint_dec = Pure.encodeUnsignedDec
+
+c_long_long_uint_dec :: CULLong -> Ptr Word8 -> IO (Ptr Word8)
+c_long_long_uint_dec = Pure.encodeUnsignedDec
+
+c_uint_hex :: CUInt -> Ptr Word8 -> IO (Ptr Word8)
+c_uint_hex = Pure.encodeUnsignedHex
+
+c_long_long_uint_hex :: CULLong -> Ptr Word8 -> IO (Ptr Word8)
+c_long_long_uint_hex = Pure.encodeUnsignedHex
+
+c_int_dec_padded9 :: CInt -> Ptr Word8 -> IO ()
+c_int_dec_padded9 = Pure.encodeUnsignedDecPadded 9
+
+c_long_long_int_dec_padded18 :: CLLong -> Ptr Word8 -> IO ()
+c_long_long_int_dec_padded18 = Pure.encodeUnsignedDecPadded 18
+
+#endif

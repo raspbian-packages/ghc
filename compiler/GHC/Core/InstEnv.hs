@@ -7,18 +7,19 @@
 The bits common to GHC.Tc.TyCl.Instance and GHC.Tc.Deriv.
 -}
 
-{-# LANGUAGE DeriveDataTypeable #-}
+{-# LANGUAGE DeriveDataTypeable, DeriveGeneric #-}
 
 module GHC.Core.InstEnv (
         DFunId, InstMatch, ClsInstLookupResult,
-        PotentialUnifiers(..), getPotentialUnifiers, nullUnifiers,
+        Canonical, PotentialUnifiers(..), getPotentialUnifiers, nullUnifiers,
         OverlapFlag(..), OverlapMode(..), setOverlapModeMaybe,
-        ClsInst(..), DFunInstType, pprInstance, pprInstanceHdr, pprInstances,
-        instanceHead, instanceSig, mkLocalInstance, mkImportedInstance,
+        ClsInst(..), DFunInstType, pprInstance, pprInstanceHdr, pprDFunId, pprInstances,
+        instanceWarning, instanceHead, instanceSig, mkLocalClsInst, mkImportedClsInst,
         instanceDFunId, updateClsInstDFuns, updateClsInstDFun,
         fuzzyClsInstCmp, orphNamesOfClsInst,
 
         InstEnvs(..), VisibleOrphanModules, InstEnv,
+        LookupInstanceErrReason (..),
         mkInstEnv, emptyInstEnv, unionInstEnv, extendInstEnv,
         filterInstEnv, deleteFromInstEnv, deleteDFunFromInstEnv,
         anyInstEnv,
@@ -40,8 +41,11 @@ import GHC.Core ( IsOrphan(..), isOrphan, chooseOrphanAnchor )
 import GHC.Core.RoughMap
 import GHC.Core.Class
 import GHC.Core.Unify
+import GHC.Core.FVs( orphNamesOfTypes, orphNamesOfType )
+import GHC.Hs.Extension
 
 import GHC.Unit.Module.Env
+import GHC.Unit.Module.Warnings
 import GHC.Unit.Types
 import GHC.Types.Var
 import GHC.Types.Unique.DSet
@@ -50,14 +54,14 @@ import GHC.Types.Name
 import GHC.Types.Name.Set
 import GHC.Types.Basic
 import GHC.Types.Id
+import GHC.Generics (Generic)
 import Data.Data        ( Data )
 import Data.List.NonEmpty ( NonEmpty (..), nonEmpty )
 import qualified Data.List.NonEmpty as NE
 import Data.Maybe       ( isJust )
 
-import GHC.Utils.Outputable
+import GHC.Utils.Outputable hiding ((<>))
 import GHC.Utils.Panic
-import GHC.Utils.Panic.Plain
 import Data.Semigroup
 
 {-
@@ -105,6 +109,10 @@ data ClsInst
              , is_flag :: OverlapFlag   -- See detailed comments with
                                         -- the decl of BasicTypes.OverlapFlag
              , is_orphan :: IsOrphan
+             , is_warn :: Maybe (WarningTxt GhcRn)
+                -- Warning emitted when the instance is used
+                -- See Note [Implementation of deprecated instances]
+                -- in GHC.Tc.Solver.Dict
     }
   deriving Data
 
@@ -119,10 +127,11 @@ fuzzyClsInstCmp x y =
     cmp (RM_KnownTc _, RM_WildCard)   = GT
     cmp (RM_KnownTc x, RM_KnownTc y) = stableNameCmp x y
 
-isOverlappable, isOverlapping, isIncoherent :: ClsInst -> Bool
+isOverlappable, isOverlapping, isIncoherent, isNonCanonical :: ClsInst -> Bool
 isOverlappable i = hasOverlappableFlag (overlapMode (is_flag i))
 isOverlapping  i = hasOverlappingFlag  (overlapMode (is_flag i))
 isIncoherent   i = hasIncoherentFlag   (overlapMode (is_flag i))
+isNonCanonical i = hasNonCanonicalFlag (overlapMode (is_flag i))
 
 {-
 Note [ClsInst laziness and the rough-match fields]
@@ -214,6 +223,16 @@ instance NamedThing ClsInst where
 instance Outputable ClsInst where
    ppr = pprInstance
 
+pprDFunId :: DFunId -> SDoc
+-- Prints the analogous information to `pprInstance`
+-- but with just the DFunId
+pprDFunId dfun
+  = hang dfun_header
+       2 (vcat [ text "--" <+> pprDefinedAt (getName dfun)
+               , whenPprDebug (ppr dfun) ])
+  where
+    dfun_header = ppr_overlap_dfun_hdr empty dfun
+
 pprInstance :: ClsInst -> SDoc
 -- Prints the ClsInst as an instance declaration
 pprInstance ispec
@@ -225,10 +244,17 @@ pprInstance ispec
 pprInstanceHdr :: ClsInst -> SDoc
 -- Prints the ClsInst as an instance declaration
 pprInstanceHdr (ClsInst { is_flag = flag, is_dfun = dfun })
-  = text "instance" <+> ppr flag <+> pprSigmaType (idType dfun)
+  = ppr_overlap_dfun_hdr (ppr flag) dfun
+
+ppr_overlap_dfun_hdr :: SDoc -> DFunId -> SDoc
+ppr_overlap_dfun_hdr flag_sdoc dfun
+  = text "instance" <+> flag_sdoc <+> pprSigmaType (idType dfun)
 
 pprInstances :: [ClsInst] -> SDoc
 pprInstances ispecs = vcat (map pprInstance ispecs)
+
+instanceWarning :: ClsInst -> Maybe (WarningTxt GhcRn)
+instanceWarning = is_warn
 
 instanceHead :: ClsInst -> ([TyVar], Class, [Type])
 -- Returns the head, using the fresh tyvars from the ClsInst
@@ -255,19 +281,20 @@ instanceSig :: ClsInst -> ([TyVar], [Type], Class, [Type])
 -- Decomposes the DFunId
 instanceSig ispec = tcSplitDFunTy (idType (is_dfun ispec))
 
-mkLocalInstance :: DFunId -> OverlapFlag
-                -> [TyVar] -> Class -> [Type]
-                -> ClsInst
+mkLocalClsInst :: DFunId -> OverlapFlag
+               -> [TyVar] -> Class -> [Type]
+               -> Maybe (WarningTxt GhcRn)
+               -> ClsInst
 -- Used for local instances, where we can safely pull on the DFunId.
 -- Consider using newClsInst instead; this will also warn if
 -- the instance is an orphan.
-mkLocalInstance dfun oflag tvs cls tys
+mkLocalClsInst dfun oflag tvs cls tys warn
   = ClsInst { is_flag = oflag, is_dfun = dfun
             , is_tvs = tvs
             , is_dfun_name = dfun_name
             , is_cls = cls, is_cls_nm = cls_name
             , is_tys = tys, is_tcs = RM_KnownTc cls_name : roughMatchTcs tys
-            , is_orphan = orph
+            , is_orphan = orph, is_warn = warn
             }
   where
     cls_name = className cls
@@ -298,24 +325,26 @@ mkLocalInstance dfun oflag tvs cls tys
 
     choose_one nss = chooseOrphanAnchor (unionNameSets nss)
 
-mkImportedInstance :: Name           -- ^ the name of the class
-                   -> [RoughMatchTc] -- ^ the rough match signature of the instance
-                   -> Name           -- ^ the 'Name' of the dictionary binding
-                   -> DFunId         -- ^ the 'Id' of the dictionary.
-                   -> OverlapFlag    -- ^ may this instance overlap?
-                   -> IsOrphan       -- ^ is this instance an orphan?
-                   -> ClsInst
+mkImportedClsInst :: Name                     -- ^ the name of the class
+                  -> [RoughMatchTc]           -- ^ the rough match signature of the instance
+                  -> Name                     -- ^ the 'Name' of the dictionary binding
+                  -> DFunId                   -- ^ the 'Id' of the dictionary.
+                  -> OverlapFlag              -- ^ may this instance overlap?
+                  -> IsOrphan                 -- ^ is this instance an orphan?
+                  -> Maybe (WarningTxt GhcRn) -- ^ warning emitted when solved
+                  -> ClsInst
 -- Used for imported instances, where we get the rough-match stuff
 -- from the interface file
 -- The bound tyvars of the dfun are guaranteed fresh, because
 -- the dfun has been typechecked out of the same interface file
-mkImportedInstance cls_nm mb_tcs dfun_name dfun oflag orphan
+mkImportedClsInst cls_nm mb_tcs dfun_name dfun oflag orphan warn
   = ClsInst { is_flag = oflag, is_dfun = dfun
             , is_tvs = tvs, is_tys = tys
             , is_dfun_name = dfun_name
             , is_cls_nm = cls_nm, is_cls = cls
             , is_tcs = RM_KnownTc cls_nm : mb_tcs
-            , is_orphan = orphan }
+            , is_orphan = orphan
+            , is_warn = warn }
   where
     (tvs, _, cls, tys) = tcSplitDFunTy (idType dfun)
 
@@ -576,50 +605,54 @@ The willingness to be overlapped or incoherent is a property of the
 instance declaration itself, controlled as follows:
 
  * An instance is "incoherent"
-   if it has an INCOHERENT pragma, or
-   if it appears in a module compiled with -XIncoherentInstances.
+   if it has an `INCOHERENT` pragma, or
+   if it appears in a module compiled with `-XIncoherentInstances`.
 
  * An instance is "overlappable"
-   if it has an OVERLAPPABLE or OVERLAPS pragma, or
-   if it appears in a module compiled with -XOverlappingInstances, or
+   if it has an `OVERLAPPABLE` or `OVERLAPS` pragma, or
+   if it appears in a module compiled with `-XOverlappingInstances`, or
    if the instance is incoherent.
 
  * An instance is "overlapping"
-   if it has an OVERLAPPING or OVERLAPS pragma, or
-   if it appears in a module compiled with -XOverlappingInstances, or
+   if it has an `OVERLAPPING` or `OVERLAPS` pragma, or
+   if it appears in a module compiled with `-XOverlappingInstances`, or
    if the instance is incoherent.
-     compiled with -XOverlappingInstances.
 
 Now suppose that, in some client module, we are searching for an instance
 of the target constraint (C ty1 .. tyn). The search works like this.
 
-*  Find all instances `I` that *match* the target constraint; that is, the
-   target constraint is a substitution instance of `I`. These instance
-   declarations are the *candidates*.
+(IL0) If there are any local Givens that match (potentially unifying
+      any metavariables, even untouchable ones) the target constraint,
+      the search fails. See Note [Instance and Given overlap] in
+      GHC.Tc.Solver.Dict.
 
-*  Eliminate any candidate `IX` for which both of the following hold:
+(IL1) Find all instances `I` that *match* the target constraint; that is, the target
+      constraint is a substitution instance of `I`. These instance declarations are
+      the /candidates/.
 
-   -  There is another candidate `IY` that is strictly more specific; that
-      is, `IY` is a substitution instance of `IX` but not vice versa.
+(IL2) If there are no candidates, the search fails.
 
-   -  Either `IX` is *overlappable*, or `IY` is *overlapping*. (This
-      "either/or" design, rather than a "both/and" design, allow a
-      client to deliberately override an instance from a library,
-      without requiring a change to the library.)
+(IL3) Eliminate any candidate `IX` for which there is another candidate `IY` such
+      that both of the following hold:
+      - `IY` is strictly more specific than `IX`. That is, `IY` is a
+        substitution instance of `IX` but not vice versa.
+      - Either `IX` is *overlappable*, or `IY` is *overlapping*. (This
+        "either/or" design, rather than a "both/and" design, allow a
+        client to deliberately override an instance from a library,
+        without requiring a change to the library.)
 
--  If exactly one non-incoherent candidate remains, select it. If all
-   remaining candidates are incoherent, select an arbitrary one.
-   Otherwise the search fails (i.e. when more than one surviving
-   candidate is not incoherent).
+(IL4) If all the remaining candidates are *incoherent*, the search succeeds,
+      returning an arbitrary surviving candidate.
 
--  If the selected candidate (from the previous step) is incoherent, the
-   search succeeds, returning that candidate.
+(IL5) If more than one non-*incoherent* candidate remains, the search
+      fails.  Otherwise there is exactly one non-*incoherent*
+      candidate; call it the "prime candidate".
 
--  If not, find all instances that *unify* with the target constraint,
-   but do not *match* it. Such non-candidate instances might match when
-   the target constraint is further instantiated. If all of them are
-   incoherent, the search succeeds, returning the selected candidate; if
-   not, the search fails.
+(IL6) Now find all instances that unify with the target constraint,
+      but do not match it. Such non-candidate instances might match
+      when the target constraint is further instantiated. If all of
+      them are *incoherent* top-level instances, the search succeeds,
+      returning the prime candidate. Otherwise the search fails.
 
 Notice that these rules are not influenced by flag settings in the
 client module, where the instances are *used*. These rules make it
@@ -747,6 +780,140 @@ but neither does
 But still x and y might subsequently be unified so they *do* match.
 
 Simple story: unify, don't match.
+
+Note [Coherence and specialisation: overview]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+GHC's specialiser relies on the Coherence Assumption: that if
+      d1 :: C tys
+      d2 :: C tys
+then the dictionary d1 can be used in place of d2 and vice versa; it is as if
+(C tys) is a singleton type.  How do we guarantee this?  Let's use this
+example
+  class C a where { op :: a -> Int }
+  instance                     C [a]         where {...}   -- (I1)
+  instance {-# OVERLAPPING #-} C [Int]       where {...}   -- (I2)
+
+  instance C a =>              C (Maybe a)   where {...}   -- (I3)
+  instance {-# INCOHERENT #-}  C (Maybe Int) where {...}   -- (I4)
+  instance                     C Int         where {...}   -- (I5)
+
+* When solving (C tys) from the top-level instances, we generally insist that
+  there is a unique, most-specific match.  (Incoherent instances change the
+  picture a bit: see Note [Rules for instance lookup].) Example:
+     [W] C [Int]    -- Pick (I2)
+     [W] C [Char]   -- Pick (I1); does not match (I2)
+
+  Caveat: if different usage sites see different instances (which the
+  programmer can contrive, with some effort), all bets are off; we really
+  can't make any guarantees at all.
+
+* But what about [W] C [b], which might arise from
+     risky :: b -> Int
+     risky x = op [x]
+  We can't pick (I2) because `b` is not Int. But if we pick (I1), and later
+  the simplifier inlines a call (risky @Int) we'll get a dictionary of type
+  (C [Int]) built by (I1), which might be utterly different to the dictionary
+  of type (C [Int]) built by (I2).  That breaks the Coherence Assumption.
+
+  So GHC declines to pick either, and rejects `risky`. You have to write a
+  different signature
+     notRisky :: C [b] => b -> Int
+     notRisky x = op [x]
+  so that the dictionary is resolved at the call site.
+
+* The INCOHERENT pragma tells GHC to choose an instance anyway: see
+  Note [Rules for instance lookup] step (IL6).  Suppose we have
+     veryRisky :: C b => b -> Int
+     veryRisky x = op (Just x)
+   So we have [W] C (Maybe b).  Because (I4) is INCOHERENT, GHC is allowed to
+   pick (I3).  Of course, this risks breaking the Coherence Assumption, as
+   described above.
+
+* What about the incoherence from step (IL4)? For example
+     class D a b where { opD :: a -> b -> String }
+     instance {-# INCOHERENT #-} D Int b where {...}  -- (I7)
+     instance {-# INCOHERENT #-} D a Int where {...}  -- (I8)
+
+     g (x::Int) = opD x x  -- [W] D Int Int
+
+  Here both (I7) and (I8) match, GHC picks an arbitrary one.
+
+So INCOHERENT may break the Coherence Assumption. But sometimes that
+is fine, because the programmer promises that it doesn't matter which
+one is chosen.  A good example is in the `optics` library:
+
+  data IxEq i is js where { IxEq :: IxEq i is is }
+
+  class AppendIndices xs ys ks | xs ys -> ks where
+    appendIndices :: IxEq i (Curry xs (Curry ys i)) (Curry ks i)
+
+  instance {-# INCOHERENT #-} xs ~ zs => AppendIndices xs '[] zs where
+    appendIndices = IxEq
+
+  instance ys ~ zs => AppendIndices '[] ys zs where
+    appendIndices = IxEq
+
+Here `xs` and `ys` are type-level lists, and for type inference purposes we want to
+solve the `AppendIndices` constraint when /either/ of them are the empty list. The
+dictionaries are the same in both cases (indeed the dictionary type is a singleton!),
+so we really don't care which is used.  See #23287 for discussion.
+
+
+In short, sometimes we want to specialise on these incoherently-selected dictionaries,
+and sometimes we don't.  It would be best to have a per-instance pragma, but for now
+we have a global flag:
+
+* If an instance has an `{-# INCOHERENT #-}` pragma, we use its `OverlapFlag` to
+  label it as either
+  * `Incoherent`: meaning incoherent but still specialisable, or
+  * `NonCanonical`: meaning incoherent and not specialisable.
+
+The module-wide `-fspecialise-incoherents` flag determines which
+choice is made.  The rest of this note describes what happens for
+`NonCanonical` instances, i.e. with `-fno-specialise-incoherents`.
+
+To avoid this incoherence breaking the specialiser,
+
+* We label as "non-canonical" the dictionary constructed by a
+  (potentially) incoherent use of an instance declaration whose
+  `OverlapFlag` is `NonCanonical`.
+
+* We do not specialise a function if there is a non-canonical
+  dictionary in the /transistive dependencies/ of its dictionary
+  arguments.
+
+To see the transitive closure issue, consider
+  deeplyRisky :: C b => b -> Int
+  deeplyRisky x = op (Just (Just x))
+
+From (op (Just (Just x))) we get
+  [W] d1 : C (Maybe (Maybe b))
+which we solve (coherently!) via (I3), giving
+  [W] d2 : C (Maybe b)
+Now we can only solve this incoherently. So we end up with
+
+  deeplyRisky @b (d1 :: C b)
+    = op @(Maybe (Maybe b)) d1
+    where
+      d1 :: C (Maybe (Maybe b)) = $dfI3 d2   -- Coherent decision
+      d2 :: C (Maybe b)         = $sfI3 d1   -- Incoherent decision
+
+So `d2` is incoherent, and hence (transitively) so is `d1`.
+
+Here are the moving parts:
+
+* GHC.Core.InstEnv.lookupInstEnv tells if any incoherent unifiers were discarded
+  in step (IL6) of the instance lookup.
+
+* That info is recorded in the `cir_is_coherent` field of `OneInst`, and thence
+  transferred to the `ep_is_coherent` field of the `EvBind` for the dictionary.
+
+* `GHC.HsToCore.Binds.dsHsWrapper` desugars the evidence application (f d) into
+  (nospec f d) if `d` is incoherent. It has to do a dependency analysis to
+  determine transitive dependencies, but we need to do that anyway.
+  See Note [Desugaring non-canonical evidence] in GHC.HsToCore.Binds.
+
+  See also Note [nospecId magic] in GHC.Types.Id.Make.
 -}
 
 type DFunInstType = Maybe Type
@@ -826,44 +993,75 @@ anyone noticing, so it's manifestly not ruining anyone's day.)
 -- yield 'Left errorMessage'.
 lookupUniqueInstEnv :: InstEnvs
                     -> Class -> [Type]
-                    -> Either SDoc (ClsInst, [Type])
+                    -> Either LookupInstanceErrReason (ClsInst, [Type])
 lookupUniqueInstEnv instEnv cls tys
   = case lookupInstEnv False instEnv cls tys of
       ([(inst, inst_tys)], _, _)
              | noFlexiVar -> Right (inst, inst_tys')
-             | otherwise  -> Left $ text "flexible type variable:" <+>
-                                    (ppr $ mkTyConApp (classTyCon cls) tys)
+             | otherwise  -> Left $ LookupInstErrFlexiVar
              where
                inst_tys'  = [ty | Just ty <- inst_tys]
                noFlexiVar = all isJust inst_tys
-      _other -> Left $ text "instance not found" <+>
-                       (ppr $ mkTyConApp (classTyCon cls) tys)
+      _other -> Left $ LookupInstErrNotFound
 
-data PotentialUnifiers = NoUnifiers
-                       | OneOrMoreUnifiers [ClsInst]
+-- | Why a particular typeclass application couldn't be looked up.
+data LookupInstanceErrReason =
+  -- | Tyvars aren't an exact match.
+  LookupInstErrNotExact
+  |
+  -- | One of the tyvars is flexible.
+  LookupInstErrFlexiVar
+  |
+  -- | No matching instance was found.
+  LookupInstErrNotFound
+  deriving (Generic)
+
+type Canonical = Bool
+
+-- See Note [Recording coherence information in `PotentialUnifiers`]
+data PotentialUnifiers = NoUnifiers Canonical
+                       -- NoUnifiers True: We have a unique solution modulo canonicity
+                       -- NoUnifiers False: The solutions is not canonical, and thus
+                       --   we shouldn't specialise on it.
+                       | OneOrMoreUnifiers (NonEmpty ClsInst)
                        -- This list is lazy as we only look at all the unifiers when
                        -- printing an error message. It can be expensive to compute all
                        -- the unifiers because if you are matching something like C a[sk] then
                        -- all instances will unify.
 
+{- Note [Recording coherence information in `PotentialUnifiers`]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+When we find a matching instance, there might be other instances that
+could potentially unify with the goal. For `INCOHERENT` instances, we
+don't care (see steps IL4 and IL6 in Note [Rules for instance
+lookup]). But if we have potentially unifying coherent instance, we
+report these `OneOrMoreUnifiers` so that `matchInstEnv` can go down
+the `NotSure` route.
+
+If this hurdle is passed, i.e. we have a unique solution up to
+`INCOHERENT` instances, the specialiser needs to know if that unique
+solution is canonical or not (see Note [Coherence and specialisation:
+overview] for why we care at all). So when the set of potential
+unifiers is empty, we record in `NoUnifiers` if the one solution is
+`Canonical`.
+-}
+
 instance Outputable PotentialUnifiers where
-  ppr NoUnifiers = text "NoUnifiers"
+  ppr (NoUnifiers c) = text "NoUnifiers" <+> if c then text "canonical" else text "non-canonical"
   ppr xs = ppr (getPotentialUnifiers xs)
 
 instance Semigroup PotentialUnifiers where
-  NoUnifiers <> u = u
-  u <> NoUnifiers = u
-  u1 <> u2 = OneOrMoreUnifiers (getPotentialUnifiers u1 ++ getPotentialUnifiers u2)
-
-instance Monoid PotentialUnifiers where
-  mempty = NoUnifiers
+  NoUnifiers c1 <> NoUnifiers c2 = NoUnifiers (c1 && c2)
+  NoUnifiers _ <> u = u
+  OneOrMoreUnifiers (unifier :| unifiers) <> u = OneOrMoreUnifiers (unifier :| (unifiers <> getPotentialUnifiers u))
 
 getPotentialUnifiers :: PotentialUnifiers -> [ClsInst]
-getPotentialUnifiers NoUnifiers = []
-getPotentialUnifiers (OneOrMoreUnifiers cls) = cls
+getPotentialUnifiers NoUnifiers{} = []
+getPotentialUnifiers (OneOrMoreUnifiers cls) = NE.toList cls
 
 nullUnifiers :: PotentialUnifiers -> Bool
-nullUnifiers NoUnifiers = True
+nullUnifiers NoUnifiers{} = True
 nullUnifiers _ = False
 
 lookupInstEnv' :: InstEnv          -- InstEnv to look in
@@ -900,14 +1098,21 @@ lookupInstEnv' (InstEnv rm) vis_mods cls tys
       = acc
 
 
+    noncanonically_matched :: PotentialUnifiers -> PotentialUnifiers
+    noncanonically_matched (NoUnifiers _) = NoUnifiers False
+    noncanonically_matched u = u
+
     check_unifier :: [ClsInst] -> PotentialUnifiers
-    check_unifier [] = NoUnifiers
+    check_unifier [] = NoUnifiers True
     check_unifier (item@ClsInst { is_tvs = tpl_tvs, is_tys = tpl_tys }:items)
       | not (instIsVisible vis_mods item)
       = check_unifier items  -- See Note [Instance lookup and orphan instances]
       | Just {} <- tcMatchTys tpl_tys tys = check_unifier items
         -- Does not match, so next check whether the things unify
         -- See Note [Overlapping instances]
+        -- Record that we encountered non-canonical instances: Note [Coherence and specialisation: overview]
+      | isNonCanonical item
+      = noncanonically_matched $ check_unifier items
         -- Ignore ones that are incoherent: Note [Incoherent instances]
       | isIncoherent item
       = check_unifier items
@@ -927,7 +1132,7 @@ lookupInstEnv' (InstEnv rm) vis_mods cls tys
               -- See Note [Infinitary substitution in lookup]
             MaybeApart MARInfinite _ -> check_unifier items
             _                        ->
-              OneOrMoreUnifiers (item: getPotentialUnifiers (check_unifier items))
+              OneOrMoreUnifiers (item :| getPotentialUnifiers (check_unifier items))
 
       where
         tpl_tv_set = mkVarSet tpl_tvs
@@ -952,8 +1157,8 @@ lookupInstEnv check_overlap_safe
   where
     (home_matches, home_unifs) = lookupInstEnv' home_ie vis_mods cls tys
     (pkg_matches,  pkg_unifs)  = lookupInstEnv' pkg_ie  vis_mods cls tys
-    all_matches = home_matches ++ pkg_matches
-    all_unifs   = home_unifs   `mappend` pkg_unifs
+    all_matches = home_matches <> pkg_matches
+    all_unifs   = home_unifs <> pkg_unifs
     final_matches = pruneOverlappedMatches all_matches
         -- Even if the unifs is non-empty (an error situation)
         -- we still prune the matches, so that the error message isn't
@@ -967,7 +1172,7 @@ lookupInstEnv check_overlap_safe
 
     -- If the selected match is incoherent, discard all unifiers
     final_unifs = case final_matches of
-                    (m:_) | isIncoherent (fst m) -> NoUnifiers
+                    (m:_) | isIncoherent (fst m) -> NoUnifiers True
                     _                            -> all_unifs
 
     -- Note [Safe Haskell isSafeOverlap]
@@ -1145,7 +1350,7 @@ noMatches = InstMatches { instMatches = [], instGuards = [] }
 pruneOverlappedMatches :: [InstMatch] -> [InstMatch]
 -- ^ Remove from the argument list any InstMatches for which another
 -- element of the list is more specific, and overlaps it, using the
--- rules of Nove [Rules for instance lookup]
+-- rules of Note [Rules for instance lookup]
 pruneOverlappedMatches all_matches =
   instMatches $ foldr insert_overlapping noMatches all_matches
 
@@ -1298,7 +1503,12 @@ not incoherent, but we still want this to compile. Hence the
 The implementation is in insert_overlapping, where we remove matching
 incoherent instances as long as there are others.
 
-
+If the choice of instance *does* matter, all bets are still not off:
+users can consult the detailed specification of the instance selection
+algorithm in the GHC Users' Manual. However, this means we can end up
+with different instances at the same types at different parts of the
+program, and this difference has to be preserved. Note [Coherence and
+specialisation: overview] details how we achieve that.
 
 ************************************************************************
 *                                                                      *

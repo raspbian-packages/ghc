@@ -82,27 +82,6 @@
    that depend on config info, such as __USE_FILE_OFFSET64 */
 #include <math.h>
 
-// On Solaris, we don't get the INFINITY and NAN constants unless we
-// #define _STDC_C99, and we can't do that unless we also use -std=c99,
-// because _STDC_C99 causes the headers to use C99 syntax (e.g. restrict).
-// We aren't ready for -std=c99 yet, so define INFINITY/NAN by hand using
-// the gcc builtins.
-#if !defined(INFINITY)
-#if defined(__GNUC__)
-#define INFINITY __builtin_inf()
-#else
-#error No definition for INFINITY
-#endif
-#endif
-
-#if !defined(NAN)
-#if defined(__GNUC__)
-#define NAN __builtin_nan("")
-#else
-#error No definition for NAN
-#endif
-#endif
-
 /* -----------------------------------------------------------------------------
    Useful definitions
    -------------------------------------------------------------------------- */
@@ -129,7 +108,7 @@
 
 /* Compute offsets of struct fields
  */
-#define STG_FIELD_OFFSET(s_type, field) ((StgWord)&(((s_type*)0)->field))
+#define STG_FIELD_OFFSET(s_type, field) __builtin_offsetof(s_type, field)
 
 /*
  * 'Portable' inlining:
@@ -243,6 +222,8 @@
 #define STG_PRINTF_ATTR(fmt_arg, rest) GNUC3_ATTRIBUTE(format(printf, fmt_arg, rest))
 #endif
 
+#define STG_RESTRICT __restrict__
+
 #define STG_NORETURN GNU_ATTRIBUTE(__noreturn__)
 
 #define STG_MALLOC GNUC3_ATTRIBUTE(__malloc__)
@@ -303,6 +284,17 @@
 #else
 # define STG_RETURNS_NONNULL
 #endif
+
+/* -----------------------------------------------------------------------------
+   Suppressing C warnings
+   -------------------------------------------------------------------------- */
+
+#define DO_PRAGMA(x) _Pragma(#x)
+#define NO_WARN(warnoption, ...)                   \
+    DO_PRAGMA(GCC diagnostic push)                 \
+    DO_PRAGMA(GCC diagnostic ignored #warnoption)  \
+    __VA_ARGS__                                    \
+    DO_PRAGMA(GCC diagnostic pop)
 
 /* -----------------------------------------------------------------------------
    Global type definitions
@@ -402,6 +394,7 @@ external prototype return neither of these types to workaround #11395.
 #include "stg/MachRegsForHost.h"
 #include "stg/Regs.h"
 #include "stg/Ticky.h"
+#include "rts/TSANUtils.h"
 
 #if IN_STG_CODE
 /*
@@ -412,7 +405,7 @@ external prototype return neither of these types to workaround #11395.
 #endif
 
 #include "stg/Prim.h" /* ghc-prim fallbacks */
-#include "stg/SMP.h" // write_barrier() inline is required
+#include "stg/SMP.h"
 
 /* -----------------------------------------------------------------------------
    Moving Floats and Doubles

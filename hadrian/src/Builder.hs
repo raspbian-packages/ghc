@@ -8,10 +8,7 @@ module Builder (
     -- * Builder properties
     builderProvenance, systemBuilderPath, builderPath, isSpecified, needBuilders,
     runBuilder, runBuilderWith, runBuilderWithCmdOptions, getBuilderPath,
-    builderEnvironment,
-
-    -- * Ad hoc builder invocation
-    applyPatch
+    builderEnvironment
     ) where
 
 import Control.Exception.Extra (Partial)
@@ -20,6 +17,7 @@ import Development.Shake.Classes
 import Development.Shake.Command
 import Development.Shake.FilePath
 import GHC.Generics
+import GHC.Platform.ArchOS (ArchOS(..), Arch(..))
 import qualified Hadrian.Builder as H
 import Hadrian.Builder hiding (Builder)
 import Hadrian.Builder.Ar
@@ -28,7 +26,7 @@ import Hadrian.Builder.Tar
 import Hadrian.Oracles.Path
 import Hadrian.Oracles.TextFile
 import Hadrian.Utilities
-import Oracles.Setting (bashPath)
+import Oracles.Setting (bashPath, targetStage)
 import System.Exit
 import System.IO (stderr)
 
@@ -41,6 +39,11 @@ import Packages
 import GHC.IO.Encoding (getFileSystemEncoding)
 import qualified Data.ByteString as BS
 import qualified GHC.Foreign as GHC
+import GHC.ResponseFile
+
+import GHC.Toolchain (Target(..))
+import qualified GHC.Toolchain as Toolchain
+import GHC.Toolchain.Program
 
 -- | C compiler can be used in two different modes:
 -- * Compile or preprocess a source file.
@@ -170,6 +173,7 @@ data Builder = Alex
              | Hp2Ps
              | Hpc
              | HsCpp
+             | JsCpp
              | Hsc2Hs Stage
              | Ld Stage --- ^ linker
              | Make FilePath
@@ -177,7 +181,6 @@ data Builder = Alex
              | MergeObjects Stage -- ^ linker to be used to merge object files.
              | Nm
              | Objdump
-             | Patch
              | Python
              | Ranlib
              | Testsuite TestMode
@@ -233,18 +236,11 @@ instance H.Builder Builder where
           -- changes (#18001).
           _bootGhcVersion <- setting GhcVersion
           pure []
-        Ghc _ stage -> do
+        Ghc {} -> do
             root <- buildRoot
-            touchyPath <- programPath (vanillaContext (Stage0 InTreeLibs) touchy)
             unlitPath  <- builderPath Unlit
 
-            -- GHC from the previous stage is used to build artifacts in the
-            -- current stage. Need the previous stage's GHC deps.
-            ghcdeps <- ghcBinDeps (predStage stage)
-
             return $ [ unlitPath ]
-                  ++ ghcdeps
-                  ++ [ touchyPath          | windowsHost ]
                   ++ [ root -/- mingwStamp | windowsHost ]
                      -- proxy for the entire mingw toolchain that
                      -- we have in inplace/mingw initially, and then at
@@ -308,20 +304,20 @@ instance H.Builder Builder where
                 msgOut = "[runBuilderWith] Exactly one output file expected."
                 -- Capture stdout and write it to the output file.
                 captureStdout = do
-                    Stdout stdout <- cmd' [path] buildArgs
+                    Stdout stdout <- cmd' [path] buildArgs buildOptions
                     -- see Note [Capture stdout as a ByteString]
                     writeFileChangedBS output stdout
             case builder of
                 Ar Pack stg -> do
                     useTempFile <- arSupportsAtFile stg
-                    if useTempFile then runAr                path buildArgs buildInputs
-                                   else runArWithoutTempFile path buildArgs buildInputs
+                    if useTempFile then runAr                path buildArgs buildInputs buildOptions
+                                   else runArWithoutTempFile path buildArgs buildInputs buildOptions
 
-                Ar Unpack _ -> cmd' [Cwd output] [path] buildArgs
+                Ar Unpack _ -> cmd' [Cwd output] [path] buildArgs buildOptions
 
                 Autoreconf dir -> do
                   bash <- bashPath
-                  cmd' [Cwd dir] [bash, path] buildArgs
+                  cmd' [Cwd dir] [bash, path] buildArgs buildOptions
 
                 Configure  dir -> do
                     -- Inject /bin/bash into `libtool`, instead of /bin/sh,
@@ -333,9 +329,8 @@ instance H.Builder Builder where
                 GenApply -> captureStdout
 
                 GenPrimopCode -> do
-                    stdin <- readFile' input
                     need [input]
-                    Stdout stdout <- cmd' (Stdin stdin) [path] buildArgs
+                    Stdout stdout <- cmd' (FileStdin input) [path] buildArgs buildOptions
                     -- see Note [Capture stdout as a ByteString]
                     writeFileChangedBS output stdout
 
@@ -346,75 +341,91 @@ instance H.Builder Builder where
                       , "describe"
                       , input -- the package name
                       ]
-                    cmd' (Stdin pkgDesc) [path] (buildArgs ++ ["-"])
+                    cmd' (Stdin pkgDesc) [path] (buildArgs ++ ["-"]) buildOptions
 
                 GhcPkg Unregister _ -> do
                     -- unregistering is allowed to fail (e.g. when a package
                     -- isn't already present)
-                    Exit _ <- cmd' [path] (buildArgs ++ [input])
+                    Exit _ <- cmd' [path] (buildArgs ++ [input]) buildOptions
                     return ()
+
+                Haddock BuildPackage -> runHaddock path buildArgs buildInputs
 
                 HsCpp    -> captureStdout
 
-                Make dir -> cmd' path ["-C", dir] buildArgs
+                Make dir -> cmd' buildOptions path ["-C", dir] buildArgs
 
                 Makeinfo -> do
-                  cmd' [path] "--no-split" [ "-o", output] [input]
+                  cmd' [path] "--no-split" [ "-o", output] [input] buildOptions
 
                 Xelatex   ->
                   -- xelatex produces an incredible amount of output, almost
                   -- all of which is useless. Suppress it unless user
                   -- requests a loud build.
                   if verbosity >= Diagnostic
-                    then cmd' [Cwd output] [path] buildArgs
-                    else do (Stdouterr out, Exit code) <- cmd' [Cwd output] [path] buildArgs
+                    then cmd' [Cwd output] [path] buildArgs buildOptions
+                    else do (Stdouterr out, Exit code) <- cmd' [Cwd output] [path] buildArgs buildOptions
                             when (code /= ExitSuccess) $ do
                               liftIO $ BSL.hPutStrLn stderr out
                               putFailure "xelatex failed!"
                               fail "xelatex failed"
 
-                Makeindex -> unit $ cmd' [Cwd output] [path] (buildArgs ++ [input])
+                Makeindex -> unit $ cmd' [Cwd output] [path] (buildArgs ++ [input]) buildOptions
 
                 Tar _ -> cmd' buildOptions [path] buildArgs
 
                 -- RunTest produces a very large amount of (colorised) output;
                 -- Don't attempt to capture it.
                 Testsuite RunTest -> do
-                  Exit code <- cmd [path] buildArgs
+                  Exit code <- cmd [path] buildArgs buildOptions
                   when (code /= ExitSuccess) $ do
                     fail "tests failed"
 
-                _  -> cmd' [path] buildArgs
+                _  -> cmd' [path] buildArgs buildOptions
+
+-- | Invoke @haddock@ given a path to it and a list of arguments. The arguments
+-- are passed in a response file.
+runHaddock :: FilePath    -- ^ path to @haddock@
+      -> [String]
+      -> [FilePath]  -- ^ input file paths
+      -> Action ()
+runHaddock haddockPath flagArgs fileInputs = withTempFile $ \tmp -> do
+    writeFile' tmp $ escapeArgs fileInputs
+    cmd [haddockPath] flagArgs ('@' : tmp)
 
 -- TODO: Some builders are required only on certain platforms. For example,
 -- 'Objdump' is only required on OpenBSD and AIX. Add support for platform
 -- specific optional builders as soon as we can reliably test this feature.
 -- See https://github.com/snowleopard/hadrian/issues/211.
-isOptional :: Builder -> Bool
-isOptional = \case
+isOptional :: Toolchain.Target -- ^ Some builders are optional depending on the target
+           -> Builder
+           -> Bool
+isOptional target = \case
     Objdump  -> True
     -- alex and happy are not required when building source distributions
     -- and ./configure will complain if they are not available when building in-tree
     Happy    -> True
     Alex     -> True
+    -- Most ar implemententions no longer need ranlib, but some still do
+    Ranlib   -> not $ Toolchain.arNeedsRanlib (tgtAr target)
+    JsCpp    -> not $ (archOS_arch . tgtArchOs) target == ArchJavaScript -- ArchWasm32 too?
     _        -> False
 
 -- | Determine the location of a system 'Builder'.
 systemBuilderPath :: Builder -> Action FilePath
 systemBuilderPath builder = case builder of
     Alex            -> fromKey "alex"
-    Ar _ (Stage0 {})-> fromKey "system-ar"
-    Ar _ _          -> fromKey "ar"
+    Ar _ stage      -> fromStageTC stage "ar"  (Toolchain.arMkArchive . tgtAr)
     Autoreconf _    -> stripExe =<< fromKey "autoreconf"
-    Cc  _  (Stage0 {}) -> fromKey "system-cc"
-    Cc  _  _        -> fromKey "cc"
+    Cc  _ stage     -> fromStageTC stage "cc" (Toolchain.ccProgram . tgtCCompiler)
     -- We can't ask configure for the path to configure!
     Configure _     -> return "configure"
     Ghc _  (Stage0 {})   -> fromKey "system-ghc"
     GhcPkg _ (Stage0 {}) -> fromKey "system-ghc-pkg"
     Happy           -> fromKey "happy"
-    HsCpp           -> fromKey "hs-cpp"
-    Ld _            -> fromKey "ld"
+    HsCpp           -> fromTargetTC "hs-cpp" (Toolchain.hsCppProgram . tgtHsCPreprocessor)
+    JsCpp           -> fromTargetTC "js-cpp" (maybeProg Toolchain.jsCppProgram . tgtJsCPreprocessor)
+    Ld _            -> fromTargetTC "ld" (Toolchain.ccLinkProgram . tgtCCompilerLink)
     -- MergeObjects Stage0 is a special case in case of
     -- cross-compiling. We're building stage1, e.g. code which will be
     -- executed on the host and hence we need to use host's merge
@@ -423,15 +434,13 @@ systemBuilderPath builder = case builder of
     -- parameters. E.g. building a cross-compiler on and for x86_64
     -- which will target ppc64 means that MergeObjects Stage0 will use
     -- x86_64 linker and MergeObject _ will use ppc64 linker.
-    MergeObjects (Stage0 {}) -> fromKey "system-merge-objects"
-    MergeObjects _  -> fromKey "merge-objects"
+    MergeObjects st -> fromStageTC st "merge-objects" (maybeProg Toolchain.mergeObjsProgram . tgtMergeObjs)
     Make _          -> fromKey "make"
     Makeinfo        -> fromKey "makeinfo"
-    Nm              -> fromKey "nm"
+    Nm              -> fromTargetTC "nm" (Toolchain.nmProgram . tgtNm)
     Objdump         -> fromKey "objdump"
-    Patch           -> fromKey "patch"
     Python          -> fromKey "python"
-    Ranlib          -> fromKey "ranlib"
+    Ranlib          -> fromTargetTC "ranlib" (maybeProg Toolchain.ranlibProgram . tgtRanlib)
     Testsuite _     -> fromKey "python"
     Sphinx _        -> fromKey "sphinx-build"
     Tar _           -> fromKey "tar"
@@ -447,10 +456,24 @@ systemBuilderPath builder = case builder of
         let unpack = fromMaybe . error $ "Cannot find path to builder "
                 ++ quote key ++ inCfg ++ " Did you skip configure?"
         path <- unpack <$> lookupValue configFile key
+        validate key path
+
+    -- Get program from a certain stage's target configuration
+    fromStageTC stage keyname key = do
+        path <- prgPath . key <$> targetStage stage
+        validate keyname path
+
+    -- Get program from the target's target configuration
+    fromTargetTC keyname key = do
+        path <- queryTargetTarget (prgPath . key)
+        validate keyname path
+
+    validate keyname path = do
+        target <- getTargetTarget
         if null path
         then do
-            unless (isOptional builder) . error $ "Non optional builder "
-                ++ quote key ++ " is not specified" ++ inCfg
+            unless (isOptional target builder) . error $ "Non optional builder "
+                ++ quote keyname ++ " is not specified" ++ inCfg
             return "" -- TODO: Use a safe interface.
         else do
             -- angerman: I find this lookupInPath rather questionable.
@@ -476,19 +499,12 @@ systemBuilderPath builder = case builder of
         exists <- doesFileExist s
         if exists then return s else return sNoExt
 
+    maybeProg = maybe (Program "" [])
+
 
 -- | Was the path to a given system 'Builder' specified in configuration files?
 isSpecified :: Builder -> Action Bool
 isSpecified = fmap (not . null) . systemBuilderPath
-
--- | Apply a patch by executing the 'Patch' builder in a given directory.
-applyPatch :: FilePath -> FilePath -> Action ()
-applyPatch dir patch = do
-    let file = dir -/- patch
-    needBuilders [Patch]
-    path <- builderPath Patch
-    putBuild $ "| Apply patch " ++ file
-    quietly $ cmd' [Cwd dir, FileStdin file] [path, "-p0"]
 
 -- Note [cmd wrapper]
 -- ~~~~~~~~~~~~~~~~~~

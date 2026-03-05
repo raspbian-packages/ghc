@@ -32,7 +32,7 @@
 #include "sm/NonMoving.h"
 #include "sm/NonMovingMark.h"
 #include "Profiling.h" // prof_arena
-#include "HeapAlloc.h"
+#include "rts/storage/HeapAlloc.h"
 
 /* -----------------------------------------------------------------------------
    Forward decls.
@@ -42,7 +42,6 @@ int   isHeapAlloced       ( StgPtr p);
 static void  checkSmallBitmap    ( StgPtr payload, StgWord bitmap, uint32_t );
 static void  checkLargeBitmap    ( StgPtr payload, StgLargeBitmap*, uint32_t );
 static void  checkClosureShallow ( const StgClosure * );
-static void  checkSTACK          (StgStack *stack);
 
 static void  checkCompactObjects (bdescr *bd);
 
@@ -355,11 +354,11 @@ checkClosure( const StgClosure* p )
 
     p = UNTAG_CONST_CLOSURE(p);
 
-    info = p->header.info;
-    load_load_barrier();
+    info = ACQUIRE_LOAD(&p->header.info);
 
     if (IS_FORWARDING_PTR(info)) {
-        barf("checkClosure: found EVACUATED closure %d", info->type);
+        ASSERT(LOOKS_LIKE_CLOSURE_PTR(info));
+        barf("checkClosure: found EVACUATED closure %u", GET_INFO((StgClosure*)UN_FORWARDING_PTR(info))->type);
     }
 
 #if defined(PROFILING)
@@ -367,7 +366,6 @@ checkClosure( const StgClosure* p )
 #endif
 
     info = INFO_PTR_TO_STRUCT(info);
-    load_load_barrier();
 
     switch (info->type) {
 
@@ -641,7 +639,7 @@ void checkNonmovingHeap (const struct NonmovingHeap *heap)
     checkLargeObjects(nonmoving_large_objects);
     checkLargeObjects(nonmoving_marked_large_objects);
     checkCompactObjects(nonmoving_compact_objects);
-    for (unsigned int i=0; i < NONMOVING_ALLOCA_CNT; i++) {
+    for (unsigned int i=0; i < nonmoving_alloca_cnt; i++) {
         const struct NonmovingAllocator *alloc = &heap->allocators[i];
         checkNonmovingSegments(alloc->filled);
         checkNonmovingSegments(alloc->saved_filled);
@@ -725,7 +723,7 @@ checkCompactObjects(bdescr *bd)
     }
 }
 
-static void
+void
 checkSTACK (StgStack *stack)
 {
     StgPtr sp = stack->sp;
@@ -737,14 +735,44 @@ checkSTACK (StgStack *stack)
     checkStackChunk(sp, stack_end);
 }
 
+/*
+ * Note [Sanity-checking global_link]
+ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ * TSOs are a bit odd in that they have a global_link pointer field
+ * which is not scavenged by the GC. This field is used to track the
+ * generations[_].[old_]threads lists and is ultimately updated by
+ * MarkWeak.c:tidyThreadList, which walks the thread lists and updates
+ * the global_link references of all TSOs that it finds.
+ *
+ * Typically the fact that this field is not scavenged is fine as all reachable
+ * TSOs on the heap are guaranteed to be on some generation's thread list and
+ * therefore will be scavenged by tidyThreadList. However, the sanity checker
+ * poses a bit of a challenge here as it walks heap blocks directly and
+ * therefore may encounter TSOs which aren't reachable via the the global
+ * thread lists.
+ *
+ * How might such orphan TSOs arise? One such way is via racing evacuation.
+ * Specifically, if two GC threads attempt to simultaneously evacuate a
+ * TSO, both threads will produce a copy of the TSO in their respective
+ * to-space. However, only one will succeed in turning the from-space TSO into
+ * a forwarding pointer. Consequently, tidyThreadList will find and update the
+ * copy which "won". Meanwhile, the "losing" copy will contain a dangling
+ * global_link pointer into from-space.
+ *
+ * For this reason, checkTSO does not check global_link. Instead, we only do
+ * so in checkGlobalTSOList, which by definition will only look at
+ * threads which are reachable via a thread list (and therefore must have won
+ * the forwarding-pointer race).
+ *
+ * See #19146.
+ */
+
 void
 checkTSO(StgTSO *tso)
 {
-    StgTSO *next = tso->_link;
-    const StgInfoTable *info = (const StgInfoTable*) tso->_link->header.info;
-    load_load_barrier();
+    const StgInfoTable *info = (const StgInfoTable*) ACQUIRE_LOAD(&tso->_link)->header.info;
 
-    ASSERT(next == END_TSO_QUEUE ||
+    ASSERT(tso->_link == END_TSO_QUEUE ||
            info == &stg_MVAR_TSO_QUEUE_info ||
            info == &stg_TSO_info ||
            info == &stg_WHITEHOLE_info); // used to happen due to STM doing
@@ -762,9 +790,12 @@ checkTSO(StgTSO *tso)
     ASSERT(LOOKS_LIKE_CLOSURE_PTR(tso->bq));
     ASSERT(LOOKS_LIKE_CLOSURE_PTR(tso->blocked_exceptions));
     ASSERT(LOOKS_LIKE_CLOSURE_PTR(tso->stackobj));
-    ASSERT(LOOKS_LIKE_CLOSURE_PTR(tso->global_link) &&
-            (tso->global_link == END_TSO_QUEUE ||
-             get_itbl((StgClosure*)tso->global_link)->type == TSO));
+
+    // This assertion sadly does not always hold.
+    // See Note [Sanity-checking global_link] for why.
+    //ASSERT(LOOKS_LIKE_CLOSURE_PTR(tso->global_link) &&
+    //        (tso->global_link == END_TSO_QUEUE ||
+    //         get_itbl((StgClosure*)tso->global_link)->type == TSO));
 
     if (tso->label) {
         ASSERT(LOOKS_LIKE_CLOSURE_PTR(tso->label));
@@ -1080,7 +1111,7 @@ findMemoryLeak (void)
         markBlocks(nonmoving_marked_large_objects);
         markBlocks(nonmoving_compact_objects);
         markBlocks(nonmoving_marked_compact_objects);
-        for (i = 0; i < NONMOVING_ALLOCA_CNT; i++) {
+        for (i = 0; i < nonmoving_alloca_cnt; i++) {
             struct NonmovingAllocator *alloc = &nonmovingHeap.allocators[i];
             markNonMovingSegments(alloc->filled);
             markNonMovingSegments(alloc->saved_filled);
@@ -1196,7 +1227,7 @@ static W_
 countNonMovingHeap(struct NonmovingHeap *heap)
 {
     W_ ret = 0;
-    for (int alloc_idx = 0; alloc_idx < NONMOVING_ALLOCA_CNT; alloc_idx++) {
+    for (int alloc_idx = 0; alloc_idx < nonmoving_alloca_cnt; alloc_idx++) {
         struct NonmovingAllocator *alloc = &heap->allocators[alloc_idx];
         ret += countNonMovingSegments(alloc->filled);
         ret += countNonMovingSegments(alloc->saved_filled);
@@ -1208,6 +1239,7 @@ countNonMovingHeap(struct NonmovingHeap *heap)
     }
     ret += countNonMovingSegments(heap->sweep_list);
     ret += countNonMovingSegments(heap->free);
+    ret += countNonMovingSegments(heap->saved_free);
     return ret;
 }
 
@@ -1225,8 +1257,7 @@ memInventory (bool show)
 #if defined(THREADED_RTS)
   // We need to be careful not to race with the nonmoving collector.
   // If a nonmoving collection is on-going we simply abort the inventory.
-  if (RtsFlags.GcFlags.useNonmoving){
-    if(TRY_ACQUIRE_LOCK(&nonmoving_collection_mutex))
+  if (RtsFlags.GcFlags.useNonmoving && !nonmovingBlockConcurrentMark(false)) {
       return;
   }
 #endif
@@ -1333,13 +1364,7 @@ memInventory (bool show)
   ASSERT(n_alloc_blocks == live_blocks);
   ASSERT(!leak);
 
-#if defined(THREADED_RTS)
-  if (RtsFlags.GcFlags.useNonmoving){
-    RELEASE_LOCK(&nonmoving_collection_mutex);
-  }
-#endif
-
+  nonmovingUnblockConcurrentMark();
 }
-
 
 #endif /* DEBUG */

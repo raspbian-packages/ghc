@@ -1,8 +1,4 @@
-{-# LANGUAGE BangPatterns    #-}
-{-# LANGUAGE DeriveFunctor   #-}
-{-# LANGUAGE RankNTypes      #-}
 {-# LANGUAGE ViewPatterns    #-}
-{-# LANGUAGE TypeApplications #-}
 
 {-
 (c) The AQUA Project, Glasgow University, 1994-1998
@@ -32,7 +28,7 @@ module GHC.Utils.Error (
         formatBulleted,
 
         -- ** Construction
-        DiagOpts (..), diag_wopt, diag_fatal_wopt,
+        DiagOpts (..), emptyDiagOpts, diag_wopt, diag_fatal_wopt,
         emptyMessages, mkDecorated, mkLocMessage,
         mkMsgEnvelope, mkPlainMsgEnvelope, mkPlainErrorMsgEnvelope,
         mkErrorMsgEnvelope,
@@ -75,10 +71,10 @@ import GHC.Data.EnumSet (EnumSet)
 import GHC.Utils.Exception
 import GHC.Utils.Outputable as Outputable
 import GHC.Utils.Panic
-import GHC.Utils.Panic.Plain
 import GHC.Utils.Logger
 import GHC.Types.Error
 import GHC.Types.SrcLoc as SrcLoc
+import GHC.Unit.Module.Warnings
 
 import System.Exit      ( ExitCode(..), exitWith )
 import Data.List        ( sortBy )
@@ -89,15 +85,32 @@ import Control.Monad.IO.Class
 import Control.Monad.Catch as MC (handle)
 import GHC.Conc         ( getAllocationCounter )
 import System.CPUTime
+import Data.List.NonEmpty (NonEmpty (..))
+import qualified Data.List.NonEmpty as NE
 
 data DiagOpts = DiagOpts
   { diag_warning_flags       :: !(EnumSet WarningFlag) -- ^ Enabled warnings
   , diag_fatal_warning_flags :: !(EnumSet WarningFlag) -- ^ Fatal warnings
+  , diag_custom_warning_categories       :: !WarningCategorySet -- ^ Enabled custom warning categories
+  , diag_fatal_custom_warning_categories :: !WarningCategorySet -- ^ Fatal custom warning categories
   , diag_warn_is_error       :: !Bool                  -- ^ Treat warnings as errors
   , diag_reverse_errors      :: !Bool                  -- ^ Reverse error reporting order
   , diag_max_errors          :: !(Maybe Int)           -- ^ Max reported error count
   , diag_ppr_ctx             :: !SDocContext           -- ^ Error printing context
   }
+
+emptyDiagOpts :: DiagOpts
+emptyDiagOpts =
+    DiagOpts
+        { diag_warning_flags = EnumSet.empty
+        , diag_fatal_warning_flags = EnumSet.empty
+        , diag_custom_warning_categories = emptyWarningCategorySet
+        , diag_fatal_custom_warning_categories = emptyWarningCategorySet
+        , diag_warn_is_error = False
+        , diag_reverse_errors = False
+        , diag_max_errors = Nothing
+        , diag_ppr_ctx = defaultSDocContext
+        }
 
 diag_wopt :: WarningFlag -> DiagOpts -> Bool
 diag_wopt wflag opts = wflag `EnumSet.member` diag_warning_flags opts
@@ -105,33 +118,60 @@ diag_wopt wflag opts = wflag `EnumSet.member` diag_warning_flags opts
 diag_fatal_wopt :: WarningFlag -> DiagOpts -> Bool
 diag_fatal_wopt wflag opts = wflag `EnumSet.member` diag_fatal_warning_flags opts
 
+diag_wopt_custom :: WarningCategory -> DiagOpts -> Bool
+diag_wopt_custom wflag opts = wflag `elemWarningCategorySet` diag_custom_warning_categories opts
+
+diag_fatal_wopt_custom :: WarningCategory -> DiagOpts -> Bool
+diag_fatal_wopt_custom wflag opts = wflag `elemWarningCategorySet` diag_fatal_custom_warning_categories opts
+
 -- | Computes the /right/ 'Severity' for the input 'DiagnosticReason' out of
 -- the 'DiagOpts. This function /has/ to be called when a diagnostic is constructed,
 -- i.e. with a 'DiagOpts \"snapshot\" taken as close as possible to where a
 -- particular diagnostic message is built, otherwise the computed 'Severity' might
 -- not be correct, due to the mutable nature of the 'DynFlags' in GHC.
+--
+--
 diagReasonSeverity :: DiagOpts -> DiagnosticReason -> Severity
-diagReasonSeverity opts reason = case reason of
-  WarningWithFlag wflag
-    | not (diag_wopt wflag opts) -> SevIgnore
-    | diag_fatal_wopt wflag opts -> SevError
-    | otherwise                  -> SevWarning
-  WarningWithoutFlag
-    | diag_warn_is_error opts -> SevError
-    | otherwise             -> SevWarning
-  ErrorWithoutFlag
-    -> SevError
+diagReasonSeverity opts reason = fst (diag_reason_severity opts reason)
 
+-- Like the diagReasonSeverity but the second half of the pair is a small
+-- ReasolvedDiagnosticReason which would cause the diagnostic to be triggered with the
+-- same severity.
+--
+-- See Note [Warnings controlled by multiple flags]
+--
+diag_reason_severity :: DiagOpts -> DiagnosticReason -> (Severity, ResolvedDiagnosticReason)
+diag_reason_severity opts reason = fmap ResolvedDiagnosticReason $ case reason of
+  WarningWithFlags wflags -> case wflags' of
+    []     -> (SevIgnore, reason)
+    w : ws -> case wflagsE of
+      []     -> (SevWarning, WarningWithFlags (w :| ws))
+      e : es -> (SevError, WarningWithFlags (e :| es))
+    where
+      wflags' = NE.filter (\wflag -> diag_wopt wflag opts) wflags
+      wflagsE = filter (\wflag -> diag_fatal_wopt wflag opts) wflags'
+
+  WarningWithCategory wcat
+    | not (diag_wopt_custom wcat opts) -> (SevIgnore, reason)
+    | diag_fatal_wopt_custom wcat opts -> (SevError, reason)
+    | otherwise                        -> (SevWarning, reason)
+  WarningWithoutFlag
+    | diag_warn_is_error opts -> (SevError, reason)
+    | otherwise             -> (SevWarning, reason)
+  ErrorWithoutFlag
+    -> (SevError, reason)
 
 -- | Make a 'MessageClass' for a given 'DiagnosticReason', consulting the
--- 'DiagOpts.
+-- 'DiagOpts'.
 mkMCDiagnostic :: DiagOpts -> DiagnosticReason -> Maybe DiagnosticCode -> MessageClass
-mkMCDiagnostic opts reason code = MCDiagnostic (diagReasonSeverity opts reason) reason code
+mkMCDiagnostic opts reason code = MCDiagnostic sev reason' code
+  where
+    (sev, reason') = diag_reason_severity opts reason
 
 -- | Varation of 'mkMCDiagnostic' which can be used when we are /sure/ the
 -- input 'DiagnosticReason' /is/ 'ErrorWithoutFlag' and there is no diagnostic code.
 errorDiagnostic :: MessageClass
-errorDiagnostic = MCDiagnostic SevError ErrorWithoutFlag Nothing
+errorDiagnostic = MCDiagnostic SevError (ResolvedDiagnosticReason ErrorWithoutFlag) Nothing
 
 --
 -- Creating MsgEnvelope(s)
@@ -142,13 +182,15 @@ mk_msg_envelope
   => Severity
   -> SrcSpan
   -> NamePprCtx
+  -> ResolvedDiagnosticReason
   -> e
   -> MsgEnvelope e
-mk_msg_envelope severity locn name_ppr_ctx err
+mk_msg_envelope severity locn name_ppr_ctx reason err
  = MsgEnvelope { errMsgSpan = locn
                , errMsgContext = name_ppr_ctx
                , errMsgDiagnostic = err
                , errMsgSeverity = severity
+               , errMsgReason = reason
                }
 
 -- | Wrap a 'Diagnostic' in a 'MsgEnvelope', recording its location.
@@ -162,7 +204,9 @@ mkMsgEnvelope
   -> e
   -> MsgEnvelope e
 mkMsgEnvelope opts locn name_ppr_ctx err
- = mk_msg_envelope (diagReasonSeverity opts (diagnosticReason err)) locn name_ppr_ctx err
+ = mk_msg_envelope sev locn name_ppr_ctx reason err
+  where
+    (sev, reason) = diag_reason_severity opts (diagnosticReason err)
 
 -- | Wrap a 'Diagnostic' in a 'MsgEnvelope', recording its location.
 -- Precondition: the diagnostic is, in fact, an error. That is,
@@ -173,7 +217,7 @@ mkErrorMsgEnvelope :: Diagnostic e
                    -> e
                    -> MsgEnvelope e
 mkErrorMsgEnvelope locn name_ppr_ctx msg =
- assert (diagnosticReason msg == ErrorWithoutFlag) $ mk_msg_envelope SevError locn name_ppr_ctx msg
+ assert (diagnosticReason msg == ErrorWithoutFlag) $ mk_msg_envelope SevError locn name_ppr_ctx (ResolvedDiagnosticReason ErrorWithoutFlag) msg
 
 -- | Variant that doesn't care about qualified/unqualified names.
 mkPlainMsgEnvelope :: Diagnostic e
@@ -191,7 +235,7 @@ mkPlainErrorMsgEnvelope :: Diagnostic e
                         -> e
                         -> MsgEnvelope e
 mkPlainErrorMsgEnvelope locn msg =
-  mk_msg_envelope SevError locn alwaysQualify msg
+  mk_msg_envelope SevError locn alwaysQualify (ResolvedDiagnosticReason ErrorWithoutFlag) msg
 
 -------------------------
 data Validity' a
@@ -219,14 +263,14 @@ getInvalids vs = [d | NotValid d <- vs]
 
 ----------------
 -- | Formats the input list of structured document, where each element of the list gets a bullet.
-formatBulleted :: SDocContext -> DecoratedSDoc -> SDoc
-formatBulleted ctx (unDecorated -> docs)
-  = case msgs of
+formatBulleted :: DecoratedSDoc -> SDoc
+formatBulleted (unDecorated -> docs)
+  = sdocWithContext $ \ctx -> case msgs ctx of
         []    -> Outputable.empty
         [msg] -> msg
-        _     -> vcat $ map starred msgs
+        xs    -> vcat $ map starred xs
     where
-    msgs    = filter (not . Outputable.isEmpty ctx) docs
+    msgs ctx = filter (not . Outputable.isEmpty ctx) docs
     starred = (bullet<+>)
 
 pprMessages :: Diagnostic e => DiagnosticOpts e -> Messages e -> SDoc
@@ -247,13 +291,13 @@ pprLocMsgEnvelope :: Diagnostic e => DiagnosticOpts e -> MsgEnvelope e -> SDoc
 pprLocMsgEnvelope opts (MsgEnvelope { errMsgSpan      = s
                                , errMsgDiagnostic = e
                                , errMsgSeverity  = sev
-                               , errMsgContext   = name_ppr_ctx })
-  = sdocWithContext $ \ctx ->
-    withErrStyle name_ppr_ctx $
+                               , errMsgContext   = name_ppr_ctx
+                               , errMsgReason    = reason })
+  = withErrStyle name_ppr_ctx $
       mkLocMessage
-        (MCDiagnostic sev (diagnosticReason e) (diagnosticCode e))
+        (MCDiagnostic sev reason (diagnosticCode e))
         s
-        (formatBulleted ctx $ diagnosticMessage opts e)
+        (formatBulleted $ diagnosticMessage opts e)
 
 sortMsgBag :: Maybe DiagOpts -> Bag (MsgEnvelope e) -> [MsgEnvelope e]
 sortMsgBag mopts = maybeLimit . sortBy (cmp `on` errMsgSpan) . bagToList
@@ -365,7 +409,7 @@ withTiming' :: MonadIO m
             -> m a
 withTiming' logger what force_result prtimings action
   = if logVerbAtLeast logger 2 || logHasDumpFlag logger Opt_D_dump_timings
-    then do whenPrintTimings $
+    then do when printTimingsNotDumpToFile $ liftIO $
               logInfo logger $ withPprStyle defaultUserStyle $
                 text "***" <+> what <> colon
             let ctx = log_default_user_context (logFlags logger)
@@ -383,7 +427,7 @@ withTiming' logger what force_result prtimings action
             let alloc = alloc0 - alloc1
                 time = realToFrac (end - start) * 1e-9
 
-            when (logVerbAtLeast logger 2 && prtimings == PrintTimings)
+            when (logVerbAtLeast logger 2 && printTimingsNotDumpToFile)
                 $ liftIO $ logInfo logger $ withPprStyle defaultUserStyle
                     (text "!!!" <+> what <> colon <+> text "finished in"
                      <+> doublePrec 2 time
@@ -403,7 +447,16 @@ withTiming' logger what force_result prtimings action
             pure r
      else action
 
-    where whenPrintTimings = liftIO . when (prtimings == PrintTimings)
+    where whenPrintTimings =
+            liftIO . when printTimings
+
+          printTimings =
+            prtimings == PrintTimings
+
+          -- Avoid both printing to console and dumping to a file (#20316).
+          printTimingsNotDumpToFile =
+            printTimings
+            && not (log_dump_to_file (logFlags logger))
 
           recordAllocs alloc =
             liftIO $ traceMarkerIO $ "GHC:allocs:" ++ show alloc

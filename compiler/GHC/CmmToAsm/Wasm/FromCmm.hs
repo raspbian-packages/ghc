@@ -26,7 +26,7 @@ import Control.Monad
 import qualified Data.ByteString as BS
 import Data.Foldable
 import Data.Functor
-import qualified Data.IntSet as IS
+import qualified GHC.Data.Word64Set as WS
 import Data.Semigroup
 import Data.String
 import Data.Traversable
@@ -48,6 +48,7 @@ import GHC.Types.ForeignCall
 import GHC.Types.Unique
 import GHC.Types.Unique.FM
 import GHC.Types.Unique.Map
+import GHC.Types.Unique.Supply
 import GHC.Utils.Outputable hiding ((<>))
 import GHC.Utils.Panic
 import GHC.Wasm.ControlFlow.FromCmm
@@ -177,7 +178,7 @@ trouble.
 -}
 globalInfoFromCmmGlobalReg :: WasmTypeTag w -> GlobalReg -> Maybe GlobalInfo
 globalInfoFromCmmGlobalReg t reg = case reg of
-  VanillaReg i _
+  VanillaReg i
     | i >= 1 && i <= 10 -> Just (fromString $ "__R" <> show i, ty_word)
   FloatReg i
     | i >= 1 && i <= 6 ->
@@ -197,7 +198,7 @@ globalInfoFromCmmGlobalReg t reg = case reg of
 
 supportedCmmGlobalRegs :: [GlobalReg]
 supportedCmmGlobalRegs =
-  [VanillaReg i VGcPtr | i <- [1 .. 10]]
+  [VanillaReg i | i <- [1 .. 10]]
     <> [FloatReg i | i <- [1 .. 6]]
     <> [DoubleReg i | i <- [1 .. 6]]
     <> [LongReg i | i <- [1 .. 1]]
@@ -627,6 +628,7 @@ lower_CmmMachOp ::
   WasmCodeGenM
     w
     (SomeWasmExpr w)
+lower_CmmMachOp lbl (MO_RelaxedRead w0) [x] = lower_CmmExpr lbl (CmmLoad x (cmmBits w0) NaturallyAligned)
 lower_CmmMachOp lbl (MO_Add w0) xs = lower_MO_Bin_Homo_Trunc WasmAdd lbl w0 xs
 lower_CmmMachOp lbl (MO_Sub w0) xs = lower_MO_Bin_Homo_Trunc WasmSub lbl w0 xs
 lower_CmmMachOp lbl (MO_Eq w0) xs = lower_MO_Bin_Rel WasmEq lbl (cmmBits w0) xs
@@ -815,7 +817,9 @@ lower_CmmMachOp lbl (MO_SS_Conv w0 w1) xs = lower_MO_SS_Conv lbl w0 w1 xs
 lower_CmmMachOp lbl (MO_UU_Conv w0 w1) xs = lower_MO_UU_Conv lbl w0 w1 xs
 lower_CmmMachOp lbl (MO_XX_Conv w0 w1) xs = lower_MO_UU_Conv lbl w0 w1 xs
 lower_CmmMachOp lbl (MO_FF_Conv w0 w1) xs = lower_MO_FF_Conv lbl w0 w1 xs
-lower_CmmMachOp _ _ _ = panic "lower_CmmMachOp: unreachable"
+lower_CmmMachOp _ mop _ =
+  pprPanic "lower_CmmMachOp: unreachable" $
+    vcat [ text "offending MachOp:" <+> pprMachOp mop ]
 
 -- | Lower a 'CmmLit'. Note that we don't emit 'f32.const' or
 -- 'f64.const' for the time being, and instead emit their relative bit
@@ -872,38 +876,35 @@ lower_CmmReg :: CLabel -> CmmReg -> WasmCodeGenM w (SomeWasmExpr w)
 lower_CmmReg _ (CmmLocal reg) = do
   (reg_i, SomeWasmType ty) <- onCmmLocalReg reg
   pure $ SomeWasmExpr ty $ WasmExpr $ WasmLocalGet ty reg_i
-lower_CmmReg _ (CmmGlobal EagerBlackholeInfo) = do
-  ty_word <- wasmWordTypeM
-  pure $
-    SomeWasmExpr ty_word $
-      WasmExpr $
-        WasmSymConst "__stg_EAGER_BLACKHOLE_info"
-lower_CmmReg _ (CmmGlobal GCEnter1) = do
+lower_CmmReg lbl (CmmGlobal (GlobalRegUse greg reg_use_ty)) = do
   ty_word <- wasmWordTypeM
   ty_word_cmm <- wasmWordCmmTypeM
-  onFuncSym "__stg_gc_enter_1" [] [ty_word_cmm]
-  pure $ SomeWasmExpr ty_word $ WasmExpr $ WasmSymConst "__stg_gc_enter_1"
-lower_CmmReg _ (CmmGlobal GCFun) = do
-  ty_word <- wasmWordTypeM
-  ty_word_cmm <- wasmWordCmmTypeM
-  onFuncSym "__stg_gc_fun" [] [ty_word_cmm]
-  pure $ SomeWasmExpr ty_word $ WasmExpr $ WasmSymConst "__stg_gc_fun"
-lower_CmmReg lbl (CmmGlobal BaseReg) = do
-  platform <- wasmPlatformM
-  lower_CmmExpr lbl $ regTableOffset platform 0
-lower_CmmReg lbl (CmmGlobal reg) = do
-  ty_word <- wasmWordTypeM
-  if
+  case greg of
+    EagerBlackholeInfo ->
+      pure $
+        SomeWasmExpr ty_word $
+          WasmExpr $
+            WasmSymConst "__stg_EAGER_BLACKHOLE_info"
+    GCEnter1 -> do
+      onFuncSym "__stg_gc_enter_1" [] [ty_word_cmm]
+      pure $ SomeWasmExpr ty_word $ WasmExpr $ WasmSymConst "__stg_gc_enter_1"
+    GCFun -> do
+      onFuncSym "__stg_gc_fun" [] [ty_word_cmm]
+      pure $ SomeWasmExpr ty_word $ WasmExpr $ WasmSymConst "__stg_gc_fun"
+    BaseReg -> do
+      platform <- wasmPlatformM
+      lower_CmmExpr lbl $ regTableOffset platform 0
+    _other
       | Just (sym_global, SomeWasmType ty) <-
-          globalInfoFromCmmGlobalReg ty_word reg ->
+          globalInfoFromCmmGlobalReg ty_word greg ->
           pure $ SomeWasmExpr ty $ WasmExpr $ WasmGlobalGet ty sym_global
       | otherwise -> do
           platform <- wasmPlatformM
-          case someWasmTypeFromCmmType $ globalRegType platform reg of
+          case someWasmTypeFromCmmType reg_use_ty of
             SomeWasmType ty -> do
               (WasmExpr ptr_instr, o) <-
                 lower_CmmExpr_Ptr lbl $
-                  get_GlobalReg_addr platform reg
+                  get_GlobalReg_addr platform greg
               pure $
                 SomeWasmExpr ty $
                   WasmExpr $
@@ -1056,6 +1057,28 @@ lower_CMO_Un_Homo lbl op [reg] [x] = do
       x_instr `WasmConcat` WasmCCall op `WasmConcat` WasmLocalSet ty ri
 lower_CMO_Un_Homo _ _ _ _ = panic "lower_CMO_Un_Homo: unreachable"
 
+-- | Lower an unary homogeneous 'CallishMachOp' to a primitive operation.
+lower_CMO_Un_Homo_Prim ::
+  CLabel ->
+  ( forall pre t.
+    WasmTypeTag t ->
+    WasmInstr
+      w
+      (t : pre)
+      (t : pre)
+  ) ->
+  WasmTypeTag t ->
+  [CmmFormal] ->
+  [CmmActual] ->
+  WasmCodeGenM w (WasmStatements w)
+lower_CMO_Un_Homo_Prim lbl op ty [reg] [x] = do
+  (ri, _) <- onCmmLocalReg reg
+  WasmExpr x_instr <- lower_CmmExpr_Typed lbl ty x
+  pure $
+    WasmStatements $
+      x_instr `WasmConcat` op ty `WasmConcat` WasmLocalSet ty ri
+lower_CMO_Un_Homo_Prim _ _ _ _ _ = panic "lower_CMO_Bin_Homo_Prim: unreachable"
+
 -- | Lower a binary homogeneous 'CallishMachOp' to a ccall.
 lower_CMO_Bin_Homo ::
   CLabel ->
@@ -1159,8 +1182,8 @@ lower_CallishMachOp lbl MO_F64_Log rs xs = lower_CMO_Un_Homo lbl "log" rs xs
 lower_CallishMachOp lbl MO_F64_Log1P rs xs = lower_CMO_Un_Homo lbl "log1p" rs xs
 lower_CallishMachOp lbl MO_F64_Exp rs xs = lower_CMO_Un_Homo lbl "exp" rs xs
 lower_CallishMachOp lbl MO_F64_ExpM1 rs xs = lower_CMO_Un_Homo lbl "expm1" rs xs
-lower_CallishMachOp lbl MO_F64_Fabs rs xs = lower_CMO_Un_Homo lbl "fabs" rs xs
-lower_CallishMachOp lbl MO_F64_Sqrt rs xs = lower_CMO_Un_Homo lbl "sqrt" rs xs
+lower_CallishMachOp lbl MO_F64_Fabs rs xs = lower_CMO_Un_Homo_Prim lbl WasmAbs TagF64 rs xs
+lower_CallishMachOp lbl MO_F64_Sqrt rs xs = lower_CMO_Un_Homo_Prim lbl WasmSqrt TagF64 rs xs
 lower_CallishMachOp lbl MO_F32_Pwr rs xs = lower_CMO_Bin_Homo lbl "powf" rs xs
 lower_CallishMachOp lbl MO_F32_Sin rs xs = lower_CMO_Un_Homo lbl "sinf" rs xs
 lower_CallishMachOp lbl MO_F32_Cos rs xs = lower_CMO_Un_Homo lbl "cosf" rs xs
@@ -1183,11 +1206,12 @@ lower_CallishMachOp lbl MO_F32_Log1P rs xs =
 lower_CallishMachOp lbl MO_F32_Exp rs xs = lower_CMO_Un_Homo lbl "expf" rs xs
 lower_CallishMachOp lbl MO_F32_ExpM1 rs xs =
   lower_CMO_Un_Homo lbl "expm1f" rs xs
-lower_CallishMachOp lbl MO_F32_Fabs rs xs = lower_CMO_Un_Homo lbl "fabsf" rs xs
-lower_CallishMachOp lbl MO_F32_Sqrt rs xs = lower_CMO_Un_Homo lbl "sqrtf" rs xs
+lower_CallishMachOp lbl MO_F32_Fabs rs xs = lower_CMO_Un_Homo_Prim lbl WasmAbs TagF32 rs xs
+lower_CallishMachOp lbl MO_F32_Sqrt rs xs = lower_CMO_Un_Homo_Prim lbl WasmSqrt TagF32 rs xs
 lower_CallishMachOp lbl (MO_UF_Conv w0) rs xs = lower_MO_UF_Conv lbl w0 rs xs
-lower_CallishMachOp _ MO_ReadBarrier _ _ = pure $ WasmStatements WasmNop
-lower_CallishMachOp _ MO_WriteBarrier _ _ = pure $ WasmStatements WasmNop
+lower_CallishMachOp _ MO_AcquireFence _ _ = pure $ WasmStatements WasmNop
+lower_CallishMachOp _ MO_ReleaseFence _ _ = pure $ WasmStatements WasmNop
+lower_CallishMachOp _ MO_SeqCstFence _ _ = pure $ WasmStatements WasmNop
 lower_CallishMachOp _ MO_Touch _ _ = pure $ WasmStatements WasmNop
 lower_CallishMachOp _ (MO_Prefetch_Data {}) _ _ = pure $ WasmStatements WasmNop
 lower_CallishMachOp lbl (MO_Memcpy {}) [] xs = do
@@ -1331,7 +1355,7 @@ lower_CmmUnsafeForeignCall_Drop ::
   [CmmActual] ->
   WasmCodeGenM w (WasmStatements w)
 lower_CmmUnsafeForeignCall_Drop lbl sym_callee ret_cmm_ty arg_exprs = do
-  ret_uniq <- wasmUniq
+  ret_uniq <- getUniqueM
   let ret_local = LocalReg ret_uniq ret_cmm_ty
   lower_CmmUnsafeForeignCall
     lbl
@@ -1379,7 +1403,7 @@ lower_CmmUnsafeForeignCall lbl target mb_hints ret_info ret_locals arg_exprs = d
           (reg_i, SomeWasmType reg_ty) <- onCmmLocalReg reg
           pure $
             SomeWasmPostCCall (reg_ty `TypeListCons` acc_tys) $
-              case (# ret_hint, cmmRegWidth platform $ CmmLocal reg #) of
+              case (# ret_hint, cmmRegWidth $ CmmLocal reg #) of
                 (# SignedHint, W8 #) ->
                   acc_instr
                     `WasmConcat` WasmConst reg_ty 0xFF
@@ -1458,7 +1482,7 @@ lower_CmmAction lbl act = do
       (i, SomeWasmType ty_reg) <- onCmmLocalReg reg
       WasmExpr instrs <- lower_CmmExpr_Typed lbl ty_reg e
       pure $ WasmStatements $ instrs `WasmConcat` WasmLocalSet ty_reg i
-    CmmAssign (CmmGlobal reg) e
+    CmmAssign (CmmGlobal (GlobalRegUse reg _)) e
       | BaseReg <- reg -> pure $ WasmStatements WasmNop
       | Just (sym_global, SomeWasmType ty_reg) <-
           globalInfoFromCmmGlobalReg ty_word reg -> do
@@ -1531,9 +1555,11 @@ lower_CmmGraph :: CLabel -> CmmGraph -> WasmCodeGenM w (FuncBody w)
 lower_CmmGraph lbl g = do
   ty_word <- wasmWordTypeM
   platform <- wasmPlatformM
+  us <- getUniqueSupplyM
   body <-
     structuredControl
       platform
+      us
       (\_ -> lower_CmmExpr_Typed lbl ty_word)
       (lower_CmmActions lbl)
       g
@@ -1551,7 +1577,7 @@ onTopSym lbl = case sym_vis of
   SymDefault -> wasmModifyM $ \s ->
     s
       { defaultSyms =
-          IS.insert
+          WS.insert
             (getKey $ getUnique sym)
             $ defaultSyms s
       }

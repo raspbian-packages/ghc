@@ -20,6 +20,8 @@ import GHC.Core.Type
 import GHC.Core.Opt.WorkWrap.Utils
 import GHC.Core.SimpleOpt
 
+import GHC.Data.FastString
+
 import GHC.Types.Var
 import GHC.Types.Id
 import GHC.Types.Id.Info
@@ -33,7 +35,6 @@ import GHC.Types.Unique
 import GHC.Utils.Misc
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
-import GHC.Utils.Panic.Plain
 import GHC.Utils.Monad
 import GHC.Core.DataCon
 
@@ -68,9 +69,7 @@ info for exported values).
 wwTopBinds :: WwOpts -> UniqSupply -> CoreProgram -> CoreProgram
 
 wwTopBinds ww_opts us top_binds
-  = initUs_ us $ do
-    top_binds' <- mapM (wwBind ww_opts) top_binds
-    return (concat top_binds')
+  = initUs_ us $ concatMapM (wwBind ww_opts) top_binds
 
 {-
 ************************************************************************
@@ -821,7 +820,7 @@ mkWWBindPair ww_opts fn_id fn_info fn_args fn_body work_uniq div
                    NoInline _  -> inl_act fn_inl_prag
                    _           -> inl_act wrap_prag
 
-    work_prag = InlinePragma { inl_src = SourceText "{-# INLINE"
+    work_prag = InlinePragma { inl_src = SourceText $ fsLit "{-# INLINE"
                              , inl_inline = fn_inline_spec
                              , inl_sat    = Nothing
                              , inl_act    = work_act
@@ -830,8 +829,8 @@ mkWWBindPair ww_opts fn_id fn_info fn_args fn_body work_uniq div
       -- inl_act:    see Note [Worker activation]
       -- inl_rule:   it does not make sense for workers to be constructorlike.
 
-    work_join_arity | isJoinId fn_id = Just join_arity
-                    | otherwise      = Nothing
+    work_join_arity | isJoinId fn_id = JoinPoint join_arity
+                    | otherwise      = NotJoinPoint
       -- worker is join point iff wrapper is join point
       -- (see Note [Don't w/w join points for CPR])
 
@@ -889,7 +888,7 @@ mkStrWrapperInlinePrag :: InlinePragma -> [CoreRule] -> InlinePragma
 mkStrWrapperInlinePrag (InlinePragma { inl_inline = fn_inl
                                      , inl_act    = fn_act
                                      , inl_rule   = rule_info }) rules
-  = InlinePragma { inl_src    = SourceText "{-# INLINE"
+  = InlinePragma { inl_src    = SourceText $ fsLit "{-# INLINE"
                  , inl_sat    = Nothing
 
                  , inl_inline = fn_inl

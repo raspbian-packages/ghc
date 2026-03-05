@@ -133,7 +133,7 @@ readPkgConfigDb verbosity progdb = handle ioErrorHandler $ do
     getIndividualVersion pkgConfig pkg = do
        (pkgVersion, _errs, exitCode) <-
                getProgramInvocationOutputAndErrors verbosity
-                 (programInvocation pkgConfig ["--modversion",pkg])
+                 (programInvocation pkgConfig ["--modversion", pkg])
        return $ case exitCode of
          ExitSuccess -> Just (pkg, pkgVersion)
          _ -> Nothing

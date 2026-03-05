@@ -14,9 +14,9 @@
 #include "RaiseAsync.h"
 
 import CLOSURE ghczmprim_GHCziTypes_True_closure;
-import CLOSURE base_GHCziExceptionziType_divZZeroException_closure;
-import CLOSURE base_GHCziExceptionziType_underflowException_closure;
-import CLOSURE base_GHCziExceptionziType_overflowException_closure;
+import CLOSURE ghczminternal_GHCziInternalziExceptionziType_divZZeroException_closure;
+import CLOSURE ghczminternal_GHCziInternalziExceptionziType_underflowException_closure;
+import CLOSURE ghczminternal_GHCziInternalziExceptionziType_overflowException_closure;
 #if !defined(UnregisterisedCompiler)
 import CLOSURE CATCHF_PUSHED_ctr;
 import CLOSURE RtsFlags;
@@ -351,9 +351,9 @@ stg_killThreadzh (P_ target, P_ exception)
         if (msg == NULL) {
             return ();
         } else {
-            StgTSO_why_blocked(CurrentTSO) = BlockedOnMsgThrowTo;
             updateRemembSetPushPtr(StgTSO_block_info(CurrentTSO));
             StgTSO_block_info(CurrentTSO) = msg;
+            %release StgTSO_why_blocked(CurrentTSO) = BlockedOnMsgThrowTo;
             // we must block, and unlock the message before returning
             jump stg_block_throwto (target, exception);
         }
@@ -535,15 +535,19 @@ retry_pop_stack:
             // be per-thread.
             CInt[rts_stop_on_exception] = 0;
             ("ptr" ioAction) = ccall deRefStablePtr (W_[rts_breakpoint_io_action] "ptr");
-            Sp = Sp - WDS(9);
-            Sp(8) = exception;
-            Sp(7) = stg_raise_ret_info;
-            Sp(6) = exception;
-            Sp(5) = ghczmprim_GHCziTypes_True_closure; // True <=> an exception
-            Sp(4) = stg_ap_ppv_info;
-            Sp(3) = 0;
-            Sp(2) = stg_ap_n_info;
-            Sp(1) = 0;
+            Sp = Sp - WDS(13);
+            Sp(12) = exception;
+            Sp(11) = stg_raise_ret_info;
+            Sp(10) = exception;
+            Sp(9)  = ghczmprim_GHCziTypes_True_closure; // True <=> an exception
+            Sp(8)  = stg_ap_ppv_info;
+            Sp(7)  = 0;
+            Sp(6)  = stg_ap_n_info;
+            Sp(5)  = 0;
+            Sp(4)  = stg_ap_n_info;
+            Sp(3)  = 0;
+            Sp(2)  = stg_ap_n_info;
+            Sp(1)  = 0;
             R1 = ioAction;
             jump RET_LBL(stg_ap_n) [R1];
         }
@@ -648,17 +652,17 @@ stg_raiseIOzh (P_ exception)
 
 stg_raiseDivZZerozh ()
 {
-    jump stg_raisezh(base_GHCziExceptionziType_divZZeroException_closure);
+    jump stg_raisezh(ghczminternal_GHCziInternalziExceptionziType_divZZeroException_closure);
 }
 
 stg_raiseUnderflowzh ()
 {
-    jump stg_raisezh(base_GHCziExceptionziType_underflowException_closure);
+    jump stg_raisezh(ghczminternal_GHCziInternalziExceptionziType_underflowException_closure);
 }
 
 stg_raiseOverflowzh ()
 {
-    jump stg_raisezh(base_GHCziExceptionziType_overflowException_closure);
+    jump stg_raisezh(ghczminternal_GHCziInternalziExceptionziType_overflowException_closure);
 }
 
 /* The FFI doesn't support variadic C functions so we can't directly expose

@@ -1,4 +1,3 @@
-{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE MultiWayIf #-}
 
 -----------------------------------------------------------------------------
@@ -118,7 +117,7 @@ import GHC.Prelude
 import GHC.Platform
 import GHC.Platform.Profile
 
-import GHC.StgToCmm.ArgRep    ( slowCallPattern , toArgRep , argRepString )
+import GHC.StgToCmm.ArgRep    ( slowCallPattern, toArgRepOrV, argRepString )
 import GHC.StgToCmm.Closure
 import GHC.StgToCmm.Config
 import {-# SOURCE #-} GHC.StgToCmm.Foreign   ( emitPrimCall )
@@ -157,6 +156,7 @@ import GHC.Types.Id.Info
 import GHC.StgToCmm.Env (getCgInfo_maybe)
 import Data.Coerce (coerce)
 import GHC.Utils.Json
+import GHC.Utils.Unique (anyOfUnique)
 
 -----------------------------------------------------------------------------
 --
@@ -586,7 +586,7 @@ tickyDirectCall :: RepArity -> [StgArg] -> FCode ()
 tickyDirectCall arity args
   | args `lengthIs` arity = tickyKnownCallExact
   | otherwise = do tickyKnownCallExtraArgs
-                   tickySlowCallPat (map argPrimRep (drop arity args))
+                   tickySlowCallPat (drop arity args)
 
 tickyKnownCallTooFewArgs :: FCode ()
 tickyKnownCallTooFewArgs = ifTicky $ bumpTickyCounter (fsLit "KNOWN_CALL_TOO_FEW_ARGS_ctr")
@@ -609,12 +609,12 @@ tickySlowCall lf_info args = do
  if isKnownFun lf_info
    then tickyKnownCallTooFewArgs
    else tickyUnknownCall
- tickySlowCallPat (map argPrimRep args)
+ tickySlowCallPat args
 
-tickySlowCallPat :: [PrimRep] -> FCode ()
+tickySlowCallPat :: [StgArg] -> FCode ()
 tickySlowCallPat args = ifTicky $ do
   platform <- profilePlatform <$> getProfile
-  let argReps = map (toArgRep platform) args
+  let argReps = map (toArgRepOrV platform . stgArgRep1) args
       (_, n_matched) = slowCallPattern argReps
   if n_matched > 0 && args `lengthIs` n_matched
      then bumpTickyLbl $ mkRtsSlowFastTickyCtrLabel $ concatMap (map Data.Char.toLower . argRepString) argReps
@@ -809,7 +809,7 @@ bumpTickyEntryCount lbl = do
 bumpTickyAllocd :: CLabel -> Int -> FCode ()
 bumpTickyAllocd lbl bytes = do
   platform <- getPlatform
-  bumpTickyLitBy (cmmLabelOffB lbl (pc_OFFSET_StgEntCounter_entry_count (platformConstants platform))) bytes
+  bumpTickyLitBy (cmmLabelOffB lbl (pc_OFFSET_StgEntCounter_allocd (platformConstants platform))) bytes
 
 bumpTickyTagSkip :: CLabel -> FCode ()
 bumpTickyTagSkip lbl = do
@@ -829,25 +829,34 @@ bumpTickyLit :: CmmLit -> FCode ()
 bumpTickyLit lhs = bumpTickyLitBy lhs 1
 
 bumpTickyLitBy :: CmmLit -> Int -> FCode ()
-bumpTickyLitBy lhs n = do
-  platform <- getPlatform
-  emit (addToMem (bWord platform) (CmmLit lhs) n)
+bumpTickyLitBy lhs n = emitAddToMem (CmmLit lhs) n
 
 bumpTickyLitByE :: CmmLit -> CmmExpr -> FCode ()
-bumpTickyLitByE lhs e = do
-  platform <- getPlatform
-  emit (addToMemE (bWord platform) (CmmLit lhs) e)
+bumpTickyLitByE lhs e = emitAddToMemE (CmmLit lhs) e
 
 bumpHistogram :: FastString -> Int -> FCode ()
 bumpHistogram lbl n = do
     platform <- getPlatform
     let offset = n `min` (pc_TICKY_BIN_COUNT (platformConstants platform) - 1)
-    emit (addToMem (bWord platform)
-           (cmmIndexExpr platform
+    let addr =
+           cmmIndexExpr platform
                 (wordWidth platform)
                 (CmmLit (CmmLabel (mkRtsCmmDataLabel lbl)))
-                (CmmLit (CmmInt (fromIntegral offset) (wordWidth platform))))
-           1)
+                (CmmLit (CmmInt (fromIntegral offset) (wordWidth platform)))
+    emitAddToMem addr 1
+
+emitAddToMem :: CmmExpr -> Int -> FCode ()
+emitAddToMem lhs n = do
+  platform <- getPlatform
+  emitAddToMemE lhs (mkIntExpr platform n)
+
+emitAddToMemE :: CmmExpr -> CmmExpr -> FCode ()
+emitAddToMemE lhs n = do
+  platform <- getPlatform
+  val <- newTemp (bWord platform)
+  emitAtomicRead MemOrderRelaxed val lhs
+  let val' = cmmOffsetExpr platform (CmmReg (CmmLocal val)) n
+  emitAtomicWrite MemOrderRelaxed lhs val'
 
 ------------------------------------------------------------------
 -- Showing the "type category" for ticky-ticky profiling
@@ -884,20 +893,19 @@ showTypeCategory ty
   | otherwise = case tcSplitTyConApp_maybe ty of
   Nothing -> '.'
   Just (tycon, _) ->
-    let anyOf us = getUnique tycon `elem` us in
     case () of
-      _ | anyOf [fUNTyConKey] -> '>'
-        | anyOf [charTyConKey] -> 'C'
-        | anyOf [charPrimTyConKey] -> 'c'
-        | anyOf [doubleTyConKey] -> 'D'
-        | anyOf [doublePrimTyConKey] -> 'd'
-        | anyOf [floatTyConKey] -> 'F'
-        | anyOf [floatPrimTyConKey] -> 'f'
-        | anyOf [intTyConKey, int8TyConKey, int16TyConKey, int32TyConKey, int64TyConKey] -> 'I'
-        | anyOf [intPrimTyConKey, int8PrimTyConKey, int16PrimTyConKey, int32PrimTyConKey, int64PrimTyConKey] -> 'i'
-        | anyOf [wordTyConKey, word8TyConKey, word16TyConKey, word32TyConKey, word64TyConKey] -> 'W'
-        | anyOf [wordPrimTyConKey, word8PrimTyConKey, word16PrimTyConKey, word32PrimTyConKey, word64PrimTyConKey] -> 'w'
-        | anyOf [listTyConKey] -> 'L'
+      _ | anyOfUnique tycon [fUNTyConKey] -> '>'
+        | anyOfUnique tycon [charTyConKey] -> 'C'
+        | anyOfUnique tycon [charPrimTyConKey] -> 'c'
+        | anyOfUnique tycon [doubleTyConKey] -> 'D'
+        | anyOfUnique tycon [doublePrimTyConKey] -> 'd'
+        | anyOfUnique tycon [floatTyConKey] -> 'F'
+        | anyOfUnique tycon [floatPrimTyConKey] -> 'f'
+        | anyOfUnique tycon [intTyConKey, int8TyConKey, int16TyConKey, int32TyConKey, int64TyConKey] -> 'I'
+        | anyOfUnique tycon [intPrimTyConKey, int8PrimTyConKey, int16PrimTyConKey, int32PrimTyConKey, int64PrimTyConKey] -> 'i'
+        | anyOfUnique tycon [wordTyConKey, word8TyConKey, word16TyConKey, word32TyConKey, word64TyConKey] -> 'W'
+        | anyOfUnique tycon [wordPrimTyConKey, word8PrimTyConKey, word16PrimTyConKey, word32PrimTyConKey, word64PrimTyConKey] -> 'w'
+        | anyOfUnique tycon [listTyConKey] -> 'L'
         | isUnboxedTupleTyCon tycon -> 't'
         | isTupleTyCon tycon       -> 'T'
         | isPrimTyCon tycon        -> 'P'

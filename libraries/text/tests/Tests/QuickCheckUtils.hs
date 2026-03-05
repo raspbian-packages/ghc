@@ -2,8 +2,12 @@
 -- instances, and comparison functions, so we can focus on the actual properties
 -- in the 'Tests.Properties' module.
 --
-{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE DeriveFunctor #-}
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE NamedFieldPuns #-}
+{-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 {-# OPTIONS_GHC -fno-warn-orphans #-}
 
@@ -30,13 +34,17 @@ module Tests.QuickCheckUtils
     ) where
 
 import Control.Arrow ((***))
-import Control.DeepSeq (NFData (..), deepseq)
-import Control.Exception (bracket)
+import Control.Monad (when)
 import Data.Char (isSpace)
+import Data.IORef (writeIORef)
 import Data.Text.Foreign (I8)
 import Data.Text.Lazy.Builder.RealFloat (FPFormat(..))
 import Data.Word (Word8, Word16)
-import Test.QuickCheck (Arbitrary(..), arbitraryUnicodeChar, arbitraryBoundedEnum, getUnicodeString, arbitrarySizedIntegral, shrinkIntegral, Property, ioProperty, discard, counterexample, scale, (===), (.&&.), NonEmptyList(..))
+import qualified GHC.IO.Buffer as GIO
+import qualified GHC.IO.Handle.Internals as GIO
+import qualified GHC.IO.Handle.Types as GIO
+import GHC.IO.Encoding.Types (TextEncoding(textEncodingName))
+import Test.QuickCheck (Arbitrary(..), arbitraryUnicodeChar, arbitraryBoundedEnum, getUnicodeString, arbitrarySizedIntegral, shrinkIntegral, Property, ioProperty, counterexample, scale, (.&&.), NonEmptyList(..), forAllShrink)
 import Test.QuickCheck.Gen (Gen, choose, chooseAny, elements, frequency, listOf, oneof, resize, sized)
 import Tests.Utils
 import qualified Data.ByteString as B
@@ -52,6 +60,9 @@ import qualified System.IO as IO
 
 genWord8 :: Gen Word8
 genWord8 = chooseAny
+
+genWord16 :: Gen Word16
+genWord16 = chooseAny
 
 instance Arbitrary I8 where
     arbitrary     = arbitrarySizedIntegral
@@ -213,18 +224,20 @@ instance Arbitrary (Precision Double) where
     arbitrary = arbitraryPrecision 22
     shrink    = map Precision . shrink . precision undefined
 
+#if !MIN_VERSION_QuickCheck(2,14,3)
 instance Arbitrary IO.Newline where
     arbitrary = oneof [return IO.LF, return IO.CRLF]
 
 instance Arbitrary IO.NewlineMode where
     arbitrary = IO.NewlineMode <$> arbitrary <*> arbitrary
+#endif
 
 instance Arbitrary IO.BufferMode where
     arbitrary = oneof [ return IO.NoBuffering,
                         return IO.LineBuffering,
                         return (IO.BlockBuffering Nothing),
                         (IO.BlockBuffering . Just . (+1) . fromIntegral) `fmap`
-                        (arbitrary :: Gen Word16) ]
+                        genWord16 ]
 
 -- This test harness is complex!  What property are we checking?
 --
@@ -237,33 +250,55 @@ instance Arbitrary IO.BufferMode where
 --   sometimes contain line endings.)
 -- * Newline translation mode.
 -- * Buffering.
-write_read :: (NFData a, Eq a, Show a)
-           => ([b] -> a)
-           -> ((Char -> Bool) -> a -> b)
-           -> (IO.Handle -> a -> IO ())
-           -> (IO.Handle -> IO a)
-           -> IO.NewlineMode
-           -> IO.BufferMode
-           -> [a]
-           -> Property
-write_read _ _ _ _ (IO.NewlineMode IO.LF IO.CRLF) _ _ = discard
-write_read unline filt writer reader nl buf ts = ioProperty $
-    (===t) <$> act
+write_read :: forall a.
+  (Eq a, Show a)
+  => Gen a
+  -> (a -> [a])
+  -> (a -> a) -- ^ replace '\n' with '\r\n' (for multiline tests) or append '\r' (for single-line tests)
+  -> (IO.Handle -> a -> IO ())
+  -> (IO.Handle -> IO a)
+  -> Property
+write_read genTxt shrinkTxt expandNl writer reader
+  = forAllShrink genEncoding shrinkEncoding propTest
   where
-    t = unline . map (filt (not . (`elem` "\r\n"))) $ ts
+  propTest :: TextEncoding -> IO.BufferMode -> Property
+  propTest enc mode = forAllShrink genTxt shrinkTxt $ \txt -> ioProperty $ do
+    file <- emptyTempFile
+    let with nl k = IO.withFile file IO.ReadWriteMode $ \h -> do
+          IO.hSetEncoding h enc
+          IO.hSetBuffering h mode
+          IO.hSetNewlineMode h nl
+          setSmallBuffer h
+          k h
+        -- Put a very small buffer in Handle to easily test boundary conditions in `writeBlocks`
+        setSmallBuffer h = GIO.withHandle_ "setSmallBuffer" h $ \h_ -> do
+          buf <- GIO.newCharBuffer 9 GIO.WriteBuffer
+          writeIORef (GIO.haCharBuffer h_) buf
+        readExpecting h txt' msg = do
+          out <- reader h
+          when (txt' /= out) $ error (show txt' ++ " /= " ++ show out ++ msg)
+    -- 'reader' may be 'hGetContents', which closes the handle
+    -- So we reopen a new file every time.
 
-    act = withTempFile $ \path h -> do
-            IO.hSetEncoding h IO.utf8
-            IO.hSetNewlineMode h nl
-            IO.hSetBuffering h buf
-            () <- writer h t
-            IO.hClose h
-            bracket (IO.openFile path IO.ReadMode) IO.hClose $ \h' -> do
-              IO.hSetEncoding h' IO.utf8
-              IO.hSetNewlineMode h' nl
-              IO.hSetBuffering h' buf
-              r <- reader h'
-              r `deepseq` return r
+    -- Test with CRLF encoding
+    with (IO.NewlineMode IO.CRLF IO.CRLF) $ \h -> do
+      writer h txt
+      IO.hSeek h IO.AbsoluteSeek 0
+      readExpecting h txt " (at location 1)"
+
+    -- Re-read without CRLF decoding to check that we did encode CRLF correctly
+    with (IO.NewlineMode IO.LF IO.LF) $ \h -> do
+      readExpecting h (expandNl txt) " (at location 2)"
+
+    -- Test without CRLF encoding
+    with (IO.NewlineMode IO.LF IO.LF) $ \h -> do
+      IO.hSetFileSize h 0
+      writer h txt
+      IO.hSeek h IO.AbsoluteSeek 0
+      readExpecting h txt " (at location 3)"
+
+  genEncoding = elements [IO.utf8, IO.utf8_bom, IO.utf16, IO.utf16le, IO.utf16be, IO.utf32, IO.utf32le, IO.utf32be]
+  shrinkEncoding enc = if textEncodingName enc == textEncodingName IO.utf8 then [] else [IO.utf8]
 
 -- Generate various Unicode space characters with high probability
 arbitrarySpacyChar :: Gen Char

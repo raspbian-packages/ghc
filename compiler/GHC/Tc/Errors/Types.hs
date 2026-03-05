@@ -1,11 +1,16 @@
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE KindSignatures #-}
+{-# LANGUAGE DataKinds #-}
+{-# LANGUAGE UndecidableInstances #-}
+{-# LANGUAGE TypeApplications #-}
 
 module GHC.Tc.Errors.Types (
   -- * Main types
     TcRnMessage(..)
+  , TcRnMessageOpts(..)
   , mkTcRnUnknownMessage
   , TcRnMessageDetailed(..)
   , TypeDataForbids(..)
@@ -15,6 +20,7 @@ module GHC.Tc.Errors.Types (
   , ShadowedNameProvenance(..)
   , RecordFieldPart(..)
   , IllegalNewtypeReason(..)
+  , BadRecordUpdateReason(..)
   , InjectivityErrReason(..)
   , HasKinds(..)
   , hasKinds
@@ -69,6 +75,7 @@ module GHC.Tc.Errors.Types (
   , HoleFitDispConfig(..)
   , RelevantBindings(..), pprRelevantBindings
   , PromotionErr(..), pprPECategory, peCategory
+  , TermLevelUseErr(..), teCategory
   , NotInScopeError(..), mkTcRnNotInScope
   , ImportError(..)
   , HoleError(..)
@@ -78,74 +85,158 @@ module GHC.Tc.Errors.Types (
   , ExpectedBackends
   , ArgOrResult(..)
   , MatchArgsContext(..), MatchArgBadMatches(..)
+  , PragmaWarningInfo(..)
+  , EmptyStatementGroupErrReason(..)
+  , UnexpectedStatement(..)
+  , DeclSort(..)
+  , NonStandardGuards(..)
+  , RuleLhsErrReason(..)
+  , HsigShapeMismatchReason(..)
+  , WrongThingSort(..)
+  , StageCheckReason(..)
+  , UninferrableTyVarCtx(..)
+  , PatSynInvalidRhsReason(..)
+  , BadFieldAnnotationReason(..)
+  , SuperclassCycle(..)
+  , SuperclassCycleDetail(..)
+  , RoleValidationFailedReason(..)
+  , DisabledClassExtension(..)
+  , TyFamsDisabledReason(..)
+  , TypeApplication(..)
+  , BadEmptyCaseReason(..)
+  , HsTypeOrSigType(..)
+  , HsTyVarBndrExistentialFlag(..)
+  , TySynCycleTyCons
+  , BadImportKind(..)
+  , DodgyImportsReason (..)
+  , ImportLookupReason (..)
+  , UnusedImportReason (..)
+  , UnusedImportName (..)
+  , NestedForallsContextsIn(..)
+  , UnusedNameProv(..)
+  , NonCanonicalDefinition(..)
+  , NonCanonical_Monoid(..)
+  , NonCanonical_Monad(..)
+
+    -- * Errors for hs-boot and signature files
+  , BadBootDecls(..)
+  , MissingBootThing(..), missingBootThing
+  , BootMismatch(..)
+  , BootMismatchWhat(..)
+  , BootTyConMismatch(..)
+  , BootAxiomBranchMismatch(..)
+  , BootClassMismatch(..)
+  , BootMethodMismatch(..)
+  , BootATMismatch(..)
+  , BootDataMismatch(..)
+  , BootDataConMismatch(..)
+  , SynAbstractDataError(..)
+  , BootListMismatch(..), BootListMismatches
+
+    -- * Class and family instance errors
+  , IllegalInstanceReason(..)
+  , IllegalClassInstanceReason(..)
+  , IllegalInstanceHeadReason(..)
+  , IllegalHasFieldInstance(..)
+  , CoverageProblem(..), FailedCoverageCondition(..)
+  , IllegalFamilyInstanceReason(..)
+  , InvalidFamInstQTv(..), InvalidFamInstQTvReason(..)
+  , InvalidAssoc(..), InvalidAssocInstance(..)
+  , InvalidAssocDefault(..), AssocDefaultBadArgs(..)
+
+    -- * Template Haskell errors
+  , THError(..), THSyntaxError(..), THNameError(..)
+  , THReifyError(..), TypedTHError(..)
+  , SpliceFailReason(..), RunSpliceFailReason(..)
+  , AddTopDeclsError(..)
   , ConversionFailReason(..)
   , UnrepresentableTypeDescr(..)
   , LookupTHInstNameErrReason(..)
   , SplicePhase(..)
   , THDeclDescriptor(..)
-  , RunSpliceFailReason(..)
   , ThingBeingConverted(..)
   , IllegalDecls(..)
-  , EmptyStatementGroupErrReason(..)
-  , UnexpectedStatement(..)
+
+  -- * Zonker errors
+  , ZonkerMessage(..)
+
+  -- FFI Errors
+  , IllegalForeignTypeReason(..)
+  , TypeCannotBeMarshaledReason(..)
   ) where
 
 import GHC.Prelude
 
 import GHC.Hs
-import {-# SOURCE #-} GHC.Tc.Types (TcIdSigInfo, TcTyThing)
-import {-# SOURCE #-} GHC.Tc.Errors.Hole.FitTypes (HoleFit)
+import GHC.Tc.Errors.Types.PromotionErr
+import GHC.Tc.Errors.Hole.FitTypes (HoleFit)
 import GHC.Tc.Types.Constraint
 import GHC.Tc.Types.Evidence (EvBindsVar)
 import GHC.Tc.Types.Origin ( CtOrigin (ProvCtxtOrigin), SkolemInfoAnon (SigSkol)
                            , UserTypeCtxt (PatSynCtxt), TyVarBndrs, TypedThing
-                           , FixedRuntimeRepOrigin(..) )
+                           , FixedRuntimeRepOrigin(..), InstanceWhat )
 import GHC.Tc.Types.Rank (Rank)
-import GHC.Tc.Utils.TcType (IllegalForeignTypeReason, TcType)
+import GHC.Tc.Utils.TcType (TcType, TcSigmaType, TcPredType,
+                            PatersonCondFailure, PatersonCondFailureContext)
+import GHC.Types.Basic
 import GHC.Types.Error
+import GHC.Types.Avail
 import GHC.Types.Hint (UntickedPromotedThing(..))
 import GHC.Types.ForeignCall (CLabelString)
-import GHC.Types.Name (Name, OccName, getSrcLoc, getSrcSpan)
+import GHC.Types.Id.Info ( RecSelParent(..) )
+import GHC.Types.Name (NamedThing(..), Name, OccName, getSrcLoc, getSrcSpan)
 import qualified GHC.Types.Name.Occurrence as OccName
 import GHC.Types.Name.Reader
+import GHC.Types.SourceFile (HsBootOrSig(..))
 import GHC.Types.SrcLoc
 import GHC.Types.TyThing (TyThing)
-import GHC.Types.Var (Id, TyCoVar, TyVar, TcTyVar)
+import GHC.Types.Var (Id, TyCoVar, TyVar, TcTyVar, CoVar, Specificity)
 import GHC.Types.Var.Env (TidyEnv)
 import GHC.Types.Var.Set (TyVarSet, VarSet)
 import GHC.Unit.Types (Module)
 import GHC.Utils.Outputable
-import GHC.Core.Class (Class, ClassMinimalDef)
+import GHC.Core.Class (Class, ClassMinimalDef, ClassOpItem, ClassATItem)
+import GHC.Core.Coercion (Coercion)
 import GHC.Core.Coercion.Axiom (CoAxBranch)
 import GHC.Core.ConLike (ConLike)
-import GHC.Core.DataCon (DataCon)
+import GHC.Core.DataCon (DataCon, FieldLabel)
 import GHC.Core.FamInstEnv (FamInst)
-import GHC.Core.InstEnv (ClsInst)
+import GHC.Core.InstEnv (LookupInstanceErrReason, ClsInst, DFunId)
 import GHC.Core.PatSyn (PatSyn)
 import GHC.Core.Predicate (EqRel, predTypeEqRel)
-import GHC.Core.TyCon (TyCon, TyConFlavour)
-import GHC.Core.Type (Kind, Type, ThetaType, PredType)
+import GHC.Core.TyCon (TyCon, Role, FamTyConFlav, AlgTyConRhs)
+import GHC.Core.Type (Kind, Type, ThetaType, PredType, ErrorMsgType, ForAllTyFlag, ForAllTyBinder)
+
 import GHC.Driver.Backend (Backend)
 import GHC.Unit.State (UnitState)
-import GHC.Types.Basic
-import GHC.Utils.Misc (capitalise, filterOut)
+import GHC.Utils.Misc (filterOut)
 import qualified GHC.LanguageExtensions as LangExt
 import GHC.Data.FastString (FastString)
+import GHC.Data.Pair
 import GHC.Exception.Type (SomeException)
 
 import Language.Haskell.Syntax.Basic (FieldLabelString(..))
 
 import qualified Data.List.NonEmpty as NE
 import           Data.Typeable (Typeable)
-import GHC.Unit.Module.Warnings (WarningTxt)
+import GHC.Unit.Module.Warnings (WarningCategory, WarningTxt)
 import qualified Language.Haskell.TH.Syntax as TH
 
 import GHC.Generics ( Generic )
+import GHC.Types.Name.Env (NameEnv)
+import GHC.Iface.Errors.Types
+import GHC.Unit.Module.ModIface (ModIface)
+import GHC.Tc.Types.TH
+import GHC.Tc.Types.BasicTypes
 
-{-
-Note [Migrating TcM Messages]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
+
+data TcRnMessageOpts = TcRnMessageOpts { tcOptsShowContext :: !Bool -- ^ Whether we show the error context or not
+                                       , tcOptsIfaceOpts   :: !IfaceMessageOpts
+                                       }
+
+{- Note [Migrating TcM Messages]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 As part of #18516, we are slowly migrating the diagnostic messages emitted
 and reported in the TcM from SDoc to TcRnMessage. Historically, GHC emitted
 some diagnostics in 3 pieces, i.e. there were lots of error-reporting functions
@@ -174,7 +265,6 @@ diagnostic API inside Tc.Utils.Monad, enabling further refactorings.
 In the future, once the conversion will be complete and we will successfully eradicate
 any use of SDoc in the diagnostic reporting of GHC, we can surely revisit the usage and
 existence of these two types, which for now remain a "necessary evil".
-
 -}
 
 -- The majority of TcRn messages come with extra context about the error,
@@ -185,7 +275,6 @@ data ErrInfo = ErrInfo {
   , errInfoSupplementary :: !SDoc
     -- ^ Extra supplementary info associated to the error.
   }
-
 
 -- | 'TcRnMessageDetailed' is an \"internal\" type (used only inside
 -- 'GHC.Tc.Utils.Monad' that wraps a 'TcRnMessage' while also providing
@@ -198,14 +287,24 @@ data TcRnMessageDetailed
 
 mkTcRnUnknownMessage :: (Diagnostic a, Typeable a, DiagnosticOpts a ~ NoDiagnosticOpts)
                      => a -> TcRnMessage
-mkTcRnUnknownMessage diag = TcRnUnknownMessage (UnknownDiagnostic diag)
+mkTcRnUnknownMessage diag = TcRnUnknownMessage (mkSimpleUnknownDiagnostic diag)
+  -- Please don't use this function inside the GHC codebase;
+  -- it mainly exists for users of the GHC API, such as plugins.
+  --
+  -- If you need to emit a new error message in the typechecker,
+  -- you should add a new constructor to 'TcRnMessage' instead.
 
 -- | An error which might arise during typechecking/renaming.
 data TcRnMessage where
   {-| Simply wraps an unknown 'Diagnostic' message @a@. It can be used by plugins
       to provide custom diagnostic messages originated during typechecking/renaming.
   -}
-  TcRnUnknownMessage :: UnknownDiagnostic -> TcRnMessage
+  TcRnUnknownMessage :: (UnknownDiagnostic (DiagnosticOpts TcRnMessage)) -> TcRnMessage
+
+  {-| Wrap an 'IfaceMessage' to a 'TcRnMessage' for when we attempt to load interface
+      files during typechecking but encounter an error. -}
+
+  TcRnInterfaceError :: !IfaceMessage -> TcRnMessage
 
   {-| TcRnMessageWithInfo is a constructor which is used when extra information is needed
       to be provided in order to qualify a diagnostic and where it was originated (and why).
@@ -229,16 +328,36 @@ data TcRnMessage where
   {-| TcRnSolverReport is the constructor used to report unsolved constraints
       after constraint solving, as well as other errors such as hole fit errors.
 
-      See the documentation of the 'TcSolverReportMsg' datatype for an overview
+      See the documentation of t'TcSolverReportMsg' datatype for an overview
       of the different errors.
   -}
   TcRnSolverReport :: SolverReportWithCtxt
                    -> DiagnosticReason
-                   -> [GhcHint]
                    -> TcRnMessage
-    -- TODO: split up TcRnSolverReport into several components,
-    -- so that we can compute the reason and hints, as opposed
-    -- to having to pass them here.
+
+  {-| TcRnSolverDepthError is an error that occurs when the constraint solver
+      exceeds the maximum recursion depth.
+
+      Example:
+
+        class C a where { meth :: a }
+        instance Cls [a] => Cls a where { meth = head . meth }
+
+        t :: ()
+        t = meth
+
+      Test cases:
+        T7788
+        T8550
+        T9554
+        T15316A
+        T17267{∅,a,b,c,e}
+        T17458
+        ContextStack1
+        T22924b
+        TcCoercibleFail
+  -}
+  TcRnSolverDepthError :: !Type -> !SubGoalDepth -> TcRnMessage
 
   {-| TcRnRedundantConstraints is a warning that is emitted when a binding
       has a user-written type signature which contains superfluous constraints.
@@ -276,7 +395,19 @@ data TcRnMessage where
   TcRnInaccessibleCode :: Implication          -- ^ The implication containing a contradiction.
                        -> SolverReportWithCtxt -- ^ The contradiction.
                        -> TcRnMessage
+  {-| TcRnInaccessibleCoAxBranch is a warning that is emitted when a closed type family has a
+      branch which is inaccessible due to a more general, prior branch.
 
+      Example:
+        type family F a where
+          F a = Int
+          F Bool = Bool
+      Test cases: T9085, T14066a, T9085, T6018, tc265,
+
+  -}
+  TcRnInaccessibleCoAxBranch :: TyCon      -- ^ The type family's constructor
+                             -> CoAxBranch -- ^ The inaccessible branch
+                             -> TcRnMessage
   {-| A type which was expected to have a fixed runtime representation
       does not have a fixed runtime representation.
 
@@ -303,6 +434,7 @@ data TcRnMessage where
      Test cases: th/T17804
   -}
   TcRnImplicitLift :: Name -> !ErrInfo -> TcRnMessage
+
   {-| TcRnUnusedPatternBinds is a warning (controlled with -Wunused-pattern-binds)
       that occurs if a pattern binding binds no variables at all, unless it is a
       lone wild-card pattern, or a banged pattern.
@@ -316,16 +448,29 @@ data TcRnMessage where
      Test cases: rename/{T13646,T17c,T17e,T7085}
   -}
   TcRnUnusedPatternBinds :: HsBind GhcRn -> TcRnMessage
-  {-| TcRnDodgyImports is a warning (controlled with -Wdodgy-imports) that occurs when
-      a datatype 'T' is imported with all constructors, i.e. 'T(..)', but has been exported
-      abstractly, i.e. 'T'.
 
-     Test cases: rename/should_compile/T7167
+  {-| TcRnUnusedQuantifiedTypeVar is a warning that occurs if there are unused
+      quantified type variables.
+
+      Examples:
+        f :: forall a. Int -> Char
+
+      Test cases: rename/should_compile/ExplicitForAllRules1
+                  rename/should_compile/T5331
   -}
-  TcRnDodgyImports :: RdrName -> TcRnMessage
-  {-| TcRnDodgyExports is a warning (controlled by -Wdodgy-exports) that occurs when a datatype
-      'T' is exported with all constructors, i.e. 'T(..)', but is it just a type synonym or a
-      type/data family.
+  TcRnUnusedQuantifiedTypeVar
+    :: HsDocContext
+    -> HsTyVarBndrExistentialFlag -- ^ tyVar binder.
+    -> TcRnMessage
+
+  {-| TcRnDodgyImports is a group of warnings (controlled with -Wdodgy-imports).
+
+      See 'DodgyImportsReason' for the different warnings.
+  -}
+  TcRnDodgyImports :: !DodgyImportsReason -> TcRnMessage
+  {-| TcRnDodgyExports is a warning (controlled by -Wdodgy-exports) that occurs when
+      an export of the form 'T(..)' for a type constructor 'T' does not actually export anything
+      beside 'T' itself.
 
      Example:
        module Foo (
@@ -340,7 +485,7 @@ data TcRnMessage where
 
      Test cases: warnings/should_compile/DodgyExports01
   -}
-  TcRnDodgyExports :: Name -> TcRnMessage
+  TcRnDodgyExports :: GlobalRdrElt -> TcRnMessage
   {-| TcRnMissingImportList is a warning (controlled by -Wmissing-import-lists) that occurs when
       an import declaration does not explicitly list all the names brought into scope.
 
@@ -398,21 +543,41 @@ data TcRnMessage where
                  rename/should_fail/T2723
                  rename/should_compile/T3262
                  driver/werror
+                 rename/should_fail/T22478d
+                 typecheck/should_fail/TyAppPat_ScopedTyVarConflict
   -}
   TcRnShadowedName :: OccName -> ShadowedNameProvenance -> TcRnMessage
+
+  {-| TcRnInvalidWarningCategory is an error that occurs when a warning is declared
+      with a category name that is not the special category "deprecations", and
+      either does not begin with the prefix "x-" indicating a user-defined
+      category, or contains characters not valid in category names.  See Note
+      [Warning categories] in GHC.Unit.Module.Warnings
+
+      Examples(s):
+        module M {-# WARNING in "invalid" "Oops" #-} where
+
+        {-# WARNING in "x- spaces not allowed" foo "Oops" #-}
+
+     Test cases: warnings/should_fail/WarningCategoryInvalid
+  -}
+  TcRnInvalidWarningCategory :: !WarningCategory -> TcRnMessage
 
   {-| TcRnDuplicateWarningDecls is an error that occurs whenever
       a warning is declared twice.
 
       Examples(s):
-        None.
+        {-# DEPRECATED foo "Don't use me" #-}
+        {-# DEPRECATED foo "Don't use me" #-}
+        foo :: Int
+        foo = 2
 
      Test cases:
-        None.
+        rename/should_fail/rnfail058
   -}
   TcRnDuplicateWarningDecls :: !(LocatedN RdrName) -> !RdrName -> TcRnMessage
 
-  {-| TcRnDuplicateWarningDecls is an error that occurs whenever
+  {-| TcRnSimplifierTooManyIterations is an error that occurs whenever
       the constraint solver in the simplifier hits the iterations' limit.
 
       Examples(s):
@@ -544,20 +709,52 @@ data TcRnMessage where
         saks_fail003
         T15433a
   -}
-
   TcRnIllegalWildcardInType
     :: Maybe Name
         -- ^ the wildcard name, or 'Nothing' for an anonymous wildcard
     -> !BadAnonWildcardContext
     -> TcRnMessage
 
+  {-| TcRnIllegalNamedWildcardInTypeArgument is an error that occurs
+      when a named wildcard is used in a required type argument.
+
+      Example:
+
+        vfun :: forall (a :: k) -> ()
+        x = vfun _nwc
+        --       ^^^^
+        -- named wildcards not allowed in type arguments
+
+      Test cases:
+        T23738_fail_wild
+  -}
+  TcRnIllegalNamedWildcardInTypeArgument
+    :: RdrName
+    -> TcRnMessage
+
+  {- TcRnIllegalImplicitTyVarInTypeArgument is an error raised
+     when a type variable is implicitly quantified in a required type argument.
+
+     Example:
+       vfun :: forall (a :: k) -> ()
+       x = vfun (Nothing :: Maybe a)
+       --                        ^^^
+       -- implicit quantification not allowed in type arguments
+
+  -}
+  TcRnIllegalImplicitTyVarInTypeArgument
+    :: RdrName
+    -> TcRnMessage
 
   {-| TcRnDuplicateFieldName is an error that occurs whenever
-      there are duplicate field names in a record.
+      there are duplicate field names in a single record.
 
-      Examples(s): None.
+      Examples(s):
 
-     Test cases: None.
+        data R = MkR { x :: Int, x :: Bool }
+        f r = r { x = 3, x = 4 }
+
+     Test cases: T21959.
   -}
   TcRnDuplicateFieldName :: !RecordFieldPart -> NE.NonEmpty RdrName -> TcRnMessage
 
@@ -584,12 +781,26 @@ data TcRnMessage where
   -}
   TcRnCharLiteralOutOfRange :: !Char -> TcRnMessage
 
+  {-| TcRnNegativeNumTypeLiteral is an error that occurs whenever
+      a type-level number literal is negative.
+
+      type Neg = -1
+
+     Test cases: th/T8412
+                 typecheck/should_fail/T8306
+  -}
+  TcRnNegativeNumTypeLiteral :: HsTyLit GhcPs -> TcRnMessage
+
   {-| TcRnIllegalWildcardsInConstructor is an error that occurs whenever
       the record wildcards '..' are used inside a constructor without labeled fields.
 
       Examples(s): None
 
-     Test cases: None
+     Test cases:
+       rename/should_fail/T9815.hs
+       rename/should_fail/T9815b.hs
+       rename/should_fail/T9815ghci.hs
+       rename/should_fail/T9815bghci.hs
   -}
   TcRnIllegalWildcardsInConstructor :: !Name -> TcRnMessage
 
@@ -687,14 +898,62 @@ data TcRnMessage where
   -}
   TcRnArrowIfThenElsePredDependsOnResultTy :: TcRnMessage
 
-  {-| TcRnIllegalHsBootFileDecl is an error that occurs when an hs-boot file
+  {-| TcRnIllegalHsBootOrSigDecl is an error that occurs when an hs-boot file
       contains declarations that are not allowed, such as bindings.
 
-      Example(s): None
+      Examples:
 
-     Test cases: None
+        -- A.hs-boot
+        f :: Int -> Int
+        f x = 2 * x -- binding not allowed
+
+        -- B.hs-boot
+        type family F a where { F Int = Bool }
+          -- type family equations not allowed
+
+        -- C.hsig
+        bar :: Int -> Int
+        {-# RULES forall x. bar x = x #-} -- RULES not allowed
+
+
+     Test cases:
+
+       - bindings: T19781
+       - class instance body: none
+       - type family instance: HsBootFam
+       - splice: none
+       - foreign declaration: none
+       - default declaration: none
+       - RULEs: none
   -}
-  TcRnIllegalHsBootFileDecl :: TcRnMessage
+  TcRnIllegalHsBootOrSigDecl :: !HsBootOrSig -> !BadBootDecls -> TcRnMessage
+
+  {-| TcRnBootMismatch is a family of errors that occur when there is a
+      mismatch between the hs-boot and hs files.
+
+     Examples:
+
+       -- A.hs-boot
+       foo :: Int -> Bool
+       data D = MkD
+
+       -- A.hs
+       foo :: Int -> Char
+       foo = chr
+
+       data D = MkD Int
+
+      Test cases:
+
+        - missing export: bkpcabal06, bkpfail{01,05,09,16,35}, rnfail{047,055}
+        - missing definition: none
+        - missing instance: T14075
+        - mismatch in exports: bkpfail{03,19}
+        - conflicting definitions: bkpcabal02,
+           bkpfail{04,06,07,10,12,133,14,15,17,22,23,25,26,27,41,42,45,47,50,52,53,54},
+           T19244{a,b}, T23344, ClosedFam3, rnfail055
+  -}
+  TcRnBootMismatch :: !HsBootOrSig -> !BootMismatch -> TcRnMessage
 
   {-| TcRnRecursivePatternSynonym is an error that occurs when a pattern synonym
       is defined in terms of itself, either directly or indirectly.
@@ -751,6 +1010,7 @@ data TcRnMessage where
         -Wmissing-pattern-synonym-signatures
         -Wmissing-exported-pattern-synonym-signatures
         -Wmissing-kind-signatures
+        -Wmissing-poly-kind-signatures
 
       Test cases:
         T11077 (top-level bindings)
@@ -759,8 +1019,6 @@ data TcRnMessage where
   -}
   TcRnMissingSignature :: MissingSignature
                        -> Exported
-                       -> Bool -- ^ True: -Wmissing-signatures overrides -Wmissing-exported-signatures,
-                               --     or -Wmissing-pattern-synonym-signatures overrides -Wmissing-exported-pattern-synonym-signatures
                        -> TcRnMessage
 
   {-| TcRnPolymorphicBinderMissingSig is a warning controlled by -Wmissing-local-signatures
@@ -784,7 +1042,7 @@ data TcRnMessage where
 
      Test cases: typecheck/should_compile/T11339
   -}
-  TcRnOverloadedSig :: TcIdSigInfo -> TcRnMessage
+  TcRnOverloadedSig :: TcIdSig -> TcRnMessage
 
   {-| TcRnTupleConstraintInst is an error that occurs whenever an instance
       for a tuple constraint is specified.
@@ -798,44 +1056,6 @@ data TcRnMessage where
       Test cases: quantified-constraints/T15334
   -}
   TcRnTupleConstraintInst :: !Class -> TcRnMessage
-
-  {-| TcRnAbstractClassInst is an error that occurs whenever an instance
-      of an abstract class is specified.
-
-      Examples(s):
-        -- A.hs-boot
-        module A where
-        class C a
-
-        -- B.hs
-        module B where
-        import {-# SOURCE #-} A
-        instance C Int where
-
-        -- A.hs
-        module A where
-        import B
-        class C a where
-          f :: a
-
-        -- Main.hs
-        import A
-        main = print (f :: Int)
-
-      Test cases: typecheck/should_fail/T13068
-  -}
-  TcRnAbstractClassInst :: !Class -> TcRnMessage
-
-  {-| TcRnNoClassInstHead is an error that occurs whenever an instance
-      head is not headed by a class.
-
-      Examples(s):
-        instance c
-
-      Test cases: typecheck/rename/T5513
-                  typecheck/rename/T16385
-  -}
-  TcRnNoClassInstHead :: !Type -> TcRnMessage
 
   {-| TcRnUserTypeError is an error that occurs due to a user's custom type error,
       which can be triggered by adding a `TypeError` constraint in a type signature
@@ -1001,17 +1221,6 @@ data TcRnMessage where
   -}
   TcRnIllegalConstraintSynonymOfKind :: !Type -> TcRnMessage
 
-  {-| TcRnIllegalClassInst is an error that occurs whenever a class instance is specified
-      for a non-class.
-
-      Examples(s):
-        type C1 a = (Show (a -> Bool))
-        instance C1 Int where
-
-      Test cases: polykinds/T13267
-  -}
-  TcRnIllegalClassInst :: !TyConFlavour -> TcRnMessage
-
   {-| TcRnOversaturatedVisibleKindArg is an error that occurs whenever an illegal oversaturated
       visible kind argument is specified.
 
@@ -1024,21 +1233,6 @@ data TcRnMessage where
                   typecheck/should_fail/T16255
   -}
   TcRnOversaturatedVisibleKindArg :: !Type -> TcRnMessage
-
-  {-| TcRnBadAssociatedType is an error that occurs whenever a class doesn't have an
-      associated type.
-
-      Examples(s):
-        $(do d <- instanceD (cxt []) (conT ''Eq `appT` conT ''Foo)
-                    [tySynInstD $ tySynEqn Nothing (conT ''Rep `appT` conT ''Foo) (conT ''Maybe)]
-             return [d])
-        ======>
-        instance Eq Foo where
-          type Rep Foo = Maybe
-
-      Test cases: th/T12387a
-  -}
-  TcRnBadAssociatedType :: {-Class-} !Name -> {-TyCon-} !Name -> TcRnMessage
 
   {-| TcRnForAllRankErr is an error that occurs whenever an illegal ranked type
       is specified.
@@ -1070,8 +1264,61 @@ data TcRnMessage where
   -}
   TcRnForAllRankErr :: !Rank -> !Type -> TcRnMessage
 
+  {-| TcRnSimplifiableConstraint is a warning triggered by the occurrence of
+      a simplifiable constraint in a context, when MonoLocalBinds is not enabled.
+
+      Examples(s):
+        simplifiableEq :: Eq (a, a) => a -> a -> Bool
+        simplifiableEq = undefined
+
+      Test cases:
+        - indexed-types/should_compile/T15322
+        - partial-sigs/should_compile/SomethingShowable
+        - typecheck/should_compile/T13526
+  -}
+  TcRnSimplifiableConstraint :: !PredType -> !InstanceWhat -> TcRnMessage
+
+  {-| TcRnArityMismatch is an error that occurs when a type constructor is supplied with
+      fewer arguments than required.
+
+      Examples(s):
+        f Left = undefined
+
+      Test cases:
+        - backpack/should_fail/bkpfail25.bkp
+        - ghci/should_fail/T16013
+        - ghci/should_fail/T16287
+        - indexed-types/should_fail/BadSock
+        - indexed-types/should_fail/T9433
+        - module/mod60
+        - ndexed-types/should_fail/T2157
+        - parser/should_fail/ParserNoBinaryLiterals2
+        - parser/should_fail/ParserNoBinaryLiterals3
+        - patsyn/should_fail/T12819
+        - polykinds/T10516
+        - typecheck/should_fail/T12124
+        - typecheck/should_fail/T15954
+        - typecheck/should_fail/T16874
+        - typecheck/should_fail/tcfail100
+        - typecheck/should_fail/tcfail101
+        - typecheck/should_fail/tcfail107
+        - typecheck/should_fail/tcfail129
+        - typecheck/should_fail/tcfail187
+  -}
+  TcRnArityMismatch :: !TyThing
+                    -> !Arity -- ^ expected arity
+                    -> !Arity -- ^ actual arity
+                    -> TcRnMessage
+
+  {-| TcRnIllegalClassInstance is a collection of diagnostics that arise
+      from an invalid class or family instance declaration.
+
+      See t'IllegalInstanceReason'.
+  -}
+  TcRnIllegalInstance :: IllegalInstanceReason -> TcRnMessage
+
   {-| TcRnMonomorphicBindings is a warning (controlled by -Wmonomorphism-restriction)
-      that arise when the monomorphism restriction applies to the given bindings.
+      that arises when the monomorphism restriction applies to the given bindings.
 
       Examples(s):
         {-# OPTIONS_GHC -Wmonomorphism-restriction #-}
@@ -1093,17 +1340,17 @@ data TcRnMessage where
   -}
   TcRnMonomorphicBindings :: [Name] -> TcRnMessage
 
-  {-| TcRnOrphanInstance is a warning (controlled by -Wwarn-orphans)
-      that arises when a typeclass instance is an \"orphan\", i.e. if it appears
-      in a module in which neither the class nor the type being instanced are
-      declared in the same module.
+  {-| TcRnOrphanInstance is a warning (controlled by -Worphans) that arises when
+      a typeclass instance or family instance is an \"orphan\", i.e. if it
+      appears in a module in which neither the class/family nor the type being
+      instanced are declared in the same module.
 
       Examples(s): None
 
       Test cases: warnings/should_compile/T9178
                   typecheck/should_compile/T4912
   -}
-  TcRnOrphanInstance :: ClsInst -> TcRnMessage
+  TcRnOrphanInstance :: Either ClsInst FamInst -> TcRnMessage
 
   {-| TcRnFunDepConflict is an error that occurs when there are functional dependencies
       conflicts between instance declarations.
@@ -1172,7 +1419,15 @@ data TcRnMessage where
   -}
   TcRnConflictingFamInstDecls :: NE.NonEmpty FamInst -> TcRnMessage
 
-  TcRnFamInstNotInjective :: InjectivityErrReason -> TyCon -> NE.NonEmpty CoAxBranch -> TcRnMessage
+  {-| TcRnFamInstNotInjective is a collection of errors that arise from
+      a type family equation violating the injectivity annotation.
+
+      See 'InjectivityErrReason'.
+  -}
+  TcRnFamInstNotInjective :: InjectivityErrReason -- ^ the violation
+                          -> TyCon -- ^ the family 'TyCon'
+                          -> NE.NonEmpty CoAxBranch -- ^ the family equations
+                          -> TcRnMessage
 
   {-| TcRnBangOnUnliftedType is a warning (controlled by -Wredundant-strictness-flags) that
       occurs when a strictness annotation is applied to an unlifted type.
@@ -1312,7 +1567,7 @@ data TcRnMessage where
                  overloadedrecflds/should_fail/DuplicateExports
                  patsyn/should_compile/T11959
   -}
-  TcRnDuplicateExport :: GreName -> IE GhcPs -> IE GhcPs -> TcRnMessage
+  TcRnDuplicateExport :: GlobalRdrElt -> IE GhcPs -> IE GhcPs -> TcRnMessage
 
   {-| TcRnExportedParentChildMismatch is an error that occurs when an export is
       bundled with a parent that it does not belong to
@@ -1328,7 +1583,10 @@ data TcRnMessage where
                  module/mod3
                  overloadedrecflds/should_fail/NoParent
   -}
-  TcRnExportedParentChildMismatch :: Name -> TyThing -> GreName -> [Name] -> TcRnMessage
+  TcRnExportedParentChildMismatch :: Name -- ^ parent
+                                  -> TyThing
+                                  -> Name -- ^ child
+                                  -> [Name] -> TcRnMessage
 
   {-| TcRnConflictingExports is an error that occurs when different identifiers that
       have the same name are being exported by a module.
@@ -1355,29 +1613,50 @@ data TcRnMessage where
                  typecheck/should_fail/tcfail026
   -}
   TcRnConflictingExports
-    :: OccName -- ^ Occurrence name shared by both exports
-    -> GreName -- ^ Name of first export
-    -> GlobalRdrElt -- ^ Provenance for definition site of first export
-    -> IE GhcPs -- ^ Export decl of first export
-    -> GreName -- ^ Name of second export
-    -> GlobalRdrElt -- ^ Provenance for definition site of second export
-    -> IE GhcPs -- ^ Export decl of second export
+    :: OccName      -- ^ Occurrence name shared by both exports
+    -> GlobalRdrElt -- ^ First export
+    -> IE GhcPs     -- ^ Export decl of first export
+    -> GlobalRdrElt -- ^ Second export
+    -> IE GhcPs     -- ^ Export decl of second export
     -> TcRnMessage
 
-  {-| TcRnAmbiguousField is a warning controlled by -Wambiguous-fields occurring
-      when a record update's type cannot be precisely determined. This will not
-      be supported by -XDuplicateRecordFields in future releases.
+  {-| TcRnDuplicateFieldExport is an error that occurs when a module exports
+      multiple record fields with the same name, without enabling
+      DuplicateRecordFields.
+
+      Example:
+
+      module M1 where
+        data D1 = MkD1 { foo :: Int }
+      module M2 where
+        data D2 = MkD2 { foo :: Int }
+      module M ( D1(..), D2(..) ) where
+        import module M1
+        import module M2
+
+     Test case: overloadedrecflds/should_fail/overloadedrecfldsfail10
+  -}
+  TcRnDuplicateFieldExport
+    :: (GlobalRdrElt, IE GhcPs)
+    -> NE.NonEmpty (GlobalRdrElt, IE GhcPs)
+    -> TcRnMessage
+
+  {-| TcRnAmbiguousRecordUpdate is a warning, controlled by -Wambiguous-fields,
+      which occurs when a user relies on the type-directed disambiguation
+      mechanism to disambiguate a record update. This will not be supported by
+      -XDuplicateRecordFields in future releases.
 
       Example(s):
-      data Person  = MkPerson  { personId :: Int, name :: String }
-      data Address = MkAddress { personId :: Int, address :: String }
-      bad1 x = x { personId = 4 } :: Person -- ambiguous
-      bad2 (x :: Person) = x { personId = 4 } -- ambiguous
-      good x = (x :: Person) { personId = 4 } -- not ambiguous
+
+        data Person  = MkPerson  { personId :: Int, name :: String }
+        data Address = MkAddress { personId :: Int, address :: String }
+        bad1 x = x { personId = 4 } :: Person -- ambiguous
+        bad2 (x :: Person) = x { personId = 4 } -- ambiguous
+        good x = (x :: Person) { personId = 4 } -- not ambiguous
 
      Test cases: overloadedrecflds/should_fail/overloadedrecfldsfail06
   -}
-  TcRnAmbiguousField
+  TcRnAmbiguousRecordUpdate
     :: HsExpr GhcRn -- ^ Field update
     -> TyCon -- ^ Record type
     -> TcRnMessage
@@ -1412,39 +1691,7 @@ data TcRnMessage where
   -}
   TcRnFieldUpdateInvalidType :: [(FieldLabelString,TcType)] -> TcRnMessage
 
-  {-| TcRnNoConstructorHasAllFields is an error that occurs when a record update
-      has fields that no single constructor encompasses.
-
-      Example(s):
-      data Foo = A { x :: Bool }
-               | B { y :: Int }
-      foo = (A False) { x = True, y = 5 }
-
-     Test cases: overloadedrecflds/should_fail/overloadedrecfldsfail08
-                 patsyn/should_fail/mixed-pat-syn-record-sels
-                 typecheck/should_fail/T7989
-  -}
-  TcRnNoConstructorHasAllFields :: [FieldLabelString] -> TcRnMessage
-
-  {- TcRnMixedSelectors is an error for when a mixture of pattern synonym and
-      record selectors are used in the same record update block.
-
-      Example(s):
-      data Rec = Rec { foo :: Int, bar :: String }
-      pattern Pat { f1, f2 } = Rec { foo = f1, bar = f2 }
-      illegal :: Rec -> Rec
-      illegal r = r { f1 = 1, bar = "two" }
-
-     Test cases: patsyn/should_fail/records-mixing-fields
-  -}
-  TcRnMixedSelectors
-    :: Name -- ^ Record
-    -> [Id] -- ^ Record selectors
-    -> Name -- ^ Pattern synonym
-    -> [Id] -- ^ Pattern selectors
-    -> TcRnMessage
-
-  {- TcRnMissingStrictFields is an error occurring when a record field marked
+  {-| TcRnMissingStrictFields is an error occurring when a record field marked
      as strict is omitted when constructing said record.
 
      Example(s):
@@ -1457,32 +1704,56 @@ data TcRnMessage where
   -}
   TcRnMissingStrictFields :: ConLike -> [(FieldLabelString, TcType)] -> TcRnMessage
 
-  {- TcRnNoPossibleParentForFields is an error thrown when the fields used in a
-     record update block do not all belong to any one type.
+  {-| TcRnAmbiguousFieldInUpdate is an error that occurs when a field in a
+      record update clashes with another field or top-level function of the
+      same name, and the user hasn't enabled -XDisambiguateRecordFields.
+
+      Example:
+
+        {-# LANGUAGE NoFieldSelectors #-}
+        {-# LANGUAGE NoDisambiguateRecordFields #-}
+        module M where
+
+          data A = MkA { fld :: Int }
+
+          fld :: Bool
+          fld = False
+
+          f r = r { fld = 3 }
+
+  -}
+  TcRnAmbiguousFieldInUpdate :: (GlobalRdrElt, GlobalRdrElt, [GlobalRdrElt])
+                                -> TcRnMessage
+
+  {-| TcRnBadRecordUpdate is an error when a regular (non-overloaded)
+     record update cannot be pinned down to any one parent.
+
+     The problem with the record update is stored in the 'BadRecordUpdateReason'
+     field.
 
      Example(s):
-     data R1 = R1 { x :: Int, y :: Int }
-     data R2 = R2 { y :: Int, z :: Int }
-     update r = r { x = 1, y = 2, z = 3 }
+
+       data R1 = R1 { x :: Int }
+       data R2 = R2 { x :: Int }
+       update r = r { x = 1 }
+         -- ambiguous
+
+       data R1 = R1 { x :: Int, y :: Int }
+       data R2 = R2 { y :: Int, z :: Int }
+       update r = r { x = 1, y = 2, z = 3 }
+         -- no parent has all the fields
 
     Test cases: overloadedrecflds/should_fail/overloadedrecfldsfail01
+                overloadedrecflds/should_fail/overloadedrecfldsfail01
                 overloadedrecflds/should_fail/overloadedrecfldsfail14
   -}
-  TcRnNoPossibleParentForFields :: [LHsRecUpdField GhcRn] -> TcRnMessage
+  TcRnBadRecordUpdate :: [RdrName]
+                         -- ^ the fields of the record update
+                      -> BadRecordUpdateReason
+                         -- ^ the reason this record update was rejected
+                      -> TcRnMessage
 
-  {- TcRnBadOverloadedRecordUpdate is an error for a record update that cannot
-     be pinned down to any one constructor and thus must be given a type signature.
-
-     Example(s):
-     data R1 = R1 { x :: Int }
-     data R2 = R2 { x :: Int }
-     update r = r { x = 1 } -- needs a type signature
-
-    Test cases: overloadedrecflds/should_fail/overloadedrecfldsfail01
-  -}
-  TcRnBadOverloadedRecordUpdate :: [LHsRecUpdField GhcRn] -> TcRnMessage
-
-  {- TcRnStaticFormNotClosed is an error pertaining to terms that are marked static
+  {-| TcRnStaticFormNotClosed is an error pertaining to terms that are marked static
      using the -XStaticPointers extension but which are not closed terms.
 
      Example(s):
@@ -1492,21 +1763,6 @@ data TcRnMessage where
                 rename/should_fail/RnStaticPointersFail03
   -}
   TcRnStaticFormNotClosed :: Name -> NotClosedReason -> TcRnMessage
-  {-| TcRnSpecialClassInst is an error that occurs when a user
-      attempts to define an instance for a built-in typeclass such as
-      'Coercible', 'Typeable', or 'KnownNat', outside of a signature file.
-
-     Test cases: deriving/should_fail/T9687
-                 deriving/should_fail/T14916
-                 polykinds/T8132
-                 typecheck/should_fail/TcCoercibleFail2
-                 typecheck/should_fail/T12837
-                 typecheck/should_fail/T14390
-
-  -}
-  TcRnSpecialClassInst :: !Class
-                       -> !Bool -- ^ Whether the error is due to Safe Haskell being enabled
-                       -> TcRnMessage
 
   {-| TcRnUselessTypeable is a warning (controlled by -Wderiving-typeable) that
       occurs when trying to derive an instance of the 'Typeable' class. Deriving
@@ -1645,21 +1901,20 @@ data TcRnMessage where
   -}
   TcRnArrowProcGADTPattern :: TcRnMessage
 
-  {-| TcRnForallIdentifier is a warning (controlled with -Wforall-identifier) that occurs
-     when a definition uses 'forall' as an identifier.
+  {-| TcRnCapturedTermName is a warning (controlled by -Wterm-variable-capture) that occurs
+    when an implicitly quantified type variable's name is already used for a term.
+    Example:
+      a = 10
+      f :: a -> a
 
-     Example:
-       forall x = ()
-       g forall = ()
-
-     Test cases: T20609 T20609a T20609b T20609c T20609d
-  -}
-  TcRnForallIdentifier :: RdrName -> TcRnMessage
+    Test cases: T22513a T22513b T22513c T22513d T22513e T22513f T22513g T22513h T22513i
+ -}
+  TcRnCapturedTermName :: RdrName -> Either [GlobalRdrElt] Name -> TcRnMessage
 
   {-| TcRnTypeEqualityOutOfScope is a warning (controlled by -Wtype-equality-out-of-scope)
       that occurs when the type equality (a ~ b) is not in scope.
 
-      Test case: T18862b
+      Test case: warnings/should_compile/T18862b
   -}
   TcRnTypeEqualityOutOfScope :: TcRnMessage
 
@@ -1705,7 +1960,6 @@ data TcRnMessage where
   -}
   TcRnIllegalTypeOperatorDecl :: !RdrName -> TcRnMessage
 
-
   {-| TcRnGADTMonoLocalBinds is a warning controlled by -Wgadt-mono-local-binds
       that occurs when pattern matching on a GADT when -XMonoLocalBinds is off.
 
@@ -1714,6 +1968,7 @@ data TcRnMessage where
       Test cases: T20485, T20485a
   -}
   TcRnGADTMonoLocalBinds :: TcRnMessage
+
   {-| The TcRnNotInScope constructor is used for various not-in-scope errors.
       See 'NotInScopeError' for more details. -}
   TcRnNotInScope :: NotInScopeError  -- ^ what the problem is
@@ -1721,6 +1976,20 @@ data TcRnMessage where
                  -> [ImportError]    -- ^ import errors that are relevant
                  -> [GhcHint]        -- ^ hints, e.g. enable DataKinds to refer to a promoted data constructor
                  -> TcRnMessage
+
+  {-| TcRnTermNameInType is an error that occurs when a term-level identifier
+      is used in a type.
+
+      Example:
+
+        import qualified Prelude
+
+        bad :: Prelude.fst (Bool, Float)
+        bad = False
+
+      Test cases: T21605{c,d}
+  -}
+  TcRnTermNameInType :: RdrName -> [GhcHint] -> TcRnMessage
 
   {-| TcRnUntickedPromotedThing is a warning (controlled with -Wunticked-promoted-constructors)
       that is triggered by an unticked occurrence of a promoted data constructor.
@@ -1777,9 +2046,11 @@ data TcRnMessage where
 
       Example:
 
-        f x = Int
+        list2 = $( conE ''(:) `appE` litE (IntegerL 5) `appE` conE '[] )
+        --              ^^^^^
+        --              should use a single quotation tick, i.e. '(:)
 
-      Test cases: T18740a, T20884.
+      Test cases: T20884.
   -}
   TcRnIncorrectNameSpace :: Name
                          -> Bool -- ^ whether the error is happening
@@ -1787,7 +2058,7 @@ data TcRnMessage where
                                  -- (so we should give a Template Haskell hint)
                          -> TcRnMessage
 
-  {- TcRnForeignImportPrimExtNotSet is an error occurring when a foreign import
+  {-| TcRnForeignImportPrimExtNotSet is an error occurring when a foreign import
      is declared using the @prim@ calling convention without having turned on
      the -XGHCForeignImportPrim extension.
 
@@ -1798,7 +2069,7 @@ data TcRnMessage where
   -}
   TcRnForeignImportPrimExtNotSet :: ForeignImport GhcRn -> TcRnMessage
 
-  {- TcRnForeignImportPrimSafeAnn is an error declaring that the safe/unsafe
+  {-| TcRnForeignImportPrimSafeAnn is an error declaring that the safe/unsafe
      annotation should not be used with @prim@ foreign imports.
 
      Example(s):
@@ -1808,7 +2079,7 @@ data TcRnMessage where
   -}
   TcRnForeignImportPrimSafeAnn :: ForeignImport GhcRn -> TcRnMessage
 
-  {- TcRnForeignFunctionImportAsValue is an error explaining that foreign @value@
+  {-| TcRnForeignFunctionImportAsValue is an error explaining that foreign @value@
      imports cannot have function types.
 
      Example(s):
@@ -1818,7 +2089,7 @@ data TcRnMessage where
   -}
   TcRnForeignFunctionImportAsValue :: ForeignImport GhcRn -> TcRnMessage
 
-  {- TcRnFunPtrImportWithoutAmpersand is a warning controlled by @-Wdodgy-foreign-imports@
+  {-| TcRnFunPtrImportWithoutAmpersand is a warning controlled by @-Wdodgy-foreign-imports@
      that informs the user of a possible missing @&@ in the declaration of a
      foreign import with a 'FunPtr' return type.
 
@@ -1829,7 +2100,7 @@ data TcRnMessage where
   -}
   TcRnFunPtrImportWithoutAmpersand :: ForeignImport GhcRn -> TcRnMessage
 
-  {- TcRnIllegalForeignDeclBackend is an error occurring when a foreign import declaration
+  {-| TcRnIllegalForeignDeclBackend is an error occurring when a foreign import declaration
      is not compatible with the code generation backend being used.
 
      Example(s): None
@@ -1842,7 +2113,7 @@ data TcRnMessage where
     -> ExpectedBackends
     -> TcRnMessage
 
-  {- TcRnUnsupportedCallConv informs the user that the calling convention specified
+  {-| TcRnUnsupportedCallConv informs the user that the calling convention specified
      for a foreign export declaration is not compatible with the target platform.
      It is a warning controlled by @-Wunsupported-calling-conventions@ in the case of
      @stdcall@ but is otherwise considered an error.
@@ -1855,7 +2126,7 @@ data TcRnMessage where
                           -> UnsupportedCallConvention
                           -> TcRnMessage
 
-  {- TcRnIllegalForeignType is an error for when a type appears in a foreign
+  {-| TcRnIllegalForeignType is an error for when a type appears in a foreign
      function signature that is not compatible with the FFI.
 
      Example(s): None
@@ -1873,7 +2144,7 @@ data TcRnMessage where
   -}
   TcRnIllegalForeignType :: !(Maybe ArgOrResult) -> !IllegalForeignTypeReason -> TcRnMessage
 
-  {- TcRnInvalidCIdentifier indicates a C identifier that is not valid.
+  {-| TcRnInvalidCIdentifier indicates a C identifier that is not valid.
 
      Example(s):
      foreign import prim safe "not valid" cmm_test2 :: Int# -> Int#
@@ -1882,7 +2153,7 @@ data TcRnMessage where
   -}
   TcRnInvalidCIdentifier :: !CLabelString -> TcRnMessage
 
-  {- TcRnExpectedValueId is an error occurring when something that is not a
+  {-| TcRnExpectedValueId is an error occurring when something that is not a
       value identifier is used where one is expected.
 
      Example(s): none
@@ -1891,20 +2162,7 @@ data TcRnMessage where
   -}
   TcRnExpectedValueId :: !TcTyThing -> TcRnMessage
 
-  {- TcRnNotARecordSelector is an error for when something that is not a record
-     selector is used in a record pattern.
-
-     Example(s):
-     data Rec = MkRec { field :: Int }
-     r = Mkrec 1
-     r' = r { notAField = 2 }
-
-    Test cases: rename/should_fail/rnfail054
-                typecheck/should_fail/tcfail114
-  -}
-  TcRnNotARecordSelector :: !Name -> TcRnMessage
-
-  {- TcRnRecSelectorEscapedTyVar is an error indicating that a record field selector
+  {-| TcRnRecSelectorEscapedTyVar is an error indicating that a record field selector
      containing an existential type variable is used as a function rather than in
      a pattern match.
 
@@ -1917,7 +2175,7 @@ data TcRnMessage where
   -}
   TcRnRecSelectorEscapedTyVar :: !OccName -> TcRnMessage
 
-  {- TcRnPatSynNotBidirectional is an error for when a non-bidirectional pattern
+  {-| TcRnPatSynNotBidirectional is an error for when a non-bidirectional pattern
      synonym is used as a constructor.
 
      Example(s):
@@ -1930,17 +2188,7 @@ data TcRnMessage where
   -}
   TcRnPatSynNotBidirectional :: !Name -> TcRnMessage
 
-  {- TcRnSplicePolymorphicLocalVar is the error that occurs when the expression
-     inside typed template haskell brackets is a polymorphic local variable.
-
-     Example(s):
-     x = \(y :: forall a. a -> a) -> [|| y ||]
-
-    Test cases: quotes/T10384
-  -}
-  TcRnSplicePolymorphicLocalVar :: !Id -> TcRnMessage
-
-  {- TcRnIllegalDerivingItem is an error for when something other than a type class
+  {-| TcRnIllegalDerivingItem is an error for when something other than a type class
      appears in a deriving statement.
 
      Example(s):
@@ -1950,7 +2198,7 @@ data TcRnMessage where
   -}
   TcRnIllegalDerivingItem :: !(LHsSigType GhcRn) -> TcRnMessage
 
-  {- TcRnUnexpectedAnnotation indicates the erroroneous use of an annotation such
+  {-| TcRnUnexpectedAnnotation indicates the erroroneous use of an annotation such
      as strictness, laziness, or unpacking.
 
      Example(s):
@@ -1959,29 +2207,22 @@ data TcRnMessage where
 
     Test cases: parser/should_fail/unpack_inside_type
                 typecheck/should_fail/T7210
+                rename/should_fail/T22478b
   -}
   TcRnUnexpectedAnnotation :: !(HsType GhcRn) -> !HsSrcBang -> TcRnMessage
 
-  {- TcRnIllegalRecordSyntax is an error indicating an illegal use of record syntax.
+  {-| TcRnIllegalRecordSyntax is an error indicating an illegal use of record syntax.
 
      Example(s):
      data T = T Int { field :: Int }
 
     Test cases: rename/should_fail/T7943
                 rename/should_fail/T9077
+                rename/should_fail/T22478b
   -}
-  TcRnIllegalRecordSyntax :: !(HsType GhcRn) -> TcRnMessage
+  TcRnIllegalRecordSyntax :: Either (HsType GhcPs) (HsType GhcRn) -> TcRnMessage
 
-  {- TcRnUnexpectedTypeSplice is an error for a typed template haskell splice
-     appearing unexpectedly.
-
-     Example(s): none
-
-    Test cases: none
-  -}
-  TcRnUnexpectedTypeSplice :: !(HsType GhcRn) -> TcRnMessage
-
-  {- TcRnInvalidVisibleKindArgument is an error for a kind application on a
+  {-| TcRnInvalidVisibleKindArgument is an error for a kind application on a
      target type that cannot accept it.
 
      Example(s):
@@ -2003,7 +2244,7 @@ data TcRnMessage where
     -> !Type -- ^ Target of the kind application
     -> TcRnMessage
 
-  {- TcRnTooManyBinders is an error for a type constructor that is declared with
+  {-| TcRnTooManyBinders is an error for a type constructor that is declared with
      more arguments then its kind specifies.
 
      Example(s):
@@ -2012,9 +2253,9 @@ data TcRnMessage where
 
     Test cases: saks/should_fail/saks_fail008
   -}
-  TcRnTooManyBinders :: !Kind -> ![LHsTyVarBndr () GhcRn] -> TcRnMessage
+  TcRnTooManyBinders :: !Kind -> ![LHsTyVarBndr (HsBndrVis GhcRn) GhcRn] -> TcRnMessage
 
-  {- TcRnDifferentNamesForTyVar is an error that indicates different names being
+  {-| TcRnDifferentNamesForTyVar is an error that indicates different names being
      used for the same type variable.
 
      Example(s):
@@ -2033,6 +2274,8 @@ data TcRnMessage where
       where the implicitly-bound type type variables can't be matched up unambiguously
       with the ones from the signature. See Note [Disconnected type variables] in
       GHC.Tc.Gen.HsType.
+
+      Test cases: T24083
   -}
   TcRnDisconnectedTyVar :: !Name -> TcRnMessage
 
@@ -2058,7 +2301,32 @@ data TcRnMessage where
     -> !(Maybe SuggestUnliftedTypes) -- ^ suggested extension
     -> TcRnMessage
 
-  {- TcRnClassKindNotConstraint is an error for a type class that has a kind that
+  {-| TcRnUnexpectedKindVar is an error that occurs when the user
+      tries to use kind variables without -XPolyKinds.
+
+      Example:
+        f :: forall k a. Proxy (a :: k)
+
+      Test cases: polykinds/BadKindVar
+                  polykinds/T14710
+                  saks/should_fail/T16722
+  -}
+  TcRnUnexpectedKindVar :: RdrName -> TcRnMessage
+
+  {-| TcRnIllegalKind is used for a various illegal kinds errors including
+
+      Example:
+        type T :: forall k. Type -- without emabled -XPolyKinds
+
+      Test cases: polykinds/T16762b
+  -}
+  TcRnIllegalKind
+    :: HsTypeOrSigType GhcPs
+            -- ^ The illegal kind
+    -> Bool -- ^ Whether enabling -XPolyKinds should be suggested
+    -> TcRnMessage
+
+  {-| TcRnClassKindNotConstraint is an error for a type class that has a kind that
      is not equivalent to Constraint.
 
      Example(s):
@@ -2069,7 +2337,7 @@ data TcRnMessage where
   -}
   TcRnClassKindNotConstraint :: !Kind -> TcRnMessage
 
-  {- TcRnUnpromotableThing is an error that occurs when the user attempts to
+  {-| TcRnUnpromotableThing is an error that occurs when the user attempts to
      use the promoted version of something which is not promotable.
 
      Example(s):
@@ -2101,10 +2369,34 @@ data TcRnMessage where
                 saks/should_fail/T16727a
                 saks/should_fail/T16727b
                 rename/should_fail/T12686
+                rename/should_fail/T16635a
+                rename/should_fail/T16635b
+                rename/should_fail/T16635c
   -}
   TcRnUnpromotableThing :: !Name -> !PromotionErr -> TcRnMessage
 
-  {- TcRnMatchesHaveDiffNumArgs is an error occurring when something has matches
+  {- | TcRnIllegalTermLevelUse is an error that occurs when the user attempts to
+       use a type-level entity at the term-level.
+
+       Examples:
+          f x = Int                 -- illegal use of a type constructor
+          g (Proxy :: Proxy a) = a  -- illegal use of a type variable
+
+       Note that the namespace cannot be used to determine if a name refers to a
+       type-level entity:
+
+          {-# LANGUAGE RequiredTypeArguments #-}
+          bad :: forall (a :: k) -> k
+          bad t = t
+
+      The name `t` is assigned the `varName` namespace but stands for a type
+      variable that cannot be used at the term level.
+
+      Test cases: T18740a, T18740b, T23739_fail_ret, T23739_fail_case
+  -}
+  TcRnIllegalTermLevelUse :: !Name -> !TermLevelUseErr -> TcRnMessage
+
+  {-| TcRnMatchesHaveDiffNumArgs is an error occurring when something has matches
      that have different numbers of arguments
 
      Example(s):
@@ -2115,11 +2407,67 @@ data TcRnMessage where
                 typecheck/should_fail/T20768_fail
   -}
   TcRnMatchesHaveDiffNumArgs
-    :: !(HsMatchContext GhcTc) -- ^ Pattern match specifics
+    :: !HsMatchContextRn   -- ^ Pattern match specifics
     -> !MatchArgBadMatches
     -> TcRnMessage
 
-  {- TcRnCannotBindScopedTyVarInPatSig is an error stating that scoped type
+  {-| TcRnUnexpectedPatSigType is an error occurring when there is
+      a type signature in a pattern without -XScopedTypeVariables extension
+
+      Examples:
+        f (a :: Bool) = ...
+
+      Test case: rename/should_fail/T11663
+  -}
+  TcRnUnexpectedPatSigType :: HsPatSigType GhcPs -> TcRnMessage
+
+  {-| TcRnIllegalKindSignature is an error occurring when there is
+      a kind signature without -XKindSignatures extension
+
+      Examples:
+        data Foo (a :: Nat) = ....
+
+      Test case: parser/should_fail/readFail036
+  -}
+  TcRnIllegalKindSignature :: HsType GhcPs -> TcRnMessage
+
+  {-| TcRnDataKindsError is an error occurring when there is
+      an illegal type or kind, probably required -XDataKinds
+      and is used without the enabled extension.
+
+      This error can occur in both the renamer and the typechecker. The field
+      of type @'Either' ('HsType' 'GhcPs') 'Type'@ reflects this: this field
+      will contain a 'Left' value if the error occurred in the renamer, and this
+      field will contain a 'Right' value if the error occurred in the
+      typechecker.
+
+      Examples:
+
+        type Foo = [Nat, Char]
+
+        type Bar = [Int, String]
+
+      Test cases: linear/should_fail/T18888
+                  parser/should_fail/readFail001
+                  polykinds/T7151
+                  polykinds/T7433
+                  rename/should_fail/T13568
+                  rename/should_fail/T22478e
+                  th/TH_Promoted1Tuple
+                  typecheck/should_compile/tcfail094
+                  typecheck/should_compile/T22141a
+                  typecheck/should_compile/T22141b
+                  typecheck/should_compile/T22141c
+                  typecheck/should_compile/T22141d
+                  typecheck/should_compile/T22141e
+                  typecheck/should_compile/T22141f
+                  typecheck/should_compile/T22141g
+                  typecheck/should_fail/T20873c
+                  typecheck/should_fail/T20873d
+  -}
+  TcRnDataKindsError :: TypeOrKind -> Either (HsType GhcPs) Type -> TcRnMessage
+
+  {-| TcRnCannotBindScopedTyVarInPatSig is an error stating that scoped type
      variables cannot be used in pattern bindings.
 
      Example(s):
@@ -2129,7 +2477,7 @@ data TcRnMessage where
   -}
   TcRnCannotBindScopedTyVarInPatSig :: !(NE.NonEmpty (Name, TcTyVar)) -> TcRnMessage
 
-  {- TcRnCannotBindTyVarsInPatBind is an error for when type
+  {-| TcRnCannotBindTyVarsInPatBind is an error for when type
      variables are introduced in a pattern binding
 
      Example(s):
@@ -2140,7 +2488,7 @@ data TcRnMessage where
   -}
   TcRnCannotBindTyVarsInPatBind :: !(NE.NonEmpty (Name, TcTyVar)) -> TcRnMessage
 
-  {- TcRnTooManyTyArgsInConPattern is an error occurring when a constructor pattern
+  {-| TcRnTooManyTyArgsInConPattern is an error occurring when a constructor pattern
      has more than the expected number of type arguments
 
      Example(s):
@@ -2155,7 +2503,7 @@ data TcRnMessage where
     -> !Int -- ^ Actual number of args
     -> TcRnMessage
 
-  {- TcRnMultipleInlinePragmas is a warning signifying that multiple inline pragmas
+  {-| TcRnMultipleInlinePragmas is a warning signifying that multiple inline pragmas
      reference the same definition.
 
      Example(s):
@@ -2172,7 +2520,7 @@ data TcRnMessage where
     -> !(NE.NonEmpty (LocatedA InlinePragma)) -- ^ Other pragmas
     -> TcRnMessage
 
-  {- TcRnUnexpectedPragmas is a warning that occurs when unexpected pragmas appear
+  {-| TcRnUnexpectedPragmas is a warning that occurs when unexpected pragmas appear
      in the source.
 
      Example(s):
@@ -2181,7 +2529,7 @@ data TcRnMessage where
   -}
   TcRnUnexpectedPragmas :: !Id -> !(NE.NonEmpty (LSig GhcRn)) -> TcRnMessage
 
-  {- TcRnNonOverloadedSpecialisePragma is a warning for a specialise pragma being
+  {-| TcRnNonOverloadedSpecialisePragma is a warning for a specialise pragma being
      placed on a definition that is not overloaded.
 
      Example(s):
@@ -2194,7 +2542,7 @@ data TcRnMessage where
   -}
   TcRnNonOverloadedSpecialisePragma :: !(LIdP GhcRn) -> TcRnMessage
 
-  {- TcRnSpecialiseNotVisible is a warning that occurs when the subject of a
+  {-| TcRnSpecialiseNotVisible is a warning that occurs when the subject of a
      SPECIALISE pragma has a definition that is not visible from the current module.
 
      Example(s): none
@@ -2203,33 +2551,7 @@ data TcRnMessage where
   -}
   TcRnSpecialiseNotVisible :: !Name -> TcRnMessage
 
-  {- TcRnNameByTemplateHaskellQuote is an error that occurs when one tries
-     to use a Template Haskell splice to define a top-level identifier with
-     an already existing name.
-
-     (See issue #13968 (closed) on GHC's issue tracker for more details)
-
-     Example(s):
-
-       $(pure [ValD (VarP 'succ) (NormalB (ConE 'True)) []])
-
-     Test cases:
-      T13968
-  -}
-  TcRnNameByTemplateHaskellQuote :: !RdrName -> TcRnMessage
-
-  {- TcRnIllegalBindingOfBuiltIn is an error that occurs when one uses built-in
-     syntax for data constructors or class names.
-
-     Use an OccName here because we don't want to print Prelude.(,)
-
-     Test cases:
-      rename/should_fail/T14907b
-      rename/should_fail/rnfail042
-  -}
-  TcRnIllegalBindingOfBuiltIn :: !OccName -> TcRnMessage
-
-  {- TcRnPragmaWarning is a warning that can happen when usage of something
+  {-| TcRnPragmaWarning is a warning that can happen when usage of something
      is warned or deprecated by pragma.
 
     Test cases:
@@ -2239,14 +2561,40 @@ data TcRnMessage where
       rn050
       rn066 (here is a warning, not deprecation)
       T3303
+      ExportWarnings1
+      ExportWarnings2
+      ExportWarnings3
+      ExportWarnings4
+      ExportWarnings5
+      ExportWarnings6
+      InstanceWarnings
   -}
   TcRnPragmaWarning :: {
-    pragma_warning_occ :: OccName,
-    pragma_warning_msg :: WarningTxt GhcRn,
-    pragma_warning_import_mod :: ModuleName,
-    pragma_warning_defined_mod :: ModuleName
+    pragma_warning_info :: PragmaWarningInfo,
+    pragma_warning_msg :: WarningTxt GhcRn
   } -> TcRnMessage
 
+  {-| TcRnDifferentExportWarnings is an error that occurs when the
+     warning messages for exports of a name differ between several export items.
+
+     Test case:
+      DifferentExportWarnings
+  -}
+  TcRnDifferentExportWarnings :: !Name -- ^ The name with different export warnings
+                              -> NE.NonEmpty SrcSpan -- ^ The locations of export list items that differ
+                                            --   from the one at which the error is reported
+                              -> TcRnMessage
+
+  {-| TcRnIncompleteExportWarnings is a warning (controlled by -Wincomplete-export-warnings) that
+     occurs when some of the exports of a name do not have an export warning and some do
+
+     Test case:
+      ExportWarnings6
+  -}
+  TcRnIncompleteExportWarnings :: !Name -- ^ The name that is exported
+                               -> NE.NonEmpty SrcSpan -- ^ The locations of export list items that are
+                                             --   missing the export warning
+                               -> TcRnMessage
 
   {-| TcRnIllegalHsigDefaultMethods is an error that occurs when a binding for
      a class default method is provided in a Backpack signature file.
@@ -2254,10 +2602,39 @@ data TcRnMessage where
     Test case:
       bkpfail40
   -}
-
   TcRnIllegalHsigDefaultMethods :: !Name -- ^ 'Name' of the class
                                 -> NE.NonEmpty (LHsBind GhcRn) -- ^ default methods
                                 -> TcRnMessage
+
+  {-| TcRnHsigFixityMismatch is an error indicating that the fixity decl in a
+    Backpack signature file differs from the one in the source file for the same
+    operator.
+
+    Test cases:
+      bkpfail37, bkpfail38
+  -}
+  TcRnHsigFixityMismatch :: !TyThing -- ^ The operator whose fixity is defined
+                         -> !Fixity -- ^ the fixity used in the source file
+                         -> !Fixity -- ^ the fixity used in the signature
+                         -> TcRnMessage
+
+  {-| TcRnHsigShapeMismatch is a group of errors related to mismatches between
+    backpack signatures.
+  -}
+  TcRnHsigShapeMismatch :: !HsigShapeMismatchReason
+                         -> TcRnMessage
+
+  {-| TcRnHsigMissingModuleExport is an error indicating that a module doesn't
+    export a name exported by its signature.
+
+    Test cases:
+      bkpfail01, bkpfail05, bkpfail09, bkpfail16, bkpfail35, bkpcabal06
+  -}
+  TcRnHsigMissingModuleExport :: !OccName -- ^ The missing name
+                              -> !UnitState -- ^ The module's unit state
+                              -> !Module -- ^ The implementation module
+                              -> TcRnMessage
+
   {-| TcRnBadGenericMethod
      This test ensures that if you provide a "more specific" type signatures
      for the default method, you must also provide a binding.
@@ -2271,7 +2648,7 @@ data TcRnMessage where
        meth = 0
 
     Test case:
-      testsuite/tests/typecheck/should_fail/MissingDefaultMethodBinding.hs
+      typecheck/should_fail/MissingDefaultMethodBinding.hs
   -}
   TcRnBadGenericMethod :: !Name   -- ^ 'Name' of the class
                        -> !Name   -- ^ Problematic method
@@ -2286,16 +2663,32 @@ data TcRnMessage where
        {-# MINIMAL #-} -- warning!
 
      Test case:
-       testsuite/tests/warnings/minimal/WarnMinimal.hs:
+       warnings/minimal/WarnMinimal.hs:
   -}
   TcRnWarningMinimalDefIncomplete :: ClassMinimalDef -> TcRnMessage
+
+  {-| TcRnIllegalQuasiQuotes is an error that occurs when a quasi-quote
+      is used without the QuasiQuotes extension.
+
+      Example:
+
+        foo = [myQuoter|x y z|]
+
+      Test cases: none; the parser fails to parse this if QuasiQuotes is off.
+  -}
+  TcRnIllegalQuasiQuotes :: TcRnMessage
+
+  {-| TcRnTHError is a family of errors involving Template Haskell.
+      See 'THError'.
+  -}
+  TcRnTHError :: THError -> TcRnMessage
 
   {-| TcRnDefaultMethodForPragmaLacksBinding is an error that occurs when
       a default method pragma is missing an accompanying binding.
 
     Test cases:
-      testsuite/tests/typecheck/should_fail/T5084.hs
-      testsuite/tests/typecheck/should_fail/T2354.hs
+      typecheck/should_fail/T5084.hs
+      typecheck/should_fail/T2354.hs
   -}
   TcRnDefaultMethodForPragmaLacksBinding
             :: Id             -- ^ method
@@ -2310,27 +2703,16 @@ data TcRnMessage where
             :: !Name
             -> TcRnMessage
   {-| TcRnBadMethodErr is an error that happens when one attempts to provide a method
-     in a class instance, when the class doesn't have a method by that name.
+      in a class instance, when the class doesn't have a method by that name.
 
      Test case:
-       testsuite/tests/th/T12387
+       th/T12387
   -}
   TcRnBadMethodErr
     :: { badMethodErrClassName  :: !Name
        , badMethodErrMethodName :: !Name
        } -> TcRnMessage
-  {-| TcRnNoExplicitAssocTypeOrDefaultDeclaration is an error that occurs
-      when a class instance does not provide an expected associated type
-      or default declaration.
 
-    Test cases:
-      testsuite/tests/deriving/should_compile/T14094
-      testsuite/tests/indexed-types/should_compile/Simple2
-      testsuite/tests/typecheck/should_compile/tc254
-  -}
-  TcRnNoExplicitAssocTypeOrDefaultDeclaration
-            :: Name
-            -> TcRnMessage
   {-| TcRnIllegalNewtype is an error that occurs when a newtype:
 
       * Does not have exactly one field, or
@@ -2341,18 +2723,18 @@ data TcRnMessage where
       * has strictness annotations.
 
     Test cases:
-      testsuite/tests/gadt/T14719
-      testsuite/tests/indexed-types/should_fail/T14033
-      testsuite/tests/indexed-types/should_fail/T2334A
-      testsuite/tests/linear/should_fail/LinearGADTNewtype
-      testsuite/tests/parser/should_fail/readFail008
-      testsuite/tests/polykinds/T11459
-      testsuite/tests/typecheck/should_fail/T15523
-      testsuite/tests/typecheck/should_fail/T15796
-      testsuite/tests/typecheck/should_fail/T17955
-      testsuite/tests/typecheck/should_fail/T18891a
-      testsuite/tests/typecheck/should_fail/T21447
-      testsuite/tests/typecheck/should_fail/tcfail156
+      gadt/T14719
+      indexed-types/should_fail/T14033
+      indexed-types/should_fail/T2334A
+      linear/should_fail/LinearGADTNewtype
+      parser/should_fail/readFail008
+      polykinds/T11459
+      typecheck/should_fail/T15523
+      typecheck/should_fail/T15796
+      typecheck/should_fail/T17955
+      typecheck/should_fail/T18891a
+      typecheck/should_fail/T21447
+      typecheck/should_fail/tcfail156
   -}
   TcRnIllegalNewtype
             :: DataCon
@@ -2366,7 +2748,7 @@ data TcRnMessage where
       See Note [Type data declarations]
 
      Test case:
-       testsuite/tests/type-data/should_fail/TDNoPragma
+       type-data/should_fail/TDNoPragma
   -}
   TcRnIllegalTypeData :: TcRnMessage
 
@@ -2377,199 +2759,15 @@ data TcRnMessage where
       See Note [Type data declarations]
 
      Test cases:
-       testsuite/tests/type-data/should_fail/TDDeriving
-       testsuite/tests/type-data/should_fail/TDRecordsGADT
-       testsuite/tests/type-data/should_fail/TDRecordsH98
-       testsuite/tests/type-data/should_fail/TDStrictnessGADT
-       testsuite/tests/type-data/should_fail/TDStrictnessH98
+       type-data/should_fail/TDDeriving
+       type-data/should_fail/TDRecordsGADT
+       type-data/should_fail/TDRecordsH98
+       type-data/should_fail/TDStrictnessGADT
+       type-data/should_fail/TDStrictnessH98
   -}
   TcRnTypeDataForbids :: !TypeDataForbids -> TcRnMessage
 
-  {-| TcRnTypedTHWithPolyType is an error that signifies the illegal use
-      of a polytype in a typed template haskell expression.
-
-      Example(s):
-      bad :: (forall a. a -> a) -> ()
-      bad = $$( [|| \_ -> () ||] )
-
-     Test cases: th/T11452
-  -}
-  TcRnTypedTHWithPolyType :: !TcType -> TcRnMessage
-
-  {-| TcRnSpliceThrewException is an error that occurrs when running a template
-      haskell splice throws an exception.
-
-      Example(s):
-
-     Test cases: annotations/should_fail/annfail12
-                 perf/compiler/MultiLayerModulesTH_Make
-                 perf/compiler/MultiLayerModulesTH_OneShot
-                 th/T10796b
-                 th/T19470
-                 th/T19709d
-                 th/T5358
-                 th/T5976
-                 th/T7276a
-                 th/T8987
-                 th/TH_exn1
-                 th/TH_exn2
-                 th/TH_runIO
-  -}
-  TcRnSpliceThrewException
-    :: !SplicePhase
-    -> !SomeException
-    -> !String -- ^ Result of showing the exception (cannot be done safely outside IO)
-    -> !(LHsExpr GhcTc)
-    -> !Bool -- True <=> Print the expression
-    -> TcRnMessage
-
-  {-| TcRnInvalidTopDecl is a template haskell error occurring when one of the 'Dec's passed to
-      'addTopDecls' is not a function, value, annotation, or foreign import declaration.
-
-      Example(s):
-
-     Test cases:
-  -}
-  TcRnInvalidTopDecl :: !(HsDecl GhcPs) -> TcRnMessage
-
-  {-| TcRnNonExactName is a template haskell error for when a declaration being
-      added is bound to a name that is not fully known.
-
-      Example(s):
-
-     Test cases:
-  -}
-  TcRnNonExactName :: !RdrName -> TcRnMessage
-
-  {-| TcRnAddInvalidCorePlugin is a template haskell error indicating that a
-      core plugin being added has an invalid module due to being in the current package.
-
-      Example(s):
-
-     Test cases:
-  -}
-  TcRnAddInvalidCorePlugin
-    :: !String -- ^ Module name
-    -> TcRnMessage
-
-  {-| TcRnAddDocToNonLocalDefn is a template haskell error for documentation being added to a
-      definition which is not in the current module.
-
-      Example(s):
-
-     Test cases: showIface/should_fail/THPutDocExternal
-  -}
-  TcRnAddDocToNonLocalDefn :: !TH.DocLoc -> TcRnMessage
-
-  {-| TcRnFailedToLookupThInstName is a template haskell error that occurrs when looking up an
-      instance fails.
-
-      Example(s):
-
-     Test cases: showIface/should_fail/THPutDocNonExistent
-  -}
-  TcRnFailedToLookupThInstName :: !TH.Type -> !LookupTHInstNameErrReason -> TcRnMessage
-
-  {-| TcRnCannotReifyInstance is a template haskell error for when an instance being reified
-      via `reifyInstances` is not a class constraint or type family application.
-
-      Example(s):
-
-     Test cases:
-  -}
-  TcRnCannotReifyInstance :: !Type -> TcRnMessage
-
-  {-| TcRnCannotReifyOutOfScopeThing is a template haskell error indicating
-      that the given name is not in scope and therefore cannot be reified.
-
-      Example(s):
-
-     Test cases: th/T16976f
-  -}
-  TcRnCannotReifyOutOfScopeThing :: !TH.Name -> TcRnMessage
-
-  {-| TcRnCannotReifyThingNotInTypeEnv is a template haskell error occurring
-      when the given name is not in the type environment and therefore cannot be reified.
-
-      Example(s):
-
-     Test cases:
-  -}
-  TcRnCannotReifyThingNotInTypeEnv :: !Name -> TcRnMessage
-
-  {-| TcRnNoRolesAssociatedWithName is a template haskell error for when the user
-      tries to reify the roles of a given name but it is not something that has
-      roles associated with it.
-
-      Example(s):
-
-     Test cases:
-  -}
-  TcRnNoRolesAssociatedWithThing :: !TcTyThing -> TcRnMessage
-
-  {-| TcRnCannotRepresentThing is a template haskell error indicating that a
-      type cannot be reified because it does not have a representation in template haskell.
-
-      Example(s):
-
-     Test cases:
-  -}
-  TcRnCannotRepresentType :: !UnrepresentableTypeDescr -> !Type -> TcRnMessage
-
-  {-| TcRnRunSpliceFailure is an error indicating that a template haskell splice
-      failed to be converted into a valid expression.
-
-      Example(s):
-
-     Test cases: th/T10828a
-                 th/T10828b
-                 th/T12478_4
-                 th/T15270A
-                 th/T15270B
-                 th/T16895a
-                 th/T16895b
-                 th/T16895c
-                 th/T16895d
-                 th/T16895e
-                 th/T17379a
-                 th/T17379b
-                 th/T18740d
-                 th/T2597b
-                 th/T2674
-                 th/T3395
-                 th/T7484
-                 th/T7667a
-                 th/TH_implicitParamsErr1
-                 th/TH_implicitParamsErr2
-                 th/TH_implicitParamsErr3
-                 th/TH_invalid_add_top_decl
-  -}
-  TcRnRunSpliceFailure
-    :: !(Maybe String) -- ^ Name of the function used to run the splice
-    -> !RunSpliceFailReason
-    -> TcRnMessage
-
-  {-| TcRnUserErrReported is an error or warning thrown using 'qReport' from
-      the 'Quasi' instance of 'TcM'.
-
-      Example(s):
-
-     Test cases:
-  -}
-  TcRnReportCustomQuasiError
-    :: !Bool -- True => Error, False => Warning
-    -> !String -- Error body
-    -> TcRnMessage
-
-  {-| TcRnInterfaceLookupError is an error resulting from looking up a name in an interface file.
-
-      Example(s):
-
-     Test cases:
-  -}
-  TcRnInterfaceLookupError :: !Name -> !SDoc -> TcRnMessage
-
-  {- | TcRnUnsatisfiedMinimalDef is a warning that occurs when a class instance
+  {-| TcRnUnsatisfiedMinimalDef is a warning that occurs when a class instance
        is missing methods that are required by the minimal definition.
 
        Example:
@@ -2578,83 +2776,45 @@ data TcRnMessage where
           instance C ()        -- | foo needs to be defined here
 
        Test cases:
-         testsuite/tests/typecheck/prog001/typecheck.prog001
-         testsuite/tests/typecheck/should_compile/tc126
-         testsuite/tests/typecheck/should_compile/T7903
-         testsuite/tests/typecheck/should_compile/tc116
-         testsuite/tests/typecheck/should_compile/tc175
-         testsuite/tests/typecheck/should_compile/HasKey
-         testsuite/tests/typecheck/should_compile/tc125
-         testsuite/tests/typecheck/should_compile/tc078
-         testsuite/tests/typecheck/should_compile/tc161
-         testsuite/tests/typecheck/should_fail/T5051
-         testsuite/tests/typecheck/should_compile/T21583
-         testsuite/tests/backpack/should_compile/bkp47
-         testsuite/tests/backpack/should_fail/bkpfail25
-         testsuite/tests/parser/should_compile/T2245
-         testsuite/tests/parser/should_compile/read014
-         testsuite/tests/indexed-types/should_compile/Class3
-         testsuite/tests/indexed-types/should_compile/Simple2
-         testsuite/tests/indexed-types/should_fail/T7862
-         testsuite/tests/deriving/should_compile/deriving-1935
-         testsuite/tests/deriving/should_compile/T9968a
-         testsuite/tests/deriving/should_compile/drv003
-         testsuite/tests/deriving/should_compile/T4966
-         testsuite/tests/deriving/should_compile/T14094
-         testsuite/tests/perf/compiler/T15304
-         testsuite/tests/warnings/minimal/WarnMinimal
-         testsuite/tests/simplCore/should_compile/simpl020
-         testsuite/tests/deSugar/should_compile/T14546d
-         testsuite/tests/ghci/scripts/T5820
-         testsuite/tests/ghci/scripts/ghci019
+         typecheck/prog001/typecheck.prog001
+         typecheck/should_compile/tc126
+         typecheck/should_compile/T7903
+         typecheck/should_compile/tc116
+         typecheck/should_compile/tc175
+         typecheck/should_compile/HasKey
+         typecheck/should_compile/tc125
+         typecheck/should_compile/tc078
+         typecheck/should_compile/tc161
+         typecheck/should_fail/T5051
+         typecheck/should_compile/T21583
+         backpack/should_compile/bkp47
+         backpack/should_fail/bkpfail25
+         parser/should_compile/T2245
+         parser/should_compile/read014
+         indexed-types/should_compile/Class3
+         indexed-types/should_compile/Simple2
+         indexed-types/should_fail/T7862
+         deriving/should_compile/deriving-1935
+         deriving/should_compile/T9968a
+         deriving/should_compile/drv003
+         deriving/should_compile/T4966
+         deriving/should_compile/T14094
+         perf/compiler/T15304
+         warnings/minimal/WarnMinimal
+         simplCore/should_compile/simpl020
+         deSugar/should_compile/T14546d
+         ghci/scripts/T5820
+         ghci/scripts/ghci019
   -}
   TcRnUnsatisfiedMinimalDef :: ClassMinimalDef -> TcRnMessage
 
-  {- | 'TcRnMisplacedInstSig' is an error that happens when a method in
+  {-| 'TcRnMisplacedInstSig' is an error that happens when a method in
        a class instance is given a type signature, but the user has not
        enabled the @InstanceSigs@ extension.
 
-       Test case:
-       testsuite/tests/module/mod45
+       Test case: module/mod45
   -}
   TcRnMisplacedInstSig :: Name -> (LHsSigType GhcRn) -> TcRnMessage
-  {- | 'TcRnBadBootFamInstDecl' is an error that is triggered by a
-       type family instance being declared in an hs-boot file.
-
-       Test case:
-       testsuite/tests/indexed-types/should_fail/HsBootFam
-  -}
-  TcRnBadBootFamInstDecl :: {} -> TcRnMessage
-  {- | 'TcRnIllegalFamilyInstance' is an error that occurs when an associated
-       type or data family is given a top-level instance.
-
-       Test case:
-       testsuite/tests/indexed-types/should_fail/T3092
-  -}
-  TcRnIllegalFamilyInstance :: TyCon -> TcRnMessage
-  {- | 'TcRnMissingClassAssoc' is an error that occurs when a class instance
-       for a class with an associated type or data family is missing a corresponding
-       family instance declaration.
-
-       Test case:
-       testsuite/tests/indexed-types/should_fail/SimpleFail7
-  -}
-  TcRnMissingClassAssoc :: TyCon -> TcRnMessage
-  {- | 'TcRnBadFamInstDecl' is an error that is triggered by a type or data family
-       instance without the @TypeFamilies@ extension.
-
-       Test case:
-       testsuite/tests/indexed-types/should_fail/BadFamInstDecl
-  -}
-  TcRnBadFamInstDecl :: TyCon -> TcRnMessage
-  {- | 'TcRnNotOpenFamily' is an error that is triggered by attempting to give
-       a top-level (open) type family instance for a closed type family.
-
-       Test cases:
-         testsuite/tests/indexed-types/should_fail/Overlap7
-         testsuite/tests/indexed-types/should_fail/Overlap3
-  -}
-  TcRnNotOpenFamily :: TyCon -> TcRnMessage
   {-| TcRnNoRebindableSyntaxRecordDot is an error triggered by an overloaded record update
       without RebindableSyntax enabled.
 
@@ -2682,15 +2842,6 @@ data TcRnMessage where
      Test cases: th/T14204
   -}
   TcRnIllegalStaticExpression :: HsExpr GhcPs -> TcRnMessage
-
-  {-| TcRnIllegalStaticFormInSplice is an error when a user attempts to define
-      a static pointer in a Template Haskell splice.
-
-      Example(s):
-
-     Test cases: th/TH_StaticPointers02
-  -}
-  TcRnIllegalStaticFormInSplice :: HsExpr GhcPs -> TcRnMessage
 
   {-| TcRnListComprehensionDuplicateBinding is an error triggered by duplicate
       let-bindings in a list comprehension.
@@ -2731,7 +2882,7 @@ data TcRnMessage where
                  parser/should_fail/readFail028
   -}
   TcRnLastStmtNotExpr
-    :: HsStmtContext GhcRn
+    :: HsStmtContextRn
     -> UnexpectedStatement
     -> TcRnMessage
 
@@ -2745,7 +2896,7 @@ data TcRnMessage where
                  parser/should_fail/readFail043
   -}
   TcRnUnexpectedStatementInContext
-    :: HsStmtContext GhcRn
+    :: HsStmtContextRn
     -> UnexpectedStatement
     -> Maybe LangExt.Extension
     -> TcRnMessage
@@ -2783,35 +2934,1410 @@ data TcRnMessage where
   -}
   TcRnSectionWithoutParentheses :: HsExpr GhcPs -> TcRnMessage
 
-  {-| TcRnLoopySuperclassSolve is a warning, controlled by @-Wloopy-superclass-solve@,
-      that is triggered when GHC solves a constraint in a possibly-loopy way,
-      violating the class instance termination rules described in the section
-      "Undecidable instances and loopy superclasses" of the user's guide.
+  {-| TcRnBindingOfExistingName is an error triggered by an attempt to rebind
+     built-in syntax, punned list or tuple syntax, or a name quoted via Template Haskell.
+
+     Examples:
+
+       data []
+       data (->)
+       $(pure [ValD (VarP 'succ) (NormalB (ConE 'True)) []])
+
+     Test cases: rename/should_fail/T14907b
+                 rename/should_fail/T22839
+                 rename/should_fail/rnfail042
+                 th/T13968
+  -}
+  TcRnBindingOfExistingName :: RdrName -> TcRnMessage
+  {-| TcRnMultipleFixityDecls is an error triggered by multiple
+      fixity declarations for the same operator.
+
+     Example(s):
+
+       infixr 6 $$
+       infixl 4 $$
+
+     Test cases: rename/should_fail/RnMultipleFixityFail
+  -}
+  TcRnMultipleFixityDecls :: SrcSpan -> RdrName -> TcRnMessage
+
+  {-| TcRnIllegalPatternSynonymDecl is an error thrown when a user
+      defines a pattern synonyms without enabling the PatternSynonyms extension.
+
+     Example:
+
+       pattern O :: Int
+       pattern O = 0
+
+     Test cases: rename/should_fail/RnPatternSynonymFail
+  -}
+  TcRnIllegalPatternSynonymDecl :: TcRnMessage
+
+  {-| TcRnIllegalClassBinding is an error triggered by a binding
+      in a class or instance declaration of an illegal form.
+
+     Examples:
+
+        class ZeroOne a where
+          zero :: a
+          one :: a
+        instance ZeroOne Int where
+          (zero,one) = (0,1)
+
+        class C a where
+           pattern P = ()
+
+     Test cases: module/mod48
+                 patsyn/should_fail/T9705-1
+                 patsyn/should_fail/T9705-2
+                 typecheck/should_fail/tcfail021
+
+  -}
+  TcRnIllegalClassBinding :: DeclSort -> HsBindLR GhcPs GhcPs -> TcRnMessage
+
+  {-| TcRnOrphanCompletePragma is an error triggered by a {-# COMPLETE #-}
+      pragma which does not mention any data constructors or pattern synonyms
+      defined in the current module.
+
+     Test cases: patsyn/should_fail/T13349
+  -}
+  TcRnOrphanCompletePragma :: TcRnMessage
+
+  {-| TcRnEmptyCase is an error thrown when a user uses
+      a case expression with an empty list of alternatives without
+      enabling the EmptyCase extension.
+
+     Example for EmptyCaseWithoutFlag:
+
+       {-# LANGUAGE NoEmptyCase #-}
+       f :: Void -> a
+       f = \case {}    -- extension not enabled
+
+     Example for EmptyCaseDisallowedCtxt:
+
+       f = \cases {}   -- multi-case requires n>0 alternatives
+
+     Example for EmptyCaseForall:
+
+       f :: forall (xs :: Type) -> ()
+       f = \case {}    -- can't match on a type argument
+
+     Test cases: rename/should_fail/RnEmptyCaseFail
+                 typecheck/should_fail/T25004
+  -}
+  TcRnEmptyCase :: !HsMatchContextRn
+                -> !BadEmptyCaseReason
+                -> TcRnMessage
+
+  {-| TcRnNonStdGuards is a warning thrown when a user uses
+      non-standard guards (e.g. patterns in guards) without
+      enabling the PatternGuards extension.
+      More realistically: the user has explicitly disabled PatternGuards,
+      as it is enabled by default with `-XHaskell2010`.
+
+     Example(s):
+
+       f | 5 <- 2 + 3 = ...
+
+     Test cases: rename/should_compile/rn049
+  -}
+  TcRnNonStdGuards :: NonStandardGuards -> TcRnMessage
+
+  {-| TcRnDuplicateSigDecl is an error triggered by two or more
+      signatures for one entity.
+
+     Examples:
+
+       f :: Int -> Bool
+       f :: Int -> Bool
+       f _ = True
+
+       g x = x
+       {-# INLINE g #-}
+       {-# NOINLINE g #-}
+
+       pattern P = ()
+       {-# COMPLETE P #-}
+       {-# COMPLETE P #-}
+
+     Test cases: module/mod68
+                 parser/should_fail/OpaqueParseFail4
+                 patsyn/should_fail/T12165
+                 rename/should_fail/rnfail048
+                 rename/should_fail/T5589
+                 rename/should_fail/T7338
+                 rename/should_fail/T7338a
+  -}
+  TcRnDuplicateSigDecl :: NE.NonEmpty (LocatedN RdrName, Sig GhcPs) -> TcRnMessage
+
+  {-| TcRnMisplacedSigDecl is an error triggered by the pragma application
+      in the wrong context, like `MINIMAL` applied to a function or
+      `SPECIALIZE` to an instance.
+
+     Example:
+
+       f x = x
+       {-# MINIMAL f #-}
+
+     Test cases: rename/should_fail/T18138
+                 warnings/minimal/WarnMinimalFail1
+  -}
+  TcRnMisplacedSigDecl :: Sig GhcRn -> TcRnMessage
+
+  {-| TcRnUnexpectedDefaultSig is an error thrown when a user uses
+      default signatures without enabling the DefaultSignatures extension.
+
+     Example:
+
+       class C a where
+         m :: a
+         default m :: Num a => a
+         m = 0
+
+     Test cases: rename/should_fail/RnDefaultSigFail
+  -}
+  TcRnUnexpectedDefaultSig :: Sig GhcPs -> TcRnMessage
+
+  {-| TcRnDuplicateMinimalSig is an error triggered by two or more minimal
+      signatures for one type class.
+
+     Example:
+
+       class C where
+         f :: ()
+         {-# MINIMAL f #-}
+         {-# MINIMAL f #-}
+
+     Test cases: rename/should_fail/RnMultipleMinimalPragmaFail
+  -}
+  TcRnDuplicateMinimalSig :: LSig GhcPs -> LSig GhcPs -> [LSig GhcPs] -> TcRnMessage
+
+  {-| 'TcRnIllegalInvisTyVarBndr' is an error that occurs
+      when invisible type variable binders in type declarations
+      are used without enabling the @TypeAbstractions@ extension.
+
+      Example:
+        {-# LANGUAGE NoTypeAbstractions #-}         -- extension disabled
+        data T @k (a :: k) @(j :: Type) (b :: j)
+               ^^          ^^^^^^^^^^^^
+
+      Test case: T22560_fail_ext
+  -}
+  TcRnIllegalInvisTyVarBndr
+    :: !(LHsTyVarBndr (HsBndrVis GhcRn) GhcRn)
+    -> TcRnMessage
+
+  {-| 'TcRnInvalidInvisTyVarBndr' is an error that occurs
+      when an invisible type variable binder has no corresponding
+      @forall k.@ quantifier in the standalone kind signature.
+
+      Example:
+        type P :: forall a -> Type
+        data P @a = MkP
+
+      Test cases: T22560_fail_a T22560_fail_b
+  -}
+  TcRnInvalidInvisTyVarBndr
+    :: !Name
+    -> !(LHsTyVarBndr (HsBndrVis GhcRn) GhcRn)
+    -> TcRnMessage
+
+  {-| 'TcRnInvisBndrWithoutSig' is an error triggered by attempting to use
+      an invisible type variable binder in a type declaration without a
+      standalone kind signature or a complete user-supplied kind.
+
+      Example:
+        data T @k (a :: k)     -- No CUSK, no SAKS
+
+      Test case: T22560_fail_d
+  -}
+  TcRnInvisBndrWithoutSig
+    :: !Name
+    -> !(LHsTyVarBndr (HsBndrVis GhcRn) GhcRn)
+    -> TcRnMessage
+
+  {-| TcRnDeprecatedInvisTyArgInConPat is a warning that triggers on type applications
+      in constructor patterns when the user has not enabled '-XTypeAbstractions'
+      but instead has enabled both '-XScopedTypeVariables' and '-XTypeApplications'.
+
+      This warning is a deprecation mechanism that is scheduled until GHC 9.12.
+  -}
+  TcRnDeprecatedInvisTyArgInConPat
+    :: TcRnMessage
+
+  {-| TcRnUnexpectedStandaloneDerivingDecl is an error thrown when a user uses
+      standalone deriving without enabling the StandaloneDeriving extension.
 
       Example:
 
-        class Foo f
-        class Foo f => Bar f g
-        instance Bar f f => Bar f (h k)
+        deriving instance Eq Foo
 
-      Test cases: T20666, T20666{a,b}, T22891, T22912.
+      Test cases: rename/should_fail/RnUnexpectedStandaloneDeriving
   -}
-  TcRnLoopySuperclassSolve :: CtLoc    -- ^ Wanted 'CtLoc'
-                           -> PredType -- ^ Wanted 'PredType'
+  TcRnUnexpectedStandaloneDerivingDecl :: TcRnMessage
+
+  {-| TcRnUnusedVariableInRuleDecl is an error triggered by forall'd variable in
+      rewrite rule that does not appear on left-hand side
+
+      Example:
+
+        {-# RULES "rule" forall a. id = id #-}
+
+      Test cases: rename/should_fail/ExplicitForAllRules2
+  -}
+  TcRnUnusedVariableInRuleDecl :: FastString -> Name -> TcRnMessage
+
+  {-| TcRnUnexpectedStandaloneKindSig is an error thrown when a user uses standalone
+      kind signature without enabling the StandaloneKindSignatures extension.
+
+      Example:
+
+        type D :: Type
+        data D = D
+
+      Test cases: saks/should_fail/saks_fail001
+  -}
+  TcRnUnexpectedStandaloneKindSig :: TcRnMessage
+
+  {-| TcRnIllegalRuleLhs is an error triggered by malformed left-hand side
+      of rewrite rule
+
+      Examples:
+
+        {-# RULES "test" forall x. f x = x #-}
+
+        {-# RULES "test" forall x. case x of = x #-}
+
+      Test cases: rename/should_fail/T15659
+  -}
+  TcRnIllegalRuleLhs
+    :: RuleLhsErrReason
+    -> FastString -- Rule name
+    -> LHsExpr GhcRn -- Full expression
+    -> HsExpr GhcRn -- Bad expression
+    -> TcRnMessage
+
+  {-| TcRnDuplicateRoleAnnot is an error triggered by two or more role
+      annotations for one type
+
+      Example:
+
+        data D a
+        type role D phantom
+        type role D phantom
+
+      Test cases: roles/should_fail/Roles8
+  -}
+  TcRnDuplicateRoleAnnot :: NE.NonEmpty (LRoleAnnotDecl GhcPs) -> TcRnMessage
+
+  {-| TcRnDuplicateKindSig is an error triggered by two or more standalone
+      kind signatures for one type
+
+      Example:
+
+        type D :: Type
+        type D :: Type
+        data D
+
+      Test cases: saks/should_fail/saks_fail002
+  -}
+  TcRnDuplicateKindSig :: NE.NonEmpty (LStandaloneKindSig GhcPs) -> TcRnMessage
+
+  {-| TcRnIllegalDerivStrategy  is an error thrown when a user uses deriving
+      strategy without enabling the DerivingStrategies extension or uses deriving
+      via without enabling the DerivingVia extension.
+
+      Examples:
+
+        data T = T deriving stock Eq
+
+        data T = T deriving via Eq T
+
+      Test cases: deriving/should_fail/deriving-via-fail3
+                  deriving/should_fail/T10598_fail4
+  -}
+  TcRnIllegalDerivStrategy :: DerivStrategy GhcPs -> TcRnMessage
+
+  {-| TcRnIllegalMultipleDerivClauses is an error thrown when a user uses two or more
+      deriving clauses without enabling the DerivingStrategies extension.
+
+      Example:
+
+        data T = T
+          deriving Eq
+          deriving Ord
+
+      Test cases: deriving/should_fail/T10598_fail5
+  -}
+  TcRnIllegalMultipleDerivClauses :: TcRnMessage
+
+  {-| TcRnNoDerivStratSpecified is a warning implied by -Wmissing-deriving-strategies
+      and triggered by deriving clause without specified deriving strategy.
+
+      Example:
+
+        data T = T
+          deriving Eq
+
+      Test cases: rename/should_compile/T15798a
+                  rename/should_compile/T15798b
+                  rename/should_compile/T15798c
+  -}
+  TcRnNoDerivStratSpecified
+    :: Bool -- True if DerivingStrategies is enabled
+    -> TcRnMessage
+
+  {-| TcRnStupidThetaInGadt is an error triggered by data contexts in GADT-style
+      data declaration
+
+      Example:
+
+        data (Eq a) => D a where
+          MkD :: D Int
+
+      Test cases: rename/should_fail/RnStupidThetaInGadt
+  -}
+  TcRnStupidThetaInGadt :: HsDocContext -> TcRnMessage
+
+  {-| TcRnShadowedTyVarNameInFamResult is an error triggered by type variable in
+      type family result that shadows type variable from left hand side
+
+      Example:
+
+        type family F a b c = b
+
+      Test cases: ghci/scripts/T6018ghcirnfail
+                  rename/should_fail/T6018rnfail
+  -}
+  TcRnShadowedTyVarNameInFamResult :: IdP GhcPs -> TcRnMessage
+
+  {-| TcRnIncorrectTyVarOnRhsOfInjCond is an error caused by a situation where the
+      left-hand side of an injectivity condition of a type family is not a variable
+      referring to the type family result.
+      See Note [Renaming injectivity annotation] for more details.
+
+      Example:
+
+        type family F a = r | a -> a
+
+      Test cases: ghci/scripts/T6018ghcirnfail
+                  rename/should_fail/T6018rnfail
+  -}
+  TcRnIncorrectTyVarOnLhsOfInjCond
+    :: IdP GhcRn -- Expected
+    -> LIdP GhcPs -- Actual
+    -> TcRnMessage
+
+  {-| TcRnUnknownTyVarsOnRhsOfInjCond is an error triggered by out-of-scope type
+      variables on the right-hand side of a of an injectivity condition of a type family
+
+      Example:
+
+        type family F a = res | res -> b
+
+      Test cases: ghci/scripts/T6018ghcirnfail
+                  rename/should_fail/T6018rnfail
+  -}
+  TcRnUnknownTyVarsOnRhsOfInjCond :: [Name] -> TcRnMessage
+
+  {-| TcRnLookupInstance groups several errors emitted when looking up class instances.
+
+    Test cases:
+      none
+  -}
+  TcRnLookupInstance
+    :: !Class
+    -> ![Type]
+    -> !LookupInstanceErrReason
+    -> TcRnMessage
+
+  {-| TcRnBadlyStaged is an error that occurs when a TH binding is used in an
+    invalid stage.
+
+    Test cases:
+      T17820d
+  -}
+  TcRnBadlyStaged
+    :: !StageCheckReason -- ^ The binding being spliced.
+    -> !Int -- ^ The binding stage.
+    -> !Int -- ^ The stage at which the binding is used.
+    -> TcRnMessage
+
+  {-| TcRnStageRestriction is an error that occurs when a top level splice refers to
+    a local name.
+
+    Test cases:
+      T17820, T21547, T5795, qq00[1-4], annfail0{3,4,6,9}
+  -}
+  TcRnStageRestriction
+    :: !StageCheckReason -- ^ The binding being spliced.
+    -> TcRnMessage
+
+  {-| TcRnBadlyStagedWarn is a warning that occurs when a TH type binding is
+    used in an invalid stage.
+
+    Controlled by flags:
+       - Wbadly-staged-type
+
+    Test cases:
+      T23829_timely T23829_tardy T23829_hasty
+  -}
+  TcRnBadlyStagedType
+    :: !Name  -- ^ The type binding being spliced.
+    -> !Int -- ^ The binding stage.
+    -> !Int -- ^ The stage at which the binding is used.
+    -> TcRnMessage
+
+  {-| TcRnTyThingUsedWrong is an error that occurs when a thing is used where another
+    thing was expected.
+
+    Test cases:
+      none
+  -}
+  TcRnTyThingUsedWrong
+    :: !WrongThingSort -- ^ Expected thing.
+    -> !TcTyThing -- ^ Thing used wrongly.
+    -> !Name -- ^ Name of the thing used wrongly.
+    -> TcRnMessage
+
+  {-| TcRnCannotDefaultKindVar is an error that occurs when attempting to use
+    unconstrained kind variables whose type isn't @Type@, without -XPolyKinds.
+
+    Test cases:
+      T11334b
+  -}
+  TcRnCannotDefaultKindVar
+    :: !TyVar -- ^ The unconstrained variable.
+    -> !Kind -- ^ Kind of the variable.
+    -> TcRnMessage
+
+  {-| TcRnUninferrableTyVar is an error that occurs when metavariables
+    in a type could not be defaulted.
+
+    Test cases:
+      T17301, T17562, T17567, T17567StupidTheta, T15474, T21479
+  -}
+  TcRnUninferrableTyVar
+    :: ![TyCoVar] -- ^ The variables that could not be defaulted.
+    -> !UninferrableTyVarCtx -- ^ Description of the surrounding context.
+    -> TcRnMessage
+
+  {-| TcRnSkolemEscape is an error that occurs when type variables from an
+    outer scope is used in a context where they should be locally scoped.
+
+    Test cases:
+      T15076, T15076b, T14880-2, T15825, T14880, T15807, T16946, T14350,
+      T14040A, T15795, T15795a, T14552
+  -}
+  TcRnSkolemEscape
+    :: ![TcTyVar] -- ^ The variables that would escape.
+    -> !TcTyVar -- ^ The variable that is being quantified.
+    -> !Type -- ^ The type in which they occur.
+    -> TcRnMessage
+
+  {-| TcRnPatSynEscapedCoercion is an error indicating that a coercion escaped from
+    a pattern synonym into a type.
+    See Note [Coercions that escape] in GHC.Tc.TyCl.PatSyn
+
+    Test cases:
+      T14507
+  -}
+  TcRnPatSynEscapedCoercion :: !Id -- ^ The pattern-bound variable
+                            -> !(NE.NonEmpty CoVar) -- ^ The escaped coercions
+                            -> TcRnMessage
+
+  {-| TcRnPatSynExistentialInResult is an error indicating that the result type
+    of a pattern synonym mentions an existential type variable.
+
+    Test cases:
+      PatSynExistential
+  -}
+  TcRnPatSynExistentialInResult :: !Name -- ^ The name of the pattern synonym
+                                -> !TcSigmaType -- ^ The result type
+                                -> ![TyVar] -- ^ The escaped existential variables
+                                -> TcRnMessage
+
+  {-| TcRnPatSynArityMismatch is an error indicating that the number of arguments in a
+    pattern synonym's equation differs from the number of parameters in its
+    signature.
+
+    Test cases:
+      PatSynArity
+  -}
+  TcRnPatSynArityMismatch :: !Name -- ^ The name of the pattern synonym
+                          -> !Arity -- ^ The number of equation arguments
+                          -> !Arity -- ^ The difference
+                          -> TcRnMessage
+
+  {-| TcRnPatSynInvalidRhs is an error group indicating that the pattern on the
+    right hand side of a pattern synonym is invalid.
+
+    Test cases:
+      unidir, T14112
+  -}
+  TcRnPatSynInvalidRhs :: !Name -- ^ The name of the pattern synonym
+                       -> !(LPat GhcRn) -- ^ The pattern
+                       -> ![LIdP GhcRn] -- ^ The LHS args
+                       -> !PatSynInvalidRhsReason -- ^ The number of equation arguments
+                       -> TcRnMessage
+
+  {-| TcRnZonkerMessage is collection of errors that occur when zonking,
+      i.e. filling in metavariables with their final values.
+
+      See 'ZonkerMessage'
+  -}
+  TcRnZonkerMessage :: ZonkerMessage -> TcRnMessage
+
+  {-| TcRnTyFamDepsDisabled is an error indicating that a type family injectivity
+    annotation was used without enabling the extension TypeFamilyDependencies.
+
+    Test cases:
+      T11381
+  -}
+  TcRnTyFamDepsDisabled :: TcRnMessage
+
+  {-| TcRnAbstractClosedTyFamDecl is an error indicating that an abstract closed
+    type family was declared in a regular source file, while it is only allowed
+    in hs-boot files.
+
+    Test cases:
+      ClosedFam4
+  -}
+  TcRnAbstractClosedTyFamDecl :: TcRnMessage
+
+  {-| TcRnPartialFieldSelector is a warning indicating that a record selector
+    was not defined for all constructors of a data type.
+
+    Test cases:
+      DRFPartialFields, T7169
+  -}
+  TcRnPartialFieldSelector :: !FieldLabel -- ^ The selector
                            -> TcRnMessage
 
-  {- TcRnCannotDefaultConcrete is an error occurring when a concrete
+  {-| TcRnHasFieldResolvedIncomplete is a warning triggered when a HasField constraint
+      is resolved for a record field for which a `getField @"field"` application
+      might not be successful. Currently, this means that the warning is triggered when
+      the parent data type of that record field does not have that field in all
+      its constructors.
+
+      Example(s):
+      data T = T1 | T2 {x :: Bool}
+      f :: HasField t "x" Bool => t -> Bool
+      f = getField @"x"
+      g :: T -> Bool
+      g = f
+
+     Test cases:
+       TcIncompleteRecSel
+  -}
+  TcRnHasFieldResolvedIncomplete :: !Name -> TcRnMessage
+
+  {-| TcRnBadFieldAnnotation is an error/warning group indicating that a
+    strictness/unpack related data type field annotation is invalid.
+  -}
+  TcRnBadFieldAnnotation :: !Int -- ^ The index of the field
+                         -> !DataCon -- ^ The constructor in which the field is defined
+                         -> !BadFieldAnnotationReason -- ^ The error specifics
+                         -> TcRnMessage
+
+  {-| TcRnSuperclassCycle is an error indicating that a class has a superclass
+    cycle.
+
+    Test cases:
+      mod40, tcfail027, tcfail213, tcfail216, tcfail217, T9415, T9739
+  -}
+  TcRnSuperclassCycle :: !SuperclassCycle -- ^ The details of the cycle
+                      -> TcRnMessage
+
+  {-| TcRnDefaultSigMismatch is an error indicating that a default method
+    signature doesn't match the regular method signature.
+
+    Test cases:
+      T7437, T12918a, T12918b, T12151
+  -}
+  TcRnDefaultSigMismatch :: !Id -- ^ The name of the method
+                         -> !Type -- ^ The type of the default signature
+                         -> TcRnMessage
+
+  {-| TcRnTyFamsDisabled is an error indicating that a type family or instance
+    was declared while the extension TypeFamilies was disabled.
+
+    Test cases:
+      TyFamsDisabled
+  -}
+  TcRnTyFamsDisabled :: !TyFamsDisabledReason -- ^ The name of the family or instance
+                     -> TcRnMessage
+
+  {-| TcRnBadTyConTelescope is an error caused by an ill-scoped 'TyCon' kind,
+     due to type variables being out of dependency order.
+
+     Example:
+
+      class C a (b :: Proxy a) (c :: Proxy b) where
+        type T c a
+
+     Test cases:
+       BadTelescope{∅,3,4}
+       T14066{f,g}
+       T14887
+       T15591{b,c}
+       T15743{c,d}
+       T15764
+       T23252
+
+  -}
+  TcRnBadTyConTelescope :: !TyCon -> TcRnMessage
+
+  {-| TcRnTyFamResultDisabled is an error indicating that a result variable
+    was used on a type family while the extension TypeFamilyDependencies was
+    disabled.
+
+    Test cases:
+      T13571, T13571a
+  -}
+  TcRnTyFamResultDisabled :: !Name -- ^ The name of the type family
+                          -> !(LHsTyVarBndr () GhcRn) -- ^ Name of the result variable
+                          -> TcRnMessage
+
+  {-| TcRnRoleValidationFailed is an error indicating that a variable was
+    assigned an invalid role by the inference algorithm.
+    This is only performed with -dcore-lint.
+  -}
+  TcRnRoleValidationFailed :: !Role -- ^ The validated role
+                           -> !RoleValidationFailedReason -- ^ The failure reason
+                           -> TcRnMessage
+
+  {-| TcRnCommonFieldResultTypeMismatch is an error indicating that a sum type
+    declares the same field name in multiple constructors, but the constructors'
+    result types differ.
+
+    Test cases:
+      CommonFieldResultTypeMismatch
+  -}
+  TcRnCommonFieldResultTypeMismatch :: !DataCon -- ^ First constructor
+                                    -> !DataCon -- ^ Second constructor
+                                    -> !FieldLabelString -- ^ Field name
+                                    -> TcRnMessage
+
+  {-| TcRnCommonFieldTypeMismatch is an error indicating that a sum type
+    declares the same field name in multiple constructors, but their types
+    differ.
+
+    Test cases:
+      CommonFieldTypeMismatch
+  -}
+  TcRnCommonFieldTypeMismatch :: !DataCon -- ^ First constructor
+                              -> !DataCon -- ^ Second constructor
+                              -> !FieldLabelString -- ^ Field name
+                              -> TcRnMessage
+
+  {-| TcRnClassExtensionDisabled is an error indicating that a class
+    was declared with an extension feature while the extension was disabled.
+  -}
+  TcRnClassExtensionDisabled :: !Class -- ^ The class
+                             -> !DisabledClassExtension -- ^ The extension
+                             -> TcRnMessage
+
+  {-| TcRnDataConParentTypeMismatch is an error indicating that a data
+    constructor was declared with a type that doesn't match its type
+    constructor (i.e. a GADT result type and its data name).
+
+    Test cases:
+      T7175, T13300, T14719, T18357, T18357b, gadt11, tcfail155, tcfail176
+  -}
+  TcRnDataConParentTypeMismatch :: !DataCon -- ^ The data constructor
+                                -> !Type -- ^ The parent type
+                                -> TcRnMessage
+
+  {-| TcRnGADTsDisabled is an error indicating that a GADT was declared
+    while the extension GADTs was disabled.
+
+    Test cases:
+      ghci057, T9293
+  -}
+  TcRnGADTsDisabled :: !Name -- ^ The name of the GADT
+                    -> TcRnMessage
+
+  {-| TcRnExistentialQuantificationDisabled is an error indicating that
+    a data constructor was declared with existential features while the
+    extension ExistentialQuantification was disabled.
+
+    Test cases:
+      ghci057, T9293, gadtSyntaxFail001, gadtSyntaxFail002, gadtSyntaxFail003,
+      prog006, rnfail053, T12083a
+  -}
+  TcRnExistentialQuantificationDisabled :: !DataCon -- ^ The constructor
+                                        -> TcRnMessage
+
+  {-| TcRnGADTDataContext is an error indicating that a GADT was declared with a
+    data type context.
+    This error is emitted in the tc, but it is also caught in the renamer.
+  -}
+  TcRnGADTDataContext :: !Name -- ^ The data type name
+                      -> TcRnMessage
+
+  {-| TcRnMultipleConForNewtype is an error indicating that a newtype was
+    declared with multiple constructors.
+    This error is caught by the parser.
+  -}
+  TcRnMultipleConForNewtype :: !Name -- ^ The newtype name
+                            -> !Int -- ^ The number of constructors
+                            -> TcRnMessage
+
+  {-| TcRnKindSignaturesDisabled is an error indicating that a kind signature
+    was used in a data type declaration while the extension KindSignatures was
+    disabled.
+
+    Test cases:
+      T20873c, readFail036
+  -}
+  TcRnKindSignaturesDisabled :: !(Either (HsType GhcPs) (Name, HsType GhcRn))
+                                -- ^ The data type name
+                             -> TcRnMessage
+
+  {-| TcRnEmptyDataDeclsDisabled is an error indicating that a data type
+    was declared with no constructors while the extension EmptyDataDecls was
+    disabled.
+
+    Test cases:
+      readFail035
+  -}
+  TcRnEmptyDataDeclsDisabled :: !Name -- ^ The data type name
+                             -> TcRnMessage
+
+  {-| TcRnRoleMismatch is an error indicating that the role specified
+    in an annotation differs from its inferred role.
+
+    Test cases:
+      T7253, Roles11
+  -}
+  TcRnRoleMismatch :: !Name -- ^ The type variable
+                   -> !Role -- ^ The annotated role
+                   -> !Role -- ^ The inferred role
+                   -> TcRnMessage
+
+  {-| TcRnRoleCountMismatch is an error indicating that the number of
+    roles in an annotation doesn't match the number of type parameters.
+
+    Test cases:
+      Roles6
+  -}
+  TcRnRoleCountMismatch :: !Int -- ^ The number of type variables
+                        -> !(LRoleAnnotDecl GhcRn) -- ^ The role annotation
+                        -> TcRnMessage
+
+  {-| TcRnIllegalRoleAnnotation is an error indicating that a role
+    annotation was attached to a decl that doesn't allow it.
+
+    Test cases:
+      Roles5
+  -}
+  TcRnIllegalRoleAnnotation :: !(RoleAnnotDecl GhcRn) -- ^ The role annotation
+                            -> TcRnMessage
+
+  {-| TcRnRoleAnnotationsDisabled is an error indicating that a role
+    annotation was declared while the extension RoleAnnotations was disabled.
+
+    Test cases:
+      Roles5, TH_Roles1
+  -}
+  TcRnRoleAnnotationsDisabled :: !TyCon -- ^ The annotated type
+                              -> TcRnMessage
+
+  {-| TcRnIncoherentRoles is an error indicating that a role
+    annotation for a class parameter was declared as not nominal.
+
+    Test cases:
+      T8773
+  -}
+  TcRnIncoherentRoles :: !TyCon -- ^ The class tycon
+                      -> TcRnMessage
+  {-| TcRnPrecedenceParsingError is an error caused by attempting to
+      use operators with the same precedence in one infix expression.
+
+      Example:
+        eq :: (a ~ b ~ c) :~: ()
+
+      Test cases: module/mod61
+                  parser/should_fail/readFail016
+                  rename/should_fail/rnfail017
+                  rename/should_fail/T9077
+                  typecheck/should_fail/T18252a
+  -}
+  TcRnPrecedenceParsingError
+    :: (OpName, Fixity) -- ^ first operator's name and fixity
+    -> (OpName, Fixity) -- ^ second operator's name and fixity
+    -> TcRnMessage
+
+  {-| TcRnPrecedenceParsingError is an error caused by attempting to
+      use an operator with higher precedence than the operand.
+
+      Example:
+        k = (-3 **)
+          where
+                (**) = const
+                infixl 7 **
+
+      Test cases: overloadedrecflds/should_fail/T13132_duplicaterecflds
+                  parser/should_fail/readFail023
+                  rename/should_fail/rnfail019
+                  th/TH_unresolvedInfix2
+  -}
+  TcRnSectionPrecedenceError
+    :: (OpName, Fixity) -- ^ first operator's name and fixity
+    -> (OpName, Fixity) -- ^ argument operator
+    -> HsExpr GhcPs -- ^ Section
+    -> TcRnMessage
+
+  {-| TcRnTypeSynonymCycle is an error indicating that a cycle between type
+    synonyms has occurred.
+
+    Test cases:
+      mod27, ghc-e-fail2, bkpfail29
+  -}
+  TcRnTypeSynonymCycle :: !TySynCycleTyCons -- ^ The tycons involved in the cycle
+                       -> TcRnMessage
+
+  {-| TcRnSelfImport is an error indicating that a module contains an
+    import of itself.
+
+    Test cases:
+      T9032
+  -}
+  TcRnSelfImport :: !ModuleName -- ^ The module
+                 -> TcRnMessage
+
+  {-| TcRnNoExplicitImportList is a warning indicating that an import
+      statement did not include an explicit import list.
+
+    Test cases:
+      T1789, T4489
+  -}
+  TcRnNoExplicitImportList :: !ModuleName -- ^ The imported module
+                           -> TcRnMessage
+
+  {-| TcRnSafeImportsDisabled is an error indicating that an import was
+    declared using the @safe@ keyword while SafeHaskell wasn't active.
+
+    Test cases:
+      Mixed01
+  -}
+  TcRnSafeImportsDisabled :: !ModuleName -- ^ The imported module
+                           -> TcRnMessage
+
+  {-| TcRnDeprecatedModule is a warning indicating that an imported module
+    is annotated with a warning or deprecation pragma.
+
+    Test cases:
+      DeprU
+  -}
+  TcRnDeprecatedModule :: !ModuleName -- ^ The imported module
+                       -> !(WarningTxt GhcRn) -- ^ The pragma data
+                       -> TcRnMessage
+
+  {-| TcRnCompatUnqualifiedImport is a warning indicating that a special
+    module (right now only Data.List) was imported unqualified without
+    import list, for compatibility reasons.
+
+    Test cases:
+      T17244A
+  -}
+  TcRnCompatUnqualifiedImport :: !(ImportDecl GhcPs) -- ^ The import
+                              -> TcRnMessage
+
+  {-| TcRnRedundantSourceImport is a warning indicating that a {-# SOURCE #-}
+    import was used when there is no import cycle.
+
+    Test cases:
+      none
+  -}
+  TcRnRedundantSourceImport :: !ModuleName -- ^ The imported module
+                            -> TcRnMessage
+
+  {-| TcRnImportLookup is a group of errors about bad imported names.
+  -}
+  TcRnImportLookup :: !ImportLookupReason -- ^ Details about the error
+                   -> TcRnMessage
+
+  {-| TcRnUnusedImport is a group of errors about unused imports.
+  -}
+  TcRnUnusedImport :: !(ImportDecl GhcRn) -- ^ The import
+                   -> !UnusedImportReason -- ^ Details about the error
+                   -> TcRnMessage
+
+  {-| TcRnDuplicateDecls is an error indicating that the same name was used for
+    multiple declarations.
+
+    Test cases:
+      FieldSelectors, overloadedrecfldsfail03, T17965, NFSDuplicate, T9975a,
+      TDMultiple01, mod19, mod38, mod21, mod66, mod20, TDPunning, mod18, mod22,
+      TDMultiple02, T4127a, ghci048, T8932, rnfail015, rnfail010, rnfail011,
+      rnfail013, rnfail002, rnfail003, rn_dup, rnfail009, T7164, rnfail043,
+      TH_dupdecl, rnfail012
+  -}
+  TcRnDuplicateDecls :: !OccName -- ^ The name of the declarations
+                     -> !(NE.NonEmpty Name) -- ^ The individual declarations
+                     -> TcRnMessage
+
+  {-| TcRnPackageImportsDisabled is an error indicating that an import uses
+    a package qualifier while the extension PackageImports was disabled.
+
+    Test cases:
+      PackageImportsDisabled
+  -}
+  TcRnPackageImportsDisabled :: TcRnMessage
+
+  {-| TcRnIllegalDataCon is an error indicating that a data constructor was
+    defined using a lowercase name, or a symbolic name in prefix position.
+    Mostly caught by PsErrNotADataCon.
+
+    Test cases:
+      None
+  -}
+  TcRnIllegalDataCon :: !RdrName -- ^ The constructor name
+                     -> TcRnMessage
+
+  {-| TcRnNestedForallsContexts is an error indicating that multiple foralls or
+    contexts are nested/curried where this is not supported,
+    like @∀ x. ∀ y.@ instead of @∀ x y.@.
+
+    Test cases:
+      T12087, T14320, T16114, T16394, T16427, T18191, T18240a, T18240b, T18455, T5951
+  -}
+  TcRnNestedForallsContexts :: !NestedForallsContextsIn -> TcRnMessage
+
+  {-| TcRnRedundantRecordWildcard is a warning indicating that a pattern uses
+    a record wildcard even though all of the record's fields are bound explicitly.
+
+    Test cases:
+      T15957_Fail
+  -}
+  TcRnRedundantRecordWildcard :: TcRnMessage
+
+  {-| TcRnUnusedRecordWildcard is a warning indicating that a pattern uses
+    a record wildcard while none of the fields bound by it are used.
+
+    Test cases:
+      T15957_Fail
+  -}
+  TcRnUnusedRecordWildcard :: ![Name] -- ^ The names bound by the wildcard
+                           -> TcRnMessage
+
+  {-| TcRnUnusedName is a warning indicating that a defined or imported name
+    is not used in the module.
+
+    Test cases:
+      ds053, mc10, overloadedrecfldsfail05, overloadedrecfldsfail06, prog018,
+      read014, rn040, rn041, rn047, rn063, T13839, T13839a, T13919, T17171b,
+      T17a, T17b, T17d, T17e, T18470, T1972, t22391, t22391j, T2497, T3371,
+      T3449, T7145b, T7336, TH_recover_warns, unused_haddock, WarningGroups,
+      werror
+  -}
+  TcRnUnusedName :: !OccName -- ^ The unused name
+                 -> !UnusedNameProv -- ^ The provenance of the name
+                 -> TcRnMessage
+
+  {-| TcRnQualifiedBinder is an error indicating that a qualified name
+    was used in binding position.
+
+    Test cases:
+      mod62, rnfail021, rnfail034, rnfail039, rnfail046
+  -}
+  TcRnQualifiedBinder :: !RdrName -- ^ The name used as a binder
+                      -> TcRnMessage
+
+  {-| TcRnTypeApplicationsDisabled is an error indicating that a type
+    application was used while the extension TypeApplications was disabled.
+
+    Test cases:
+      T12411, T12446, T15527, T16133, T18251c
+  -}
+  TcRnTypeApplicationsDisabled :: !TypeApplication -- ^ what kind of type application is it?
+                               -> TcRnMessage
+
+  {-| TcRnInvalidRecordField is an error indicating that a record field was
+    used that doesn't exist in a constructor.
+
+    Test cases:
+      T13644, T13847, T17469, T8448, T8570, tcfail083, tcfail084
+  -}
+  TcRnInvalidRecordField :: !Name -- ^ The constructor name
+                         -> !FieldLabelString -- ^ The name of the field
+                         -> TcRnMessage
+
+  {-| TcRnTupleTooLarge is an error indicating that the arity of a tuple
+    exceeds mAX_TUPLE_SIZE.
+
+    Test cases:
+      T18723a, T18723b, T18723c, T6148a, T6148b, T6148c, T6148d
+  -}
+  TcRnTupleTooLarge :: !Int -- ^ The arity of the tuple
+                    -> TcRnMessage
+
+  {-| TcRnCTupleTooLarge is an error indicating that the arity of a constraint
+    tuple exceeds mAX_CTUPLE_SIZE.
+
+    Test cases:
+      T10451
+  -}
+  TcRnCTupleTooLarge :: !Int -- ^ The arity of the constraint tuple
+                     -> TcRnMessage
+
+  {-| TcRnIllegalInferredTyVars is an error indicating that some type variables
+    were quantified as inferred (like @∀ {a}.@) in a place where this is not
+    allowed, like in an instance declaration.
+
+    Test cases:
+      ExplicitSpecificity5, ExplicitSpecificity6, ExplicitSpecificity8,
+      ExplicitSpecificity9
+  -}
+  TcRnIllegalInferredTyVars :: !(NE.NonEmpty (HsTyVarBndr Specificity GhcPs))
+                              -- ^ The offending type variables
+                           -> TcRnMessage
+
+  {-| TcRnAmbiguousName is an error indicating that an unbound name
+    might refer to multiple names in scope.
+
+    Test cases:
+      BootFldReexport, DRFUnused, duplicaterecfldsghci01, GHCiDRF, mod110,
+      mod151, mod152, mod153, mod164, mod165, NoFieldSelectorsFail,
+      overloadedrecfldsfail02, overloadedrecfldsfail04, overloadedrecfldsfail11,
+      overloadedrecfldsfail12, overloadedrecfldsfail13,
+      overloadedrecfldswasrunnowfail06, rnfail044, T11167_ambig,
+      T11167_ambiguous_fixity, T13132_duplicaterecflds, T15487, T16745, T17420,
+      T18999_NoDisambiguateRecordFields, T19397E1, T19397E2, T23010_fail,
+      tcfail037
+  -}
+  TcRnAmbiguousName :: !GlobalRdrEnv
+                    -> !RdrName -- ^ The name
+                    -> !(NE.NonEmpty GlobalRdrElt) -- ^ The possible matches
+                    -> TcRnMessage
+
+  {-| TcRnBindingNameConflict is an error indicating that multiple local or
+    top-level bindings have the same name.
+
+    Test cases:
+      dsrun006, mdofail002, mdofail003, mod23, mod24, qq006, rnfail001,
+      rnfail004, SimpleFail6, T14114, T16110_Fail1, tcfail038, TH_spliceD1,
+      T22478b, TyAppPat_NonlinearMultiAppPat, TyAppPat_NonlinearMultiPat,
+      TyAppPat_NonlinearSinglePat,
+  -}
+  TcRnBindingNameConflict :: !RdrName -- ^ The conflicting name
+                          -> !(NE.NonEmpty SrcSpan)
+                             -- ^ The locations of the duplicates
+                          -> TcRnMessage
+
+  {-| TcRnNonCanonicalDefinition is a warning indicating that an instance
+    defines an implementation for a method that should not be defined in a way
+    that deviates from its default implementation, for example because it has
+    been scheduled to be absorbed into another method, like @pure@ making
+    @return@ obsolete.
+
+    Test cases:
+      WCompatWarningsOn, WCompatWarningsOff, WCompatWarningsOnOff
+  -}
+  TcRnNonCanonicalDefinition :: !NonCanonicalDefinition -- ^ Specifics
+                             -> !(LHsSigType GhcRn) -- ^ The instance type
+                             -> TcRnMessage
+  {-| TcRnImplicitImportOfPrelude is a warning, controlled by @Wimplicit-prelude@,
+      that is triggered upon an implicit import of the @Prelude@ module.
+
+      Example:
+
+        {-# OPTIONS_GHC -fwarn-implicit-prelude #-}
+        module M where {}
+
+      Test case: rn055
+
+  -}
+  TcRnImplicitImportOfPrelude :: TcRnMessage
+
+  {-| TcRnMissingMain is an error that occurs when a Main module does
+      not define a main function (named @main@ by default, but overridable
+      with the @main-is@ command line flag).
+
+      Example:
+
+        module Main where {}
+
+      Test cases:
+        T414, T7765, readFail021, rnfail007, T13839b, T17171a, T16453E1, tcfail030,
+        T19397E3, T19397E4
+
+  -}
+  TcRnMissingMain
+    :: !Bool -- ^ whether the module has an explicit export list
+    -> !Module
+    -> !OccName -- ^ the expected name of the main function
+    -> TcRnMessage
+
+  {-| TcRnGhciUnliftedBind is an error that occurs when a user attempts to
+      bind an unlifted value in GHCi.
+
+      Example (in GHCi):
+
+        let a = (# 1#, 3# #)
+
+      Test cases: T9140, T19035b
+  -}
+  TcRnGhciUnliftedBind :: !Id -> TcRnMessage
+
+  {-| TcRnGhciMonadLookupFail is an error that occurs when the user sets
+      the GHCi monad, using the GHC API 'setGHCiMonad' function, but GHC
+      can't find which monad the user is referring to.
+
+      Example:
+
+        import GHC ( setGHCiMonad )
+
+        ... setGHCiMonad "NoSuchThing"
+
+      Test cases: none
+  -}
+  TcRnGhciMonadLookupFail
+    :: String -- ^ the textual name of the monad requested by the user
+    -> Maybe [GlobalRdrElt] -- ^ lookup result
+    -> TcRnMessage
+
+  {-| TcRnMissingRoleAnnotation is a warning that occurs when type declaration
+     doesn't have a role annotatiosn
+
+     Controlled by flags:
+       - Wmissing-role-annotations
+
+     Test cases:
+       T22702
+
+  -}
+  TcRnMissingRoleAnnotation :: Name -> [Role] -> TcRnMessage
+  {-| TcRnPatersonCondFailure is an error that occurs when an instance
+      declaration fails to conform to the Paterson conditions. Which particular condition
+      fails depends on the constructor of PatersonCondFailure
+      See Note [Paterson conditions].
+
+      Test cases:
+        T15231, tcfail157, T15316, T19187a, fd-loop, tcfail108, tcfail154,
+        T15172, tcfail214
+  -}
+  TcRnPatersonCondFailure
+    :: PatersonCondFailure -- ^ the failed Paterson Condition
+    -> PatersonCondFailureContext
+    -> Type                -- ^ the LHS
+    -> Type                -- ^ the RHS
+    -> TcRnMessage
+
+  {-| TcRnImplicitRhsQuantification is a warning that occurs when GHC implicitly
+      quantifies over a type variable that occurs free on the RHS of the type declaration
+      that is not mentioned on the LHS
+
+      Example:
+
+        type T = 'Nothing :: Maybe a
+
+      Controlled by flags:
+       - Wimplicit-rhs-quantification
+
+      Test cases:
+          T23510a
+          T23510b
+  -}
+  TcRnImplicitRhsQuantification :: LocatedN RdrName -> TcRnMessage
+
+  {-| TcRnIllformedTypePattern is an error raised when the pattern
+      corresponding to a required type argument (visible forall)
+      does not have a form that can be interpreted as a type pattern.
+
+      Example:
+
+        vfun :: forall (a :: k) -> ()
+        vfun !x = ()
+        --   ^^
+        -- bang-patterns not allowed as type patterns
+
+      Test cases:
+          T22326_fail_bang_pat
+  -}
+  TcRnIllformedTypePattern :: !(Pat GhcRn) -> TcRnMessage
+
+  {-| TcRnIllegalTypePattern is an error raised when a pattern constructed
+      with the @type@ keyword occurs in a position that does not correspond
+      to a required type argument (visible forall).
+
+      Example:
+
+        case x of
+          (type _) -> True     -- the (type _) pattern is illegal here
+          _        -> False
+
+      Test cases:
+        T22326_fail_ado
+        T22326_fail_caseof
+  -}
+  TcRnIllegalTypePattern :: TcRnMessage
+
+  {-| TcRnIllformedTypeArgument is an error raised when an argument
+      that specifies a required type argument (instantiates a visible forall)
+      does not have a form that can be interpreted as a type argument.
+
+      Example:
+
+        vfun :: forall (a :: k) -> ()
+        x = vfun (\_ -> _)
+        --       ^^^^^^^^^
+        -- lambdas not allowed in type arguments
+
+      Test cases:
+        T22326_fail_lam_arg
+  -}
+  TcRnIllformedTypeArgument :: !(LHsExpr GhcRn) -> TcRnMessage
+
+  {-| TcRnIllegalTypeExpr is an error raised when an expression constructed
+      with the @type@ keyword occurs in a position that does not correspond
+      to a required type argument (visible forall).
+
+      Example:
+
+        xtop = type Int                  -- not a function argument
+        xarg = length (type Int)         -- `length` does not expect a required type argument
+
+      Test cases:
+        T22326_fail_app
+        T22326_fail_top
+  -}
+  TcRnIllegalTypeExpr :: TcRnMessage
+
+  {-| TcRnInvalidDefaultedTyVar is an error raised when a
+      defaulting plugin proposes to default a type variable that is
+      not an unfilled metavariable
+
+      Test cases:
+        T23832_invalid
+  -}
+  TcRnInvalidDefaultedTyVar
+      :: ![Ct]                -- ^ The constraints passed to the plugin
+      -> [(TcTyVar, Type)]    -- ^ The plugin-proposed type variable defaults
+      -> NE.NonEmpty TcTyVar  -- ^ The invalid type variables of the proposal
+      -> TcRnMessage
+
+  {-| TcRnNamespacedWarningPragmaWithoutFlag is an error that occurs when
+      a namespace specifier is used in {-# WARNING ... #-} or {-# DEPRECATED ... #-}
+      pragmas without the -XExplicitNamespaces extension enabled
+
+      Example:
+
+        {-# LANGUAGE NoExplicitNamespaces #-}
+        f = id
+        {-# WARNING data f "some warning message" #-}
+
+      Test cases:
+        T24396c
+  -}
+  TcRnNamespacedWarningPragmaWithoutFlag :: WarnDecl GhcPs -> TcRnMessage
+
+  {-| TcRnInvisPatWithNoForAll is an error raised when invisible type pattern
+      is used without associated `forall` in types
+
+      Examples:
+
+        f :: Int
+        f @t = 5
+
+        g :: [a -> a]
+        g = [\ @t x -> x :: t]
+
+      Test cases: T17694c T17594d
+  -}
+  TcRnInvisPatWithNoForAll :: HsTyPat GhcRn -> TcRnMessage
+
+  {-| TcRnIllegalInvisibleTypePattern is an error raised when invisible type pattern
+      is used without the TypeAbstractions extension enabled
+
+      Example:
+
+        {-# LANGUAGE NoTypeAbstractions #-}
+        id :: a -> a
+        id @t x = x
+
+      Test cases: T17694b
+  -}
+  TcRnIllegalInvisibleTypePattern :: HsTyPat GhcPs -> TcRnMessage
+
+  {-| TcRnNamespacedFixitySigWithoutFlag is an error that occurs when
+      a namespace specifier is used in fixity signatures
+      without the -XExplicitNamespaces extension enabled
+
+      Example:
+
+        {-# LANGUAGE NoExplicitNamespaces #-}
+        f = const
+        infixl 7 data `f`
+
+      Test cases:
+        T14032c
+  -}
+  TcRnNamespacedFixitySigWithoutFlag :: FixitySig GhcPs -> TcRnMessage
+
+  {-| TcRnDefaultedExceptionContext is a warning that is triggered when the
+      backward-compatibility logic solving for implicit ExceptionContext
+      constraints fires.
+
+      Test cases: DefaultExceptionContext
+  -}
+  TcRnDefaultedExceptionContext :: CtLoc -> TcRnMessage
+
+  {-| TcRnOutOfArityTyVar is an error raised when the arity of a type synonym
+      (as determined by the SAKS and the LHS) is insufficiently high to
+      accommodate an implicit binding for a free variable that occurs in the
+      outermost kind signature on the RHS of the said type synonym.
+
+      Example:
+
+        type SynBad :: forall k. k -> Type
+        type SynBad = Proxy :: j -> Type
+
+      Test cases:
+        T24770a
+  -}
+  TcRnOutOfArityTyVar
+    :: Name -- ^ Type synonym's name
+    -> Name -- ^ Type variable's name
+    -> TcRnMessage
+
+  {- TcRnMisplacedInvisPat is an error raised when invisible @-pattern
+     appears in invalid context (e.g. pattern in case of or in do-notation)
+     or nested inside the pattern. Template Haskell seems to be the only
+     source for this diagnostic.
+
+     Examples:
+
+        f (smth, $(invisP (varT (newName "blah")))) = ...
+
+        g = do
+          $(invisP (varT (newName "blah"))) <- aciton1
+          ...
+
+     Test cases:
+
+  -}
+  TcRnMisplacedInvisPat :: HsTyPat GhcPs -> TcRnMessage
+  deriving Generic
+
+----
+
+data ZonkerMessage where
+  {-| ZonkerCannotDefaultConcrete is an error occurring when a concrete
     type variable cannot be defaulted.
 
     Test cases:
       T23153
   -}
-  TcRnCannotDefaultConcrete
+  ZonkerCannotDefaultConcrete
     :: !FixedRuntimeRepOrigin
-    -> TcRnMessage
-
+    -> ZonkerMessage
 
   deriving Generic
+
+----
 
 -- | Things forbidden in @type data@ declarations.
 -- See Note [Type data declarations]
@@ -2827,55 +4353,6 @@ instance Outputable TypeDataForbids where
   ppr TypeDataForbidsLabelledFields        = text "Labelled fields"
   ppr TypeDataForbidsStrictnessAnnotations = text "Strictness flags"
   ppr TypeDataForbidsDerivingClauses       = text "Deriving clauses"
-
-data RunSpliceFailReason
-  = ConversionFail !ThingBeingConverted !ConversionFailReason
-  deriving Generic
-
--- | Identifies the TH splice attempting to be converted
-data ThingBeingConverted
-  = ConvDec !TH.Dec
-  | ConvExp !TH.Exp
-  | ConvPat !TH.Pat
-  | ConvType !TH.Type
-
--- | The reason a TH splice could not be converted to a Haskell expression
-data ConversionFailReason
-  = IllegalOccName !OccName.NameSpace !String
-  | SumAltArityExceeded !TH.SumAlt !TH.SumArity
-  | IllegalSumAlt !TH.SumAlt
-  | IllegalSumArity !TH.SumArity
-  | MalformedType !TypeOrKind !TH.Type
-  | IllegalLastStatement !HsDoFlavour !(LStmt GhcPs (LHsExpr GhcPs))
-  | KindSigsOnlyAllowedOnGADTs
-  | IllegalDeclaration !THDeclDescriptor !IllegalDecls
-  | CannotMixGADTConsWith98Cons
-  | EmptyStmtListInDoBlock
-  | NonVarInInfixExpr
-  | MultiWayIfWithoutAlts
-  | CasesExprWithoutAlts
-  | ImplicitParamsWithOtherBinds
-  | InvalidCCallImpent !String -- ^ Source
-  | RecGadtNoCons
-  | GadtNoCons
-  | InvalidTypeInstanceHeader !TH.Type
-  | InvalidTyFamInstLHS !TH.Type
-  | InvalidImplicitParamBinding
-  | DefaultDataInstDecl ![LDataFamInstDecl GhcPs]
-  | FunBindLacksEquations !TH.Name
-  deriving Generic
-
-data IllegalDecls
-  = IllegalDecls    !(NE.NonEmpty (LHsDecl GhcPs))
-  | IllegalFamDecls !(NE.NonEmpty (LFamilyDecl GhcPs))
-
--- | Label for a TH declaration
-data THDeclDescriptor
-  = InstanceDecl
-  | WhereClause
-  | LetBinding
-  | LetExpression
-  | ClssDecl
 
 -- | Specifies which back ends can handle a requested foreign import or export
 type ExpectedBackends = [Backend]
@@ -2893,9 +4370,29 @@ data ArgOrResult
 
 -- | Which parts of a record field are affected by a particular error or warning.
 data RecordFieldPart
-  = RecordFieldConstructor !Name
+  = RecordFieldDecl !Name
+  | RecordFieldConstructor !Name
   | RecordFieldPattern !Name
   | RecordFieldUpdate
+
+-- | Why did we reject a record update?
+data BadRecordUpdateReason
+   -- | No constructor has all of the required fields.
+   = NoConstructorHasAllFields
+       { conflictingFields :: [FieldLabelString] }
+
+   -- | There are several possible parents which have all of the required fields,
+   -- and we weren't able to disambiguate in any way.
+   | MultiplePossibleParents
+       (RecSelParent, RecSelParent, [RecSelParent])
+         -- ^ The possible parents (at least 2)
+
+   -- | We used type-directed disambiguation, but this resulted in
+   -- an invalid parent (the type-directed parent is not among the
+   -- parents we computed from the field labels alone).
+   | InvalidTyConParent TyCon (NE.NonEmpty RecSelParent)
+
+  deriving Generic
 
 -- | Where a shadowed name comes from
 data ShadowedNameProvenance
@@ -3173,6 +4670,278 @@ data SoleExtraConstraintWildcardAllowed
   = SoleExtraConstraintWildcardNotAllowed
   | SoleExtraConstraintWildcardAllowed
 
+-- | Why is a class instance head invalid?
+data IllegalInstanceHeadReason
+  -- | An instance for an abstract class from an hs-boot or Backpack
+  -- hsig file.
+  --
+  --  Example:
+  --
+  --    -- A.hs-boot
+  --    module A where
+  --    class C a
+  --
+  --    -- B.hs
+  --    module B where
+  --    import {-# SOURCE #-} A
+  --    instance C Int where
+  --
+  --    -- A.hs
+  --    module A where
+  --    import B
+  --    class C a where
+  --      f :: a
+  --
+  -- Test cases: typecheck/should_fail/T13068
+  = InstHeadAbstractClass !Class
+  -- | An instance whose head is not a class.
+  --
+  -- Examples(s):
+  --
+  --   instance c
+  --
+  --   instance 42
+  --
+  --   instance !Show D
+  --
+  --   type C1 a = (Show (a -> Bool))
+  --   instance C1 Int where
+  --
+  -- Test cases: typecheck/rename/T5513
+  --             typecheck/rename/T16385
+  --             parser/should_fail/T3811c
+  --             rename/should_fail/T18240a
+  --             polykinds/T13267
+  --             deriving/should_fail/T23522
+  | InstHeadNonClass
+    !(Maybe TyCon) -- ^ the 'TyCon' at the head of the instance head,
+                   -- or 'Nothing' if the instance head is not even headed
+                   -- by a 'TyCon'
+
+  -- | Instance head was headed by a type synonym.
+  --
+  -- Example:
+  --    type MyInt = Int
+  --    class C a where {..}
+  --    instance C MyInt where {..}
+  --
+  -- Test cases: drvfail015, mod42, TidyClassKinds, tcfail139
+  | InstHeadTySynArgs
+  -- | Instance head was not of the form @T a1 ... an@,
+  -- where @a1, ..., an@ are all type variables or literals.
+  --
+  -- Example:
+  --
+  --    instance Num [Int] where {..}
+  --
+  -- Test cases: mod41, mod42, tcfail044, tcfail047.
+  | InstHeadNonTyVarArgs
+  -- | Multi-param instance without -XMultiParamTypeClasses.
+  --
+  -- Example:
+  --
+  --  instance C a b where {..}
+  --
+  -- Test case: IllegalMultiParamInstance
+  | InstHeadMultiParam
+  deriving Generic
+
+
+-- | Why is a (type or data) family instance invalid?
+data IllegalFamilyInstanceReason
+  {-| A top-level family instance for a 'TyCon' that isn't a family 'TyCon'.
+
+    Example:
+
+      data D a = MkD
+      type instance D Int = Bool
+
+    Test case: indexed-types/should_fail/T3092
+  -}
+  = NotAFamilyTyCon
+      !TypeOrData -- ^ was this a 'type' or a 'data' instance?
+      !TyCon
+  {-| A top-level (open) type family instance for a closed type family.
+
+    Test cases:
+      indexed-types/should_fail/Overlap7
+      indexed-types/should_fail/Overlap3
+  -}
+  | NotAnOpenFamilyTyCon !TyCon
+
+  {-| A family instance was declared for a family of a different kind,
+      e.g. a data instance for a type family 'TyCon'.
+
+     Test cases:
+       T9896, SimpleFail3a
+  -}
+  | FamilyCategoryMismatch !TyCon -- ^ The family tycon
+
+
+  {-| A family instance was declared with a different number of arguments
+      than expected.
+      See Note [Oversaturated type family equations] in "GHC.Tc.Validity".
+
+    Test cases:
+      TyFamArity1, TyFamArity2, T11136, Overlap4, AssocTyDef05, AssocTyDef06,
+      T14110
+  -}
+  | FamilyArityMismatch !TyCon -- ^ The family tycon
+                        !Arity -- ^ The right number of parameters
+
+  {-| A closed type family equation used a different name than the parent family.
+
+    Example:
+
+      type family F a where
+        G Int = Bool
+
+    Test cases:
+      Overlap5, T15362, T16002, T20260, T11623
+  -}
+  | TyFamNameMismatch !Name -- ^ The family name
+                      !Name -- ^ The name used in the equation
+
+
+  -- | There are out-of-scope type variables in the right-hand side
+  -- of an associated type or data family instance.
+  --
+  -- Example:
+  --
+  --    instance forall a. C Int where
+  --      data instance D Int = MkD1 a
+  --
+  -- Test cases: indexed-types/should_fail/T5515, polykinds/T9574, rename/should_fail/T18021
+  | FamInstRHSOutOfScopeTyVars
+      !(Maybe (TyCon, [Type], TyVarSet))
+        -- ^ family 'TyCon', arguments, and set of "dodgy" type variables
+        -- See Note [Dodgy binding sites in type family instances]
+        -- in GHC.Tc.Validity
+      !(NE.NonEmpty Name) -- ^ the out-of-scope type variables
+
+  | FamInstLHSUnusedBoundTyVars
+      !(NE.NonEmpty InvalidFamInstQTv) -- ^ the unused bound type variables
+
+  | InvalidAssoc !InvalidAssoc
+  deriving Generic
+
+-- | A quantified type variable in a type or data family equation that
+-- is either not bound in any LHS patterns or not used in the RHS (or both).
+data InvalidFamInstQTv
+  = InvalidFamInstQTv
+    { ifiqtv :: TcTyVar
+    , ifiqtv_user_written :: Bool
+       -- ^ Did the user write this type variable, or was introduced by GHC?
+       -- For example: with @-XPolyKinds@, in @type instance forall a. F = ()@,
+       -- we have a user-written @a@ but GHC introduces a kind variable @k@
+       -- as well. See #23734.
+    , ifiqtv_reason       :: InvalidFamInstQTvReason
+      -- ^ For what reason was the quantified type variable invalid?
+    }
+
+data InvalidFamInstQTvReason
+  -- | A dodgy binder, i.e. a variable that syntactically appears in
+  -- LHS patterns but only in non-injective positions.
+  --
+  -- See Note [Dodgy binding sites in type family instances]
+  -- in GHC.Tc.Validity.
+  = InvalidFamInstQTvDodgy
+  -- | A quantified type variable in a type or data family equation
+  -- that is not bound in any LHS patterns.
+  | InvalidFamInstQTvNotBoundInPats
+  -- | A quantified type variable in a type or data family equation
+  -- that is not used on the RHS.
+  | InvalidFamInstQTvNotUsedInRHS
+
+-- The 'check_tvs' function in 'GHC.Tc.Validity.checkFamPatBinders'
+-- uses 'getSrcSpan', so this 'NamedThing' instance is convenient.
+instance NamedThing InvalidFamInstQTv where
+  getName = getName . ifiqtv
+
+data InvalidAssoc
+  -- | An invalid associated family instance.
+  --
+  -- See t'InvalidAssocInstance'.Builder
+  = InvalidAssocInstance !InvalidAssocInstance
+  -- | An invalid associated family default declaration.
+  --
+  -- See t'InvalidAssocDefault'.
+  | InvalidAssocDefault  !InvalidAssocDefault
+  deriving Generic
+
+-- | The reason that an associated family instance was invalid.
+data InvalidAssocInstance
+  -- | A class instance is missing its expected associated type/data instance.
+  --
+  -- Test cases: deriving/should_compile/T14094
+  --             indexed-types/should_compile/Simple2
+  --             typecheck/should_compile/tc254
+  = AssocInstanceMissing !Name
+
+  -- | A top-level instance for an associated family 'TyCon'.
+  --
+  -- Example:
+  --
+  --  class C a where { type T a }
+  --  instance T Int = Bool
+  --
+  -- Test case: indexed-types/should_fail/SimpleFail7
+  | AssocInstanceNotInAClass !TyCon
+
+  -- | An associated type instance is provided for a class that doesn't have
+  -- that associated type.
+  --
+  -- Examples(s):
+  --   $(do d <- instanceD (cxt []) (conT ''Eq `appT` conT ''Foo)
+  --               [tySynInstD $ tySynEqn Nothing (conT ''Rep `appT` conT ''Foo) (conT ''Maybe)]
+  --        return [d])
+  --   ======>
+  --   instance Eq Foo where
+  --     type Rep Foo = Maybe
+  --
+  -- Test cases: th/T12387a
+  | AssocNotInThisClass !Class !TyCon
+  -- | An associated family instance does not mention any of the parent 'Class'
+  -- 'TyVar's.
+  --
+  -- Test cases: T2888, T9167, T12867
+  | AssocNoClassTyVar !Class !TyCon
+
+  | AssocTyVarsDontMatch
+      !ForAllTyFlag
+      !TyCon  -- ^ family 'TyCon'
+      ![Type] -- ^ expected type arguments
+      ![Type] -- ^ actual type arguments
+  deriving Generic
+
+
+-- | The reason that an associated family default declaration was invalid.
+data InvalidAssocDefault
+    -- | An associated family default declaration for something that isn't
+    -- an associated family.
+  = AssocDefaultNotAssoc !Name -- ^ 'Class' 'Name'
+                         !Name -- ^ 'TyCon' 'Name'
+    -- | Multiple default declarations were given for an associated
+    -- family instance.
+    --
+    -- Test cases: none.
+  | AssocMultipleDefaults !Name
+    -- | Invalid arguments in an associated family instance.
+    --
+    -- See t'AssocDefaultBadArgs'.
+  | AssocDefaultBadArgs !TyCon ![Type] AssocDefaultBadArgs
+  deriving Generic
+
+-- | Invalid arguments in an associated family instance declaration.
+data AssocDefaultBadArgs
+  -- | An argument which isn't a type variable in an associated
+  -- family instance default declaration.
+  = AssocDefaultNonTyVarArg !(Type, ForAllTyFlag)
+  -- | Duplicate occurrence of a type variable in an associated
+  -- family instance default declaration.
+  | AssocDefaultDuplicateTyVars !(NE.NonEmpty (TyCoVar, ForAllTyFlag))
+  deriving Generic
+
 -- | A type representing whether or not the input type has associated data family instances.
 data HasAssociatedDataFamInsts
   = YesHasAdfs
@@ -3224,10 +4993,191 @@ data MissingSignature
 data Exported
   = IsNotExported
   | IsExported
+  deriving Eq
 
 instance Outputable Exported where
   ppr IsNotExported = text "IsNotExported"
   ppr IsExported    = text "IsExported"
+
+-- | What declarations were not allowed in an hs-boot or hsig file?
+data BadBootDecls
+  = BootBindsPs      !(NE.NonEmpty (LHsBindLR GhcRn GhcPs))
+  | BootBindsRn      !(NE.NonEmpty (LHsBindLR GhcRn GhcRn))
+  | BootInstanceSigs !(NE.NonEmpty (LSig GhcRn))
+  | BootFamInst      !TyCon
+  | BootSpliceDecls  !(NE.NonEmpty (LocatedA (HsUntypedSplice GhcPs)))
+  | BootForeignDecls !(NE.NonEmpty (LForeignDecl GhcRn))
+  | BootDefaultDecls !(NE.NonEmpty (LDefaultDecl GhcRn))
+  | BootRuleDecls    !(NE.NonEmpty (LRuleDecls GhcRn))
+
+-- | A mismatch between an hs-boot or signature file and its implementing module.
+data BootMismatch
+  -- | Something defined or exported by an hs-boot or signature file
+  -- is missing from the implementing module.
+  = MissingBootThing !Name !MissingBootThing
+
+  -- | A typeclass instance is declared in the hs-boot file but
+  -- it is not present in the implementing module.
+  | MissingBootInstance !DFunId -- ^ the boot instance 'DFunId'
+    -- NB: we never trigger this for hsig files, as in that case we do
+    -- a full round of constraint solving, and a missing instance gets reported
+    -- as an unsolved Wanted constraint with a 'InstProvidedOrigin' 'CtOrigin'.
+    -- See GHC.Tc.Utils.Backpack.check_inst.
+
+  -- | A mismatch between an hsig file and its implementing module
+  -- in the 'Name' that a particular re-export refers to.
+  | BadReexportedBootThing !Name !Name
+
+  -- | A mismatch between the declaration of something in the hs-boot or
+  -- signature file and its implementation, e.g. a type mismatch or
+  -- a type family implemented as a class.
+  | BootMismatch
+      !TyThing -- ^ boot thing
+      !TyThing -- ^ real thing
+      !BootMismatchWhat
+  deriving Generic
+
+-- | Something from the hs-boot or signature file is missing from the
+-- implementing module.
+data MissingBootThing
+  -- | Something defined in the hs-boot or signature file is not defined in the
+  -- implementing module.
+  = MissingBootDefinition
+  -- | Something exported by the hs-boot or signature file is not exported by the
+  -- implementing module.
+  | MissingBootExport
+  deriving Generic
+
+missingBootThing :: HsBootOrSig -> Name -> MissingBootThing -> TcRnMessage
+missingBootThing src nm thing =
+  TcRnBootMismatch src (MissingBootThing nm thing)
+
+-- | A mismatch of two 'TyThing's between an hs-boot or signature file
+-- and its implementing module.
+data BootMismatchWhat
+  -- | The 'Id's have different types.
+  = BootMismatchedIdTypes !Id -- ^ boot 'Id'
+                          !Id -- ^ real 'Id'
+  -- | Two 'TyCon's aren't compatible.
+  | BootMismatchedTyCons !TyCon -- ^ boot 'TyCon'
+                         !TyCon -- ^ real 'TyCon'
+                         !(NE.NonEmpty BootTyConMismatch)
+  deriving Generic
+
+-- | An error in the implementation of an abstract datatype using
+-- a type synonym.
+data SynAbstractDataError
+  -- | The type synony was not nullary.
+  = SynAbsDataTySynNotNullary
+  -- | The type synonym RHS contained invalid types, e.g.
+  -- a type family or a forall.
+  | SynAbstractDataInvalidRHS !(NE.NonEmpty Type)
+
+-- | Mismatched implementation of a 'TyCon' in an hs-boot or signature file.
+data BootTyConMismatch
+  -- | The 'TyCon' kinds differ.
+  = TyConKindMismatch
+  -- | The 'TyCon' 'Role's aren't compatible.
+  | TyConRoleMismatch !Bool -- ^ True <=> role subtype check
+  -- | Two type synonyms have different RHSs.
+  | TyConSynonymMismatch !Kind !Kind
+  -- | The two 'TyCon's are of a different flavour, e.g. one is
+  -- a data family and the other is a type family.
+  | TyConFlavourMismatch !FamTyConFlav !FamTyConFlav
+  -- | The equations of a type family don't match.
+  | TyConAxiomMismatch !(BootListMismatches CoAxBranch BootAxiomBranchMismatch)
+  -- | The type family injectivity annotations don't match.
+  | TyConInjectivityMismatch
+  -- | The 'TyCon's are both datatype 'TyCon's, but they have diferent 'DataCon's.
+  | TyConMismatchedData !AlgTyConRhs !AlgTyConRhs !BootDataMismatch
+  -- | The 'TyCon's are both 'Class' 'TyCon's, but the classes don't match.
+  | TyConMismatchedClasses !Class !Class !BootClassMismatch
+  -- | The 'TyCon's are something completely different.
+  | TyConsVeryDifferent
+  -- | An abstract 'TyCon' is implemented using a type synonym in an invalid
+  -- manner. See 'SynAbstractDataError'.
+  | SynAbstractData !SynAbstractDataError
+
+
+-- | Utility datatype to record errors when checking compatibity
+-- between two lists of things, e.g. class methods, associated types,
+-- type family equations, etc.
+data BootListMismatch item err
+  -- | Different number of items.
+  = MismatchedLength
+  -- | The item at the given position in the list differs.
+  | MismatchedThing !Int !item !item !err
+
+type BootListMismatches item err =
+  NE.NonEmpty (BootListMismatch item err)
+
+data BootAxiomBranchMismatch
+  -- | The quantified variables in an equation don't match.
+  --
+  -- Example: the quantification of @a@ in
+  --
+  --   @type family F a where { forall a. F a = Maybe a }@
+  = MismatchedAxiomBinders
+  -- | The LHSs of an equation don't match.
+  | MismatchedAxiomLHS
+  -- | The RHSs of an equation don't match.
+  | MismatchedAxiomRHS
+
+-- | A mismatch in a class, between its declaration in an hs-boot or signature
+-- file, and its implementation in a source Haskell file.
+data BootClassMismatch
+  -- | The class methods don't match.
+  = MismatchedMethods !(BootListMismatches ClassOpItem BootMethodMismatch)
+  -- | The associated types don't match.
+  | MismatchedATs !(BootListMismatches ClassATItem BootATMismatch)
+  -- | The functional dependencies don't match.
+  | MismatchedFunDeps
+  -- | The superclasses don't match.
+  | MismatchedSuperclasses
+  -- | The @MINIMAL@ pragmas are not compatible.
+  | MismatchedMinimalPragmas
+
+-- | A mismatch in a class method, between its declaration in an hs-boot or signature
+-- file, and its implementation in a source Haskell file.
+data BootMethodMismatch
+  -- | The class method names are different.
+  = MismatchedMethodNames
+  -- | The types of a class method are different.
+  | MismatchedMethodTypes !Type !Type
+  -- | The default method types are not compatible.
+  | MismatchedDefaultMethods !Bool -- ^ True <=> subtype check
+
+-- | A mismatch in an associated type of a class, between its declaration
+-- in an hs-boot or signature file, and its implementation in a source Haskell file.
+data BootATMismatch
+  -- | Two associated types don't match.
+  = MismatchedTyConAT !BootTyConMismatch
+  -- | Two associated type defaults don't match.
+  | MismatchedATDefaultType
+
+-- | A mismatch in a datatype declaration, between an hs-boot file or signature
+-- file and its implementing module.
+data BootDataMismatch
+  -- | A datatype is implemented as a newtype or vice-versa.
+  = MismatchedNewtypeVsData
+  -- | The constructors don't match.
+  | MismatchedConstructors !(BootListMismatches DataCon BootDataConMismatch)
+  -- | The datatype contexts differ.
+  | MismatchedDatatypeContexts
+
+-- | A mismatch in a data constrcutor, between its declaration in an hs-boot
+-- file or signature file, and its implementation in a source Haskell module.
+data BootDataConMismatch
+  -- | The 'Name's of the 'DataCon's differ.
+  = MismatchedDataConNames
+  -- | The fixities of the 'DataCon's differ.
+  | MismatchedDataConFixities
+  -- | The strictness annotations of the 'DataCon's differ.
+  | MismatchedDataConBangs
+  -- | The 'DataCon's have different field labels.
+  | MismatchedDataConFieldLabels
+  -- | The 'DataCon's have incompatible types.
+  | MismatchedDataConTypes
 
 --------------------------------------------------------------------------------
 --
@@ -3263,7 +5213,6 @@ data SolverReport
   = SolverReport
   { sr_important_msg :: SolverReportWithCtxt
   , sr_supplementary :: [SolverReportSupplementary]
-  , sr_hints         :: [GhcHint]
   }
 
 -- | Additional information to print in a 'SolverReport', after the
@@ -3453,19 +5402,14 @@ data TcSolverReportMsg
   --   err = ()
   --
   -- Test cases: CustomTypeErrors0{1,2,3,4,5}, T12104.
-  | UserTypeError Type
+  | UserTypeError ErrorMsgType -- ^ the message to report
+
+  -- | Report a Wanted constraint of the form "Unsatisfiable msg".
+  | UnsatisfiableError ErrorMsgType -- ^ the message to report
 
   -- | We want to report an out of scope variable or a typed hole.
   -- See 'HoleError'.
   | ReportHoleError Hole HoleError
-
-  -- | Trying to unify an untouchable variable, e.g. a variable from an outer scope.
-  --
-  -- Test case: Simple14
-  | UntouchableVariable
-    { untouchableTyVar :: TyVar
-    , untouchableTyVarImplication :: Implication
-    }
 
   -- | Cannot unify a variable, because of a type mismatch.
   | CannotUnifyVariable
@@ -3490,8 +5434,8 @@ data TcSolverReportMsg
   -- Test cases: none.
   | BlockedEquality ErrorItem
     -- These are for the "blocked" equalities, as described in
-    -- Note [Equalities with incompatible kinds] in GHC.Tc.Solver.Canonical,
-    -- wrinkle (2). There should always be another unsolved wanted around,
+    -- Note [Equalities with incompatible kinds] in GHC.Tc.Solver.Equality,
+    -- wrinkle (EIK2). There should always be another unsolved wanted around,
     -- which will ordinarily suppress this message. But this can still be printed out
     -- with -fdefer-type-errors (sigh), so we must produce a message.
 
@@ -3597,8 +5541,7 @@ data MismatchMsg
   --
   -- Test cases: T1470, tcfail212.
   | TypeEqMismatch
-      { teq_mismatch_ppr_explicit_kinds :: Bool
-      , teq_mismatch_item     :: ErrorItem
+      { teq_mismatch_item     :: ErrorItem
       , teq_mismatch_ty1      :: Type
       , teq_mismatch_ty2      :: Type
       , teq_mismatch_expected :: Type -- ^ The overall expected type
@@ -3739,12 +5682,32 @@ data WhenMatching
   = WhenMatching TcType TcType CtOrigin (Maybe TypeOrKind)
   deriving Generic
 
+data BadImportKind
+  -- | Module does not export...
+  = BadImportNotExported [GhcHint] -- ^ suggestions for what might have been meant
+  -- | Missing @type@ keyword when importing a type.
+  -- e.g.  `import TypeLits( (+) )`, where TypeLits exports a /type/ (+), not a /term/ (+)
+  -- Then we want to suggest using `import TypeLits( type (+) )`
+  | BadImportAvailTyCon Bool -- ^ is ExplicitNamespaces enabled?
+  -- | Trying to import a data constructor directly, e.g.
+  -- @import Data.Maybe (Just)@ instead of @import Data.Maybe (Maybe(Just))@
+  | BadImportAvailDataCon OccName
+  -- | The parent does not export the given children.
+  | BadImportNotExportedSubordinates [OccName]
+  -- | Incorrect @type@ keyword when importing something which isn't a type.
+  | BadImportAvailVar
+  deriving Generic
+
 -- | Some form of @"not in scope"@ error. See also the 'OutOfScopeHole'
 -- constructor of 'HoleError'.
 data NotInScopeError
 
   -- | A run-of-the-mill @"not in scope"@ error.
   = NotInScope
+
+  -- | Like 'NotInScope', but when we know we are looking for a
+  -- record field.
+  | NotARecordField
 
   -- | An exact 'Name' was not in scope.
   --
@@ -3777,6 +5740,12 @@ data NotInScopeError
   -- or, a class doesn't have an associated type with this name,
   -- or, a record doesn't have a record field with this name.
   | UnknownSubordinate SDoc
+
+  -- | A name is not in scope during type checking but passed the renamer.
+  --
+  -- Test cases:
+  --   none
+  | NotInScopeTc (NameEnv TcTyThing)
   deriving Generic
 
 -- | Create a @"not in scope"@ error message for the given 'RdrName'.
@@ -3800,7 +5769,7 @@ data HoleError
   -- See 'NotInScopeError' for other not-in-scope errors.
   --
   -- Test cases: T9177a.
-  = OutOfScopeHole [ImportError]
+  = OutOfScopeHole [ImportError] [GhcHint]
   -- | Report a typed hole, or wildcard, with additional information.
   | HoleError HoleSort
               [TcTyVar]                     -- Other type variables which get computed on the way.
@@ -3897,48 +5866,6 @@ discardMsg :: SDoc
 discardMsg = text "(Some bindings suppressed;" <+>
              text "use -fmax-relevant-binds=N or -fno-max-relevant-binds)"
 
-data PromotionErr
-  = TyConPE          -- TyCon used in a kind before we are ready
-                     --     data T :: T -> * where ...
-  | ClassPE          -- Ditto Class
-
-  | FamDataConPE     -- Data constructor for a data family
-                     -- See Note [AFamDataCon: not promoting data family constructors]
-                     -- in GHC.Tc.Utils.Env.
-  | ConstrainedDataConPE PredType
-                     -- Data constructor with a non-equality context
-                     -- See Note [Constraints in kinds] in GHC.Core.TyCo.Rep
-  | PatSynPE         -- Pattern synonyms
-                     -- See Note [Don't promote pattern synonyms] in GHC.Tc.Utils.Env
-
-  | RecDataConPE     -- Data constructor in a recursive loop
-                     -- See Note [Recursion and promoting data constructors] in GHC.Tc.TyCl
-  | TermVariablePE   -- See Note [Promoted variables in types]
-  | NoDataKindsDC    -- -XDataKinds not enabled (for a datacon)
-
-instance Outputable PromotionErr where
-  ppr ClassPE                     = text "ClassPE"
-  ppr TyConPE                     = text "TyConPE"
-  ppr PatSynPE                    = text "PatSynPE"
-  ppr FamDataConPE                = text "FamDataConPE"
-  ppr (ConstrainedDataConPE pred) = text "ConstrainedDataConPE"
-                                      <+> parens (ppr pred)
-  ppr RecDataConPE                = text "RecDataConPE"
-  ppr NoDataKindsDC               = text "NoDataKindsDC"
-  ppr TermVariablePE              = text "TermVariablePE"
-
-pprPECategory :: PromotionErr -> SDoc
-pprPECategory = text . capitalise . peCategory
-
-peCategory :: PromotionErr -> String
-peCategory ClassPE                = "class"
-peCategory TyConPE                = "type constructor"
-peCategory PatSynPE               = "pattern synonym"
-peCategory FamDataConPE           = "data constructor"
-peCategory ConstrainedDataConPE{} = "data constructor"
-peCategory RecDataConPE           = "data constructor"
-peCategory NoDataKindsDC          = "data constructor"
-peCategory TermVariablePE         = "term variable"
 
 -- | Stores the information to be reported in a representation-polymorphism
 -- error message.
@@ -3992,7 +5919,7 @@ data MatchArgsContext
   = EquationArgs
       !Name -- ^ Name of the function
   | PatternArgs
-      !(HsMatchContext GhcTc) -- ^ Pattern match specifics
+      !HsMatchContextRn -- ^ Pattern match specifics
 
 -- | The information necessary to report mismatched
 -- numbers of arguments in a match group.
@@ -4002,18 +5929,15 @@ data MatchArgBadMatches where
         , matchArgBadMatches :: NE.NonEmpty (LocatedA (Match GhcRn body)) }
     -> MatchArgBadMatches
 
--- | The phase in which an exception was encountered when dealing with a TH splice
-data SplicePhase
-  = SplicePhase_Run
-  | SplicePhase_CompileAndLink
+data PragmaWarningInfo
+  = PragmaWarningName { pwarn_occname :: OccName
+                      , pwarn_impmod :: ModuleName
+                      , pwarn_declmod :: ModuleName }
+  | PragmaWarningExport { pwarn_occname :: OccName
+                        , pwarn_impmod :: ModuleName }
+  | PragmaWarningInstance { pwarn_dfunid :: DFunId
+                          , pwarn_ctorig :: CtOrigin }
 
-data LookupTHInstNameErrReason
-  = NoMatchesFound
-  | CouldNotDetermineInstance
-
-data UnrepresentableTypeDescr
-  = LinearInvisibleArgument
-  | CoercionsInTypes
 
 -- | The context for an "empty statement group" error.
 data EmptyStatementGroupErrReason
@@ -4043,3 +5967,788 @@ data UnexpectedStatement where
     :: Outputable (StmtLR GhcPs GhcPs body)
     => StmtLR GhcPs GhcPs body
     -> UnexpectedStatement
+
+data DeclSort = ClassDeclSort | InstanceDeclSort
+
+data NonStandardGuards where
+  NonStandardGuards
+    :: (Outputable body,
+        Anno (Stmt GhcRn body) ~ SrcSpanAnnA)
+    => [LStmtLR GhcRn GhcRn body]
+    -> NonStandardGuards
+
+data RuleLhsErrReason
+  = UnboundVariable RdrName NotInScopeError
+  | IllegalExpression
+
+data HsigShapeMismatchReason =
+  {-| HsigShapeSortMismatch is an error indicating that an item in the
+    export list of a signature doesn't match the item of the same name in
+    another signature when merging the two – one is a type while the other is a
+    plain identifier.
+
+    Test cases:
+      none
+  -}
+  HsigShapeSortMismatch !AvailInfo !AvailInfo
+  |
+  {-| HsigShapeNotUnifiable is an error indicating that a name in the
+    export list of a signature cannot be unified with a name of the same name in
+    another signature when merging the two.
+
+    Test cases:
+      bkpfail20, bkpfail21
+  -}
+  HsigShapeNotUnifiable !Name !Name !Bool
+  deriving (Generic)
+
+data WrongThingSort
+  = WrongThingType
+  | WrongThingDataCon
+  | WrongThingPatSyn
+  | WrongThingConLike
+  | WrongThingClass
+  | WrongThingTyCon
+  | WrongThingAxiom
+
+data StageCheckReason
+  = StageCheckInstance !InstanceWhat !PredType
+  | StageCheckSplice !Name
+
+data UninferrableTyVarCtx
+  = UninfTyCtx_ClassContext [TcType]
+  | UninfTyCtx_DataContext [TcType]
+  | UninfTyCtx_ProvidedContext [TcType]
+  | UninfTyCtx_TyFamRhs TcType
+  | UninfTyCtx_TySynRhs TcType
+  | UninfTyCtx_Sig TcType (LHsSigType GhcRn)
+
+data PatSynInvalidRhsReason
+  = PatSynNotInvertible !(Pat GhcRn)
+  | PatSynUnboundVar !Name
+  deriving (Generic)
+
+data BadFieldAnnotationReason where
+  {-| A lazy data type field annotation (~) was used without enabling the
+    extension StrictData.
+
+    Test cases:
+    LazyFieldsDisabled
+  -}
+  LazyFieldsDisabled :: BadFieldAnnotationReason
+  {-| An UNPACK pragma was applied to a field without strictness annotation (!).
+
+    Test cases:
+    T14761a, T7562
+  -}
+  UnpackWithoutStrictness :: BadFieldAnnotationReason
+  {-| An UNPACK pragma was applied to an abstract type in an indefinite package
+    in Backpack.
+
+    Test cases:
+    unpack_sums_5, T3966, T7050
+  -}
+  BackpackUnpackAbstractType :: BadFieldAnnotationReason
+  deriving (Generic)
+
+data SuperclassCycle =
+  MkSuperclassCycle { cls :: Class, definite :: Bool, reasons :: [SuperclassCycleDetail] }
+
+data SuperclassCycleDetail
+  = SCD_HeadTyVar !PredType
+  | SCD_HeadTyFam !PredType
+  | SCD_Superclass !Class
+
+data RoleValidationFailedReason
+  = TyVarRoleMismatch !TyVar !Role
+  | TyVarMissingInEnv !TyVar
+  | BadCoercionRole !Coercion
+  deriving (Generic)
+
+data DisabledClassExtension where
+  {-| MultiParamTypeClasses is required.
+
+    Test cases:
+    readFail037, TcNoNullaryTC
+  -}
+  MultiParamDisabled :: !Int -- ^ The arity
+                     -> DisabledClassExtension
+  {-| FunctionalDependencies is required.
+
+    Test cases:
+    readFail041
+  -}
+  FunDepsDisabled :: DisabledClassExtension
+  {-| ConstrainedClassMethods is required.
+
+    Test cases:
+    mod39, tcfail150
+  -}
+  ConstrainedClassMethodsDisabled :: !Id
+                                  -> !TcPredType
+                                  -> DisabledClassExtension
+  deriving (Generic)
+
+data TyFamsDisabledReason
+  = TyFamsDisabledFamily !Name
+  | TyFamsDisabledInstance !TyCon
+  deriving (Generic)
+
+data TypeApplication
+  = TypeApplication !(HsType GhcPs) !TypeOrKind
+  | TypeApplicationInPattern !(HsConPatTyArg GhcPs)
+  deriving Generic
+
+-- | Why was the empty case rejected?
+data BadEmptyCaseReason
+  = EmptyCaseWithoutFlag
+  | EmptyCaseDisallowedCtxt
+  | EmptyCaseForall ForAllTyBinder
+
+-- | Either `HsType p` or `HsSigType p`.
+--
+-- Used for reporting errors in `TcRnIllegalKind`.
+data HsTypeOrSigType p
+  = HsType    (HsType p)
+  | HsSigType (HsSigType p)
+
+instance OutputableBndrId p => Outputable (HsTypeOrSigType (GhcPass p)) where
+  ppr (HsType ty) = ppr ty
+  ppr (HsSigType sig_ty) = ppr sig_ty
+
+-- | A wrapper around HsTyVarBndr.
+-- Used for reporting errors in `TcRnUnusedQuantifiedTypeVar`.
+data HsTyVarBndrExistentialFlag = forall flag. OutputableBndrFlag flag 'Renamed =>
+  HsTyVarBndrExistentialFlag (HsTyVarBndr flag GhcRn)
+
+instance Outputable HsTyVarBndrExistentialFlag where
+  ppr (HsTyVarBndrExistentialFlag hsTyVarBndr) = ppr hsTyVarBndr
+
+type TySynCycleTyCons =
+  [Either TyCon (LTyClDecl GhcRn)]
+
+-- | Different types of warnings for dodgy imports.
+data DodgyImportsReason =
+  {-| An import of the form 'T(..)' or 'f(..)' does not actually import anything beside
+      'T'/'f' itself.
+
+    Test cases:
+      DodgyImports
+  -}
+  DodgyImportsEmptyParent !GlobalRdrElt
+  |
+  {-| A 'hiding' clause contains something that would be reported as an error in a
+    regular import, but is relaxed to a warning.
+
+    Test cases:
+      DodgyImports_hiding
+  -}
+  DodgyImportsHiding !ImportLookupReason
+  deriving (Generic)
+
+-- | Different types of errors for import lookup.
+data ImportLookupReason where
+  {-| An item in an import statement is not exported by the corresponding
+    module.
+
+    Test cases:
+      T21826, recomp001, retc001, mod79, mod80, mod81, mod91, T6007, T7167,
+      T9006, T11071, T9905fail2, T5385, T10668
+  -}
+  ImportLookupBad :: BadImportKind
+                  -> ModIface
+                  -> ImpDeclSpec
+                  -> IE GhcPs
+                  -> Bool -- ^ whether @-XPatternSynonyms@ was enabled
+                  -> ImportLookupReason
+  {-| A name is specified with a qualifying module.
+
+    Test cases:
+      T3792
+  -}
+  ImportLookupQualified :: !RdrName -- ^ The name extracted from the import item
+                        -> ImportLookupReason
+
+  {-| Something completely unexpected is in an import list, like @module Foo@.
+
+    Test cases:
+      ImportLookupIllegal
+  -}
+  ImportLookupIllegal :: ImportLookupReason
+  {-| An item in an import list matches multiple names exported from that module.
+
+    Test cases:
+      None
+  -}
+  ImportLookupAmbiguous :: !RdrName -- ^ The name extracted from the import item
+                        -> ![GlobalRdrElt] -- ^ The potential matches
+                        -> ImportLookupReason
+  deriving (Generic)
+
+-- | Distinguish record fields from other names for pretty-printing.
+data UnusedImportName where
+  UnusedImportNameRecField :: !Parent -> !OccName -> UnusedImportName
+  UnusedImportNameRegular :: !Name -> UnusedImportName
+
+-- | Different types of errors for unused imports.
+data UnusedImportReason where
+  {-| No names in the import list are used in the module.
+
+    Test cases:
+      overloadedrecfldsfail06, T10890_2, t22391, t22391j, T1074, prog018,
+      mod177, rn046, rn037, T5211
+  -}
+  UnusedImportNone :: UnusedImportReason
+  {-| A set of names in the import list are not used in the module.
+
+    Test cases:
+      overloadedrecfldsfail06, T17324, mod176, T11970A, rn046, T14881,
+      T7454, T8149, T13064
+  -}
+  UnusedImportSome :: ![UnusedImportName] -- ^ The unsed names
+                   -> UnusedImportReason
+  deriving (Generic)
+
+-- | Different places in which a nested foralls/contexts error might occur.
+data NestedForallsContextsIn
+  -- | Nested forall in @SPECIALISE instance@
+  = NFC_Specialize
+  -- | Nested forall in @deriving via@ (via-type)
+  | NFC_ViaType
+  -- | Nested forall in the type of a GADT constructor
+  | NFC_GadtConSig
+  -- | Nested forall in an instance head
+  | NFC_InstanceHead
+  -- | Nested forall in a standalone deriving instance head
+  | NFC_StandaloneDerivedInstanceHead
+  -- | Nested forall in deriving class type
+  | NFC_DerivedClassType
+
+-- | Provenance of an unused name.
+data UnusedNameProv
+  = UnusedNameTopDecl
+  | UnusedNameImported !ModuleName
+  | UnusedNameTypePattern
+  | UnusedNameMatch
+  | UnusedNameLocalBind
+
+-- | Different reasons for TcRnNonCanonicalDefinition.
+data NonCanonicalDefinition =
+  -- | Related to @(<>)@ and @mappend@.
+  NonCanonicalMonoid NonCanonical_Monoid
+  |
+  -- | Related to @(*>)@/@(>>)@ and @pure@/@return@.
+  NonCanonicalMonad NonCanonical_Monad
+  deriving (Generic)
+
+-- | Possible cases for the -Wnoncanonical-monoid-instances.
+data NonCanonical_Monoid =
+  -- | @(<>) = mappend@ was defined.
+  NonCanonical_Sappend
+  |
+  -- | @mappend@ was defined as something other than @(<>)@.
+  NonCanonical_Mappend
+
+-- | Possible cases for the -Wnoncanonical-monad-instances.
+data NonCanonical_Monad =
+  -- | @pure = return@ was defined.
+  NonCanonical_Pure
+  |
+  -- | @(*>) = (>>)@ was defined.
+  NonCanonical_ThenA
+  |
+  -- | @return@ was defined as something other than @pure@.
+  NonCanonical_Return
+  |
+  -- | @(>>)@ was defined as something other than @(*>)@.
+  NonCanonical_ThenM
+
+-- | Why was an instance declaration rejected?
+data IllegalInstanceReason
+  = IllegalClassInstance
+      !TypedThing -- ^ the instance head type
+      !IllegalClassInstanceReason -- ^ the problem with the instance head
+  | IllegalFamilyInstance !IllegalFamilyInstanceReason
+  | IllegalFamilyApplicationInInstance
+      !Type   -- ^ the instance head type
+      !Bool   -- ^ is this an invisible argument?
+      !TyCon  -- ^ type family
+      ![Type] -- ^ type family argument
+  deriving Generic
+
+-- | Why was a class instance declaration rejected?
+data IllegalClassInstanceReason
+  -- | An illegal type at the head of the instance.
+  --
+  -- See t'IllegalInstanceHeadReason'.
+  = IllegalInstanceHead !IllegalInstanceHeadReason
+  -- | An illegal HasField instance. See t'IllegalHasFieldInstance'.
+  | IllegalHasFieldInstance !IllegalHasFieldInstance
+  -- | An illegal instance for a built-in typeclass such as
+  --   'Coercible', 'Typeable', or 'KnownNat', outside of a signature file.
+  --
+  --   Test cases: deriving/should_fail/T9687
+  --               deriving/should_fail/T14916
+  --               polykinds/T8132
+  --               typecheck/should_fail/TcCoercibleFail2
+  --               typecheck/should_fail/T12837
+  --               typecheck/should_fail/T14390
+  | IllegalSpecialClassInstance !Class !Bool -- ^ Whether the error is due to Safe Haskell being enabled
+  -- | The instance failed the coverage condition, i.e. the functional
+  -- dependencies were not respected.
+  --
+  -- Example:
+  --
+  --  class C a b | a -> b where {..}
+  --  instance C a b where {..}
+  --
+  -- Test cases: T9106, T10570, T2247, T12803, tcfail170.
+  | IllegalInstanceFailsCoverageCondition
+      !Class !CoverageProblem
+  deriving Generic
+
+-- | Why was a HasField instance declaration rejected?
+data IllegalHasFieldInstance
+  -- | HasField instance for a type not headed by a TyCon.
+  --
+  -- Example:
+  --
+  --   instance HasField a where {..}
+  --
+  -- Test case: hasfieldfail03
+  = IllegalHasFieldInstanceNotATyCon
+  -- | HasField instance for a data family.
+  --
+  -- Example:
+  --
+  --  data family D a
+  --  data instance D Int = MkDInt Char
+  --
+  --  instance HasField "fld" (D Int) where {..}
+  --
+  -- Test case: hasfieldfail03
+  | IllegalHasFieldInstanceFamilyTyCon
+  -- | HasField instance for a type that already has that field.
+  --
+  -- Example
+  --
+  --  data T = MkT { quux :: Int }
+  --  instance HasField "quux" T Int where {..}
+  --
+  -- Test case: hasfieldfail03
+  | IllegalHasFieldInstanceTyConHasField !TyCon !FieldLabelString
+  -- | HasField instance for a type that already has fields, when the
+  -- field label could potentially unify with those fields.
+  --
+  -- Example:
+  --
+  --  data T = MkInt { quux :: Int }
+  --  instance forall (fld :: Symbol). HasField fld T Int where {..}
+  --
+  -- Test case: hasfieldfail03
+  | IllegalHasFieldInstanceTyConHasFields !TyCon !Type -- ^ the label type in the instance head
+  deriving Generic
+
+-- | Description of an instance coverage condition failure.
+data CoverageProblem =
+  CoverageProblem
+    { not_covered_fundep        :: ([TyVar], [TyVar])
+    , not_covered_fundep_inst   :: ([Type], [Type])
+    , not_covered_invis_vis_tvs :: Pair VarSet
+    , not_covered_liberal       :: FailedCoverageCondition
+    }
+
+-- | Which instance coverage condition failed? Was it the liberal
+-- coverage condition?
+data FailedCoverageCondition
+  -- | Failed the instance coverage condition (ICC)
+  = FailedICC
+    { alsoFailedLICC :: !Bool
+      -- ^ Whether the instance also failed the LICC
+    }
+  -- | Failed the liberal instance coverage condition (LICC)
+  | FailedLICC
+
+--------------------------------------------------------------------------------
+-- Template Haskell errors
+
+data THError
+  -- | A syntax error with Template Haskel quotes & splices.
+  -- See t'THSyntaxError'.
+  = THSyntaxError !THSyntaxError
+  -- | An error in Template Haskell involving 'Name's.
+  -- See t'THNameError'.
+  | THNameError !THNameError
+  -- | An error in Template Haskell reification. See t'THReifyError'.
+  | THReifyError !THReifyError
+  -- | An error due to typing restrictions in Typed Template Haskell.
+  -- See t'TypedTHError'.
+  | TypedTHError !TypedTHError
+  -- | An error occurred when trying to run a splice in Template Haskell.
+  -- See 'SpliceFailReason'.
+  | THSpliceFailed !SpliceFailReason
+  -- | An error involving the 'addTopDecls' functionality. See t'AddTopDeclsError'.
+  | AddTopDeclsError !AddTopDeclsError
+
+  {-| IllegalStaticFormInSplice is an error when a user attempts to define
+      a static pointer in a Template Haskell splice.
+
+      Example(s):
+
+     Test cases: th/TH_StaticPointers02
+  -}
+  | IllegalStaticFormInSplice !(HsExpr GhcPs)
+
+  {-| FailedToLookupThInstName is a Template Haskell error that occurrs when looking up an
+      instance fails.
+
+      Example(s):
+
+      Test cases: showIface/should_fail/THPutDocNonExistent
+  -}
+  | FailedToLookupThInstName !TH.Type !LookupTHInstNameErrReason
+
+  {-| AddInvalidCorePlugin is a Template Haskell error indicating that a
+      Core plugin being added has an invalid module due to being
+      in the current package.
+
+      Example(s):
+
+      Test cases:
+  -}
+  | AddInvalidCorePlugin !String -- ^ Module name
+
+  {-| AddDocToNonLocalDefn is a Template Haskell error for documentation being added to a
+      definition which is not in the current module.
+
+      Example(s):
+
+      Test cases: showIface/should_fail/THPutDocExternal
+  -}
+  | AddDocToNonLocalDefn !TH.DocLoc
+
+  {-| ReportCustomQuasiError is an error or warning thrown using 'qReport' from
+      the 'Quasi' instance of 'TcM'.
+
+      Example(s):
+
+      Test cases:
+  -}
+  | ReportCustomQuasiError
+    !Bool -- ^ True => Error, False => Warning
+    !String -- ^ Error body
+  deriving Generic
+
+-- | An error involving Template Haskell quotes or splices, e.g. nested
+-- quotation brackets or the use of an untyped bracket inside a typed splice.
+data THSyntaxError
+  = {-| IllegalTHQuotes is an error that occurs when a Template Haskell
+        quote is used without the TemplateHaskell extension enabled.
+
+        Test case: T18251e
+    -}
+    IllegalTHQuotes !(HsExpr GhcPs)
+
+    {-| IllegalTHSplice is an error that occurs when a Template Haskell
+        splice occurs without having enabled the TemplateHaskell extension.
+
+        Test cases:
+          bkpfail01, bkpfail05, bkpfail09, bkpfail16, bkpfail35, bkpcabal06
+    -}
+  | IllegalTHSplice
+
+    {-| NestedTHBrackets is an error that occurs when Template Haskell
+        brackets are nested without any intervening splices.
+
+        Example:
+
+          foo = [| [| 'x' |] |]
+
+        Test cases: TH_NestedSplicesFail{5,6,7,8}
+    -}
+  | NestedTHBrackets
+
+  {-| MismatchedSpliceType is an error that happens when a typed bracket
+      or splice is used inside a typed splice/bracket, or the other way around.
+
+      Examples:
+
+        f1 = [| $$x |]
+        f2 = [|| $y ||]
+        f3 = $$( [| 'x' |] )
+        f4 = $( [|| 'y' ||] )
+
+      Test cases: TH_NestedSplicesFail{1,2,3,4}
+  -}
+  | MismatchedSpliceType
+      SpliceType -- ^ type of the splice
+      SpliceOrBracket -- ^ what's nested inside
+  {-| BadImplicitSplice is an error thrown when a user uses top-level implicit
+      TH-splice without enabling the TemplateHaskell extension.
+
+      Example:
+
+        pure [] -- on top-level
+
+      Test cases: ghci/prog019/prog019
+                  ghci/scripts/T1914
+                  ghci/scripts/T6106
+                  rename/should_fail/T4042
+                  rename/should_fail/T12146
+  -}
+  | BadImplicitSplice
+  deriving Generic
+
+data THNameError
+  {-| NonExactName is a Template Haskell error that occurs when the user
+      attempts to define a binder with a 'RdrName' that is not an exact 'Name'.
+
+      Example(s):
+
+      Test cases:
+  -}
+  = NonExactName !RdrName
+
+  {-| QuotedNameWrongStage is an error that can happen when a
+      (non-top-level) Name is used at a different Template Haskell stage
+      than the stage at which it is bound.
+
+     Test cases: T16976z
+  -}
+  | QuotedNameWrongStage !(HsQuote GhcPs)
+  deriving Generic
+
+data THReifyError
+  = {-| CannotReifyInstance is a Template Haskell error for when an instance being reified
+        via `reifyInstances` is not a class constraint or type family application.
+
+        Example(s):
+
+       Test cases:
+    -}
+    CannotReifyInstance !Type
+
+  {-| CannotReifyOutOfScopeThing is a Template Haskell error indicating
+      that the given name is not in scope and therefore cannot be reified.
+
+      Example(s):
+
+     Test cases: th/T16976f
+  -}
+ | CannotReifyOutOfScopeThing !TH.Name
+
+  {-| CannotReifyThingNotInTypeEnv is a Template Haskell error occurring
+      when the given name is not in the type environment and therefore cannot be reified.
+
+      Example(s):
+
+     Test cases:
+  -}
+  | CannotReifyThingNotInTypeEnv !Name
+
+  {-| NoRolesAssociatedWithName is a Template Haskell error for when the user
+      tries to reify the roles of a given name but it is not something that has
+      roles associated with it.
+
+      Example(s):
+
+     Test cases:
+  -}
+  | NoRolesAssociatedWithThing !TcTyThing
+
+  {-| CannotRepresentThing is a Template Haskell error indicating that a
+      type cannot be reified because it does not have a representation in Template Haskell.
+
+      Example(s):
+
+     Test cases:
+  -}
+  | CannotRepresentType !UnrepresentableTypeDescr !Type
+  deriving Generic
+
+data AddTopDeclsError
+  = {-| InvalidTopDecl is a Template Haskell error occurring when one of the 'Dec's passed to
+      'addTopDecls' is not a function, value, annotation, or foreign import declaration.
+
+       Example(s):
+
+       Test cases:
+    -}
+    InvalidTopDecl !(HsDecl GhcPs)
+    {-| UnexpectedDeclarationSplice is an error that occurs when a Template Haskell
+        splice appears inside top-level declarations added with 'addTopDecls'.
+
+        Example(s): none
+
+        Test cases: none
+  -}
+  | AddTopDeclsUnexpectedDeclarationSplice
+
+  | AddTopDeclsRunSpliceFailure !RunSpliceFailReason
+  deriving Generic
+
+data TypedTHError
+  = {-| SplicePolymorphicLocalVar is the error that occurs when the expression
+        inside typed Template Haskell brackets is a polymorphic local variable.
+
+        Example(s):
+        x = \(y :: forall a. a -> a) -> [|| y ||]
+
+       Test cases: quotes/T10384
+    -}
+    SplicePolymorphicLocalVar !Id
+
+    {-| TypedTHWithPolyType is an error that signifies the illegal use
+        of a polytype in a typed Template Haskell expression.
+
+        Example(s):
+        bad :: (forall a. a -> a) -> ()
+        bad = $$( [|| \_ -> () ||] )
+
+       Test cases: th/T11452
+    -}
+  | TypedTHWithPolyType !TcType
+  deriving Generic
+
+data SpliceFailReason
+  = {-| SpliceThrewException is an error that occurs when running a Template
+        Haskell splice throws an exception.
+
+        Example(s):
+
+       Test cases: annotations/should_fail/annfail12
+                   perf/compiler/MultiLayerModulesTH_Make
+                   perf/compiler/MultiLayerModulesTH_OneShot
+                   th/T10796b
+                   th/T19470
+                   th/T19709d
+                   th/T5358
+                   th/T5976
+                   th/T7276a
+                   th/T8987
+                   th/TH_exn1
+                   th/TH_exn2
+                   th/TH_runIO
+  -}
+  SpliceThrewException
+    !SplicePhase
+    !SomeException
+    !String -- ^ Result of showing the exception (cannot be done safely outside IO)
+    !(LHsExpr GhcTc)
+    !Bool -- True <=> Print the expression
+
+  {-| RunSpliceFailure is an error indicating that a Template Haskell splice
+      failed to be converted into a valid expression.
+
+      Example(s):
+
+     Test cases: th/T10828a
+                 th/T10828b
+                 th/T12478_4
+                 th/T15270A
+                 th/T15270B
+                 th/T16895a
+                 th/T16895b
+                 th/T16895c
+                 th/T16895d
+                 th/T16895e
+                 th/T18740d
+                 th/T2597b
+                 th/T2674
+                 th/T3395
+                 th/T7484
+                 th/T7667a
+                 th/TH_implicitParamsErr1
+                 th/TH_implicitParamsErr2
+                 th/TH_implicitParamsErr3
+                 th/TH_invalid_add_top_decl
+  -}
+  | RunSpliceFailure !RunSpliceFailReason
+  deriving Generic
+
+data RunSpliceFailReason
+  = ConversionFail !ThingBeingConverted !ConversionFailReason
+  deriving Generic
+
+-- | Identifies the TH splice attempting to be converted
+data ThingBeingConverted
+  = ConvDec !TH.Dec
+  | ConvExp !TH.Exp
+  | ConvPat !TH.Pat
+  | ConvType !TH.Type
+
+-- | The reason a TH splice could not be converted to a Haskell expression
+data ConversionFailReason
+  = IllegalOccName !OccName.NameSpace !String
+  | SumAltArityExceeded !TH.SumAlt !TH.SumArity
+  | IllegalSumAlt !TH.SumAlt
+  | IllegalSumArity !TH.SumArity
+  | MalformedType !TypeOrKind !TH.Type
+  | IllegalLastStatement !HsDoFlavour !(LStmt GhcPs (LHsExpr GhcPs))
+  | KindSigsOnlyAllowedOnGADTs
+  | IllegalDeclaration !THDeclDescriptor !IllegalDecls
+  | CannotMixGADTConsWith98Cons
+  | EmptyStmtListInDoBlock
+  | NonVarInInfixExpr
+  | MultiWayIfWithoutAlts
+  | CasesExprWithoutAlts
+  | ImplicitParamsWithOtherBinds
+  | InvalidCCallImpent !String -- ^ Source
+  | RecGadtNoCons
+  | GadtNoCons
+  | InvalidTypeInstanceHeader !TH.Type
+  | InvalidTyFamInstLHS !TH.Type
+  | InvalidImplicitParamBinding
+  | DefaultDataInstDecl ![LDataFamInstDecl GhcPs]
+  | FunBindLacksEquations !TH.Name
+  deriving Generic
+
+data IllegalDecls
+  = IllegalDecls    !(NE.NonEmpty (LHsDecl GhcPs))
+  | IllegalFamDecls !(NE.NonEmpty (LFamilyDecl GhcPs))
+
+-- | Label for a TH declaration
+data THDeclDescriptor
+  = InstanceDecl
+  | WhereClause
+  | LetBinding
+  | LetExpression
+  | ClssDecl
+
+-- | The phase in which an exception was encountered when dealing with a TH splice
+data SplicePhase
+  = SplicePhase_Run
+  | SplicePhase_CompileAndLink
+
+data LookupTHInstNameErrReason
+  = NoMatchesFound
+  | CouldNotDetermineInstance
+
+data UnrepresentableTypeDescr
+  = LinearInvisibleArgument
+  | CoercionsInTypes
+
+-- FFI error types
+data IllegalForeignTypeReason
+  = TypeCannotBeMarshaled !Type TypeCannotBeMarshaledReason
+  | ForeignDynNotPtr
+      !Type -- ^ Expected type
+      !Type -- ^ Actual type
+  | SafeHaskellMustBeInIO
+  | IOResultExpected
+  | UnexpectedNestedForall
+  | LinearTypesNotAllowed
+  | OneArgExpected
+  | AtLeastOneArgExpected
+  deriving Generic
+
+-- | Reason why a type cannot be marshalled through the FFI.
+data TypeCannotBeMarshaledReason
+  = NotADataType
+  | NewtypeDataConNotInScope !TyCon ![Type]
+  | UnliftedFFITypesNeeded
+  | NotABoxedMarshalableTyCon
+  | ForeignLabelNotAPtr
+  | NotSimpleUnliftedType
+  | NotBoxedKindAny
+  deriving Generic

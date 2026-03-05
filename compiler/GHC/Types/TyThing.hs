@@ -1,3 +1,5 @@
+{-# LANGUAGE LambdaCase #-}
+
 -- | A global typecheckable-thing, essentially anything that has a name.
 module GHC.Types.TyThing
    ( TyThing (..)
@@ -15,7 +17,7 @@ module GHC.Types.TyThing
    , isImplicitTyThing
    , tyThingParent_maybe
    , tyThingsTyCoVars
-   , tyThingAvailInfo
+   , tyThingLocalGREs, tyThingGREInfo
    , tyThingTyCon
    , tyThingCoAxiom
    , tyThingDataCon
@@ -26,12 +28,14 @@ where
 
 import GHC.Prelude
 
+import GHC.Types.GREInfo
 import GHC.Types.Name
+import GHC.Types.Name.Reader
 import GHC.Types.Var
 import GHC.Types.Var.Set
 import GHC.Types.Id
 import GHC.Types.Id.Info
-import GHC.Types.Avail
+import GHC.Types.Unique.Set
 
 import GHC.Core.Class
 import GHC.Core.DataCon
@@ -48,6 +52,11 @@ import GHC.Utils.Panic
 import Control.Monad ( liftM )
 import Control.Monad.Trans.Reader
 import Control.Monad.Trans.Class
+
+import Data.List.NonEmpty ( NonEmpty(..) )
+import qualified Data.List.NonEmpty as NE
+import Data.List ( intersect )
+
 
 {-
 Note [ATyCon for classes]
@@ -257,7 +266,7 @@ tyThingParent_maybe (AnId id)     = case idDetails id of
                                           Just (ATyCon tc)
                                       RecSelId { sel_tycon = RecSelPatSyn ps } ->
                                           Just (AConLike (PatSynCon ps))
-                                      ClassOpId cls               ->
+                                      ClassOpId cls _             ->
                                           Just (ATyCon (classTyCon cls))
                                       _other                      -> Nothing
 tyThingParent_maybe _other = Nothing
@@ -276,22 +285,90 @@ tyThingsTyCoVars tts =
               Nothing  -> tyCoVarsOfType $ tyConKind tc
         ttToVarSet (ACoAxiom _)  = emptyVarSet
 
--- | The Names that a TyThing should bring into scope.  Used to build
--- the GlobalRdrEnv for the InteractiveContext.
-tyThingAvailInfo :: TyThing -> [AvailInfo]
-tyThingAvailInfo (ATyCon t)
-   = case tyConClass_maybe t of
-        Just c  -> [availTC n ((n : map getName (classMethods c)
-                                 ++ map getName (classATs c))) [] ]
-             where n = getName c
-        Nothing -> [availTC n (n : map getName dcs) flds]
-             where n    = getName t
-                   dcs  = tyConDataCons t
-                   flds = tyConFieldLabels t
-tyThingAvailInfo (AConLike (PatSynCon p))
-  = avail (getName p) : map availField (patSynFieldLabels p)
-tyThingAvailInfo t
-   = [avail (getName t)]
+-- | The 'GlobalRdrElt's that a 'TyThing' should bring into scope.
+-- Used to build the 'GlobalRdrEnv' for the InteractiveContext.
+tyThingLocalGREs :: TyThing -> [GlobalRdrElt]
+tyThingLocalGREs ty_thing =
+  case ty_thing of
+    ATyCon t
+      | Just c <- tyConClass_maybe t
+      -> myself NoParent
+       : (  map (mkLocalVanillaGRE (ParentIs $ className c) . getName) (classMethods c)
+         ++ map tc_GRE (classATs c) )
+      | otherwise
+      -> let dcs = tyConDataCons t
+             par = ParentIs $ tyConName t
+             mk_nm = DataConName . dataConName
+         in myself NoParent
+          : map (dc_GRE par) dcs
+            ++
+            mkLocalFieldGREs par
+               [ (mk_nm dc, con_info)
+               | dc <- dcs
+               , let con_info = conLikeConInfo (RealDataCon dc) ]
+    AConLike con ->
+      let (par, cons_flds) = case con of
+            PatSynCon {} ->
+              (NoParent, [(conLikeConLikeName con, conLikeConInfo con)])
+              -- NB: NoParent for local pattern synonyms, as per
+              -- Note [Parents] in GHC.Types.Name.Reader.
+            RealDataCon dc1 ->
+              (ParentIs $ tyConName $ dataConTyCon dc1
+              , [ (DataConName $ dataConName $ dc, ConHasRecordFields (fld :| flds))
+                | dc <- tyConDataCons $ dataConTyCon dc1
+                -- Go through all the data constructors of the parent TyCon,
+                -- to ensure that all the record fields have the correct set
+                -- of parent data constructors. See #23546.
+                , let con_info = conLikeConInfo (RealDataCon dc)
+                , ConHasRecordFields flds0 <- [con_info]
+                , let flds1 = NE.toList flds0 `intersect` dataConFieldLabels dc
+                , fld:flds <- [flds1]
+                ])
+      in myself par : mkLocalFieldGREs par cons_flds
+    AnId id
+      | RecSelId { sel_tycon = RecSelData tc } <- idDetails id
+      -> [ myself (ParentIs $ tyConName tc) ]
+      -- Fallback to NoParent for PatSyn record selectors,
+      -- as per Note [Parents] in GHC.Types.Name.Reader.
+    _ -> [ myself NoParent ]
+  where
+    tc_GRE :: TyCon -> GlobalRdrElt
+    tc_GRE at = mkLocalTyConGRE
+                     (fmap tyConName $ tyConFlavour at)
+                     (tyConName at)
+    dc_GRE :: Parent -> DataCon -> GlobalRdrElt
+    dc_GRE par dc =
+      let con_info = conLikeConInfo (RealDataCon dc)
+      in mkLocalConLikeGRE par (DataConName $ dataConName dc, con_info)
+    myself :: Parent -> GlobalRdrElt
+    myself p = mkLocalGRE (tyThingGREInfo ty_thing) p (getName ty_thing)
+
+-- | Obtain information pertinent to the renamer about a particular 'TyThing'.
+--
+-- This extracts out renamer information from typechecker information.
+tyThingGREInfo :: TyThing -> GREInfo
+tyThingGREInfo = \case
+  AConLike con -> IAmConLike $ conLikeConInfo con
+  AnId id -> case idDetails id of
+    RecSelId { sel_tycon = parent, sel_fieldLabel = fl } ->
+      let relevant_cons = case parent of
+            RecSelPatSyn ps -> unitUniqSet $ PatSynName (patSynName ps)
+            RecSelData   tc ->
+              let dcs = map RealDataCon $ tyConDataCons tc in
+              case conLikesWithFields dcs [flLabel fl] of
+                ([], _) -> pprPanic "tyThingGREInfo: no DataCons with this FieldLabel" $
+                        vcat [ text "id:"  <+> ppr id
+                             , text "fl:"  <+> ppr fl
+                             , text "dcs:" <+> ppr dcs ]
+                (cons, _) -> mkUniqSet $ map conLikeConLikeName cons
+       in IAmRecField $
+            RecFieldInfo
+              { recFieldLabel = fl
+              , recFieldCons  = relevant_cons }
+    _ -> Vanilla
+  ATyCon tc ->
+    IAmTyCon (fmap tyConName $ tyConFlavour tc)
+  _ -> Vanilla
 
 -- | Get the 'TyCon' from a 'TyThing' if it is a type constructor thing. Panics otherwise
 tyThingTyCon :: HasDebugCallStack => TyThing -> TyCon

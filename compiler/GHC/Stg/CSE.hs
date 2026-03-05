@@ -71,6 +71,11 @@ and nothing stops us from transforming that to
                           , Right [x] -> b}
 
 
+Note that this can revive dead case binders (e.g. "b" above), hence we zap
+occurrence information on all case binders during STG CSE.
+See Note [Dead-binder optimisation] in GHC.StgToCmm.Expr.
+
+
 Note [StgCse after unarisation]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -165,8 +170,8 @@ data CseEnv = CseEnv
         -- ^ This substitution is applied to the code as we traverse it.
         --   Entries have one of two reasons:
         --
-        --   * The input might have shadowing (see Note [Shadowing]), so we have
-        --     to rename some binders as we traverse the tree.
+        --   * The input might have shadowing (see Note [Shadowing in Core]),
+        --     so we have to rename some binders as we traverse the tree.
         --   * If we remove `let x = Con z` because  `let y = Con z` is in scope,
         --     we note this here as x ↦ y.
     , ce_bndrMap     :: IdEnv OutId
@@ -319,11 +324,11 @@ stgCseTopLvl in_scope (StgTopLifted (StgRec eqs))
   where in_scope' = in_scope `extendInScopeSetList` [ bndr | (bndr, _) <- eqs ]
 
 stgCseTopLvlRhs :: InScopeSet -> InStgRhs -> OutStgRhs
-stgCseTopLvlRhs in_scope (StgRhsClosure ext ccs upd args body)
+stgCseTopLvlRhs in_scope (StgRhsClosure ext ccs upd args body typ)
     = let body' = stgCseExpr (initEnv in_scope) body
-      in  StgRhsClosure ext ccs upd args body'
-stgCseTopLvlRhs _ (StgRhsCon ccs dataCon mu ticks args)
-    = StgRhsCon ccs dataCon mu ticks args
+      in  StgRhsClosure ext ccs upd args body' typ
+stgCseTopLvlRhs _ (StgRhsCon ccs dataCon mu ticks args typ)
+    = StgRhsCon ccs dataCon mu ticks args typ
 
 ------------------------------
 -- The actual AST traversal --
@@ -344,16 +349,20 @@ stgCseExpr env (StgTick tick body)
     = let body' = stgCseExpr env body
       in StgTick tick body'
 stgCseExpr env (StgCase scrut bndr ty alts)
-    = mkStgCase scrut' bndr' ty alts'
+    = mkStgCase scrut' bndr'' ty alts'
   where
     scrut' = stgCseExpr env scrut
     (env1, bndr') = substBndr env bndr
+    -- we must zap occurrence information on the case binder
+    -- because CSE might revive it.
+    -- See Note [Dead-binder optimisation] in GHC.StgToCmm.Expr
+    bndr'' = zapIdOccInfo bndr'
     env2 | StgApp trivial_scrut [] <- scrut'
          = addTrivCaseBndr bndr trivial_scrut env1
                  -- See Note [Trivial case scrutinee]
          | otherwise
          = env1
-    alts' = map (stgCseAlt env2 ty bndr') alts
+    alts' = map (stgCseAlt env2 ty bndr'') alts
 
 
 -- A constructor application.
@@ -427,7 +436,7 @@ stgCsePairs env0 ((b,e):pairs)
 -- The RHS of a binding.
 -- If it is a constructor application, either short-cut it or extend the environment
 stgCseRhs :: CseEnv -> OutId -> InStgRhs -> (Maybe (OutId, OutStgRhs), CseEnv)
-stgCseRhs env bndr (StgRhsCon ccs dataCon mu ticks args)
+stgCseRhs env bndr (StgRhsCon ccs dataCon mu ticks args typ)
     | Just other_bndr <- envLookup dataCon args' env
     , not (isWeakLoopBreaker (idOccInfo bndr)) -- See Note [Care with loop breakers]
     = let env' = addSubst bndr other_bndr env
@@ -435,15 +444,15 @@ stgCseRhs env bndr (StgRhsCon ccs dataCon mu ticks args)
     | otherwise
     = let env' = addDataCon bndr dataCon args' env
             -- see Note [Case 1: CSEing allocated closures]
-          pair = (bndr, StgRhsCon ccs dataCon mu ticks args')
+          pair = (bndr, StgRhsCon ccs dataCon mu ticks args' typ)
       in (Just pair, env')
   where args' = substArgs env args
 
-stgCseRhs env bndr (StgRhsClosure ext ccs upd args body)
+stgCseRhs env bndr (StgRhsClosure ext ccs upd args body typ)
     = let (env1, args') = substBndrs env args
           env2 = forgetCse env1 -- See Note [Free variables of an StgClosure]
           body' = stgCseExpr env2 body
-      in (Just (substVar env bndr, StgRhsClosure ext ccs upd args' body'), env)
+      in (Just (substVar env bndr, StgRhsClosure ext ccs upd args' body' typ), env)
 
 
 mkStgCase :: StgExpr -> OutId -> AltType -> [StgAlt] -> StgExpr

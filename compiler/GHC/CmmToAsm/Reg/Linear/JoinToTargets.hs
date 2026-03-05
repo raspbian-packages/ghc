@@ -23,7 +23,7 @@ import GHC.CmmToAsm.Types
 import GHC.Platform.Reg
 
 import GHC.Cmm.BlockId
-import GHC.Cmm.Dataflow.Collections
+import GHC.Cmm.Dataflow.Label
 import GHC.Data.Graph.Directed
 import GHC.Utils.Panic
 import GHC.Utils.Monad (concatMapM)
@@ -199,8 +199,7 @@ joinToTargets_again
                         (return ())
                 -}
                 delta           <- getDeltaR
-                fixUpInstrs_    <- mapM (handleComponent delta instr) sccs
-                let fixUpInstrs = concat fixUpInstrs_
+                fixUpInstrs     <- concatMapM (handleComponent delta instr) sccs
 
                 -- make a new basic block containing the fixup code.
                 --      A the end of the current block we will jump to the fixup one,

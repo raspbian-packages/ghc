@@ -56,6 +56,11 @@ module GHC.Stg.Syntax (
         stgRhsArity, freeVarsOfRhs,
         isDllConApp,
         stgArgType,
+        stgArgRep,
+        stgArgRep1,
+        stgArgRepU,
+        stgArgRep_maybe,
+
         stgCaseBndrInScope,
 
         -- ppr
@@ -68,27 +73,36 @@ module GHC.Stg.Syntax (
 
 import GHC.Prelude
 
-import GHC.Core     ( AltCon )
+import GHC.Stg.InferTags.TagSig( TagSig )
+import GHC.Stg.Lift.Types
+  -- To avoid having an orphan instances for BinderP, XLet etc
+
 import GHC.Types.CostCentre ( CostCentreStack )
-import Data.ByteString ( ByteString )
-import Data.Data   ( Data )
-import Data.List   ( intersperse )
+
+import GHC.Core     ( AltCon )
 import GHC.Core.DataCon
+import GHC.Core.TyCon    ( PrimRep(..), PrimOrVoidRep(..), TyCon )
+import GHC.Core.Type     ( Type )
+import GHC.Core.Ppr( {- instances -} )
+
 import GHC.Types.ForeignCall ( ForeignCall )
 import GHC.Types.Id
 import GHC.Types.Name        ( isDynLinkName )
 import GHC.Types.Tickish     ( StgTickish )
 import GHC.Types.Var.Set
 import GHC.Types.Literal     ( Literal, literalType )
+import GHC.Types.RepType ( typePrimRep, typePrimRep1, typePrimRepU, typePrimRep_maybe )
+
 import GHC.Unit.Module       ( Module )
 import GHC.Utils.Outputable
-import GHC.Platform
-import GHC.Core.Ppr( {- instances -} )
-import GHC.Builtin.PrimOps ( PrimOp, PrimCall )
-import GHC.Core.TyCon    ( PrimRep(..), TyCon )
-import GHC.Core.Type     ( Type )
-import GHC.Types.RepType ( typePrimRep1, typePrimRep )
 import GHC.Utils.Panic.Plain
+
+import GHC.Platform
+import GHC.Builtin.PrimOps ( PrimOp, PrimCall )
+
+import Data.ByteString ( ByteString )
+import Data.Data   ( Data )
+import Data.List   ( intersperse )
 
 {-
 ************************************************************************
@@ -164,24 +178,44 @@ isDllConApp platform ext_dyn_refs this_mod con args
 --    $WT1 = T1 Int (Coercion (Refl Int))
 --
 -- The coercion argument here gets VoidRep
-isAddrRep :: PrimRep -> Bool
-isAddrRep AddrRep     = True
-isAddrRep LiftedRep   = True
-isAddrRep UnliftedRep = True
-isAddrRep _           = False
+isAddrRep :: PrimOrVoidRep -> Bool
+isAddrRep (NVRep AddrRep)      = True
+isAddrRep (NVRep (BoxedRep _)) = True -- FIXME: not true for JavaScript
+isAddrRep _                    = False
 
 -- | Type of an @StgArg@
 --
 -- Very half baked because we have lost the type arguments.
+--
+-- This function should be avoided: in STG we aren't supposed to
+-- look at types, but only PrimReps.
+-- Use 'stgArgRep', 'stgArgRep_maybe', 'stgArgRep1' instaed.
 stgArgType :: StgArg -> Type
 stgArgType (StgVarArg v)   = idType v
 stgArgType (StgLitArg lit) = literalType lit
+
+stgArgRep :: StgArg -> [PrimRep]
+stgArgRep ty = typePrimRep (stgArgType ty)
+
+stgArgRep_maybe :: StgArg -> Maybe [PrimRep]
+stgArgRep_maybe ty = typePrimRep_maybe (stgArgType ty)
+
+-- | Assumes that the argument has at most one PrimRep, which holds after unarisation.
+-- See Note [Post-unarisation invariants] in GHC.Stg.Unarise.
+-- See Note [VoidRep] in GHC.Types.RepType.
+stgArgRep1 :: StgArg -> PrimOrVoidRep
+stgArgRep1 ty = typePrimRep1 (stgArgType ty)
+
+-- | Assumes that the argument has exactly one PrimRep.
+-- See Note [VoidRep] in GHC.Types.RepType.
+stgArgRepU :: StgArg -> PrimRep
+stgArgRepU ty = typePrimRepU (stgArgType ty)
 
 -- | Given an alt type and whether the program is unarised, return whether the
 -- case binder is in scope.
 --
 -- Case binders of unboxed tuple or unboxed sum type always dead after the
--- unariser has run. See Note [Post-unarisation invariants].
+-- unariser has run. See Note [Post-unarisation invariants] in GHC.Stg.Unarise.
 stgCaseBndrInScope :: AltType -> Bool {- ^ unarised? -} -> Bool
 stgCaseBndrInScope alt_ty unarised =
     case alt_ty of
@@ -228,6 +262,52 @@ StgConApp and StgPrimApp --- saturated applications
 
 There are specialised forms of application, for constructors, primitives, and
 literals.
+
+Note [Constructor applications in STG]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+After the unarisation pass:
+* In `StgConApp` and `StgRhsCon` and `StgAlt` we filter out the void arguments,
+  leaving only non-void ones.
+* In `StgApp` and `StgOpApp` we retain void arguments.
+
+We can do this because we know that `StgConApp` and `StgRhsCon` are saturated applications,
+so we lose no information by dropping those void args.  In contrast, in `StgApp` we need the
+ void argument to compare the number of args in the call with the arity of the function.
+
+This is an open design choice.  We could instead choose to treat all these applications
+consistently (keeping the void args).  But for some reason we don't, and this Note simply
+documents that design choice.
+
+As an example, consider:
+
+        data T a = MkT !Int a Void#
+
+The wrapper's representation and the worker's representation (i.e. the
+datacon's Core representation) are respectively:
+
+        $WMkT :: Int  -> a -> Void# -> T a
+        MkT   :: Int# -> a -> Void# -> T a
+
+T would end up being used in STG post-unarise as:
+
+  let x = MkT 1# y
+  in ...
+      case x of
+        MkT int a -> ...
+
+The Void# argument is dropped. In essence we only generate binders for runtime
+relevant values.
+
+We also flatten out unboxed tuples in this process. See the unarise
+pass for details on how this is done. But as an example consider
+`data S = MkS Bool (# Bool | Char #)` which when matched on would
+result in an alternative with three binders like this
+
+    MkS bool tag tpl_field ->
+
+See Note [Translating unboxed sums to unboxed tuples] and Note [Unarisation]
+for the details of this transformation.
+
 -}
 
   | StgLit      Literal
@@ -236,8 +316,8 @@ literals.
         -- which can't be let-bound
   | StgConApp   DataCon
                 ConstructorNumber
-                [StgArg] -- Saturated. (After Unarisation, [NonVoid StgArg])
-                [Type]   -- See Note [Types in StgConApp] in GHC.Stg.Unarise
+                [StgArg] -- Saturated. See Note [Constructor applications in STG]
+                [[PrimRep]]   -- See Note [Representations in StgConApp] in GHC.Stg.Unarise
 
   | StgOpApp    StgOp    -- Primitive op or foreign call
                 [StgArg] -- Saturated.
@@ -384,6 +464,7 @@ data GenStgRhs pass
         [BinderP pass]     -- ^ arguments; if empty, then not a function;
                            --   as above, order is important.
         (GenStgExpr pass)  -- ^ body
+        Type               -- ^ result type
 
 {-
 An example may be in order.  Consider:
@@ -412,7 +493,8 @@ important):
                         -- are not allocated.
         ConstructorNumber
         [StgTickish]
-        [StgArg]        -- Args
+        [StgArg]        -- Saturated Args. See Note [Constructor applications in STG]
+        Type            -- Type, for rewriting to an StgRhsClosure
 
 -- | Like 'GHC.Hs.Extension.NoExtField', but with an 'Outputable' instance that
 -- returns 'empty'.
@@ -430,14 +512,14 @@ noExtFieldSilent = NoExtFieldSilent
 -- implications on build time...
 
 stgRhsArity :: StgRhs -> Int
-stgRhsArity (StgRhsClosure _ _ _ bndrs _)
+stgRhsArity (StgRhsClosure _ _ _ bndrs _ _)
   = assert (all isId bndrs) $ length bndrs
   -- The arity never includes type parameters, but they should have gone by now
 stgRhsArity (StgRhsCon {}) = 0
 
 freeVarsOfRhs :: (XRhsClosure pass ~ DIdSet) => GenStgRhs pass -> DIdSet
-freeVarsOfRhs (StgRhsCon _ _ _ _ args) = mkDVarSet [ id | StgVarArg id <- args ]
-freeVarsOfRhs (StgRhsClosure fvs _ _ _ _) = fvs
+freeVarsOfRhs (StgRhsCon _ _ _ _ args _) = mkDVarSet [ id | StgVarArg id <- args ]
+freeVarsOfRhs (StgRhsClosure fvs _ _ _ _ _) = fvs
 
 {-
 ************************************************************************
@@ -600,25 +682,34 @@ data StgPass
   | CodeGen
 
 type family BinderP (pass :: StgPass)
-type instance BinderP 'Vanilla = Id
-type instance BinderP 'CodeGen = Id
-type instance BinderP 'InferTagged = Id
+type instance BinderP 'Vanilla            = Id
+type instance BinderP 'CodeGen            = Id
+type instance BinderP 'InferTagged        = Id
+type instance BinderP 'InferTaggedBinders = (Id, TagSig)
+type instance BinderP 'LiftLams           = BinderInfo
 
 type family XRhsClosure (pass :: StgPass)
-type instance XRhsClosure 'Vanilla = NoExtFieldSilent
-type instance XRhsClosure 'InferTagged = NoExtFieldSilent
+type instance XRhsClosure 'Vanilla            = NoExtFieldSilent
+type instance XRhsClosure  'LiftLams          = DIdSet
+type instance XRhsClosure 'InferTagged        = NoExtFieldSilent
+type instance XRhsClosure 'InferTaggedBinders = XRhsClosure  'CodeGen
 -- | Code gen needs to track non-global free vars
 type instance XRhsClosure 'CodeGen = DIdSet
 
+
 type family XLet (pass :: StgPass)
-type instance XLet 'Vanilla = NoExtFieldSilent
-type instance XLet 'InferTagged = NoExtFieldSilent
-type instance XLet 'CodeGen = NoExtFieldSilent
+type instance XLet 'Vanilla            = NoExtFieldSilent
+type instance XLet 'LiftLams           = Skeleton
+type instance XLet 'InferTagged        = NoExtFieldSilent
+type instance XLet 'InferTaggedBinders = XLet 'CodeGen
+type instance XLet 'CodeGen            = NoExtFieldSilent
 
 type family XLetNoEscape (pass :: StgPass)
-type instance XLetNoEscape 'Vanilla = NoExtFieldSilent
-type instance XLetNoEscape 'InferTagged = NoExtFieldSilent
-type instance XLetNoEscape 'CodeGen = NoExtFieldSilent
+type instance XLetNoEscape 'Vanilla            = NoExtFieldSilent
+type instance XLetNoEscape 'LiftLams           = Skeleton
+type instance XLetNoEscape 'InferTagged        = NoExtFieldSilent
+type instance XLetNoEscape 'InferTaggedBinders = XLetNoEscape 'CodeGen
+type instance XLetNoEscape 'CodeGen            = NoExtFieldSilent
 
 {-
 
@@ -815,10 +906,9 @@ pprStgExpr opts e = case e of
              , hang (text "} in ") 2 (pprStgExpr opts expr)
              ]
 
-   StgTick _tickish expr -> sdocOption sdocSuppressTicks $ \case
+   StgTick tickish expr -> sdocOption sdocSuppressTicks $ \case
       True  -> pprStgExpr opts expr
-      False -> pprStgExpr opts expr
-        -- XXX sep [ ppr tickish, pprStgExpr opts expr ]
+      False -> sep [ ppr tickish, pprStgExpr opts expr ]
 
    -- Don't indent for a single case alternative.
    StgCase expr bndr alt_type [alt]
@@ -874,14 +964,14 @@ instance Outputable AltType where
 
 pprStgRhs :: OutputablePass pass => StgPprOpts -> GenStgRhs pass -> SDoc
 pprStgRhs opts rhs = case rhs of
-   StgRhsClosure ext cc upd_flag args body
+   StgRhsClosure ext cc upd_flag args body _
       -> hang (hsep [ if stgSccEnabled opts then ppr cc else empty
                     , ppUnlessOption sdocSuppressStgExts (ppr ext)
                     , char '\\' <> ppr upd_flag, brackets (interppSP args)
                     ])
               4 (pprStgExpr opts body)
 
-   StgRhsCon cc con mid _ticks args
+   StgRhsCon cc con mid _ticks args _
       -> hcat [ if stgSccEnabled opts then ppr cc <> space else empty
               , case mid of
                   NoNumber -> empty

@@ -16,17 +16,18 @@ module GHC.Core.Predicate (
   getEqPredTys, getEqPredTys_maybe, getEqPredRole,
   predTypeEqRel,
   mkPrimEqPred, mkReprPrimEqPred, mkPrimEqPredRole,
-  mkHeteroPrimEqPred, mkHeteroReprPrimEqPred,
+  mkNomPrimEqPred,
 
   -- Class predicates
   mkClassPred, isDictTy, typeDeterminesValue,
-  isClassPred, isEqPredClass, isCTupleClass,
+  isClassPred, isEqualityClass, isCTupleClass,
   getClassPredTys, getClassPredTys_maybe,
   classMethodTy, classMethodInstTy,
 
   -- Implicit parameters
-  isIPLikePred, hasIPSuperClasses, isIPTyCon, isIPClass,
+  isIPLikePred, mentionsIP, isIPTyCon, isIPClass,
   isCallStackTy, isCallStackPred, isCallStackPredTy,
+  isExceptionContextPred, isExceptionContextTy,
   isIPPred_maybe,
 
   -- Evidence variables
@@ -51,8 +52,6 @@ import GHC.Utils.Misc
 import GHC.Utils.Panic
 import GHC.Data.FastString
 
-import Control.Monad ( guard )
-
 -- | A predicate in the solver. The solver tries to prove Wanted predicates
 -- from Given ones.
 data Pred
@@ -68,13 +67,13 @@ data Pred
 
   -- | A quantified predicate.
   --
-  -- See Note [Quantified constraints] in GHC.Tc.Solver.Canonical
+  -- See Note [Quantified constraints] in GHC.Tc.Solver.Solve
   | ForAllPred [TyVar] [PredType] PredType
 
   -- NB: There is no TuplePred case
   --     Tuple predicates like (Eq a, Ord b) are just treated
   --     as ClassPred, as if we had a tuple class with two superclasses
-  --        class (c1, c2) => (%,%) c1 c2
+  --        class (c1, c2) => CTuple2 c1 c2
 
 classifyPredType :: PredType -> Pred
 classifyPredType ev_ty = case splitTyConApp_maybe ev_ty of
@@ -207,7 +206,7 @@ Predicates on PredType
 {-
 Note [Evidence for quantified constraints]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-The superclass mechanism in GHC.Tc.Solver.Canonical.makeSuperClasses risks
+The superclass mechanism in GHC.Tc.Solver.Dict.makeSuperClasses risks
 taking a quantified constraint like
    (forall a. C a => a ~ b)
 and generate superclass evidence
@@ -216,7 +215,7 @@ and generate superclass evidence
 This is a funny thing: neither isPredTy nor isCoVarType are true
 of it.  So we are careful not to generate it in the first place:
 see Note [Equality superclasses in quantified constraints]
-in GHC.Tc.Solver.Canonical.
+in GHC.Tc.Solver.Dict.
 -}
 
 isEvVarType :: Type -> Bool
@@ -226,26 +225,31 @@ isEvVarType :: Type -> Bool
 -- See Note [Evidence for quantified constraints]
 isEvVarType ty = isCoVarType ty || isPredTy ty
 
-isEqPredClass :: Class -> Bool
--- True of (~) and (~~)
-isEqPredClass cls =  cls `hasKey` eqTyConKey
-                  || cls `hasKey` heqTyConKey
-
-isClassPred, isEqPred, isEqPrimPred :: PredType -> Bool
+isClassPred :: PredType -> Bool
 isClassPred ty = case tyConAppTyCon_maybe ty of
-    Just tyCon | isClassTyCon tyCon -> True
-    _                               -> False
+    Just tc -> isClassTyCon tc
+    _       -> False
 
+isEqPred :: PredType -> Bool
 isEqPred ty  -- True of (a ~ b) and (a ~~ b)
              -- ToDo: should we check saturation?
   | Just tc <- tyConAppTyCon_maybe ty
   , Just cls <- tyConClass_maybe tc
-  = isEqPredClass cls
+  = isEqualityClass cls
   | otherwise
   = False
 
+isEqPrimPred :: PredType -> Bool
 isEqPrimPred ty = isCoVarType ty
   -- True of (a ~# b) (a ~R# b)
+
+isEqualityClass :: Class -> Bool
+-- True of (~), (~~), and Coercible
+-- These all have a single primitive-equality superclass, either (~N# or ~R#)
+isEqualityClass cls
+  = cls `hasKey` heqTyConKey
+    || cls `hasKey` eqTyConKey
+    || cls `hasKey` coercibleTyConKey
 
 isCTupleClass :: Class -> Bool
 isCTupleClass cls = isTupleTyCon (classTyCon cls)
@@ -263,39 +267,37 @@ isIPTyCon tc = tc `hasKey` ipClassKey
 isIPClass :: Class -> Bool
 isIPClass cls = cls `hasKey` ipClassKey
 
-isIPLikePred :: Type -> Bool
--- See Note [Local implicit parameters]
-isIPLikePred = is_ip_like_pred initIPRecTc
-
-
-is_ip_like_pred :: RecTcChecker -> Type -> Bool
-is_ip_like_pred rec_clss ty
-  | Just (tc, tys) <- splitTyConApp_maybe ty
-  , Just rec_clss' <- if isTupleTyCon tc  -- Tuples never cause recursion
-                      then Just rec_clss
-                      else checkRecTc rec_clss tc
-  , Just cls       <- tyConClass_maybe tc
-  = isIPClass cls || has_ip_super_classes rec_clss' cls tys
-
+-- | Decomposes a predicate if it is an implicit parameter. Does not look in
+-- superclasses. See also [Local implicit parameters].
+isIPPred_maybe :: Class -> [Type] -> Maybe (Type, Type)
+isIPPred_maybe cls tys
+  | isIPClass cls
+  , [t1,t2] <- tys
+  = Just (t1,t2)
   | otherwise
-  = False -- Includes things like (D []) where D is
-          -- a Constraint-ranged family; #7785
+  = Nothing
 
-hasIPSuperClasses :: Class -> [Type] -> Bool
--- See Note [Local implicit parameters]
-hasIPSuperClasses = has_ip_super_classes initIPRecTc
+-- --------------------- ExceptionContext predicates --------------------------
 
-has_ip_super_classes :: RecTcChecker -> Class -> [Type] -> Bool
-has_ip_super_classes rec_clss cls tys
-  = any ip_ish (classSCSelIds cls)
-  where
-    -- Check that the type of a superclass determines its value
-    -- sc_sel_id :: forall a b. C a b -> <superclass type>
-    ip_ish sc_sel_id = is_ip_like_pred rec_clss $
-                       classMethodInstTy sc_sel_id tys
+-- | Is a 'PredType' an @ExceptionContext@ implicit parameter?
+--
+-- If so, return the name of the parameter.
+isExceptionContextPred :: Class -> [Type] -> Maybe FastString
+isExceptionContextPred cls tys
+  | [ty1, ty2] <- tys
+  , isIPClass cls
+  , isExceptionContextTy ty2
+  = isStrLitTy ty1
+  | otherwise
+  = Nothing
 
-initIPRecTc :: RecTcChecker
-initIPRecTc = setRecTcMaxBound 1 initRecTc
+-- | Is a type an 'ExceptionContext'?
+isExceptionContextTy :: Type -> Bool
+isExceptionContextTy ty
+  | Just tc <- tyConAppTyCon_maybe ty
+  = tc `hasKey` exceptionContextTyConKey
+  | otherwise
+  = False
 
 -- --------------------- CallStack predicates ---------------------------------
 
@@ -329,18 +331,56 @@ isCallStackTy ty
   | otherwise
   = False
 
+-- --------------------- isIPLike and mentionsIP  --------------------------
+--                 See Note [Local implicit parameters]
 
--- | Decomposes a predicate if it is an implicit parameter. Does not look in
--- superclasses. See also [Local implicit parameters].
-isIPPred_maybe :: Type -> Maybe (FastString, Type)
-isIPPred_maybe ty =
-  do (tc,[t1,t2]) <- splitTyConApp_maybe ty
-     guard (isIPTyCon tc)
-     x <- isStrLitTy t1
-     return (x,t2)
+isIPLikePred :: Type -> Bool
+-- Is `pred`, or any of its superclasses, an implicit parameter?
+-- See Note [Local implicit parameters]
+isIPLikePred pred =
+  mentions_ip_pred initIPRecTc (const True) (const True) pred
+
+mentionsIP :: (Type -> Bool) -- ^ predicate on the string
+           -> (Type -> Bool) -- ^ predicate on the type
+           -> Class
+           -> [Type] -> Bool
+-- ^ @'mentionsIP' str_cond ty_cond cls tys@ returns @True@ if:
+--
+--    - @cls tys@ is of the form @IP str ty@, where @str_cond str@ and @ty_cond ty@
+--      are both @True@,
+--    - or any superclass of @cls tys@ has this property.
+--
+-- See Note [Local implicit parameters]
+mentionsIP = mentions_ip initIPRecTc
+
+mentions_ip :: RecTcChecker -> (Type -> Bool) -> (Type -> Bool) -> Class -> [Type] -> Bool
+mentions_ip rec_clss str_cond ty_cond cls tys
+  | Just (str_ty, ty) <- isIPPred_maybe cls tys
+  = str_cond str_ty && ty_cond ty
+  | otherwise
+  = or [ mentions_ip_pred rec_clss str_cond ty_cond (classMethodInstTy sc_sel_id tys)
+       | sc_sel_id <- classSCSelIds cls ]
+
+
+mentions_ip_pred :: RecTcChecker -> (Type -> Bool) -> (Type -> Bool) -> Type -> Bool
+mentions_ip_pred rec_clss str_cond ty_cond ty
+  | Just (cls, tys) <- getClassPredTys_maybe ty
+  , let tc = classTyCon cls
+  , Just rec_clss' <- if isTupleTyCon tc then Just rec_clss
+                      else checkRecTc rec_clss tc
+  = mentions_ip rec_clss' str_cond ty_cond cls tys
+  | otherwise
+  = False -- Includes things like (D []) where D is
+          -- a Constraint-ranged family; #7785
+
+initIPRecTc :: RecTcChecker
+initIPRecTc = setRecTcMaxBound 1 initRecTc
 
 {- Note [Local implicit parameters]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+See also wrinkle (SIP1) in Note [Shadowing of implicit parameters] in
+GHC.Tc.Solver.Dict.
+
 The function isIPLikePred tells if this predicate, or any of its
 superclasses, is an implicit parameter.
 
@@ -395,7 +435,38 @@ Small worries (Sept 20):
 * The superclass hunt stops when it encounters the same class again,
   but in principle we could have the same class, differently instantiated,
   and the second time it could have an implicit parameter
-I'm going to treat these as problems for another day. They are all exotic.  -}
+I'm going to treat these as problems for another day. They are all exotic.
+
+Note [Using typesAreApart when calling mentionsIP]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+We call 'mentionsIP' in two situations:
+
+  (1) to check that a predicate does not contain any implicit parameters
+      IP str ty, for a fixed literal str and any type ty,
+  (2) to check that a predicate does not contain any HasCallStack or
+      HasExceptionContext constraints.
+
+In both of these cases, we want to be sure, so we should be conservative:
+
+  For (1), the predicate might contain an implicit parameter IP Str a, where
+  Str is a type family such as:
+
+    type family MyStr where MyStr = "abc"
+
+  To safeguard against this (niche) situation, instead of doing a simple
+  type equality check, we use 'typesAreApart'. This allows us to recognise
+  that 'IP MyStr a' contains an implicit parameter of the form 'IP "abc" ty'.
+
+  For (2), we similarly might have
+
+    type family MyCallStack where MyCallStack = CallStack
+
+  Again, here we use 'typesAreApart'. This allows us to see that
+
+    (?foo :: MyCallStack)
+
+  is indeed a CallStack constraint, hidden under a type family.
+-}
 
 {- *********************************************************************
 *                                                                      *

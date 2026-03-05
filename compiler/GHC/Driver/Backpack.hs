@@ -90,6 +90,7 @@ import Data.IORef
 import Data.Map (Map)
 import qualified Data.Map as Map
 import qualified Data.Set as Set
+import GHC.Types.Error (mkUnknownDiagnostic)
 
 -- | Entry point to compile a Backpack file.
 doBackpack :: [FilePath] -> Ghc ()
@@ -108,7 +109,7 @@ doBackpack [src_filename] = do
     liftIO $ checkProcessArgsResult unhandled_flags
     let print_config = initPrintConfig dflags
     liftIO $ printOrThrowDiagnostics logger print_config (initDiagOpts dflags) (GhcPsMessage <$> p_warns)
-    liftIO $ handleFlagWarnings logger print_config (initDiagOpts dflags) warns
+    liftIO $ printOrThrowDiagnostics logger print_config (initDiagOpts dflags) (GhcDriverMessage <$> warns)
     -- TODO: Preprocessing not implemented
 
     buf <- liftIO $ hGetStringBuffer src_filename
@@ -139,9 +140,9 @@ computeUnitId (L _ unit) = (cid, [ (r, mkHoleModule r) | r <- reqs ])
   where
     cid = hsComponentId (unLoc (hsunitName unit))
     reqs = uniqDSetToList (unionManyUniqDSets (map (get_reqs . unLoc) (hsunitBody unit)))
-    get_reqs (DeclD HsigFile (L _ modname) _) = unitUniqDSet modname
     get_reqs (DeclD HsSrcFile _ _) = emptyUniqDSet
     get_reqs (DeclD HsBootFile _ _) = emptyUniqDSet
+    get_reqs (DeclD HsigFile (L _ modname) _) = unitUniqDSet modname
     get_reqs (IncludeD (IncludeDecl (L _ hsuid) _ _)) =
         unitFreeModuleHoles (convertHsComponentId hsuid)
 
@@ -329,7 +330,7 @@ buildUnit session cid insts lunit = do
         mod_graph <- hsunitModuleGraph False (unLoc lunit)
 
         msg <- mkBackpackMsg
-        ok <- load' noIfaceCache LoadAllTargets (Just msg) mod_graph
+        ok <- load' noIfaceCache LoadAllTargets mkUnknownDiagnostic (Just msg) mod_graph
         when (failed ok) (liftIO $ exitWith (ExitFailure 1))
 
         let hi_dir = expectJust (panic "hiDir Backpack") $ hiDir dflags
@@ -418,7 +419,7 @@ compileExe lunit = do
     withBkpExeSession deps_w_rns $ do
         mod_graph <- hsunitModuleGraph True (unLoc lunit)
         msg <- mkBackpackMsg
-        ok <- load' noIfaceCache LoadAllTargets (Just msg) mod_graph
+        ok <- load' noIfaceCache LoadAllTargets mkUnknownDiagnostic (Just msg) mod_graph
         when (failed ok) (liftIO $ exitWith (ExitFailure 1))
 
 -- | Register a new virtual unit database containing a single unit
@@ -800,7 +801,7 @@ summariseRequirement pn mod_name = do
                 hpm_module = L loc (HsModule {
                         hsmodExt = XModulePs {
                             hsmodAnn = noAnn,
-                            hsmodLayout = NoLayoutInfo,
+                            hsmodLayout = EpNoLayout,
                             hsmodDeprecMessage = Nothing,
                             hsmodHaddockModHeader = Nothing
                                              },
@@ -857,9 +858,9 @@ hsModuleToModSummary home_keys pn hsc_src modname
                              (unpackFS unit_fs </>
                               moduleNameSlashes modname)
                               (case hsc_src of
-                                HsigFile -> "hsig"
+                                HsigFile   -> "hsig"
                                 HsBootFile -> "hs-boot"
-                                HsSrcFile -> "hs")
+                                HsSrcFile  -> "hs")
     -- DANGEROUS: bootifying can POISON the module finder cache
     let location = case hsc_src of
                         HsBootFile -> addBootSuffixLocnOut location0

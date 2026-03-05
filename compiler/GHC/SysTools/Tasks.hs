@@ -10,16 +10,13 @@
 module GHC.SysTools.Tasks where
 
 import GHC.Prelude
-import GHC.Platform
 import GHC.ForeignSrcLang
-import GHC.IO (catchException)
 
-import GHC.CmmToLlvm.Config (LlvmVersion, llvmVersionStr, supportedLlvmVersionUpperBound, parseLlvmVersion, supportedLlvmVersionLowerBound)
+import GHC.CmmToLlvm.Version (LlvmVersion, llvmVersionStr, supportedLlvmVersionUpperBound, parseLlvmVersion, supportedLlvmVersionLowerBound)
 
 import GHC.Settings
 
 import GHC.SysTools.Process
-import GHC.SysTools.Info
 
 import GHC.Driver.Session
 
@@ -29,7 +26,6 @@ import GHC.Utils.Outputable
 import GHC.Utils.Misc
 import GHC.Utils.Logger
 import GHC.Utils.TmpFs
-import GHC.Utils.Constants (isWindowsHost)
 import GHC.Utils.Panic
 
 import Data.List (tails, isPrefixOf)
@@ -61,38 +57,9 @@ augmentImports _ [x] = [x]
 augmentImports dflags ("-include":fp:fps) = "-include" : augmentByWorkingDirectory dflags fp  : augmentImports dflags fps
 augmentImports dflags (fp1: fp2: fps) = fp1 : augmentImports dflags (fp2:fps)
 
-runCpp :: Logger -> DynFlags -> [Option] -> IO ()
-runCpp logger dflags args = traceSystoolCommand logger "cpp" $ do
-  let opts = getOpts dflags opt_P
-      modified_imports = augmentImports dflags opts
-  let (p,args0) = pgm_P dflags
-      args1 = map Option modified_imports
-      args2 = [Option "-Werror" | gopt Opt_WarnIsError dflags]
-                ++ [Option "-Wundef" | wopt Opt_WarnCPPUndef dflags]
-  mb_env <- getGccEnv args2
-  runSomethingFiltered logger id  "C pre-processor" p
-                       (args0 ++ args1 ++ args2 ++ args) Nothing mb_env
-
-runPp :: Logger -> DynFlags -> [Option] -> IO ()
-runPp logger dflags args = traceSystoolCommand logger "pp" $ do
-  let prog = pgm_F dflags
-      opts = map Option (getOpts dflags opt_F)
-  runSomething logger "Haskell pre-processor" prog (args ++ opts)
-
--- | Run compiler of C-like languages and raw objects (such as gcc or clang).
-runCc :: Maybe ForeignSrcLang -> Logger -> TmpFs -> DynFlags -> [Option] -> IO ()
-runCc mLanguage logger tmpfs dflags args = traceSystoolCommand logger "cc" $ do
-  let args1 = map Option userOpts
-      args2 = languageOptions ++ args ++ args1
-      -- We take care to pass -optc flags in args1 last to ensure that the
-      -- user can override flags passed by GHC. See #14452.
-  mb_env <- getGccEnv args2
-  runSomethingResponseFile logger tmpfs dflags cc_filter dbgstring prog args2
-                           mb_env
- where
-  -- discard some harmless warnings from gcc that we can't turn off
-  cc_filter = unlines . doFilter . lines
-
+-- | Discard some harmless warnings from gcc that we can't turn off
+cc_filter :: String -> String
+cc_filter = unlines . doFilter . lines where
   {-
   gcc gives warnings in chunks like so:
       In file included from /foo/bar/baz.h:11,
@@ -140,6 +107,92 @@ runCc mLanguage logger tmpfs dflags args = traceSystoolCommand logger "cc" $ do
    | "warning: call-clobbered register used" `isContainedIn` w = False
    | otherwise = True
 
+-- | See the Note [Preprocessing invocations]
+data SourceCodePreprocessor
+  = SCPCpp
+    -- ^ Use the ordinary C preprocessor
+  | SCPHsCpp
+    -- ^ Use the Haskell C preprocessor (don't remove C comments, don't break on names including single quotes)
+  | SCPJsCpp
+    -- ^ Use the JavaScript preprocessor (don't remove jsdoc and multiline comments)
+  | SCPCmmCpp
+    -- ^ Use the C-- preprocessor (don't emit debug information)
+  deriving (Eq)
+
+-- | Run source code preprocessor.
+-- See also Note [Preprocessing invocations] in GHC.SysTools.Cpp
+runSourceCodePreprocessor
+  :: Logger
+  -> TmpFs
+  -> DynFlags
+  -> SourceCodePreprocessor
+  -> [Option]
+  -> IO ()
+runSourceCodePreprocessor logger tmpfs dflags preprocessor args =
+  traceSystoolCommand logger logger_name $ do
+    let
+      (p, args0) = pgm_getter dflags
+      args1 = Option <$> (augmentImports dflags $ getOpts dflags opt_getter)
+      args2 = [Option "-Werror" | gopt Opt_WarnIsError dflags]
+                ++ [Option "-Wundef" | wopt Opt_WarnCPPUndef dflags]
+      all_args = args0 ++ args1 ++ args2 ++ args
+
+    mb_env <- getGccEnv (args0 ++ args1)
+
+    runSomething readable_name p all_args mb_env
+
+  where
+    toolSettings' = toolSettings dflags
+    cmmG0 = ["-g0" | toolSettings_cmmCppSupportsG0 toolSettings']
+    -- GCC <=10 (pre commit r11-5596-g934a54180541d2) implied -dD for debug
+    -- flags by the spec snippet %{g3|ggdb3|gstabs3|gxcoff3|gvms3:-dD}.  This
+    -- means that a g0 will not override a previously-specified -g3 causing
+    -- debug info emission (see https://gcc.gnu.org/PR97989).  We're filtering
+    -- -optc here, rather than the combined command line, in order to avoid an
+    -- issue where a user has to, for some reason, override our decision.  If
+    -- they see the need to do that, they can pass -optCmmP.
+    g3Flags = ["-g3", "-ggdb3", "-gstabs3", "-gxcoff3", "-gvms3"]
+    optCFiltered = filter (`notElem` g3Flags) . opt_c
+    -- In the wild (and GHC), there is lots of code assuming that -optc gets
+    -- passed to the C-- preprocessor too.  Note that the arguments are
+    -- reversed by getOpts.
+    cAndCmmOpt dflags =  opt_CmmP dflags ++ cmmG0 ++ optCFiltered dflags
+    (logger_name, pgm_getter, opt_getter, readable_name)
+      = case preprocessor of
+        SCPCpp -> ("cpp", pgm_cpp, opt_c, "C pre-processor")
+        SCPHsCpp -> ("hs-cpp", pgm_P, opt_P, "Haskell C pre-processor")
+        SCPJsCpp -> ("js-cpp", pgm_JSP, opt_JSP, "JavaScript C pre-processor")
+        SCPCmmCpp -> ("cmm-cpp", pgm_CmmP, cAndCmmOpt, "C-- C pre-processor")
+
+    runSomethingResponseFileCpp
+      = runSomethingResponseFile logger tmpfs (tmpDir dflags) cc_filter
+    runSomethingFilteredOther phase_name pgm args mb_env
+      = runSomethingFiltered logger id phase_name pgm args Nothing mb_env
+
+    runSomething
+      = case preprocessor of
+        SCPCpp -> runSomethingResponseFileCpp
+        SCPHsCpp -> runSomethingFilteredOther
+        SCPJsCpp -> runSomethingFilteredOther
+        SCPCmmCpp -> runSomethingResponseFileCpp
+
+runPp :: Logger -> DynFlags -> [Option] -> IO ()
+runPp logger dflags args = traceSystoolCommand logger "pp" $ do
+  let prog = pgm_F dflags
+      opts = map Option (getOpts dflags opt_F)
+  runSomething logger "Haskell pre-processor" prog (args ++ opts)
+
+-- | Run compiler of C-like languages and raw objects (such as gcc or clang).
+runCc :: Maybe ForeignSrcLang -> Logger -> TmpFs -> DynFlags -> [Option] -> IO ()
+runCc mLanguage logger tmpfs dflags args = traceSystoolCommand logger "cc" $ do
+  let args1 = map Option userOpts
+      args2 = languageOptions ++ args ++ args1
+      -- We take care to pass -optc flags in args1 last to ensure that the
+      -- user can override flags passed by GHC. See #14452.
+  mb_env <- getGccEnv args2
+  runSomethingResponseFile logger tmpfs (tmpDir dflags) cc_filter dbgstring prog args2
+                           mb_env
+ where
   -- force the C compiler to interpret this file as C when
   -- compiling .hc files, by adding the -x c option.
   -- Also useful for plain .c files, just in case GHC saw a
@@ -205,27 +258,13 @@ runLlvmLlc logger dflags args = traceSystoolCommand logger "llc" $ do
       args1 = map Option (getOpts dflags opt_lc)
   runSomething logger "LLVM Compiler" p (args0 ++ args1 ++ args)
 
--- | Run the clang compiler (used as an assembler for the LLVM
--- backend on OS X as LLVM doesn't support the OS X system
--- assembler)
-runClang :: Logger -> DynFlags -> [Option] -> IO ()
-runClang logger dflags args = traceSystoolCommand logger "clang" $ do
-  let (clang,_) = pgm_lcc dflags
-      -- be careful what options we call clang with
-      -- see #5903 and #7617 for bugs caused by this.
-      (_,args0) = pgm_a dflags
-      args1 = map Option (getOpts dflags opt_a)
-      args2 = args0 ++ args1 ++ args
-  mb_env <- getGccEnv args2
-  catchException
-    (runSomethingFiltered logger id "Clang (Assembler)" clang args2 Nothing mb_env)
-    (\(err :: SomeException) -> do
-        errorMsg logger $
-            text ("Error running clang! you need clang installed to use the" ++
-                  " LLVM backend") $+$
-            text "(or GHC tried to execute clang incorrectly)"
-        throwIO err
-    )
+-- | Run the LLVM Assembler
+runLlvmAs :: Logger -> DynFlags -> [Option] -> IO ()
+runLlvmAs logger dflags args = traceSystoolCommand logger "llvm-as" $ do
+  let (p,args0) = pgm_las dflags
+      args1 = map Option (getOpts dflags opt_las)
+  runSomething logger "LLVM assembler" p (args0 ++ args1 ++ args)
+
 
 runEmscripten :: Logger -> DynFlags -> [Option] -> IO ()
 runEmscripten logger dflags args = traceSystoolCommand logger "emcc" $ do
@@ -247,14 +286,17 @@ figureLlvmVersion logger dflags = traceSystoolCommand logger "llc" $ do
               (pin, pout, perr, p) <- runInteractiveProcess pgm args'
                                               Nothing Nothing
               {- > llc -version
-                  LLVM (http://llvm.org/):
-                    LLVM version 3.5.2
+                  <vendor> LLVM version 15.0.7
                     ...
+                  OR
+                  LLVM (http://llvm.org/):
+                    LLVM version 14.0.6
               -}
               hSetBinaryMode pout False
-              _     <- hGetLine pout
-              vline <- hGetLine pout
-              let mb_ver = parseLlvmVersion vline
+              line1 <- hGetLine pout
+              mb_ver <- case parseLlvmVersion line1 of
+                mb_ver@(Just _) -> return mb_ver
+                Nothing -> parseLlvmVersion <$> hGetLine pout -- Try the second line
               hClose pin
               hClose pout
               hClose perr
@@ -275,71 +317,6 @@ figureLlvmVersion logger dflags = traceSystoolCommand logger "llc" $ do
                                 ++ ")") ]
                 return Nothing)
 
-
-
-runLink :: Logger -> TmpFs -> DynFlags -> [Option] -> IO ()
-runLink logger tmpfs dflags args = traceSystoolCommand logger "linker" $ do
-  -- See Note [Run-time linker info]
-  --
-  -- `-optl` args come at the end, so that later `-l` options
-  -- given there manually can fill in symbols needed by
-  -- Haskell libraries coming in via `args`.
-  linkargs <- neededLinkArgs `fmap` getLinkerInfo logger dflags
-  let (p,args0) = pgm_l dflags
-      optl_args = map Option (getOpts dflags opt_l)
-      args2     = args0 ++ linkargs ++ args ++ optl_args
-  mb_env <- getGccEnv args2
-  runSomethingResponseFile logger tmpfs dflags ld_filter "Linker" p args2 mb_env
-  where
-    ld_filter = case (platformOS (targetPlatform dflags)) of
-                  OSSolaris2 -> sunos_ld_filter
-                  _ -> id
-{-
-  SunOS/Solaris ld emits harmless warning messages about unresolved
-  symbols in case of compiling into shared library when we do not
-  link against all the required libs. That is the case of GHC which
-  does not link against RTS library explicitly in order to be able to
-  choose the library later based on binary application linking
-  parameters. The warnings look like:
-
-Undefined                       first referenced
-  symbol                             in file
-stg_ap_n_fast                       ./T2386_Lib.o
-stg_upd_frame_info                  ./T2386_Lib.o
-templatezmhaskell_LanguageziHaskellziTHziLib_litE_closure ./T2386_Lib.o
-templatezmhaskell_LanguageziHaskellziTHziLib_appE_closure ./T2386_Lib.o
-templatezmhaskell_LanguageziHaskellziTHziLib_conE_closure ./T2386_Lib.o
-templatezmhaskell_LanguageziHaskellziTHziSyntax_mkNameGzud_closure ./T2386_Lib.o
-newCAF                              ./T2386_Lib.o
-stg_bh_upd_frame_info               ./T2386_Lib.o
-stg_ap_ppp_fast                     ./T2386_Lib.o
-templatezmhaskell_LanguageziHaskellziTHziLib_stringL_closure ./T2386_Lib.o
-stg_ap_p_fast                       ./T2386_Lib.o
-stg_ap_pp_fast                      ./T2386_Lib.o
-ld: warning: symbol referencing errors
-
-  this is actually coming from T2386 testcase. The emitting of those
-  warnings is also a reason why so many TH testcases fail on Solaris.
-
-  Following filter code is SunOS/Solaris linker specific and should
-  filter out only linker warnings. Please note that the logic is a
-  little bit more complex due to the simple reason that we need to preserve
-  any other linker emitted messages. If there are any. Simply speaking
-  if we see "Undefined" and later "ld: warning:..." then we omit all
-  text between (including) the marks. Otherwise we copy the whole output.
--}
-    sunos_ld_filter :: String -> String
-    sunos_ld_filter = unlines . sunos_ld_filter' . lines
-    sunos_ld_filter' x = if (undefined_found x && ld_warning_found x)
-                          then (ld_prefix x) ++ (ld_postfix x)
-                          else x
-    breakStartsWith x y = break (isPrefixOf x) y
-    ld_prefix = fst . breakStartsWith "Undefined"
-    undefined_found = not . null . snd . breakStartsWith "Undefined"
-    ld_warn_break = breakStartsWith "ld: warning: symbol referencing errors"
-    ld_postfix = tail . snd . ld_warn_break
-    ld_warning_found = not . null . snd . ld_warn_break
-
 -- See Note [Merging object files for GHCi] in GHC.Driver.Pipeline.
 runMergeObjects :: Logger -> TmpFs -> DynFlags -> [Option] -> IO ()
 runMergeObjects logger tmpfs dflags args =
@@ -350,12 +327,10 @@ runMergeObjects logger tmpfs dflags args =
             , "does not support object merging." ]
         optl_args = map Option (getOpts dflags opt_lm)
         args2     = args0 ++ args ++ optl_args
-    -- N.B. Darwin's ld64 doesn't support response files. Consequently we only
-    -- use them on Windows where they are truly necessary.
-    if isWindowsHost
+    if toolSettings_mergeObjsSupportsResponseFiles (toolSettings dflags)
       then do
         mb_env <- getGccEnv args2
-        runSomethingResponseFile logger tmpfs dflags id "Merge objects" p args2 mb_env
+        runSomethingResponseFile logger tmpfs (tmpDir dflags) id "Merge objects" p args2 mb_env
       else do
         runSomething logger "Merge objects" p args2
 
@@ -388,6 +363,3 @@ runWindres logger dflags args = traceSystoolCommand logger "windres" $ do
   mb_env <- getGccEnv cc_args
   runSomethingFiltered logger id "Windres" windres (opts ++ args) Nothing mb_env
 
-touch :: Logger -> DynFlags -> String -> String -> IO ()
-touch logger dflags purpose arg = traceSystoolCommand logger "touch" $
-  runSomething logger purpose (pgm_T dflags) [FileOption "" arg]

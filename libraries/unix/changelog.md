@@ -1,5 +1,24 @@
 # Changelog for [`unix` package](http://hackage.haskell.org/package/unix)
 
+## 2.8.7.0 *May 2025*
+
+  * Add portable support for file open with data caching supressed/eliminated wrt [#322](https://github.com/haskell/unix/issues/322)
+  * Support for ARM64 Windows when cross-compilation from Linux/Darwin or other unix system is involved
+  * Use `Base.o_*` instead of raw `{#const O_*}`, fixing a bug in GHC JS
+
+## 2.8.6.0 *Nov 2024*
+
+  * add `readDirStreamWith` and `readDirStreamWithPtr` to `System.Posix.Directory.Internals` wrt [#251](https://github.com/haskell/unix/pull/251)
+  * Fix CTimeVal definition for platforms where time_t isn't CLong, wrt [#252](https://github.com/haskell/unix/pull/252)
+
+## 2.8.5.1 *Apr 2024*
+
+  * fix building with newer filepath/os-string when `#ifndef HAVE_OPENPTY`
+
+## 2.8.5.0 *Dec 2023*
+
+  * allow building with newer filepath/os-string
+
 ## 2.8.4.0 *Dec 2023*
 
   * add `haveStatx`

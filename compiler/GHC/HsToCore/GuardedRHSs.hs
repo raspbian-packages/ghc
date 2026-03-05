@@ -28,7 +28,6 @@ import GHC.Utils.Misc
 import GHC.Types.SrcLoc
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
-import GHC.Utils.Panic.Plain
 import GHC.Core.Multiplicity
 import Control.Monad ( zipWithM )
 import Data.List.NonEmpty ( NonEmpty, toList )
@@ -55,7 +54,7 @@ dsGuarded grhss rhs_ty rhss_nablas = do
 
 -- In contrast, @dsGRHSs@ produces a @MatchResult CoreExpr@.
 
-dsGRHSs :: HsMatchContext GhcRn
+dsGRHSs :: HsMatchContextRn
         -> GRHSs GhcTc (LHsExpr GhcTc) -- ^ Guarded RHSs
         -> Type                        -- ^ Type of RHS
         -> NonEmpty Nablas             -- ^ Refined pattern match checking
@@ -76,10 +75,11 @@ dsGRHSs hs_ctx (GRHSs _ grhss binds) rhs_ty rhss_nablas
                              -- NB: nested dsLet inside matchResult
        ; return match_result2 }
 
-dsGRHS :: HsMatchContext GhcRn -> Type -> Nablas -> LGRHS GhcTc (LHsExpr GhcTc)
+dsGRHS :: HsMatchContextRn -> Type -> Nablas -> LGRHS GhcTc (LHsExpr GhcTc)
        -> DsM (MatchResult CoreExpr)
 dsGRHS hs_ctx rhs_ty rhs_nablas (L _ (GRHS _ guards rhs))
-  = matchGuards (map unLoc guards) (PatGuard hs_ctx) rhs_nablas rhs rhs_ty
+  = updPmNablas rhs_nablas $
+      matchGuards (map unLoc guards) hs_ctx rhs rhs_ty
 
 {-
 ************************************************************************
@@ -90,8 +90,7 @@ dsGRHS hs_ctx rhs_ty rhs_nablas (L _ (GRHS _ guards rhs))
 -}
 
 matchGuards :: [GuardStmt GhcTc]     -- Guard
-            -> HsStmtContext GhcRn   -- Context
-            -> Nablas                -- The RHS's covered set for PmCheck
+            -> HsMatchContextRn      -- Context
             -> LHsExpr GhcTc         -- RHS
             -> Type                  -- Type of RHS of guard
             -> DsM (MatchResult CoreExpr)
@@ -99,8 +98,8 @@ matchGuards :: [GuardStmt GhcTc]     -- Guard
 -- See comments with HsExpr.Stmt re what a BodyStmt means
 -- Here we must be in a guard context (not do-expression, nor list-comp)
 
-matchGuards [] _ nablas rhs _
-  = do  { core_rhs <- updPmNablas nablas (dsLExpr rhs)
+matchGuards [] _ rhs _
+  = do  { core_rhs <- dsLExpr rhs
         ; return (cantFailMatchResult core_rhs) }
 
         -- BodyStmts must be guards
@@ -110,41 +109,50 @@ matchGuards [] _ nablas rhs _
         -- NB:  The success of this clause depends on the typechecker not
         --      wrapping the 'otherwise' in empty HsTyApp or HsWrap constructors
         --      If it does, you'll get bogus overlap warnings
-matchGuards (BodyStmt _ e _ _ : stmts) ctx nablas rhs rhs_ty
+matchGuards (BodyStmt _ e _ _ : stmts) ctx rhs rhs_ty
   | Just addTicks <- isTrueLHsExpr e = do
-    match_result <- matchGuards stmts ctx nablas rhs rhs_ty
+    match_result <- matchGuards stmts ctx rhs rhs_ty
     return (adjustMatchResultDs addTicks match_result)
-matchGuards (BodyStmt _ expr _ _ : stmts) ctx nablas rhs rhs_ty = do
-    match_result <- matchGuards stmts ctx nablas rhs rhs_ty
+matchGuards (BodyStmt _ expr _ _ : stmts) ctx rhs rhs_ty = do
+    match_result <- matchGuards stmts ctx rhs rhs_ty
     pred_expr <- dsLExpr expr
     return (mkGuardedMatchResult pred_expr match_result)
 
-matchGuards (LetStmt _ binds : stmts) ctx nablas rhs rhs_ty = do
-    match_result <- matchGuards stmts ctx nablas rhs rhs_ty
-    return (adjustMatchResultDs (dsLocalBinds binds) match_result)
+matchGuards (LetStmt _ binds : stmts) ctx rhs rhs_ty = do
+    ldi_nablas <- getPmNablas
+    match_result <- matchGuards stmts ctx rhs rhs_ty
+      -- Propagate long-distance information when desugaring let bindings, e.g.
+      --
+      --  f r@(K1 {})
+      --    | let g = fld r
+      --    = g
+      --
+      -- Failing to do so resulted in #25749.
+    return (adjustMatchResultDs (updPmNablas ldi_nablas . dsLocalBinds binds) match_result)
         -- NB the dsLet occurs inside the match_result
         -- Reason: dsLet takes the body expression as its argument
         --         so we can't desugar the bindings without the
         --         body expression in hand
 
-matchGuards (BindStmt _ pat bind_rhs : stmts) ctx nablas rhs rhs_ty = do
+matchGuards (BindStmt _ pat bind_rhs : stmts) ctx rhs rhs_ty = do
     let upat = unLoc pat
     match_var <- selectMatchVar ManyTy upat
-       -- We only allow unrestricted patterns in guard, hence the `Many`
+       -- We only allow unrestricted patterns in guards, hence the `Many`
        -- above. It isn't clear what linear patterns would mean, maybe we will
        -- figure it out in the future.
 
-    match_result <- matchGuards stmts ctx nablas rhs rhs_ty
+    match_result <- matchGuards stmts ctx rhs rhs_ty
     core_rhs <- dsLExpr bind_rhs
-    match_result' <- matchSinglePatVar match_var (Just core_rhs) (StmtCtxt ctx)
-                                       pat rhs_ty match_result
-    pure $ bindNonRec match_var core_rhs <$> match_result'
+    match_result' <-
+      matchSinglePatVar match_var (Just core_rhs) (StmtCtxt $ PatGuard ctx)
+      pat rhs_ty match_result
+    return $ bindNonRec match_var core_rhs <$> match_result'
 
-matchGuards (LastStmt  {} : _) _ _ _ _ = panic "matchGuards LastStmt"
-matchGuards (ParStmt   {} : _) _ _ _ _ = panic "matchGuards ParStmt"
-matchGuards (TransStmt {} : _) _ _ _ _ = panic "matchGuards TransStmt"
-matchGuards (RecStmt   {} : _) _ _ _ _ = panic "matchGuards RecStmt"
-matchGuards (ApplicativeStmt {} : _) _ _ _ _ =
+matchGuards (LastStmt  {} : _) _ _ _ = panic "matchGuards LastStmt"
+matchGuards (ParStmt   {} : _) _ _ _ = panic "matchGuards ParStmt"
+matchGuards (TransStmt {} : _) _ _ _ = panic "matchGuards TransStmt"
+matchGuards (RecStmt   {} : _) _ _ _ = panic "matchGuards RecStmt"
+matchGuards (ApplicativeStmt {} : _) _ _ _ =
   panic "matchGuards ApplicativeLastStmt"
 
 {-

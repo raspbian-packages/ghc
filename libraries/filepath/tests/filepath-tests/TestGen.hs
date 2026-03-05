@@ -15,10 +15,10 @@ import GHC.IO.Encoding.Failure ( CodingFailureMode(..) )
 import GHC.IO.Encoding.UTF16 ( mkUTF16le )
 import GHC.IO.Encoding.UTF8 ( mkUTF8 )
 import System.OsString.Internal.Types
-import System.OsPath.Encoding.Internal
+import System.OsString.Encoding.Internal
 import qualified Data.Char as C
-import qualified System.OsPath.Data.ByteString.Short as SBS
-import qualified System.OsPath.Data.ByteString.Short.Word16 as SBS16
+import qualified System.OsString.Data.ByteString.Short as SBS
+import qualified System.OsString.Data.ByteString.Short.Word16 as SBS16
 import qualified System.FilePath.Windows as W
 import qualified System.FilePath.Posix as P
 import qualified System.OsPath.Windows as AFP_W
@@ -312,10 +312,6 @@ tests =
     ,("uncurry W.addExtension (W.splitExtensions x) == x", property $ \(QFilePathValidW x) -> uncurry W.addExtension (W.splitExtensions x) == x)
     ,("uncurry AFP_P.addExtension (AFP_P.splitExtensions x) == x", property $ \(QFilePathValidAFP_P x) -> uncurry AFP_P.addExtension (AFP_P.splitExtensions x) == x)
     ,("uncurry AFP_W.addExtension (AFP_W.splitExtensions x) == x", property $ \(QFilePathValidAFP_W x) -> uncurry AFP_W.addExtension (AFP_W.splitExtensions x) == x)
-    ,("P.splitExtensions \"file.tar.gz\" == (\"file\", \".tar.gz\")", property $ P.splitExtensions "file.tar.gz" == ("file", ".tar.gz"))
-    ,("W.splitExtensions \"file.tar.gz\" == (\"file\", \".tar.gz\")", property $ W.splitExtensions "file.tar.gz" == ("file", ".tar.gz"))
-    ,("AFP_P.splitExtensions (\"file.tar.gz\") == ((\"file\"), (\".tar.gz\"))", property $ AFP_P.splitExtensions ("file.tar.gz") == (("file"), (".tar.gz")))
-    ,("AFP_W.splitExtensions (\"file.tar.gz\") == ((\"file\"), (\".tar.gz\"))", property $ AFP_W.splitExtensions ("file.tar.gz") == (("file"), (".tar.gz")))
     ,("P.dropExtensions \"/directory/path.ext\" == \"/directory/path\"", property $ P.dropExtensions "/directory/path.ext" == "/directory/path")
     ,("W.dropExtensions \"/directory/path.ext\" == \"/directory/path\"", property $ W.dropExtensions "/directory/path.ext" == "/directory/path")
     ,("AFP_P.dropExtensions (\"/directory/path.ext\") == (\"/directory/path\")", property $ AFP_P.dropExtensions ("/directory/path.ext") == ("/directory/path"))
@@ -476,6 +472,10 @@ tests =
     ,("W.dropFileName x == fst (W.splitFileName x)", property $ \(QFilePath x) -> W.dropFileName x == fst (W.splitFileName x))
     ,("AFP_P.dropFileName x == fst (AFP_P.splitFileName x)", property $ \(QFilePathAFP_P x) -> AFP_P.dropFileName x == fst (AFP_P.splitFileName x))
     ,("AFP_W.dropFileName x == fst (AFP_W.splitFileName x)", property $ \(QFilePathAFP_W x) -> AFP_W.dropFileName x == fst (AFP_W.splitFileName x))
+    ,("isPrefixOf (P.takeDrive x) (P.dropFileName x)", property $ \(QFilePath x) -> isPrefixOf (P.takeDrive x) (P.dropFileName x))
+    ,("isPrefixOf (W.takeDrive x) (W.dropFileName x)", property $ \(QFilePath x) -> isPrefixOf (W.takeDrive x) (W.dropFileName x))
+    ,("(\\(getPosixString -> x) (getPosixString -> y) -> SBS.isPrefixOf x y) (AFP_P.takeDrive x) (AFP_P.dropFileName x)", property $ \(QFilePathAFP_P x) -> (\(getPosixString -> x) (getPosixString -> y) -> SBS.isPrefixOf x y) (AFP_P.takeDrive x) (AFP_P.dropFileName x))
+    ,("(\\(getWindowsString -> x) (getWindowsString -> y) -> SBS16.isPrefixOf x y) (AFP_W.takeDrive x) (AFP_W.dropFileName x)", property $ \(QFilePathAFP_W x) -> (\(getWindowsString -> x) (getWindowsString -> y) -> SBS16.isPrefixOf x y) (AFP_W.takeDrive x) (AFP_W.dropFileName x))
     ,("P.takeFileName \"/directory/file.ext\" == \"file.ext\"", property $ P.takeFileName "/directory/file.ext" == "file.ext")
     ,("W.takeFileName \"/directory/file.ext\" == \"file.ext\"", property $ W.takeFileName "/directory/file.ext" == "file.ext")
     ,("AFP_P.takeFileName (\"/directory/file.ext\") == (\"file.ext\")", property $ AFP_P.takeFileName ("/directory/file.ext") == ("file.ext"))

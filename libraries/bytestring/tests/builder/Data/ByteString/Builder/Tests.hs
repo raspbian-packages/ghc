@@ -1,8 +1,3 @@
-{-# LANGUAGE BangPatterns     #-}
-{-# LANGUAGE MagicHash        #-}
-{-# LANGUAGE CPP              #-}
-{-# OPTIONS_GHC -fno-warn-orphans #-}
-
 -- |
 -- Copyright   : (c) 2011 Simon Meier
 -- License     : BSD3-style (see LICENSE)
@@ -23,14 +18,12 @@ import           Control.Monad.Trans.State (StateT, evalStateT, evalState, put, 
 import           Control.Monad.Trans.Class (lift)
 import           Control.Monad.Trans.Writer (WriterT, execWriterT, tell)
 
-import           Foreign (minusPtr)
+import           Foreign (minusPtr, castPtr, ForeignPtr, withForeignPtr, Int64)
 
 import           Data.Char (chr)
 import           Data.Bits ((.|.), shiftL)
 import           Data.Foldable
-#if !MIN_VERSION_base(4,11,0)
-import           Data.Semigroup
-#endif
+import           Data.Semigroup (Semigroup(..))
 import           Data.Word
 
 import qualified Data.ByteString          as S
@@ -47,7 +40,6 @@ import           Data.ByteString.Builder.Prim.TestUtils
 
 import           Control.Exception (evaluate)
 import           System.IO (openTempFile, hPutStr, hClose, hSetBinaryMode, hSetEncoding, utf8, hSetNewlineMode, noNewlineTranslation)
-import           Foreign (ForeignPtr, withForeignPtr, castPtr)
 import           Foreign.C.String (withCString)
 import           Numeric (showFFloat)
 import           System.Posix.Internals (c_unlink)
@@ -55,8 +47,12 @@ import           System.Posix.Internals (c_unlink)
 import           Test.Tasty (TestTree, TestName, testGroup)
 import           Test.Tasty.QuickCheck
                    ( Arbitrary(..), oneof, choose, listOf, elements
-                   , counterexample, ioProperty, UnicodeString(..), Property, testProperty
-                   , (===), (.&&.), conjoin )
+                   , counterexample, ioProperty, Property, testProperty
+                   , (===), (.&&.), conjoin, forAll, forAllShrink
+                   , UnicodeString(..), NonNegative(..), Positive(..)
+                   , mapSize, (==>)
+                   )
+import           QuickCheckUtils
 
 
 tests :: [TestTree]
@@ -67,13 +63,15 @@ tests =
   , testPut
   , testRunBuilder
   , testWriteFile
+  , testStimes
   ] ++
   testsEncodingToBuilder ++
   testsBinary ++
   testsASCII ++
   testsFloating ++
   testsChar8 ++
-  testsUtf8
+  testsUtf8 ++
+  [testLaziness]
 
 
 ------------------------------------------------------------------------------
@@ -199,6 +197,11 @@ testWriteFile =
             unless success (error msg)
             return success
 
+testStimes :: TestTree
+testStimes = testProperty "stimes" $
+  \(Sqrt (NonNegative n)) (Sqrt x) ->
+    stimes (n :: Int) x === toLazyByteString (stimes n (lazyByteString x))
+
 removeFile :: String -> IO ()
 removeFile fn = void $ withCString fn c_unlink
 
@@ -318,22 +321,6 @@ recipeComponents (Recipe how firstSize otherSize cont as) =
 
 -- 'Arbitary' instances
 -----------------------
-
-instance Arbitrary L.ByteString where
-    arbitrary = L.fromChunks <$> listOf arbitrary
-    shrink lbs
-      | L.null lbs = []
-      | otherwise = pure $ L.take (L.length lbs `div` 2) lbs
-
-instance Arbitrary S.ByteString where
-    arbitrary =
-        trim S.drop =<< trim S.take =<< S.pack <$> listOf arbitrary
-      where
-        trim f bs = oneof [pure bs, f <$> choose (0, S.length bs) <*> pure bs]
-
-    shrink bs
-      | S.null bs = []
-      | otherwise = pure $ S.take (S.length bs `div` 2) bs
 
 instance Arbitrary Mode where
     arbitrary = oneof
@@ -547,11 +534,18 @@ testBuilderConstr :: (Arbitrary a, Show a)
 testBuilderConstr name ref mkBuilder =
     testProperty name check
   where
-    check x =
-        (ws ++ ws) ==
-        (L.unpack $ toLazyByteString $ mkBuilder x `BI.append` mkBuilder x)
-      where
-        ws = ref x
+    check = int64OK $ \x ->
+            forAllShrink genPaddingAmount shrink $ \paddingAmount -> let
+      -- use padding to make sure we test at unaligned positions
+      ws = ref x
+      b1 = mkBuilder x
+      b2 = byteStringCopy (S.take paddingAmount padBuf) <> b1 <> b1
+      in (replicate paddingAmount (S.c2w ' ') ++ ws ++ ws) ===
+         (L.unpack $ toLazyByteString b2)
+
+    maxPaddingAmount = 15
+    padBuf = S.replicate maxPaddingAmount (S.c2w ' ')
+    genPaddingAmount = choose (0, maxPaddingAmount)
 
 
 testsBinary :: [TestTree]
@@ -987,4 +981,45 @@ testsUtf8 :: [TestTree]
 testsUtf8 =
   [ testBuilderConstr "charUtf8" charUtf8_list charUtf8
   , testBuilderConstr "stringUtf8" (foldMap charUtf8_list) stringUtf8
+  ]
+
+testLaziness :: TestTree
+testLaziness = testGroup "Builder laziness"
+  [ testProperty "byteString" $ mapSize (+ 10) $
+      \bs (Positive chunkSize) ->
+        let strategy = safeStrategy chunkSize chunkSize
+            lbs = toLazyByteStringWith strategy L.empty
+                    (byteString bs <> tooStrictErr)
+        in (S.length bs > max chunkSize 8) ==> L.head lbs == S.head bs
+  , testProperty "byteStringCopy" $ mapSize (+ 10) $
+      \bs (Positive chunkSize) ->
+        let strategy = safeStrategy chunkSize chunkSize
+            lbs = toLazyByteStringWith strategy L.empty
+                    (byteStringCopy bs <> tooStrictErr)
+        in (S.length bs > max chunkSize 8) ==> L.head lbs == S.head bs
+  , testProperty "byteStringInsert" $ mapSize (+ 10) $
+      \bs (Positive chunkSize) ->
+        let strategy = safeStrategy chunkSize chunkSize
+            lbs = toLazyByteStringWith strategy L.empty
+                    (byteStringInsert bs <> tooStrictErr)
+        in L.take (fromIntegral @Int @Int64 (S.length bs)) lbs
+           == L.fromStrict bs
+  , testProperty "lazyByteString" $ mapSize (+ 10) $
+      \bs (Positive chunkSize) ->
+        let strategy = safeStrategy chunkSize chunkSize
+            lbs = toLazyByteStringWith strategy L.empty
+                    (lazyByteString bs <> tooStrictErr)
+        in (L.length bs > fromIntegral @Int @Int64 (max chunkSize 8))
+              ==> L.head lbs == L.head bs
+  , testProperty "shortByteString" $ mapSize (+ 10) $
+      \bs (Positive chunkSize) ->
+        let strategy = safeStrategy chunkSize chunkSize
+            lbs = toLazyByteStringWith strategy L.empty
+                    (shortByteString bs <> tooStrictErr)
+        in (Sh.length bs > max chunkSize 8) ==> L.head lbs == Sh.head bs
+  , testProperty "flush" $ \recipe -> let
+      !(b, toLBS) = recipeComponents recipe
+      !lbs1 = toLazyByteString b
+      !lbs2 = L.take (L.length lbs1) (toLBS $ b <> flush <> tooStrictErr)
+      in lbs1 == lbs2
   ]

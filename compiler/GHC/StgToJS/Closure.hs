@@ -10,6 +10,15 @@ module GHC.StgToJS.Closure
   , assignClosure
   , CopyCC (..)
   , copyClosure
+  , mkClosure
+  -- $names
+  , allocData
+  , allocClsA
+  , dataName
+  , clsName
+  , dataFieldName
+  , varName
+  , jsClosureCount
   )
 where
 
@@ -18,16 +27,21 @@ import GHC.Data.FastString
 
 import GHC.StgToJS.Heap
 import GHC.StgToJS.Types
-import GHC.StgToJS.CoreUtils
+import GHC.StgToJS.Utils
 import GHC.StgToJS.Regs (stack,sp)
 
 import GHC.JS.Make
-import GHC.JS.Syntax
+import GHC.JS.JStg.Syntax
+import GHC.JS.JStg.Monad
+import GHC.JS.Ident
 
+import GHC.Types.Unique.Map
+
+import Data.Array
 import Data.Monoid
 import qualified Data.Bits as Bits
 
-closureInfoStat :: Bool -> ClosureInfo -> JStat
+closureInfoStat :: Bool -> ClosureInfo -> JStgStat
 closureInfoStat debug (ClosureInfo obj rs name layout ctype srefs)
   = setObjInfoL debug obj rs layout ty name tag srefs
       where
@@ -55,7 +69,7 @@ setObjInfoL :: Bool        -- ^ debug: output symbol names
             -> FastString  -- ^ object name, for printing
             -> Int         -- ^ `a' argument, depends on type (arity, conid)
             -> CIStatic    -- ^ static refs
-            -> JStat
+            -> JStgStat
 setObjInfoL debug obj rs layout t n a
   = setObjInfo debug obj t n field_types a size rs
       where
@@ -65,8 +79,9 @@ setObjInfoL debug obj rs layout t n a
           CILayoutFixed sz _ -> sz
         field_types = case layout of
           CILayoutVariable     -> []
-          CILayoutUnknown size -> toTypeList (replicate size ObjV)
-          CILayoutFixed _ fs   -> toTypeList fs
+          CILayoutUnknown size -> to_type_list (replicate size ObjV)
+          CILayoutFixed _ fs   -> to_type_list fs
+        to_type_list = concatMap (\x -> replicate (varSize x) (fromEnum x))
 
 setObjInfo :: Bool        -- ^ debug: output all symbol names
            -> Ident       -- ^ the thing to modify
@@ -77,7 +92,7 @@ setObjInfo :: Bool        -- ^ debug: output all symbol names
            -> Int         -- ^ object size, -1 (number of vars) for unknown
            -> CIRegs      -- ^ things in registers
            -> CIStatic    -- ^ static refs
-           -> JStat
+           -> JStgStat
 setObjInfo debug obj t name fields a size regs static
    | debug     = appS "h$setObjInfo" [ toJExpr obj
                                      , toJExpr t
@@ -98,29 +113,32 @@ setObjInfo debug obj t name fields a size regs static
   where
     regTag CIRegsUnknown       = -1
     regTag (CIRegs skip types) =
-      let nregs = sum $ map varSize types
+      let nregs = sum $ fmap varSize types
       in  skip + (nregs `Bits.shiftL` 8)
 
-closure :: ClosureInfo -- ^ object being info'd see @ciVar@ in @ClosureInfo@
-        -> JStat       -- ^ rhs
-        -> JStat
-closure ci body = (ciVar ci ||= jLam body) `mappend` closureInfoStat False ci
+-- | Special case of closures that do not need to generate any @fresh@ names
+closure :: ClosureInfo    -- ^ object being info'd see @ciVar@
+         -> (JSM JStgStat) -- ^ rhs
+         -> JSM JStgStat
+closure ci body = do f <- (jFunction' (ciVar ci) body)
+                     return $ f `mappend` closureInfoStat False ci
 
-conClosure :: Ident -> FastString -> CILayout -> Int -> JStat
-conClosure symbol name layout constr =
-  closure (ClosureInfo symbol (CIRegs 0 [PtrV]) name layout (CICon constr) mempty)
-          (returnS (stack .! sp))
+conClosure :: Ident -> FastString -> CILayout -> Int -> JSM JStgStat
+conClosure symbol name layout constr = closure ci body
+  where
+    ci = (ClosureInfo symbol (CIRegs 0 [PtrV]) name layout (CICon constr) mempty)
+    body   = pure . returnS $ stack .! sp
 
 -- | Used to pass arguments to newClosure with some safety
 data Closure = Closure
-  { clEntry  :: JExpr
-  , clField1 :: JExpr
-  , clField2 :: JExpr
-  , clMeta   :: JExpr
-  , clCC     :: Maybe JExpr
+  { clEntry  :: JStgExpr
+  , clField1 :: JStgExpr
+  , clField2 :: JStgExpr
+  , clMeta   :: JStgExpr
+  , clCC     :: Maybe JStgExpr
   }
 
-newClosure :: Closure -> JExpr
+newClosure :: Closure -> JStgExpr
 newClosure Closure{..} =
   let xs = [ (closureEntry_ , clEntry)
            , (closureField1_, clField1)
@@ -133,7 +151,7 @@ newClosure Closure{..} =
     Nothing -> ValExpr (jhFromList xs)
     Just cc -> ValExpr (jhFromList $ (closureCC_,cc) : xs)
 
-assignClosure :: JExpr -> Closure -> JStat
+assignClosure :: JStgExpr -> Closure -> JStgStat
 assignClosure t Closure{..} = BlockStat
   [ closureEntry  t |= clEntry
   , closureField1 t |= clField1
@@ -145,7 +163,7 @@ assignClosure t Closure{..} = BlockStat
 
 data CopyCC = CopyCC | DontCopyCC
 
-copyClosure :: CopyCC -> JExpr -> JExpr -> JStat
+copyClosure :: CopyCC -> JStgExpr -> JStgExpr -> JStgStat
 copyClosure copy_cc t s = BlockStat
   [ closureEntry  t |= closureEntry  s
   , closureField1 t |= closureField1 s
@@ -154,3 +172,79 @@ copyClosure copy_cc t s = BlockStat
   ] <> case copy_cc of
       DontCopyCC -> mempty
       CopyCC     -> closureCC t |= closureCC s
+
+mkClosure :: JStgExpr -> [JStgExpr] -> JStgExpr -> Maybe JStgExpr -> Closure
+mkClosure entry fields meta cc = Closure
+  { clEntry  = entry
+  , clField1 = x1
+  , clField2 = x2
+  , clMeta   = meta
+  , clCC     = cc
+  }
+  where
+    x1 = case fields of
+           []  -> null_
+           x:_ -> x
+    x2 = case fields of
+           []     -> null_
+           [_]    -> null_
+           [_,x]  -> x
+           _:x:xs -> ValExpr . JHash . listToUniqMap $ zip (fmap dataFieldName [1..]) (x:xs)
+
+
+-------------------------------------------------------------------------------
+--                             Name Caches
+-------------------------------------------------------------------------------
+-- $names
+
+-- | Cache "dXXX" field names
+dataFieldCache :: Array Int FastString
+dataFieldCache = listArray (0,nFieldCache) (fmap (mkFastString . ('d':) . show) [(0::Int)..nFieldCache])
+
+-- | Data names are used in the AST, and logging has determined that 255 is the maximum number we see.
+nFieldCache :: Int
+nFieldCache  = 255
+
+-- | We use this in the RTS to determine the number of generated closures. These closures use the names
+-- cached here, so we bind them to the same number.
+jsClosureCount :: Int
+jsClosureCount  = 24
+
+dataFieldName :: Int -> FastString
+dataFieldName i
+  | i < 0 || i > nFieldCache = mkFastString ('d' : show i)
+  | otherwise                = dataFieldCache ! i
+
+-- | Cache "h$dXXX" names
+dataCache :: Array Int FastString
+dataCache = listArray (0,jsClosureCount) (fmap (mkFastString . ("h$d"++) . show) [(0::Int)..jsClosureCount])
+
+dataName :: Int -> FastString
+dataName i
+  | i < 0 || i > nFieldCache = mkFastString ("h$d" ++ show i)
+  | otherwise                = dataCache ! i
+
+allocData :: Int -> JStgExpr
+allocData i = toJExpr (global (dataName i))
+
+-- | Cache "h$cXXX" names
+clsCache :: Array Int FastString
+clsCache = listArray (0,jsClosureCount) (fmap (mkFastString . ("h$c"++) . show) [(0::Int)..jsClosureCount])
+
+clsName :: Int -> FastString
+clsName i
+  | i < 0 || i > jsClosureCount = mkFastString ("h$c" ++ show i)
+  | otherwise                   = clsCache ! i
+
+allocClsA :: Int -> JStgExpr
+allocClsA i = toJExpr (global (clsName i))
+
+-- | Cache "xXXX" names
+varCache :: Array Int Ident
+varCache = listArray (0,jsClosureCount) (fmap (global . mkFastString . ('x':) . show) [(0::Int)..jsClosureCount])
+
+varName :: Int -> Ident
+varName i
+  | i < 0 || i > jsClosureCount = global $ mkFastString ('x' : show i)
+  | otherwise                   = varCache ! i
+

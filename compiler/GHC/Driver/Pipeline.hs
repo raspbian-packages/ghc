@@ -1,14 +1,7 @@
 {-# LANGUAGE CPP #-}
-{-# LANGUAGE BangPatterns #-}
-
-{-# LANGUAGE NamedFieldPuns #-}
-{-# LANGUAGE NondecreasingIndentation #-}
-{-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE ConstraintKinds #-}
-{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE NondecreasingIndentation #-}
 {-# LANGUAGE ViewPatterns #-}
-{-# LANGUAGE TypeApplications #-}
 
 -----------------------------------------------------------------------------
 --
@@ -83,7 +76,6 @@ import GHC.Linker.Static.Utils
 import GHC.Linker.Types
 
 import GHC.StgToJS.Linker.Linker
-import GHC.StgToJS.Linker.Types (defaultJSLinkConfig)
 
 import GHC.Utils.Outputable
 import GHC.Utils.Error
@@ -103,7 +95,7 @@ import GHC.Runtime.Loader      ( initializePlugins )
 
 
 import GHC.Types.Basic       ( SuccessFlag(..), ForeignSrcLang(..) )
-import GHC.Types.Error       ( singleMessage, getMessages, UnknownDiagnostic (..) )
+import GHC.Types.Error       ( singleMessage, getMessages, mkSimpleUnknownDiagnostic, defaultDiagnosticOpts )
 import GHC.Types.Target
 import GHC.Types.SrcLoc
 import GHC.Types.SourceFile
@@ -111,7 +103,7 @@ import GHC.Types.SourceError
 
 import GHC.Unit
 import GHC.Unit.Env
---import GHC.Unit.Finder
+import GHC.Unit.Finder
 --import GHC.Unit.State
 import GHC.Unit.Module.ModSummary
 import GHC.Unit.Module.ModIface
@@ -124,7 +116,6 @@ import System.IO
 import Control.Monad
 import qualified Control.Monad.Catch as MC (handle)
 import Data.Maybe
-import Data.Either      ( partitionEithers )
 import qualified Data.Set as Set
 
 import Data.Time        ( getCurrentTime )
@@ -163,7 +154,7 @@ preprocess hsc_env input_fn mb_input_buf mb_phase =
     handler (ProgramError msg) =
       return $ Left $ singleMessage $
         mkPlainErrorMsgEnvelope srcspan $
-        DriverUnknownMessage $ UnknownDiagnostic $ mkPlainError noHints $ text msg
+        DriverUnknownMessage $ mkSimpleUnknownDiagnostic $ mkPlainError noHints $ text msg
     handler ex = throwGhcExceptionIO ex
 
     to_driver_messages :: Messages GhcMessage -> Messages DriverMessage
@@ -352,6 +343,7 @@ compileOne' mHscMessage
 link :: GhcLink                 -- ^ interactive or batch
      -> Logger                  -- ^ Logger
      -> TmpFs
+     -> FinderCache
      -> Hooks
      -> DynFlags                -- ^ dynamic flags
      -> UnitEnv                 -- ^ unit environment
@@ -367,7 +359,7 @@ link :: GhcLink                 -- ^ interactive or batch
 -- exports main, i.e., we have good reason to believe that linking
 -- will succeed.
 
-link ghcLink logger tmpfs hooks dflags unit_env batch_attempt_linking mHscMessage hpt =
+link ghcLink logger tmpfs fc hooks dflags unit_env batch_attempt_linking mHscMessage hpt =
   case linkHook hooks of
       Nothing -> case ghcLink of
         NoLink        -> return Succeeded
@@ -383,7 +375,7 @@ link ghcLink logger tmpfs hooks dflags unit_env batch_attempt_linking mHscMessag
             -> panicBadLink LinkInMemory
       Just h  -> h ghcLink dflags batch_attempt_linking hpt
   where
-    normal_link = link' logger tmpfs dflags unit_env batch_attempt_linking mHscMessage hpt
+    normal_link = link' logger tmpfs fc dflags unit_env batch_attempt_linking mHscMessage hpt
 
 
 panicBadLink :: GhcLink -> a
@@ -392,6 +384,7 @@ panicBadLink other = panic ("link: GHC not built to link this way: " ++
 
 link' :: Logger
       -> TmpFs
+      -> FinderCache
       -> DynFlags                -- ^ dynamic flags
       -> UnitEnv                 -- ^ unit environment
       -> Bool                    -- ^ attempt linking in batch mode?
@@ -399,7 +392,7 @@ link' :: Logger
       -> HomePackageTable        -- ^ what to link
       -> IO SuccessFlag
 
-link' logger tmpfs dflags unit_env batch_attempt_linking mHscMessager hpt
+link' logger tmpfs fc dflags unit_env batch_attempt_linking mHscMessager hpt
    | batch_attempt_linking
    = do
         let
@@ -446,7 +439,7 @@ link' logger tmpfs dflags unit_env batch_attempt_linking mHscMessager hpt
         -- Don't showPass in Batch mode; doLink will do that for us.
         case ghcLink dflags of
           LinkBinary
-            | backendUseJSLinker (backend dflags) -> linkJSBinary logger dflags unit_env obj_files pkg_deps
+            | backendUseJSLinker (backend dflags) -> linkJSBinary logger tmpfs fc dflags unit_env obj_files pkg_deps
             | otherwise -> linkBinary logger tmpfs dflags unit_env obj_files pkg_deps
           LinkStaticLib -> linkStaticLib logger dflags unit_env obj_files pkg_deps
           LinkDynLib    -> linkDynLibCheck logger tmpfs dflags unit_env obj_files pkg_deps
@@ -463,14 +456,13 @@ link' logger tmpfs dflags unit_env batch_attempt_linking mHscMessager hpt
         return Succeeded
 
 
-linkJSBinary :: Logger -> DynFlags -> UnitEnv -> [FilePath] -> [UnitId] -> IO ()
-linkJSBinary logger dflags unit_env obj_files pkg_deps = do
+linkJSBinary :: Logger -> TmpFs -> FinderCache -> DynFlags -> UnitEnv -> [FilePath] -> [UnitId] -> IO ()
+linkJSBinary logger tmpfs fc dflags unit_env obj_files pkg_deps = do
   -- we use the default configuration for now. In the future we may expose
   -- settings to the user via DynFlags.
-  let lc_cfg   = defaultJSLinkConfig
+  let lc_cfg   = initJSLinkConfig dflags
   let cfg      = initStgToJSConfig dflags
-  let extra_js = mempty
-  jsLinkBinary lc_cfg cfg extra_js logger dflags unit_env obj_files pkg_deps
+  jsLinkBinary fc lc_cfg cfg logger tmpfs dflags unit_env obj_files pkg_deps
 
 linkingNeeded :: Logger -> DynFlags -> UnitEnv -> Bool -> [Linkable] -> [UnitId] -> IO RecompileRequired
 linkingNeeded logger dflags unit_env staticLink linkables pkg_deps = do
@@ -487,8 +479,7 @@ linkingNeeded logger dflags unit_env staticLink linkables pkg_deps = do
     Right t -> do
         -- first check object files and extra_ld_inputs
         let extra_ld_inputs = [ f | FileOption _ f <- ldInputs dflags ]
-        e_extra_times <- mapM (tryIO . getModificationUTCTime) extra_ld_inputs
-        let (errs,extra_times) = partitionEithers e_extra_times
+        (errs,extra_times) <- partitionWithM (tryIO . getModificationUTCTime) extra_ld_inputs
         let obj_times =  map linkableTime linkables ++ extra_times
         if not (null errs) || any (t <) obj_times
             then return $ needsRecompileBecause ObjectsChanged
@@ -512,9 +503,7 @@ linkingNeeded logger dflags unit_env staticLink linkables pkg_deps = do
 
         pkg_libfiles <- mapM (uncurry (findHSLib platform (ways dflags))) pkg_hslibs
         if any isNothing pkg_libfiles then return $ needsRecompileBecause LibraryChanged else do
-        e_lib_times <- mapM (tryIO . getModificationUTCTime)
-                          (catMaybes pkg_libfiles)
-        let (lib_errs,lib_times) = partitionEithers e_lib_times
+        (lib_errs,lib_times) <- partitionWithM (tryIO . getModificationUTCTime) (catMaybes pkg_libfiles)
         if not (null lib_errs) || any (t <) lib_times
            then return $ needsRecompileBecause LibraryChanged
            else do
@@ -542,6 +531,7 @@ oneShot orig_hsc_env stop_phase srcs = do
   -- In oneshot mode, initialise plugins specified on command line
   -- we also initialise in ghc/Main but this might be used as an entry point by API clients who
   -- should initialise their own plugins but may not.
+  -- See Note [Timing of plugin initialization]
   hsc_env <- initializePlugins orig_hsc_env
   o_files <- mapMaybeM (compileFile hsc_env stop_phase) srcs
   case stop_phase of
@@ -552,28 +542,28 @@ oneShot orig_hsc_env stop_phase srcs = do
 
 compileFile :: HscEnv -> StopPhase -> (FilePath, Maybe Phase) -> IO (Maybe FilePath)
 compileFile hsc_env stop_phase (src, mb_phase) = do
-   exists <- doesFileExist src
-   when (not exists) $
-        throwGhcExceptionIO (CmdLineError ("does not exist: " ++ src))
+   let offset_file = augmentByWorkingDirectory dflags src
+       dflags    = hsc_dflags hsc_env
+       mb_o_file = outputFile dflags
+       ghc_link  = ghcLink dflags      -- Set by -c or -no-link
+       notStopPreprocess | StopPreprocess <- stop_phase = False
+                         | _              <- stop_phase = True
+       -- When linking, the -o argument refers to the linker's output.
+       -- otherwise, we use it as the name for the pipeline's output.
+       output
+        | not (backendGeneratesCode (backend dflags)), notStopPreprocess = NoOutputFile
+               -- avoid -E -fno-code undesirable interactions. see #20439
+        | NoStop <- stop_phase, not (isNoLink ghc_link) = Persistent
+               -- -o foo applies to linker
+        | isJust mb_o_file = SpecificFile
+               -- -o foo applies to the file we are compiling now
+        | otherwise = Persistent
+       pipe_env = mkPipeEnv stop_phase offset_file mb_phase output
+       pipeline = pipelineStart pipe_env (setDumpPrefix pipe_env hsc_env) offset_file mb_phase
 
-   let
-        dflags    = hsc_dflags hsc_env
-        mb_o_file = outputFile dflags
-        ghc_link  = ghcLink dflags      -- Set by -c or -no-link
-        notStopPreprocess | StopPreprocess <- stop_phase = False
-                          | _              <- stop_phase = True
-        -- When linking, the -o argument refers to the linker's output.
-        -- otherwise, we use it as the name for the pipeline's output.
-        output
-         | not (backendGeneratesCode (backend dflags)), notStopPreprocess = NoOutputFile
-                -- avoid -E -fno-code undesirable interactions. see #20439
-         | NoStop <- stop_phase, not (isNoLink ghc_link) = Persistent
-                -- -o foo applies to linker
-         | isJust mb_o_file = SpecificFile
-                -- -o foo applies to the file we are compiling now
-         | otherwise = Persistent
-        pipe_env = mkPipeEnv stop_phase src mb_phase output
-        pipeline = pipelineStart pipe_env (setDumpPrefix pipe_env hsc_env) src mb_phase
+   exists <- doesFileExist offset_file
+   when (not exists) $
+        throwGhcExceptionIO (CmdLineError ("does not exist: " ++ offset_file))
    runPipeline (hsc_hooks hsc_env) pipeline
 
 
@@ -584,12 +574,13 @@ doLink hsc_env o_files = do
     logger   = hsc_logger   hsc_env
     unit_env = hsc_unit_env hsc_env
     tmpfs    = hsc_tmpfs    hsc_env
+    fc       = hsc_FC       hsc_env
 
   case ghcLink dflags of
     NoLink        -> return ()
     LinkBinary
       | backendUseJSLinker (backend dflags)
-                  -> linkJSBinary logger dflags unit_env o_files []
+                  -> linkJSBinary logger tmpfs fc dflags unit_env o_files []
       | otherwise -> linkBinary logger tmpfs dflags unit_env o_files []
     LinkStaticLib -> linkStaticLib      logger       dflags unit_env o_files []
     LinkDynLib    -> linkDynLibCheck    logger tmpfs dflags unit_env o_files []
@@ -624,9 +615,6 @@ compileForeign hsc_env lang stub_c = do
               LangObjcxx -> viaCPipeline Cobjcxx
               LangAsm    -> \pe hsc_env ml fp -> asPipeline True pe hsc_env ml fp
               LangJs     -> \pe hsc_env ml fp -> Just <$> foreignJsPipeline pe hsc_env ml fp
-#if __GLASGOW_HASKELL__ < 811
-              RawObject  -> panic "compileForeign: should be unreachable"
-#endif
             pipe_env = mkPipeEnv NoStop stub_c Nothing (Temporary TFL_GhcSession)
         res <- runPipeline (hsc_hooks hsc_env) (pipeline pipe_env hsc_env Nothing stub_c)
         case res of
@@ -747,7 +735,7 @@ preprocessPipeline pipe_env hsc_env input_fn = do
 
   let print_config = initPrintConfig dflags3
   liftIO (printOrThrowDiagnostics (hsc_logger hsc_env) print_config (initDiagOpts dflags3) (GhcPsMessage <$> p_warns3))
-  liftIO (handleFlagWarnings (hsc_logger hsc_env) print_config (initDiagOpts dflags3) warns3)
+  liftIO (printOrThrowDiagnostics (hsc_logger hsc_env) print_config (initDiagOpts dflags3) (GhcDriverMessage <$> warns3))
   return (dflags3, pp_fn)
 
 
@@ -791,7 +779,15 @@ hscBackendPipeline pipe_env hsc_env mod_sum result =
   if backendGeneratesCode (backend (hsc_dflags hsc_env)) then
     do
       res <- hscGenBackendPipeline pipe_env hsc_env mod_sum result
-      when (gopt Opt_BuildDynamicToo (hsc_dflags hsc_env)) $ do
+      -- Only run dynamic-too if the backend generates object files
+      -- See Note [Writing interface files]
+      -- If we are writing a simple interface (not . backendWritesFiles), then
+      -- hscMaybeWriteIface in the regular pipeline will write both the hi and
+      -- dyn_hi files. This way we can avoid running the pipeline twice and
+      -- generating a duplicate linkable.
+      -- We must not run the backend a second time with `dynamicNow` enable because
+      -- all the work has already been done in the first pipeline.
+      when (gopt Opt_BuildDynamicToo (hsc_dflags hsc_env) && backendWritesFiles (backend (hsc_dflags hsc_env)) ) $ do
           let dflags' = setDynamicNow (hsc_dflags hsc_env) -- set "dynamicNow"
           () <$ hscGenBackendPipeline pipe_env (hscSetFlags dflags' hsc_env) mod_sum result
       return res
@@ -832,6 +828,12 @@ asPipeline use_cpp pipe_env hsc_env location input_fn =
     StopAs -> return Nothing
     _ -> Just <$> use (T_As use_cpp pipe_env hsc_env location input_fn)
 
+lasPipeline :: P m => Bool -> PipeEnv -> HscEnv -> Maybe ModLocation -> FilePath -> m (Maybe ObjFile)
+lasPipeline use_cpp pipe_env hsc_env location input_fn =
+  case stop_phase pipe_env of
+    StopAs -> return Nothing
+    _ -> Just <$> use (T_LlvmAs use_cpp pipe_env hsc_env location input_fn)
+
 viaCPipeline :: P m => Phase -> PipeEnv -> HscEnv -> Maybe ModLocation -> FilePath -> m (Maybe FilePath)
 viaCPipeline c_phase pipe_env hsc_env location input_fn = do
   out_fn <- use (T_Cc c_phase pipe_env hsc_env location input_fn)
@@ -855,7 +857,7 @@ llvmManglePipeline pipe_env hsc_env location llc_fn = do
     if gopt Opt_NoLlvmMangler (hsc_dflags hsc_env)
       then return llc_fn
       else use (T_LlvmMangle pipe_env hsc_env llc_fn)
-  asPipeline False pipe_env hsc_env location mangled_fn
+  lasPipeline False pipe_env hsc_env location mangled_fn
 
 cmmCppPipeline :: P m => PipeEnv -> HscEnv -> FilePath -> m (Maybe FilePath)
 cmmCppPipeline pipe_env hsc_env input_fn = do
@@ -879,9 +881,8 @@ foreignJsPipeline pipe_env hsc_env location input_fn = do
   use (T_ForeignJs pipe_env hsc_env location input_fn)
 
 hscPostBackendPipeline :: P m => PipeEnv -> HscEnv -> HscSource -> Backend -> Maybe ModLocation -> FilePath -> m (Maybe FilePath)
-hscPostBackendPipeline _ _ HsBootFile _ _ _   = return Nothing
-hscPostBackendPipeline _ _ HsigFile _ _ _     = return Nothing
-hscPostBackendPipeline pipe_env hsc_env _ bcknd ml input_fn =
+hscPostBackendPipeline _ _ (HsBootOrSig _) _ _ _ = return Nothing
+hscPostBackendPipeline pipe_env hsc_env HsSrcFile bcknd ml input_fn =
   applyPostHscPipeline (backendPostHscPipeline bcknd) pipe_env hsc_env ml input_fn
 
 applyPostHscPipeline

@@ -41,13 +41,14 @@ import GHC.Utils.Panic
 import GHC.Llvm
 import GHC.CmmToLlvm.Regs
 import GHC.CmmToLlvm.Config
+import GHC.CmmToLlvm.Version
 
 import GHC.Cmm.CLabel
 import GHC.Platform.Regs ( activeStgRegs, globalRegMaybe )
-import GHC.Driver.Session
+import GHC.Driver.DynFlags
 import GHC.Data.FastString
 import GHC.Cmm              hiding ( succ )
-import GHC.Cmm.Utils (regsOverlap)
+import GHC.Cmm.Utils (globalRegsOverlap)
 import GHC.Utils.Outputable as Outp
 import GHC.Platform
 import GHC.Types.Unique.FM
@@ -194,8 +195,8 @@ padLiveArgs platform live =
     -- all use the same real regs on X86-64 (XMM registers).
     --
     classes         = NE.groupBy sharesClass fprLive
-    sharesClass a b = regsOverlap platform (norm a) (norm b) -- check if mapped to overlapping registers
-    norm x          = CmmGlobal ((fpr_ctor x) 1)             -- get the first register of the family
+    sharesClass a b = globalRegsOverlap platform (norm a) (norm b) -- check if mapped to overlapping registers
+    norm x          = fpr_ctor x 1                                 -- get the first register of the family
 
     -- For each class, we just have to fill missing registers numbers. We use
     -- the constructor of the greatest register to build padding registers.
@@ -218,7 +219,7 @@ padLiveArgs platform live =
                text ") both alive AND mapped to the same real register: " <> ppr real <>
                text ". This isn't currently supported by the LLVM backend."
          go (c:cs) f
-            | fpr_num c == f = go cs f                    -- already covered by a real register
+            | fpr_num c == f = go cs (f+1)                    -- already covered by a real register
             | otherwise      = ctor f : go (c:cs) (f + 1) -- add padding register
 
     fpr_ctor :: GlobalReg -> Int -> GlobalReg
@@ -260,7 +261,7 @@ data LlvmEnv = LlvmEnv
   , envConfig    :: !LlvmCgConfig    -- ^ Configuration for LLVM code gen
   , envLogger    :: !Logger          -- ^ Logger
   , envOutput    :: BufHandle        -- ^ Output buffer
-  , envMask      :: !Char            -- ^ Mask for creating unique values
+  , envTag       :: !Char            -- ^ Tag for creating unique values
   , envFreshMeta :: MetaId           -- ^ Supply of fresh metadata IDs
   , envUniqMeta  :: UniqFM Unique MetaId   -- ^ Global metadata nodes
   , envFunMap    :: LlvmEnvMap       -- ^ Global functions so far, with type
@@ -292,12 +293,12 @@ getConfig = LlvmM $ \env -> return (envConfig env, env)
 
 instance MonadUnique LlvmM where
     getUniqueSupplyM = do
-        mask <- getEnv envMask
-        liftIO $! mkSplitUniqSupply mask
+        tag <- getEnv envTag
+        liftIO $! mkSplitUniqSupply tag
 
     getUniqueM = do
-        mask <- getEnv envMask
-        liftIO $! uniqFromMask mask
+        tag <- getEnv envTag
+        liftIO $! uniqFromTag tag
 
 -- | Lifting of IO actions. Not exported, as we want to encapsulate IO.
 liftIO :: IO a -> LlvmM a
@@ -318,7 +319,7 @@ runLlvm logger cfg ver out m = do
                       , envConfig    = cfg
                       , envLogger    = logger
                       , envOutput    = out
-                      , envMask      = 'n'
+                      , envTag       = 'n'
                       , envFreshMeta = MetaId 0
                       , envUniqMeta  = emptyUFM
                       }
@@ -371,13 +372,13 @@ dumpIfSetLlvm flag hdr fmt doc = do
   liftIO $ putDumpFileMaybe logger flag hdr fmt doc
 
 -- | Prints the given contents to the output handle
-renderLlvm :: Outp.SDoc -> LlvmM ()
-renderLlvm sdoc = do
+renderLlvm :: Outp.HDoc -> Outp.SDoc -> LlvmM ()
+renderLlvm hdoc sdoc = do
 
     -- Write to output
     ctx <- llvmCgContext <$> getConfig
     out <- getEnv envOutput
-    liftIO $ Outp.bufLeftRenderSDoc ctx out sdoc
+    liftIO $ Outp.bPutHDoc out ctx hdoc
 
     -- Dump, if requested
     dumpIfSetLlvm Opt_D_dump_llvm "LLVM Code" FormatLLVM sdoc
@@ -412,7 +413,7 @@ getUniqMeta s = getEnv (flip lookupUFM s . envUniqMeta)
 -- so as to make sure they have the most general type in the case that
 -- user code also uses these functions but with a different type than GHC
 -- internally. (Main offender is treating return type as 'void' instead of
--- 'void *'). Fixes trac #5486.
+-- 'void *'). Fixes #5486.
 ghcInternalFunctions :: LlvmM ()
 ghcInternalFunctions = do
     platform <- getPlatform
@@ -428,7 +429,7 @@ ghcInternalFunctions = do
       let n' = fsLit n
           decl = LlvmFunctionDecl n' ExternallyVisible CC_Ccc ret
                                  FixedArgs (tysToParams args) Nothing
-      renderLlvm $ ppLlvmFunctionDecl decl
+      renderLlvm (ppLlvmFunctionDecl decl) (ppLlvmFunctionDecl decl)
       funInsert n' (LMFunction decl)
 
 -- ----------------------------------------------------------------------------
@@ -498,10 +499,10 @@ generateExternDecls = do
   modifyEnv $ \env -> env { envAliases = emptyUniqSet }
   return (concat defss, [])
 
--- | Is a variable one of the special @$llvm@ globals?
+-- | Is a variable one of the special @\@llvm@ globals?
 isBuiltinLlvmVar :: LlvmVar -> Bool
 isBuiltinLlvmVar (LMGlobalVar lbl _ _ _ _ _) =
-    "$llvm" `isPrefixOf` unpackFS lbl
+    "llvm." `isPrefixOf` unpackFS lbl
 isBuiltinLlvmVar _ = False
 
 -- | Here we take a global variable definition, rename it with a

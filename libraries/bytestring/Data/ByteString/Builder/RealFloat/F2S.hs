@@ -1,5 +1,5 @@
-{-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE BangPatterns, MagicHash #-}
+{-# LANGUAGE CPP #-}
+
 -- |
 -- Module      : Data.ByteString.Builder.RealFloat.F2S
 -- Copyright   : (c) Lawrence Wu 2021
@@ -22,64 +22,26 @@ import Data.ByteString.Builder.RealFloat.Internal
 import GHC.Int (Int32(..))
 import GHC.Word (Word32(..), Word64(..))
 
+#if !PURE_HASKELL
+import GHC.Ptr (Ptr(..))
+#endif
+
 -- See Data.ByteString.Builder.RealFloat.TableGenerator for a high-level
 -- explanation of the ryu algorithm
 
+#if !PURE_HASKELL
 -- | Table of 2^k / 5^q + 1
--- Byte-swapped version of
--- > fmap (finv float_pow5_inv_bitcount) [0..float_max_inv_split]
 --
--- Displayed here as 2 Word64 table values per line
-float_pow5_inv_split :: Addr
-float_pow5_inv_split = Addr
-  "\x01\x00\x00\x00\x00\x00\x00\x08\x67\x66\x66\x66\x66\x66\x66\x06\
-  \\xb9\x1e\x85\xeb\x51\xb8\x1e\x05\xfa\x7e\x6a\xbc\x74\x93\x18\x04\
-  \\x2a\xcb\x10\xc7\xba\xb8\x8d\x06\x22\x3c\xda\x38\x62\x2d\x3e\x05\
-  \\x4e\x63\x7b\x2d\xe8\xbd\x31\x04\x16\xd2\x2b\xaf\xa6\xfc\xb5\x06\
-  \\x78\x0e\x23\x8c\xb8\x63\x5e\x05\x2d\xa5\xb5\x09\xfa\x82\x4b\x04\
-  \\xae\x6e\xef\x75\xf6\x37\xdf\x06\x58\x25\x59\x5e\xf8\x5f\x7f\x05\
-  \\x47\x84\x7a\x4b\x60\xe6\x65\x04\x71\xa0\x5d\x12\x9a\x70\x09\x07\
-  \\xc1\xe6\x4a\xa8\xe1\x26\xa1\x05\x67\x85\xd5\xb9\xe7\xeb\x80\x04\
-  \\x0b\x6f\x22\xf6\xa5\xac\x34\x07\xa3\x25\xb5\x91\x51\xbd\xc3\x05\
-  \\xe9\xea\x90\x74\x74\x97\x9c\x04\x0e\xab\xb4\xed\x53\xf2\x60\x07\
-  \\xd8\x88\x90\x24\x43\x28\xe7\x05\xe0\xd3\xa6\x83\x02\xed\xb8\x04\
-  \\x66\xb9\xd7\x05\x04\x48\x8e\x07\x52\x94\xac\x04\xd0\x6c\x0b\x06\
-  \\xdb\xa9\x23\x6a\xa6\xf0\xd5\x04\x2b\x76\x9f\x76\x3d\xb4\xbc\x07\
-  \\xef\xc4\xb2\x2b\x31\x90\x30\x06\xf3\x03\x8f\xbc\x8d\xa6\xf3\x04\
-  \\x51\x06\x18\x94\xaf\x3d\xec\x07\xda\xd1\xac\xa9\xbf\x97\x56\x06\
-  \\xe2\xa7\xf0\xba\xff\x12\x12\x05"#
+-- > fmap (finv float_pow5_inv_bitcount) [0..float_max_inv_split]
+foreign import ccall "&hs_bytestring_float_pow5_inv_split"
+  float_pow5_inv_split :: Ptr Word64
 
 -- | Table of 5^(-e2-q) / 2^k + 1
--- Byte-swapped version of
--- > fmap (fnorm float_pow5_bitcount) [0..float_max_split]
 --
--- Displayed here as 2 Word64 table values per line
-float_pow5_split :: Addr
-float_pow5_split = Addr
-  "\x00\x00\x00\x00\x00\x00\x00\x10\x00\x00\x00\x00\x00\x00\x00\x14\
-  \\x00\x00\x00\x00\x00\x00\x00\x19\x00\x00\x00\x00\x00\x00\x40\x1f\
-  \\x00\x00\x00\x00\x00\x00\x88\x13\x00\x00\x00\x00\x00\x00\x6a\x18\
-  \\x00\x00\x00\x00\x00\x80\x84\x1e\x00\x00\x00\x00\x00\xd0\x12\x13\
-  \\x00\x00\x00\x00\x00\x84\xd7\x17\x00\x00\x00\x00\x00\x65\xcd\x1d\
-  \\x00\x00\x00\x00\x20\x5f\xa0\x12\x00\x00\x00\x00\xe8\x76\x48\x17\
-  \\x00\x00\x00\x00\xa2\x94\x1a\x1d\x00\x00\x00\x40\xe5\x9c\x30\x12\
-  \\x00\x00\x00\x90\x1e\xc4\xbc\x16\x00\x00\x00\x34\x26\xf5\x6b\x1c\
-  \\x00\x00\x80\xe0\x37\x79\xc3\x11\x00\x00\xa0\xd8\x85\x57\x34\x16\
-  \\x00\x00\xc8\x4e\x67\x6d\xc1\x1b\x00\x00\x3d\x91\x60\xe4\x58\x11\
-  \\x00\x40\x8c\xb5\x78\x1d\xaf\x15\x00\x50\xef\xe2\xd6\xe4\x1a\x1b\
-  \\x00\x92\xd5\x4d\x06\xcf\xf0\x10\x80\xf6\x4a\xe1\xc7\x02\x2d\x15\
-  \\x20\xb4\x9d\xd9\x79\x43\x78\x1a\x94\x90\x02\x28\x2c\x2a\x8b\x10\
-  \\xb9\x34\x03\x32\xb7\xf4\xad\x14\xe7\x01\x84\xfe\xe4\x71\xd9\x19\
-  \\x30\x81\x12\x1f\x2f\xe7\x27\x10\x7c\x21\xd7\xe6\xfa\xe0\x31\x14\
-  \\xdb\xe9\x8c\xa0\x39\x59\x3e\x19\x52\x24\xb0\x08\x88\xef\x8d\x1f\
-  \\xb3\x16\x6e\x05\xb5\xb5\xb8\x13\x60\x9c\xc9\x46\x22\xe3\xa6\x18\
-  \\x78\x03\x7c\xd8\xea\x9b\xd0\x1e\x2b\x82\x4d\xc7\x72\x61\x42\x13\
-  \\xb6\xe2\x20\x79\xcf\xf9\x12\x18\x64\x1b\x69\x57\x43\xb8\x17\x1e\
-  \\x1e\xb1\xa1\x16\x2a\xd3\xce\x12\x66\x1d\x4a\x9c\xf4\x87\x82\x17\
-  \\xbf\xa4\x5c\xc3\xf1\x29\x63\x1d\xf7\xe6\x19\x1a\x37\xfa\x5d\x12\
-  \\xb5\x60\xa0\xe0\xc4\x78\xf5\x16\xe3\x78\xc8\x18\xf6\xd6\xb2\x1c\
-  \\x8d\x4b\x7d\xcf\x59\xc6\xef\x11\x71\x9e\x5c\x43\xf0\xb7\x6b\x16\
-  \\x0d\xc6\x33\x54\xec\xa5\x06\x1c"#
+-- > fmap (fnorm float_pow5_bitcount) [0..float_max_split]
+foreign import ccall "&hs_bytestring_float_pow5_split"
+  float_pow5_split :: Ptr Word64
+#endif
 
 -- | Number of mantissa bits of a 32-bit float. The number of significant bits
 -- (floatDigits (undefined :: Float)) is 24 since we have a leading 1 for
@@ -113,15 +75,99 @@ mulShift32 m factor shift =
 
 -- | Index into the 64-bit word lookup table float_pow5_inv_split
 get_float_pow5_inv_split :: Int -> Word64
-get_float_pow5_inv_split =
-  let !(Addr arr) = float_pow5_inv_split
-   in getWord64At arr
+#if !PURE_HASKELL
+get_float_pow5_inv_split = getWord64At float_pow5_inv_split
+#else
+-- > putStr $ case64 (finv float_pow5_inv_bitcount) [0..float_max_inv_split]
+get_float_pow5_inv_split i = case i of
+  0  -> 0x800000000000001
+  1  -> 0x666666666666667
+  2  -> 0x51eb851eb851eb9
+  3  -> 0x4189374bc6a7efa
+  4  -> 0x68db8bac710cb2a
+  5  -> 0x53e2d6238da3c22
+  6  -> 0x431bde82d7b634e
+  7  -> 0x6b5fca6af2bd216
+  8  -> 0x55e63b88c230e78
+  9  -> 0x44b82fa09b5a52d
+  10 -> 0x6df37f675ef6eae
+  11 -> 0x57f5ff85e592558
+  12 -> 0x465e6604b7a8447
+  13 -> 0x709709a125da071
+  14 -> 0x5a126e1a84ae6c1
+  15 -> 0x480ebe7b9d58567
+  16 -> 0x734aca5f6226f0b
+  17 -> 0x5c3bd5191b525a3
+  18 -> 0x49c97747490eae9
+  19 -> 0x760f253edb4ab0e
+  20 -> 0x5e72843249088d8
+  21 -> 0x4b8ed0283a6d3e0
+  22 -> 0x78e480405d7b966
+  23 -> 0x60b6cd004ac9452
+  24 -> 0x4d5f0a66a23a9db
+  25 -> 0x7bcb43d769f762b
+  26 -> 0x63090312bb2c4ef
+  27 -> 0x4f3a68dbc8f03f3
+  28 -> 0x7ec3daf94180651
+  29 -> 0x65697bfa9acd1da
+  _  -> 0x51212ffbaf0a7e2
+#endif
 
 -- | Index into the 64-bit word lookup table float_pow5_split
 get_float_pow5_split :: Int -> Word64
-get_float_pow5_split =
-  let !(Addr arr) = float_pow5_split
-   in getWord64At arr
+#if !PURE_HASKELL
+get_float_pow5_split = getWord64At float_pow5_split
+#else
+-- > putStr $ case64 (fnorm float_pow5_bitcount) [0..float_max_split]
+get_float_pow5_split i = case i of
+  0  -> 0x1000000000000000
+  1  -> 0x1400000000000000
+  2  -> 0x1900000000000000
+  3  -> 0x1f40000000000000
+  4  -> 0x1388000000000000
+  5  -> 0x186a000000000000
+  6  -> 0x1e84800000000000
+  7  -> 0x1312d00000000000
+  8  -> 0x17d7840000000000
+  9  -> 0x1dcd650000000000
+  10 -> 0x12a05f2000000000
+  11 -> 0x174876e800000000
+  12 -> 0x1d1a94a200000000
+  13 -> 0x12309ce540000000
+  14 -> 0x16bcc41e90000000
+  15 -> 0x1c6bf52634000000
+  16 -> 0x11c37937e0800000
+  17 -> 0x16345785d8a00000
+  18 -> 0x1bc16d674ec80000
+  19 -> 0x1158e460913d0000
+  20 -> 0x15af1d78b58c4000
+  21 -> 0x1b1ae4d6e2ef5000
+  22 -> 0x10f0cf064dd59200
+  23 -> 0x152d02c7e14af680
+  24 -> 0x1a784379d99db420
+  25 -> 0x108b2a2c28029094
+  26 -> 0x14adf4b7320334b9
+  27 -> 0x19d971e4fe8401e7
+  28 -> 0x1027e72f1f128130
+  29 -> 0x1431e0fae6d7217c
+  30 -> 0x193e5939a08ce9db
+  31 -> 0x1f8def8808b02452
+  32 -> 0x13b8b5b5056e16b3
+  33 -> 0x18a6e32246c99c60
+  34 -> 0x1ed09bead87c0378
+  35 -> 0x13426172c74d822b
+  36 -> 0x1812f9cf7920e2b6
+  37 -> 0x1e17b84357691b64
+  38 -> 0x12ced32a16a1b11e
+  39 -> 0x178287f49c4a1d66
+  40 -> 0x1d6329f1c35ca4bf
+  41 -> 0x125dfa371a19e6f7
+  42 -> 0x16f578c4e0a060b5
+  43 -> 0x1cb2d6f618c878e3
+  44 -> 0x11efc659cf7d4b8d
+  45 -> 0x166bb7f0435c9e71
+  _  -> 0x1c06a5ec5433c60d
+#endif
 
 -- | Take the high bits of m * 2^k / 5^q / 2^-e2+q+k
 mulPow5InvDivPow2 :: Word32 -> Int -> Int -> Word32

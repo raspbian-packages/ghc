@@ -16,7 +16,7 @@ import GHC.Types.Tickish
 import GHC.Core.DataCon
 import GHC.Types.IPE
 import GHC.Unit.Module
-import GHC.Types.Name   ( getName, getOccName, occNameString, nameSrcSpan )
+import GHC.Types.Name   ( getName, getOccName, occNameFS, nameSrcSpan)
 import GHC.Data.FastString
 
 import Control.Monad (when)
@@ -29,7 +29,7 @@ import Control.Applicative
 import qualified Data.List.NonEmpty as NE
 import Data.List.NonEmpty (NonEmpty(..))
 
-data SpanWithLabel = SpanWithLabel RealSrcSpan String
+data SpanWithLabel = SpanWithLabel RealSrcSpan LexicalFastString
 
 data StgDebugOpts = StgDebugOpts
   { stgDebug_infoTableMap              :: !Bool
@@ -70,13 +70,13 @@ collectStgBind (StgRec pairs) = do
 collectStgRhs :: Id -> StgRhs -> M StgRhs
 collectStgRhs bndr rhs =
     case rhs of
-      StgRhsClosure ext cc us bs e -> do
+      StgRhsClosure ext cc us bs e t -> do
         e' <- with_span $ collectExpr e
         recordInfo bndr e'
-        return $ StgRhsClosure ext cc us bs e'
-      StgRhsCon cc dc _mn ticks args -> do
+        return $ StgRhsClosure ext cc us bs e' t
+      StgRhsCon cc dc _mn ticks args typ -> do
         n' <- with_span $ numberDataCon dc ticks
-        return (StgRhsCon cc dc n' ticks args)
+        return (StgRhsCon cc dc n' ticks args typ)
   where
     -- If the binder name has a span, use that initially as the source position
     -- in case we don't get anything better
@@ -85,7 +85,7 @@ collectStgRhs bndr rhs =
       let name = idName bndr in
       case nameSrcSpan name of
         RealSrcSpan pos _ ->
-          withSpan (pos, occNameString (getOccName name))
+          withSpan (pos, LexicalFastString $ occNameFS (getOccName name))
         _ -> id
 
 recordInfo :: Id -> StgExpr -> M ()
@@ -96,7 +96,7 @@ recordInfo bndr new_rhs = do
     -- A span from the ticks surrounding the new_rhs
     best_span = quickSourcePos thisFile new_rhs
     -- A back-up span if the bndr had a source position, many do not (think internally generated ids)
-    bndr_span = (\s -> SpanWithLabel s (occNameString (getOccName bndr)))
+    bndr_span = (\s -> SpanWithLabel s (LexicalFastString $ occNameFS (getOccName bndr)))
                   <$> srcSpanToRealSrcSpan (nameSrcSpan (getName bndr))
   recordStgIdPosition bndr best_span bndr_span
 

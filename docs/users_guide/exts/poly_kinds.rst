@@ -22,7 +22,7 @@ Kind polymorphism
     :implies: :extension:`KindSignatures`
     :since: 7.4.1
 
-    :status: Included in :extension:`GHC2021`
+    :status: Included in :extension:`GHC2024`, :extension:`GHC2021`
 
     Allow kind polymorphic types.
 
@@ -372,8 +372,9 @@ According to the rules above ``X`` has a CUSK. Yet, the kind of ``k`` is undeter
 It is thus quantified over, giving ``X`` the kind ``forall k1 (k :: k1). Proxy k -> Type``.
 
 The detection of CUSKs is enabled by the :extension:`CUSKs` flag, which is
-switched on by default. This extension is scheduled for deprecation to be
-replaced with :extension:`StandaloneKindSignatures`.
+switched off by default in GHC2021 and on in Haskell98 and Haskell2010.
+This extension is scheduled for deprecation to be replaced
+with :extension:`StandaloneKindSignatures`.
 
 .. index::
    single: standalone kind signature
@@ -388,7 +389,7 @@ Standalone kind signatures and polymorphic recursion
 
     :implies: :extension:`NoCUSKs`
     :since: 8.10.1
-    :status: Included in :extension:`GHC2021`
+    :status: Included in :extension:`GHC2024`, :extension:`GHC2021`
 
 Just as in type inference, kind inference for recursive types can only
 use *monomorphic* recursion. Consider this (contrived) example: ::
@@ -648,7 +649,7 @@ Kind inference for data/newtype instance declarations
 
 Consider these declarations ::
 
-   data family T :: forall k. (k->Type) -> k -> Type
+   data family T :: forall k. (k -> Type) -> k -> Type
 
    data instance T p q where
       MkT :: forall r. r Int -> T r Int
@@ -656,13 +657,13 @@ Consider these declarations ::
 Here ``T`` has an invisible kind argument; and perhaps it is instantiated
 to ``Type`` in the instance, thus::
 
-   data instance T @Type (p :: Type->Type) (q :: Type) where
+   data instance T @Type (p :: Type -> Type) (q :: Type) where
       MkT :: forall r. r Int -> T r Int
 
 Or perhaps we intended the specialisation to be in the GADT data
 constructor, thus::
 
-   data instance T @k (p :: k->Type) (q :: k) where
+   data instance T @k (p :: k -> Type) (q :: k) where
       MkT :: forall r. r Int -> T @Type r Int
 
 It gets more complicated if there are multiple constructors.  In
@@ -774,6 +775,11 @@ Closed type family instances are subject to the same rules: ::
   type family F :: Maybe (Maybe k) where
     F = Just (Nothing :: Maybe k)     -- rejected: k not in scope
 
+  type F :: forall k. Maybe (Maybe k)
+  type family F @k where
+    F @k = Just (Nothing :: Maybe k)  -- accepted
+
+  -- CUSKs version (Legacy)  
   type family F :: Maybe (Maybe k) where
     F @k = Just (Nothing :: Maybe k)  -- accepted
 
@@ -857,10 +863,17 @@ For example: ::
       F2 x     = x
     -- F2 fails to compile: no complete signature
 
-    type family F3 (a :: k) :: k where
-      F3 True  = False
-      F3 False = True
-      F3 x     = x
+    type F3 :: k -> k 
+    type family F3 a where 
+      F3 True  = False 
+      F3 False = True 
+      F3 x     = x  
+
+    -- CUSKs version (legacy)
+    type family F4 (a :: k) :: k where
+      F4 True  = False
+      F4 False = True
+      F4 x     = x
     -- OK
 
 Higher-rank kinds
@@ -909,7 +922,7 @@ The kind ``Type``
     :shortdesc: Treat ``*`` as ``Data.Kind.Type``.
 
     :since: 8.6.1
-    :status: Included in :extension:`Haskell98`, :extension:`Haskell2010`, :extension:`GHC2021`
+    :status: Included in :extension:`GHC2024`, :extension:`GHC2021`, :extension:`Haskell2010`, :extension:`Haskell98`
 
     Treat the unqualified uses of the ``*`` type operator as nullary and desugar
     to ``Data.Kind.Type``.

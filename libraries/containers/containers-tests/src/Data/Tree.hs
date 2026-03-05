@@ -55,7 +55,7 @@ module Data.Tree(
 
 import Utils.Containers.Internal.Prelude as Prelude
 import Prelude ()
-import Data.Foldable (fold, foldl', toList)
+import Data.Foldable (fold, toList)
 import Data.Traversable (foldMapDefault)
 import Control.Monad (liftM)
 import Control.Monad.Fix (MonadFix (..), fix)
@@ -162,10 +162,8 @@ instance Applicative Tree where
     pure x = Node x []
     Node f tfs <*> tx@(Node x txs) =
         Node (f x) (map (f <$>) txs ++ map (<*> tx) tfs)
-#if MIN_VERSION_base(4,10,0)
     liftA2 f (Node x txs) ty@(Node y tys) =
         Node (f x y) (map (f x <$>) tys ++ map (\tx -> liftA2 f tx ty) txs)
-#endif
     Node x txs <* ty@(Node _ tys) =
         Node x (map (x <$) tys ++ map (<* ty) txs)
     Node _ txs *> ty@(Node y tys) =
@@ -302,6 +300,7 @@ foldlMap1 f g =  -- Use a lambda to allow inlining with two arguments
 instance NFData a => NFData (Tree a) where
     rnf (Node x ts) = rnf x `seq` rnf ts
 
+-- | @since 0.5.10.1
 instance MonadZip Tree where
   mzipWith f (Node a as) (Node b bs)
     = Node (f a b) (mzipWith (mzipWith f) as bs)
@@ -489,8 +488,9 @@ unfoldForestM f = Prelude.mapM (unfoldTreeM f)
 --
 -- See 'unfoldTree' for more info.
 --
--- Implemented using an algorithm adapted from /Breadth-First Numbering: Lessons
--- from a Small Exercise in Algorithm Design/, by Chris Okasaki, /ICFP'00/.
+-- Implemented using an algorithm adapted from
+-- /Breadth-First Numbering: Lessons from a Small Exercise in Algorithm Design/,
+-- by Chris Okasaki, /ICFP'00/.
 unfoldTreeM_BF :: Monad m => (b -> m (a, [b])) -> b -> m (Tree a)
 unfoldTreeM_BF f b = liftM getElement $ unfoldForestQ f (singleton b)
   where
@@ -502,8 +502,9 @@ unfoldTreeM_BF f b = liftM getElement $ unfoldForestQ f (singleton b)
 --
 -- See 'unfoldForest' for more info.
 --
--- Implemented using an algorithm adapted from /Breadth-First Numbering: Lessons
--- from a Small Exercise in Algorithm Design/, by Chris Okasaki, /ICFP'00/.
+-- Implemented using an algorithm adapted from
+-- /Breadth-First Numbering: Lessons from a Small Exercise in Algorithm Design/,
+-- by Chris Okasaki, /ICFP'00/.
 unfoldForestM_BF :: Monad m => (b -> m (a, [b])) -> [b] -> m ([Tree a])
 unfoldForestM_BF f = liftM toList . unfoldForestQ f . fromList
 
@@ -549,9 +550,9 @@ unfoldForestQ f aQ = case viewl aQ of
 --
 -- Implemented:
 --
--- foldrMap1, foldlMap1': Basic functions
--- foldMap, foldMap1': Implemented same as the default definition, but
--- INLINABLE to allow specialization.
+-- foldMap, foldrMap1, foldlMap1': Basic functions
+-- foldMap1': Implemented same as the default definition, but INLINABLE to
+-- allow specialization.
 -- toNonEmpty, foldlMap1: Implemented more efficiently than default.
 -- maximum, minimum: Uses Foldable's implementation.
 --

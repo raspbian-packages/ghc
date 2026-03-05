@@ -12,9 +12,10 @@ import Control.Monad.Trans.Reader
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.ByteString.Builder
+import qualified Data.ByteString.Char8 as BS8
 import Data.Coerce
 import Data.Foldable
-import qualified Data.IntSet as IS
+import qualified GHC.Data.Word64Set as WS
 import Data.Maybe
 import Data.Semigroup
 import GHC.Cmm
@@ -25,6 +26,7 @@ import GHC.CmmToAsm.Wasm.Utils
 import GHC.Data.FastString
 import GHC.Float
 import GHC.Prelude
+import GHC.Settings.Config (cProjectVersion)
 import GHC.Types.Basic
 import GHC.Types.Unique
 import GHC.Types.Unique.Map
@@ -181,9 +183,9 @@ asmTellSectionHeader :: Builder -> WasmAsmM ()
 asmTellSectionHeader k = asmTellTabLine $ ".section " <> k <> ",\"\",@"
 
 asmTellDataSection ::
-  WasmTypeTag w -> IS.IntSet -> SymName -> DataSection -> WasmAsmM ()
+  WasmTypeTag w -> WS.Word64Set -> SymName -> DataSection -> WasmAsmM ()
 asmTellDataSection ty_word def_syms sym DataSection {..} = do
-  when (getKey (getUnique sym) `IS.member` def_syms) $ asmTellDefSym sym
+  when (getKey (getUnique sym) `WS.member` def_syms) $ asmTellDefSym sym
   asmTellSectionHeader sec_name
   asmTellAlign dataSectionAlignment
   asmTellTabLine asm_size
@@ -359,6 +361,7 @@ asmTellWasmInstr ty_word instr = case instr of
   WasmF32DemoteF64 -> asmTellLine "f32.demote_f64"
   WasmF64PromoteF32 -> asmTellLine "f64.promote_f32"
   WasmAbs ty -> asmTellLine $ asmFromWasmType ty <> ".abs"
+  WasmSqrt ty -> asmTellLine $ asmFromWasmType ty <> ".sqrt"
   WasmNeg ty -> asmTellLine $ asmFromWasmType ty <> ".neg"
   WasmCond t -> do
     asmTellLine "if"
@@ -420,12 +423,12 @@ asmTellWasmControl ty_word c = case c of
 
 asmTellFunc ::
   WasmTypeTag w ->
-  IS.IntSet ->
+  WS.Word64Set ->
   SymName ->
   (([SomeWasmType], [SomeWasmType]), FuncBody w) ->
   WasmAsmM ()
 asmTellFunc ty_word def_syms sym (func_ty, FuncBody {..}) = do
-  when (getKey (getUnique sym) `IS.member` def_syms) $ asmTellDefSym sym
+  when (getKey (getUnique sym) `WS.member` def_syms) $ asmTellDefSym sym
   asmTellSectionHeader $ ".text." <> asm_sym
   asmTellLine $ asm_sym <> ":"
   asmTellFuncType sym func_ty
@@ -450,7 +453,8 @@ asmTellGlobals ty_word = do
 asmTellCtors :: WasmTypeTag w -> [SymName] -> WasmAsmM ()
 asmTellCtors _ [] = mempty
 asmTellCtors ty_word syms = do
-  asmTellSectionHeader ".init_array"
+  -- See Note [JSFFI initialization] for details
+  asmTellSectionHeader ".init_array.101"
   asmTellAlign $ alignmentFromWordType ty_word
   for_ syms $ \sym ->
     asmTellTabLine $
@@ -485,7 +489,7 @@ asmTellProducers = do
         asmTellVec
           [ do
               asmTellBS "ghc"
-              asmTellBS "9.6"
+              asmTellBS $ BS8.pack cProjectVersion
           ]
     ]
 

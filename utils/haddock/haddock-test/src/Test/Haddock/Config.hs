@@ -263,6 +263,7 @@ baseDependencies ghcPath = do
       pkgs =
         [ "array"
         , "base"
+        , "deepseq"
         , "ghc-prim"
         , "process"
         , "template-haskell"

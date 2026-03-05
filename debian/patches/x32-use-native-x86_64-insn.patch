@@ -16,8 +16,8 @@ Index: b/rts/RtsSymbols.c
 ===================================================================
 --- a/rts/RtsSymbols.c
 +++ b/rts/RtsSymbols.c
-@@ -955,7 +955,7 @@ extern char **environ;
- 
+@@ -964,7 +964,7 @@ extern char **environ;
+       RTS_INTCHAR_SYMBOLS
  
  // 64-bit support functions in libgcc.a
 -#if defined(__GNUC__) && SIZEOF_VOID_P <= 4 && !defined(_ABIN32)

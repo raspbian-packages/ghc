@@ -48,6 +48,34 @@
 	><p class="caption"
 	>TypeOperators</p
 	></div
+      ><div id="description"
+      ><p class="caption"
+	>Description</p
+	><div class="doc"
+	><p
+	  >This documentation refers to <code
+	    ><a href="#" title="Data.Type.Equality"
+	      >~</a
+	      ></code
+	    >, <code
+	    ><a href="#" title="TypeOperators"
+	      >:-:</a
+	      ></code
+	    >, <code
+	    ><a href="#" title="TypeOperators"
+	      >:+:</a
+	      ></code
+	    >, <code
+	    ><a href="#" title="TypeOperators"
+	      >&lt;=&gt;</a
+	      ></code
+	    >, and <code
+	    ><a href="#" title="TypeOperators"
+	      >|||</a
+	      ></code
+	    >.</p
+	  ></div
+	></div
       ><div id="interface"
       ><h1
 	>Documentation</h1
@@ -87,7 +115,15 @@
 	    >newtype</span
 	    > <a id="t:O" class="def"
 	    >O</a
-	    > g f a <a href="#" class="selflink"
+	    > (g :: <a href="#" title="Data.Kind"
+	    >Type</a
+	    > -&gt; <a href="#" title="Data.Kind"
+	    >Type</a
+	    >) (f :: <a href="#" title="Data.Kind"
+	    >Type</a
+	    > -&gt; <a href="#" title="Data.Kind"
+	    >Type</a
+	    >) a <a href="#" class="selflink"
 	    >#</a
 	    ></p
 	  ><div class="subs constructors"
@@ -135,11 +171,33 @@
 	  ></div
 	><div class="top"
 	><p class="src"
+	  ><span class="keyword"
+	    >type</span
+	    > <a id="t:-124--124--124-" class="def"
+	    >(|||)</a
+	    > = <a href="#" title="Data.Either"
+	    >Either</a
+	    > <a href="#" class="selflink"
+	    >#</a
+	    ></p
+	  ></div
+	><div class="top"
+	><p class="src"
 	  ><a id="v:biO" class="def"
 	    >biO</a
-	    > :: (g <a href="#" title="TypeOperators"
-	    >`O`</a
-	    > f) a <a href="#" class="selflink"
+	    > :: <span class="keyword"
+	    >forall</span
+	    > (g :: <a href="#" title="Data.Kind"
+	    >Type</a
+	    > -&gt; <a href="#" title="Data.Kind"
+	    >Type</a
+	    >) (f :: <a href="#" title="Data.Kind"
+	    >Type</a
+	    > -&gt; <a href="#" title="Data.Kind"
+	    >Type</a
+	    >) a. <a href="#" title="TypeOperators"
+	    >O</a
+	    > g f a <a href="#" class="selflink"
 	    >#</a
 	    ></p
 	  ></div
@@ -173,9 +231,9 @@
 	    >:-:</a
 	    > a) <a href="#" title="TypeOperators"
 	    >&lt;=&gt;</a
-	    > (a <a href="#" title="TypeOperators"
-	    >`Op`</a
-	    > a) =&gt; a <a href="#" class="selflink"
+	    > <a href="#" title="TypeOperators"
+	    >Op</a
+	    > a a =&gt; a <a href="#" class="selflink"
 	    >#</a
 	    ></p
 	  ></div
@@ -185,9 +243,9 @@
 	    >y</a
 	    > :: (a <a href="#" title="TypeOperators"
 	    >&lt;=&gt;</a
-	    > a, (a <a href="#" title="TypeOperators"
-	    >`Op`</a
-	    > a) <a href="#" title="TypeOperators"
+	    > a, <a href="#" title="TypeOperators"
+	    >Op</a
+	    > a a <a href="#" title="TypeOperators"
 	    >&lt;=&gt;</a
 	    > a) =&gt; a <a href="#" class="selflink"
 	    >#</a

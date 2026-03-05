@@ -24,7 +24,7 @@ free variables.
 -}
 
 module GHC.Rename.Expr (
-        rnLExpr, rnExpr, rnStmts, mkExpandedExpr,
+        rnLExpr, rnExpr, rnStmts,
         AnnoBody, UnexpectedStatement(..)
    ) where
 
@@ -46,15 +46,17 @@ import GHC.Rename.Utils ( bindLocalNamesFV, checkDupNames
                         , warnUnusedLocalBinds, typeAppErr
                         , checkUnusedRecordWildcard
                         , wrapGenSpan, genHsIntegralLit, genHsTyLit
-                        , genHsVar, genLHsVar, genHsApp, genHsApps
-                        , genAppType )
+                        , genHsVar, genLHsVar, genHsApp, genHsApps, genHsApps'
+                        , genAppType, isIrrefutableHsPat )
 import GHC.Rename.Unbound ( reportUnboundName )
 import GHC.Rename.Splice  ( rnTypedBracket, rnUntypedBracket, rnTypedSplice, rnUntypedSpliceExpr, checkThLocalName )
 import GHC.Rename.HsType
 import GHC.Rename.Pat
-import GHC.Driver.Session
+import GHC.Driver.DynFlags
 import GHC.Builtin.Names
+import GHC.Builtin.Types ( nilDataConName )
 
+import GHC.Types.Basic (TypeOrKind (TypeLevel))
 import GHC.Types.FieldLabel
 import GHC.Types.Fixity
 import GHC.Types.Id.Make
@@ -63,22 +65,21 @@ import GHC.Types.Name.Set
 import GHC.Types.Name.Reader
 import GHC.Types.Unique.Set
 import GHC.Types.SourceText
+import GHC.Types.SrcLoc
 import GHC.Utils.Misc
-import GHC.Data.List.SetOps ( removeDups )
+import GHC.Data.List.SetOps ( removeDupsOn )
+import GHC.Data.Maybe
 import GHC.Utils.Error
 import GHC.Utils.Panic
-import GHC.Utils.Panic.Plain
 import GHC.Utils.Outputable as Outputable
-import GHC.Types.SrcLoc
-import Control.Monad
-import GHC.Builtin.Types ( nilDataConName )
+
 import qualified GHC.LanguageExtensions as LangExt
 
 import Language.Haskell.Syntax.Basic (FieldLabelString(..))
 
+import Control.Monad
 import Data.List (unzip4, minimumBy)
 import Data.List.NonEmpty ( NonEmpty(..), nonEmpty )
-import Data.Maybe (isJust, isNothing)
 import Control.Arrow (first)
 import Data.Ord
 import Data.Array
@@ -86,18 +87,26 @@ import qualified Data.List.NonEmpty as NE
 
 {- Note [Handling overloaded and rebindable constructs]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Nomenclature
+-------------
+* Expansion (`HsExpr GhcRn -> HsExpr GhcRn`): expand between renaming and
+  typechecking, using the `XXExprGhcRn` constructor of `HsExpr`.
+* Desugaring (`HsExpr GhcTc -> Core.Expr`): convert the typechecked `HsSyn` to Core.  This is done in GHC.HsToCore
+
+
 For overloaded constructs (overloaded literals, lists, strings), and
 rebindable constructs (e.g. if-then-else), our general plan is this,
 using overloaded labels #foo as an example:
 
 * In the RENAMER: transform
       HsOverLabel "foo"
-      ==> XExpr (HsExpansion (HsOverLabel #foo)
-                             (fromLabel `HsAppType` "foo"))
+      ==> XExpr (ExpandedThingRn (HsOverLabel #foo)
+                                 (fromLabel `HsAppType` "foo"))
   We write this more compactly in concrete-syntax form like this
       #foo  ==>  fromLabel @"foo"
 
-  Recall that in (HsExpansion orig expanded), 'orig' is the original term
+  Recall that in (ExpandedThingRn orig expanded), 'orig' is the original term
   the user wrote, and 'expanded' is the expanded or desugared version
   to be typechecked.
 
@@ -106,7 +115,7 @@ using overloaded labels #foo as an example:
   The typechecker (and desugarer) will never see HsOverLabel
 
 In effect, the renamer does a bit of desugaring. Recall GHC.Hs.Expr
-Note [Rebindable syntax and HsExpansion], which describes the use of HsExpansion.
+Note [Rebindable syntax and XXExprGhcRn], which describes the use of XXExprGhcRn.
 
 RebindableSyntax:
   If RebindableSyntax is off we use the built-in 'fromLabel', defined in
@@ -132,7 +141,7 @@ but several have a little bit of special treatment:
 * OverLabel (overloaded labels, #lbl)
      #lbl  ==>  fromLabel @"lbl"
   As ever, we use lookupSyntaxName to look up 'fromLabel'
-  See Note [Overloaded labels]
+  See Note [Overloaded labels] below
 
 * ExplicitList (explicit lists [a,b,c])
   When (and only when) OverloadedLists is on
@@ -146,13 +155,8 @@ but several have a little bit of special treatment:
   where `leftSection` and `rightSection` are representation-polymorphic
   wired-in Ids. See Note [Left and right sections]
 
-* It's a bit painful to transform `OpApp e1 op e2` to a `HsExpansion`
-  form, because the renamer does precedence rearrangement after name
-  resolution.  So the renamer leaves an OpApp as an OpApp.
-
-  The typechecker turns `OpApp` into a use of `HsExpansion`
-  on the fly, in GHC.Tc.Gen.Head.splitHsApps.  RebindableSyntax
-  does not affect this.
+* To understand why expansions for `OpApp` is done in `GHC.Tc.Gen.Head.splitHsApps`
+  see Note [Doing XXExprGhcRn in the Renamer vs Typechecker] below.
 
 * RecordUpd: we desugar record updates into case expressions,
   in GHC.Tc.Gen.Expr.tcExpr.
@@ -174,20 +178,24 @@ but several have a little bit of special treatment:
 
   See Note [Record Updates] in GHC.Tc.Gen.Expr for more details.
 
-  This is done in the typechecker, not the renamer, for two reasons:
+  To understand Why is this done in the typechecker, and not in the renamer
+  see Note [Doing XXExprGhcRn in the Renamer vs Typechecker]
 
-    - (Until we implement GHC proposal #366)
-      We need to know the type of the record to disambiguate its fields.
+* HsDo: We expand `HsDo` statements in `Ghc.Tc.Gen.Do`.
 
-    - We use the type signature of the data constructor to provide IdSigs
-      to the let-bound variables (x', y' in the example above). This is
-      needed to accept programs such as
+    - For example, a user written code:
 
-        data R b = MkR { f :: (forall a. a -> a) -> (Int,b), c :: Int }
-        foo r = r { f = \ k -> (k 3, k 'x') }
+                  do { x <- e1 ; g x ; return (f x) }
 
-      in which an updated field has a higher-rank type.
-      See Wrinkle [Using IdSig] in Note [Record Updates] in GHC.Tc.Gen.Expr.
+      is expanded to:
+
+                   (>>=) e1
+                         (\x -> ((>>) (g x)
+                                      (return (f x))))
+
+     See Note [Expanding HsDo with XXExprGhcRn] in `Ghc.Tc.Gen.Do` for more details.
+     To understand why is this done in the typechecker and not in the renamer.
+     See Note [Doing XXExprGhcRn in the Renamer vs Typechecker]
 
 Note [Overloaded labels]
 ~~~~~~~~~~~~~~~~~~~~~~~~
@@ -207,6 +215,66 @@ type-applying to "foo", so we get
 
 And those inferred kind quantifiers will indeed be instantiated when we
 typecheck the renamed-syntax call (fromLabel @"foo").
+
+Note [Doing XXExprGhcRn in the Renamer vs Typechecker]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+We expand some `HsExpr GhcRn` code at various places, usually, on the fly,
+depending on when it is more convenient. It may be beneficial to have a
+separate `HsExpr GhcRn -> HsExpr GhcRn` pass that does this expansion uniformly
+in the future when we have enough cases to cater for. For the time being,
+this note documents which language feature is expanded at which phase,
+and the reasons for doing so.
+
+  ** `HsIf` Expansions
+  --------------------
+  `HsIf` expansions are expanded in the Renamer becuase it is more convinent
+  to do so there and then not worry about it in the later stage.
+  `-XRebindableSyntax` is used to decide whether we use the `HsIf` or user defined if
+
+
+  ** `OpApp` Expansions
+  ---------------------
+  The typechecker turns `OpApp` into a use of `XXExprGhcRn`
+  on the fly, in `GHC.Tc.Gen.Head.splitHsApps`.
+  The language extension `RebindableSyntax` does not affect this behaviour.
+
+  It's a bit painful to transform `OpApp e1 op e2` to a `XXExprGhcRn`
+  form, because the renamer does precedence rearrangement after name
+  resolution. So the renamer leaves an `OpApp` as an `OpApp`.
+
+  ** Record Update Syntax `RecordUpd` Expansions
+  ----------------------------------------------
+  This is done in the typechecker on the fly (`GHC.Tc.Expr.tcExpr`), and not the renamer, for two reasons:
+
+    - (Until we implement GHC proposal #366)
+      We need to know the type of the record to disambiguate its fields.
+
+    - We use the type signature of the data constructor to provide `IdSigs`
+      to the let-bound variables (x', y' in the example of
+      Note [Handling overloaded and rebindable constructs] above).
+      This is needed to accept programs such as
+
+          data R b = MkR { f :: (forall a. a -> a) -> (Int,b), c :: Int }
+          foo r = r { f = \ k -> (k 3, k 'x') }
+
+      in which an updated field has a higher-rank type.
+      See Wrinkle [Using IdSig] in Note [Record Updates] in GHC.Tc.Gen.Expr.
+
+  ** `HsDo` Statement Expansions
+  -----------------------------------
+  The expansion for do block statements is done on the fly right before typechecking in `GHC.Tc.Gen.Expr`
+  using `GHC.Tc.Gen.Do.expandDoStmts`. There are 2 main reasons:
+
+  -  During the renaming phase, we may not have all the constructor details `HsConDetails` populated in the
+     data structure. This would result in an inaccurate irrefutability analysis causing
+     the continuation lambda body to be wrapped with `fail` alternatives when not needed.
+     See Part 1. of Note [Expanding HsDo with XXExprGhcRn] (test pattern-fails.hs)
+
+  -  If the expansion is done on the fly during renaming, expressions that
+     have explicit type applications using (-XTypeApplciations) will not work (cf. Let statements expansion)
+     as the name freshening happens from the root of the AST to the leaves,
+     but the expansion happens in the opposite direction (from leaves to the root),
+     causing the renamer to miss the scoped type variables.
 -}
 
 {-
@@ -243,7 +311,7 @@ finishHsVar (L l name)
  = do { this_mod <- getModule
       ; when (nameIsLocalOrFrom this_mod name) $
         checkThLocalName name
-      ; return (HsVar noExtField (L (la2na l) name), unitFV name) }
+      ; return (HsVar noExtField (L (l2l l) name), unitFV name) }
 
 rnUnboundVar :: RdrName -> RnM (HsExpr GhcRn, FreeVars)
 rnUnboundVar v = do
@@ -254,28 +322,33 @@ rnUnboundVar v = do
 
 rnExpr (HsVar _ (L l v))
   = do { dflags <- getDynFlags
-       ; mb_name <- lookupExprOccRn v
-
-       ; case mb_name of {
+       ; mb_gre <- lookupExprOccRn v
+       ; case mb_gre of {
            Nothing -> rnUnboundVar v ;
-           Just (NormalGreName name)
-              | name == nilDataConName -- Treat [] as an ExplicitList, so that
-                                       -- OverloadedLists works correctly
-                                       -- Note [Empty lists] in GHC.Hs.Expr
-              , xopt LangExt.OverloadedLists dflags
-              -> rnExpr (ExplicitList noAnn [])
+           Just gre ->
+    do { let nm   = greName gre
+             info = greInfo gre
+       ; if | IAmRecField fld_info <- info
+            -- Since GHC 9.4, such occurrences of record fields must be
+            -- unambiguous. For ambiguous occurrences, we arbitrarily pick one
+            -- matching GRE and add a name clash error
+            -- (see lookupGlobalOccRn_overloaded, called by lookupExprOccRn).
+            -> do { let sel_name = flSelector $ recFieldLabel fld_info
+                  ; this_mod <- getModule
+                  ; when (nameIsLocalOrFrom this_mod sel_name) $
+                      checkThLocalName sel_name
+                  ; return (HsRecSel noExtField (FieldOcc sel_name (L l v) ), unitFV sel_name)
+                  }
+            | nm == nilDataConName
+              -- Treat [] as an ExplicitList, so that
+              -- OverloadedLists works correctly
+              -- Note [Empty lists] in GHC.Hs.Expr
+            , xopt LangExt.OverloadedLists dflags
+            -> rnExpr (ExplicitList noAnn [])
 
-              | otherwise
-              -> finishHsVar (L (na2la l) name) ;
-            Just (FieldGreName fl)
-              -> do { let sel_name = flSelector fl
-                    ; this_mod <- getModule
-                    ; when (nameIsLocalOrFrom this_mod sel_name) $
-                        checkThLocalName sel_name
-                    ; return ( HsRecSel noExtField (FieldOcc sel_name (L l v) ), unitFV sel_name)
-                    }
-         }
-       }
+            | otherwise
+            -> finishHsVar (L (l2l l) nm)
+        }}}
 
 rnExpr (HsIPVar x v)
   = return (HsIPVar x v, emptyFVs)
@@ -286,8 +359,8 @@ rnExpr (HsUnboundVar _ v)
 -- HsOverLabel: see Note [Handling overloaded and rebindable constructs]
 rnExpr (HsOverLabel _ src v)
   = do { (from_label, fvs) <- lookupSyntaxName fromLabelClassOpName
-       ; return ( mkExpandedExpr (HsOverLabel noAnn src v) $
-                  HsAppType noExtField (genLHsVar from_label) noHsTok hs_ty_arg
+       ; return ( mkExpandedExpr (HsOverLabel noExtField src v) $
+                  HsAppType noExtField (genLHsVar from_label) hs_ty_arg
                 , fvs ) }
   where
     hs_ty_arg = mkEmptyWildCardBndrs $ wrapGenSpan $
@@ -310,7 +383,7 @@ rnExpr (HsOverLit x lit)
        ; case mb_neg of
               Nothing -> return (HsOverLit x lit', fvs)
               Just neg ->
-                 return (HsApp noComments (noLocA neg) (noLocA (HsOverLit x lit'))
+                 return (HsApp noExtField (noLocA neg) (noLocA (HsOverLit x lit'))
                         , fvs ) }
 
 rnExpr (HsApp x fun arg)
@@ -318,12 +391,12 @@ rnExpr (HsApp x fun arg)
        ; (arg',fvArg) <- rnLExpr arg
        ; return (HsApp x fun' arg', fvFun `plusFV` fvArg) }
 
-rnExpr (HsAppType _ fun at arg)
+rnExpr (HsAppType _ fun arg)
   = do { type_app <- xoptM LangExt.TypeApplications
-       ; unless type_app $ addErr $ typeAppErr "type" $ hswc_body arg
+       ; unless type_app $ addErr $ typeAppErr TypeLevel $ hswc_body arg
        ; (fun',fvFun) <- rnLExpr fun
        ; (arg',fvArg) <- rnHsWcType HsTypeCtx arg
-       ; return (HsAppType NoExtField fun' at arg', fvFun `plusFV` fvArg) }
+       ; return (HsAppType noExtField fun' arg', fvFun `plusFV` fvArg) }
 
 rnExpr (OpApp _ e1 op e2)
   = do  { (e1', fv_e1) <- rnLExpr e1
@@ -385,17 +458,17 @@ rnExpr (HsUntypedSplice _ splice) = rnUntypedSpliceExpr splice
 ---------------------------------------------
 --      Sections
 -- See Note [Parsing sections] in GHC.Parser
-rnExpr (HsPar x lpar (L loc (section@(SectionL {}))) rpar)
+rnExpr (HsPar _ (L loc (section@(SectionL {}))))
   = do  { (section', fvs) <- rnSection section
-        ; return (HsPar x lpar (L loc section') rpar, fvs) }
+        ; return (HsPar noExtField (L loc section'), fvs) }
 
-rnExpr (HsPar x lpar (L loc (section@(SectionR {}))) rpar)
+rnExpr (HsPar _ (L loc (section@(SectionR {}))))
   = do  { (section', fvs) <- rnSection section
-        ; return (HsPar x lpar (L loc section') rpar, fvs) }
+        ; return (HsPar noExtField (L loc section'), fvs) }
 
-rnExpr (HsPar x lpar e rpar)
+rnExpr (HsPar _ e)
   = do  { (e', fvs_e) <- rnLExpr e
-        ; return (HsPar x lpar e' rpar, fvs_e) }
+        ; return (HsPar noExtField e', fvs_e) }
 
 rnExpr expr@(SectionL {})
   = do  { addErr (sectionErr expr); rnSection expr }
@@ -410,23 +483,19 @@ rnExpr (HsPragE x prag expr)
     rn_prag :: HsPragE GhcPs -> HsPragE GhcRn
     rn_prag (HsPragSCC x ann) = HsPragSCC x ann
 
-rnExpr (HsLam x matches)
-  = do { (matches', fvMatch) <- rnMatchGroup LambdaExpr rnLExpr matches
-       ; return (HsLam x matches', fvMatch) }
-
-rnExpr (HsLamCase x lc_variant matches)
-  = do { (matches', fvs_ms) <- rnMatchGroup (LamCaseAlt lc_variant) rnLExpr matches
-       ; return (HsLamCase x lc_variant matches', fvs_ms) }
+rnExpr (HsLam x lam_variant matches)
+  = do { (matches', fvs_ms) <- rnMatchGroup (LamAlt lam_variant) rnLExpr matches
+       ; return (HsLam x lam_variant matches', fvs_ms) }
 
 rnExpr (HsCase _ expr matches)
   = do { (new_expr, e_fvs) <- rnLExpr expr
        ; (new_matches, ms_fvs) <- rnMatchGroup CaseAlt rnLExpr matches
-       ; return (HsCase noExtField new_expr new_matches, e_fvs `plusFV` ms_fvs) }
+       ; return (HsCase CaseAlt new_expr new_matches, e_fvs `plusFV` ms_fvs) }
 
-rnExpr (HsLet _ tkLet binds tkIn expr)
+rnExpr (HsLet _ binds expr)
   = rnLocalBindsAndThen binds $ \binds' _ -> do
       { (expr',fvExpr) <- rnLExpr expr
-      ; return (HsLet noExtField tkLet binds' tkIn expr', fvExpr) }
+      ; return (HsLet noExtField binds' expr', fvExpr) }
 
 rnExpr (HsDo _ do_or_lc (L l stmts))
  = do { ((stmts1, _), fvs1) <-
@@ -434,7 +503,6 @@ rnExpr (HsDo _ do_or_lc (L l stmts))
             (\ _ -> return ((), emptyFVs))
       ; (pp_stmts, fvs2) <- postProcessStmtsForApplicativeDo do_or_lc stmts1
       ; return ( HsDo noExtField do_or_lc (L l pp_stmts), fvs1 `plusFV` fvs2 ) }
-
 -- ExplicitList: see Note [Handling overloaded and rebindable constructs]
 rnExpr (ExplicitList _ exps)
   = do  { (exps', fvs) <- rnExprs exps
@@ -443,10 +511,11 @@ rnExpr (ExplicitList _ exps)
           then return  (ExplicitList noExtField exps', fvs)
           else
     do { (from_list_n_name, fvs') <- lookupSyntaxName fromListNName
+       ; loc <- getSrcSpanM -- See Note [Source locations for implicit function calls]
        ; let rn_list  = ExplicitList noExtField exps'
              lit_n    = mkIntegralLit (length exps)
              hs_lit   = genHsIntegralLit lit_n
-             exp_list = genHsApps from_list_n_name [hs_lit, wrapGenSpan rn_list]
+             exp_list = genHsApps' (L (noAnnSrcSpan loc) from_list_n_name) [hs_lit, wrapGenSpan rn_list]
        ; return ( mkExpandedExpr rn_list exp_list
                 , fvs `plusFV` fvs') } }
 
@@ -463,9 +532,9 @@ rnExpr (ExplicitSum _ alt arity expr)
   = do { (expr', fvs) <- rnLExpr expr
        ; return (ExplicitSum noExtField alt arity expr', fvs) }
 
-rnExpr (RecordCon { rcon_con = con_id
+rnExpr (RecordCon { rcon_con = con_rdr
                   , rcon_flds = rec_binds@(HsRecFields { rec_dotdot = dd }) })
-  = do { con_lname@(L _ con_name) <- lookupLocatedOccRnConstr con_id
+  = do { con_lname@(L _ con_name) <- lookupLocatedOccRnConstr con_rdr
        ; (flds, fvs)   <- rnHsRecFields (HsRecFieldCon con_name) mk_hs_var rec_binds
        ; (flds', fvss) <- mapAndUnzipM rn_field flds
        ; let rec_binds' = HsRecFields { rec_flds = flds', rec_dotdot = dd }
@@ -477,29 +546,42 @@ rnExpr (RecordCon { rcon_con = con_id
     rn_field (L l fld) = do { (arg', fvs) <- rnLExpr (hfbRHS fld)
                             ; return (L l (fld { hfbRHS = arg' }), fvs) }
 
-rnExpr (RecordUpd { rupd_expr = expr, rupd_flds = rbinds })
-  = case rbinds of
-      Left flds -> -- 'OverloadedRecordUpdate' is not in effect. Regular record update.
-        do  { ; (e, fv_e) <- rnLExpr expr
-              ; (rs, fv_rs) <- rnHsRecUpdFields flds
-              ; return ( RecordUpd noExtField e (Left rs), fv_e `plusFV` fv_rs )
-            }
-      Right flds ->  -- 'OverloadedRecordUpdate' is in effect. Record dot update desugaring.
-        do { ; unlessXOptM LangExt.RebindableSyntax $
-                 addErr TcRnNoRebindableSyntaxRecordDot
-             ; let punnedFields = [fld | (L _ fld) <- flds, hfbPun fld]
-             ; punsEnabled <-xoptM LangExt.NamedFieldPuns
-             ; unless (null punnedFields || punsEnabled) $
-                 addErr TcRnNoFieldPunsRecordDot
-             ; (getField, fv_getField) <- lookupSyntaxName getFieldName
-             ; (setField, fv_setField) <- lookupSyntaxName setFieldName
-             ; (e, fv_e) <- rnLExpr expr
-             ; (us, fv_us) <- rnHsUpdProjs flds
-             ; return ( mkExpandedExpr
-                          (RecordUpd noExtField e (Right us))
-                          (mkRecordDotUpd getField setField e us)
-                         , plusFVs [fv_getField, fv_setField, fv_e, fv_us] )
-             }
+rnExpr (RecordUpd { rupd_expr = L l expr, rupd_flds = rbinds })
+  = setSrcSpanA l $
+    case rbinds of
+
+      -- 'OverloadedRecordUpdate' is not in effect. Regular record update.
+      RegularRecUpdFields { recUpdFields = flds } ->
+        do  { (e, fv_e) <- rnExpr expr
+            ; (parents, flds, fv_flds) <- rnHsRecUpdFields flds
+            ; let upd_flds =
+                    RegularRecUpdFields
+                    { xRecUpdFields = parents
+                    , recUpdFields  = flds }
+            ; return ( RecordUpd noExtField (L l e) upd_flds
+                     , fv_e `plusFV` fv_flds ) }
+
+      -- 'OverloadedRecordUpdate' is in effect. Record dot update desugaring.
+      OverloadedRecUpdFields { olRecUpdFields = flds } ->
+        do { unlessXOptM LangExt.RebindableSyntax $
+               addErr TcRnNoRebindableSyntaxRecordDot
+           ; let punnedFields = [fld | (L _ fld) <- flds, hfbPun fld]
+           ; punsEnabled <- xoptM LangExt.NamedFieldPuns
+           ; unless (null punnedFields || punsEnabled) $
+               addErr TcRnNoFieldPunsRecordDot
+           ; (getField, fv_getField) <- lookupSyntaxName getFieldName
+           ; (setField, fv_setField) <- lookupSyntaxName setFieldName
+           ; (e, fv_e) <- rnExpr expr
+           ; (us, fv_us) <- rnHsUpdProjs flds
+            ; let upd_flds = OverloadedRecUpdFields
+                            { xOLRecUpdFields = noExtField
+                            , olRecUpdFields  = us }
+            ; return ( mkExpandedExpr
+                         (RecordUpd noExtField (L l e) upd_flds)
+                         (mkRecordDotUpd getField setField (L l e) us)
+                        , plusFVs [fv_getField, fv_setField, fv_e, fv_us] ) }
+
+rnExpr (HsRecSel x _) = dataConCantHappen x
 
 rnExpr (ExprWithTySig _ expr pty)
   = do  { (pty', fvTy)    <- rnHsSigWcType ExprWithTySigCtx pty
@@ -510,24 +592,7 @@ rnExpr (ExprWithTySig _ expr pty)
 -- HsIf: see Note [Handling overloaded and rebindable constructs]
 -- Because of the coverage checker it is most convenient /not/ to
 -- expand HsIf; unless we are in rebindable syntax.
-rnExpr (HsIf _ p b1 b2)
-  = do { (p',  fvP)  <- rnLExpr p
-       ; (b1', fvB1) <- rnLExpr b1
-       ; (b2', fvB2) <- rnLExpr b2
-       ; let fvs_if = plusFVs [fvP, fvB1, fvB2]
-             rn_if  = HsIf noExtField  p' b1' b2'
-
-       -- Deal with rebindable syntax
-       -- See Note [Handling overloaded and rebindable constructs]
-       ; mb_ite <- lookupIfThenElse
-       ; case mb_ite of
-            Nothing  -- Non rebindable-syntax case
-              -> return (rn_if, fvs_if)
-
-            Just ite_name   -- Rebindable-syntax case
-              -> do { let ds_if = genHsApps ite_name [p', b1', b2']
-                          fvs   = plusFVs [fvs_if, unitFV ite_name]
-                    ; return (mkExpandedExpr rn_if ds_if, fvs) } }
+rnExpr (HsIf _ p b1 b2) = rnHsIf p b1 b2
 
 rnExpr (HsMultiIf _ alts)
   = do { (alts', fvs) <- mapFvRn (rnGRHS IfAlt rnLExpr) alts
@@ -543,6 +608,10 @@ rnExpr (ArithSeq _ _ seq)
                      , fvs `plusFV` fvs') }
            else
             return (ArithSeq noExtField Nothing new_seq, fvs) }
+
+rnExpr (HsEmbTy _ ty)
+  = do { (ty', fvs) <- rnHsWcType HsTypeCtx ty
+       ; return (HsEmbTy noExtField ty', fvs) }
 
 {-
 ************************************************************************
@@ -569,8 +638,8 @@ rnExpr e@(HsStatic _ expr) = do
     (expr',fvExpr) <- rnLExpr expr
     stage <- getStage
     case stage of
-      Splice _ -> addErr $ TcRnIllegalStaticFormInSplice e
-      _ -> return ()
+      Splice _ -> addErr $ TcRnTHError $ IllegalStaticFormInSplice e
+      _        -> return ()
     mod <- getModule
     let fvExpr' = filterNameSet (nameIsLocalOrFrom mod) fvExpr
     return (HsStatic fvExpr' expr', fvExpr)
@@ -587,9 +656,6 @@ rnExpr (HsProc x pat body)
     rnPat (ArrowMatchCtxt ProcExpr) pat $ \ pat' -> do
       { (body',fvBody) <- rnCmdTop body
       ; return (HsProc x pat' body', fvBody) }
-
-rnExpr other = pprPanic "rnExpr: unexpected expression" (ppr other)
-        -- HsWrap
 
 {-
 ************************************************************************
@@ -622,9 +688,9 @@ rnSection section@(SectionL x expr op)
                         -- Note [Left and right sections]
         ; let rn_section = SectionL x expr' op'
               ds_section
-                | postfix_ops = HsApp noAnn op' expr'
+                | postfix_ops = HsApp noExtField op' expr'
                 | otherwise   = genHsApps leftSectionName
-                                   [wrapGenSpan $ HsApp noAnn op' expr']
+                                   [wrapGenSpan $ HsApp noExtField op' expr']
         ; return ( mkExpandedExpr rn_section ds_section
                  , fvs_op `plusFV` fvs_expr) }
 
@@ -861,24 +927,20 @@ rnCmd (HsCmdApp x fun arg)
        ; (arg',fvArg) <- rnLExpr arg
        ; return (HsCmdApp x fun' arg', fvFun `plusFV` fvArg) }
 
-rnCmd (HsCmdLam _ matches)
-  = do { (matches', fvMatch) <- rnMatchGroup (ArrowMatchCtxt KappaExpr) rnLCmd matches
-       ; return (HsCmdLam noExtField matches', fvMatch) }
+rnCmd (HsCmdLam x lam_variant matches)
+  = do { let ctxt = ArrowMatchCtxt $ ArrowLamAlt lam_variant
+       ; (new_matches, ms_fvs) <- rnMatchGroup ctxt rnLCmd matches
+       ; return (HsCmdLam x lam_variant new_matches, ms_fvs) }
 
-rnCmd (HsCmdPar x lpar e rpar)
+rnCmd (HsCmdPar _ e)
   = do  { (e', fvs_e) <- rnLCmd e
-        ; return (HsCmdPar x lpar e' rpar, fvs_e) }
+        ; return (HsCmdPar noExtField e', fvs_e) }
 
 rnCmd (HsCmdCase _ expr matches)
   = do { (new_expr, e_fvs) <- rnLExpr expr
        ; (new_matches, ms_fvs) <- rnMatchGroup (ArrowMatchCtxt ArrowCaseAlt) rnLCmd matches
        ; return (HsCmdCase noExtField new_expr new_matches
                 , e_fvs `plusFV` ms_fvs) }
-
-rnCmd (HsCmdLamCase x lc_variant matches)
-  = do { (new_matches, ms_fvs) <-
-           rnMatchGroup (ArrowMatchCtxt $ ArrowLamCaseAlt lc_variant) rnLCmd matches
-       ; return (HsCmdLamCase x lc_variant new_matches, ms_fvs) }
 
 rnCmd (HsCmdIf _ _ p b1 b2)
   = do { (p', fvP) <- rnLExpr p
@@ -892,10 +954,10 @@ rnCmd (HsCmdIf _ _ p b1 b2)
 
        ; return (HsCmdIf noExtField ite p' b1' b2', plusFVs [fvITE, fvP, fvB1, fvB2])}
 
-rnCmd (HsCmdLet _ tkLet binds tkIn cmd)
+rnCmd (HsCmdLet _ binds cmd)
   = rnLocalBindsAndThen binds $ \ binds' _ -> do
       { (cmd',fvExpr) <- rnLCmd cmd
-      ; return (HsCmdLet noExtField tkLet binds' tkIn cmd', fvExpr) }
+      ; return (HsCmdLet noExtField binds' cmd', fvExpr) }
 
 rnCmd (HsCmdDo _ (L l stmts))
   = do  { ((stmts', _), fvs) <-
@@ -918,20 +980,18 @@ methodNamesCmd (HsCmdArrApp _ _arrow _arg HsHigherOrderApp _rtl)
   = unitFV appAName
 methodNamesCmd (HsCmdArrForm {}) = emptyFVs
 
-methodNamesCmd (HsCmdPar _ _ c _) = methodNamesLCmd c
+methodNamesCmd (HsCmdPar _ c) = methodNamesLCmd c
 
 methodNamesCmd (HsCmdIf _ _ _ c1 c2)
   = methodNamesLCmd c1 `plusFV` methodNamesLCmd c2 `addOneFV` choiceAName
 
-methodNamesCmd (HsCmdLet _ _ _ _ c)      = methodNamesLCmd c
+methodNamesCmd (HsCmdLet _ _ c)          = methodNamesLCmd c
 methodNamesCmd (HsCmdDo _ (L _ stmts))   = methodNamesStmts stmts
 methodNamesCmd (HsCmdApp _ c _)          = methodNamesLCmd c
-methodNamesCmd (HsCmdLam _ match)        = methodNamesMatch match
 
-methodNamesCmd (HsCmdCase _ _ matches)
-  = methodNamesMatch matches `addOneFV` choiceAName
-methodNamesCmd (HsCmdLamCase _ _ matches)
-  = methodNamesMatch matches `addOneFV` choiceAName
+methodNamesCmd (HsCmdCase _ _ matches)        = methodNamesMatch matches `addOneFV` choiceAName
+methodNamesCmd (HsCmdLam _ LamSingle matches) = methodNamesMatch matches
+methodNamesCmd (HsCmdLam _ _         matches) = methodNamesMatch matches `addOneFV` choiceAName
 
 --methodNamesCmd _ = emptyFVs
    -- Other forms can't occur in commands, but it's not convenient
@@ -1041,7 +1101,7 @@ type AnnoBody body
 
 -- | Rename some Stmts
 rnStmts :: AnnoBody body
-        => HsStmtContext GhcRn
+        => HsStmtContextRn
         -> (body GhcPs -> RnM (body GhcRn, FreeVars))
            -- ^ How to rename the body of each statement (e.g. rnLExpr)
         -> [LStmt GhcPs (LocatedA (body GhcPs))]
@@ -1077,14 +1137,14 @@ postProcessStmtsForApplicativeDo ctxt stmts
 
 -- | strip the FreeVars annotations from statements
 noPostProcessStmts
-  :: HsStmtContext GhcRn
+  :: HsStmtContextRn
   -> [(LStmt GhcRn (LocatedA (body GhcRn)), FreeVars)]
   -> RnM ([LStmt GhcRn (LocatedA (body GhcRn))], FreeVars)
 noPostProcessStmts _ stmts = return (map fst stmts, emptyNameSet)
 
 
 rnStmtsWithFreeVars :: AnnoBody body
-        => HsStmtContext GhcRn
+        => HsStmtContextRn
         -> ((body GhcPs) -> RnM ((body GhcRn), FreeVars))
         -> [LStmt GhcPs (LocatedA (body GhcPs))]
         -> ([Name] -> RnM (thing, FreeVars))
@@ -1147,7 +1207,7 @@ At one point we failed to make this distinction, leading to #11216.
 -}
 
 rnStmt :: AnnoBody body
-       => HsStmtContext GhcRn
+       => HsStmtContextRn
        -> (body GhcPs -> RnM (body GhcRn, FreeVars))
           -- ^ How to rename the body of the statement
        -> LStmt GhcPs (LocatedA (body GhcPs))
@@ -1166,7 +1226,7 @@ rnStmt ctxt rnBody (L loc (LastStmt _ (L lb body) noret _)) thing_inside
                             else return (noSyntaxExpr, emptyFVs)
                             -- The 'return' in a LastStmt is used only
                             -- for MonadComp; and we don't want to report
-                            -- "non in scope: return" in other cases
+                            -- "not in scope: return" in other cases
                             -- #15607
 
         ; (thing,  fvs3) <- thing_inside []
@@ -1292,7 +1352,7 @@ rnStmt ctxt _ (L loc (TransStmt { trS_stmts = stmts, trS_by = by, trS_form = for
 rnStmt _ _ (L _ ApplicativeStmt{}) _ =
   panic "rnStmt: ApplicativeStmt"
 
-rnParallelStmts :: forall thing. HsStmtContext GhcRn
+rnParallelStmts :: forall thing. HsStmtContextRn
                 -> SyntaxExpr GhcRn
                 -> [ParStmtBlock GhcPs GhcPs]
                 -> ([Name] -> RnM (thing, FreeVars))
@@ -1306,7 +1366,7 @@ rnParallelStmts ctxt return_op segs thing_inside
             -> [Name] -> [ParStmtBlock GhcPs GhcPs]
             -> RnM (([ParStmtBlock GhcRn GhcRn], thing), FreeVars)
     rn_segs _ bndrs_so_far []
-      = do { let (bndrs', dups) = removeDups cmpByOcc bndrs_so_far
+      = do { let (bndrs', dups) = removeDupsOn nameOccName bndrs_so_far
            ; mapM_ dupErr dups
            ; (thing, fvs) <- bindLocalNames bndrs' (thing_inside bndrs')
            ; return (([], thing), fvs) }
@@ -1322,10 +1382,9 @@ rnParallelStmts ctxt return_op segs thing_inside
            ; let seg' = ParStmtBlock x stmts' used_bndrs return_op
            ; return ((seg':segs', thing), fvs) }
 
-    cmpByOcc n1 n2 = nameOccName n1 `compare` nameOccName n2
     dupErr vs = addErr $ TcRnListComprehensionDuplicateBinding (NE.head vs)
 
-lookupQualifiedDoStmtName :: HsStmtContext GhcRn -> Name -> RnM (SyntaxExpr GhcRn, FreeVars)
+lookupQualifiedDoStmtName :: HsStmtContextRn -> Name -> RnM (SyntaxExpr GhcRn, FreeVars)
 -- Like lookupStmtName, but respects QualifiedDo
 lookupQualifiedDoStmtName ctxt n
   = case qualifiedDoModuleName_maybe ctxt of
@@ -1333,7 +1392,7 @@ lookupQualifiedDoStmtName ctxt n
       Just modName ->
         first (mkSyntaxExpr . nl_HsVar) <$> lookupNameWithQualifier n modName
 
-lookupStmtName :: HsStmtContext GhcRn -> Name -> RnM (SyntaxExpr GhcRn, FreeVars)
+lookupStmtName :: HsStmtContextRn -> Name -> RnM (SyntaxExpr GhcRn, FreeVars)
 -- Like lookupSyntax, but respects contexts
 lookupStmtName ctxt n
   | rebindableContext ctxt
@@ -1341,7 +1400,7 @@ lookupStmtName ctxt n
   | otherwise
   = return (mkRnSyntaxExpr n, emptyFVs)
 
-lookupStmtNamePoly :: HsStmtContext GhcRn -> Name -> RnM (HsExpr GhcRn, FreeVars)
+lookupStmtNamePoly :: HsStmtContextRn -> Name -> RnM (HsExpr GhcRn, FreeVars)
 lookupStmtNamePoly ctxt name
   | rebindableContext ctxt
   = do { rebindable_on <- xoptM LangExt.RebindableSyntax
@@ -1357,7 +1416,7 @@ lookupStmtNamePoly ctxt name
 -- | Is this a context where we respect RebindableSyntax?
 -- but ListComp are never rebindable
 -- Neither is ArrowExpr, which has its own desugarer in GHC.HsToCore.Arrows
-rebindableContext :: HsStmtContext GhcRn -> Bool
+rebindableContext :: HsStmtContextRn -> Bool
 rebindableContext ctxt = case ctxt of
   HsDoStmt flavour -> rebindableDoStmtContext flavour
   ArrowExpr -> False
@@ -1413,7 +1472,7 @@ type Segment stmts = (Defs,
 
 -- wrapper that does both the left- and right-hand sides
 rnRecStmtsAndThen :: AnnoBody body
-                  => HsStmtContext GhcRn
+                  => HsStmtContextRn
                   -> (body GhcPs -> RnM (body GhcRn, FreeVars))
                   -> [LStmt GhcPs (LocatedA (body GhcPs))]
                          -- assumes that the FreeVars returned includes
@@ -1432,7 +1491,7 @@ rnRecStmtsAndThen ctxt rnBody s cont
         ; let bound_names = collectLStmtsBinders CollNoDictBinders (map fst new_lhs_and_fv)
               -- Fake uses of variables introduced implicitly (warning suppression, see #4404)
               rec_uses = lStmtsImplicits (map fst new_lhs_and_fv)
-              implicit_uses = mkNameSet $ concatMap snd $ rec_uses
+              implicit_uses = mkNameSet $ concatMap (concatMap implFlBndr_binders . snd) $ rec_uses
         ; bindLocalNamesFV bound_names $
           addLocalFixities fix_env bound_names $ do
 
@@ -1518,7 +1577,7 @@ rn_rec_stmts_lhs fix_env stmts
 -- right-hand-sides
 
 rn_rec_stmt :: AnnoBody body =>
-               HsStmtContext GhcRn
+               HsStmtContextRn
             -> (body GhcPs -> RnM (body GhcRn, FreeVars))
             -> [Name]
             -> (LStmtLR GhcRn GhcPs (LocatedA (body GhcPs)), FreeVars)
@@ -1577,7 +1636,7 @@ rn_rec_stmt _ _ _ stmt@(L _ (ApplicativeStmt {}), _)
   = pprPanic "rn_rec_stmt: ApplicativeStmt" (ppr stmt)
 
 rn_rec_stmts :: AnnoBody body
-             => HsStmtContext GhcRn
+             => HsStmtContextRn
              -> (body GhcPs -> RnM (body GhcRn, FreeVars))
              -> [Name]
              -> [(LStmtLR GhcRn GhcPs (LocatedA (body GhcPs)), FreeVars)]
@@ -1587,7 +1646,7 @@ rn_rec_stmts ctxt rnBody bndrs stmts
        ; return (concat segs_s) }
 
 ---------------------------------------------
-segmentRecStmts :: SrcSpan -> HsStmtContext GhcRn
+segmentRecStmts :: SrcSpan -> HsStmtContextRn
                 -> Stmt GhcRn (LocatedA (body GhcRn))
                 -> [Segment (LStmt GhcRn (LocatedA (body GhcRn)))]
                 -> (FreeVars, Bool)
@@ -1727,7 +1786,7 @@ in which case that function conservatively assumes that everything might well
 be used later.
 -}
 
-glomSegments :: HsStmtContext GhcRn
+glomSegments :: HsStmtContextRn
              -> [Segment (LStmt GhcRn body)]
              -> [Segment [LStmt GhcRn body]]
                                   -- Each segment has a non-empty list of Stmts
@@ -1813,7 +1872,7 @@ independent and do something like this:
      (y,z) <- (,) <$> B x <*> C
      return (f x y z)
 
-But this isn't enough! A and C were also independent, and this
+But this isn't enough! If A and C were also independent, then this
 transformation loses the ability to do A and C in parallel.
 
 The algorithm works by first splitting the sequence of statements into
@@ -2176,7 +2235,7 @@ stmtTreeToStmts monad_names ctxt (StmtTreeApplicative trees) tail tail_fvs = do
              -- Need 'pureAName' and not 'returnMName' here, so that it requires
              -- 'Applicative' and not 'Monad' whenever possible (until #20540 is fixed).
              (ret, _) <- lookupQualifiedDoExpr (HsDoStmt ctxt) pureAName
-             let expr = HsApp noComments (noLocA ret) tup
+             let expr = HsApp noExtField (noLocA ret) tup
              return (expr, emptyFVs)
      return ( ApplicativeArgMany
               { xarg_app_arg_many = noExtField
@@ -2272,8 +2331,8 @@ isStrictPattern (L loc pat) =
     WildPat{}       -> False
     VarPat{}        -> False
     LazyPat{}       -> False
-    AsPat _ _ _ p   -> isStrictPattern p
-    ParPat _ _ p _  -> isStrictPattern p
+    AsPat _ _ p     -> isStrictPattern p
+    ParPat _ p      -> isStrictPattern p
     ViewPat _ _ p   -> isStrictPattern p
     SigPat _ p _    -> isStrictPattern p
     BangPat{}       -> True
@@ -2285,10 +2344,13 @@ isStrictPattern (L loc pat) =
     NPat{}          -> True
     NPlusKPat{}     -> True
     SplicePat{}     -> True
+
+    -- The behavior of this case is unimportant, as GHC will throw an error shortly
+    -- after reaching this case for other reasons (see TcRnIllegalTypePattern).
+    EmbTyPat{}  -> False
+    InvisPat{}  -> False
+
     XPat ext        -> case ghcPass @p of
-#if __GLASGOW_HASKELL__ < 811
-      GhcPs -> dataConCantHappen ext
-#endif
       GhcRn
         | HsPatExpanded _ p <- ext
         -> isStrictPattern (L loc p)
@@ -2393,7 +2455,11 @@ mkApplicativeStmt ctxt args need_join body_stmts
                 ; return (Just join_op, fvs) }
            else
              return (Nothing, emptyNameSet)
-       ; let applicative_stmt = noLocA $ ApplicativeStmt noExtField
+       -- We cannot really say where the ApplicativeStmt is located with more accuracy
+       -- than the span of the do-block, but it is better than nothing for IDE info
+       -- See Note [Source locations for implicit function calls]
+       ; loc <- getSrcSpanM
+       ; let applicative_stmt = L (noAnnSrcSpan loc) $ ApplicativeStmt noExtField
                (zip (fmap_op : repeat ap_op) args)
                mb_join
        ; return ( applicative_stmt : body_stmts
@@ -2431,7 +2497,7 @@ isReturnApp :: MonadNames
             -- If this is @Nothing@, strip the return/pure
             -> Maybe (HsExpr GhcRn)
             -> Maybe (LHsExpr GhcRn, Maybe Bool)
-isReturnApp monad_names (L _ (HsPar _ _ expr _)) mb_pure =
+isReturnApp monad_names (L _ (HsPar _ expr)) mb_pure =
   isReturnApp monad_names expr mb_pure
 isReturnApp monad_names (L loc e) mb_pure = case e of
   OpApp x l op r
@@ -2444,8 +2510,8 @@ isReturnApp monad_names (L loc e) mb_pure = case e of
     | is_return f -> Just (arg, Just False)
   _otherwise -> Nothing
  where
-  is_var f (L _ (HsPar _ _ e _)) = is_var f e
-  is_var f (L _ (HsAppType _ e _ _)) = is_var f e
+  is_var f (L _ (HsPar _ e)) = is_var f e
+  is_var f (L _ (HsAppType _ e _)) = is_var f e
   is_var f (L _ (HsVar _ (L _ r))) = f r
        -- TODO: I don't know how to get this right for rebindable syntax
   is_var _ _ = False
@@ -2463,7 +2529,7 @@ isReturnApp monad_names (L loc e) mb_pure = case e of
 ************************************************************************
 -}
 
-checkEmptyStmts :: HsStmtContext GhcRn -> RnM ()
+checkEmptyStmts :: HsStmtContextRn -> RnM ()
 -- We've seen an empty sequence of Stmts... is that ok?
 checkEmptyStmts ctxt
   = mapM_ (addErr . TcRnEmptyStmtsGroup) mb_err
@@ -2477,7 +2543,7 @@ checkEmptyStmts ctxt
 
 ----------------------
 checkLastStmt :: AnnoBody body
-              => HsStmtContext GhcRn
+              => HsStmtContextRn
               -> LStmt GhcPs (LocatedA (body GhcPs))
               -> RnM (LStmt GhcPs (LocatedA (body GhcPs)))
 checkLastStmt ctxt lstmt@(L loc stmt)
@@ -2509,7 +2575,7 @@ checkLastStmt ctxt lstmt@(L loc stmt)
 
 -- Checking when a particular Stmt is ok
 checkStmt :: AnnoBody body
-          => HsStmtContext GhcRn
+          => HsStmtContextRn
           -> LStmt GhcPs (LocatedA (body GhcPs))
           -> RnM ()
 checkStmt ctxt (L _ stmt)
@@ -2525,7 +2591,7 @@ emptyInvalid :: Validity' (Maybe LangExt.Extension)
 emptyInvalid = NotValid Nothing -- Invalid, and no extension to suggest
 
 okStmt, okDoStmt, okCompStmt, okParStmt
-   :: DynFlags -> HsStmtContext GhcRn
+   :: DynFlags -> HsStmtContextRn
    -> Stmt GhcPs (LocatedA (body GhcPs)) -> Validity' (Maybe LangExt.Extension)
 -- Return Nothing if OK, (Just extra) if not ok
 -- The "extra" is an SDoc that is appended to a generic error message
@@ -2539,7 +2605,7 @@ okStmt dflags ctxt stmt
       TransStmtCtxt ctxt -> okStmt dflags ctxt stmt
 
 okDoFlavourStmt
-  :: DynFlags -> HsDoFlavour -> HsStmtContext GhcRn
+  :: DynFlags -> HsDoFlavour -> HsStmtContextRn
   -> Stmt GhcPs (LocatedA (body GhcPs)) -> Validity' (Maybe LangExt.Extension)
 okDoFlavourStmt dflags flavour ctxt stmt = case flavour of
       DoExpr{}     -> okDoStmt   dflags ctxt stmt
@@ -2610,7 +2676,7 @@ badIpBinds = TcRnIllegalImplicitParameterBindings
 ---------
 
 monadFailOp :: LPat GhcPs
-            -> HsStmtContext GhcRn
+            -> HsStmtContextRn
             -> RnM (FailOperator GhcRn, FreeVars)
 monadFailOp pat ctxt = do
     dflags <- getDynFlags
@@ -2661,7 +2727,7 @@ using fromString:
                         Nothing -> M.fail (fromString "Pattern match error")
 
 -}
-getMonadFailOp :: HsStmtContext p -> RnM (FailOperator GhcRn, FreeVars) -- Syntax expr fail op
+getMonadFailOp :: HsStmtContext fn -> RnM (FailOperator GhcRn, FreeVars) -- Syntax expr fail op
 getMonadFailOp ctxt
  = do { xOverloadedStrings <- fmap (xopt LangExt.OverloadedStrings) getDynFlags
       ; xRebindableSyntax <- fmap (xopt LangExt.RebindableSyntax) getDynFlags
@@ -2691,19 +2757,31 @@ getMonadFailOp ctxt
 
 {- *********************************************************************
 *                                                                      *
-              Generating code for HsExpanded
+              Generating code for ExpandedThingRn
       See Note [Handling overloaded and rebindable constructs]
 *                                                                      *
 ********************************************************************* -}
 
--- | Build a 'HsExpansion' out of an extension constructor,
---   and the two components of the expansion: original and
---   desugared expressions.
-mkExpandedExpr
-  :: HsExpr GhcRn           -- ^ source expression
-  -> HsExpr GhcRn           -- ^ expanded expression
-  -> HsExpr GhcRn           -- ^ suitably wrapped 'HsExpansion'
-mkExpandedExpr a b = XExpr (HsExpanded a b)
+-- | Expand `HsIf` if rebindable syntax is turned on
+--   See Note [Handling overloaded and rebindable constructs]
+rnHsIf :: LHsExpr GhcPs -> LHsExpr GhcPs -> LHsExpr GhcPs -> RnM (HsExpr GhcRn, FreeVars)
+rnHsIf p b1 b2
+  = do { (p',  fvP)  <- rnLExpr p
+       ; (b1', fvB1) <- rnLExpr b1
+       ; (b2', fvB2) <- rnLExpr b2
+       ; let fvs_if = plusFVs [fvP, fvB1, fvB2]
+             rn_if  = HsIf noExtField  p' b1' b2'
+
+       -- Deal with rebindable syntax
+       ; mb_ite <- lookupIfThenElse
+       ; case mb_ite of
+            Nothing  -- Non rebindable-syntax case
+              -> return (rn_if, fvs_if)
+
+            Just ite_name   -- Rebindable-syntax case
+              -> do { let ds_if = genHsApps ite_name [p', b1', b2']
+                          fvs   = plusFVs [fvs_if, unitFV ite_name]
+                    ; return (mkExpandedExpr rn_if ds_if, fvs) } }
 
 -----------------------------------------
 -- Bits and pieces for RecordDotSyntax.
@@ -2777,4 +2855,4 @@ rnHsUpdProjs us = do
                          hfbAnn = noAnn
                        , hfbLHS = fmap rnFieldLabelStrings fs
                        , hfbRHS = arg
-                       , hfbPun = pun}), fv ) }
+                       , hfbPun = pun }), fv ) }

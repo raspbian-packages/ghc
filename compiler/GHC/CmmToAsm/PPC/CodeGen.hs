@@ -61,7 +61,6 @@ import GHC.Types.SrcLoc      ( srcSpanFile, srcSpanStartLine, srcSpanStartCol )
 import GHC.Data.OrdList
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
-import GHC.Utils.Panic.Plain
 
 import Control.Monad    ( mapAndUnzipM, when )
 import Data.Word
@@ -129,10 +128,10 @@ basicBlockCodeGen block = do
   -- Generate location directive
   dbg <- getDebugBlock (entryLabel block)
   loc_instrs <- case dblSourceTick =<< dbg of
-    Just (SourceNote span name)
+    Just (SourceNote span (LexicalFastString name))
       -> do fileid <- getFileId (srcSpanFile span)
             let line = srcSpanStartLine span; col =srcSpanStartCol span
-            return $ unitOL $ LOCATION fileid line col name
+            return $ unitOL $ LOCATION fileid line col (unpackFS name)
     _ -> return nilOL
   mid_instrs <- stmtsToInstrs stmts
   tail_instrs <- stmtToInstrs tail
@@ -171,7 +170,7 @@ stmtToInstrs stmt = do
       | target32Bit platform &&
         isWord64 ty    -> assignReg_I64Code      reg src
       | otherwise      -> assignReg_IntCode format reg src
-        where ty = cmmRegType platform reg
+        where ty = cmmRegType reg
               format = cmmTypeFormat ty
 
     CmmStore addr src _alignment
@@ -233,7 +232,7 @@ getRegisterReg _ (CmmLocal local_reg)
   = getLocalRegReg local_reg
 
 getRegisterReg platform (CmmGlobal mid)
-  = case globalRegMaybe platform mid of
+  = case globalRegMaybe platform (globalRegUseGlobalReg mid) of
         Just reg -> RegReal reg
         Nothing  -> pprPanic "getRegisterReg-memory" (ppr $ CmmGlobal mid)
         -- By this stage, the only MagicIds remaining should be the
@@ -253,12 +252,12 @@ jumpTableEntry _ (Just blockid) = CmmStaticLit (CmmLabel blockLabel)
 
 -- Expand CmmRegOff.  ToDo: should we do it this way around, or convert
 -- CmmExprs into CmmRegOff?
-mangleIndexTree :: Platform -> CmmExpr -> CmmExpr
-mangleIndexTree platform (CmmRegOff reg off)
+mangleIndexTree :: CmmExpr -> CmmExpr
+mangleIndexTree (CmmRegOff reg off)
   = CmmMachOp (MO_Add width) [CmmReg reg, CmmLit (CmmInt (fromIntegral off) width)]
-  where width = typeWidth (cmmRegType platform reg)
+  where width = typeWidth (cmmRegType reg)
 
-mangleIndexTree _ _
+mangleIndexTree _
         = panic "PPC.CodeGen.mangleIndexTree: no match"
 
 -- -----------------------------------------------------------------------------
@@ -404,7 +403,7 @@ getRegister e = do config <- getConfig
 
 getRegister' :: NCGConfig -> Platform -> CmmExpr -> NatM Register
 
-getRegister' _ platform (CmmReg (CmmGlobal PicBaseReg))
+getRegister' _ platform (CmmReg (CmmGlobal (GlobalRegUse PicBaseReg _)))
   | OSAIX <- platformOS platform = do
         let code dst = toOL [ LD II32 dst tocAddr ]
             tocAddr = AddrRegImm toc (ImmLit (fsLit "ghc_toc_table[TC]"))
@@ -416,11 +415,11 @@ getRegister' _ platform (CmmReg (CmmGlobal PicBaseReg))
   | otherwise = return (Fixed II64 toc nilOL)
 
 getRegister' _ platform (CmmReg reg)
-  = return (Fixed (cmmTypeFormat (cmmRegType platform reg))
+  = return (Fixed (cmmTypeFormat (cmmRegType reg))
                   (getRegisterReg platform reg) nilOL)
 
 getRegister' config platform tree@(CmmRegOff _ _)
-  = getRegister' config platform (mangleIndexTree platform tree)
+  = getRegister' config platform (mangleIndexTree tree)
 
     -- for 32-bit architectures, support some 64 -> 32 bit conversions:
     -- TO_W_(x), TO_W_(x >> 32)
@@ -503,6 +502,9 @@ getRegister' _ _ (CmmMachOp (MO_SS_Conv W32 W64) [CmmLoad mem _ _]) = do
     -- lwa is DS-form. See Note [Power instruction format]
     Amode addr addr_code <- getAmode DS mem
     return (Any II64 (\dst -> addr_code `snocOL` LA II32 dst addr))
+
+getRegister' config platform (CmmMachOp (MO_RelaxedRead w) [e]) =
+      getRegister' config platform (CmmLoad e (cmmBits w) NaturallyAligned)
 
 getRegister' config platform (CmmMachOp mop [x]) -- unary MachOps
   = case mop of
@@ -650,6 +652,21 @@ getRegister' _ platform (CmmMachOp mop [x, y]) -- dyadic PrimOps
       code <- remainderCode rep sgn tmp x y
       return (Any fmt code)
 
+getRegister' _ _ (CmmMachOp mop [x, y, z]) -- ternary PrimOps
+  = case mop of
+
+      -- x86 fmadd    x * y + z <> PPC fmadd  rt =   ra * rc + rb
+      -- x86 fmsub    x * y - z <> PPC fmsub  rt =   ra * rc - rb
+      -- x86 fnmadd - x * y + z ~~ PPC fnmsub rt = -(ra * rc - rb)
+      -- x86 fnmsub - x * y - z ~~ PPC fnmadd rt = -(ra * rc + rb)
+
+      MO_FMA variant w ->
+        case variant of
+          FMAdd  -> fma_code w (FMADD FMAdd) x y z
+          FMSub  -> fma_code w (FMADD FMSub) x y z
+          FNMAdd -> fma_code w (FMADD FNMAdd) x y z
+          FNMSub -> fma_code w (FMADD FNMSub) x y z
+      _ -> panic "PPC.CodeGen.getRegister: no match"
 
 getRegister' _ _ (CmmLit (CmmInt i rep))
   | Just imm <- makeImmediate rep True i
@@ -736,8 +753,7 @@ data InstrForm = D | DS
 
 getAmode :: InstrForm -> CmmExpr -> NatM Amode
 getAmode inf tree@(CmmRegOff _ _)
-  = do platform <- getPlatform
-       getAmode inf (mangleIndexTree platform tree)
+  = getAmode inf (mangleIndexTree tree)
 
 getAmode _ (CmmMachOp (MO_Sub W32) [x, CmmLit (CmmInt i _)])
   | Just off <- makeImmediate W32 True (-i)
@@ -1113,10 +1129,12 @@ genCCall :: ForeignTarget      -- function to call
          -> [CmmFormal]        -- where to put the result
          -> [CmmActual]        -- arguments (of mixed type)
          -> NatM InstrBlock
-genCCall (PrimTarget MO_ReadBarrier) _ _
+genCCall (PrimTarget MO_AcquireFence) _ _
  = return $ unitOL LWSYNC
-genCCall (PrimTarget MO_WriteBarrier) _ _
+genCCall (PrimTarget MO_ReleaseFence) _ _
  = return $ unitOL LWSYNC
+genCCall (PrimTarget MO_SeqCstFence) _ _
+ = return $ unitOL HWSYNC
 
 genCCall (PrimTarget MO_Touch) _ _
  = return $ nilOL
@@ -1953,7 +1971,7 @@ genCCall' config gcp target dest_regs args
                        -> toOL [MR (getHiVRegFromLo r_dest) r3,
                                 MR r_dest r4]
                     | otherwise -> unitOL (MR r_dest r3)
-                    where rep = cmmRegType platform (CmmLocal dest)
+                    where rep = cmmRegType (CmmLocal dest)
                           r_dest = getLocalRegReg dest
                 _ -> panic "genCCall' moveResult: Bad dest_regs"
 
@@ -2081,8 +2099,9 @@ genCCall' config gcp target dest_regs args
                     MO_AddIntC {}    -> unsupported
                     MO_SubIntC {}    -> unsupported
                     MO_U_Mul2 {}     -> unsupported
-                    MO_ReadBarrier   -> unsupported
-                    MO_WriteBarrier  -> unsupported
+                    MO_AcquireFence  -> unsupported
+                    MO_ReleaseFence  -> unsupported
+                    MO_SeqCstFence   -> unsupported
                     MO_Touch         -> unsupported
                     MO_Prefetch_Data _ -> unsupported
                 unsupported = panic ("outOfLineCmmOp: " ++ show mop
@@ -2360,10 +2379,28 @@ trivialUCode rep instr x = do
     let code' dst = code `snocOL` instr dst src
     return (Any rep code')
 
+-- | Generate code for a 4-register FMA instruction,
+-- e.g. @fmadd rt ra rc rb := rt <- ra * rc + rb@.
+fma_code :: Width
+         -> (Format -> Reg -> Reg -> Reg -> Reg -> Instr)
+         -> CmmExpr
+         -> CmmExpr
+         -> CmmExpr
+         -> NatM Register
+fma_code w instr ra rc rb = do
+    let rep = floatFormat w
+    (src1, code1) <- getSomeReg ra
+    (src2, code2) <- getSomeReg rc
+    (src3, code3) <- getSomeReg rb
+    let instrCode rt =
+          code1 `appOL`
+          code2 `appOL`
+          code3 `snocOL` instr rep rt src1 src2 src3
+    return $ Any rep instrCode
+
 -- There is no "remainder" instruction on the PPC, so we have to do
 -- it the hard way.
 -- The "sgn" parameter is the signedness for the division instruction
-
 remainderCode :: Width -> Bool -> Reg -> CmmExpr -> CmmExpr
                -> NatM (Reg -> InstrBlock)
 remainderCode rep sgn reg_q arg_x arg_y = do

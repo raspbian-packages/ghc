@@ -1,13 +1,12 @@
-{-|
-Module        :  Distribution.Client.Init.Licenses
-
-Description   :  Factory functions for producing known license types.
-
-License       :  BSD-like
-Maintainer    :  cabal-devel@haskell.org
-Stability     :  provisional
-Portability   :  portable
--}
+-- |
+-- Module        :  Distribution.Client.Init.Licenses
+--
+-- Description   :  Factory functions for producing known license types.
+--
+-- License       :  BSD-like
+-- Maintainer    :  cabal-devel@haskell.org
+-- Stability     :  provisional
+-- Portability   :  portable
 module Distribution.Client.Init.Licenses
   ( License
   , bsd2
@@ -28,9 +27,9 @@ import Prelude (String, unlines, (++))
 type License = String
 
 bsd2 :: String -> String -> License
-bsd2 authors year = unlines
+bsd2 authors year =
+  unlines
     [ "Copyright (c) " ++ year ++ ", " ++ authors
-    , "All rights reserved."
     , ""
     , "Redistribution and use in source and binary forms, with or without"
     , "modification, are permitted provided that the following conditions are"
@@ -48,7 +47,7 @@ bsd2 authors year = unlines
     , "\"AS IS\" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT"
     , "LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR"
     , "A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT"
-    , "OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,"
+    , "HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,"
     , "SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT"
     , "LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,"
     , "DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY"
@@ -58,10 +57,10 @@ bsd2 authors year = unlines
     ]
 
 bsd3 :: String -> String -> License
-bsd3 authors year = unlines
+bsd3 authors year =
+  unlines
     [ "Copyright (c) " ++ year ++ ", " ++ authors
     , ""
-    , "All rights reserved."
     , ""
     , "Redistribution and use in source and binary forms, with or without"
     , "modification, are permitted provided that the following conditions are met:"
@@ -74,7 +73,7 @@ bsd3 authors year = unlines
     , "      disclaimer in the documentation and/or other materials provided"
     , "      with the distribution."
     , ""
-    , "    * Neither the name of " ++ authors ++ " nor the names of other"
+    , "    * Neither the name of the copyright holder nor the names of its"
     , "      contributors may be used to endorse or promote products derived"
     , "      from this software without specific prior written permission."
     , ""
@@ -82,7 +81,7 @@ bsd3 authors year = unlines
     , "\"AS IS\" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT"
     , "LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR"
     , "A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT"
-    , "OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,"
+    , "HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,"
     , "SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT"
     , "LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,"
     , "DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY"
@@ -92,7 +91,8 @@ bsd3 authors year = unlines
     ]
 
 gplv2 :: License
-gplv2 = unlines
+gplv2 =
+  unlines
     [ "             GNU GENERAL PUBLIC LICENSE"
     , "                Version 2, June 1991"
     , ""
@@ -435,7 +435,8 @@ gplv2 = unlines
     ]
 
 gplv3 :: License
-gplv3 = unlines
+gplv3 =
+  unlines
     [ "              GNU GENERAL PUBLIC LICENSE"
     , "                Version 3, 29 June 2007"
     , ""
@@ -1113,7 +1114,8 @@ gplv3 = unlines
     ]
 
 agplv3 :: License
-agplv3 = unlines
+agplv3 =
+  unlines
     [ "                    GNU AFFERO GENERAL PUBLIC LICENSE"
     , "                       Version 3, 19 November 2007"
     , ""
@@ -1778,7 +1780,8 @@ agplv3 = unlines
     ]
 
 lgpl21 :: License
-lgpl21 = unlines
+lgpl21 =
+  unlines
     [ "                  GNU LESSER GENERAL PUBLIC LICENSE"
     , "                       Version 2.1, February 1999"
     , ""
@@ -2284,7 +2287,8 @@ lgpl21 = unlines
     ]
 
 lgpl3 :: License
-lgpl3 = unlines
+lgpl3 =
+  unlines
     [ "                  GNU LESSER GENERAL PUBLIC LICENSE"
     , "                       Version 3, 29 June 2007"
     , ""
@@ -2453,7 +2457,8 @@ lgpl3 = unlines
     ]
 
 apache20 :: License
-apache20 = unlines
+apache20 =
+  unlines
     [ ""
     , "                                 Apache License"
     , "                           Version 2.0, January 2004"
@@ -2659,7 +2664,8 @@ apache20 = unlines
     ]
 
 mit :: String -> String -> License
-mit authors year = unlines
+mit authors year =
+  unlines
     [ "Copyright (c) " ++ year ++ " " ++ authors
     , ""
     , "Permission is hereby granted, free of charge, to any person obtaining"
@@ -2683,7 +2689,8 @@ mit authors year = unlines
     ]
 
 mpl20 :: License
-mpl20 = unlines
+mpl20 =
+  unlines
     [ "Mozilla Public License Version 2.0"
     , "=================================="
     , ""
@@ -3060,7 +3067,8 @@ mpl20 = unlines
     ]
 
 isc :: String -> String -> License
-isc authors year = unlines
+isc authors year =
+  unlines
     [ "Copyright (c) " ++ year ++ " " ++ authors
     , ""
     , "Permission to use, copy, modify, and/or distribute this software for any purpose"

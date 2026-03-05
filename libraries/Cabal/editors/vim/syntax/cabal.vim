@@ -39,6 +39,7 @@ syn keyword cabalLanguage contained
   \ Haskell98
   \ Haskell2010
   \ GHC2021
+  \ GHC2024
 
 " To update this in Cabal, `cabal repl Cabal` and:
 " >>> :m *Distribution.PackageDescription.FieldGrammar
@@ -181,6 +182,7 @@ syn keyword cabalExtension contained
   \ ExplicitForAll
   \ ExplicitNamespaces
   \ ExtendedDefaultRules
+  \ ExtendedLiterals
   \ ExtensibleRecords
   \ FieldSelectors
   \ FlexibleContexts
@@ -208,6 +210,7 @@ syn keyword cabalExtension contained
   \ LexicalNegation
   \ LiberalTypeSynonyms
   \ LinearTypes
+  \ ListTuplePuns
   \ RequiredTypeArguments
   \ MagicHash
   \ MonadComprehensions
@@ -300,6 +303,7 @@ syn keyword cabalExtension contained
   \ NoDataKinds
   \ NoDatatypeContexts
   \ NoDefaultSignatures
+  \ NoDeepSubsumption
   \ NoDeriveAnyClass
   \ NoDeriveDataTypeable
   \ NoDeriveFoldable
@@ -320,6 +324,7 @@ syn keyword cabalExtension contained
   \ NoExplicitForAll
   \ NoExplicitNamespaces
   \ NoExtendedDefaultRules
+  \ NoExtendedLiterals
   \ NoExtensibleRecords
   \ NoFieldSelectors
   \ NoFlexibleContexts
@@ -408,6 +413,7 @@ syn keyword cabalExtension contained
   \ NoTupleSections
   \ NoTypeAbstractions
   \ NoTypeApplications
+  \ NoTypeData
   \ NoTypeFamilies
   \ NoTypeFamilyDependencies
   \ NoTypeInType

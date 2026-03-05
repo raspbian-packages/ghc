@@ -123,26 +123,10 @@ cgTopRhsClosure platform rec id ccs upd_flag args body =
   -- StgStdThunks.cmm.
   gen_code _ closure_label
     | null args
-    , StgApp f [arg] <- stripStgTicksTopE (not . tickishIsCode) body
-    , Just unpack <- is_string_unpack_op f
-    = do arg' <- getArgAmode (NonVoid arg)
-         case arg' of
-           CmmLit lit -> do
-             let info = CmmInfoTable
-                   { cit_lbl = unpack
-                   , cit_rep = HeapRep True 0 1 Thunk
-                   , cit_prof = NoProfilingInfo
-                   , cit_srt = Nothing
-                   , cit_clo = Nothing
-                   }
-             emitDecl $ CmmData (Section Data closure_label) $
-                 CmmStatics closure_label info ccs [] [lit]
-           _ -> panic "cgTopRhsClosure.gen_code"
-    where
-      is_string_unpack_op f
-        | idName f == unpackCStringName     = Just mkRtsUnpackCStringLabel
-        | idName f == unpackCStringUtf8Name = Just mkRtsUnpackCStringUtf8Label
-        | otherwise                         = Nothing
+    , Just gen <- isUnpackCStringClosure body
+    = do (info, lit) <- gen
+         emitDecl $ CmmData (Section Data closure_label) $
+             CmmStatics closure_label info ccs [] [lit]
 
   gen_code lf_info _closure_label
    = do { profile <- getProfile
@@ -167,6 +151,41 @@ cgTopRhsClosure platform rec id ccs upd_flag args body =
 
   unLit (CmmLit l) = l
   unLit _ = panic "unLit"
+
+isUnpackCStringClosure :: CgStgExpr -> Maybe (FCode (CmmInfoTable, CmmLit))
+isUnpackCStringClosure body = case stripStgTicksTopE (not . tickishIsCode) body of
+  StgApp f [arg]
+    | Just unpack <- is_string_unpack_op f
+    -> Just $ do
+        arg' <- getArgAmode (NonVoid arg)
+        case arg' of
+          CmmLit lit -> do
+            let info = CmmInfoTable
+                  { cit_lbl = unpack
+                  , cit_rep = HeapRep True 0 1 Thunk
+                  , cit_prof = NoProfilingInfo
+                  , cit_srt = Nothing
+                  , cit_clo = Nothing
+                  }
+            return (info, lit)
+          _ -> panic "isUnpackCStringClosure: not a lit"
+  StgCase (StgLit l) b _ [alt]
+    -- In -O0, we might get strings that haven't been floated to top-level, e.g.,
+    --   case "undefined"# of sat {
+    --     __DEFAULT -> unpackCString# sat
+    --   }
+    -- This case is supposed to catch that.
+    | Just gen <- isUnpackCStringClosure (alt_rhs alt)
+    -> Just $ do
+        e <- cgLit l
+        addBindC (mkCgIdInfo b mkLFStringLit e)
+        gen
+  _ -> Nothing
+  where
+    is_string_unpack_op f
+      | idName f == unpackCStringName     = Just mkRtsUnpackCStringLabel
+      | idName f == unpackCStringUtf8Name = Just mkRtsUnpackCStringUtf8Label
+      | otherwise                         = Nothing
 
 ------------------------------------------------------------------------
 --              Non-top-level bindings
@@ -250,14 +269,14 @@ cgRhs :: Id
                                   -- (see above)
                )
 
-cgRhs id (StgRhsCon cc con mn _ts args)
+cgRhs id (StgRhsCon cc con mn _ts args _typ)
   = withNewTickyCounterCon id con mn $
     buildDynCon id mn True cc con (assertNonVoidStgArgs args)
       -- con args are always non-void,
       -- see Note [Post-unarisation invariants] in GHC.Stg.Unarise
 
 {- See Note [GC recovery] in "GHC.StgToCmm.Closure" -}
-cgRhs id (StgRhsClosure fvs cc upd_flag args body)
+cgRhs id (StgRhsClosure fvs cc upd_flag args body _typ)
   = do
     profile <- getProfile
     check_tags <- stgToCmmDoTagCheck <$> getStgToCmmConfig
@@ -363,7 +382,7 @@ mkRhsClosure    profile use_std_ap check_tags bndr _cc
                                -- args are all distinct local variables
                                -- The "-1" is for fun_id
     -- Missed opportunity:   (f x x) is not detected
-  , all (isGcPtrRep . idPrimRep . fromNonVoid) fvs
+  , all (isGcPtrRep . idPrimRepU . fromNonVoid) fvs
   , isUpdatable upd_flag
   , n_fvs <= pc_MAX_SPEC_AP_SIZE (profileConstants profile)
   , not (profileIsProfiling profile)
@@ -424,7 +443,7 @@ mkRhsClosure profile _use_ap _check_tags bndr cc fvs upd_flag args body
 
         -- BUILD THE OBJECT
 --      ; (use_cc, blame_cc) <- chooseDynCostCentres cc args body
-        ; let use_cc = cccsExpr; blame_cc = cccsExpr
+        ; let use_cc = cccsExpr platform; blame_cc = cccsExpr platform
         ; emit (mkComment $ mkFastString "calling allocDynClosure")
         ; let toVarArg (NonVoid a, off) = (NonVoid (StgVarArg a), off)
         ; let info_tbl = mkCmmInfo closure_info bndr currentCCS
@@ -465,7 +484,7 @@ cgRhsStdThunk bndr lf_info payload
                                      descr
 
 --  ; (use_cc, blame_cc) <- chooseDynCostCentres cc [{- no args-}] body
-  ; let use_cc = cccsExpr; blame_cc = cccsExpr
+  ; let use_cc = cccsExpr platform; blame_cc = cccsExpr platform
 
 
         -- BUILD THE OBJECT
@@ -640,6 +659,7 @@ thunkCode :: ClosureInfo -> [(NonVoid Id, ByteOff)] -> CostCentreStack
           -> LocalReg -> CgStgExpr -> FCode ()
 thunkCode cl_info fv_details _cc node body
   = do { profile <- getProfile
+       ; platform <- getPlatform
        ; let node_points = nodeMustPointToIt profile (closureLFInfo cl_info)
              node'       = if node_points then Just node else Nothing
         ; ldvEnterClosure cl_info (CmmLocal node) -- NB: Node always points when profiling
@@ -658,7 +678,7 @@ thunkCode cl_info fv_details _cc node body
             -- that cc of enclosing scope will be recorded
             -- in update frame CAF/DICT functions will be
             -- subsumed by this enclosing cc
-            do { enterCostCentreThunk (CmmReg nodeReg)
+            do { enterCostCentreThunk (CmmReg $ nodeReg platform)
                ; let lf_info = closureLFInfo cl_info
                ; fv_bindings <- mapM bind_fv fv_details
                ; load_fvs node lf_info fv_bindings
@@ -709,11 +729,11 @@ emitBlackHoleCode node = do
     whenUpdRemSetEnabled $ emitUpdRemSetPushThunk node
     emitAtomicStore platform MemOrderRelease
         (cmmOffsetW platform node (fixedHdrSizeW profile))
-        currentTSOExpr
+        (currentTSOExpr platform)
     -- See Note [Heap memory barriers] in SMP.h.
     emitAtomicStore platform MemOrderRelease
         node
-        (CmmReg (CmmGlobal EagerBlackholeInfo))
+        (CmmReg (CmmGlobal $ GlobalRegUse EagerBlackholeInfo $ bWord platform))
 
 emitAtomicStore :: Platform -> MemoryOrdering -> CmmExpr -> CmmExpr -> FCode ()
 emitAtomicStore platform mord addr val =
@@ -743,7 +763,8 @@ setupUpdate closure_info node body
               lbl | bh        = mkBHUpdInfoLabel
                   | otherwise = mkUpdInfoLabel
 
-          pushUpdateFrame lbl (CmmReg (CmmLocal node)) body
+          pushOrigThunkInfoFrame closure_info
+            $ pushUpdateFrame lbl (CmmReg (CmmLocal node)) body
 
   | otherwise   -- A static closure
   = do  { tickyUpdateBhCaf closure_info
@@ -751,7 +772,8 @@ setupUpdate closure_info node body
         ; if closureUpdReqd closure_info
           then do       -- Blackhole the (updatable) CAF:
                 { upd_closure <- link_caf node
-                ; pushUpdateFrame mkBHUpdInfoLabel upd_closure body }
+                ; pushOrigThunkInfoFrame closure_info
+                    $ pushUpdateFrame mkBHUpdInfoLabel upd_closure body }
           else do {tickyUpdateFrameOmitted; body}
     }
 
@@ -767,8 +789,7 @@ pushUpdateFrame lbl updatee body
   = do
        updfr  <- getUpdFrameOff
        profile <- getProfile
-       let
-           hdr         = fixedHdrSize profile
+       let hdr         = fixedHdrSize profile
            frame       = updfr + hdr + pc_SIZEOF_StgUpdateFrame_NoHdr (profileConstants profile)
        --
        emitUpdateFrame (CmmStackSlot Old frame) lbl updatee
@@ -785,6 +806,47 @@ emitUpdateFrame frame lbl updatee = do
   emitStore frame (mkLblExpr lbl)
   emitStore (cmmOffset platform frame off_updatee) updatee
   initUpdFrameProf frame
+
+-----------------------------------------------------------------------------
+-- Original thunk info table frames
+--
+-- Note [Original thunk info table frames]
+-- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+-- In some debugging scenarios (e.g. when debugging cyclic thunks) it can be very
+-- useful to know which thunks the program is in the process of evaluating.
+-- However, in the case of updateable thunks this can be very difficult
+-- to determine since the process of blackholing overwrites the thunk's
+-- info table pointer.
+--
+-- To help in such situations we provide the -forig-thunk-info flag. This enables
+-- code generation logic which pushes a stg_orig_thunk_info_frame stack frame to
+-- accompany each update frame. As the name suggests, this frame captures the
+-- the original info table of the thunk being updated. The entry code for these
+-- frames has no operational effects; the frames merely exist as breadcrumbs
+-- for debugging.
+
+pushOrigThunkInfoFrame :: ClosureInfo -> FCode () -> FCode ()
+pushOrigThunkInfoFrame closure_info body = do
+  cfg <- getStgToCmmConfig
+  if stgToCmmOrigThunkInfo cfg
+     then do_it
+     else body
+  where
+    orig_itbl = mkLblExpr (closureInfoLabel closure_info)
+    do_it = do
+      updfr <- getUpdFrameOff
+      profile <- getProfile
+      let platform = profilePlatform profile
+          hdr = fixedHdrSize profile
+          orig_info_frame_sz =
+              hdr + pc_SIZEOF_StgOrigThunkInfoFrame_NoHdr (profileConstants profile)
+          off_orig_info = hdr + pc_OFFSET_StgOrigThunkInfoFrame_info_ptr (profileConstants profile)
+          frame_off = updfr + orig_info_frame_sz
+          frame = CmmStackSlot Old frame_off
+      --
+      emitStore frame (mkLblExpr mkOrigThunkInfoLabel)
+      emitStore (cmmOffset platform frame off_orig_info) orig_itbl
+      withUpdFrameOff frame_off body
 
 -----------------------------------------------------------------------------
 -- Entering a CAF
@@ -805,7 +867,7 @@ link_caf node = do
   ; let platform = profilePlatform profile
   ; bh <- newTemp (bWord platform)
   ; emitRtsCallGen [(bh,AddrHint)] newCAF_lbl
-      [ (baseExpr,  AddrHint),
+      [ (baseExpr platform,  AddrHint),
         (CmmReg (CmmLocal node), AddrHint) ]
       False
 

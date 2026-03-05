@@ -13,12 +13,11 @@ import GHC.Prelude
 
 import GHC.Driver.Errors.Types
 import GHC.Driver.Flags
-import GHC.Driver.Session
-import GHC.HsToCore.Errors.Ppr ()
-import GHC.Parser.Errors.Ppr ()
-import GHC.Tc.Errors.Ppr ()
+import GHC.Driver.DynFlags
+import GHC.HsToCore.Errors.Ppr () -- instance Diagnostic DsMessage
+import GHC.Parser.Errors.Ppr () -- instance Diagnostic PsMessage
 import GHC.Types.Error
-import GHC.Types.Error.Codes ( constructorCode )
+import GHC.Types.Error.Codes
 import GHC.Unit.Types
 import GHC.Utils.Outputable
 import GHC.Unit.Module
@@ -30,6 +29,9 @@ import Data.Version
 import Language.Haskell.Syntax.Decls (RuleDecl(..))
 import GHC.Tc.Errors.Types (TcRnMessage)
 import GHC.HsToCore.Errors.Types (DsMessage)
+import GHC.Iface.Errors.Types
+import GHC.Tc.Errors.Ppr () -- instance Diagnostic TcRnMessage
+import GHC.Iface.Errors.Ppr () -- instance Diagnostic IfaceMessage
 
 --
 -- Suggestions
@@ -40,12 +42,14 @@ suggestInstantiatedWith :: ModuleName -> GenInstantiations UnitId -> [Instantiat
 suggestInstantiatedWith pi_mod_name insts =
   [ InstantiationSuggestion k v | (k,v) <- ((pi_mod_name, mkHoleModule pi_mod_name) : insts) ]
 
-instance Diagnostic GhcMessage where
-  type DiagnosticOpts GhcMessage = GhcMessageOpts
-  defaultDiagnosticOpts = GhcMessageOpts (defaultDiagnosticOpts @PsMessage)
+instance HasDefaultDiagnosticOpts GhcMessageOpts where
+  defaultOpts = GhcMessageOpts (defaultDiagnosticOpts @PsMessage)
                                          (defaultDiagnosticOpts @TcRnMessage)
                                          (defaultDiagnosticOpts @DsMessage)
                                          (defaultDiagnosticOpts @DriverMessage)
+
+instance Diagnostic GhcMessage where
+  type DiagnosticOpts GhcMessage = GhcMessageOpts
   diagnosticMessage opts = \case
     GhcPsMessage m
       -> diagnosticMessage (psMessageOpts opts) m
@@ -55,8 +59,8 @@ instance Diagnostic GhcMessage where
       -> diagnosticMessage (dsMessageOpts opts) m
     GhcDriverMessage m
       -> diagnosticMessage (driverMessageOpts opts) m
-    GhcUnknownMessage (UnknownDiagnostic @e m)
-      -> diagnosticMessage (defaultDiagnosticOpts @e) m
+    GhcUnknownMessage (UnknownDiagnostic f m)
+      -> diagnosticMessage (f opts) m
 
   diagnosticReason = \case
     GhcPsMessage m
@@ -84,12 +88,14 @@ instance Diagnostic GhcMessage where
 
   diagnosticCode = constructorCode
 
+instance HasDefaultDiagnosticOpts DriverMessageOpts where
+  defaultOpts = DriverMessageOpts (defaultDiagnosticOpts @PsMessage) (defaultDiagnosticOpts @IfaceMessage)
+
 instance Diagnostic DriverMessage where
   type DiagnosticOpts DriverMessage = DriverMessageOpts
-  defaultDiagnosticOpts = DriverMessageOpts (defaultDiagnosticOpts @PsMessage)
   diagnosticMessage opts = \case
-    DriverUnknownMessage (UnknownDiagnostic @e m)
-      -> diagnosticMessage (defaultDiagnosticOpts @e) m
+    DriverUnknownMessage (UnknownDiagnostic f m)
+      -> diagnosticMessage (f opts) m
     DriverPsHeaderMessage m
       -> diagnosticMessage (psDiagnosticOpts opts) m
     DriverMissingHomeModules uid missing buildingCabalPackage
@@ -218,6 +224,20 @@ instance Diagnostic DriverMessage where
       -> mkSimpleDecorated $ vcat ([text "Home units are not closed."
                                   , text "It is necessary to also load the following units:" ]
                                   ++ map (\uid -> text "-" <+> ppr uid) needed_unit_ids)
+    DriverInterfaceError reason -> diagnosticMessage (ifaceDiagnosticOpts opts) reason
+
+    DriverInconsistentDynFlags msg
+      -> mkSimpleDecorated $ text msg
+    DriverSafeHaskellIgnoredExtension ext
+      -> let arg = text "-X" <> ppr ext
+         in mkSimpleDecorated $ arg <+> text "is not allowed in Safe Haskell; ignoring" <+> arg
+    DriverPackageTrustIgnored
+      -> mkSimpleDecorated $ text "-fpackage-trust ignored; must be specified with a Safe Haskell flag"
+
+    DriverUnrecognisedFlag arg
+      -> mkSimpleDecorated $ text $ "unrecognised warning flag: -" ++ arg
+    DriverDeprecatedFlag arg msg
+      -> mkSimpleDecorated $ text $ arg ++ " is deprecated: " ++ msg
 
   diagnosticReason = \case
     DriverUnknownMessage m
@@ -272,6 +292,17 @@ instance Diagnostic DriverMessage where
       -> ErrorWithoutFlag
     DriverHomePackagesNotClosed {}
       -> ErrorWithoutFlag
+    DriverInterfaceError reason -> diagnosticReason reason
+    DriverInconsistentDynFlags {}
+      -> WarningWithFlag Opt_WarnInconsistentFlags
+    DriverSafeHaskellIgnoredExtension {}
+      -> WarningWithoutFlag
+    DriverPackageTrustIgnored {}
+      -> WarningWithoutFlag
+    DriverUnrecognisedFlag {}
+      -> WarningWithFlag Opt_WarnUnrecognisedWarningFlags
+    DriverDeprecatedFlag {}
+      -> WarningWithFlag Opt_WarnDeprecatedFlags
 
   diagnosticHints = \case
     DriverUnknownMessage m
@@ -327,6 +358,17 @@ instance Diagnostic DriverMessage where
     DriverRedirectedNoMain {}
       -> noHints
     DriverHomePackagesNotClosed {}
+      -> noHints
+    DriverInterfaceError reason -> diagnosticHints reason
+    DriverInconsistentDynFlags {}
+      -> noHints
+    DriverSafeHaskellIgnoredExtension {}
+      -> noHints
+    DriverPackageTrustIgnored {}
+      -> noHints
+    DriverUnrecognisedFlag {}
+      -> noHints
+    DriverDeprecatedFlag {}
       -> noHints
 
   diagnosticCode = constructorCode

@@ -1,5 +1,32 @@
 /* include/HsUnixConfig.h.in.  Generated from configure.ac by autoheader.  */
 
+/* The value of DT_BLK. */
+#undef CONST_DT_BLK
+
+/* The value of DT_CHR. */
+#undef CONST_DT_CHR
+
+/* The value of DT_DIR. */
+#undef CONST_DT_DIR
+
+/* The value of DT_FIFO. */
+#undef CONST_DT_FIFO
+
+/* The value of DT_LNK. */
+#undef CONST_DT_LNK
+
+/* The value of DT_REG. */
+#undef CONST_DT_REG
+
+/* The value of DT_SOCK. */
+#undef CONST_DT_SOCK
+
+/* The value of DT_UNKNOWN. */
+#undef CONST_DT_UNKNOWN
+
+/* The value of DT_WHT. */
+#undef CONST_DT_WHT
+
 /* The value of SIGABRT. */
 #undef CONST_SIGABRT
 
@@ -147,7 +174,8 @@
 /* Define if we have /dev/ptmx. */
 #undef HAVE_DEV_PTMX
 
-/* Define to 1 if you have the <dirent.h> header file. */
+/* Define to 1 if you have the <dirent.h> header file, and it defines `DIR'.
+   */
 #undef HAVE_DIRENT_H
 
 /* Define to 1 if you have the `dup' function. */
@@ -182,6 +210,9 @@
 
 /* Define to 1 if F_GETLK is available. */
 #undef HAVE_F_GETLK
+
+/* Define to 1 if F_NOCACHE available. */
+#undef HAVE_F_NOCACHE
 
 /* Define to 1 if you have the `getgrent' function. */
 #undef HAVE_GETGRENT
@@ -246,11 +277,17 @@
 /* Define to 1 if you have the `nanosleep' function. */
 #undef HAVE_NANOSLEEP
 
+/* Define to 1 if you have the <ndir.h> header file, and it defines `DIR'. */
+#undef HAVE_NDIR_H
+
 /* Ignore the pw_gecos member of passwd where it does not exist */
 #undef HAVE_NO_PASSWD_PW_GECOS
 
 /* Define to 1 if you have the `openpty' function. */
 #undef HAVE_OPENPTY
+
+/* Define to 1 if O_DIRECT open flag is available. */
+#undef HAVE_O_DIRECT
 
 /* Define to 1 if you have the `pipe' function. */
 #undef HAVE_PIPE
@@ -324,6 +361,9 @@
 /* Define to 1 if you have the <string.h> header file. */
 #undef HAVE_STRING_H
 
+/* Define to 1 if `d_type' is a member of `struct dirent'. */
+#undef HAVE_STRUCT_DIRENT_D_TYPE
+
 /* HAVE_STRUCT_RLIMIT */
 #undef HAVE_STRUCT_RLIMIT
 
@@ -383,6 +423,14 @@
 
 /* Define to 1 if you have the `sysconf' function. */
 #undef HAVE_SYSCONF
+
+/* Define to 1 if you have the <sys/dir.h> header file, and it defines `DIR'.
+   */
+#undef HAVE_SYS_DIR_H
+
+/* Define to 1 if you have the <sys/ndir.h> header file, and it defines `DIR'.
+   */
+#undef HAVE_SYS_NDIR_H
 
 /* Define to 1 if you have the <sys/resource.h> header file. */
 #undef HAVE_SYS_RESOURCE_H

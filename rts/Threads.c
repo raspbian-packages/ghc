@@ -8,6 +8,7 @@
 
 #include "rts/PosixSource.h"
 #include "Rts.h"
+#include "RtsFlags.h"
 
 #include "Capability.h"
 #include "Updates.h"
@@ -89,13 +90,13 @@ createThread(Capability *cap, W_ size)
     stack->marking      = 0;
 
     tso = (StgTSO *)allocate(cap, sizeofW(StgTSO));
-    TICK_ALLOC_TSO();
+    TICK_ALLOC_TSO(sizeofW(StgTSO));
     SET_HDR(tso, &stg_TSO_info, CCS_SYSTEM);
 
     // Always start with the compiled code evaluator
     tso->what_next = ThreadRunGHC;
-    tso->why_blocked  = NotBlocked;
     tso->block_info.closure = (StgClosure *)END_TSO_QUEUE;
+    tso->why_blocked  = NotBlocked;
     tso->blocked_exceptions = END_BLOCKED_EXCEPTIONS_QUEUE;
     tso->bq = (StgBlockingQueue *)END_TSO_QUEUE;
     tso->flags = 0;
@@ -272,20 +273,21 @@ tryWakeupThread (Capability *cap, StgTSO *tso)
     traceEventThreadWakeup (cap, tso, tso->cap->no);
 
 #if defined(THREADED_RTS)
-    if (tso->cap != cap)
+    Capability *tso_owner = RELAXED_LOAD(&tso->cap);
+    if (tso_owner != cap)
     {
         MessageWakeup *msg;
         msg = (MessageWakeup *)allocate(cap,sizeofW(MessageWakeup));
         msg->tso = tso;
         SET_HDR(msg, &stg_MSG_TRY_WAKEUP_info, CCS_SYSTEM);
-        sendMessage(cap, tso->cap, (Message*)msg);
+        sendMessage(cap, tso_owner, (Message*)msg);
         debugTraceCap(DEBUG_sched, cap, "message: try wakeup thread %"
-                      FMT_StgThreadID " on cap %d", tso->id, tso->cap->no);
+                      FMT_StgThreadID " on cap %d", tso->id, tso_owner->no);
         return;
     }
 #endif
 
-    switch (tso->why_blocked)
+    switch (ACQUIRE_LOAD(&tso->why_blocked))
     {
     case BlockedOnMVar:
     case BlockedOnMVarRead:
@@ -825,10 +827,11 @@ loop:
         }
     }
 
-    ASSERT(tso->block_info.closure == (StgClosure*)mvar);
     // save why_blocked here, because waking up the thread destroys
     // this information
-    StgWord why_blocked = RELAXED_LOAD(&tso->why_blocked);
+    StgWord why_blocked = ACQUIRE_LOAD(&tso->why_blocked);
+    ASSERT(why_blocked == BlockedOnMVarRead || why_blocked == BlockedOnMVar);
+    ASSERT(tso->block_info.closure == (StgClosure*)mvar);
 
     // actually perform the takeMVar
     StgStack* stack = tso->stackobj;
@@ -873,7 +876,7 @@ StgMutArrPtrs *listThreads(Capability *cap)
     StgMutArrPtrs *arr =
         (StgMutArrPtrs *)allocate(cap, sizeofW(StgMutArrPtrs) + size);
     SET_HDR(arr, &stg_MUT_ARR_PTRS_DIRTY_info, CCS_SYSTEM);
-    TICK_ALLOC_PRIM(sizeofW(StgMutArrPtrs), n, 0);
+    TICK_ALLOC_PRIM(sizeofW(StgMutArrPtrs), size, 0);
     arr->ptrs = n_threads;
     arr->size = size;
 
@@ -902,7 +905,7 @@ StgMutArrPtrs *listThreads(Capability *cap)
 void
 printThreadBlockage(StgTSO *tso)
 {
-  switch (tso->why_blocked) {
+  switch (ACQUIRE_LOAD(&tso->why_blocked)) {
 #if defined(mingw32_HOST_OS)
     case BlockedOnDoProc:
     debugBelch("is blocked on proc (request: %u)", tso->block_info.async_result->reqID);
@@ -1003,6 +1006,20 @@ printAllThreads(void)
           printThreadStatus(t);
       }
       next = t->global_link;
+    }
+  }
+}
+
+void
+printGlobalThreads(void)
+{
+  for (uint32_t g = 0; g < RtsFlags.GcFlags.generations; g++) {
+    debugBelch("\ngen %d\n", g);
+    for (StgTSO *t = generations[g].threads; t != END_TSO_QUEUE; t = t->global_link) {
+      debugBelch("thread %p (id=%lu)\n", t, (unsigned long)t->id);
+    }
+    for (StgTSO *t = generations[g].old_threads; t != END_TSO_QUEUE; t = t->global_link) {
+      debugBelch("thread %p (id=%lu) (old)\n", t, (unsigned long)t->id);
     }
   }
 }

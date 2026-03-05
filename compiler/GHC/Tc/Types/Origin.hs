@@ -2,6 +2,8 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE PolyKinds #-}
+{-# LANGUAGE StandaloneKindSignatures #-}
+{-# LANGUAGE TypeFamilies #-}
 
 -- | Describes the provenance of types as they flow through the type-checker.
 -- The datatypes here are mainly used for error message generation.
@@ -20,21 +22,31 @@ module GHC.Tc.Types.Origin (
   isVisibleOrigin, toInvisibleOrigin,
   pprCtOrigin, isGivenOrigin, isWantedWantedFunDepOrigin,
   isWantedSuperclassOrigin,
+  ClsInstOrQC(..), NakedScFlag(..), NonLinearPatternReason(..),
 
   TypedThing(..), TyVarBndrs(..),
 
-  -- * CtOrigin and CallStack
+  -- * CallStack
   isPushCallStackOrigin, callStackOriginFS,
-  -- * FixedRuntimeRep origin
-  FixedRuntimeRepOrigin(..), FixedRuntimeRepContext(..),
-  pprFixedRuntimeRepContext,
-  StmtOrigin(..), RepPolyFun(..), ArgPos(..),
-  ClsInstOrQC(..), NakedScFlag(..),
 
-  -- * Arrow command origin
+  -- * FixedRuntimeRep origin
+  FixedRuntimeRepOrigin(..),
+  FixedRuntimeRepContext(..),
+  pprFixedRuntimeRepContext,
+  StmtOrigin(..), ArgPos(..),
+  mkFRRUnboxedTuple, mkFRRUnboxedSum,
+
+  -- ** FixedRuntimeRep origin for rep-poly 'Id's
+  RepPolyId(..), Polarity(..), Position(..),
+
+  -- ** Arrow command FixedRuntimeRep origin
   FRRArrowContext(..), pprFRRArrowContext,
+
+  -- ** ExpectedFunTy FixedRuntimeRepOrigin
   ExpectedFunTyOrigin(..), pprExpectedFunTyOrigin, pprExpectedFunTyHerald,
 
+  -- * InstanceWhat
+  InstanceWhat(..), SafeOverlapping
   ) where
 
 import GHC.Prelude
@@ -52,6 +64,7 @@ import GHC.Core.PatSyn
 import GHC.Core.Multiplicity ( scaledThing )
 
 import GHC.Unit.Module
+import GHC.Unit.Module.Warnings
 import GHC.Types.Id
 import GHC.Types.Name
 import GHC.Types.Name.Reader
@@ -69,6 +82,8 @@ import GHC.Types.Unique.Supply
 
 import Language.Haskell.Syntax.Basic (FieldLabelString(..))
 
+import qualified Data.Kind as Hs
+
 {- *********************************************************************
 *                                                                      *
           UserTypeCtxt
@@ -83,11 +98,22 @@ data UserTypeCtxt
                     -- Also used for types in SPECIALISE pragmas
        Name              -- Name of the function
        ReportRedundantConstraints
-         -- This is usually 'WantRCC', but 'NoRCC' for
+         -- See Note [Tracking redundant constraints] in GHC.Tc.Solver
+         -- This field is usually 'WantRCC', but 'NoRCC' for
          --   * Record selectors (not important here)
          --   * Class and instance methods.  Here the code may legitimately
          --     be more polymorphic than the signature generated from the
          --     class declaration
+         --   * Functions whose type signature has hidden the constraints
+         --     behind a type synonym.  E.g.
+         --          type Foo = forall a. Eq a => a -> a
+         --          id :: Foo
+         --          id x = x
+         --     Here we can't give a good location for the redundant constraints
+         --     (see lhsSigWcTypeContextSpan), so we don't report redundant
+         --     constraints at all. It's not clear that this a good choice;
+         --     perhaps we should report, just with a less informative SrcSpan.
+         --     c.f. #16154
 
   | InfSigCtxt Name     -- Inferred type for function
   | ExprSigCtxt         -- Expression type signature
@@ -134,10 +160,14 @@ data UserTypeCtxt
 -- | Report Redundant Constraints.
 data ReportRedundantConstraints
   = NoRRC            -- ^ Don't report redundant constraints
-  | WantRRC SrcSpan  -- ^ Report redundant constraints, and here
-                     -- is the SrcSpan for the constraints
-                     -- E.g. f :: (Eq a, Ord b) => blah
-                     -- The span is for the (Eq a, Ord b)
+
+  | WantRRC SrcSpan  -- ^ Report redundant constraints
+      -- The SrcSpan is for the constraints
+      -- E.g. f :: (Eq a, Ord b) => blah
+      --      The span is for the (Eq a, Ord b)
+      -- We need to record the span here because we have
+      -- long since discarded the HsType in favour of a Type
+
   deriving( Eq )  -- Just for checkSkolInfoAnon
 
 reportRedundantConstraints :: ReportRedundantConstraints -> Bool
@@ -258,7 +288,7 @@ data SkolemInfoAnon
   | FamInstSkol         -- Bound at a family instance decl
   | PatSkol             -- An existential type variable bound by a pattern for
       ConLike           -- a data constructor with an existential type.
-      (HsMatchContext GhcTc)
+      HsMatchContextRn
              -- e.g.   data T = forall a. Eq a => MkT a
              --        f (MkT x) = ...
              -- The pattern MkT x will allocate an existential type
@@ -278,7 +308,7 @@ data SkolemInfoAnon
   | UnifyForAllSkol     -- We are unifying two for-all types
        TcType           -- The instantiated type *inside* the forall
 
-  | TyConSkol TyConFlavour Name  -- bound in a type declaration of the given flavour
+  | TyConSkol (TyConFlavour TyCon) Name -- bound in a type declaration of the given flavour
 
   | DataConSkol Name    -- bound as an existential in a Haskell98 datacon decl or
                         -- as any variable in a GADT datacon decl
@@ -308,7 +338,7 @@ unkSkolAnon = UnkSkol callStack
 -- shares a certain 'Unique'.
 mkSkolemInfo :: MonadIO m => SkolemInfoAnon -> m SkolemInfo
 mkSkolemInfo sk_anon = do
-  u <- liftIO $! uniqFromMask 's'
+  u <- liftIO $! uniqFromTag 's'
   return (SkolemInfo u sk_anon)
 
 getSkolemInfo :: SkolemInfo -> SkolemInfoAnon
@@ -410,7 +440,7 @@ in the right place.  So we proceed as follows:
   whatever it tidies to, say a''; and then we walk over the type
   replacing the binder a by the tidied version a'', to give
        forall a''. Eq a'' => forall b''. b'' -> a''
-  We need to do this under (=>) arrows, to match what topSkolemise
+  We need to do this under (=>) arrows and (->), to match what skolemisation
   does.
 
 * Typically a'' will have a nice pretty name like "a", but the point is
@@ -433,6 +463,7 @@ data TypedThing
   = HsTypeRnThing (HsType GhcRn)
   | TypeThing Type
   | HsExprRnThing (HsExpr GhcRn)
+  | HsExprTcThing (HsExpr GhcTc)
   | NameThing Name
 
 -- | Some kind of type variable binder.
@@ -446,6 +477,7 @@ instance Outputable TypedThing where
   ppr (HsTypeRnThing ty) = ppr ty
   ppr (TypeThing ty) = ppr ty
   ppr (HsExprRnThing expr) = ppr expr
+  ppr (HsExprTcThing expr) = ppr expr
   ppr (NameThing name) = ppr name
 
 instance Outputable TyVarBndrs where
@@ -467,7 +499,7 @@ data CtOrigin
 
         ScDepth         -- ^ The number of superclass selections necessary to
                         -- get this constraint; see Note [Replacement vs keeping]
-                        -- in GHC.Tc.Solver.Interact
+                        -- in GHC.Tc.Solver.Dict
 
         Bool   -- ^ True => "blocked": cannot use this to solve naked superclass Wanteds
                --                      i.e. ones with (ScOrigin _ NakedSc)
@@ -578,9 +610,8 @@ data CtOrigin
   | IfThenElseOrigin    -- An if-then-else expression
   | BracketOrigin       -- An overloaded quotation bracket
   | StaticOrigin        -- A static form
-  | Shouldn'tHappenOrigin String
-                            -- the user should never see this one
-  | GhcBug20076             -- see #20076
+  | ImpedanceMatching Id   -- See Note [Impedance matching] in GHC.Tc.Gen.Bind
+  | Shouldn'tHappenOrigin String  -- The user should never see this one
 
   -- | Testing whether the constraint associated with an instance declaration
   -- in a signature file is satisfied upon instantiation.
@@ -590,13 +621,13 @@ data CtOrigin
       Module  -- ^ Module in which the instance was declared
       ClsInst -- ^ The declared typeclass instance
 
-  | NonLinearPatternOrigin
+  | NonLinearPatternOrigin NonLinearPatternReason (LPat GhcRn)
   | UsageEnvironmentOf Name
 
   | CycleBreakerOrigin
       CtOrigin   -- origin of the original constraint
 
-      -- See Detail (7) of Note [Type equality cycles] in GHC.Tc.Solver.Canonical
+      -- See Detail (7) of Note [Type equality cycles] in GHC.Tc.Solver.Equality
   | FRROrigin
       FixedRuntimeRepOrigin
 
@@ -611,6 +642,12 @@ data CtOrigin
       Type   -- the instantiated type of the method
   | AmbiguityCheckOrigin UserTypeCtxt
 
+data NonLinearPatternReason
+  = LazyPatternReason
+  | GeneralisedPatternReason
+  | PatternSynonymReason
+  | ViewPatternReason
+  | OtherPatternReason
 
 -- | The number of superclass selections needed to get this Given.
 -- If @d :: C ty@   has @ScDepth=2@, then the evidence @d@ will look
@@ -685,13 +722,12 @@ exprCtOrigin (ExplicitList {})    = ListOrigin
 exprCtOrigin (HsIPVar _ ip)       = IPOccOrigin ip
 exprCtOrigin (HsOverLit _ lit)    = LiteralOrigin lit
 exprCtOrigin (HsLit {})           = Shouldn'tHappenOrigin "concrete literal"
-exprCtOrigin (HsLam _ matches)    = matchesCtOrigin matches
-exprCtOrigin (HsLamCase _ _ ms)   = matchesCtOrigin ms
+exprCtOrigin (HsLam _ _ ms)       = matchesCtOrigin ms
 exprCtOrigin (HsApp _ e1 _)       = lexprCtOrigin e1
-exprCtOrigin (HsAppType _ e1 _ _) = lexprCtOrigin e1
+exprCtOrigin (HsAppType _ e1 _)   = lexprCtOrigin e1
 exprCtOrigin (OpApp _ _ op _)     = lexprCtOrigin op
 exprCtOrigin (NegApp _ e _)       = lexprCtOrigin e
-exprCtOrigin (HsPar _ _ e _)      = lexprCtOrigin e
+exprCtOrigin (HsPar _ e)          = lexprCtOrigin e
 exprCtOrigin (HsProjection _ _)   = SectionOrigin
 exprCtOrigin (SectionL _ _ _)     = SectionOrigin
 exprCtOrigin (SectionR _ _ _)     = SectionOrigin
@@ -700,7 +736,7 @@ exprCtOrigin ExplicitSum{}        = Shouldn'tHappenOrigin "explicit sum"
 exprCtOrigin (HsCase _ _ matches) = matchesCtOrigin matches
 exprCtOrigin (HsIf {})           = IfThenElseOrigin
 exprCtOrigin (HsMultiIf _ rhs)   = lGRHSCtOrigin rhs
-exprCtOrigin (HsLet _ _ _ _ e)   = lexprCtOrigin e
+exprCtOrigin (HsLet _ _ e)       = lexprCtOrigin e
 exprCtOrigin (HsDo {})           = DoOrigin
 exprCtOrigin (RecordCon {})      = Shouldn'tHappenOrigin "record construction"
 exprCtOrigin (RecordUpd {})      = RecordUpdOrigin
@@ -713,7 +749,11 @@ exprCtOrigin (HsTypedSplice {})    = Shouldn'tHappenOrigin "TH typed splice"
 exprCtOrigin (HsUntypedSplice {})  = Shouldn'tHappenOrigin "TH untyped splice"
 exprCtOrigin (HsProc {})         = Shouldn'tHappenOrigin "proc"
 exprCtOrigin (HsStatic {})       = Shouldn'tHappenOrigin "static expression"
-exprCtOrigin (XExpr (HsExpanded a _)) = exprCtOrigin a
+exprCtOrigin (HsEmbTy {})        = Shouldn'tHappenOrigin "type expression"
+exprCtOrigin (XExpr (ExpandedThingRn thing _)) | OrigExpr a <- thing = exprCtOrigin a
+                                               | OrigStmt _ <- thing = DoOrigin
+                                               | OrigPat p  <- thing = DoPatOrigin p
+exprCtOrigin (XExpr (PopErrCtxt {})) = Shouldn'tHappenOrigin "PopErrCtxt"
 
 -- | Extract a suitable CtOrigin from a MatchGroup
 matchesCtOrigin :: MatchGroup GhcRn (LHsExpr GhcRn) -> CtOrigin
@@ -806,13 +846,6 @@ pprCtOrigin (Shouldn'tHappenOrigin note)
          , text "https://gitlab.haskell.org/ghc/ghc/wikis/report-a-bug >>"
          ]
 
-pprCtOrigin GhcBug20076
-  = vcat [ text "GHC Bug #20076 <https://gitlab.haskell.org/ghc/ghc/-/issues/20076>"
-         , text "Assuming you have a partial type signature, you can avoid this error"
-         , text "by either adding an extra-constraints wildcard (like `(..., _) => ...`,"
-         , text "with the underscore at the end of the constraint), or by avoiding the"
-         , text "use of a simplifiable constraint in your partial type signature." ]
-
 pprCtOrigin (ProvCtxtOrigin PSB{ psb_id = (L _ name) })
   = hang (ctoHerald <+> text "the \"provided\" constraints claimed by")
        2 (text "the signature of" <+> quotes (ppr name))
@@ -821,6 +854,10 @@ pprCtOrigin (InstProvidedOrigin mod cls_inst)
   = vcat [ text "arising when attempting to show that"
          , ppr cls_inst
          , text "is provided by" <+> quotes (ppr mod)]
+
+pprCtOrigin (ImpedanceMatching x)
+  = vcat [ text "arising when matching required constraints"
+         , text "in a group involving" <+> quotes (ppr x)]
 
 pprCtOrigin (CycleBreakerOrigin orig)
   = pprCtOrigin orig
@@ -849,6 +886,10 @@ pprCtOrigin (ScOrigin (IsQC orig) nkd)
   = vcat [ ctoHerald <+> text "the head of a quantified constraint"
          , whenPprDebug (braces (text "sc-origin:" <> ppr nkd))
          , pprCtOrigin orig ]
+
+pprCtOrigin (NonLinearPatternOrigin reason pat)
+  = hang (ctoHerald <+> text "a non-linear pattern" <+> quotes (ppr pat))
+       2 (pprNonLinearPatternReason reason)
 
 pprCtOrigin simple_origin
   = ctoHerald <+> pprCtO simple_origin
@@ -890,7 +931,6 @@ pprCtO PatCheckOrigin        = text "a pattern-match completeness check"
 pprCtO ListOrigin            = text "an overloaded list"
 pprCtO IfThenElseOrigin      = text "an if-then-else expression"
 pprCtO StaticOrigin          = text "a static form"
-pprCtO NonLinearPatternOrigin = text "a non-linear pattern"
 pprCtO (UsageEnvironmentOf x) = hsep [text "multiplicity of", quotes (ppr x)]
 pprCtO BracketOrigin         = text "a quotation bracket"
 
@@ -914,10 +954,18 @@ pprCtO (ProvCtxtOrigin {})          = text "a provided constraint"
 pprCtO (InstProvidedOrigin {})      = text "a provided constraint"
 pprCtO (CycleBreakerOrigin orig)    = pprCtO orig
 pprCtO (FRROrigin {})               = text "a representation-polymorphism check"
-pprCtO GhcBug20076                  = text "GHC Bug #20076"
 pprCtO (WantedSuperclassOrigin {})  = text "a superclass constraint"
 pprCtO (InstanceSigOrigin {})       = text "a type signature in an instance"
 pprCtO (AmbiguityCheckOrigin {})    = text "a type ambiguity check"
+pprCtO (ImpedanceMatching {})       = text "combining required constraints"
+pprCtO (NonLinearPatternOrigin _ pat) = hsep [text "a non-linear pattern" <+> quotes (ppr pat)]
+
+pprNonLinearPatternReason :: HasCallStack => NonLinearPatternReason -> SDoc
+pprNonLinearPatternReason LazyPatternReason = parens (text "non-variable lazy pattern aren't linear")
+pprNonLinearPatternReason GeneralisedPatternReason = parens (text "non-variable pattern bindings that have been generalised aren't linear")
+pprNonLinearPatternReason PatternSynonymReason = parens (text "pattern synonyms aren't linear")
+pprNonLinearPatternReason ViewPatternReason = parens (text "view patterns aren't linear")
+pprNonLinearPatternReason OtherPatternReason = empty
 
 {- *********************************************************************
 *                                                                      *
@@ -991,11 +1039,16 @@ data FixedRuntimeRepOrigin
   = FixedRuntimeRepOrigin
     { frr_type    :: Type
        -- ^ What type are we checking?
-       -- For example, `a[tau]` in `a[tau] :: TYPE rr[tau]`.
+       -- For example, @a[tau]@ in @a[tau] :: TYPE rr[tau]@.
 
     , frr_context :: FixedRuntimeRepContext
       -- ^ What context requires a fixed runtime representation?
     }
+
+instance Outputable FixedRuntimeRepOrigin where
+  ppr (FixedRuntimeRepOrigin { frr_type = ty, frr_context = cxt })
+    = text "FrOrigin" <> braces (vcat [ text "frr_type:" <+> ppr ty
+                                      , text "frr_context:" <+> ppr cxt ])
 
 -- | The context in which a representation-polymorphism check was performed.
 --
@@ -1016,6 +1069,32 @@ data FixedRuntimeRepContext
   --
   -- Test cases: LevPolyLet, RepPolyPatBind.
   | FRRBinder !Name
+
+  -- | Types appearing in negative position in the type of a
+  -- representation-polymorphic 'Id' must have a fixed runtime representation.
+  --
+  -- This includes:
+  --
+  --  - arguments,
+  --
+  --    Test cases: RepPolyMagic, RepPolyRightSection, RepPolyWrappedVar,
+  --                T14561b, T17817.
+  --
+  --  - continuation result types, such as in 'catch#', 'keepAlive#'
+  --    and 'control0#'.
+  --
+  --    Test case: T21906.
+  | FRRRepPolyId
+      !Name
+      !RepPolyId
+      !(Position Neg)
+
+  -- | A partial application of the constructor of a representation-polymorphic
+  -- unlifted newtype in which the argument type does not have a fixed
+  -- runtime representation.
+  --
+  -- Test cases: UnliftedNewtypesLevityBinder, UnliftedNewtypesCoerceFail.
+  | FRRRepPolyUnliftedNewtype !DataCon
 
   -- | Pattern binds must have a fixed runtime representation.
   --
@@ -1039,26 +1118,20 @@ data FixedRuntimeRepContext
   -- Test case: T20363.
   | FRRDataConPatArg !DataCon !Int
 
-  -- | An instantiation of a function with no binding (e.g. `coerce`, `unsafeCoerce#`, an unboxed tuple 'DataCon')
-  -- in which one of the remaining arguments types does not have a fixed runtime representation.
-  --
-  -- Test cases: RepPolyWrappedVar, T14561, UnliftedNewtypesLevityBinder, UnliftedNewtypesCoerceFail.
-  | FRRNoBindingResArg !RepPolyFun !ArgPos
-
-  -- | Arguments to unboxed tuples must have fixed runtime representations.
+  -- | The 'RuntimeRep' arguments to unboxed tuples must be concrete 'RuntimeRep's.
   --
   -- Test case: RepPolyTuple.
-  | FRRTupleArg !Int
+  | FRRUnboxedTuple !Int
 
   -- | Tuple sections must have a fixed runtime representation.
   --
   -- Test case: RepPolyTupleSection.
-  | FRRTupleSection !Int
+  | FRRUnboxedTupleSection !Int
 
-  -- | Unboxed sums must have a fixed runtime representation.
+  -- | The 'RuntimeRep' arguments to unboxed sums must be concrete 'RuntimeRep's.
   --
   -- Test cases: RepPolySum.
-  | FRRUnboxedSum
+  | FRRUnboxedSum !(Maybe Int)
 
   -- | The body of a @do@ expression or a monad comprehension must
   -- have a fixed runtime representation.
@@ -1089,13 +1162,35 @@ data FixedRuntimeRepContext
   | FRRArrow !FRRArrowContext
 
   -- | A representation-polymorphic check arising from a call
-  -- to 'matchExpectedFunTys' or 'matchActualFunTySigma'.
+  -- to 'matchExpectedFunTys' or 'matchActualFunTy'.
   --
   -- See 'ExpectedFunTyOrigin' for more details.
   | FRRExpectedFunTy
       !ExpectedFunTyOrigin
       !Int
         -- ^ argument position (1-indexed)
+
+-- | The description of a representation-polymorphic 'Id'.
+data RepPolyId
+  -- | A representation-polymorphic 'PrimOp'.
+  = RepPolyPrimOp
+  -- | An unboxed tuple constructor.
+  | RepPolyTuple
+  -- | An unboxed sum constructor.
+  | RepPolySum
+  -- | An unspecified representation-polymorphic function,
+  -- e.g. a pseudo-op such as 'coerce'.
+  | RepPolyFunction
+
+-- | A synonym for 'FRRUnboxedTuple' exposed in the hs-boot file
+-- for "GHC.Tc.Types.Origin".
+mkFRRUnboxedTuple :: Int -> FixedRuntimeRepContext
+mkFRRUnboxedTuple = FRRUnboxedTuple
+
+-- | A synonym for 'FRRUnboxedSum' exposed in the hs-boot file
+-- for "GHC.Tc.Types.Origin".
+mkFRRUnboxedSum :: Maybe Int -> FixedRuntimeRepContext
+mkFRRUnboxedSum = FRRUnboxedSum
 
 -- | Print the context for a @FixedRuntimeRep@ representation-polymorphism check.
 --
@@ -1112,6 +1207,8 @@ pprFixedRuntimeRepContext (FRRRecordUpdate lbl _arg)
 pprFixedRuntimeRepContext (FRRBinder binder)
   = sep [ text "The binder"
         , quotes (ppr binder) ]
+pprFixedRuntimeRepContext (FRRRepPolyId nm id what)
+  = pprFRRRepPolyId id nm what
 pprFixedRuntimeRepContext FRRPatBind
   = text "The pattern binding"
 pprFixedRuntimeRepContext FRRPatSynArg
@@ -1127,30 +1224,17 @@ pprFixedRuntimeRepContext (FRRDataConPatArg con i)
       = text "newtype constructor pattern"
       | otherwise
       = text "data constructor pattern in" <+> speakNth i <+> text "position"
-pprFixedRuntimeRepContext (FRRNoBindingResArg fn arg_pos)
-  = vcat [ text "Unsaturated use of a representation-polymorphic" <+> what_fun <> dot
-         , what_arg <+> text "argument of" <+> quotes (ppr fn) ]
-  where
-    what_fun, what_arg :: SDoc
-    what_fun = case fn of
-      RepPolyWiredIn {} -> text "primitive function"
-      RepPolyDataCon dc -> what_con <+> text "constructor"
-        where
-          what_con :: SDoc
-          what_con
-            | isNewDataCon dc
-            = text "newtype"
-            | otherwise
-            = text "data"
-    what_arg = case arg_pos of
-      ArgPosInvis -> text "An invisible"
-      ArgPosVis i -> text "The" <+> speakNth i
-pprFixedRuntimeRepContext (FRRTupleArg i)
-  = text "The tuple argument in" <+> speakNth i <+> text "position"
-pprFixedRuntimeRepContext (FRRTupleSection i)
-  = text "The" <+> speakNth i <+> text "component of the tuple section"
-pprFixedRuntimeRepContext FRRUnboxedSum
+pprFixedRuntimeRepContext (FRRRepPolyUnliftedNewtype dc)
+  = vcat [ text "Unsaturated use of a representation-polymorphic unlifted newtype."
+         , text "The argument of the newtype constructor" <+> quotes (ppr dc) ]
+pprFixedRuntimeRepContext (FRRUnboxedTuple i)
+  = text "The" <+> speakNth i <+> text "component of the unboxed tuple"
+pprFixedRuntimeRepContext (FRRUnboxedTupleSection i)
+  = text "The" <+> speakNth i <+> text "component of the unboxed tuple section"
+pprFixedRuntimeRepContext (FRRUnboxedSum Nothing)
   = text "The unboxed sum"
+pprFixedRuntimeRepContext (FRRUnboxedSum (Just i))
+  = text "The" <+> speakNth i <+> text "component of the unboxed sum"
 pprFixedRuntimeRepContext (FRRBodyStmt stmtOrig i)
   = vcat [ text "The" <+> speakNth i <+> text "argument to (>>)" <> comma
          , text "arising from the" <+> ppr stmtOrig <> comma ]
@@ -1181,29 +1265,56 @@ instance Outputable StmtOrigin where
   ppr MonadComprehension = text "monad comprehension"
   ppr DoNotation         = quotes ( text "do" ) <+> text "statement"
 
--- | A function with representation-polymorphic arguments,
--- such as @coerce@ or @(#, #)@.
---
--- Used for reporting partial applications of representation-polymorphic
--- functions in error messages.
-data RepPolyFun
-  = RepPolyWiredIn !Id
-    -- ^ A wired-in function with representation-polymorphic
-    -- arguments, such as 'coerce'.
-  | RepPolyDataCon !DataCon
-    -- ^ A data constructor with representation-polymorphic arguments,
-    -- such as an unboxed tuple or a newtype constructor with @-XUnliftedNewtypes@.
-
-instance Outputable RepPolyFun where
-  ppr (RepPolyWiredIn id) = ppr id
-  ppr (RepPolyDataCon dc) = ppr dc
-
 -- | The position of an argument (to be reported in an error message).
 data ArgPos
   = ArgPosInvis
     -- ^ Invisible argument: don't report its position to the user.
   | ArgPosVis !Int
     -- ^ Visible argument in i-th position.
+
+{- *********************************************************************
+*                                                                      *
+            FixedRuntimeRep: representation-polymorphic Ids
+*                                                                      *
+********************************************************************* -}
+
+data Polarity = Pos | Neg
+
+type FlipPolarity :: Polarity -> Polarity
+type family FlipPolarity p where
+  FlipPolarity Pos = Neg
+  FlipPolarity Neg = Pos
+
+-- | A position in which a type variable appears in a type;
+-- in particular, whether it appears in a positive or a negative position.
+type Position :: Polarity -> Hs.Type
+data Position p where
+  -- | In the @i@-th argument of a function arrow
+  Argument :: Int -> Position (FlipPolarity p) -> Position p
+  -- | In the result of a function arrow
+  Result   :: Position p -> Position p
+  -- | At the top level of a type
+  Top      :: Position Pos
+
+pprFRRRepPolyId :: RepPolyId -> Name -> Position Neg -> SDoc
+pprFRRRepPolyId id nm (Argument i pos) =
+  text "The" <+> what <+> speakNth i <+> text "argument of" <+> pprRepPolyId id nm
+  where
+    what = case pos of
+      Top       -> empty
+      Result {} -> text "return type of the"
+      _         -> text "nested return type inside the"
+pprFRRRepPolyId id nm (Result {}) =
+  text "The result of" <+> pprRepPolyId id nm
+
+pprRepPolyId :: RepPolyId -> Name -> SDoc
+pprRepPolyId id nm = id_desc <+> quotes (ppr nm)
+  where
+    id_desc = case id of
+      RepPolyPrimOp   {} -> text "the primop"
+      RepPolySum      {} -> text "the unboxed sum constructor"
+      RepPolyTuple    {} -> text "the unboxed tuple constructor"
+      RepPolyFunction {} -> empty
 
 {- *********************************************************************
 *                                                                      *
@@ -1276,7 +1387,7 @@ instance Outputable FRRArrowContext where
 ********************************************************************* -}
 
 -- | In what context are we calling 'matchExpectedFunTys'
--- or 'matchActualFunTySigma'?
+-- or 'matchActualFunTy'?
 --
 -- Used for two things:
 --
@@ -1297,9 +1408,9 @@ data ExpectedFunTyOrigin
   --
   -- Test cases for representation-polymorphism checks:
   --   RepPolyDoBind, RepPolyDoBody{1,2}, RepPolyMc{Bind,Body,Guard}, RepPolyNPlusK
-  = ExpectedFunTySyntaxOp
-    !CtOrigin
-    !(HsExpr GhcRn)
+  = forall (p :: Pass)
+     . (OutputableBndrId p)
+    => ExpectedFunTySyntaxOp !CtOrigin !(HsExpr (GhcPass p))
       -- ^ rebindable syntax operator
 
   -- | A view pattern must have a function type.
@@ -1315,8 +1426,7 @@ data ExpectedFunTyOrigin
   -- Test cases for representation-polymorphism checks:
   --   RepPolyApp
   | forall (p :: Pass)
-      . (OutputableBndrId p)
-      => ExpectedFunTyArg
+     . Outputable (HsExpr (GhcPass p)) => ExpectedFunTyArg
           !TypedThing
             -- ^ function
           !(HsExpr (GhcPass p))
@@ -1336,16 +1446,8 @@ data ExpectedFunTyOrigin
   -- | Ensure that a lambda abstraction has a function type.
   --
   -- Test cases for representation-polymorphism checks:
-  --   RepPolyLambda
-  | ExpectedFunTyLam
-      !(MatchGroup GhcRn (LHsExpr GhcRn))
-
-  -- | Ensure that a lambda case expression has a function type.
-  --
-  -- Test cases for representation-polymorphism checks:
-  --   RepPolyMatch
-  | ExpectedFunTyLamCase
-      LamCaseVariant
+  --   RepPolyLambda, RepPolyMatch
+  | ExpectedFunTyLam HsLamVariant
       !(HsExpr GhcRn)
        -- ^ the entire lambda-case expression
 
@@ -1373,8 +1475,7 @@ pprExpectedFunTyOrigin funTy_origin i =
       | otherwise
       -> text "The" <+> speakNth i <+> text "pattern in the equation" <> plural alts
      <+> text "for" <+> quotes (ppr fun)
-    ExpectedFunTyLam {} -> binder_of $ text "lambda"
-    ExpectedFunTyLamCase lc_variant _ -> binder_of $ lamCaseKeyword lc_variant
+    ExpectedFunTyLam lam_variant _ -> binder_of $ lamCaseKeyword lam_variant
   where
     the_arg_of :: SDoc
     the_arg_of = text "The" <+> speakNth i <+> text "argument of"
@@ -1392,12 +1493,50 @@ pprExpectedFunTyHerald (ExpectedFunTyArg fun _)
         , text "is applied to" ]
 pprExpectedFunTyHerald (ExpectedFunTyMatches fun (MG { mg_alts = L _ alts }))
   = text "The equation" <> plural alts <+> text "for" <+> quotes (ppr fun) <+> hasOrHave alts
-pprExpectedFunTyHerald (ExpectedFunTyLam match)
-  = sep [ text "The lambda expression" <+>
-                   quotes (pprSetDepth (PartWay 1) $
-                           pprMatches match)
-        -- The pprSetDepth makes the lambda abstraction print briefly
+pprExpectedFunTyHerald (ExpectedFunTyLam lam_variant expr)
+  = sep [ text "The" <+> lamCaseKeyword lam_variant <+> text "expression"
+                     <+> quotes (pprSetDepth (PartWay 1) (ppr expr))
+               -- The pprSetDepth makes the lambda abstraction print briefly
         , text "has" ]
-pprExpectedFunTyHerald (ExpectedFunTyLamCase _ expr)
-  = sep [ text "The function" <+> quotes (ppr expr)
-        , text "requires" ]
+
+{- *******************************************************************
+*                                                                    *
+                       InstanceWhat
+*                                                                    *
+**********************************************************************-}
+
+-- | Indicates if Instance met the Safe Haskell overlapping instances safety
+-- check.
+--
+-- See Note [Safe Haskell Overlapping Instances] in GHC.Tc.Solver
+-- See Note [Safe Haskell Overlapping Instances Implementation] in GHC.Tc.Solver
+type SafeOverlapping = Bool
+
+data InstanceWhat  -- How did we solve this constraint?
+  = BuiltinEqInstance    -- Built-in solver for (t1 ~ t2), (t1 ~~ t2), Coercible t1 t2
+                         -- See GHC.Tc.Solver.InertSet Note [Solved dictionaries]
+
+  | BuiltinTypeableInstance TyCon   -- Built-in solver for Typeable (T t1 .. tn)
+                         -- See Note [Well-staged instance evidence]
+
+  | BuiltinInstance      -- Built-in solver for (C t1 .. tn) where C is
+                         --   KnownNat, .. etc (classes with no top-level evidence)
+
+  | LocalInstance        -- Solved by a quantified constraint
+                         -- See GHC.Tc.Solver.InertSet Note [Solved dictionaries]
+
+  | TopLevInstance       -- Solved by a top-level instance decl
+      { iw_dfun_id   :: DFunId
+      , iw_safe_over :: SafeOverlapping
+      , iw_warn      :: Maybe (WarningTxt GhcRn) }
+            -- See Note [Implementation of deprecated instances]
+            -- in GHC.Tc.Solver.Dict
+
+instance Outputable InstanceWhat where
+  ppr BuiltinInstance   = text "a built-in instance"
+  ppr BuiltinTypeableInstance {} = text "a built-in typeable instance"
+  ppr BuiltinEqInstance = text "a built-in equality instance"
+  ppr LocalInstance     = text "a locally-quantified instance"
+  ppr (TopLevInstance { iw_dfun_id = dfun })
+      = hang (text "instance" <+> pprSigmaType (idType dfun))
+           2 (text "--" <+> pprDefinedAt (idName dfun))

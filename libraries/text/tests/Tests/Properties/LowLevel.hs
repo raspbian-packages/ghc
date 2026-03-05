@@ -2,6 +2,7 @@
 
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE MagicHash #-}
+{-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 
 {-# OPTIONS_GHC -fno-warn-missing-signatures -fno-warn-unused-imports #-}
@@ -16,6 +17,7 @@ module Tests.Properties.LowLevel (testLowLevel) where
 import Prelude hiding (head, tail)
 import Control.Applicative ((<$>), pure)
 import Control.Exception as E (SomeException, catch, evaluate)
+import Data.Functor.Identity (Identity(..))
 import Data.Int (Int32, Int64)
 import Data.Text.Foreign
 import Data.Text.Internal (Text(..), mul, mul32, mul64, safe)
@@ -28,9 +30,11 @@ import Test.QuickCheck hiding ((.&.))
 import Tests.QuickCheckUtils
 import Tests.Utils
 import qualified Data.Text as T
+import qualified Data.Text.Foreign as T
 import qualified Data.Text.IO as T
 import qualified Data.Text.Lazy as TL
 import qualified Data.Text.Lazy.IO as TL
+import qualified Data.Text.IO.Utf8 as TU
 import qualified System.IO as IO
 
 #ifdef MIN_VERSION_tasty_inspection_testing
@@ -71,6 +75,14 @@ t_use_from0 t = ioProperty $ do
   let t' = t `T.snoc` '\0'
   (== T.takeWhile (/= '\0') t') <$> useAsPtr t' (const . fromPtr0)
 
+t_peek_cstring t = T.all (/= '\0') t ==> ioProperty $ do
+  roundTrip <- T.withCString t T.peekCString
+  assertEqual "cstring" t roundTrip
+
+t_peek_cstring_len t = ioProperty $ do
+  roundTrip <- T.withCStringLen t T.peekCStringLen
+  assertEqual "cstring_len" t roundTrip
+
 t_copy t = T.copy t === t
 
 t_literal_length1 = assertEqual xs (length xs) byteLen
@@ -99,14 +111,32 @@ t_literal_foo = T.pack "foo"
 -- tl_put_get = write_read TL.unlines TL.filter put get
 --   where put h = withRedirect h IO.stdout . TL.putStr
 --         get h = withRedirect h IO.stdin TL.getContents
-t_write_read = write_read T.unlines T.filter T.hPutStr T.hGetContents
-tl_write_read = write_read TL.unlines TL.filter TL.hPutStr TL.hGetContents
 
-t_write_read_line m b t = write_read (T.concat . take 1) T.filter T.hPutStrLn
-                            T.hGetLine m b [t]
-tl_write_read_line m b t = write_read (TL.concat . take 1) TL.filter TL.hPutStrLn
-                             TL.hGetLine m b [t]
+inputOutput :: TestTree
+inputOutput = testGroup "input-output" [
+    testProperty "t_write_read" $ write_read arbitrary shrink (T.replace "\n" "\r\n") T.hPutStr T.hGetContents,
+    testProperty "tl_write_read" $ write_read arbitrary shrink (TL.replace "\n" "\r\n") TL.hPutStr TL.hGetContents,
+    testProperty "t_write_read_line" $ write_read genTLine shrinkTLine (`T.append` "\r") T.hPutStrLn T.hGetLine,
+    testProperty "tl_write_read_line" $ write_read genTLLine shrinkTLLine (`TL.append` "\r") TL.hPutStrLn TL.hGetLine,
+    -- Note: Data.Text.IO.Utf8 does NO newline translation
+    testProperty "utf8_write_read" $ write_read arbitrary shrink id TU.hPutStr TU.hGetContents,
+    testProperty "utf8_write_read_line" $ write_read genTLine shrinkTLine id TU.hPutStrLn TU.hGetLine
+    -- These tests are subject to I/O race conditions
+    -- testProperty "t_put_get" t_put_get,
+    -- testProperty "tl_put_get" tl_put_get
+  ]
 
+genTLine :: Gen T.Text
+genTLine = T.filter (`notElem` ("\r\n" :: String)) <$> arbitrary
+
+genTLLine :: Gen TL.Text
+genTLLine = TL.filter (`notElem` ("\r\n" :: String)) <$> arbitrary
+
+shrinkTLine :: T.Text -> [T.Text]
+shrinkTLine = filter (T.all (/= '\n')) . shrink
+
+shrinkTLLine :: TL.Text -> [TL.Text]
+shrinkTLLine = filter (TL.all (/= '\n')) . shrink
 
 testLowLevel :: TestTree
 testLowLevel =
@@ -124,6 +154,8 @@ testLowLevel =
       testProperty "t_use_from" t_use_from,
       testProperty "t_use_from0" t_use_from0,
       testProperty "t_copy" t_copy,
+      testProperty "t_peek_cstring" t_peek_cstring,
+      testProperty "t_peek_cstring_len" t_peek_cstring_len,
       testCase "t_literal_length1" t_literal_length1,
       testCase "t_literal_length2" t_literal_length2,
       testCase "t_literal_surrogates" t_literal_surrogates
@@ -138,14 +170,5 @@ testLowLevel =
 #endif
     ],
 
-    testGroup "input-output" [
-      testProperty "t_write_read" t_write_read,
-      testProperty "tl_write_read" tl_write_read,
-      testProperty "t_write_read_line" t_write_read_line,
-      testProperty "tl_write_read_line" tl_write_read_line
-      -- These tests are subject to I/O race conditions
-      -- testProperty "t_put_get" t_put_get,
-      -- testProperty "tl_put_get" tl_put_get
-    ]
+    inputOutput
   ]
-

@@ -1,4 +1,5 @@
 {-# LANGUAGE GADTs         #-}
+{-# LANGUAGE TupleSections #-}
 
 module GHC.Driver.GenerateCgIPEStub (generateCgIPEStub, lookupEstimatedTicks) where
 
@@ -9,8 +10,7 @@ import GHC.Cmm
 import GHC.Cmm.CLabel (CLabel, mkAsmTempLabel)
 import GHC.Cmm.Dataflow (O)
 import GHC.Cmm.Dataflow.Block (blockSplit, blockToList)
-import GHC.Cmm.Dataflow.Collections
-import GHC.Cmm.Dataflow.Label (Label)
+import GHC.Cmm.Dataflow.Label
 import GHC.Cmm.Info.Build (emptySRT)
 import GHC.Cmm.Pipeline (cmmPipeline)
 import GHC.Data.Stream (Stream, liftIO)
@@ -18,7 +18,7 @@ import qualified GHC.Data.Stream as Stream
 import GHC.Driver.Env (hsc_dflags, hsc_logger)
 import GHC.Driver.Env.Types (HscEnv)
 import GHC.Driver.Flags (GeneralFlag (..), DumpFlag(Opt_D_ipe_stats))
-import GHC.Driver.Session (gopt, targetPlatform)
+import GHC.Driver.DynFlags (gopt, targetPlatform)
 import GHC.Driver.Config.StgToCmm
 import GHC.Driver.Config.Cmm
 import GHC.Prelude

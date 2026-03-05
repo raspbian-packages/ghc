@@ -1,6 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE BlockArguments #-}
-{-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE LambdaCase   #-}
+{-# LANGUAGE ViewPatterns #-}
 
 -- | JavaScript code generator
 module GHC.StgToJS.CodeGen
@@ -13,16 +14,17 @@ import GHC.Prelude
 import GHC.Driver.Flags (DumpFlag (Opt_D_dump_js))
 
 import GHC.JS.Ppr
-import GHC.JS.Syntax
+import GHC.JS.JStg.Syntax
+import GHC.JS.Ident
 import GHC.JS.Make
 import GHC.JS.Transform
+import GHC.JS.Optimizer
 
 import GHC.StgToJS.Arg
 import GHC.StgToJS.Sinker
 import GHC.StgToJS.Types
 import qualified GHC.StgToJS.Object as Object
-import GHC.StgToJS.StgUtils
-import GHC.StgToJS.CoreUtils
+import GHC.StgToJS.Utils
 import GHC.StgToJS.Deps
 import GHC.StgToJS.Expr
 import GHC.StgToJS.ExprCtx
@@ -90,11 +92,11 @@ stgToJS logger config stg_binds0 this_mod spt_entries foreign_stubs cccs output_
   -- Doc to dump when -ddump-js is enabled
   when (logHasDumpFlag logger Opt_D_dump_js) $ do
     putDumpFileMaybe logger Opt_D_dump_js "JavaScript code" FormatJS
-      $ vcat (fmap (docToSDoc . jsToDoc . oiStat . luObjUnit) lus)
+      $ vcat (fmap (jsToDoc . oiStat . luObjBlock) lus)
 
   -- Write the object file
   bh <- openBinMem (4 * 1024 * 1000) -- a bit less than 4kB
-  Object.putObject bh (moduleName this_mod) deps (map luObjUnit lus)
+  Object.putObject bh (moduleName this_mod) deps (map luObjBlock lus)
 
   createDirectoryIfMissing True (takeDirectory output_fn)
   writeBinMem bh output_fn
@@ -133,21 +135,21 @@ genUnits m ss spt_entries foreign_stubs = do
         glbl <- State.gets gsGlobal
         staticInit <-
           initStaticPtrs spt_entries
-        let stat = ( -- O.optimize .
-                     jsSaturate (Just $ modulePrefix m 1)
+        let stat = ( jStgStatToJS
                    $ mconcat (reverse glbl) <> staticInit)
+        let opt_stat = jsOptimize stat
         let syms = [moduleGlobalSymbol m]
-        let oi = ObjUnit
+        let oi = ObjBlock
                   { oiSymbols  = syms
                   , oiClInfo   = []
                   , oiStatic   = []
-                  , oiStat     = stat
+                  , oiStat     = opt_stat
                   , oiRaw      = mempty
                   , oiFExports = []
                   , oiFImports = []
                   }
         let lu = LinkableUnit
-                  { luObjUnit      = oi
+                  { luObjBlock     = oi
                   , luIdExports    = []
                   , luOtherExports = syms
                   , luIdDeps       = []
@@ -169,7 +171,7 @@ genUnits m ss spt_entries foreign_stubs = do
 
         let syms = [moduleExportsSymbol m]
         let raw  = utf8EncodeByteString $ renderWithContext defaultSDocContext f_c
-        let oi = ObjUnit
+        let oi = ObjBlock
                   { oiSymbols  = syms
                   , oiClInfo   = []
                   , oiStatic   = []
@@ -179,7 +181,7 @@ genUnits m ss spt_entries foreign_stubs = do
                   , oiFImports = []
                   }
         let lu = LinkableUnit
-                  { luObjUnit      = oi
+                  { luObjBlock     = oi
                   , luIdExports    = []
                   , luOtherExports = syms
                   , luIdDeps       = []
@@ -196,31 +198,27 @@ genUnits m ss spt_entries foreign_stubs = do
                     => CgStgTopBinding
                     -> Int
                     -> G (Maybe LinkableUnit)
-      generateBlock top_bind n = case top_bind of
+      generateBlock top_bind _n = case top_bind of
         StgTopStringLit bnd str -> do
           bids <- identsForId bnd
           case bids of
-            [(TxtI b1t),(TxtI b2t)] -> do
-              -- [e1,e2] <- genLit (MachStr str)
+            [(identFS -> b1t),(identFS -> b2t)] -> do
               emitStatic b1t (StaticUnboxed (StaticUnboxedString str)) Nothing
               emitStatic b2t (StaticUnboxed (StaticUnboxedStringOffset str)) Nothing
-              _extraTl   <- State.gets (ggsToplevelStats . gsGroup)
               si        <- State.gets (ggsStatic . gsGroup)
-              let body = mempty -- mconcat (reverse extraTl) <> b1 ||= e1 <> b2 ||= e2
-              let stat = jsSaturate (Just $ modulePrefix m n) body
               let ids = [bnd]
-              syms <- (\(TxtI i) -> [i]) <$> identForId bnd
-              let oi = ObjUnit
+              syms <- (\(identFS -> i) -> [i]) <$> identForId bnd
+              let oi = ObjBlock
                         { oiSymbols  = syms
                         , oiClInfo   = []
                         , oiStatic   = si
-                        , oiStat     = stat
+                        , oiStat     = mempty
                         , oiRaw      = ""
                         , oiFExports = []
                         , oiFImports = []
                         }
               let lu = LinkableUnit
-                        { luObjUnit      = oi
+                        { luObjBlock     = oi
                         , luIdExports    = ids
                         , luOtherExports = []
                         , luIdDeps       = []
@@ -244,21 +242,21 @@ genUnits m ss spt_entries foreign_stubs = do
           let allDeps  = collectIds unf decl
               topDeps  = collectTopIds decl
               required = hasExport decl
-              stat     = -- Opt.optimize .
-                         jsSaturate (Just $ modulePrefix m n)
-                       $ mconcat (reverse extraTl) <> tl
-          syms <- mapM (fmap (\(TxtI i) -> i) . identForId) topDeps
-          let oi = ObjUnit
+              stat     = jStgStatToJS
+                         $ mconcat (reverse extraTl) <> tl
+          let opt_stat = jsOptimize stat
+          syms <- mapM (fmap (\(identFS -> i) -> i) . identForId) topDeps
+          let oi = ObjBlock
                     { oiSymbols  = syms
                     , oiClInfo   = ci
                     , oiStatic   = si
-                    , oiStat     = stat
+                    , oiStat     = opt_stat
                     , oiRaw      = ""
                     , oiFExports = []
                     , oiFImports = fRefs
                     }
           let lu = LinkableUnit
-                    { luObjUnit      = oi
+                    { luObjBlock     = oi
                     , luIdExports    = topDeps
                     , luOtherExports = []
                     , luIdDeps       = allDeps
@@ -270,60 +268,56 @@ genUnits m ss spt_entries foreign_stubs = do
           pure $! seqList topDeps `seq` seqList allDeps `seq` Just lu
 
 -- | variable prefix for the nth block in module
-modulePrefix :: Module -> Int -> FastString
-modulePrefix m n =
-  let encMod = zEncodeString . moduleNameString . moduleName $ m
-  in  mkFastString $ "h$" ++ encMod ++ "_id_" ++ show n
 
-genToplevel :: CgStgBinding -> G JStat
+genToplevel :: CgStgBinding -> G JStgStat
 genToplevel (StgNonRec bndr rhs) = genToplevelDecl bndr rhs
 genToplevel (StgRec bs)          =
   mconcat <$> mapM (\(bndr, rhs) -> genToplevelDecl bndr rhs) bs
 
-genToplevelDecl :: Id -> CgStgRhs -> G JStat
+genToplevelDecl :: Id -> CgStgRhs -> G JStgStat
 genToplevelDecl i rhs = do
   s1 <- resetSlots (genToplevelConEntry i rhs)
   s2 <- resetSlots (genToplevelRhs i rhs)
   return (s1 <> s2)
 
-genToplevelConEntry :: Id -> CgStgRhs -> G JStat
+genToplevelConEntry :: Id -> CgStgRhs -> G JStgStat
 genToplevelConEntry i rhs = case rhs of
-   StgRhsCon _cc con _mu _ts _args
+   StgRhsCon _cc con _mu _ts _args _typ
      | isDataConWorkId i
        -> genSetConInfo i con (stgRhsLive rhs) -- NoSRT
-   StgRhsClosure _ _cc _upd_flag _args _body
+   StgRhsClosure _ _cc _upd_flag _args _body _typ
      | Just dc <- isDataConWorkId_maybe i
        -> genSetConInfo i dc (stgRhsLive rhs) -- srt
    _ -> pure mempty
 
-genSetConInfo :: HasDebugCallStack => Id -> DataCon -> LiveVars -> G JStat
+genSetConInfo :: HasDebugCallStack => Id -> DataCon -> LiveVars -> G JStgStat
 genSetConInfo i d l {- srt -} = do
   ei <- identForDataConEntryId i
   sr <- genStaticRefs l
   emitClosureInfo $ ClosureInfo ei
                                 (CIRegs 0 [PtrV])
                                 (mkFastString $ renderWithContext defaultSDocContext (ppr d))
-                                (fixedLayout $ map uTypeVt fields)
+                                (fixedLayout $ map unaryTypeJSRep fields)
                                 (CICon $ dataConTag d)
                                 sr
-  return (ei ||= mkDataEntry)
+  return (mkDataEntry ei)
     where
       -- dataConRepArgTys sometimes returns unboxed tuples. is that a bug?
       fields = concatMap (map primRepToType . typePrimRep . unwrapType . scaledThing)
                          (dataConRepArgTys d)
         -- concatMap (map slotTyToType . repTypeSlots . repType) (dataConRepArgTys d)
 
-mkDataEntry :: JExpr
-mkDataEntry = ValExpr $ JFunc [] returnStack
+mkDataEntry :: Ident -> JStgStat
+mkDataEntry i = FuncStat i [] returnStack
 
-genToplevelRhs :: Id -> CgStgRhs -> G JStat
+genToplevelRhs :: Id -> CgStgRhs -> G JStgStat
 -- general cases:
 genToplevelRhs i rhs = case rhs of
-  StgRhsCon cc con _mu _tys args -> do
+  StgRhsCon cc con _mu _tys args _typ -> do
     ii <- identForId i
     allocConStatic ii cc con args
     return mempty
-  StgRhsClosure _ext cc _upd_flag {- srt -} args body -> do
+  StgRhsClosure _ext cc _upd_flag {- srt -} args body typ -> do
     {-
       algorithm:
        - collect all Id refs that are in the global id cache
@@ -331,10 +325,11 @@ genToplevelRhs i rhs = case rhs of
        - order by increasing use
        - prepend loading lives var to body: body can stay the same
     -}
-    eid@(TxtI eidt) <- identForEntryId i
-    (TxtI idt)   <- identForId i
-    body <- genBody (initExprCtx i) i R2 args body
-    global_occs <- globalOccs (jsSaturate (Just "ghcjs_tmp_sat_") body)
+    eid  <- identForEntryId i
+    idt  <- identFS <$> identForId i
+    body <- genBody (initExprCtx i) R2 args body typ
+    global_occs <- globalOccs body
+    let eidt = identFS eid
     let lidents = map global_ident global_occs
     let lids    = map global_id    global_occs
     let lidents' = map identFS lidents
@@ -349,8 +344,8 @@ genToplevelRhs i rhs = case rhs of
           r <- updateThunk
           pure (StaticThunk (Just (eidt, map StaticObjArg lidents')), CIRegs 0 [PtrV],r)
         else return (StaticFun eidt (map StaticObjArg lidents'),
-                    (if null lidents then CIRegs 1 (concatMap idVt args)
-                                     else CIRegs 0 (PtrV : concatMap idVt args))
+                    (if null lidents then CIRegs 1 (concatMap idJSRep args)
+                                     else CIRegs 0 (PtrV : concatMap idJSRep args))
                       , mempty)
     setcc <- ifProfiling $
                if et == CIThunk
@@ -359,9 +354,9 @@ genToplevelRhs i rhs = case rhs of
     emitClosureInfo (ClosureInfo eid
                                  regs
                                  idt
-                                 (fixedLayout $ map (uTypeVt . idType) lids)
+                                 (fixedLayout $ map (unaryTypeJSRep . idType) lids)
                                  et
                                  sr)
     ccId <- costCentreStackLbl cc
     emitStatic idt static ccId
-    return $ (eid ||= toJExpr (JFunc [] (ll <> upd <> setcc <> body)))
+    return $ (FuncStat eid [] (ll <> upd <> setcc <> body))

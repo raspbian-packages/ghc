@@ -27,6 +27,10 @@
 # string "${docdir}", not the value of docdir! This is crucial for the GNU
 # coding standards. See #1924.
 
+# The build.mk contains information about the bindist such as whether there are
+# profiled libraries.
+include build.mk
+
 define set_default
 # $1 = variable to set
 # $2 = default value to use, if configure didn't expand it
@@ -62,6 +66,13 @@ $(eval $(call set_default,htmldir,$${docdir}))
 $(eval $(call set_default,dvidir,$${docdir}))
 $(eval $(call set_default,pdfdir,$${docdir}))
 $(eval $(call set_default,psdir,$${docdir}))
+
+# On Windows we can only make a relocatable bindist because the normal install
+# script creates wrapper scripts which do not work on windows. Therefore we force
+# RelocatableBuild = YES here until/if that is ever fixed.
+ifeq "$(Windows_Host)" "YES"
+RelocatableBuild = YES
+endif
 
 ifeq "$(RelocatableBuild)" "YES"
 
@@ -122,6 +133,7 @@ INSTALL_DIR     = $(INSTALL) -m 755 -d
 CrossCompiling        = @CrossCompiling@
 CrossCompilePrefix    = @CrossCompilePrefix@
 GhcUnregisterised     = @Unregisterised@
+EnableDistroToolchain = @SettingsUseDistroMINGW@
 
 # ArchSupportsSMP should be set iff there is support for that arch in
 # rts/include/stg/SMP.h
@@ -149,71 +161,11 @@ else
 GhcWithInterpreter=$(if $(findstring YES,$(DYNAMIC_GHC_PROGRAMS)),YES,NO)
 endif
 
-# On Windows we normally want to make a relocatable bindist, to we
-# ignore flags like libdir
-ifeq "$(Windows_Host)" "YES"
-RelocatableBuild = YES
-else
-RelocatableBuild = NO
-endif
 
-
-# runhaskell and hsc2hs are special, in that other compilers besides
-# GHC might provide them.  Systems with a package manager often come
-# with tools to manage this kind of clash, e.g. RPM's
-# update-alternatives.  When building a distribution for such a system,
-# we recommend setting both of the following to 'YES'.
-#
-# NO_INSTALL_RUNHASKELL = YES
-# NO_INSTALL_HSC2HS     = YES
-#
-# NB. we use negative tests here because for binary-distributions we cannot
-# test build-time variables at install-time, so they must default to on.
 
 ifneq "$(DESTDIR)" ""
 override DESTDIR := $(abspath $(DESTDIR))
 endif
-
-# We build the libraries at least the "vanilla" way (way "v")
-# Technically we don't need the v way if DYNAMIC_GHC_PROGRAMS is YES,
-# but with -dynamic-too it's cheap, and makes life easier.
-GhcLibWays = v
-
-# In addition to the normal sequential way, the default is to also build
-# profiled prelude libraries
-# $(if $(filter ...)) allows controlling this expression from build.mk.
-GhcLibWays += $(if $(filter $(BUILD_PROF_LIBS),NO),,p)
-
-# Backward compatibility: although it would be cleaner to test for
-# PlatformSupportsSharedLibs, or perhaps a new variable BUILD_SHARED_LIBS,
-# some users currently expect that DYNAMIC_GHC_PROGRAMS=NO in build.mk implies
-# that dyn is not added to GhcLibWays.
-GhcLibWays += $(if $(filter $(DYNAMIC_GHC_PROGRAMS),NO),,dyn)
-
-# Handy way to test whether we're building shared libs or not.
-BuildSharedLibs=$(strip $(if $(findstring dyn,$(GhcLibWays)),YES,NO))
-
-# In addition, the RTS is built in some further variations.  Ways that
-# make sense here:
-#
-#   thr           : threaded
-#   thr_p         : threaded + profiled
-#   debug         : debugging
-#   thr_debug     : debugging + threaded
-#   p             : profiled
-#
-# While the eventlog used to be enabled in only a subset of ways, we now always
-# enable it.
-
-# Usually want the debug version
-GhcRTSWays = debug
-
-# We always have the threaded versions, but note that SMP support may be disabled
-# (see GhcWithSMP).
-GhcRTSWays += thr thr_debug
-GhcRTSWays += $(if $(findstring p, $(GhcLibWays)),thr_p,)
-GhcRTSWays += $(if $(findstring dyn, $(GhcLibWays)),dyn debug_dyn thr_dyn thr_debug_dyn,)
-GhcRTSWays += $(if $(findstring p, $(GhcLibWays)),thr_debug_p debug_p,)
 
 # We can only build GHCi threaded if we have a threaded RTS:
 GhcThreaded = $(if $(findstring thr,$(GhcRTSWays)),YES,NO)
@@ -234,8 +186,8 @@ GhcRtsWithLibdw=$(strip $(if $(filter $(TargetArch_CPP),i386 x86_64 s390x),@UseL
 # might become redundant.
 # See Note [tooldir: How GHC finds mingw on Windows]
 
-GccExtraViaCOpts = @GccExtraViaCOpts@
 LdHasFilelist = @LdHasFilelist@
+MergeObjsSupportsResponseFiles = @MergeObjsSupportsResponseFiles@
 LdHasBuildId = @LdHasBuildId@
 LdHasFilelist = @LdHasFilelist@
 LdIsGNULd = @LdIsGNULd@
@@ -253,32 +205,37 @@ TargetWordBigEndian = @TargetWordBigEndian@
 TargetHasGnuNonexecStack = @TargetHasGnuNonexecStack@
 TargetHasIdentDirective = @TargetHasIdentDirective@
 TargetHasSubsectionsViaSymbols = @TargetHasSubsectionsViaSymbols@
-TargetHasRTSLinker = @TargetHasRTSLinker@
 TargetHasLibm = @TargetHasLibm@
 TablesNextToCode = @TablesNextToCode@
+LeadingUnderscore = @LeadingUnderscore@
+LlvmTarget = @LlvmTarget@
 
 SettingsCCompilerCommand = @SettingsCCompilerCommand@
 SettingsCxxCompilerCommand = @SettingsCxxCompilerCommand@
+SettingsCPPCommand = @SettingsCPPCommand@
+SettingsCPPFlags = @SettingsCPPFlags@
 SettingsHaskellCPPCommand = @SettingsHaskellCPPCommand@
 SettingsHaskellCPPFlags = @SettingsHaskellCPPFlags@
+SettingsJavaScriptCPPCommand = @SettingsJavaScriptCPPCommand@
+SettingsJavaScriptCPPFlags = @SettingsJavaScriptCPPFlags@
+SettingsCmmCPPCommand = @SettingsCmmCPPCommand@
+SettingsCmmCPPFlags = @SettingsCmmCPPFlags@
+SettingsCmmCPPSupportsG0 = @SettingsCmmCPPSupportsG0@
 SettingsCCompilerFlags = @SettingsCCompilerFlags@
 SettingsCxxCompilerFlags = @SettingsCxxCompilerFlags@
 SettingsCCompilerLinkFlags = @SettingsCCompilerLinkFlags@
 SettingsCCompilerSupportsNoPie = @SettingsCCompilerSupportsNoPie@
-SettingsLdCommand = @SettingsLdCommand@
-SettingsLdFlags = @SettingsLdFlags@
 SettingsMergeObjectsCommand = @SettingsMergeObjectsCommand@
 SettingsMergeObjectsFlags = @SettingsMergeObjectsFlags@
 SettingsArCommand = @SettingsArCommand@
 SettingsOtoolCommand = @SettingsOtoolCommand@
 SettingsInstallNameToolCommand = @SettingsInstallNameToolCommand@
 SettingsRanlibCommand = @SettingsRanlibCommand@
-SettingsDllWrapCommand = @SettingsDllWrapCommand@
 SettingsWindresCommand = @SettingsWindresCommand@
 SettingsLibtoolCommand = @SettingsLibtoolCommand@
-SettingsTouchCommand = @SettingsTouchCommand@
-SettingsClangCommand = @SettingsClangCommand@
 SettingsLlcCommand = @SettingsLlcCommand@
 SettingsOptCommand = @SettingsOptCommand@
+SettingsLlvmAsCommand = @SettingsLlvmAsCommand@
 SettingsUseDistroMINGW = @SettingsUseDistroMINGW@
+
 

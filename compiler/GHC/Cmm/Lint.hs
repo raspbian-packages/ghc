@@ -18,7 +18,6 @@ import GHC.Prelude
 import GHC.Platform
 import GHC.Platform.Regs (callerSaves)
 import GHC.Cmm.Dataflow.Block
-import GHC.Cmm.Dataflow.Collections
 import GHC.Cmm.Dataflow.Graph
 import GHC.Cmm.Dataflow.Label
 import GHC.Cmm
@@ -107,8 +106,7 @@ lintCmmExpr expr@(CmmMachOp op args) = do
         then cmmCheckMachOp op args tys
         else cmmLintMachOpErr expr (map (cmmExprType platform) args) (machOpArgReps platform op)
 lintCmmExpr (CmmRegOff reg offset)
-  = do platform <- getPlatform
-       let rep = typeWidth (cmmRegType platform reg)
+  = do let rep = typeWidth (cmmRegType reg)
        lintCmmExpr (CmmMachOp (MO_Add rep)
                 [CmmReg reg, CmmLit (CmmInt (fromIntegral offset) rep)])
 lintCmmExpr expr =
@@ -171,24 +169,10 @@ lintCmmMiddle node = case node of
   CmmUnwind{}  -> return ()
 
   CmmAssign reg expr -> do
-            platform <- getPlatform
             erep <- lintCmmExpr expr
-            let reg_ty = cmmRegType platform reg
-            unless (compat_regs erep reg_ty) $
+            let reg_ty = cmmRegType reg
+            unless (erep `cmmEqType_ignoring_ptrhood` reg_ty) $
               cmmLintAssignErr (CmmAssign reg expr) erep reg_ty
-    where
-      compat_regs :: CmmType -> CmmType -> Bool
-      compat_regs ty1 ty2
-        -- As noted in #22297, SIMD vector registers can be used for
-        -- multiple different purposes, e.g. xmm1 can be used to hold 4 Floats,
-        -- or 4 Int32s, or 2 Word64s, ...
-        -- To allow this, we relax the check: we only ensure that the widths
-        -- match, until we can find a more robust solution.
-        | isVecType ty1
-        , isVecType ty2
-        = typeWidth ty1 == typeWidth ty2
-        | otherwise
-        = cmmEqType_ignoring_ptrhood ty1 ty2
 
   CmmStore l r _alignment -> do
             _ <- lintCmmExpr l

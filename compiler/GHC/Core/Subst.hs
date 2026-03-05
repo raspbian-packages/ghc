@@ -19,7 +19,7 @@ module GHC.Core.Subst (
         substTickish, substDVarSet, substIdInfo,
 
         -- ** Operations on substitutions
-        emptySubst, mkEmptySubst, mkSubst, mkOpenSubst, isEmptySubst,
+        emptySubst, mkEmptySubst, mkTCvSubst, mkOpenSubst, isEmptySubst,
         extendIdSubst, extendIdSubstList, extendTCvSubst, extendTvSubstList,
         extendIdSubstWithClone,
         extendSubst, extendSubstList, extendSubstWithVar,
@@ -61,7 +61,6 @@ import GHC.Data.Maybe
 import GHC.Utils.Misc
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
-import GHC.Utils.Panic.Plain
 
 import Data.Functor.Identity (Identity (..))
 import Data.List (mapAccumL)
@@ -371,7 +370,7 @@ substIdBndr :: SDoc
 
 substIdBndr _doc rec_subst subst@(Subst in_scope env tvs cvs) old_id
   = -- pprTrace "substIdBndr" (doc $$ ppr old_id $$ ppr in_scope) $
-    (Subst (in_scope `InScopeSet.extendInScopeSet` new_id) new_env tvs cvs, new_id)
+    (Subst new_in_scope new_env tvs cvs, new_id)
   where
     id1 = uniqAway in_scope old_id      -- id1 is cloned if necessary
     id2 | no_type_change = id1
@@ -385,14 +384,16 @@ substIdBndr _doc rec_subst subst@(Subst in_scope env tvs cvs) old_id
         -- new_id has the right IdInfo
         -- The lazy-set is because we're in a loop here, with
         -- rec_subst, when dealing with a mutually-recursive group
-    new_id = maybeModifyIdInfo mb_new_info id2
+    !new_id = maybeModifyIdInfo mb_new_info id2
     mb_new_info = substIdInfo rec_subst id2 (idInfo id2)
         -- NB: unfolding info may be zapped
 
         -- Extend the substitution if the unique has changed
         -- See the notes with substTyVarBndr for the delVarEnv
-    new_env | no_change = delVarEnv env old_id
-            | otherwise = extendVarEnv env old_id (Var new_id)
+    !new_in_scope = in_scope `InScopeSet.extendInScopeSet` new_id
+        -- Forcing new_in_scope improves T9675 by 1.7%
+    !new_env | no_change = delVarEnv env old_id
+             | otherwise = extendVarEnv env old_id (Var new_id)
 
     no_change = id1 == old_id
         -- See Note [Extending the IdSubstEnv]
@@ -417,11 +418,12 @@ cloneIdBndrs :: Subst -> UniqSupply -> [Id] -> (Subst, [Id])
 cloneIdBndrs subst us ids
   = mapAccumL (clone_id subst) subst (ids `zip` uniqsFromSupply us)
 
-cloneBndrs :: Subst -> UniqSupply -> [Var] -> (Subst, [Var])
+cloneBndrs :: MonadUnique m => Subst -> [Var] -> m (Subst, [Var])
 -- Works for all kinds of variables (typically case binders)
 -- not just Ids
-cloneBndrs subst us vs
-  = mapAccumL (\subst (v, u) -> cloneBndr subst u v) subst (vs `zip` uniqsFromSupply us)
+cloneBndrs subst vs
+  = do us <- getUniquesM
+       pure $ mapAccumL (\subst (v, u) -> cloneBndr subst u v) subst (vs `zip` us)
 
 cloneBndr :: Subst -> Unique -> Var -> (Subst, Var)
 cloneBndr subst uniq v
@@ -429,12 +431,11 @@ cloneBndr subst uniq v
   | otherwise = clone_id subst subst (v,uniq)  -- Works for coercion variables too
 
 -- | Clone a mutually recursive group of 'Id's
-cloneRecIdBndrs :: Subst -> UniqSupply -> [Id] -> (Subst, [Id])
-cloneRecIdBndrs subst us ids
-  = (subst', ids')
-  where
-    (subst', ids') = mapAccumL (clone_id subst') subst
-                               (ids `zip` uniqsFromSupply us)
+cloneRecIdBndrs :: MonadUnique m => Subst -> [Id] -> m (Subst, [Id])
+cloneRecIdBndrs subst ids
+  = do us <- getUniquesM
+       let (subst', ids') = mapAccumL (clone_id subst') subst (ids `zip` us)
+       pure (subst', ids')
 
 -- Just like substIdBndr, except that it always makes a new unique
 -- It is given the unique to use
@@ -444,13 +445,15 @@ clone_id    :: Subst                    -- Substitution for the IdInfo
             -> (Subst, Id)              -- Transformed pair
 
 clone_id rec_subst subst@(Subst in_scope idvs tvs cvs) (old_id, uniq)
-  = (Subst (in_scope `InScopeSet.extendInScopeSet` new_id) new_idvs tvs new_cvs, new_id)
+  = (Subst new_in_scope new_idvs tvs new_cvs, new_id)
   where
     id1     = setVarUnique old_id uniq
     id2     = substIdType subst id1
-    new_id  = maybeModifyIdInfo (substIdInfo rec_subst id2 (idInfo old_id)) id2
-    (new_idvs, new_cvs) | isCoVar old_id = (idvs, extendVarEnv cvs old_id (mkCoVarCo new_id))
-                        | otherwise      = (extendVarEnv idvs old_id (Var new_id), cvs)
+    !new_id = maybeModifyIdInfo (substIdInfo rec_subst id2 (idInfo old_id)) id2
+    !new_in_scope = in_scope `InScopeSet.extendInScopeSet` new_id
+        -- Forcing new_in_scope improves T9675 by 1.7%
+    (!new_idvs, !new_cvs) | isCoVar old_id = (idvs, extendVarEnv cvs old_id (mkCoVarCo new_id))
+                          | otherwise      = (extendVarEnv idvs old_id (Var new_id), cvs)
 
 {-
 ************************************************************************
@@ -590,11 +593,13 @@ substDVarSet subst@(Subst _ _ tv_env cv_env) fvs
      = exprFVs fv_expr (const True) emptyVarSet $! acc
 
 ------------------
+-- | Drop free vars from the breakpoint if they have a non-variable substitution.
 substTickish :: Subst -> CoreTickish -> CoreTickish
-substTickish subst (Breakpoint ext n ids)
-   = Breakpoint ext n (map do_one ids)
+substTickish subst (Breakpoint ext n ids modl)
+   = Breakpoint ext n (mapMaybe do_one ids) modl
  where
-    do_one = getIdFromTrivialExpr . lookupIdSubst subst
+    do_one = getIdFromTrivialExpr_maybe . lookupIdSubst subst
+
 substTickish _subst other = other
 
 {- Note [Substitute lazily]
@@ -649,6 +654,13 @@ Second, we have to ensure that we never try to substitute a literal
 for an Id in a breakpoint.  We ensure this by never storing an Id with
 an unlifted type in a Breakpoint - see GHC.HsToCore.Ticks.mkTickish.
 Breakpoints can't handle free variables with unlifted types anyway.
+
+These measures are only reliable with unoptimized code.
+Since we can now enable optimizations for GHCi with
+@-fno-unoptimized-core-for-interpreter -O@, nontrivial expressions can be
+substituted, e.g. by specializations.
+Therefore we resort to discarding free variables from breakpoints when this
+situation occurs.
 -}
 
 {-

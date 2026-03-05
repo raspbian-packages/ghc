@@ -3,9 +3,7 @@
 (c) The GRASP/AQUA Project, Glasgow University, 1992-1998
 -}
 
-{-# LANGUAGE DeriveDataTypeable, FlexibleContexts #-}
-{-# LANGUAGE NamedFieldPuns #-}
-{-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE NoPolyKinds #-}
 
 -- | GHC.Core holds all the main data types for use by for the Glasgow Haskell Compiler midsection
 module GHC.Core (
@@ -27,13 +25,15 @@ module GHC.Core (
         mkIntLit, mkIntLitWrap,
         mkWordLit, mkWordLitWrap,
         mkWord8Lit,
-        mkWord64LitWord64, mkInt64LitInt64,
+        mkWord32LitWord32, mkWord64LitWord64, mkInt64LitInt64,
         mkCharLit, mkStringLit,
         mkFloatLit, mkFloatLitFloat,
         mkDoubleLit, mkDoubleLitDouble,
 
         mkConApp, mkConApp2, mkTyBind, mkCoBind,
         varToCoreExpr, varsToCoreExprs,
+
+        mkBinds,
 
         isId, cmpAltCon, cmpAlt, ltAlt,
 
@@ -112,7 +112,6 @@ import GHC.Utils.Binary
 import GHC.Utils.Misc
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
-import GHC.Utils.Panic.Plain
 
 import Data.Data hiding (TyCon)
 import Data.Int
@@ -155,7 +154,7 @@ These data types are the heart of the compiler
 --      f_1 x_2 = let f_3 x_4 = x_4 + 1
 --                in f_3 (x_2 - 2)
 -- @
---    But see Note [Shadowing] below.
+--    But see Note [Shadowing in Core] below.
 --
 -- 3. The resulting syntax tree undergoes type checking (which also deals with instantiating
 --    type class arguments) to yield a 'GHC.Hs.Expr.HsExpr' type that has 'GHC.Types.Id.Id' as it's names.
@@ -292,7 +291,7 @@ data AltCon
 -- This instance is a bit shady. It can only be used to compare AltCons for
 -- a single type constructor. Fortunately, it seems quite unlikely that we'll
 -- ever need to compare AltCons for different type constructors.
--- The instance adheres to the order described in [Core case invariants]
+-- The instance adheres to the order described in Note [Case expression invariants]
 instance Ord AltCon where
   compare (DataAlt con1) (DataAlt con2) =
     assert (dataConTyCon con1 == dataConTyCon con2) $
@@ -312,27 +311,18 @@ data Bind b = NonRec b (Expr b)
             | Rec [(b, (Expr b))]
   deriving Data
 
+-- | Helper function. You can use the result of 'mkBinds' with 'mkLets' for
+-- instance.
+--
+--   * @'mkBinds' 'Recursive' binds@ makes a single mutually-recursive
+--     bindings with all the rhs/lhs pairs in @binds@
+--   * @'mkBinds' 'NonRecursive' binds@ makes one non-recursive binding
+--     for each rhs/lhs pairs in @binds@
+mkBinds :: RecFlag -> [(b, (Expr b))] -> [Bind b]
+mkBinds Recursive binds = [Rec binds]
+mkBinds NonRecursive binds = map (uncurry NonRec) binds
+
 {-
-Note [Shadowing]
-~~~~~~~~~~~~~~~~
-While various passes attempt to rename on-the-fly in a manner that
-avoids "shadowing" (thereby simplifying downstream optimizations),
-neither the simplifier nor any other pass GUARANTEES that shadowing is
-avoided. Thus, all passes SHOULD work fine even in the presence of
-arbitrary shadowing in their inputs.
-
-In particular, scrutinee variables `x` in expressions of the form
-`Case e x t` are often renamed to variables with a prefix
-"wild_". These "wild" variables may appear in the body of the
-case-expression, and further, may be shadowed within the body.
-
-So the Unique in a Var is not really unique at all.  Still, it's very
-useful to give a constant-time equality/ordering for Vars, and to give
-a key that can be used to make sets of Vars (VarSet), or mappings from
-Vars to other things (VarEnv).   Moreover, if you do want to eliminate
-shadowing, you can give a new Unique to an Id without changing its
-printable name, which makes debugging easier.
-
 Note [Literal alternatives]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Literal alternatives (LitAlt lit) are always for *un-lifted* literals.
@@ -364,41 +354,73 @@ For example
 Here 'c' is a CoVar, which is lambda-bound, but it /occurs/ in
 a Coercion, (sym c).
 
+Note [Shadowing in Core]
+~~~~~~~~~~~~~~~~~~~~~~~~
+You might wonder if there is an invariant that a Core expression has no
+"shadowing".  For example, is this illegal?
+     \x. \x. blah     -- x is shadowed
+Answer; no!  Core does /not/ have a no-shadowing invariant.
+
+Neither the simplifier nor any other pass GUARANTEES that shadowing is
+avoided. Thus, all passes SHOULD work fine even in the presence of
+arbitrary shadowing in their inputs.
+
+So the Unique in a Var is not really unique at all.  Still, it's very
+useful to give a constant-time equality/ordering for Vars, and to give
+a key that can be used to make sets of Vars (VarSet), or mappings from
+Vars to other things (VarEnv).   Moreover, if you do want to eliminate
+shadowing, you can give a new Unique to an Id without changing its
+printable name, which makes debugging easier.
+
+It would in many ways be easier to have a no-shadowing invariant.  And the
+Simplifier does its best to clone variables that are shadowed.  But it is
+extremely difficult to GUARANTEE it:
+
+* We use `GHC.Types.Id.mkTemplateLocal` to make up local binders, with uniques
+  that are locally-unique (enough for the purpose) but not globally unique.
+  It is convenient not to have to plumb a unique supply to these functions.
+
+* It is very difficult for the Simplifier to gurantee a no-shadowing result.
+  See Note [Shadowing in the Simplifier] in GHC.Core.Opt.Simplify.Iteration.
+
+* See Note [Shadowing in CSE] in GHC.Core.Opt.CSE
+
+* See Note [Shadowing in SpecConstr] in GHC.Core.Opt.SpecContr
+
 Note [Core letrec invariant]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 The Core letrec invariant:
 
-    The right hand sides of all
-      /top-level/ or /recursive/
-    bindings must be of lifted type
-
-    There is one exception to this rule, top-level @let@s are
-    allowed to bind primitive string literals: see
-    Note [Core top-level string literals].
+  The right hand sides of all /top-level/ or /recursive/
+  bindings must be of lifted type
 
 See "Type#type_classification" in GHC.Core.Type
-for the meaning of "lifted" vs. "unlifted").
+for the meaning of "lifted" vs. "unlifted".
 
-For the non-top-level, non-recursive case see Note [Core let-can-float invariant].
+For the non-top-level, non-recursive case see
+Note [Core let-can-float invariant].
 
-Note [Compilation plan for top-level string literals]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Here is a summary on how top-level string literals are handled by various
-parts of the compilation pipeline.
+At top level, however, there are two exceptions to this rule:
 
-* In the source language, there is no way to bind a primitive string literal
-  at the top level.
+(TL1) A top-level binding is allowed to bind primitive string literal,
+      (which is unlifted).  See Note [Core top-level string literals].
 
-* In Core, we have a special rule that permits top-level Addr# bindings. See
-  Note [Core top-level string literals]. Core-to-core passes may introduce
-  new top-level string literals.
+(TL2) In Core, we generate a top-level binding for every non-newtype data
+constructor worker or wrapper
+      e.g.   data T = MkT Int
+      we generate
+             MkT :: Int -> T
+             MkT = \x. MkT x
+      (This binding looks recursive, but isn't; it defines a top-level, curried
+      function whose body just allocates and returns the data constructor.)
 
-* In STG, top-level string literals are explicitly represented in the syntax
-  tree.
-
-* A top-level string literal may end up exported from a module. In this case,
-  in the object file, the content of the exported literal is given a label with
-  the _bytes suffix.
+      But if (a) the data constructor is nullary and (b) the data type is unlifted,
+      this binding is unlifted.
+      e.g.   data S :: UnliftedType where { S1 :: S, S2 :: S -> S }
+      we generate
+             S1 :: S   -- A top-level unlifted binding
+             S1 = S1
+      We allow this top-level unlifted binding to exist.
 
 Note [Core let-can-float invariant]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -428,9 +450,6 @@ which will generate a @case@ if necessary
 
 The let-can-float invariant is initially enforced by mkCoreLet in GHC.Core.Make.
 
-For discussion of some implications of the let-can-float invariant primops see
-Note [Checking versus non-checking primops] in GHC.Builtin.PrimOps.
-
 Historical Note [The let/app invariant]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Before 2022 GHC used the "let/app invariant", which applied the let-can-float rules
@@ -452,7 +471,7 @@ TL;DR: we relaxed the let/app invariant to become the let-can-float invariant.
 Note [Core top-level string literals]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 As an exception to the usual rule that top-level binders must be lifted,
-we allow binding primitive string literals (of type Addr#) of type Addr# at the
+we allow binding primitive string literals (of type Addr#) at the
 top level. This allows us to share string literals earlier in the pipeline and
 crucially allows other optimizations in the Core2Core pipeline to fire.
 Consider,
@@ -495,6 +514,45 @@ parts of the compilation pipeline.
 * A top-level string literal may end up exported from a module. In this case,
   in the object file, the content of the exported literal is given a label with
   the _bytes suffix.
+
+Note [NON-BOTTOM-DICTS invariant]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+It is a global invariant (not checkable by Lint) that
+
+     every non-newtype dictionary-typed expression is non-bottom.
+
+These conditions are captured by GHC.Core.Type.isTerminatingType.
+
+How are we so sure about this?  Dictionaries are built by GHC in only two ways:
+
+* A dictionary function (DFun), arising from an instance declaration.
+  DFuns do no computation: they always return a data constructor immediately.
+  See DFunUnfolding in GHC.Core.  So the result of a call to a DFun is always
+  non-bottom.
+
+  Exception: newtype dictionaries.
+
+  Plus: see the Very Nasty Wrinkle in Note [Speculative evaluation]
+  in GHC.CoreToStg.Prep
+
+* A superclass selection from some other dictionary. This is harder to guarantee:
+  see Note [Recursive superclasses] and Note [Solving superclass constraints]
+  in GHC.Tc.TyCl.Instance.
+
+A bad Core-to-Core pass could invalidate this reasoning, but that's too bad.
+It's still an invariant of Core programs generated by GHC from Haskell, and
+Core-to-Core passes maintain it.
+
+Why is it useful to know that dictionaries are non-bottom?
+
+1. It justifies the use of `-XDictsStrict`;
+   see `GHC.Core.Types.Demand.strictifyDictDmd`
+
+2. It means that (eq_sel d) is ok-for-speculation and thus
+     case (eq_sel d) of _ -> blah
+   can be discarded by the Simplifier.  See these Notes:
+   Note [exprOkForSpeculation and type classes] in GHC.Core.Utils
+   Note[Speculative evaluation] in GHC.CoreToStg.Prep
 
 Note [Case expression invariants]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -584,18 +642,14 @@ substitutions until the next run of the simplifier.
       case (df @Int) of (co :: a ~# b) -> blah
   Which is very exotic, and I think never encountered; but see
   Note [Equality superclasses in quantified constraints]
-  in GHC.Tc.Solver.Canonical
-
-Note [Core case invariants]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~
-See Note [Case expression invariants]
+  in GHC.Tc.Solver.Dict
 
 Note [Representation polymorphism invariants]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 GHC allows us to abstract over calling conventions using **representation polymorphism**.
 For example, we have:
 
-  ($) :: forall (r :: RuntimeRep) (a :: Type) (b :: TYPE r). a -> b -> b
+  ($) :: forall (r :: RuntimeRep) (a :: Type) (b :: TYPE r). (a -> b) -> a -> b
 
 In this example, the type `b` is representation-polymorphic: it has kind `TYPE r`,
 where the type variable `r :: RuntimeRep` abstracts over the runtime representation
@@ -609,13 +663,6 @@ The paper "Levity Polymorphism" [PLDI'17] states the first two invariants:
   I1. The type of a bound variable must have a fixed runtime representation
       (except for join points: See Note [Invariants on join points])
   I2. The type of a function argument must have a fixed runtime representation.
-
-On top of these two invariants, GHC's internal eta-expansion mechanism also requires:
-
-  I3. In any partial application `f e_1 .. e_n`, where `f` is `hasNoBinding`,
-      it must be the case that the application can be eta-expanded to match
-      the arity of `f`.
-      See Note [checkCanEtaExpand] in GHC.Core.Lint for more details.
 
 Example of I1:
 
@@ -631,37 +678,31 @@ Example of I2:
     This contravenes I2: we are applying the function `f` to a value
     with an unknown runtime representation.
 
-Examples of I3:
+Note that these two invariants require us to check other types than just the
+types of bound variables and types of function arguments, due to transformations
+that GHC performs. For example, the definition
 
-  myUnsafeCoerce# :: forall {r1} (a :: TYPE r1) {r2} (b :: TYPE r2). a -> b
-  myUnsafeCoerce# = unsafeCoerce#
+  myCoerce :: forall {r} (a :: TYPE r) (b :: TYPE r). Coercible a b => a -> b
+  myCoerce = coerce
 
-    This contravenes I3: we are instantiating `unsafeCoerce#` without any
-    value arguments, and with a remaining argument type, `a`, which does not
-    have a fixed runtime representation.
-    But `unsafeCorce#` has no binding (see Note [Wiring in unsafeCoerce#]
-    in GHC.HsToCore).  So before code-generation we must saturate it
-    by eta-expansion (see GHC.CoreToStg.Prep.maybeSaturate), thus
-       myUnsafeCoerce# = \x. unsafeCoerce# x
-    But we can't do that because now the \x binding would violate I1.
+is invalid, because `coerce` has no binding (see GHC.Types.Id.Make.coerceId).
+So, before code-generation, GHC saturates the RHS of 'myCoerce' by performing
+an eta-expansion (see GHC.CoreToStg.Prep.maybeSaturate):
 
-  bar :: forall (a :: TYPE) r (b :: TYPE r). a -> b
-  bar = unsafeCoerce#
+  myCoerce = \ (x :: TYPE r) -> coerce x
 
-    OK: eta expand to `\ (x :: Type) -> unsafeCoerce# x`,
-    and `x` has a fixed RuntimeRep.
+However, this transformation would be invalid, because now the binding of x
+in the lambda abstraction would violate I1.
+
+See Note [Representation-polymorphism checking built-ins] in GHC.Tc.Gen.Head
+and Note [Linting representation-polymorphic builtins] in GHC.Core.Lint for
+more details.
 
 Note that we currently require something slightly stronger than a fixed runtime
 representation: we check whether bound variables and function arguments have a
 /fixed RuntimeRep/ in the sense of Note [Fixed RuntimeRep] in GHC.Tc.Utils.Concrete.
 See Note [Representation polymorphism checking] in GHC.Tc.Utils.Concrete
 for an overview of how we enforce these invariants in the typechecker.
-
-Note [Core let goal]
-~~~~~~~~~~~~~~~~~~~~
-* The simplifier tries to ensure that if the RHS of a let is a constructor
-  application, its arguments are trivial, so that the constructor can be
-  inlined vigorously.
 
 Note [Empty case alternatives]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -707,9 +748,13 @@ this exhaustive list can be empty!
   its scrutinee is (see GHC.Core.Utils.exprIsTrivial).  This is actually
   important; see Note [Empty case is trivial] in GHC.Core.Utils
 
-* An empty case is replaced by its scrutinee during the CoreToStg
-  conversion; remember STG is un-typed, so there is no need for
-  the empty case to do the type conversion.
+* We lower empty cases in GHC.CoreToStg.coreToStgExpr to an eval on the
+  scrutinee.
+
+Historical Note: We used to lower EmptyCase in CorePrep by way of an
+unsafeCoercion on the scrutinee, but that yielded panics in CodeGen when
+we were beginning to eta expand in arguments, plus required to mess with
+heterogenously-kinded coercions. It's simpler to stick to it just a bit longer.
 
 Note [Join points]
 ~~~~~~~~~~~~~~~~~~
@@ -1107,7 +1152,7 @@ has two major consequences
 
 Orphan-hood is computed
   * For class instances:
-    when we make a ClsInst in GHC.Core.InstEnv.mkLocalInstance
+    when we make a ClsInst in GHC.Core.InstEnv.mkLocalClsInst
       (because it is needed during instance lookup)
     See Note [When exactly is an instance decl an orphan?]
         in GHC.Core.InstEnv
@@ -1856,6 +1901,9 @@ mkWordLitWrap platform w = Lit (mkLitWordWrap platform w)
 mkWord8Lit :: Integer -> Expr b
 mkWord8Lit    w = Lit (mkLitWord8 w)
 
+mkWord32LitWord32 :: Word32 -> Expr b
+mkWord32LitWord32 w = Lit (mkLitWord32 (toInteger w))
+
 mkWord64LitWord64 :: Word64 -> Expr b
 mkWord64LitWord64 w = Lit (mkLitWord64 (toInteger w))
 
@@ -2101,7 +2149,7 @@ stripNArgs 0 e = Just e
 stripNArgs n (App f _) = stripNArgs (n - 1) f
 stripNArgs _ _ = Nothing
 
--- | Like @collectArgs@, but also collects looks through floatable
+-- | Like @collectArgs@, but also looks through floatable
 -- ticks if it means that we can find more arguments.
 collectArgsTicks :: (CoreTickish -> Bool) -> Expr b
                  -> (Expr b, [Arg b], [CoreTickish])

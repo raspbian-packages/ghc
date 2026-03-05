@@ -12,7 +12,7 @@ import {-# SOURCE #-} Settings.Default
 developmentFlavour :: Stage -> Flavour
 developmentFlavour ghcStage = defaultFlavour
     { name = "devel" ++ stageString ghcStage
-    , args = defaultBuilderArgs <> developmentArgs ghcStage <> defaultPackageArgs
+    , extraArgs = developmentArgs ghcStage <> defaultHaddockExtraArgs
     , libraryWays = pure $ Set.fromList [vanilla]
     , rtsWays = Set.fromList <$> mconcat [pure [vanilla, debug], targetSupportsThreadedRts ? pure [threaded, threadedDebug]]
     , dynamicGhcPrograms = return False
@@ -24,8 +24,7 @@ developmentFlavour ghcStage = defaultFlavour
       stageString s = error ("developmentFlavour not supported for " ++ show s)
 
 developmentArgs :: Stage -> Args
-developmentArgs ghcStage = do
-    stage <- getStage
+developmentArgs ghcStage =
     sourceArgs SourceArgs
         { hsDefault  = mconcat [ pure ["-O", "-H64m"],
                                  -- Disable optimization when building Cabal;
@@ -33,5 +32,5 @@ developmentArgs ghcStage = do
                                  package cabal ? pure ["-O0"]]
         , hsLibrary  = notStage0 ? arg "-dlint"
         , hsCompiler = mconcat [stage0 ? arg "-O2",
-                                 stage == predStage ghcStage ? pure ["-O0"]]
-        , hsGhc      = stage == predStage ghcStage ? pure ["-O0"] }
+                                buildingCompilerStage ghcStage ? pure ["-O0"]]
+        , hsGhc      = buildingCompilerStage ghcStage ? pure ["-O0"] }

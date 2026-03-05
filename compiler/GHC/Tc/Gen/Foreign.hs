@@ -71,6 +71,7 @@ import GHC.Driver.Backend
 import GHC.Utils.Error
 import GHC.Utils.Outputable as Outputable
 import GHC.Utils.Panic
+import GHC.Utils.Unique
 import GHC.Platform
 
 import GHC.Data.Bag
@@ -82,6 +83,8 @@ import Control.Monad.Trans.Writer.CPS
   ( WriterT, runWriterT, tell )
 import Control.Monad.Trans.Class
   ( lift )
+import Data.Maybe (isJust)
+import GHC.Builtin.Types (unitTyCon)
 
 -- Defines a binding
 isForeignImport :: forall name. UnXRec name => LForeignDecl name -> Bool
@@ -267,7 +270,7 @@ tcFImport (L dloc fo@(ForeignImport { fd_name = L nloc nm, fd_sig_ty = hs_ty
              id = mkLocalId nm ManyTy sig_ty
                  -- Use a LocalId to obey the invariant that locally-defined
                  -- things are LocalIds.  However, it does not need zonking,
-                 -- (so GHC.Tc.Utils.Zonk.zonkForeignExports ignores it).
+                 -- (so GHC.Tc.Zonk.Type.zonkForeignExports ignores it).
 
        ; imp_decl' <- tcCheckFIType arg_tys res_ty imp_decl
           -- Can't use sig_ty here because sig_ty :: Type and
@@ -352,7 +355,7 @@ tcCheckFIType arg_tys res_ty idecl@(CImport src (L lc cconv) (L ls safety) mh
       dflags <- getDynFlags
       checkForeignArgs (isFFIArgumentTy dflags safety) arg_tys
       checkForeignRes nonIOok checkSafe (isFFIImportResultTy dflags) res_ty
-      checkMissingAmpersand idecl (map scaledThing arg_tys) res_ty
+      checkMissingAmpersand idecl target (map scaledThing arg_tys) res_ty
       case target of
           StaticTarget _ _ _ False
            | not (null arg_tys) ->
@@ -369,8 +372,10 @@ checkCTarget idecl (StaticTarget _ str _ _) = do
 
 checkCTarget _ DynamicTarget = panic "checkCTarget DynamicTarget"
 
-checkMissingAmpersand :: ForeignImport GhcRn -> [Type] -> Type -> TcM ()
-checkMissingAmpersand idecl arg_tys res_ty
+checkMissingAmpersand :: ForeignImport GhcRn -> CCallTarget -> [Type] -> Type -> TcM ()
+checkMissingAmpersand _ (StaticTarget _ _ _ False) _ _ = return ()
+
+checkMissingAmpersand idecl _ arg_tys res_ty
   | null arg_tys && isFunPtrTy res_ty
   = addDiagnosticTc $ TcRnFunPtrImportWithoutAmpersand idecl
   | otherwise
@@ -549,7 +554,7 @@ checkCConv decl PrimCallConv = do
   return PrimCallConv
 checkCConv decl JavaScriptCallConv = do
   dflags <- getDynFlags
-  if platformArch (targetPlatform dflags) == ArchJavaScript
+  if platformArch (targetPlatform dflags) `elem` [ ArchJavaScript, ArchWasm32 ]
       then return JavaScriptCallConv
       else do
         addErrTc $ TcRnUnsupportedCallConv decl JavaScriptCallConvUnsupported
@@ -567,3 +572,214 @@ foreignDeclCtxt :: ForeignDecl GhcRn -> SDoc
 foreignDeclCtxt fo
   = hang (text "When checking declaration:")
        2 (ppr fo)
+
+
+{- Predicates on Types used in this module -}
+
+-- | Reason why a type in an FFI signature is invalid
+
+isFFIArgumentTy :: DynFlags -> Safety -> Type -> Validity' IllegalForeignTypeReason
+-- Checks for valid argument type for a 'foreign import'
+isFFIArgumentTy dflags safety ty
+   = checkRepTyCon (legalOutgoingTyCon dflags safety) ty
+
+isFFIExternalTy :: Type -> Validity' IllegalForeignTypeReason
+-- Types that are allowed as arguments of a 'foreign export'
+isFFIExternalTy ty = checkRepTyCon legalFEArgTyCon ty
+
+isFFIImportResultTy :: DynFlags -> Type -> Validity' IllegalForeignTypeReason
+isFFIImportResultTy dflags ty
+  = checkRepTyCon (legalFIResultTyCon dflags) ty
+
+isFFIExportResultTy :: Type -> Validity' IllegalForeignTypeReason
+isFFIExportResultTy ty = checkRepTyCon legalFEResultTyCon ty
+
+isFFIDynTy :: Type -> Type -> Validity' IllegalForeignTypeReason
+-- The type in a foreign import dynamic must be Ptr, FunPtr, or a newtype of
+-- either, and the wrapped function type must be equal to the given type.
+-- We assume that all types have been run through normaliseFfiType, so we don't
+-- need to worry about expanding newtypes here.
+isFFIDynTy expected ty
+    -- Note [Foreign import dynamic]
+    -- In the example below, expected would be 'CInt -> IO ()', while ty would
+    -- be 'FunPtr (CDouble -> IO ())'.
+    | Just (tc, [ty']) <- splitTyConApp_maybe ty
+    , tyConUnique tc `elem` [ptrTyConKey, funPtrTyConKey]
+    , eqType ty' expected
+    = IsValid
+    | otherwise
+    = NotValid (ForeignDynNotPtr expected ty)
+
+isFFILabelTy :: Type -> Validity' IllegalForeignTypeReason
+-- The type of a foreign label must be Ptr, FunPtr, or a newtype of either.
+isFFILabelTy ty = checkRepTyCon ok ty
+  where
+    ok tc | tc `hasKey` funPtrTyConKey || tc `hasKey` ptrTyConKey
+          = IsValid
+          | otherwise
+          = NotValid ForeignLabelNotAPtr
+
+-- | Check validity for a type of the form @Any :: k@.
+--
+-- This function returns:
+--
+--  - @Just IsValid@ for @Any :: Type@ and @Any :: UnliftedType@,
+--  - @Just (NotValid ..)@ for @Any :: k@ if @k@ is not a kind of boxed types,
+--  - @Nothing@ if the type is not @Any@.
+checkAnyTy :: Type -> Maybe (Validity' IllegalForeignTypeReason)
+checkAnyTy ty
+  | Just ki <- anyTy_maybe ty
+  = Just $
+      if isJust $ kindBoxedRepLevity_maybe ki
+      then IsValid
+      -- NB: don't allow things like @Any :: TYPE IntRep@, as per #21305.
+      else NotValid (TypeCannotBeMarshaled ty NotBoxedKindAny)
+  | otherwise
+  = Nothing
+
+isFFIPrimArgumentTy :: DynFlags -> Type -> Validity' IllegalForeignTypeReason
+-- Checks for valid argument type for a 'foreign import prim'
+-- Currently they must all be simple unlifted types, or Any (at kind Type or UnliftedType),
+-- which can be used to pass the address to a Haskell object on the heap to
+-- the foreign function.
+isFFIPrimArgumentTy dflags ty
+  | Just validity <- checkAnyTy ty
+  = validity
+  | otherwise
+  = checkRepTyCon (legalFIPrimArgTyCon dflags) ty
+
+isFFIPrimResultTy :: DynFlags -> Type -> Validity' IllegalForeignTypeReason
+-- Checks for valid result type for a 'foreign import prim' Currently
+-- it must be an unlifted type, including unboxed tuples, unboxed
+-- sums, or the well-known type Any (at kind Type or UnliftedType).
+isFFIPrimResultTy dflags ty
+  | Just validity <- checkAnyTy ty
+  = validity
+  | otherwise
+  = checkRepTyCon (legalFIPrimResultTyCon dflags) ty
+
+isFunPtrTy :: Type -> Bool
+isFunPtrTy ty
+  | Just (tc, [_]) <- splitTyConApp_maybe ty
+  = tc `hasKey` funPtrTyConKey
+  | otherwise
+  = False
+
+-- normaliseFfiType gets run before checkRepTyCon, so we don't
+-- need to worry about looking through newtypes or type functions
+-- here; that's already been taken care of.
+checkRepTyCon
+  :: (TyCon -> Validity' TypeCannotBeMarshaledReason)
+  -> Type
+  -> Validity' IllegalForeignTypeReason
+checkRepTyCon check_tc ty
+  = fmap (TypeCannotBeMarshaled ty) $ case splitTyConApp_maybe ty of
+      Just (tc, tys)
+        | isNewTyCon tc -> NotValid (mk_nt_reason tc tys)
+        | otherwise     -> check_tc tc
+      Nothing -> NotValid NotADataType
+  where
+    mk_nt_reason tc tys = NewtypeDataConNotInScope tc tys
+
+{-
+Note [Foreign import dynamic]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A dynamic stub must be of the form 'FunPtr ft -> ft' where ft is any foreign
+type.  Similarly, a wrapper stub must be of the form 'ft -> IO (FunPtr ft)'.
+
+We use isFFIDynTy to check whether a signature is well-formed. For example,
+given a (illegal) declaration like:
+
+foreign import ccall "dynamic"
+  foo :: FunPtr (CDouble -> IO ()) -> CInt -> IO ()
+
+isFFIDynTy will compare the 'FunPtr' type 'CDouble -> IO ()' with the curried
+result type 'CInt -> IO ()', and return False, as they are not equal.
+
+
+----------------------------------------------
+These chaps do the work; they are not exported
+----------------------------------------------
+-}
+
+legalFEArgTyCon :: TyCon -> Validity' TypeCannotBeMarshaledReason
+legalFEArgTyCon tc
+  -- It's illegal to make foreign exports that take unboxed
+  -- arguments.  The RTS API currently can't invoke such things.  --SDM 7/2000
+  = boxedMarshalableTyCon tc
+
+legalFIResultTyCon :: DynFlags -> TyCon -> Validity' TypeCannotBeMarshaledReason
+legalFIResultTyCon dflags tc
+  | tc == unitTyCon         = IsValid
+  | otherwise               = marshalableTyCon dflags tc
+
+legalFEResultTyCon :: TyCon -> Validity' TypeCannotBeMarshaledReason
+legalFEResultTyCon tc
+  | tc == unitTyCon         = IsValid
+  | otherwise               = boxedMarshalableTyCon tc
+
+legalOutgoingTyCon :: DynFlags -> Safety -> TyCon -> Validity' TypeCannotBeMarshaledReason
+-- Checks validity of types going from Haskell -> external world
+legalOutgoingTyCon dflags _ tc
+  = marshalableTyCon dflags tc
+
+-- Check for marshalability of a primitive type.
+-- We exclude lifted types such as RealWorld and TYPE.
+-- They can technically appear in types, e.g.
+-- f :: RealWorld -> TYPE LiftedRep -> RealWorld
+-- f x _ = x
+-- but there are no values of type RealWorld or TYPE LiftedRep,
+-- so it doesn't make sense to use them in FFI.
+marshalablePrimTyCon :: TyCon -> Bool
+marshalablePrimTyCon tc = isPrimTyCon tc && not (isLiftedTypeKind (tyConResKind tc))
+
+marshalableTyCon :: DynFlags -> TyCon -> Validity' TypeCannotBeMarshaledReason
+marshalableTyCon dflags tc
+  | marshalablePrimTyCon tc
+  = validIfUnliftedFFITypes dflags
+  | otherwise
+  = boxedMarshalableTyCon tc
+
+boxedMarshalableTyCon :: TyCon -> Validity' TypeCannotBeMarshaledReason
+boxedMarshalableTyCon tc
+   | anyOfUnique tc [ intTyConKey, int8TyConKey, int16TyConKey
+                    , int32TyConKey, int64TyConKey
+                    , wordTyConKey, word8TyConKey, word16TyConKey
+                    , word32TyConKey, word64TyConKey
+                    , floatTyConKey, doubleTyConKey
+                    , ptrTyConKey, funPtrTyConKey
+                    , charTyConKey
+                    , stablePtrTyConKey
+                    , boolTyConKey
+                    , jsvalTyConKey
+                    ]
+  = IsValid
+
+  | otherwise = NotValid NotABoxedMarshalableTyCon
+
+legalFIPrimArgTyCon :: DynFlags -> TyCon -> Validity' TypeCannotBeMarshaledReason
+-- Check args of 'foreign import prim', only allow simple unlifted types.
+legalFIPrimArgTyCon dflags tc
+  | marshalablePrimTyCon tc
+  = validIfUnliftedFFITypes dflags
+  | otherwise
+  = NotValid NotSimpleUnliftedType
+
+legalFIPrimResultTyCon :: DynFlags -> TyCon -> Validity' TypeCannotBeMarshaledReason
+-- Check result type of 'foreign import prim'. Allow simple unlifted
+-- types and also unboxed tuple and sum result types.
+legalFIPrimResultTyCon dflags tc
+  | marshalablePrimTyCon tc
+  = validIfUnliftedFFITypes dflags
+
+  | isUnboxedTupleTyCon tc || isUnboxedSumTyCon tc
+  = validIfUnliftedFFITypes dflags
+
+  | otherwise
+  = NotValid $ NotSimpleUnliftedType
+
+validIfUnliftedFFITypes :: DynFlags -> Validity' TypeCannotBeMarshaledReason
+validIfUnliftedFFITypes dflags
+  | xopt LangExt.UnliftedFFITypes dflags =  IsValid
+  | otherwise = NotValid UnliftedFFITypesNeeded
+

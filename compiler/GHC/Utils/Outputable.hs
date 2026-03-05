@@ -23,6 +23,7 @@
 module GHC.Utils.Outputable (
         -- * Type classes
         Outputable(..), OutputableBndr(..), OutputableP(..),
+        BindingSite(..),  JoinPointHood(..), isJoinPoint,
 
         IsOutput(..), IsLine(..), IsDoc(..),
         HLine, HDoc,
@@ -31,13 +32,14 @@ module GHC.Utils.Outputable (
         SDoc, runSDoc, PDoc(..),
         docToSDoc,
         interppSP, interpp'SP, interpp'SP',
-        pprQuotedList, pprWithCommas, quotedListWithOr, quotedListWithNor,
+        pprQuotedList, pprWithCommas,
+        quotedListWithOr, quotedListWithNor, quotedListWithAnd,
         pprWithBars,
         spaceIfSingleQuote,
         isEmpty, nest,
         ptext,
-        int, intWithCommas, integer, word, float, double, rational, doublePrec,
-        parens, cparen, brackets, braces, quotes, quote,
+        int, intWithCommas, integer, word64, word, float, double, rational, doublePrec,
+        parens, cparen, brackets, braces, quotes, quote, quoteIfPunsEnabled,
         doubleQuotes, angleBrackets,
         semi, comma, colon, dcolon, space, equals, dot, vbar,
         arrow, lollipop, larrow, darrow, arrowt, larrowt, arrowtt, larrowtt,
@@ -46,10 +48,11 @@ module GHC.Utils.Outputable (
         blankLine, forAllLit, bullet,
         ($+$),
         cat, fcat,
-        hang, hangNotEmpty, punctuate, ppWhen, ppUnless,
-        ppWhenOption, ppUnlessOption,
+        hang, hangNotEmpty, punctuate, punctuateFinal,
+        ppWhen, ppUnless, ppWhenOption, ppUnlessOption,
         speakNth, speakN, speakNOf, plural, singular,
         isOrAre, doOrDoes, itsOrTheir, thisOrThese, hasOrHave,
+        itOrThey,
         unicodeSyntax,
 
         coloured, keyword,
@@ -85,8 +88,6 @@ module GHC.Utils.Outputable (
         pprModuleName,
 
         -- * Controlling the style in which output is printed
-        BindingSite(..),
-
         PprStyle(..), NamePprCtx(..),
         QueryQualifyName, QueryQualifyModule, QueryQualifyPackage, QueryPromotionTick,
         PromotedItem(..), IsEmptyOrSingleton(..), isListEmptyOrSingleton,
@@ -126,6 +127,7 @@ import GHC.Data.FastString
 import qualified GHC.Utils.Ppr as Pretty
 import qualified GHC.Utils.Ppr.Colour as Col
 import GHC.Utils.Ppr       ( Doc, Mode(..) )
+import GHC.Utils.Panic.Plain (assert)
 import GHC.Serialized
 import GHC.LanguageExtensions (Extension)
 import GHC.Utils.GlobalVars( unsafeHasPprDebug )
@@ -139,7 +141,7 @@ import Data.Int
 import qualified Data.IntMap as IM
 import Data.Set (Set)
 import qualified Data.Set as Set
-import qualified Data.IntSet as IntSet
+import qualified GHC.Data.Word64Set as Word64Set
 import Data.String
 import Data.Word
 import System.IO        ( Handle )
@@ -149,10 +151,12 @@ import Numeric (showFFloat)
 import Data.Graph (SCC(..))
 import Data.List (intersperse)
 import Data.List.NonEmpty (NonEmpty (..))
+import Data.Semigroup (Arg(..))
 import qualified Data.List.NonEmpty as NEL
-import Data.Time
+import Data.Time ( UTCTime )
 import Data.Time.Format.ISO8601
 import Data.Void
+import Control.DeepSeq (NFData(rnf))
 
 import GHC.Fingerprint
 import GHC.Show         ( showMultiLineString )
@@ -393,6 +397,7 @@ data SDocContext = SDC
   , sdocCanUseUnicode               :: !Bool
       -- ^ True if Unicode encoding is supported
       -- and not disabled by GHC_NO_UNICODE environment variable
+  , sdocPrintErrIndexLinks          :: !Bool
   , sdocHexWordLiterals             :: !Bool
   , sdocPprDebug                    :: !Bool
   , sdocPrintUnicodeSyntax          :: !Bool
@@ -454,6 +459,7 @@ defaultSDocContext = SDC
   , sdocDefaultDepth                = 5
   , sdocLineLength                  = 100
   , sdocCanUseUnicode               = False
+  , sdocPrintErrIndexLinks          = False
   , sdocHexWordLiterals             = False
   , sdocPprDebug                    = False
   , sdocPrintUnicodeSyntax          = False
@@ -678,6 +684,7 @@ ptext    ::               PtrString  -> SDoc
 int      :: IsLine doc => Int        -> doc
 integer  :: IsLine doc => Integer    -> doc
 word     ::               Integer    -> SDoc
+word64   :: IsLine doc => Word64     -> doc
 float    :: IsLine doc => Float      -> doc
 double   :: IsLine doc => Double     -> doc
 rational ::               Rational   -> SDoc
@@ -695,6 +702,8 @@ double n    = text $ show n
 {-# INLINE CONLIKE rational #-}
 rational n  = text $ show n
               -- See Note [Print Hexadecimal Literals] in GHC.Utils.Ppr
+{-# INLINE CONLIKE word64 #-}
+word64 n    = text $ show n
 {-# INLINE CONLIKE word #-}
 word n      = sdocOption sdocHexWordLiterals $ \case
                True  -> docToSDoc $ Pretty.hex n
@@ -724,6 +733,12 @@ angleBrackets d = char '<' <> d <> char '>'
 cparen :: Bool -> SDoc -> SDoc
 {-# INLINE CONLIKE cparen #-}
 cparen b d = SDoc $ Pretty.maybeParens b . runSDoc d
+
+quoteIfPunsEnabled :: SDoc -> SDoc
+quoteIfPunsEnabled doc =
+  sdocOption sdocListTuplePuns $ \case
+    True -> quote doc
+    False -> doc
 
 -- 'quotes' encloses something in single quotes...
 -- but it omits them if the thing begins or ends in a single quote
@@ -839,6 +854,21 @@ punctuate p (d:ds) = go d ds
                      go d [] = [d]
                      go d (e:es) = (d <> p) : go e es
 
+-- | Punctuate a list, e.g. with commas and dots.
+--
+-- > sep $ punctuateFinal comma dot [text "ab", text "cd", text "ef"]
+-- > ab, cd, ef.
+punctuateFinal :: IsLine doc
+               => doc   -- ^ The interstitial punctuation
+               -> doc   -- ^ The final punctuation
+               -> [doc] -- ^ The list that will have punctuation added between every adjacent pair of elements
+               -> [doc] -- ^ Punctuated list
+punctuateFinal _ _ []     = []
+punctuateFinal p q (d:ds) = go d ds
+  where
+    go d [] = [d <> q]
+    go d (e:es) = (d <> p) : go e es
+
 ppWhen, ppUnless :: IsOutput doc => Bool -> doc -> doc
 {-# INLINE CONLIKE ppWhen #-}
 ppWhen True  doc = doc
@@ -855,9 +885,10 @@ ppWhenOption f doc = sdocOption f $ \case
    False -> empty
 
 {-# INLINE CONLIKE ppUnlessOption #-}
-ppUnlessOption :: IsLine doc => (SDocContext -> Bool) -> doc -> doc
-ppUnlessOption f doc = docWithContext $
-                          \ctx -> if f ctx then empty else doc
+ppUnlessOption :: (SDocContext -> Bool) -> SDoc -> SDoc
+ppUnlessOption f doc = sdocOption f $ \case
+   True  -> empty
+   False -> doc
 
 -- | Apply the given colour\/style for the argument.
 --
@@ -886,6 +917,9 @@ class Outputable a where
 
 -- There's no Outputable for Char; it's too easy to use Outputable
 -- on String and have ppr "hello" rendered as "h,e,l,l,o".
+
+instance Outputable Void where
+    ppr _ = text "<<Void>>"
 
 instance Outputable Bool where
     ppr True  = text "True"
@@ -947,11 +981,14 @@ instance (Outputable a) => Outputable [a] where
 instance (Outputable a) => Outputable (NonEmpty a) where
     ppr = ppr . NEL.toList
 
+instance (Outputable a, Outputable b) => Outputable (Arg a b) where
+    ppr (Arg a b) = text "Arg" <+> ppr a <+> ppr b
+
 instance (Outputable a) => Outputable (Set a) where
     ppr s = braces (pprWithCommas ppr (Set.toList s))
 
-instance Outputable IntSet.IntSet where
-    ppr s = braces (pprWithCommas ppr (IntSet.toList s))
+instance Outputable Word64Set.Word64Set where
+    ppr s = braces (pprWithCommas ppr (Word64Set.toList s))
 
 instance (Outputable a, Outputable b) => Outputable (a, b) where
     ppr (x,y) = parens (sep [ppr x <> comma, ppr y])
@@ -1040,10 +1077,7 @@ instance Outputable ModuleName where
 
 pprModuleName :: IsLine doc => ModuleName -> doc
 pprModuleName (ModuleName nm) =
-    docWithContext $ \ctx ->
-    if codeStyle (sdocStyle ctx)
-        then ztext (zEncodeFS nm)
-        else ftext nm
+    docWithStyle (ztext (zEncodeFS nm)) (\_ -> ftext nm)
 {-# SPECIALIZE pprModuleName :: ModuleName -> SDoc #-}
 {-# SPECIALIZE pprModuleName :: ModuleName -> HLine #-} -- see Note [SPECIALIZE to HDoc]
 
@@ -1195,16 +1229,6 @@ instance OutputableP env Void where
 ************************************************************************
 -}
 
--- | 'BindingSite' is used to tell the thing that prints binder what
--- language construct is binding the identifier.  This can be used
--- to decide how much info to print.
--- Also see Note [Binding-site specific printing] in "GHC.Core.Ppr"
-data BindingSite
-    = LambdaBind  -- ^ The x in   (\x. e)
-    | CaseBind    -- ^ The x in   case scrut of x { (y,z) -> ... }
-    | CasePatBind -- ^ The y,z in case scrut of x { (y,z) -> ... }
-    | LetBind     -- ^ The x in   (let x = rhs in e)
-    deriving Eq
 -- | When we print a binder, we often want to print its type too.
 -- The @OutputableBndr@ class encapsulates this idea.
 class Outputable a => OutputableBndr a where
@@ -1216,12 +1240,39 @@ class Outputable a => OutputableBndr a where
       -- prefix position of an application, thus   (f a b) or  ((+) x)
       -- or infix position,                 thus   (a `f` b) or  (x + y)
 
-   bndrIsJoin_maybe :: a -> Maybe Int
-   bndrIsJoin_maybe _ = Nothing
+   bndrIsJoin_maybe :: a -> JoinPointHood
+   bndrIsJoin_maybe _ = NotJoinPoint
       -- When pretty-printing we sometimes want to find
       -- whether the binder is a join point.  You might think
       -- we could have a function of type (a->Var), but Var
       -- isn't available yet, alas
+
+-- | 'BindingSite' is used to tell the thing that prints binder what
+-- language construct is binding the identifier.  This can be used
+-- to decide how much info to print.
+-- Also see Note [Binding-site specific printing] in "GHC.Core.Ppr"
+data BindingSite
+    = LambdaBind  -- ^ The x in   (\x. e)
+    | CaseBind    -- ^ The x in   case scrut of x { (y,z) -> ... }
+    | CasePatBind -- ^ The y,z in case scrut of x { (y,z) -> ... }
+    | LetBind     -- ^ The x in   (let x = rhs in e)
+    deriving Eq
+
+data JoinPointHood
+  = JoinPoint {-# UNPACK #-} !Int   -- The JoinArity (but an Int here because
+  | NotJoinPoint                    -- synonym JoinArity is defined in Types.Basic)
+  deriving( Eq )
+
+isJoinPoint :: JoinPointHood -> Bool
+isJoinPoint (JoinPoint {}) = True
+isJoinPoint NotJoinPoint   = False
+
+instance Outputable JoinPointHood where
+  ppr NotJoinPoint      = text "NotJoinPoint"
+  ppr (JoinPoint arity) = text "JoinPoint" <> parens (ppr arity)
+
+instance NFData JoinPointHood where
+  rnf x = x `seq` ()
 
 {-
 ************************************************************************
@@ -1384,6 +1435,11 @@ quotedListWithNor :: [SDoc] -> SDoc
 quotedListWithNor xs@(_:_:_) = quotedList (init xs) <+> text "nor" <+> quotes (last xs)
 quotedListWithNor xs = quotedList xs
 
+quotedListWithAnd :: [SDoc] -> SDoc
+-- [x,y,z]  ==>  `x', `y' and `z'
+quotedListWithAnd xs@(_:_:_) = quotedList (init xs) <+> text "and" <+> quotes (last xs)
+quotedListWithAnd xs = quotedList xs
+
 {-
 ************************************************************************
 *                                                                      *
@@ -1496,6 +1552,15 @@ doOrDoes _   = text "do"
 itsOrTheir :: [a] -> SDoc
 itsOrTheir [_] = text "its"
 itsOrTheir _   = text "their"
+
+-- | 'it' or 'they', depeneding on the length of the list.
+--
+-- > itOrThey [x]   = text "it"
+-- > itOrThey [x,y] = text "they"
+-- > itOrThey []    = text "they"  -- probably avoid this
+itOrThey :: [a] -> SDoc
+itOrThey [_] = text "it"
+itOrThey _   = text "they"
 
 
 -- | Determines the form of subject appropriate for the length of a list:
@@ -1633,6 +1698,7 @@ IsOutput, that allows these combinators to be generic over both variants:
     class IsOutput doc where
       empty :: doc
       docWithContext :: (SDocContext -> doc) -> doc
+      docWithStyle :: doc -> (PprStyle -> SDoc) -> doc
 
     class IsOutput doc => IsLine doc
     class (IsOutput doc, IsLine (Line doc)) => IsDoc doc
@@ -1669,13 +1735,22 @@ arguments depending on the type they are instantiated at. They serve as a
 difficult to make completely equivalent under both printer implementations.
 
 These operations should generally be avoided, as they can result in surprising
-changes in behavior when the printer implementation is changed. However, in
-certain cases, the alternative is even worse. For example, we use dualLine in
-the implementation of pprUnitId, as the hack we use for printing unit ids
-(see Note [Pretty-printing UnitId] in GHC.Unit) is difficult to adapt to HLine
-and is not necessary for code paths that use it, anyway.
+changes in behavior when the printer implementation is changed.
+Right now, they are used only when outputting debugging comments in
+codegen, as it is difficult to adapt that code to use HLine and not necessary.
 
-Use these operations wisely. -}
+Use these operations wisely.
+
+Note [docWithStyle]
+~~~~~~~~~~~~~~~~~~~
+Sometimes when printing, we consult the printing style. This can be done
+with 'docWithStyle c f'. This is similar to 'docWithContext (f . sdocStyle)',
+but:
+* For code style, 'docWithStyle c f' will return 'c'.
+* For other styles, 'docWithStyle c f', will call 'f style', but expect
+  an SDoc rather than doc. This removes the need to write code polymorphic
+  in SDoc and HDoc, since the latter is used only for code style.
+-}
 
 -- | Represents a single line of output that can be efficiently printed directly
 -- to a 'System.IO.Handle' (actually a 'BufHandle').
@@ -1700,7 +1775,7 @@ pattern HDoc f <- HDoc' f
 {-# COMPLETE HDoc #-}
 
 bPutHDoc :: BufHandle -> SDocContext -> HDoc -> IO ()
-bPutHDoc h ctx (HDoc f) = f ctx h
+bPutHDoc h ctx (HDoc f) = assert (codeStyle (sdocStyle ctx)) (f ctx h)
 
 -- | A superclass for 'IsLine' and 'IsDoc' that provides an identity, 'empty',
 -- as well as access to the shared 'SDocContext'.
@@ -1709,6 +1784,7 @@ bPutHDoc h ctx (HDoc f) = f ctx h
 class IsOutput doc where
   empty :: doc
   docWithContext :: (SDocContext -> doc) -> doc
+  docWithStyle :: doc -> (PprStyle -> SDoc) -> doc  -- see Note [docWithStyle]
 
 -- | A class of types that represent a single logical line of text, with support
 -- for horizontal composition.
@@ -1779,6 +1855,11 @@ instance IsOutput SDoc where
   {-# INLINE CONLIKE empty #-}
   docWithContext = sdocWithContext
   {-# INLINE docWithContext #-}
+  docWithStyle c f = sdocWithContext (\ctx -> let sty = sdocStyle ctx
+                                              in if codeStyle sty then c
+                                                                  else f sty)
+                     -- see Note [docWithStyle]
+  {-# INLINE CONLIKE docWithStyle #-}
 
 instance IsLine SDoc where
   char c = docToSDoc $ Pretty.char c
@@ -1823,12 +1904,16 @@ instance IsOutput HLine where
   {-# INLINE empty #-}
   docWithContext f = HLine $ \ctx h -> runHLine (f ctx) ctx h
   {-# INLINE CONLIKE docWithContext #-}
+  docWithStyle c _ = c  -- see Note [docWithStyle]
+  {-# INLINE CONLIKE docWithStyle #-}
 
 instance IsOutput HDoc where
   empty = HDoc (\_ _ -> pure ())
   {-# INLINE empty #-}
   docWithContext f = HDoc $ \ctx h -> runHDoc (f ctx) ctx h
   {-# INLINE CONLIKE docWithContext #-}
+  docWithStyle c _ = c  -- see Note [docWithStyle]
+  {-# INLINE CONLIKE docWithStyle #-}
 
 instance IsLine HLine where
   char c = HLine (\_ h -> bPutChar h c)

@@ -1,7 +1,7 @@
 module CommandLine (
     optDescrs, cmdLineArgsMap, cmdFlavour, lookupFreeze1, lookupFreeze2, lookupSkipDepends,
     cmdBignum, cmdBignumCheck, cmdProgressInfo, cmdCompleteSetting,
-    cmdDocsArgs, lookupBuildRoot, TestArgs(..), TestSpeed(..), defaultTestArgs,
+    cmdDocsArgs, cmdUnitIdHash, lookupBuildRoot, TestArgs(..), TestSpeed(..), defaultTestArgs,
     cmdPrefix, DocArgs(..), defaultDocArgs
     ) where
 
@@ -17,7 +17,6 @@ import System.Environment
 import qualified System.Directory as Directory
 
 import qualified Data.Set as Set
-import Data.Maybe
 
 data TestSpeed = TestSlow | TestNormal | TestFast deriving (Show, Eq)
 
@@ -28,6 +27,7 @@ data CommandLineArgs = CommandLineArgs
     , freeze1        :: Bool
     , freeze2        :: Bool
     , skipDepends    :: Bool
+    , unitIdHash     :: Bool
     , bignum         :: Maybe String
     , bignumCheck    :: Bool
     , progressInfo   :: ProgressInfo
@@ -47,6 +47,7 @@ defaultCommandLineArgs = CommandLineArgs
     , freeze1        = False
     , freeze2        = False
     , skipDepends    = False
+    , unitIdHash     = False
     , bignum         = Nothing
     , bignumCheck    = False
     , progressInfo   = Brief
@@ -112,7 +113,7 @@ data DocArgs = DocArgs
   } deriving (Eq, Show)
 
 defaultDocArgs :: DocArgs
-defaultDocArgs = DocArgs { docsBaseUrl = "../%pkg%" }
+defaultDocArgs = DocArgs { docsBaseUrl = "../%pkgid%" }
 
 readConfigure :: Either String (CommandLineArgs -> CommandLineArgs)
 readConfigure = Left "hadrian --configure has been deprecated (see #20167). Please run ./boot; ./configure manually"
@@ -127,32 +128,29 @@ readBignum (Just ms) = Right $ \flags -> case break (== '-') (lower ms) of
    ("check",'-':backend) -> flags { bignum = Just backend, bignumCheck = True }
    _                     -> flags { bignum = Just (lower ms) }
 
-readBuildRoot :: Maybe FilePath -> Either String (CommandLineArgs -> CommandLineArgs)
+readBuildRoot :: FilePath -> Either String (CommandLineArgs -> CommandLineArgs)
 readBuildRoot ms =
-    maybe (Left "Cannot parse build-root") (Right . set) (go =<< ms)
-  where
-    go :: String -> Maybe BuildRoot
-    go = Just . BuildRoot
-    set :: BuildRoot -> CommandLineArgs -> CommandLineArgs
-    set flag flags = flags { buildRoot = flag }
+    Right $ \flags -> flags { buildRoot = BuildRoot ms }
 
 readFreeze1, readFreeze2, readSkipDepends :: Either String (CommandLineArgs -> CommandLineArgs)
 readFreeze1 = Right $ \flags -> flags { freeze1 = True }
 readFreeze2 = Right $ \flags -> flags { freeze1 = True, freeze2 = True }
 readSkipDepends = Right $ \flags -> flags { skipDepends = True }
 
-readProgressInfo :: Maybe String -> Either String (CommandLineArgs -> CommandLineArgs)
+readUnitIdHash :: Either String (CommandLineArgs -> CommandLineArgs)
+readUnitIdHash = Right $ \flags -> flags { unitIdHash = True }
+
+readProgressInfo :: String -> Either String (CommandLineArgs -> CommandLineArgs)
 readProgressInfo ms =
-    maybe (Left "Cannot parse progress-info") (Right . set) (go =<< lower <$> ms)
+  case lower ms of
+    "none"    -> set None
+    "brief"   -> set Brief
+    "normal"  -> set Normal
+    "unicorn" -> set Unicorn
+    _         -> Left "Cannot parse progress-info"
   where
-    go :: String -> Maybe ProgressInfo
-    go "none"    = Just None
-    go "brief"   = Just Brief
-    go "normal"  = Just Normal
-    go "unicorn" = Just Unicorn
-    go _         = Nothing
-    set :: ProgressInfo -> CommandLineArgs -> CommandLineArgs
-    set flag flags = flags { progressInfo = flag }
+    set :: ProgressInfo -> Either String (CommandLineArgs -> CommandLineArgs)
+    set flag = Right $ \flags -> flags { progressInfo = flag }
 
 readTestKeepFiles :: Either String (CommandLineArgs -> CommandLineArgs)
 readTestKeepFiles = Right $ \flags -> flags { testArgs = (testArgs flags) { testKeepFiles = True } }
@@ -163,24 +161,16 @@ readTestAccept = Right $ \flags -> flags { testArgs = (testArgs flags) { testAcc
 readTestHasInTreeFiles :: Either String (CommandLineArgs -> CommandLineArgs)
 readTestHasInTreeFiles = Right $ \flags -> flags { testArgs = (testArgs flags) { testHasInTreeFiles = True } }
 
-readTestCompiler :: Maybe String -> Either String (CommandLineArgs -> CommandLineArgs)
-readTestCompiler compiler = maybe (Left "Cannot parse compiler") (Right . set) compiler
-  where
-     set compiler  = \flags -> flags { testArgs = (testArgs flags) { testCompiler = compiler } }
+readTestCompiler :: String -> Either String (CommandLineArgs -> CommandLineArgs)
+readTestCompiler compiler = Right $ \flags -> flags { testArgs = (testArgs flags) { testCompiler = compiler } }
 
-readTestConfig :: Maybe String -> Either String (CommandLineArgs -> CommandLineArgs)
-readTestConfig config =
-    case config of
-         Nothing -> Right id
-         Just conf -> Right $ \flags ->
+readTestConfig :: String -> Either String (CommandLineArgs -> CommandLineArgs)
+readTestConfig conf = Right $ \flags ->
                         let configs = conf : testConfigs (testArgs flags)
                         in flags { testArgs = (testArgs flags) { testConfigs = configs } }
 
-readTestConfigFile :: Maybe String -> Either String (CommandLineArgs -> CommandLineArgs)
-readTestConfigFile filepath =
-    maybe (Left "Cannot parse test-config-file") (Right . set) filepath
-  where
-    set filepath flags =  flags { testArgs = (testArgs flags) { testConfigFile = filepath } }
+readTestConfigFile :: String -> Either String (CommandLineArgs -> CommandLineArgs)
+readTestConfigFile filepath = Right $ \flags ->  flags { testArgs = (testArgs flags) { testConfigFile = filepath } }
 
 readTestJUnit :: Maybe String -> Either String (CommandLineArgs -> CommandLineArgs)
 readTestJUnit filepath = Right $ \flags -> flags { testArgs = (testArgs flags) { testJUnit = filepath } }
@@ -201,11 +191,11 @@ readTestOnlyPerf = Right $ \flags -> flags { testArgs = (testArgs flags) { testO
 readTestSkipPerf :: Either String (CommandLineArgs -> CommandLineArgs)
 readTestSkipPerf = Right $ \flags -> flags { testArgs = (testArgs flags) { testSkipPerf = True } }
 
-readHaddockBaseUrl :: Maybe String -> Either String (CommandLineArgs -> CommandLineArgs)
-readHaddockBaseUrl base_url = Right $ \flags ->
-  flags { docsArgs = (docsArgs flags) { docsBaseUrl = base_url' } }
+readHaddockBaseUrl :: Either String (CommandLineArgs -> CommandLineArgs)
+readHaddockBaseUrl = Right $ \flags ->
+  flags { docsArgs = (docsArgs flags) { docsBaseUrl = base_url } }
 
-  where base_url' = fromMaybe "https://hackage.haskell.org/package/%pkg%/docs" base_url
+  where base_url = "/package/%pkg%/docs"
 
 
 readTestRootDirs :: Maybe String -> Either String (CommandLineArgs -> CommandLineArgs)
@@ -215,17 +205,16 @@ readTestRootDirs rootdirs = Right $ \flags ->
   where rootdirs' = maybe [] (splitOn ":") rootdirs
         rootdirs'' flags = testRootDirs (testArgs flags) ++ rootdirs'
 
-readTestSpeed :: Maybe String -> Either String (CommandLineArgs -> CommandLineArgs)
+readTestSpeed :: String -> Either String (CommandLineArgs -> CommandLineArgs)
 readTestSpeed ms =
-    maybe (Left "Cannot parse test-speed") (Right . set) (go =<< lower <$> ms)
+  case lower ms of
+    "fast"    -> set TestFast
+    "slow"    -> set TestSlow
+    "normal"  -> set TestNormal
+    _         -> Left "Cannot parse test-speed"
   where
-    go :: String -> Maybe TestSpeed
-    go "fast"    = Just TestFast
-    go "slow"    = Just TestSlow
-    go "normal"  = Just TestNormal
-    go _         = Nothing
-    set :: TestSpeed -> CommandLineArgs -> CommandLineArgs
-    set flag flags = flags { testArgs = (testArgs flags) {testSpeed = flag} }
+    set :: TestSpeed -> Either String (CommandLineArgs -> CommandLineArgs)
+    set flag = Right $ \flags -> flags { testArgs = (testArgs flags) {testSpeed = flag} }
 
 readTestSummary :: Maybe String -> Either String (CommandLineArgs -> CommandLineArgs)
 readTestSummary filepath = Right $ \flags -> flags { testArgs = (testArgs flags) { testSummary = filepath } }
@@ -233,19 +222,15 @@ readTestSummary filepath = Right $ \flags -> flags { testArgs = (testArgs flags)
 readTestVerbose :: Maybe String -> Either String (CommandLineArgs -> CommandLineArgs)
 readTestVerbose verbose = Right $ \flags -> flags { testArgs = (testArgs flags) { testVerbosity = verbose } }
 
-readTestWay :: Maybe String -> Either String (CommandLineArgs -> CommandLineArgs)
+readTestWay :: String -> Either String (CommandLineArgs -> CommandLineArgs)
 readTestWay way =
-    case way of
-        Nothing -> Right id
-        Just way -> Right $ \flags ->
+    Right $ \flags ->
             let newWays = way : testWays (testArgs flags)
             in flags { testArgs = (testArgs flags) {testWays = newWays} }
 
-readBrokenTests :: Maybe String -> Either String (CommandLineArgs -> CommandLineArgs)
-readBrokenTests way =
-    case way of
-        Nothing -> Left "--broken-tests expects argument"
-        Just tests -> Right $ \flags ->
+readBrokenTests :: String -> Either String (CommandLineArgs -> CommandLineArgs)
+readBrokenTests tests =
+    Right $ \flags ->
             let newTests = words tests ++ brokenTests (testArgs flags)
             in flags { testArgs = (testArgs flags) {brokenTests = newTests} }
 
@@ -255,33 +240,32 @@ readPrefix ms = Right $ \flags -> flags { prefix = ms }
 readCompleteStg :: Maybe String -> Either String (CommandLineArgs -> CommandLineArgs)
 readCompleteStg ms = Right $ \flags -> flags { completeStg = ms }
 
-readDocsArg :: Maybe String -> Either String (CommandLineArgs -> CommandLineArgs)
-readDocsArg ms = maybe (Left "Cannot parse docs argument") (Right . set) (go =<< ms)
+readDocsArg :: String -> Either String (CommandLineArgs -> CommandLineArgs)
+readDocsArg ms =
+  case ms of
+    "none"           -> set (const Set.empty)
+    "no-haddocks"    -> set (Set.delete Haddocks)
+    "no-sphinx-html" -> set (Set.delete SphinxHTML)
+    "no-sphinx-pdfs" -> set (Set.delete SphinxPDFs)
+    "no-sphinx-man"  -> set (Set.delete SphinxMan)
+    "no-sphinx-info" -> set (Set.delete SphinxInfo)
+    "no-sphinx"      -> set (Set.delete SphinxHTML
+                           . Set.delete SphinxPDFs
+                           . Set.delete SphinxMan
+                           . Set.delete SphinxInfo)
+    _                -> Left "Cannot parse docs argument"
 
   where
-    go :: String -> Maybe (DocTargets -> DocTargets)
-    go "none"           = Just (const Set.empty)
-    go "no-haddocks"    = Just (Set.delete Haddocks)
-    go "no-sphinx-html" = Just (Set.delete SphinxHTML)
-    go "no-sphinx-pdfs" = Just (Set.delete SphinxPDFs)
-    go "no-sphinx-man"  = Just (Set.delete SphinxMan)
-    go "no-sphinx-info" = Just (Set.delete SphinxInfo)
-    go "no-sphinx"      = Just (Set.delete SphinxHTML
-                              . Set.delete SphinxPDFs
-                              . Set.delete SphinxMan
-                              . Set.delete SphinxInfo)
-    go _                = Nothing
-
-    set :: (DocTargets -> DocTargets) -> CommandLineArgs -> CommandLineArgs
-    set tweakTargets flags = flags
-      { docTargets = tweakTargets (docTargets flags) }
+    set :: (DocTargets -> DocTargets) -> Either String (CommandLineArgs -> CommandLineArgs)
+    set tweakTargets = Right $ \flags ->
+      flags { docTargets = tweakTargets (docTargets flags) }
 
 -- | Standard 'OptDescr' descriptions of Hadrian's command line arguments.
 optDescrs :: [OptDescr (Either String (CommandLineArgs -> CommandLineArgs))]
 optDescrs =
     [ Option ['c'] ["configure"] (NoArg readConfigure)
       "Deprecated: Run the boot and configure scripts."
-    , Option ['o'] ["build-root"] (OptArg readBuildRoot "BUILD_ROOT")
+    , Option ['o'] ["build-root"] (ReqArg readBuildRoot "BUILD_ROOT")
       "Where to store build artifacts. (Default _build)."
     , Option [] ["flavour"] (OptArg readFlavour "FLAVOUR")
       "Build flavour (Default, Devel1, Devel2, Perf, Prof, Quick or Quickest)."
@@ -289,21 +273,23 @@ optDescrs =
       "Freeze Stage1 GHC."
     , Option [] ["freeze2"] (NoArg readFreeze2)
       "Freeze Stage2 GHC."
+    , Option [] ["hash-unit-ids"] (NoArg readUnitIdHash)
+      "Include package hashes in unit ids."
     , Option [] ["skip-depends"] (NoArg readSkipDepends)
       "Skip rebuilding dependency information."
     , Option [] ["bignum"] (OptArg readBignum "BACKEND")
       "Select ghc-bignum backend: native, gmp (default), check-gmp, ffi."
-    , Option [] ["progress-info"] (OptArg readProgressInfo "STYLE")
+    , Option [] ["progress-info"] (ReqArg readProgressInfo "STYLE")
       "Progress info style (None, Brief, Normal or Unicorn)."
-    , Option [] ["docs"] (OptArg readDocsArg "TARGET")
+    , Option [] ["docs"] (ReqArg readDocsArg "TARGET")
       "Strip down docs targets (none, no-haddocks, no-sphinx[-{html, pdfs, man}]."
     , Option ['k'] ["keep-test-files"] (NoArg readTestKeepFiles)
       "Keep all the files generated when running the testsuite."
-    , Option [] ["test-compiler"] (OptArg readTestCompiler "TEST_COMPILER")
+    , Option [] ["test-compiler"] (ReqArg readTestCompiler "TEST_COMPILER")
       "Use given compiler [Default=stage2]."
-    , Option [] ["test-config-file"] (OptArg readTestConfigFile "CONFIG_FILE")
+    , Option [] ["test-config-file"] (ReqArg readTestConfigFile "CONFIG_FILE")
       "configuration file for testsuite. Default=testsuite/config/ghc"
-    , Option [] ["config"] (OptArg readTestConfig "EXTRA_TEST_CONFIG")
+    , Option [] ["config"] (ReqArg readTestConfig "EXTRA_TEST_CONFIG")
       "Configurations to run test, in key=value format."
     , Option [] ["summary-junit"] (OptArg readTestJUnit "TEST_SUMMARY_JUNIT")
       "Output testsuite summary in JUnit format."
@@ -317,15 +303,15 @@ optDescrs =
       "Skip performance tests."
     , Option [] ["test-root-dirs"] (OptArg readTestRootDirs "DIR1:[DIR2:...:DIRn]")
       "Test root directories to look at (all by default)."
-    , Option [] ["test-speed"] (OptArg readTestSpeed "SPEED")
+    , Option [] ["test-speed"] (ReqArg readTestSpeed "SPEED")
       "fast, slow or normal. Normal by default"
     , Option [] ["summary"] (OptArg readTestSummary "TEST_SUMMARY")
       "Where to output the test summary file."
     , Option [] ["test-verbose"] (OptArg readTestVerbose "TEST_VERBOSE")
       "A verbosity value between 0 and 5. 0 is silent, 4 and higher activates extra output."
-    , Option [] ["test-way"] (OptArg readTestWay "TEST_WAY")
+    , Option [] ["test-way"] (ReqArg readTestWay "TEST_WAY")
       "only run these ways"
-    , Option [] ["broken-test"] (OptArg readBrokenTests "TEST_NAME")
+    , Option [] ["broken-test"] (ReqArg readBrokenTests "TEST_NAME")
       "consider these tests to be broken"
     , Option ['a'] ["test-accept"] (NoArg readTestAccept) "Accept new output of tests"
     , Option [] ["test-have-intree-files"] (NoArg readTestHasInTreeFiles) "Run the in-tree tests even with an out of tree compiler"
@@ -333,8 +319,8 @@ optDescrs =
         "Destination path for the bindist 'install' rule"
     , Option [] ["complete-setting"] (OptArg readCompleteStg "SETTING")
         "Setting key to autocomplete, for the 'autocomplete' target."
-    , Option [] ["haddock-base-url"] (OptArg readHaddockBaseUrl "BASE_URL")
-        "Generate documentation suitable for upload to hackage or for another base URL (for example a local hackage server)."
+    , Option [] ["haddock-for-hackage"] (NoArg readHaddockBaseUrl)
+        "Generate documentation suitable for upload to a hackage server."
     ]
 
 -- | A type-indexed map containing Hadrian command line arguments to be passed
@@ -399,6 +385,9 @@ lookupFreeze2 = freeze2 . lookupExtra defaultCommandLineArgs
 
 lookupSkipDepends :: Map.HashMap TypeRep Dynamic -> Bool
 lookupSkipDepends = skipDepends . lookupExtra defaultCommandLineArgs
+
+cmdUnitIdHash :: Action Bool
+cmdUnitIdHash = unitIdHash <$> cmdLineArgs
 
 cmdBignum :: Action (Maybe String)
 cmdBignum = bignum <$> cmdLineArgs

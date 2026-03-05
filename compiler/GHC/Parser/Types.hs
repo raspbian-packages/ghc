@@ -29,7 +29,7 @@ import Language.Haskell.Syntax
 data SumOrTuple b
   = Sum ConTag Arity (LocatedA b) [EpaLocation] [EpaLocation]
   -- ^ Last two are the locations of the '|' before and after the payload
-  | Tuple [Either (EpAnn EpaLocation) (LocatedA b)]
+  | Tuple [Either (EpAnn Bool) (LocatedA b)]
 
 pprSumOrTuple :: Outputable b => Boxity -> SumOrTuple b -> SDoc
 pprSumOrTuple boxity = \case
@@ -53,13 +53,19 @@ pprSumOrTuple boxity = \case
 -- | See Note [Ambiguous syntactic categories] and Note [PatBuilder]
 data PatBuilder p
   = PatBuilderPat (Pat p)
-  | PatBuilderPar (LHsToken "(" p) (LocatedA (PatBuilder p)) (LHsToken ")" p)
+  | PatBuilderPar (EpToken "(") (LocatedA (PatBuilder p)) (EpToken ")")
   | PatBuilderApp (LocatedA (PatBuilder p)) (LocatedA (PatBuilder p))
-  | PatBuilderAppType (LocatedA (PatBuilder p)) (LHsToken "@" p) (HsPatSigType GhcPs)
+  | PatBuilderAppType (LocatedA (PatBuilder p)) (EpToken "@") (HsTyPat GhcPs)
   | PatBuilderOpApp (LocatedA (PatBuilder p)) (LocatedN RdrName)
-                    (LocatedA (PatBuilder p)) (EpAnn [AddEpAnn])
+                    (LocatedA (PatBuilder p)) [AddEpAnn]
   | PatBuilderVar (LocatedN RdrName)
   | PatBuilderOverLit (HsOverLit GhcPs)
+
+-- These instances are here so that they are not orphans
+type instance Anno (GRHS GhcPs (LocatedA (PatBuilder GhcPs)))             = EpAnnCO
+type instance Anno [LocatedA (Match GhcPs (LocatedA (PatBuilder GhcPs)))] = SrcSpanAnnL
+type instance Anno (Match GhcPs (LocatedA (PatBuilder GhcPs)))            = SrcSpanAnnA
+type instance Anno (StmtLR GhcPs GhcPs (LocatedA (PatBuilder GhcPs)))     = SrcSpanAnnA
 
 instance Outputable (PatBuilder GhcPs) where
   ppr (PatBuilderPat p) = ppr p

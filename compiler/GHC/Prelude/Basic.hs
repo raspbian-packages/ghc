@@ -2,6 +2,9 @@
 {-# OPTIONS_HADDOCK not-home #-}
 {-# OPTIONS_GHC -O2 #-} -- See Note [-O2 Prelude]
 
+-- See Note [Proxies for head and tail]
+{-# OPTIONS_GHC -Wno-unrecognised-warning-flags -Wno-x-partial #-}
+
 -- | Custom minimal GHC "Prelude"
 --
 -- This module serves as a replacement for the "Prelude" module
@@ -10,7 +13,7 @@
 
 -- Every module in GHC
 --   * Is compiled with -XNoImplicitPrelude
---   * Explicitly imports GHC.BasicPrelude or GHC.Prelude
+--   * Explicitly imports GHC.Prelude.Basic or GHC.Prelude
 --   * The later provides some functionality with within ghc itself
 --     like pprTrace.
 
@@ -19,6 +22,9 @@ module GHC.Prelude.Basic
   ,Applicative (..)
   ,module Bits
   ,shiftL, shiftR
+  ,head, tail
+
+  , strictGenericLength
   ) where
 
 
@@ -50,9 +56,11 @@ NoImplicitPrelude. There are two motivations for this:
     extensions.
 -}
 
-import Prelude as X hiding ((<>), Applicative(..))
+import qualified Prelude
+import Prelude as X hiding ((<>), Applicative(..), Foldable(..), head, tail)
 import Control.Applicative (Applicative(..))
-import Data.Foldable as X (foldl')
+import Data.Foldable as X (Foldable(elem, foldMap, foldr, foldl, foldl', foldr1, foldl1, maximum, minimum, product, sum, null, length))
+import GHC.Stack.Types (HasCallStack)
 
 #if MIN_VERSION_base(4,16,0)
 import GHC.Bits as Bits hiding (shiftL, shiftR)
@@ -102,3 +110,33 @@ shiftR = Bits.shiftR
 shiftL = Bits.unsafeShiftL
 shiftR = Bits.unsafeShiftR
 #endif
+
+{- Note [Proxies for head and tail]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Prelude.head and Prelude.tail have recently acquired {-# WARNING in "x-partial" #-},
+but the GHC codebase uses them fairly extensively and insists on building warning-free.
+Thus, instead of adding {-# OPTIONS_GHC -Wno-x-partial #-} to every module which
+employs them, we define warning-less proxies and export them from GHC.Prelude.
+-}
+
+-- See Note [Proxies for head and tail]
+head :: HasCallStack => [a] -> a
+head = Prelude.head
+{-# INLINE head #-}
+
+-- See Note [Proxies for head and tail]
+tail :: HasCallStack => [a] -> [a]
+tail = Prelude.tail
+{-# INLINE tail #-}
+
+{- |
+The 'genericLength' function defined in base can't be specialised due to the
+NOINLINE pragma.
+
+It is also not strict in the accumulator, and strictGenericLength is not exported.
+
+See #25706 for why it is important to use a strict, specialised version.
+
+-}
+strictGenericLength :: Num a => [x] -> a
+strictGenericLength = fromIntegral . length

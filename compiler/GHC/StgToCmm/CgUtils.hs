@@ -1,5 +1,4 @@
 {-# LANGUAGE GADTs #-}
-{-# LANGUAGE BangPatterns #-}
 
 -----------------------------------------------------------------------------
 --
@@ -33,17 +32,17 @@ import GHC.Utils.Panic
 
 baseRegOffset :: Platform -> GlobalReg -> Int
 baseRegOffset platform reg = case reg of
-   VanillaReg 1 _       -> pc_OFFSET_StgRegTable_rR1  constants
-   VanillaReg 2 _       -> pc_OFFSET_StgRegTable_rR2  constants
-   VanillaReg 3 _       -> pc_OFFSET_StgRegTable_rR3  constants
-   VanillaReg 4 _       -> pc_OFFSET_StgRegTable_rR4  constants
-   VanillaReg 5 _       -> pc_OFFSET_StgRegTable_rR5  constants
-   VanillaReg 6 _       -> pc_OFFSET_StgRegTable_rR6  constants
-   VanillaReg 7 _       -> pc_OFFSET_StgRegTable_rR7  constants
-   VanillaReg 8 _       -> pc_OFFSET_StgRegTable_rR8  constants
-   VanillaReg 9 _       -> pc_OFFSET_StgRegTable_rR9  constants
-   VanillaReg 10 _      -> pc_OFFSET_StgRegTable_rR10 constants
-   VanillaReg n _       -> panic ("Registers above R10 are not supported (tried to use R" ++ show n ++ ")")
+   VanillaReg 1         -> pc_OFFSET_StgRegTable_rR1  constants
+   VanillaReg 2         -> pc_OFFSET_StgRegTable_rR2  constants
+   VanillaReg 3         -> pc_OFFSET_StgRegTable_rR3  constants
+   VanillaReg 4         -> pc_OFFSET_StgRegTable_rR4  constants
+   VanillaReg 5         -> pc_OFFSET_StgRegTable_rR5  constants
+   VanillaReg 6         -> pc_OFFSET_StgRegTable_rR6  constants
+   VanillaReg 7         -> pc_OFFSET_StgRegTable_rR7  constants
+   VanillaReg 8         -> pc_OFFSET_StgRegTable_rR8  constants
+   VanillaReg 9         -> pc_OFFSET_StgRegTable_rR9  constants
+   VanillaReg 10        -> pc_OFFSET_StgRegTable_rR10 constants
+   VanillaReg n         -> panic ("Registers above R10 are not supported (tried to use R" ++ show n ++ ")")
    FloatReg  1          -> pc_OFFSET_StgRegTable_rF1 constants
    FloatReg  2          -> pc_OFFSET_StgRegTable_rF2 constants
    FloatReg  3          -> pc_OFFSET_StgRegTable_rF3 constants
@@ -124,7 +123,7 @@ regTableOffset platform n =
 get_Regtable_addr_from_offset :: Platform -> Int -> CmmExpr
 get_Regtable_addr_from_offset platform offset =
     if haveRegBase platform
-    then cmmRegOff baseReg offset
+    then cmmRegOff (baseReg platform) offset
     else regTableOffset platform offset
 
 -- | Fixup global registers so that they assign to locations within the
@@ -144,34 +143,38 @@ fixStgRegStmt platform stmt = fixAssign $ mapExpDeep fixExpr stmt
   where
     fixAssign stmt =
       case stmt of
-        CmmAssign (CmmGlobal reg) src
+        CmmAssign (CmmGlobal reg_use) src
           -- MachSp isn't an STG register; it's merely here for tracking unwind
           -- information
           | reg == MachSp -> stmt
           | otherwise ->
             let baseAddr = get_GlobalReg_addr platform reg
             in case reg `elem` activeStgRegs platform of
-                True  -> CmmAssign (CmmGlobal reg) src
+                True  -> CmmAssign (CmmGlobal reg_use) src
                 False -> CmmStore baseAddr src NaturallyAligned
+          where reg = globalRegUseGlobalReg reg_use
         other_stmt -> other_stmt
 
     fixExpr expr = case expr of
         -- MachSp isn't an STG; it's merely here for tracking unwind information
-        CmmReg (CmmGlobal MachSp) -> expr
-        CmmReg (CmmGlobal reg) ->
+        CmmReg (CmmGlobal (GlobalRegUse MachSp _)) -> expr
+        CmmReg (CmmGlobal reg_use) ->
             -- Replace register leaves with appropriate StixTrees for
             -- the given target.  MagicIds which map to a reg on this
             -- arch are left unchanged.  For the rest, BaseReg is taken
             -- to mean the address of the reg table in MainCapability,
             -- and for all others we generate an indirection to its
             -- location in the register table.
+            let reg = globalRegUseGlobalReg reg_use in
             case reg `elem` activeStgRegs platform of
                 True  -> expr
                 False ->
                     let baseAddr = get_GlobalReg_addr platform reg
                     in case reg of
                         BaseReg -> baseAddr
-                        _other  -> CmmLoad baseAddr (globalRegType platform reg) NaturallyAligned
+                        _other  -> CmmLoad baseAddr
+                                     (globalRegSpillType platform reg)
+                                     NaturallyAligned
 
         CmmRegOff greg@(CmmGlobal reg) offset ->
             -- RegOf leaves are just a shorthand form. If the reg maps
@@ -180,11 +183,11 @@ fixStgRegStmt platform stmt = fixAssign $ mapExpDeep fixExpr stmt
             -- NB: to ensure type correctness we need to ensure the Add
             --     as well as the Int need to be of the same size as the
             --     register.
-            case reg `elem` activeStgRegs platform of
+            case globalRegUseGlobalReg reg `elem` activeStgRegs platform of
                 True  -> expr
-                False -> CmmMachOp (MO_Add (cmmRegWidth platform greg)) [
+                False -> CmmMachOp (MO_Add (cmmRegWidth greg)) [
                                     fixExpr (CmmReg greg),
                                     CmmLit (CmmInt (fromIntegral offset)
-                                                   (cmmRegWidth platform greg))]
+                                                   (cmmRegWidth greg))]
 
         other_expr -> other_expr

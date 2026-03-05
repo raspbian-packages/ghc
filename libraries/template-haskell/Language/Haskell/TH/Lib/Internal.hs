@@ -1,3 +1,4 @@
+{-# OPTIONS_HADDOCK not-home #-}
 {-# LANGUAGE PolyKinds #-}
 {-# LANGUAGE StandaloneKindSignatures #-}
 {-# LANGUAGE Trustworthy #-}
@@ -79,6 +80,7 @@ type InjectivityAnn      = TH.InjectivityAnn
 
 type TyVarBndrUnit       = TyVarBndr ()
 type TyVarBndrSpec       = TyVarBndr Specificity
+type TyVarBndrVis        = TyVarBndr BndrVis
 
 ----------------------------------------------------------
 -- * Lowercase pattern syntax functions
@@ -159,10 +161,17 @@ sigP :: Quote m => m Pat -> m Type -> m Pat
 sigP p t = do p' <- p
               t' <- t
               pure (SigP p' t')
+typeP :: Quote m => m Type -> m Pat
+typeP t = do t' <- t
+             pure (TypeP t')
+invisP :: Quote m => m Type -> m Pat
+invisP t = do t' <- t
+              pure (InvisP t')
 viewP :: Quote m => m Exp -> m Pat -> m Pat
 viewP e p = do e' <- e
                p' <- p
                pure (ViewP e' p')
+
 
 fieldPat :: Quote m => Name -> m Pat -> m FieldPat
 fieldPat n p = do p' <- p
@@ -245,11 +254,10 @@ clause ps r ds = do { ps' <- sequenceA ps;
                       ds' <- sequenceA ds;
                       pure (Clause ps' r' ds') }
 
-
 ---------------------------------------------------------------------------
 -- *   Exp
 
--- | Dynamically binding a variable (unhygenic)
+-- | Dynamically binding a variable (unhygienic)
 dyn :: Quote m => String -> m Exp
 dyn s = pure (VarE (mkName s))
 
@@ -380,6 +388,12 @@ getFieldE e f = do
 projectionE :: Quote m => NonEmpty String -> m Exp
 projectionE xs = pure (ProjectionE xs)
 
+typedSpliceE :: Quote m => m Exp -> m Exp
+typedSpliceE = fmap TypedSpliceE
+
+typedBracketE :: Quote m => m Exp -> m Exp
+typedBracketE = fmap TypedBracketE
+
 -- ** 'arithSeqE' Shortcuts
 fromE :: Quote m => m Exp -> m Exp
 fromE x = do { a <- x; pure (ArithSeqE (FromR a)) }
@@ -394,6 +408,8 @@ fromThenToE :: Quote m => m Exp -> m Exp -> m Exp -> m Exp
 fromThenToE x y z = do { a <- x; b <- y; c <- z;
                          pure (ArithSeqE (FromThenToR a b c)) }
 
+typeE :: Quote m => m Type -> m Exp
+typeE = fmap TypeE
 
 -------------------------------------------------------------------------------
 -- *   Dec
@@ -412,14 +428,14 @@ funD nm cs =
     ; pure (FunD nm cs1)
     }
 
-tySynD :: Quote m => Name -> [m (TyVarBndr ())] -> m Type -> m Dec
+tySynD :: Quote m => Name -> [m (TyVarBndr BndrVis)] -> m Type -> m Dec
 tySynD tc tvs rhs =
   do { tvs1 <- sequenceA tvs
      ; rhs1 <- rhs
      ; pure (TySynD tc tvs1 rhs1)
      }
 
-dataD :: Quote m => m Cxt -> Name -> [m (TyVarBndr ())] -> Maybe (m Kind) -> [m Con]
+dataD :: Quote m => m Cxt -> Name -> [m (TyVarBndr BndrVis)] -> Maybe (m Kind) -> [m Con]
       -> [m DerivClause] -> m Dec
 dataD ctxt tc tvs ksig cons derivs =
   do
@@ -430,7 +446,7 @@ dataD ctxt tc tvs ksig cons derivs =
     derivs1 <- sequenceA derivs
     pure (DataD ctxt1 tc tvs1 ksig1 cons1 derivs1)
 
-newtypeD :: Quote m => m Cxt -> Name -> [m (TyVarBndr ())] -> Maybe (m Kind) -> m Con
+newtypeD :: Quote m => m Cxt -> Name -> [m (TyVarBndr BndrVis)] -> Maybe (m Kind) -> m Con
          -> [m DerivClause] -> m Dec
 newtypeD ctxt tc tvs ksig con derivs =
   do
@@ -441,7 +457,7 @@ newtypeD ctxt tc tvs ksig con derivs =
     derivs1 <- sequenceA derivs
     pure (NewtypeD ctxt1 tc tvs1 ksig1 con1 derivs1)
 
-typeDataD :: Quote m => Name -> [m (TyVarBndr ())] -> Maybe (m Kind) -> [m Con]
+typeDataD :: Quote m => Name -> [m (TyVarBndr BndrVis)] -> Maybe (m Kind) -> [m Con]
       -> m Dec
 typeDataD tc tvs ksig cons =
   do
@@ -450,7 +466,7 @@ typeDataD tc tvs ksig cons =
     cons1   <- sequenceA cons
     pure (TypeDataD tc tvs1 ksig1 cons1)
 
-classD :: Quote m => m Cxt -> Name -> [m (TyVarBndr ())] -> [FunDep] -> [m Dec] -> m Dec
+classD :: Quote m => m Cxt -> Name -> [m (TyVarBndr BndrVis)] -> [FunDep] -> [m Dec] -> m Dec
 classD ctxt cls tvs fds decs =
   do
     tvs1  <- sequenceA tvs
@@ -483,13 +499,22 @@ forImpD cc s str n ty
       pure $ ForeignD (ImportF cc s str n ty')
 
 infixLD :: Quote m => Int -> Name -> m Dec
-infixLD prec nm = pure (InfixD (Fixity prec InfixL) nm)
+infixLD prec = infixLWithSpecD prec NoNamespaceSpecifier
 
 infixRD :: Quote m => Int -> Name -> m Dec
-infixRD prec nm = pure (InfixD (Fixity prec InfixR) nm)
+infixRD prec = infixRWithSpecD prec NoNamespaceSpecifier
 
 infixND :: Quote m => Int -> Name -> m Dec
-infixND prec nm = pure (InfixD (Fixity prec InfixN) nm)
+infixND prec = infixNWithSpecD prec NoNamespaceSpecifier
+
+infixLWithSpecD :: Quote m => Int -> NamespaceSpecifier -> Name -> m Dec
+infixLWithSpecD prec ns_spec nm = pure (InfixD (Fixity prec InfixL) ns_spec nm)
+
+infixRWithSpecD :: Quote m => Int -> NamespaceSpecifier -> Name -> m Dec
+infixRWithSpecD prec ns_spec nm = pure (InfixD (Fixity prec InfixR) ns_spec nm)
+
+infixNWithSpecD :: Quote m => Int -> NamespaceSpecifier -> Name -> m Dec
+infixNWithSpecD prec ns_spec nm = pure (InfixD (Fixity prec InfixN) ns_spec nm)
 
 defaultD :: Quote m => [m Type] -> m Dec
 defaultD tys = DefaultD <$> sequenceA tys
@@ -541,6 +566,12 @@ pragLineD line file = pure $ PragmaD $ LineP line file
 pragCompleteD :: Quote m => [Name] -> Maybe Name -> m Dec
 pragCompleteD cls mty = pure $ PragmaD $ CompleteP cls mty
 
+pragSCCFunD :: Quote m => Name -> m Dec
+pragSCCFunD nm = pure $ PragmaD $ SCCP nm Nothing
+
+pragSCCFunNamedD :: Quote m => Name -> String -> m Dec
+pragSCCFunNamedD nm str = pure $ PragmaD $ SCCP nm (Just str)
+
 dataInstD :: Quote m => m Cxt -> (Maybe [m (TyVarBndr ())]) -> m Type -> Maybe (m Kind) -> [m Con]
           -> [m DerivClause] -> m Dec
 dataInstD ctxt mb_bndrs ty ksig cons derivs =
@@ -571,20 +602,20 @@ tySynInstD eqn =
     eqn1 <- eqn
     pure (TySynInstD eqn1)
 
-dataFamilyD :: Quote m => Name -> [m (TyVarBndr ())] -> Maybe (m Kind) -> m Dec
+dataFamilyD :: Quote m => Name -> [m (TyVarBndr BndrVis)] -> Maybe (m Kind) -> m Dec
 dataFamilyD tc tvs kind =
   do tvs'  <- sequenceA tvs
      kind' <- sequenceA kind
      pure $ DataFamilyD tc tvs' kind'
 
-openTypeFamilyD :: Quote m => Name -> [m (TyVarBndr ())] -> m FamilyResultSig
+openTypeFamilyD :: Quote m => Name -> [m (TyVarBndr BndrVis)] -> m FamilyResultSig
                 -> Maybe InjectivityAnn -> m Dec
 openTypeFamilyD tc tvs res inj =
   do tvs' <- sequenceA tvs
      res' <- res
      pure $ OpenTypeFamilyD (TypeFamilyHead tc tvs' res' inj)
 
-closedTypeFamilyD :: Quote m => Name -> [m (TyVarBndr ())] -> m FamilyResultSig
+closedTypeFamilyD :: Quote m => Name -> [m (TyVarBndr BndrVis)] -> m FamilyResultSig
                   -> Maybe InjectivityAnn -> [m TySynEqn] -> m Dec
 closedTypeFamilyD tc tvs result injectivity eqns =
   do tvs1    <- sequenceA tvs
@@ -879,17 +910,29 @@ plainTV n = pure $ PlainTV n ()
 plainInvisTV :: Quote m => Name -> Specificity -> m (TyVarBndr Specificity)
 plainInvisTV n s = pure $ PlainTV n s
 
+plainBndrTV :: Quote m => Name -> BndrVis -> m (TyVarBndr BndrVis)
+plainBndrTV n v = pure $ PlainTV n v
+
 kindedTV :: Quote m => Name -> m Kind -> m (TyVarBndr ())
 kindedTV n = fmap (KindedTV n ())
 
 kindedInvisTV :: Quote m => Name -> Specificity -> m Kind -> m (TyVarBndr Specificity)
 kindedInvisTV n s = fmap (KindedTV n s)
 
+kindedBndrTV :: Quote m => Name -> BndrVis -> m Kind -> m (TyVarBndr BndrVis)
+kindedBndrTV n v = fmap (KindedTV n v)
+
 specifiedSpec :: Specificity
 specifiedSpec = SpecifiedSpec
 
 inferredSpec :: Specificity
 inferredSpec = InferredSpec
+
+bndrReq :: BndrVis
+bndrReq = BndrReq
+
+bndrInvis :: BndrVis
+bndrInvis = BndrInvis
 
 varK :: Name -> Kind
 varK = VarT
@@ -1048,7 +1091,7 @@ withDecDoc doc dec = do
     doc_loc (SigD n _)                                     = Just $ DeclDoc n
     doc_loc (ForeignD (ImportF _ _ _ n _))                 = Just $ DeclDoc n
     doc_loc (ForeignD (ExportF _ _ n _))                   = Just $ DeclDoc n
-    doc_loc (InfixD _ n)                                   = Just $ DeclDoc n
+    doc_loc (InfixD _ _ n)                                 = Just $ DeclDoc n
     doc_loc (DataFamilyD n _ _)                            = Just $ DeclDoc n
     doc_loc (OpenTypeFamilyD (TypeFamilyHead n _ _ _))     = Just $ DeclDoc n
     doc_loc (ClosedTypeFamilyD (TypeFamilyHead n _ _ _) _) = Just $ DeclDoc n
@@ -1091,7 +1134,7 @@ funD_doc nm cs mfun_doc arg_docs = do
     Nothing -> funD nm cs
 
 -- | Variant of 'dataD' that attaches Haddock documentation.
-dataD_doc :: Q Cxt -> Name -> [Q (TyVarBndr ())] -> Maybe (Q Kind)
+dataD_doc :: Q Cxt -> Name -> [Q (TyVarBndr BndrVis)] -> Maybe (Q Kind)
           -> [(Q Con, Maybe String, [Maybe String])]
           -- ^ List of constructors, documentation for the constructor, and
           -- documentation for the arguments
@@ -1105,7 +1148,7 @@ dataD_doc ctxt tc tvs ksig cons_with_docs derivs mdoc = do
   maybe dec (flip withDecDoc dec) mdoc
 
 -- | Variant of 'newtypeD' that attaches Haddock documentation.
-newtypeD_doc :: Q Cxt -> Name -> [Q (TyVarBndr ())] -> Maybe (Q Kind)
+newtypeD_doc :: Q Cxt -> Name -> [Q (TyVarBndr BndrVis)] -> Maybe (Q Kind)
              -> (Q Con, Maybe String, [Maybe String])
              -- ^ The constructor, documentation for the constructor, and
              -- documentation for the arguments
@@ -1119,7 +1162,7 @@ newtypeD_doc ctxt tc tvs ksig con_with_docs@(con, _, _) derivs mdoc = do
   maybe dec (flip withDecDoc dec) mdoc
 
 -- | Variant of 'typeDataD' that attaches Haddock documentation.
-typeDataD_doc :: Name -> [Q (TyVarBndr ())] -> Maybe (Q Kind)
+typeDataD_doc :: Name -> [Q (TyVarBndr BndrVis)] -> Maybe (Q Kind)
           -> [(Q Con, Maybe String, [Maybe String])]
           -- ^ List of constructors, documentation for the constructor, and
           -- documentation for the arguments
@@ -1191,15 +1234,3 @@ docCons (c, md, arg_docs) = do
                     | nm <- get_cons_names c'
                     , (i, Just arg_doc) <- zip [0..] arg_docs
                 ]
-  where
-    get_cons_names :: Con -> [Name]
-    get_cons_names (NormalC n _) = [n]
-    get_cons_names (RecC n _) = [n]
-    get_cons_names (InfixC _ n _) = [n]
-    get_cons_names (ForallC _ _ cons) = get_cons_names cons
-    -- GadtC can have multiple names, e.g
-    -- > data Bar a where
-    -- >   MkBar1, MkBar2 :: a -> Bar a
-    -- Will have one GadtC with [MkBar1, MkBar2] as names
-    get_cons_names (GadtC ns _ _) = ns
-    get_cons_names (RecGadtC ns _ _) = ns

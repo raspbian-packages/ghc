@@ -7,7 +7,7 @@ module Settings.Default (
 
     -- * Default command line arguments for various builders
     SourceArgs (..), sourceArgs, defaultBuilderArgs, defaultPackageArgs,
-    defaultArgs,
+    defaultExtraArgs, defaultHaddockExtraArgs,
 
     -- * Default build flavour and BigNum backend
     defaultFlavour, defaultBignumBackend
@@ -17,7 +17,6 @@ import qualified Data.Set as Set
 
 import qualified Hadrian.Builder.Sphinx
 import qualified Hadrian.Builder.Tar
-import Hadrian.Haskell.Cabal.Type
 
 import CommandLine
 import Expression
@@ -65,9 +64,17 @@ defaultBignumBackend = "gmp"
 -- These packages are things needed to do the build.. so they are only built by
 -- boot compiler, with global package database. By default we will only build these
 -- packages in StageBoot so if you also need to distribute anything here then add
--- it to `stage0packages` or `stage1packages` as appropiate.
+-- it to `stage0packages` or `stage1packages` as appropriate.
 stageBootPackages :: Action [Package]
-stageBootPackages = return [lintersCommon, lintCommitMsg, lintSubmoduleRefs, lintWhitespace, lintNotes, hsc2hs, compareSizes, deriveConstants, genapply, genprimopcode, unlit ]
+stageBootPackages = return
+  [ lintersCommon, lintCommitMsg, lintSubmoduleRefs, lintWhitespace, lintNotes
+  , hsc2hs
+  , compareSizes
+  , deriveConstants
+  , genapply
+  , genprimopcode
+  , unlit
+  ]
 
 -- | Packages built in 'Stage0' by default. You can change this in "UserSettings".
 stage0Packages :: Action [Package]
@@ -87,15 +94,20 @@ stage0Packages = do
              , runGhc
              , ghcBoot
              , ghcBootTh
+             , ghcPlatform
              , ghcHeap
+             , ghcToolchain
              , ghci
              , ghcPkg
              , haddock
+             , haskeline
              , hsc2hs
              , hpc
              , hpcBin
              , mtl
+             , osString
              , parsec
+             , semaphoreCompat
              , time
              , templateHaskell
              , text
@@ -106,7 +118,6 @@ stage0Packages = do
              ]
           ++ [ terminfo | not windowsHost, not cross ]
           ++ [ timeout  | windowsHost                ]
-          ++ [ touchy   | windowsHost                ]
 
 -- | Packages built in 'Stage1' by default. You can change this in "UserSettings".
 stage1Packages :: Action [Package]
@@ -135,6 +146,8 @@ stage1Packages = do
         , ghc
         , ghcBignum
         , ghcCompact
+        , ghcExperimental
+        , ghcInternal
         , ghcPkg
         , ghcPrim
         , haskeline
@@ -143,6 +156,7 @@ stage1Packages = do
         , integerGmp
         , pretty
         , rts
+        , semaphoreCompat
         , stm
         , unlit
         , xhtml
@@ -152,13 +166,12 @@ stage1Packages = do
         [ haddock
         , hpcBin
         , iserv
-        , libiserv
         , runGhc
+        , ghcToolchainBin
         ]
       , when (winTarget && not cross)
-        [ touchy
-         -- See Note [Hadrian's ghci-wrapper package]
-        , ghciWrapper
+        [ -- See Note [Hadrian's ghci-wrapper package]
+          ghciWrapper
         ]
       ]
 
@@ -168,7 +181,7 @@ stage2Packages = stage1Packages
 
 -- | Packages that are built only for the testsuite.
 testsuitePackages :: Action [Package]
-testsuitePackages = return ([ timeout | windowsHost ] ++ [ checkPpr, checkExact, countDeps, ghcConfig ])
+testsuitePackages = return ([ timeout | windowsHost ] ++ [ checkPpr, checkExact, countDeps, lintCodes, ghcConfig, dumpDecls ])
 
 -- | Default build ways for library packages:
 -- * We always build 'vanilla' way.
@@ -210,7 +223,6 @@ data SourceArgs = SourceArgs
 sourceArgs :: SourceArgs -> Args
 sourceArgs SourceArgs {..} = builder Ghc ? mconcat
     [ hsDefault
-    , getContextData hcOpts
     -- `compiler` is also a library but the specific arguments that we want
     -- to apply to that are given by the hsCompiler option. `ghc` is an
     -- executable so we don't have to exclude that.
@@ -219,11 +231,14 @@ sourceArgs SourceArgs {..} = builder Ghc ? mconcat
     , package ghc      ? hsGhc ]
 
 -- | All default command line arguments.
-defaultArgs :: Args
-defaultArgs = mconcat
-    [ defaultBuilderArgs
-    , sourceArgs defaultSourceArgs
-    , defaultPackageArgs ]
+defaultExtraArgs :: Args
+defaultExtraArgs =
+  mconcat [ sourceArgs defaultSourceArgs, defaultHaddockExtraArgs ]
+
+defaultHaddockExtraArgs :: Args
+defaultHaddockExtraArgs = builder (Haddock BuildPackage) ?
+  mconcat [ arg "--hyperlinked-source", arg "--hoogle", arg "--quickjump" ]
+
 
 -- | Default source arguments, e.g. optimisation settings.
 defaultSourceArgs :: SourceArgs
@@ -241,7 +256,7 @@ defaultSourceArgs = SourceArgs
 defaultFlavour :: Flavour
 defaultFlavour = Flavour
     { name               = "default"
-    , args               = defaultArgs
+    , extraArgs          = defaultExtraArgs
     , packages           = defaultPackages
     , bignumBackend      = defaultBignumBackend
     , bignumCheck        = False

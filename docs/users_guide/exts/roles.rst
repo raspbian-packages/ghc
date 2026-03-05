@@ -103,7 +103,7 @@ hand, has its parameter at role nominal, because ``Complex Age`` and
 Role inference
 --------------
 
-What role should a given type parameter should have? GHC performs role
+What role should a given type parameter have? GHC performs role
 inference to determine the correct role for every parameter. It starts
 with a few base facts: ``(->)`` has two representational parameters;
 ``(~)`` has two nominal parameters; all type families' parameters are
@@ -151,30 +151,12 @@ Role annotations
     :shortdesc: Enable role annotations.
 
     :since: 7.8.1
+    :status: Included in :extension:`GHC2024`
 
     Allow role annotation syntax.
 
 Sometimes the programmer wants to constrain the inference process. For
-example, the base library contains the following definition: ::
-
-      data Ptr a = Ptr Addr#
-
-The idea is that ``a`` should really be a representational parameter,
-but role inference assigns it to phantom. This makes some level of
-sense: a pointer to an ``Int`` really is representationally the same as
-a pointer to a ``Bool``. But, that's not at all how we want to use
-``Ptr``\ s! So, we want to be able to say ::
-
-      type role Ptr representational
-      data Ptr a = Ptr Addr#
-
-The ``type role`` (enabled with :extension:`RoleAnnotations`) declaration
-forces the parameter ``a`` to be at role representational, not role
-phantom. GHC then checks the user-supplied roles to make sure they don't
-break any promises. It would be bad, for example, if the user could make
-``BadIdea``\'s role be representational.
-
-As another example, we can consider a type ``Set a`` that represents a
+example, we can consider a type ``Set a`` that represents a
 set of data, ordered according to ``a``\'s ``Ord`` instance. While it
 would generally be type-safe to consider ``a`` to be at role
 representational, it is possible that a ``newtype`` and its base type

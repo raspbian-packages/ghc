@@ -6,11 +6,6 @@
 --
 -----------------------------------------------------------------------------
 
-{-# LANGUAGE BangPatterns #-}
-{-# LANGUAGE MultiParamTypeClasses #-}
-{-# LANGUAGE FlexibleInstances #-}
-
-
 module GHC.Cmm.CLabel (
         CLabel, -- abstract type
         NeedExternDecl (..),
@@ -53,6 +48,7 @@ module GHC.Cmm.CLabel (
         mkDirty_MUT_VAR_Label,
         mkMUT_VAR_CLEAN_infoLabel,
         mkNonmovingWriteBarrierEnabledLabel,
+        mkOrigThunkInfoLabel,
         mkUpdInfoLabel,
         mkBHUpdInfoLabel,
         mkIndStaticInfoLabel,
@@ -153,7 +149,6 @@ import GHC.Builtin.PrimOps
 import GHC.Types.CostCentre
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
-import GHC.Utils.Panic.Plain
 import GHC.Data.FastString
 import GHC.Platform
 import GHC.Types.Unique.Set
@@ -641,7 +636,7 @@ mkBlockInfoTableLabel name c = IdLabel name c BlockInfoTable
 -- Constructing Cmm Labels
 mkDirty_MUT_VAR_Label,
     mkNonmovingWriteBarrierEnabledLabel,
-    mkUpdInfoLabel,
+    mkOrigThunkInfoLabel, mkUpdInfoLabel,
     mkBHUpdInfoLabel, mkIndStaticInfoLabel, mkMainCapabilityLabel,
     mkMAP_FROZEN_CLEAN_infoLabel, mkMAP_FROZEN_DIRTY_infoLabel,
     mkMAP_DIRTY_infoLabel,
@@ -655,6 +650,7 @@ mkDirty_MUT_VAR_Label,
 mkDirty_MUT_VAR_Label           = mkForeignLabel (fsLit "dirty_MUT_VAR") Nothing ForeignLabelInExternalPackage IsFunction
 mkNonmovingWriteBarrierEnabledLabel
                                 = CmmLabel rtsUnitId (NeedExternDecl False) (fsLit "nonmoving_write_barrier_enabled") CmmData
+mkOrigThunkInfoLabel            = CmmLabel rtsUnitId (NeedExternDecl False) (fsLit "stg_orig_thunk_info_frame") CmmInfo
 mkUpdInfoLabel                  = CmmLabel rtsUnitId (NeedExternDecl False) (fsLit "stg_upd_frame")         CmmInfo
 mkBHUpdInfoLabel                = CmmLabel rtsUnitId (NeedExternDecl False) (fsLit "stg_bh_upd_frame" )     CmmInfo
 mkIndStaticInfoLabel            = CmmLabel rtsUnitId (NeedExternDecl False) (fsLit "stg_IND_STATIC")        CmmInfo
@@ -797,6 +793,7 @@ isSomeRODataLabel (IdLabel _ _ LocalInfoTable) = True
 isSomeRODataLabel (IdLabel _ _ BlockInfoTable) = True
 -- info table defined in cmm (.cmm)
 isSomeRODataLabel (CmmLabel _ _ _ CmmInfo) = True
+isSomeRODataLabel (CmmLabel _ _ _ CmmRetInfo) = True
 isSomeRODataLabel _lbl = False
 
 -- | Whether label is points to some kind of info table
@@ -839,7 +836,7 @@ data InfoProvEnt = InfoProvEnt
                                -- The rendered Haskell type of the closure the table represents
                                , infoProvModule :: !Module
                                -- Origin module
-                               , infoTableProv :: !(Maybe (RealSrcSpan, String)) }
+                               , infoTableProv :: !(Maybe (RealSrcSpan, LexicalFastString)) }
                                -- Position and information about the info table
                                deriving (Eq, Ord)
 

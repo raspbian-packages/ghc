@@ -158,9 +158,9 @@ because the list of variables is typically not yet defined.
 --      = case v of v { (x1, .., xn) -> body }
 -- But the matching may be nested if the tuple is very big
 
-coreCaseTuple :: UniqSupply -> Id -> [Id] -> CoreExpr -> CoreExpr
-coreCaseTuple uniqs scrut_var vars body
-  = mkBigTupleCase uniqs vars body (Var scrut_var)
+coreCaseTuple :: Id -> [Id] -> CoreExpr -> DsM CoreExpr
+coreCaseTuple scrut_var vars body
+  = mkBigTupleCase vars body (Var scrut_var)
 
 coreCasePair :: Id -> Id -> Id -> CoreExpr -> CoreExpr
 coreCasePair scrut_var var1 var2 body
@@ -231,9 +231,8 @@ matchEnvStack   :: [Id]         -- x1..xn
                 -> CoreExpr     -- e
                 -> DsM CoreExpr
 matchEnvStack env_ids stack_id body = do
-    uniqs <- newUniqueSupply
     tup_var <- newSysLocalDs ManyTy (mkBigCoreVarTupTy env_ids)
-    let match_env = coreCaseTuple uniqs tup_var env_ids body
+    match_env <- coreCaseTuple tup_var env_ids body
     pair_id <- newSysLocalDs ManyTy (mkCorePairTy (idType tup_var) (idType stack_id))
     return (Lam pair_id (coreCasePair pair_id tup_var stack_id match_env))
 
@@ -250,9 +249,9 @@ matchEnv :: [Id]        -- x1..xn
          -> CoreExpr    -- e
          -> DsM CoreExpr
 matchEnv env_ids body = do
-    uniqs <- newUniqueSupply
     tup_id <- newSysLocalDs ManyTy (mkBigCoreVarTupTy env_ids)
-    return (Lam tup_id (coreCaseTuple uniqs tup_id env_ids body))
+    tup_case <- coreCaseTuple tup_id env_ids body
+    return (Lam tup_id tup_case)
 
 ----------------------------------------------
 --              matchVarStack
@@ -296,7 +295,7 @@ dsProcExpr pat (L _ (HsCmdTop (CmdTopTc _unitTy cmd_ty ids) cmd)) = do
     let env_stk_expr = mkCorePairExpr (mkBigCoreVarTup env_ids) mkCoreUnitExpr
     fail_expr <- mkFailExpr (ArrowMatchCtxt ProcExpr) env_stk_ty
     var <- selectSimpleMatchVarL ManyTy pat
-    match_code <- matchSimply (Var var) (ArrowMatchCtxt ProcExpr) pat env_stk_expr fail_expr
+    match_code <- matchSimply (Var var) (ArrowMatchCtxt ProcExpr) ManyTy pat env_stk_expr fail_expr
     let pat_ty = hsLPatType pat
     let proc_code = do_premap meth_ids pat_ty env_stk_ty cmd_ty
                     (Lam var match_code)
@@ -416,14 +415,7 @@ dsCmd ids local_vars stack_ty res_ty (HsCmdApp _ cmd arg) env_ids = do
             free_vars `unionDVarSet`
               (exprFreeIdsDSet core_arg `uniqDSetIntersectUniqSet` local_vars))
 
-dsCmd ids local_vars stack_ty res_ty
-        (HsCmdLam _ (MG { mg_alts
-          = (L _ [L _ (Match { m_pats  = pats
-                             , m_grhss = GRHSs _ [L _ (GRHS _ [] body)] _ })]) }))
-        env_ids
-  = dsCmdLam ids local_vars stack_ty res_ty pats body env_ids
-
-dsCmd ids local_vars stack_ty res_ty (HsCmdPar _ _ cmd _) env_ids
+dsCmd ids local_vars stack_ty res_ty (HsCmdPar _ cmd) env_ids
   = dsLCmd ids local_vars stack_ty res_ty cmd env_ids
 
 -- D, xs |- e :: Bool
@@ -511,7 +503,7 @@ dsCmd ids local_vars stack_ty res_ty (HsCmdCase _ exp match) env_ids = do
     let MG{ mg_ext = MatchGroupTc _ sum_ty _ } = match'
         in_ty = envStackType env_ids stack_ty
 
-    core_body <- dsExpr (HsCase noExtField exp match')
+    core_body <- dsExpr (HsCase (ArrowMatchCtxt ArrowCaseAlt) exp match')
 
     core_matches <- matchEnvStack env_ids stack_id core_body
     return (do_premap ids in_ty sum_ty res_ty core_matches core_choices,
@@ -536,11 +528,18 @@ multiple scrutinees)
 
 -}
 dsCmd ids local_vars stack_ty res_ty
-      (HsCmdLamCase _ lc_variant match@MG { mg_ext = MatchGroupTc {mg_arg_tys = arg_tys} } )
+        (HsCmdLam _ LamSingle (MG { mg_alts
+          = (L _ [L _ (Match { m_pats  = pats
+                             , m_grhss = GRHSs _ [L _ (GRHS _ [] body)] _ })]) }))
+        env_ids
+  = dsCmdLam ids local_vars stack_ty res_ty pats body env_ids
+
+dsCmd ids local_vars stack_ty res_ty
+      (HsCmdLam _ lam_variant match@MG { mg_ext = MatchGroupTc {mg_arg_tys = arg_tys} } )
       env_ids = do
     arg_ids <- newSysLocalsDs arg_tys
 
-    let match_ctxt = ArrowLamCaseAlt lc_variant
+    let match_ctxt = ArrowLamAlt lam_variant
         pat_vars = mkVarSet arg_ids
         local_vars' = pat_vars `unionVarSet` local_vars
         (pat_tys, stack_ty') = splitTypeAt (length arg_tys) stack_ty
@@ -592,7 +591,7 @@ dsCmd ids local_vars stack_ty res_ty
 --
 --              ---> premap (\ ((xs),stk) -> let binds in ((ys),stk)) c
 
-dsCmd ids local_vars stack_ty res_ty (HsCmdLet _ _ lbinds@binds _ body) env_ids = do
+dsCmd ids local_vars stack_ty res_ty (HsCmdLet _ lbinds@binds body) env_ids = do
     let
         defined_vars = mkVarSet (collectLocalBinders CollWithDictBinders binds)
         local_vars' = defined_vars `unionVarSet` local_vars
@@ -644,10 +643,8 @@ dsCmd _ local_vars _stack_ty _res_ty (HsCmdArrForm _ op _ _ args) env_ids = do
 
 dsCmd ids local_vars stack_ty res_ty (XCmd (HsWrap wrap cmd)) env_ids = do
     (core_cmd, env_ids') <- dsCmd ids local_vars stack_ty res_ty cmd env_ids
-    core_wrap <- dsHsWrapper wrap
-    return (core_wrap core_cmd, env_ids')
-
-dsCmd _ _ _ _ c _ = pprPanic "dsCmd" (ppr c)
+    dsHsWrapper wrap $ \core_wrap ->
+      return (core_wrap core_cmd, env_ids')
 
 -- D; ys |-a c : stk --> t      (ys <= xs)
 -- ---------------------
@@ -739,10 +736,11 @@ dsCmdLam ids local_vars stack_ty res_ty pats body env_ids = do
         core_expr = buildEnvStack env_ids' stack_id'
         in_ty = envStackType env_ids stack_ty
         in_ty' = envStackType env_ids' stack_ty'
+        lam_cxt = ArrowMatchCtxt (ArrowLamAlt LamSingle)
 
-    fail_expr <- mkFailExpr (ArrowMatchCtxt KappaExpr) in_ty'
+    fail_expr <- mkFailExpr lam_cxt in_ty'
     -- match the patterns against the parameters
-    match_code <- matchSimplys (map Var param_ids) (ArrowMatchCtxt KappaExpr) pats core_expr
+    match_code <- matchSimplys (map Var param_ids) lam_cxt pats core_expr
                     fail_expr
     -- match the parameters against the top of the old stack
     (stack_id, param_code) <- matchVarStack param_ids stack_id' match_code
@@ -786,9 +784,9 @@ dsCases ids local_vars stack_id stack_ty res_ty
   let
       left_id  = mkConLikeTc (RealDataCon left_con)
       right_id = mkConLikeTc (RealDataCon right_con)
-      left_expr  ty1 ty2 e = noLocA $ HsApp noComments
+      left_expr  ty1 ty2 e = noLocA $ HsApp noExtField
                          (noLocA $ mkHsWrap (mkWpTyApps [ty1, ty2]) left_id ) e
-      right_expr ty1 ty2 e = noLocA $ HsApp noComments
+      right_expr ty1 ty2 e = noLocA $ HsApp noExtField
                          (noLocA $ mkHsWrap (mkWpTyApps [ty1, ty2]) right_id) e
 
       -- Prefix each tuple with a distinct series of Left's and Right's,
@@ -810,9 +808,9 @@ dsCases ids local_vars stack_id stack_ty res_ty
     -- i.e. Void. The choices then effectively become `arr absurd`,
     -- implemented as `arr \case {}`.
     Nothing -> ([], void_ty,) . do_arr ids void_ty res_ty <$>
-      dsExpr (HsLamCase EpAnnNotUsed LamCase
+      dsExpr (HsLam noAnn LamCase
         (MG { mg_alts = noLocA []
-            , mg_ext = MatchGroupTc [Scaled ManyTy void_ty] res_ty Generated
+            , mg_ext = MatchGroupTc [Scaled ManyTy void_ty] res_ty (Generated OtherExpansion SkipPmc)
             }))
 
       -- Replace the commands in the case with these tagged tuples,
@@ -957,16 +955,15 @@ dsCmdStmt ids local_vars out_ids (BindStmt _ pat cmd) env_ids = do
     --          \ (p, (xs2)) -> (zs)
 
     env_id <- newSysLocalDs ManyTy env_ty2
-    uniqs <- newUniqueSupply
     let
        after_c_ty = mkCorePairTy pat_ty env_ty2
        out_ty = mkBigCoreVarTupTy out_ids
-       body_expr = coreCaseTuple uniqs env_id env_ids2 (mkBigCoreVarTup out_ids)
+    body_expr <- coreCaseTuple env_id env_ids2 (mkBigCoreVarTup out_ids)
 
     fail_expr <- mkFailExpr (StmtCtxt (HsDoStmt (DoExpr Nothing))) out_ty
     pat_id    <- selectSimpleMatchVarL ManyTy pat
     match_code
-      <- matchSimply (Var pat_id) (StmtCtxt (HsDoStmt (DoExpr Nothing))) pat body_expr fail_expr
+      <- matchSimply (Var pat_id) (StmtCtxt (HsDoStmt (DoExpr Nothing))) ManyTy pat body_expr fail_expr
     pair_id   <- newSysLocalDs ManyTy after_c_ty
     let
         proj_expr = Lam pair_id (coreCasePair pair_id pat_id env_id match_code)
@@ -1029,12 +1026,11 @@ dsCmdStmt ids local_vars out_ids
 
     -- post_loop_fn = \((later_ids),(env2_ids)) -> (out_ids)
 
-    uniqs <- newUniqueSupply
     env2_id <- newSysLocalDs ManyTy env2_ty
     let
         later_ty = mkBigCoreVarTupTy later_ids
         post_pair_ty = mkCorePairTy later_ty env2_ty
-        post_loop_body = coreCaseTuple uniqs env2_id env2_ids (mkBigCoreVarTup out_ids)
+    post_loop_body <- coreCaseTuple env2_id env2_ids (mkBigCoreVarTup out_ids)
 
     post_loop_fn <- matchEnvStack later_ids env2_id post_loop_body
 
@@ -1194,7 +1190,7 @@ dsCmdStmts _ _ _ [] _ = panic "dsCmdStmts []"
 -- Match a list of expressions against a list of patterns, left-to-right.
 
 matchSimplys :: [CoreExpr]              -- Scrutinees
-             -> HsMatchContext GhcRn    -- Match kind
+             -> HsMatchContextRn        -- Match kind
              -> [LPat GhcTc]            -- Patterns they should match
              -> CoreExpr                -- Return this if they all match
              -> CoreExpr                -- Return this if they don't
@@ -1202,7 +1198,7 @@ matchSimplys :: [CoreExpr]              -- Scrutinees
 matchSimplys [] _ctxt [] result_expr _fail_expr = return result_expr
 matchSimplys (exp:exps) ctxt (pat:pats) result_expr fail_expr = do
     match_code <- matchSimplys exps ctxt pats result_expr fail_expr
-    matchSimply exp ctxt pat match_code fail_expr
+    matchSimply exp ctxt ManyTy pat match_code fail_expr
 matchSimplys _ _ _ _ _ = panic "matchSimplys"
 
 -- List of leaf expressions, with set of variables bound in each

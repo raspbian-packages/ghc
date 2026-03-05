@@ -98,6 +98,8 @@ data Token = TEOF
            | TFalse
            | TCompare
            | TGenPrimOp
+           | TByteArrayAccessOps
+           | TAddrAccessOps
            | TThatsAllFolks
            | TLowerName String
            | TUpperName String
@@ -109,6 +111,15 @@ data Token = TEOF
            | TInfixL
            | TInfixR
            | TNothing
+           | TEffect
+           | TNoEffect
+           | TCanFail
+           | TThrowsException
+           | TReadWriteEffect
+           | TCanFailWarnFlag
+           | TDoNotWarnCanFail
+           | TWarnIfEffectIsCanFail
+           | TYesWarnCanFail
            | TVector
            | TSCALAR
            | TVECTOR

@@ -17,9 +17,7 @@
 -----------------------------------------------------------------------------
 
 module GHC.StgToJS.Linker.Utils
-  ( getOptionsFromJsFile
-  , JSOption(..)
-  , jsExeFileName
+  ( jsExeFileName
   , getInstalledPackageLibDirs
   , getInstalledPackageHsLibs
   , commonCppDefs
@@ -42,9 +40,14 @@ import          GHC.StgToJS.Types
 import           Prelude
 import GHC.Platform
 import Data.List (isPrefixOf)
-import System.IO
-import Data.Char (isSpace)
-import qualified Control.Exception as Exception
+
+import GHC.Builtin.Types
+import Language.Haskell.Syntax.Basic
+import GHC.Types.Name
+import GHC.StgToJS.Ids
+import GHC.JS.Ident
+import GHC.Core.DataCon
+import GHC.Data.FastString
 
 -- | Retrieve library directories provided by the @UnitId@ in @UnitState@
 getInstalledPackageLibDirs :: UnitState -> UnitId -> [ShortText]
@@ -70,6 +73,26 @@ commonCppDefs_vanilla, commonCppDefs_profiled :: ByteString
 commonCppDefs_vanilla  = genCommonCppDefs False
 commonCppDefs_profiled = genCommonCppDefs True
 
+-- | Generate macros MK_TUP* for tuples sized 2+.
+genMkTup :: Bool -> Int -> ByteString
+genMkTup profiling n = mconcat
+  [ "#define MK_TUP", sn                                                          -- #define MK_TUPn
+  , "(", B.intercalate "," xs, ")"                                                -- (x1,x2,...)
+  , "(h$c", sn, "("                                                               -- (h$cn(
+  , bytesFS symbol, ","                                                           -- h$ghczmprimZCGHCziTupleziZnT_con_e,                                                                        -- ,
+  , B.intercalate "," $ map (\x -> "(" <> x <> ")") xs                            -- (x1),(x2),(...)
+  , if profiling then ",h$currentThread?h$currentThread.ccs:h$CCS_SYSTEM" else "" -- ,h$currentThread?h$currentThread.ccs:h$CCS_SYSTEM
+  , "))\n"                                                                        -- ))\n
+  ]
+  where
+    xs = take n $ map (("x" <>) . Char8.pack . show) ([1..] :: [Int])
+    sn = Char8.pack $ show n
+    symbol = identFS $ makeIdentForId (dataConWorkId $ tupleDataCon Boxed n) Nothing IdConEntry mod
+    name = tupleDataConName Boxed n
+    mod = case nameModule_maybe name of
+      Just m -> m
+      Nothing -> error "Tuple constructor is missing a module"
+
 -- | Generate CPP Definitions depending on a profiled or normal build. This
 -- occurs at link time.
 genCommonCppDefs :: Bool -> ByteString
@@ -86,70 +109,48 @@ genCommonCppDefs profiling = mconcat
     in mconcat (closure_defs ++ thread_defs)
 
   -- low-level heap object manipulation macros
-  , if profiling
-      then mconcat
-        [ "#define MK_TUP2(x1,x2)                           (h$c2(h$ghczmprimZCGHCziTupleziPrimziZLz2cUZR_con_e,(x1),(x2),h$currentThread?h$currentThread.ccs:h$CCS_SYSTEM))\n"
-        , "#define MK_TUP3(x1,x2,x3)                        (h$c3(h$ghczmprimZCGHCziTupleziPrimziZLz2cUz2cUZR_con_e,(x1),(x2),(x3),h$currentThread?h$currentThread.ccs:h$CCS_SYSTEM))\n"
-        , "#define MK_TUP4(x1,x2,x3,x4)                     (h$c4(h$ghczmprimZCGHCziTupleziPrimziZLz2cUz2cUz2cUZR_con_e,(x1),(x2),(x3),(x4),h$currentThread?h$currentThread.ccs:h$CCS_SYSTEM))\n"
-        , "#define MK_TUP5(x1,x2,x3,x4,x5)                  (h$c5(h$ghczmprimZCGHCziTupleziPrimziZLz2cUz2cUz2cUz2cUZR_con_e,(x1),(x2),(x3),(x4),(x5),h$currentThread?h$currentThread.ccs:h$CCS_SYSTEM))\n"
-        , "#define MK_TUP6(x1,x2,x3,x4,x5,x6)               (h$c6(h$ghczmprimZCGHCziTupleziPrimziZLz2cUz2cUz2cUz2cUz2cUZR_con_e,(x1),(x2),(x3),(x4),(x5),(x6),h$currentThread?h$currentThread.ccs:h$CCS_SYSTEM))\n"
-        , "#define MK_TUP7(x1,x2,x3,x4,x5,x6,x7)            (h$c7(h$ghczmprimZCGHCziTupleziPrimziZLz2cUz2cUz2cUz2cUz2cUz2cUZR_con_e,(x1),(x2),(x3),(x4),(x5),(x6),(x7),h$currentThread?h$currentThread.ccs:h$CCS_SYSTEM))\n"
-        , "#define MK_TUP8(x1,x2,x3,x4,x5,x6,x7,x8)         (h$c8(h$ghczmprimZCGHCziTupleziPrimziZLz2cUz2cUz2cUz2cUz2cUz2cUz2cUZR_con_e,(x1),(x2),(x3),(x4),(x5),(x6),(x7),(x8),h$currentThread?h$currentThread.ccs:h$CCS_SYSTEM))\n"
-        , "#define MK_TUP9(x1,x2,x3,x4,x5,x6,x7,x8,x9)      (h$c9(h$ghczmprimZCGHCziTupleziPrimziZLz2cUz2cUz2cUz2cUz2cUz2cUz2cUz2cUZR_con_e,(x1),(x2),(x3),(x4),(x5),(x6),(x7),(x8),(x9),h$currentThread?h$currentThread.ccs:h$CCS_SYSTEM))\n"
-        , "#define MK_TUP10(x1,x2,x3,x4,x5,x6,x7,x8,x9,x10) (h$c10(h$ghczmprimZCGHCziTupleziPrimziZLz2cUz2cUz2cUz2cUz2cUz2cUz2cUz2cUz2cUZR_con_e,(x1),(x2),(x3),(x4),(x5),(x6),(x7),(x8),(x9),(x10),h$currentThread?h$currentThread.ccs:h$CCS_SYSTEM))\n"
-        ]
-      else mconcat
-        [ "#define MK_TUP2(x1,x2)                           (h$c2(h$ghczmprimZCGHCziTupleziPrimziZLz2cUZR_con_e,(x1),(x2)))\n"
-        , "#define MK_TUP3(x1,x2,x3)                        (h$c3(h$ghczmprimZCGHCziTupleziPrimziZLz2cUz2cUZR_con_e,(x1),(x2),(x3)))\n"
-        , "#define MK_TUP4(x1,x2,x3,x4)                     (h$c4(h$ghczmprimZCGHCziTupleziPrimziZLz2cUz2cUz2cUZR_con_e,(x1),(x2),(x3),(x4)))\n"
-        , "#define MK_TUP5(x1,x2,x3,x4,x5)                  (h$c5(h$ghczmprimZCGHCziTupleziPrimziZLz2cUz2cUz2cUz2cUZR_con_e,(x1),(x2),(x3),(x4),(x5)))\n"
-        , "#define MK_TUP6(x1,x2,x3,x4,x5,x6)               (h$c6(h$ghczmprimZCGHCziTupleziPrimziZLz2cUz2cUz2cUz2cUz2cUZR_con_e,(x1),(x2),(x3),(x4),(x5),(x6)))\n"
-        , "#define MK_TUP7(x1,x2,x3,x4,x5,x6,x7)            (h$c7(h$ghczmprimZCGHCziTupleziPrimziZLz2cUz2cUz2cUz2cUz2cUz2cUZR_con_e,(x1),(x2),(x3),(x4),(x5),(x6),(x7)))\n"
-        , "#define MK_TUP8(x1,x2,x3,x4,x5,x6,x7,x8)         (h$c8(h$ghczmprimZCGHCziTupleziPrimziZLz2cUz2cUz2cUz2cUz2cUz2cUz2cUZR_con_e,(x1),(x2),(x3),(x4),(x5),(x6),(x7),(x8)))\n"
-        , "#define MK_TUP9(x1,x2,x3,x4,x5,x6,x7,x8,x9)      (h$c9(h$ghczmprimZCGHCziTupleziPrimziZLz2cUz2cUz2cUz2cUz2cUz2cUz2cUz2cUZR_con_e,(x1),(x2),(x3),(x4),(x5),(x6),(x7),(x8),(x9)))\n"
-        , "#define MK_TUP10(x1,x2,x3,x4,x5,x6,x7,x8,x9,x10) (h$c10(h$ghczmprimZCGHCziTupleziPrimziZLz2cUz2cUz2cUz2cUz2cUz2cUz2cUz2cUz2cUZR_con_e,(x1),(x2),(x3),(x4),(x5),(x6),(x7),(x8),(x9),(x10)))\n"
-        ]
+  , mconcat (map (genMkTup profiling) [2..10])
 
   , "#define TUP2_1(x) ((x).d1)\n"
   , "#define TUP2_2(x) ((x).d2)\n"
 
   -- GHCJS.Prim.JSVal
   , if profiling
-      then "#define MK_JSVAL(x) (h$c1(h$baseZCGHCziJSziPrimziJSVal_con_e, (x), h$CCS_SYSTEM))\n"
-      else "#define MK_JSVAL(x) (h$c1(h$baseZCGHCziJSziPrimziJSVal_con_e, (x)))\n"
+      then "#define MK_JSVAL(x) (h$c1(h$ghczminternalZCGHCziInternalziJSziPrimziJSVal_con_e, (x), h$CCS_SYSTEM))\n"
+      else "#define MK_JSVAL(x) (h$c1(h$ghczminternalZCGHCziInternalziJSziPrimziJSVal_con_e, (x)))\n"
   ,  "#define JSVAL_VAL(x) ((x).d1)\n"
 
   -- GHCJS.Prim.JSException
   , if profiling
-      then "#define MK_JSEXCEPTION(msg,hsMsg) (h$c2(h$baseZCGHCziJSziPrimziJSException_con_e,(msg),(hsMsg),h$CCS_SYSTEM))\n"
-      else "#define MK_JSEXCEPTION(msg,hsMsg) (h$c2(h$baseZCGHCziJSziPrimziJSException_con_e,(msg),(hsMsg)))\n"
+      then "#define MK_JSEXCEPTION(msg,hsMsg) (h$c2(h$ghczminternalZCGHCziInternalziJSziPrimziJSException_con_e,(msg),(hsMsg),h$CCS_SYSTEM))\n"
+      else "#define MK_JSEXCEPTION(msg,hsMsg) (h$c2(h$ghczminternalZCGHCziInternalziJSziPrimziJSException_con_e,(msg),(hsMsg)))\n"
 
   -- Exception dictionary for JSException
-  , "#define HS_JSEXCEPTION_EXCEPTION h$baseZCGHCziJSziPrimzizdfExceptionJSException\n"
+  , "#define HS_JSEXCEPTION_EXCEPTION h$ghczminternalZCGHCziInternalziJSziPrimzizdfExceptionJSException\n"
 
   -- SomeException
   , if profiling
-      then "#define MK_SOMEEXCEPTION(dict,except) (h$c2(h$baseZCGHCziExceptionziTypeziSomeException_con_e,(dict),(except),h$CCS_SYSTEM))\n"
-      else "#define MK_SOMEEXCEPTION(dict,except) (h$c2(h$baseZCGHCziExceptionziTypeziSomeException_con_e,(dict),(except)))\n"
+      then "#define MK_SOMEEXCEPTION(dict,except) (h$c2(h$ghczminternalZCGHCziInternalziExceptionziTypeziSomeException_con_e,(dict),(except),h$CCS_SYSTEM))\n"
+      else "#define MK_SOMEEXCEPTION(dict,except) (h$c2(h$ghczminternalZCGHCziInternalziExceptionziTypeziSomeException_con_e,(dict),(except)))\n"
 
   -- GHC.Ptr.Ptr
   , if profiling
-      then "#define MK_PTR(val,offset) (h$c2(h$baseZCGHCziPtrziPtr_con_e, (val), (offset), h$CCS_SYSTEM))\n"
-      else "#define MK_PTR(val,offset) (h$c2(h$baseZCGHCziPtrziPtr_con_e, (val), (offset)))\n"
+      then "#define MK_PTR(val,offset) (h$c2(h$ghczminternalZCGHCziInternalziPtrziPtr_con_e, (val), (offset), h$CCS_SYSTEM))\n"
+      else "#define MK_PTR(val,offset) (h$c2(h$ghczminternalZCGHCziInternalziPtrziPtr_con_e, (val), (offset)))\n"
 
   -- Put Addr# in ByteArray# or at Addr# (same thing)
   , "#define PUT_ADDR(a,o,va,vo) if (!(a).arr) (a).arr = []; (a).arr[o] = va; (a).dv.setInt32(o,vo,true);\n"
-  , "#define GET_ADDR(a,o,ra,ro) var ra = (((a).arr && (a).arr[o]) ? (a).arr[o] : null_); var ro = (a).dv.getInt32(o,true);\n"
+  , "#define GET_ADDR(a,o,ra,ro) var ra = (((a).arr && (a).arr[o]) ? (a).arr[o] : null); var ro = (a).dv.getInt32(o,true);\n"
 
   -- Data.Maybe.Maybe
-  , "#define HS_NOTHING h$baseZCGHCziMaybeziNothing\n"
-  , "#define IS_NOTHING(cl) ((cl).f === h$baseZCGHCziMaybeziNothing_con_e)\n"
-  , "#define IS_JUST(cl) ((cl).f === h$baseZCGHCziMaybeziJust_con_e)\n"
+  , "#define HS_NOTHING h$ghczminternalZCGHCziInternalziMaybeziNothing\n"
+  , "#define IS_NOTHING(cl) ((cl).f === h$ghczminternalZCGHCziInternalziMaybeziNothing_con_e)\n"
+  , "#define IS_JUST(cl) ((cl).f === h$ghczminternalZCGHCziInternalziMaybeziJust_con_e)\n"
   , "#define JUST_VAL(jj) ((jj).d1)\n"
   -- "#define HS_NOTHING h$nothing\n"
   , if profiling
-      then "#define MK_JUST(val) (h$c1(h$baseZCGHCziMaybeziJust_con_e, (val), h$CCS_SYSTEM))\n"
-      else "#define MK_JUST(val) (h$c1(h$baseZCGHCziMaybeziJust_con_e, (val)))\n"
+      then "#define MK_JUST(val) (h$c1(h$ghczminternalZCGHCziInternalziMaybeziJust_con_e, (val), h$CCS_SYSTEM))\n"
+      else "#define MK_JUST(val) (h$c1(h$ghczminternalZCGHCziInternalziMaybeziJust_con_e, (val)))\n"
 
   -- Data.List
   , "#define HS_NIL h$ghczmprimZCGHCziTypesziZMZN\n"
@@ -189,6 +190,9 @@ genCommonCppDefs profiling = mconcat
 
   -- resumable thunks
   , "#define MAKE_RESUMABLE(closure,stack) { (closure).f = h$resume_e; (closure).d1 = (stack), (closure).d2 = null; }\n"
+
+  -- making a thunk
+  , "#define MK_UPD_THUNK(closure) h$c1(h$upd_thunk_e,(closure))\n"
 
   -- general deconstruction
   , "#define IS_THUNK(x) ((x).f.t === CLOSURE_TYPE_THUNK)\n"
@@ -246,6 +250,10 @@ genCommonCppDefs profiling = mconcat
   , "#define RETURN_UBX_TUP9(x1,x2,x3,x4,x5,x6,x7,x8,x9) { h$ret1 = (x2); h$ret2 = (x3); h$ret3 = (x4); h$ret4 = (x5); h$ret5 = (x6); h$ret6 = (x7); h$ret7 = (x8); h$ret8 = (x9); return (x1); }\n"
   , "#define RETURN_UBX_TUP10(x1,x2,x3,x4,x5,x6,x7,x8,x9,x10) { h$ret1 = (x2); h$ret2 = (x3); h$ret3 = (x4); h$ret4 = (x5); h$ret5 = (x6); h$ret6 = (x7); h$ret7 = (x8); h$ret8 = (x9); h$ret9 = (x10); return (x1); }\n"
 
+  , "#define RETURN_INT64(h,l) RETURN_UBX_TUP2((h)|0,(l)>>>0)\n"
+  , "#define RETURN_WORD64(h,l) RETURN_UBX_TUP2((h)>>>0,(l)>>>0)\n"
+  , "#define RETURN_ADDR(a,o) RETURN_UBX_TUP2(a,o)\n"
+
   , "#define CALL_UBX_TUP2(r1,r2,c) { (r1) = (c); (r2) = h$ret1; }\n"
   , "#define CALL_UBX_TUP3(r1,r2,r3,c) { (r1) = (c); (r2) = h$ret1; (r3) = h$ret2; }\n"
   , "#define CALL_UBX_TUP4(r1,r2,r3,r4,c) { (r1) = (c); (r2) = h$ret1; (r3) = h$ret2; (r4) = h$ret3; }\n"
@@ -275,38 +283,3 @@ jsExeFileName dflags
     dropPrefix prefix xs
       | prefix `isPrefixOf` xs = drop (length prefix) xs
       | otherwise              = xs
-
-
--- | Parse option pragma in JS file
-getOptionsFromJsFile :: FilePath      -- ^ Input file
-                     -> IO [JSOption] -- ^ Parsed options, if any.
-getOptionsFromJsFile filename
-    = Exception.bracket
-              (openBinaryFile filename ReadMode)
-              hClose
-              getJsOptions
-
-data JSOption = CPP deriving (Eq, Ord)
-
-getJsOptions :: Handle -> IO [JSOption]
-getJsOptions handle = do
-  hSetEncoding handle utf8
-  prefix' <- B.hGet handle prefixLen
-  if prefix == prefix'
-  then parseJsOptions <$> hGetLine handle
-  else pure []
- where
-  prefix :: B.ByteString
-  prefix = "//#OPTIONS:"
-  prefixLen = B.length prefix
-
-parseJsOptions :: String -> [JSOption]
-parseJsOptions xs = go xs
-  where
-    trim = reverse . dropWhile isSpace . reverse . dropWhile isSpace
-    go [] = []
-    go xs = let (tok, rest) = break (== ',') xs
-                tok' = trim tok
-                rest' = drop 1 rest
-            in  if | tok' == "CPP" -> CPP : go rest'
-                   | otherwise     -> go rest'

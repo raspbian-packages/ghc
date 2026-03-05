@@ -12,6 +12,41 @@
 --
 -----------------------------------------------------------------------------
 
-module System.Posix.Directory.Internals ( DirStream(..), CDir, CDirent, DirStreamOffset(..) ) where
+module System.Posix.Directory.Internals (
+    DirStream(..),
+    CDir,
+    CDirent,
+    DirStreamOffset(..),
+
+    DirStreamWithPath(..),
+    fromDirStreamWithPath,
+    toDirStreamWithPath,
+    DirEnt(..),
+    dirEntName,
+    dirEntType,
+    DirType( DirType
+           , UnknownType
+           , NamedPipeType
+           , CharacterDeviceType
+           , DirectoryType
+           , BlockDeviceType
+           , RegularFileType
+           , SymbolicLinkType
+           , SocketType
+           , WhiteoutType
+           ),
+    isUnknownType,
+    isNamedPipeType,
+    isCharacterDeviceType,
+    isDirectoryType,
+    isBlockDeviceType,
+    isRegularFileType,
+    isSymbolicLinkType,
+    isSocketType,
+    isWhiteoutType,
+    getRealDirType,
+    readDirStreamWith,
+    readDirStreamWithPtr,
+    ) where
 
 import System.Posix.Directory.Common

@@ -10,7 +10,7 @@ module GHC.Core.Opt.Specialise ( specProgram, specUnfolding ) where
 
 import GHC.Prelude
 
-import GHC.Driver.Session
+import GHC.Driver.DynFlags
 import GHC.Driver.Config
 import GHC.Driver.Config.Diagnostic
 import GHC.Driver.Config.Core.Rules ( initRuleOpts )
@@ -60,7 +60,6 @@ import GHC.Utils.Monad    ( foldlM )
 import GHC.Utils.Misc
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
-import GHC.Utils.Panic.Plain( assert )
 
 import GHC.Unit.Module( Module )
 import GHC.Unit.Module.ModGuts
@@ -68,6 +67,7 @@ import GHC.Core.Unfold
 
 import Data.List( partition )
 import Data.List.NonEmpty ( NonEmpty (..) )
+import GHC.Core.Subst (substTickish)
 
 {-
 ************************************************************************
@@ -1268,11 +1268,7 @@ specLam env bndrs body
 
 --------------
 specTickish :: SpecEnv -> CoreTickish -> CoreTickish
-specTickish (SE { se_subst = subst }) (Breakpoint ext ix ids)
-  = Breakpoint ext ix [ id' | id <- ids, Var id' <- [Core.lookupIdSubst subst id]]
-  -- drop vars from the list if they have a non-variable substitution.
-  -- should never happen, but it's harmless to drop them anyway.
-specTickish _ other_tickish = other_tickish
+specTickish (SE { se_subst = subst }) bp = substTickish subst bp
 
 --------------
 specCase :: SpecEnv
@@ -1489,11 +1485,12 @@ specBind top_lvl env (NonRec fn rhs) do_body
              -- This is important: see Note [Update unfolding after specialisation]
              -- And in any case cloneBndrSM discards non-Stable unfoldings
 
-             fn3 = zapIdDemandInfo fn2
+             fn3 = floatifyIdDemandInfo fn2
              -- We zap the demand info because the binding may float,
              -- which would invalidate the demand info (see #17810 for example).
              -- Destroying demand info is not terrible; specialisation is
              -- always followed soon by demand analysis.
+             -- See Note [Floatifying demand info when floating] in GHC.Core.Opt.SetLevels
 
              body_env2 = body_env1 `bringFloatedDictsIntoScope` ud_binds rhs_uds
                                    `extendInScope` fn3
@@ -2903,7 +2900,7 @@ where
 is a top-level dictionary-former.  This actually happened in #22459,
 because of (MP1) of Note [Specialising polymorphic dictionaries].
 
-How can we speicalise $wsplit?  We might try
+How can we specialise $wsplit?  We might try
 
    RULE "SPEC" forall (d :: C T). $wsplit @T d = $s$wsplit
 
@@ -3484,9 +3481,8 @@ cloneBndrSM env@(SE { se_subst = subst }) bndr
 
 cloneRecBndrsSM :: SpecEnv -> [Id] -> SpecM (SpecEnv, [Id])
 cloneRecBndrsSM env@(SE { se_subst = subst }) bndrs
-  = do { us <- getUniqueSupplyM
-       ; let (subst', bndrs') = Core.cloneRecIdBndrs subst us bndrs
-             env' = env { se_subst = subst' }
+  = do { (subst', bndrs') <- Core.cloneRecIdBndrs subst bndrs
+       ; let env' = env { se_subst = subst' }
        ; return (env', bndrs') }
 
 newDictBndr :: SpecEnv -> CoreBndr -> SpecM (SpecEnv, CoreBndr)

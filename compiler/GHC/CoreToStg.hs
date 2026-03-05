@@ -41,7 +41,7 @@ import GHC.Types.Basic  ( Arity, TypeOrConstraint(..) )
 import GHC.Types.Literal
 import GHC.Types.ForeignCall
 import GHC.Types.IPE
-import GHC.Types.Demand    ( isUsedOnceDmd )
+import GHC.Types.Demand    ( isAtMostOnceDmd )
 import GHC.Types.SrcLoc    ( mkGeneralSrcSpan )
 
 import GHC.Unit.Module
@@ -54,10 +54,8 @@ import GHC.Utils.Outputable
 import GHC.Utils.Monad
 import GHC.Utils.Misc (HasDebugCallStack)
 import GHC.Utils.Panic
-import GHC.Utils.Panic.Plain
 
 import Control.Monad (ap)
-import Data.Maybe (fromMaybe)
 
 -- Note [Live vs free]
 -- ~~~~~~~~~~~~~~~~~~~
@@ -429,30 +427,23 @@ coreToStgExpr (Cast expr _)
   = coreToStgExpr expr
 
 -- Cases require a little more real work.
-
-{-
-coreToStgExpr (Case scrut _ _ [])
-  = coreToStgExpr scrut
-    -- See Note [Empty case alternatives] in GHC.Core If the case
-    -- alternatives are empty, the scrutinee must diverge or raise an
-    -- exception, so we can just dive into it.
-    --
-    -- Of course this may seg-fault if the scrutinee *does* return.  A
-    -- belt-and-braces approach would be to move this case into the
-    -- code generator, and put a return point anyway that calls a
-    -- runtime system error function.
-
-coreToStgExpr e0@(Case scrut bndr _ [alt]) = do
-  | isUnsafeEqualityProof scrut
-  , isDeadBinder bndr -- We can only discard the case if the case-binder is dead
-                      -- It usually is, but see #18227
-  , (_,_,rhs) <- alt
-  = coreToStgExpr rhs
-    -- See (U2) in Note [Implementing unsafeCoerce] in base:Unsafe.Coerce
--}
-
--- The normal case for case-expressions
 coreToStgExpr (Case scrut bndr _ alts)
+  | null alts
+  -- See Note [Empty case alternatives] in GHC.Core If the case
+  -- alternatives are empty, the scrutinee must diverge or raise an
+  -- exception, so we can just dive into it.
+  --
+  -- Of course this may seg-fault if the scrutinee *does* return.  A
+  -- belt-and-braces approach would be to move this case into the
+  -- code generator, and put a return point anyway that calls a
+  -- runtime system error function.
+  = coreToStgExpr scrut
+
+  | Just rhs <- isUnsafeEqualityCase scrut bndr alts
+  -- See (U2) in Note [Implementing unsafeCoerce] in base:Unsafe.Coerce
+  = coreToStgExpr rhs
+
+  | otherwise
   = do { scrut2 <- coreToStgExpr scrut
        ; alts2 <- extendVarEnvCts [(bndr, LambdaBound)] (mapM vars_alt alts)
        ; return (StgCase scrut2 bndr (mkStgAltType bndr alts) alts2) }
@@ -539,8 +530,10 @@ coreToStgApp f args ticks = do
         res_ty = exprType (mkApps (Var f) args)
         app = case idDetails f of
                 DataConWorkId dc
-                  | saturated    -> StgConApp dc NoNumber args'
-                                      (dropRuntimeRepArgs (fromMaybe [] (tyConAppArgs_maybe res_ty)))
+                  | saturated    -> if isUnboxedSumDataCon dc then
+                                      StgConApp dc NoNumber args' (sumPrimReps args)
+                                    else
+                                      StgConApp dc NoNumber args' []
 
                 -- Some primitive operator that might be implemented as a library call.
                 -- As noted by Note [Eta expanding primops] in GHC.Builtin.PrimOps
@@ -565,9 +558,19 @@ coreToStgApp f args ticks = do
         tapp = foldr add_tick app (map (coreToStgTick res_ty) ticks ++ ticks')
 
     -- Forcing these fixes a leak in the code generator, noticed while
-    -- profiling for trac #4367
+    -- profiling for #4367
     app `seq` return tapp
 
+
+-- Given Core arguments to an unboxed sum datacon, return the 'PrimRep's
+-- of every alternative. For example, in (#_|#) @LiftedRep @IntRep @Int @Int# 0
+-- the arguments are [Type LiftedRep, Type IntRep, Type Int, Type Int#, 0]
+-- and we return the list [[LiftedRep], [IntRep]].
+-- See Note [Representations in StgConApp] in GHC.Stg.Unarise.
+sumPrimReps :: [CoreArg] -> [[PrimRep]]
+sumPrimReps (Type ty : args) | isRuntimeRepKindedTy ty
+  = runtimeRepPrimRep (text "sumPrimReps") ty : sumPrimReps args
+sumPrimReps _ = []
 -- ---------------------------------------------------------------------------
 -- Argument lists
 -- This is the guy that turns applications into A-normal form
@@ -578,11 +581,7 @@ getStgArgFromTrivialArg :: HasDebugCallStack => CoreArg -> StgArg
 -- CoreArgs may not immediately look trivial, e.g., `case e of {}` or
 -- `case unsafeequalityProof of UnsafeRefl -> e` might intervene.
 -- Good thing we can just call `trivial_expr_fold` here.
-getStgArgFromTrivialArg e
-  | Just s <- exprIsTickedString_maybe e -- This case is just for backport to GHC 9.8,
-  = StgLitArg (LitString s)              -- where we used to treat strings as valid StgArgs
-  | otherwise
-  = trivial_expr_fold StgVarArg StgLitArg panic panic e
+getStgArgFromTrivialArg e = trivial_expr_fold StgVarArg StgLitArg panic panic e
   where
     panic = pprPanic "getStgArgFromTrivialArg" (ppr e)
 
@@ -614,21 +613,21 @@ coreToStgArgs (arg : args) = do         -- Non-type argument
         ticks' = map (coreToStgTick arg_ty) (stripTicksT (not . tickishIsCode) arg)
         arg' = getStgArgFromTrivialArg arg
         arg_rep = typePrimRep arg_ty
-        stg_arg_rep = typePrimRep (stgArgType arg')
+        stg_arg_rep = stgArgRep arg'
         bad_args = not (primRepsCompatible platform arg_rep stg_arg_rep)
 
     massertPpr (length ticks' <= 1) (text "More than one Tick in trivial arg:" <+> ppr arg)
-    warnPprTrace bad_args "Dangerous-looking argument. Probable cause: bad unsafeCoerce#" (ppr arg) (return ())
+    warnPprTraceM bad_args "Dangerous-looking argument. Probable cause: bad unsafeCoerce#" (ppr arg)
 
     return (arg' : stg_args, ticks' ++ ticks)
 
 coreToStgTick :: Type -- type of the ticked expression
               -> CoreTickish
               -> StgTickish
-coreToStgTick _ty (HpcTick m i)           = HpcTick m i
-coreToStgTick _ty (SourceNote span nm)    = SourceNote span nm
-coreToStgTick _ty (ProfNote cc cnt scope) = ProfNote cc cnt scope
-coreToStgTick !ty (Breakpoint _ bid fvs)  = Breakpoint ty bid fvs
+coreToStgTick _ty (HpcTick m i)                = HpcTick m i
+coreToStgTick _ty (SourceNote span nm)         = SourceNote span nm
+coreToStgTick _ty (ProfNote cc cnt scope)      = ProfNote cc cnt scope
+coreToStgTick !ty (Breakpoint _ bid fvs modl)  = Breakpoint ty bid fvs modl
 
 -- ---------------------------------------------------------------------------
 -- The magic for lets:
@@ -690,7 +689,7 @@ coreToStgRhs (bndr, rhs) = do
     return (mkStgRhs bndr new_rhs)
 
 -- Represents the RHS of a binding for use with mk(Top)StgRhs.
-data PreStgRhs = PreStgRhs [Id] StgExpr -- The [Id] is empty for thunks
+data PreStgRhs = PreStgRhs [Id] StgExpr Type -- The [Id] is empty for thunks
 
 -- Convert the RHS of a binding from Core to STG. This is a wrapper around
 -- coreToStgExpr that can handle value lambdas.
@@ -698,7 +697,7 @@ coreToPreStgRhs :: HasDebugCallStack => CoreExpr -> CtsM PreStgRhs
 coreToPreStgRhs expr
   = extendVarEnvCts [ (a, LambdaBound) | a <- args' ] $
     do { body' <- coreToStgExpr body
-       ; return (PreStgRhs args' body') }
+       ; return (PreStgRhs args' body' (exprType body)) }
   where
    (args, body) = myCollectBinders expr
    args'        = filterStgBinders args
@@ -712,13 +711,13 @@ mkTopStgRhs CoreToStgOpts
   { coreToStg_platform = platform
   , coreToStg_ExternalDynamicRefs = opt_ExternalDynamicRefs
   , coreToStg_AutoSccsOnIndividualCafs = opt_AutoSccsOnIndividualCafs
-  } this_mod ccs bndr (PreStgRhs bndrs rhs)
+  } this_mod ccs bndr (PreStgRhs bndrs rhs typ)
   | not (null bndrs)
   = -- The list of arguments is non-empty, so not CAF
     ( StgRhsClosure noExtFieldSilent
                     dontCareCCS
                     ReEntrant
-                    bndrs rhs
+                    bndrs rhs typ
     , ccs )
 
   -- After this point we know that `bndrs` is empty,
@@ -729,26 +728,26 @@ mkTopStgRhs CoreToStgOpts
   = -- CorePrep does this right, but just to make sure
     assertPpr (not (isUnboxedTupleDataCon con || isUnboxedSumDataCon con))
               (ppr bndr $$ ppr con $$ ppr args)
-    ( StgRhsCon dontCareCCS con mn ticks args, ccs )
+    ( StgRhsCon dontCareCCS con mn ticks args typ, ccs )
 
   -- Otherwise it's a CAF, see Note [Cost-centre initialization plan].
   | opt_AutoSccsOnIndividualCafs
   = ( StgRhsClosure noExtFieldSilent
                     caf_ccs
-                    upd_flag [] rhs
+                    upd_flag [] rhs typ
     , collectCC caf_cc caf_ccs ccs )
 
   | otherwise
   = ( StgRhsClosure noExtFieldSilent
                     all_cafs_ccs
-                    upd_flag [] rhs
+                    upd_flag [] rhs typ
     , ccs )
 
   where
     (ticks, unticked_rhs) = stripStgTicksTop (not . tickishIsCode) rhs
 
-    upd_flag | isUsedOnceDmd (idDemandInfo bndr) = SingleEntry
-             | otherwise                         = Updatable
+    upd_flag | isAtMostOnceDmd (idDemandInfo bndr) = SingleEntry
+             | otherwise                           = Updatable
 
     -- CAF cost centres generated for -fcaf-all
     caf_cc = mkAutoCC bndr modl
@@ -765,12 +764,12 @@ mkTopStgRhs CoreToStgOpts
 -- Generate a non-top-level RHS. Cost-centre is always currentCCS,
 -- see Note [Cost-centre initialization plan].
 mkStgRhs :: Id -> PreStgRhs -> StgRhs
-mkStgRhs bndr (PreStgRhs bndrs rhs)
+mkStgRhs bndr (PreStgRhs bndrs rhs typ)
   | not (null bndrs)
   = StgRhsClosure noExtFieldSilent
                   currentCCS
                   ReEntrant
-                  bndrs rhs
+                  bndrs rhs typ
 
   -- After this point we know that `bndrs` is empty,
   -- so this is not a function binding
@@ -781,20 +780,20 @@ mkStgRhs bndr (PreStgRhs bndrs rhs)
     StgRhsClosure noExtFieldSilent
                   currentCCS
                   ReEntrant -- ignored for LNE
-                  [] rhs
+                  [] rhs typ
 
   | StgConApp con mn args _ <- unticked_rhs
-  = StgRhsCon currentCCS con mn ticks args
+  = StgRhsCon currentCCS con mn ticks args typ
 
   | otherwise
   = StgRhsClosure noExtFieldSilent
                   currentCCS
-                  upd_flag [] rhs
+                  upd_flag [] rhs typ
   where
     (ticks, unticked_rhs) = stripStgTicksTop (not . tickishIsCode) rhs
 
-    upd_flag | isUsedOnceDmd (idDemandInfo bndr) = SingleEntry
-             | otherwise                         = Updatable
+    upd_flag | isAtMostOnceDmd (idDemandInfo bndr) = SingleEntry
+             | otherwise                           = Updatable
 
   {-
     SDM: disabled.  Eval/Apply can't handle functions with arity zero very
@@ -958,6 +957,9 @@ myCollectBinders expr
 
 -- | If the argument expression is (potential chain of) 'App', return the head
 -- of the app chain, and collect ticks/args along the chain.
+-- INVARIANT: If the app head is trivial, return the atomic Var/Lit that was
+-- wrapped in casts, empty case, ticks, etc.
+-- So keep in sync with 'exprIsTrivial'.
 myCollectArgs :: HasDebugCallStack => CoreExpr -> (CoreExpr, [CoreArg], [CoreTickish])
 myCollectArgs expr
   = go expr [] []
@@ -969,8 +971,16 @@ myCollectArgs expr
                                 -- See Note [Ticks in applications]
                                 go e as (t:ts) -- ticks can appear in type apps
     go (Cast e _)       as ts = go e as ts
+    go (Case e b _ alts) as ts  -- Just like in exprIsTrivial!
+                                -- Otherwise we fall over in case we encounter
+                                -- `(case f a of {}) b` in the future.
+       | null alts
+       = assertPpr (null as) (ppr e $$ ppr as $$ ppr expr) $
+                   go e [] ts -- NB: Empty case discards arguments
+       | Just rhs <- isUnsafeEqualityCase e b alts
+       = go rhs as ts         -- Discards unsafeCoerce in App heads
     go (Lam b e)        as ts
-       | isTyVar b            = go e as ts -- Note [Collect args]
+       | isTyVar b            = go e (drop 1 as) ts -- Note [Collect args]
     go e                as ts = (e, as, ts)
 
 {- Note [Collect args]

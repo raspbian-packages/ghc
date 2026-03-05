@@ -1,8 +1,7 @@
 module Main (main) where
 
 import qualified OsPathSpec
-import qualified EncodingSpec
-import TestUtil
+import Test.Tasty
 
 main :: IO ()
-main = runTests (EncodingSpec.tests ++ OsPathSpec.tests)
+main = defaultMain OsPathSpec.tests

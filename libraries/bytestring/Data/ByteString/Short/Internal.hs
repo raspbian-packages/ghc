@@ -1,32 +1,14 @@
-{-# LANGUAGE BangPatterns             #-}
 {-# LANGUAGE CPP                      #-}
-{-# LANGUAGE DeriveDataTypeable       #-}
-{-# LANGUAGE ForeignFunctionInterface #-}
-{-# LANGUAGE LambdaCase               #-}
-{-# LANGUAGE MagicHash                #-}
-{-# LANGUAGE MultiWayIf               #-}
-{-# LANGUAGE RankNTypes               #-}
-{-# LANGUAGE ScopedTypeVariables      #-}
-{-# LANGUAGE TemplateHaskellQuotes    #-}
-{-# LANGUAGE TupleSections            #-}
-{-# LANGUAGE TypeFamilies             #-}
-{-# LANGUAGE UnboxedTuples            #-}
-{-# LANGUAGE UnliftedFFITypes         #-}
 {-# LANGUAGE Unsafe                   #-}
-{-# LANGUAGE ViewPatterns             #-}
 
 {-# OPTIONS_HADDOCK not-home #-}
-
 {-# OPTIONS_GHC -fexpose-all-unfoldings #-}
--- Not all architectures are forgiving of unaligned accesses; whitelist ones
--- which are known not to trap (either to the kernel for emulation, or crash).
-#if defined(i386_HOST_ARCH) || defined(x86_64_HOST_ARCH) \
-    || ((defined(arm_HOST_ARCH) || defined(aarch64_HOST_ARCH)) \
-        && defined(__ARM_FEATURE_UNALIGNED)) \
-    || defined(powerpc_HOST_ARCH) || defined(powerpc64_HOST_ARCH) \
-    || defined(powerpc64le_HOST_ARCH)
-#define SAFE_UNALIGNED 1
-#endif
+
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE TypeFamilies             #-}
+{-# LANGUAGE UnliftedFFITypes         #-}
+
+#include "bytestring-cpp-macros.h"
 
 -- |
 -- Module      : Data.ByteString.Short.Internal
@@ -42,7 +24,7 @@
 module Data.ByteString.Short.Internal (
 
     -- * The @ShortByteString@ type and representation
-    ShortByteString(..),
+    ShortByteString(.., SBS),
 
     -- * Introducing and eliminating 'ShortByteString's
     empty,
@@ -163,33 +145,36 @@ import Data.ByteString.Internal.Type
   , unsafeDupablePerformIO
   , accursedUnutterablePerformIO
   , checkedAdd
+  , c_elem_index
+  , cIsValidUtf8BASafe
+  , cIsValidUtf8BA
   )
 
+import Data.Array.Byte
+  ( ByteArray(..), MutableByteArray(..) )
 import Data.Bits
   ( FiniteBits (finiteBitSize)
   , shiftL
-#if MIN_VERSION_base(4,12,0) && defined(SAFE_UNALIGNED)
+#if HS_UNALIGNED_ByteArray_OPS_OK
   , shiftR
 #endif
   , (.&.)
   , (.|.)
   )
 import Data.Data
-  ( Data(..)
-  , mkNoRepType
-  )
+  ( Data(..) )
 import Data.Monoid
   ( Monoid(..) )
 import Data.Semigroup
-  ( Semigroup((<>)) )
+  ( Semigroup(..), stimesMonoid )
+import Data.List.NonEmpty
+  ( NonEmpty(..) )
 import Data.String
   ( IsString(..) )
-import Data.Typeable
-  ( Typeable )
 import Control.Applicative
   ( pure )
 import Control.DeepSeq
-  ( NFData(..) )
+  ( NFData )
 import Control.Exception
   ( assert )
 import Control.Monad
@@ -198,15 +183,6 @@ import Foreign.C.String
   ( CString
   , CStringLen
   )
-import Foreign.C.Types
-  ( CSize(..)
-  , CInt(..)
-  , CPtrdiff(..)
-  )
-import Foreign.ForeignPtr
-  ( touchForeignPtr )
-import Foreign.ForeignPtr.Unsafe
-  ( unsafeForeignPtrToPtr )
 import Foreign.Marshal.Alloc
   ( allocaBytes )
 import Foreign.Storable
@@ -216,22 +192,17 @@ import GHC.Exts
   , State#, RealWorld
   , ByteArray#, MutableByteArray#
   , newByteArray#
-  , newPinnedByteArray#
   , byteArrayContents#
   , unsafeCoerce#
   , copyMutableByteArray#
-#if MIN_VERSION_base(4,10,0)
   , isByteArrayPinned#
   , isTrue#
-#endif
-#if MIN_VERSION_base(4,11,0)
   , compareByteArrays#
-#endif
   , sizeofByteArray#
   , indexWord8Array#, indexCharArray#
   , writeWord8Array#
   , unsafeFreezeByteArray#
-#if MIN_VERSION_base(4,12,0) && defined(SAFE_UNALIGNED)
+#if HS_UNALIGNED_ByteArray_OPS_OK
   ,writeWord64Array#
   ,indexWord8ArrayAsWord64#
 #endif
@@ -241,6 +212,8 @@ import GHC.Exts
   , writeWord8Array#
   , unsafeFreezeByteArray#
   , touch# )
+import GHC.Generics
+  ( Generic )
 import GHC.IO hiding ( unsafeDupablePerformIO )
 import GHC.ForeignPtr
   ( ForeignPtr(ForeignPtr)
@@ -272,7 +245,6 @@ import qualified Data.ByteString.Internal.Type as BS
 
 import qualified Data.List as List
 import qualified GHC.Exts
-import qualified Language.Haskell.TH.Lib as TH
 import qualified Language.Haskell.TH.Syntax as TH
 
 -- | A compact representation of a 'Word8' vector.
@@ -282,53 +254,40 @@ import qualified Language.Haskell.TH.Syntax as TH
 -- 'ByteString' (at the cost of copying the string data). It supports very few
 -- other operations.
 --
-data ShortByteString = SBS ByteArray#
-    deriving Typeable
+newtype ShortByteString =
+  -- | @since 0.12.0.0
+  ShortByteString
+  { unShortByteString :: ByteArray
+  -- ^ @since 0.12.0.0
+  }
+  deriving (Eq, TH.Lift, Data, Generic, NFData)
 
--- | @since 0.11.2.0
-instance TH.Lift ShortByteString where
-#if MIN_VERSION_template_haskell(2,16,0)
-  lift sbs = [| unsafePackLenLiteral |]
-    `TH.appE` TH.litE (TH.integerL (fromIntegral len))
-    `TH.appE` TH.litE (TH.BytesPrimL $ TH.Bytes ptr 0 (fromIntegral len))
-    where
-      BS ptr len = fromShort sbs
-#else
-  lift sbs = [| unsafePackLenLiteral |]
-    `TH.appE` TH.litE (TH.integerL (fromIntegral len))
-    `TH.appE` TH.litE (TH.StringPrimL $ BS.unpackBytes bs)
-    where
-      bs@(BS _ len) = fromShort sbs
-#endif
+-- | Prior to @bytestring-0.12@ 'SBS' was a genuine constructor of 'ShortByteString',
+-- but now it is a bundled pattern synonym, provided as a compatibility shim.
+pattern SBS :: ByteArray# -> ShortByteString
+pattern SBS x = ShortByteString (ByteArray x)
+{-# COMPLETE SBS #-}
 
-#if MIN_VERSION_template_haskell(2,17,0)
-  liftTyped = TH.unsafeCodeCoerce . TH.lift
-#elif MIN_VERSION_template_haskell(2,16,0)
-  liftTyped = TH.unsafeTExpCoerce . TH.lift
-#endif
-
--- The ByteArray# representation is always word sized and aligned but with a
--- known byte length. Our representation choice for ShortByteString is to leave
--- the 0--3 trailing bytes undefined. This means we can use word-sized writes,
--- but we have to be careful with reads, see equateBytes and compareBytes below.
-
-
-instance Eq ShortByteString where
-    (==)    = equateBytes
-
+-- | Lexicographic order.
 instance Ord ShortByteString where
     compare = compareBytes
 
+-- Instead of deriving Semigroup / Monoid , we stick to our own implementations
+-- of mappend / mconcat, because they are safer with regards to overflows
+-- (see prop_32bitOverflow_Short_mconcat test).
+-- ByteArray is likely to catch up starting from GHC 9.6:
+-- * https://gitlab.haskell.org/ghc/ghc/-/merge_requests/8272
+-- * https://gitlab.haskell.org/ghc/ghc/-/merge_requests/9128
+
 instance Semigroup ShortByteString where
     (<>)    = append
+    sconcat (b:|bs) = concat (b:bs)
+    stimes  = stimesMonoid
 
 instance Monoid ShortByteString where
     mempty  = empty
     mappend = (<>)
     mconcat = concat
-
-instance NFData ShortByteString where
-    rnf SBS{} = ()
 
 instance Show ShortByteString where
     showsPrec p ps r = showsPrec p (unpackChars ps) r
@@ -339,19 +298,14 @@ instance Read ShortByteString where
 -- | @since 0.10.12.0
 instance GHC.Exts.IsList ShortByteString where
   type Item ShortByteString = Word8
-  fromList = packBytes
-  toList   = unpack
+  fromList  = ShortByteString . GHC.Exts.fromList
+  fromListN = (ShortByteString .) . GHC.Exts.fromListN
+  toList    = GHC.Exts.toList . unShortByteString
 
 -- | Beware: 'fromString' truncates multi-byte characters to octets.
 -- e.g. "枯朶に烏のとまりけり秋の暮" becomes �6k�nh~�Q��n�
 instance IsString ShortByteString where
     fromString = packChars
-
-instance Data ShortByteString where
-  gfoldl f z txt = z packBytes `f` unpack txt
-  toConstr _     = error "Data.ByteString.Short.ShortByteString.toConstr"
-  gunfold _ _    = error "Data.ByteString.Short.ShortByteString.gunfold"
-  dataTypeOf _   = mkNoRepType "Data.ByteString.Short.ShortByteString"
 
 ------------------------------------------------------------------------
 -- Simple operations
@@ -362,7 +316,7 @@ empty = create 0 (\_ -> return ())
 
 -- | /O(1)/ The length of a 'ShortByteString'.
 length :: ShortByteString -> Int
-length (unSBS -> barr#) = I# (sizeofByteArray# barr#)
+length (SBS barr#) = I# (sizeofByteArray# barr#)
 
 -- | /O(1)/ Test whether a 'ShortByteString' is empty.
 null :: ShortByteString -> Bool
@@ -405,28 +359,18 @@ indexError sbs i =
   moduleError "index" $ "error in array index: " ++ show i
                         ++ " not in range [0.." ++ show (length sbs) ++ "]"
 
--- | @since 0.11.2.0
-unsafePackLenLiteral :: Int -> Addr# -> ShortByteString
-unsafePackLenLiteral len addr# =
-    -- createFromPtr allocates, so accursedUnutterablePerformIO is wrong
-    unsafeDupablePerformIO $ createFromPtr (Ptr addr#) len
-
 ------------------------------------------------------------------------
 -- Internal utils
 
-asBA :: ShortByteString -> BA
-asBA (unSBS -> ba#) = BA# ba#
+asBA :: ShortByteString -> ByteArray
+asBA (ShortByteString ba) = ba
 
-unSBS :: ShortByteString -> ByteArray#
-unSBS (SBS ba#) = ba#
-
-create :: Int -> (forall s. MBA s -> ST s ()) -> ShortByteString
+create :: Int -> (forall s. MutableByteArray s -> ST s ()) -> ShortByteString
 create len fill =
-    runST $ do
+    assert (len >= 0) $ runST $ do
       mba <- newByteArray len
       fill mba
-      BA# ba# <- unsafeFreezeByteArray mba
-      return (SBS ba#)
+      ShortByteString <$> unsafeFreezeByteArray mba
 {-# INLINE create #-}
 
 -- | Given the maximum size needed and a function to make the contents
@@ -434,67 +378,60 @@ create len fill =
 -- The generating function is required to return the actual final size
 -- (<= the maximum size) and the result value. The resulting byte array
 -- is realloced to this size.
-createAndTrim :: Int -> (forall s. MBA s -> ST s (Int, a)) -> (ShortByteString, a)
-createAndTrim l fill =
-    runST $ do
-      mba <- newByteArray l
-      (l', res) <- fill mba
-      if assert (l' <= l) $ l' >= l
+createAndTrim :: Int -> (forall s. MutableByteArray s -> ST s (Int, a)) -> (ShortByteString, a)
+createAndTrim maxLen fill =
+    assert (maxLen >= 0) $ runST $ do
+      mba <- newByteArray maxLen
+      (len, res) <- fill mba
+      if assert (0 <= len && len <= maxLen) $ len >= maxLen
           then do
-            BA# ba# <- unsafeFreezeByteArray mba
-            return (SBS ba#, res)
+            ba <- unsafeFreezeByteArray mba
+            return (ShortByteString ba, res)
           else do
-            mba2 <- newByteArray l'
-            copyMutableByteArray mba 0 mba2 0 l'
-            BA# ba# <- unsafeFreezeByteArray mba2
-            return (SBS ba#, res)
+            mba2 <- newByteArray len
+            copyMutableByteArray mba 0 mba2 0 len
+            ba <- unsafeFreezeByteArray mba2
+            return (ShortByteString ba, res)
 {-# INLINE createAndTrim #-}
 
-createAndTrim' :: Int -> (forall s. MBA s -> ST s Int) -> ShortByteString
-createAndTrim' l fill =
-    runST $ do
-      mba <- newByteArray l
-      l' <- fill mba
-      if assert (l' <= l) $ l' >= l
+createAndTrim' :: Int -> (forall s. MutableByteArray s -> ST s Int) -> ShortByteString
+createAndTrim' maxLen fill =
+    assert (maxLen >= 0) $ runST $ do
+      mba <- newByteArray maxLen
+      len <- fill mba
+      if assert (0 <= len && len <= maxLen) $ len >= maxLen
           then do
-            BA# ba# <- unsafeFreezeByteArray mba
-            return (SBS ba#)
+            ShortByteString <$> unsafeFreezeByteArray mba
           else do
-            mba2 <- newByteArray l'
-            copyMutableByteArray mba 0 mba2 0 l'
-            BA# ba# <- unsafeFreezeByteArray mba2
-            return (SBS ba#)
+            mba2 <- newByteArray len
+            copyMutableByteArray mba 0 mba2 0 len
+            ShortByteString <$> unsafeFreezeByteArray mba2
 {-# INLINE createAndTrim' #-}
 
-createAndTrim'' :: Int -> (forall s. MBA s -> MBA s -> ST s (Int, Int)) -> (ShortByteString, ShortByteString)
-createAndTrim'' l fill =
+-- | Like createAndTrim, but with two buffers at once
+createAndTrim2 :: Int -> Int -> (forall s. MutableByteArray s -> MutableByteArray s -> ST s (Int, Int)) -> (ShortByteString, ShortByteString)
+createAndTrim2 maxLen1 maxLen2 fill =
     runST $ do
-      mba1 <- newByteArray l
-      mba2 <- newByteArray l
-      (l1, l2) <- fill mba1 mba2
-      sbs1 <- freeze' l1 mba1
-      sbs2 <- freeze' l2 mba2
+      mba1 <- newByteArray maxLen1
+      mba2 <- newByteArray maxLen2
+      (len1, len2) <- fill mba1 mba2
+      sbs1 <- freeze' len1 maxLen1 mba1
+      sbs2 <- freeze' len2 maxLen2 mba2
       pure (sbs1, sbs2)
   where
-    freeze' :: Int -> MBA s -> ST s ShortByteString
-    freeze' l' mba =
-      if assert (l' <= l) $ l' >= l
+    freeze' :: Int -> Int -> MutableByteArray s -> ST s ShortByteString
+    freeze' len maxLen mba =
+      if assert (0 <= len && len <= maxLen) $ len >= maxLen
           then do
-            BA# ba# <- unsafeFreezeByteArray mba
-            return (SBS ba#)
+            ShortByteString <$> unsafeFreezeByteArray mba
           else do
-            mba2 <- newByteArray l'
-            copyMutableByteArray mba 0 mba2 0 l'
-            BA# ba# <- unsafeFreezeByteArray mba2
-            return (SBS ba#)
-{-# INLINE createAndTrim'' #-}
+            mba2 <- newByteArray len
+            copyMutableByteArray mba 0 mba2 0 len
+            ShortByteString <$> unsafeFreezeByteArray mba2
+{-# INLINE createAndTrim2 #-}
 
 isPinned :: ByteArray# -> Bool
-#if MIN_VERSION_base(4,10,0)
 isPinned ba# = isTrue# (isByteArrayPinned# ba#)
-#else
-isPinned _ = False
-#endif
 
 ------------------------------------------------------------------------
 -- Conversion to and from ByteString
@@ -509,31 +446,21 @@ toShort !bs = unsafeDupablePerformIO (toShortIO bs)
 toShortIO :: ByteString -> IO ShortByteString
 toShortIO (BS fptr len) = do
     mba <- stToIO (newByteArray len)
-    let ptr = unsafeForeignPtrToPtr fptr
-    stToIO (copyAddrToByteArray ptr mba 0 len)
-    touchForeignPtr fptr
-    BA# ba# <- stToIO (unsafeFreezeByteArray mba)
-    return (SBS ba#)
+    BS.unsafeWithForeignPtr fptr $ \ptr ->
+      stToIO (copyAddrToByteArray ptr mba 0 len)
+    ShortByteString <$> stToIO (unsafeFreezeByteArray mba)
 
 -- | /O(n)/. Convert a 'ShortByteString' into a 'ByteString'.
 --
 fromShort :: ShortByteString -> ByteString
-fromShort (unSBS -> b#)
-  | isPinned b# = BS fp len
-  where
-    addr# = byteArrayContents# b#
-    fp = ForeignPtr addr# (PlainPtr (unsafeCoerce# b#))
-    len = I# (sizeofByteArray# b#)
-fromShort !sbs = unsafeDupablePerformIO (fromShortIO sbs)
-
-fromShortIO :: ShortByteString -> IO ByteString
-fromShortIO sbs = do
-    let len = length sbs
-    mba@(MBA# mba#) <- stToIO (newPinnedByteArray len)
-    stToIO (copyByteArray (asBA sbs) 0 mba 0 len)
-    let fp = ForeignPtr (byteArrayContents# (unsafeCoerce# mba#))
-                        (PlainPtr mba#)
-    return (BS fp len)
+fromShort sbs@(SBS b#)
+  | isPinned b# = BS inPlaceFp len
+  | otherwise = BS.unsafeCreateFp len $ \fp ->
+      BS.unsafeWithForeignPtr fp $ \p -> copyToPtr sbs 0 p len
+    where
+      inPlaceFp = ForeignPtr (byteArrayContents# b#)
+                             (PlainPtr (unsafeCoerce# b#))
+      len = I# (sizeofByteArray# b#)
 
 -- | /O(1)/ Convert a 'Word8' into a 'ShortByteString'
 --
@@ -575,7 +502,7 @@ packLenBytes :: Int -> [Word8] -> ShortByteString
 packLenBytes len ws0 =
     create len (\mba -> go mba 0 ws0)
   where
-    go :: MBA s -> Int -> [Word8] -> ST s ()
+    go :: MutableByteArray s -> Int -> [Word8] -> ST s ()
     go !_   !_ []     = return ()
     go !mba !i (w:ws) = do
       writeWord8Array mba i w
@@ -648,13 +575,6 @@ unpackAppendBytesStrict !sbs off len = go (off-1) (off-1 + len)
 ------------------------------------------------------------------------
 -- Eq and Ord implementations
 
-equateBytes :: ShortByteString -> ShortByteString -> Bool
-equateBytes sbs1 sbs2 =
-    let !len1 = length sbs1
-        !len2 = length sbs2
-     in len1 == len2
-     && 0 == compareByteArrays (asBA sbs1) (asBA sbs2) len1
-
 compareBytes :: ShortByteString -> ShortByteString -> Ordering
 compareBytes sbs1 sbs2 =
     let !len1 = length sbs1
@@ -667,7 +587,6 @@ compareBytes sbs1 sbs2 =
             | len2 < len1 -> GT
             | otherwise   -> EQ
 
-
 ------------------------------------------------------------------------
 -- Appending and concatenation
 
@@ -675,7 +594,7 @@ append :: ShortByteString -> ShortByteString -> ShortByteString
 append src1 src2 =
   let !len1 = length src1
       !len2 = length src2
-   in create (len1 + len2) $ \dst -> do
+   in create (checkedAdd "Short.append" len1 len2) $ \dst -> do
         copyByteArray (asBA src1) 0 dst 0    len1
         copyByteArray (asBA src2) 0 dst len1 len2
 
@@ -683,10 +602,11 @@ concat :: [ShortByteString] -> ShortByteString
 concat = \sbss ->
     create (totalLen 0 sbss) (\dst -> copy dst 0 sbss)
   where
-    totalLen !acc []          = acc
-    totalLen !acc (sbs: sbss) = totalLen (acc + length sbs) sbss
+    totalLen !acc [] = acc
+    totalLen !acc (curr : rest)
+      = totalLen (checkedAdd "Short.concat" acc $ length curr) rest
 
-    copy :: MBA s -> Int -> [ShortByteString] -> ST s ()
+    copy :: MutableByteArray s -> Int -> [ShortByteString] -> ST s ()
     copy !_   !_   []                           = return ()
     copy !dst !off (src : sbss) = do
       let !len = length src
@@ -705,11 +625,11 @@ infixl 5 `snoc`
 --
 -- @since 0.11.3.0
 snoc :: ShortByteString -> Word8 -> ShortByteString
-snoc = \sbs c -> let l  = length sbs
-                     nl = l + 1
-  in create nl $ \mba -> do
-      copyByteArray (asBA sbs) 0 mba 0 l
-      writeWord8Array mba l c
+snoc = \sbs c -> let len    = length sbs
+                     newLen = checkedAdd "Short.snoc" len 1
+  in create newLen $ \mba -> do
+      copyByteArray (asBA sbs) 0 mba 0 len
+      writeWord8Array mba len c
 
 -- | /O(n)/ 'cons' is analogous to (:) for lists.
 --
@@ -717,11 +637,11 @@ snoc = \sbs c -> let l  = length sbs
 --
 -- @since 0.11.3.0
 cons :: Word8 -> ShortByteString -> ShortByteString
-cons c = \sbs -> let l  = length sbs
-                     nl = l + 1
-  in create nl $ \mba -> do
+cons c = \sbs -> let len    = length sbs
+                     newLen = checkedAdd "Short.cons" len 1
+  in create newLen $ \mba -> do
       writeWord8Array mba 0 c
-      copyByteArray (asBA sbs) 0 mba 1 l
+      copyByteArray (asBA sbs) 0 mba 1 len
 
 -- | /O(1)/ Extract the last element of a ShortByteString, which must be finite and non-empty.
 -- An exception will be thrown in the case of an empty ShortByteString.
@@ -817,7 +737,7 @@ map f = \sbs ->
         ba = asBA sbs
     in create l (\mba -> go ba mba 0 l)
   where
-    go :: BA -> MBA s -> Int -> Int -> ST s ()
+    go :: ByteArray -> MutableByteArray s -> Int -> Int -> ST s ()
     go !ba !mba !i !l
       | i >= l = return ()
       | otherwise = do
@@ -833,11 +753,10 @@ reverse :: ShortByteString -> ShortByteString
 reverse = \sbs ->
     let l  = length sbs
         ba = asBA sbs
--- https://gitlab.haskell.org/ghc/ghc/-/issues/21015
-#if MIN_VERSION_base(4,12,0) && defined(SAFE_UNALIGNED)
+#if HS_UNALIGNED_ByteArray_OPS_OK
     in create l (\mba -> go ba mba l)
   where
-    go :: forall s. BA -> MBA s -> Int -> ST s ()
+    go :: forall s. ByteArray -> MutableByteArray s -> Int -> ST s ()
     go !ba !mba !l = do
       -- this is equivalent to: (q, r) = l `quotRem` 8
       let q = l `shiftR` 3
@@ -870,7 +789,7 @@ reverse = \sbs ->
 #else
     in create l (\mba -> go ba mba 0 l)
    where
-    go :: BA -> MBA s -> Int -> Int -> ST s ()
+    go :: ByteArray -> MutableByteArray s -> Int -> Int -> ST s ()
     go !ba !mba !i !l
       | i >= l = return ()
       | otherwise = do
@@ -897,7 +816,7 @@ intercalate sep = \case
   ba  = asBA sep
   lba = length sep
 
-  go :: MBA s -> Int -> [ShortByteString] -> ST s ()
+  go :: MutableByteArray s -> Int -> [ShortByteString] -> ST s ()
   go _ _ [] = pure ()
   go mba !off (chunk:chunks) = do
     let lc = length chunk
@@ -1319,7 +1238,7 @@ unfoldrN i f = \x0 ->
      | otherwise -> createAndTrim i $ \mba -> go mba x0 0
 
   where
-    go :: forall s. MBA s -> a -> Int -> ST s (Int, Maybe a)
+    go :: forall s. MutableByteArray s -> a -> Int -> ST s (Int, Maybe a)
     go !mba !x !n = go' x n
       where
         go' :: a -> Int -> ST s (Int, Maybe a)
@@ -1344,6 +1263,7 @@ isInfixOf :: ShortByteString -> ShortByteString -> Bool
 isInfixOf sbs = \s -> null sbs || not (null $ snd $ (GHC.Exts.inline breakSubstring) sbs s)
 
 -- |/O(n)/ The 'isPrefixOf' function takes two ShortByteStrings and returns 'True'
+-- iff the first is a prefix of the second.
 --
 -- @since 0.11.3.0
 isPrefixOf :: ShortByteString -> ShortByteString -> Bool
@@ -1471,8 +1391,8 @@ filter k = \sbs -> let l = length sbs
                    in if | l <= 0    -> sbs
                          | otherwise -> createAndTrim' l $ \mba -> go mba (asBA sbs) l
   where
-    go :: forall s. MBA s -- mutable output bytestring
-       -> BA              -- input bytestring
+    go :: forall s. MutableByteArray s -- mutable output bytestring
+       -> ByteArray       -- input bytestring
        -> Int             -- length of input bytestring
        -> ST s Int
     go !mba ba !l = go' 0 0
@@ -1513,14 +1433,14 @@ find f = \sbs -> case findIndex f sbs of
 --
 -- @since 0.11.3.0
 partition :: (Word8 -> Bool) -> ShortByteString -> (ShortByteString, ShortByteString)
-partition k = \sbs -> let l = length sbs
-                   in if | l <= 0    -> (sbs, sbs)
-                         | otherwise -> createAndTrim'' l $ \mba1 mba2 -> go mba1 mba2 (asBA sbs) l
+partition k = \sbs -> let len = length sbs
+                   in if | len <= 0  -> (sbs, sbs)
+                         | otherwise -> createAndTrim2 len len $ \mba1 mba2 -> go mba1 mba2 (asBA sbs) len
   where
     go :: forall s.
-          MBA s           -- mutable output bytestring1
-       -> MBA s           -- mutable output bytestring2
-       -> BA              -- input bytestring
+          MutableByteArray s -- mutable output bytestring1
+       -> MutableByteArray s -- mutable output bytestring2
+       -> ByteArray       -- input bytestring
        -> Int             -- length of input bytestring
        -> ST s (Int, Int) -- (length mba1, length mba2)
     go !mba1 !mba2 ba !l = go' 0 0
@@ -1550,7 +1470,7 @@ partition k = \sbs -> let l = length sbs
 --
 -- @since 0.11.3.0
 elemIndex :: Word8 -> ShortByteString -> Maybe Int
-elemIndex c = \sbs@(unSBS -> ba#) -> do
+elemIndex c = \sbs@(SBS ba#) -> do
     let l = length sbs
     accursedUnutterablePerformIO $ do
       !s <- c_elem_index ba# c (fromIntegral l)
@@ -1568,8 +1488,8 @@ elemIndices k = findIndices (==k)
 --
 -- @since 0.11.3.0
 count :: Word8 -> ShortByteString -> Int
-count w = \sbs@(unSBS -> ba#) -> accursedUnutterablePerformIO $
-    fromIntegral <$> c_count ba# (fromIntegral $ length sbs) w
+count w = \sbs@(SBS ba#) -> accursedUnutterablePerformIO $
+    fromIntegral <$> BS.c_count_ba ba# (fromIntegral $ length sbs) w
 
 -- | /O(n)/ The 'findIndex' function takes a predicate and a 'ShortByteString' and
 -- returns the index of the first element in the ShortByteString
@@ -1602,8 +1522,6 @@ findIndices k = \sbs ->
             | otherwise = go (n + 1)
   in go 0
 
-
-
 ------------------------------------------------------------------------
 -- Exported low level operations
 
@@ -1623,76 +1541,68 @@ createFromPtr !ptr len =
     stToIO $ do
       mba <- newByteArray len
       copyAddrToByteArray ptr mba 0 len
-      BA# ba# <- unsafeFreezeByteArray mba
-      return (SBS ba#)
+      ShortByteString <$> unsafeFreezeByteArray mba
 
 
 ------------------------------------------------------------------------
 -- Primop wrappers
 
-data BA    = BA# ByteArray#
-data MBA s = MBA# (MutableByteArray# s)
+indexCharArray :: ByteArray -> Int -> Char
+indexCharArray (ByteArray ba#) (I# i#) = C# (indexCharArray# ba# i#)
 
-indexCharArray :: BA -> Int -> Char
-indexCharArray (BA# ba#) (I# i#) = C# (indexCharArray# ba# i#)
+indexWord8Array :: ByteArray -> Int -> Word8
+indexWord8Array (ByteArray ba#) (I# i#) = W8# (indexWord8Array# ba# i#)
 
-indexWord8Array :: BA -> Int -> Word8
-indexWord8Array (BA# ba#) (I# i#) = W8# (indexWord8Array# ba# i#)
-
-#if MIN_VERSION_base(4,12,0) && defined(SAFE_UNALIGNED)
-indexWord8ArrayAsWord64 :: BA -> Int -> Word64
-indexWord8ArrayAsWord64 (BA# ba#) (I# i#) = W64# (indexWord8ArrayAsWord64# ba# i#)
+#if HS_UNALIGNED_ByteArray_OPS_OK
+indexWord8ArrayAsWord64 :: ByteArray -> Int -> Word64
+indexWord8ArrayAsWord64 (ByteArray ba#) (I# i#) = W64# (indexWord8ArrayAsWord64# ba# i#)
 #endif
 
-newByteArray :: Int -> ST s (MBA s)
-newByteArray (I# len#) =
+newByteArray :: Int -> ST s (MutableByteArray s)
+newByteArray len@(I# len#) =
+  assert (len >= 0) $
     ST $ \s -> case newByteArray# len# s of
-                 (# s', mba# #) -> (# s', MBA# mba# #)
+                 (# s', mba# #) -> (# s', MutableByteArray mba# #)
 
-newPinnedByteArray :: Int -> ST s (MBA s)
-newPinnedByteArray (I# len#) =
-    ST $ \s -> case newPinnedByteArray# len# s of
-                 (# s', mba# #) -> (# s', MBA# mba# #)
-
-unsafeFreezeByteArray :: MBA s -> ST s BA
-unsafeFreezeByteArray (MBA# mba#) =
+unsafeFreezeByteArray :: MutableByteArray s -> ST s ByteArray
+unsafeFreezeByteArray (MutableByteArray mba#) =
     ST $ \s -> case unsafeFreezeByteArray# mba# s of
-                 (# s', ba# #) -> (# s', BA# ba# #)
+                 (# s', ba# #) -> (# s', ByteArray ba# #)
 
-writeWord8Array :: MBA s -> Int -> Word8 -> ST s ()
-writeWord8Array (MBA# mba#) (I# i#) (W8# w#) =
+writeWord8Array :: MutableByteArray s -> Int -> Word8 -> ST s ()
+writeWord8Array (MutableByteArray mba#) (I# i#) (W8# w#) =
   ST $ \s -> case writeWord8Array# mba# i# w# s of
                s' -> (# s', () #)
 
-#if MIN_VERSION_base(4,12,0) && defined(SAFE_UNALIGNED)
-writeWord64Array :: MBA s -> Int -> Word64 -> ST s ()
-writeWord64Array (MBA# mba#) (I# i#) (W64# w#) =
+#if HS_UNALIGNED_ByteArray_OPS_OK
+writeWord64Array :: MutableByteArray s -> Int -> Word64 -> ST s ()
+writeWord64Array (MutableByteArray mba#) (I# i#) (W64# w#) =
   ST $ \s -> case writeWord64Array# mba# i# w# s of
                s' -> (# s', () #)
 #endif
 
-copyAddrToByteArray :: Ptr a -> MBA RealWorld -> Int -> Int -> ST RealWorld ()
-copyAddrToByteArray (Ptr src#) (MBA# dst#) (I# dst_off#) (I# len#) =
+copyAddrToByteArray :: Ptr a -> MutableByteArray RealWorld -> Int -> Int -> ST RealWorld ()
+copyAddrToByteArray (Ptr src#) (MutableByteArray dst#) (I# dst_off#) (I# len#) =
     ST $ \s -> case copyAddrToByteArray# src# dst# dst_off# len# s of
                  s' -> (# s', () #)
 
-copyByteArrayToAddr :: BA -> Int -> Ptr a -> Int -> ST RealWorld ()
-copyByteArrayToAddr (BA# src#) (I# src_off#) (Ptr dst#) (I# len#) =
+copyByteArrayToAddr :: ByteArray -> Int -> Ptr a -> Int -> ST RealWorld ()
+copyByteArrayToAddr (ByteArray src#) (I# src_off#) (Ptr dst#) (I# len#) =
     ST $ \s -> case copyByteArrayToAddr# src# src_off# dst# len# s of
                  s' -> (# s', () #)
 
-copyByteArray :: BA -> Int -> MBA s -> Int -> Int -> ST s ()
-copyByteArray (BA# src#) (I# src_off#) (MBA# dst#) (I# dst_off#) (I# len#) =
+copyByteArray :: ByteArray -> Int -> MutableByteArray s -> Int -> Int -> ST s ()
+copyByteArray (ByteArray src#) (I# src_off#) (MutableByteArray dst#) (I# dst_off#) (I# len#) =
     ST $ \s -> case copyByteArray# src# src_off# dst# dst_off# len# s of
                  s' -> (# s', () #)
 
-setByteArray :: MBA s -> Int -> Int -> Int -> ST s ()
-setByteArray (MBA# dst#) (I# off#) (I# len#) (I# c#) =
+setByteArray :: MutableByteArray s -> Int -> Int -> Int -> ST s ()
+setByteArray (MutableByteArray dst#) (I# off#) (I# len#) (I# c#) =
     ST $ \s -> case setByteArray# dst# off# len# c# s of
                  s' -> (# s', () #)
 
-copyMutableByteArray :: MBA s -> Int -> MBA s -> Int -> Int -> ST s ()
-copyMutableByteArray (MBA# src#) (I# src_off#) (MBA# dst#) (I# dst_off#) (I# len#) =
+copyMutableByteArray :: MutableByteArray s -> Int -> MutableByteArray s -> Int -> Int -> ST s ()
+copyMutableByteArray (MutableByteArray src#) (I# src_off#) (MutableByteArray dst#) (I# dst_off#) (I# len#) =
     ST $ \s -> case copyMutableByteArray# src# src_off# dst# dst_off# len# s of
                  s' -> (# s', () #)
 
@@ -1700,40 +1610,17 @@ copyMutableByteArray (MBA# src#) (I# src_off#) (MBA# dst#) (I# dst_off#) (I# len
 ------------------------------------------------------------------------
 -- FFI imports
 --
-compareByteArrays :: BA -> BA -> Int -> Int
+compareByteArrays :: ByteArray -> ByteArray -> Int -> Int
 compareByteArrays ba1 ba2 = compareByteArraysOff ba1 0 ba2 0
 
-compareByteArraysOff :: BA  -- ^ array 1
+compareByteArraysOff :: ByteArray  -- ^ array 1
                      -> Int -- ^ offset for array 1
-                     -> BA  -- ^ array 2
+                     -> ByteArray  -- ^ array 2
                      -> Int -- ^ offset for array 2
                      -> Int -- ^ length to compare
                      -> Int -- ^ like memcmp
-#if MIN_VERSION_base(4,11,0)
-compareByteArraysOff (BA# ba1#) (I# ba1off#) (BA# ba2#) (I# ba2off#) (I# len#) =
+compareByteArraysOff (ByteArray ba1#) (I# ba1off#) (ByteArray ba2#) (I# ba2off#) (I# len#) =
   I# (compareByteArrays#  ba1# ba1off# ba2# ba2off# len#)
-#else
-compareByteArraysOff (BA# ba1#) ba1off (BA# ba2#) ba2off len =
-  assert (ba1off + len <= (I# (sizeofByteArray# ba1#)))
-  $ assert (ba2off + len <= (I# (sizeofByteArray# ba2#)))
-  $ fromIntegral $ accursedUnutterablePerformIO $
-    c_memcmp_ByteArray ba1#
-                       ba1off
-                       ba2#
-                       ba2off
-                       (fromIntegral len)
-
-
-foreign import ccall unsafe "static sbs_memcmp_off"
-  c_memcmp_ByteArray :: ByteArray# -> Int -> ByteArray# -> Int -> CSize -> IO CInt
-#endif
-
-foreign import ccall unsafe "static sbs_elem_index"
-    c_elem_index :: ByteArray# -> Word8 -> CSize -> IO CPtrdiff
-
-foreign import ccall unsafe "static fpstring.h fps_count" c_count
-    :: ByteArray# -> CSize -> Word8 -> IO CSize
-
 
 ------------------------------------------------------------------------
 -- Primop replacements
@@ -1793,9 +1680,13 @@ useAsCString sbs action =
       action buf
   where l = length sbs
 
--- | /O(n) construction./ Use a @ShortByteString@ with a function requiring a @CStringLen@.
--- As for @useAsCString@ this function makes a copy of the original @ShortByteString@.
+-- | /O(n) construction./ Use a @ShortByteString@ with a function requiring a 'CStringLen'.
+-- As for 'useAsCString' this function makes a copy of the original @ShortByteString@.
 -- It must not be stored or used after the subcomputation finishes.
+--
+-- Beware that this function does not add a terminating @\NUL@ byte at the end of 'CStringLen'.
+-- If you need to construct a pointer to a null-terminated sequence, use 'useAsCString'
+-- (and measure length independently if desired).
 --
 -- @since 0.10.10.0
 useAsCStringLen :: ShortByteString -> (CStringLen -> IO a) -> IO a
@@ -1809,7 +1700,7 @@ useAsCStringLen sbs action =
 --
 -- @since 0.11.3.0
 isValidUtf8 :: ShortByteString -> Bool
-isValidUtf8 sbs@(unSBS -> ba#) = accursedUnutterablePerformIO $ do
+isValidUtf8 sbs@(SBS ba#) = accursedUnutterablePerformIO $ do
   let n = length sbs
   -- Use a safe FFI call for large inputs to avoid GC synchronization pauses
   -- in multithreaded contexts.
@@ -1818,21 +1709,10 @@ isValidUtf8 sbs@(unSBS -> ba#) = accursedUnutterablePerformIO $ do
   -- When changing this function, also consider changing the related function:
   -- Data.ByteString.isValidUtf8
   i <- if n < 1000000 || not (isPinned ba#)
-     then cIsValidUtf8 ba# (fromIntegral n)
-     else cIsValidUtf8Safe ba# (fromIntegral n)
+     then cIsValidUtf8BA ba# (fromIntegral n)
+     else cIsValidUtf8BASafe ba# (fromIntegral n)
   IO (\s -> (# touch# ba# s, () #))
   return $ i /= 0
-
--- We import bytestring_is_valid_utf8 both unsafe and safe. For small inputs
--- we can use the unsafe version to get a bit more performance, but for large
--- inputs the safe version should be used to avoid GC synchronization pauses
--- in multithreaded contexts.
-
-foreign import ccall unsafe "bytestring_is_valid_utf8" cIsValidUtf8
-  :: ByteArray# -> CSize -> IO CInt
-
-foreign import ccall safe "bytestring_is_valid_utf8" cIsValidUtf8Safe
-  :: ByteArray# -> CSize -> IO CInt
 
 -- ---------------------------------------------------------------------
 -- Internal utilities
@@ -1873,7 +1753,7 @@ packLenBytesRev :: Int -> [Word8] -> ShortByteString
 packLenBytesRev len ws0 =
     create len (\mba -> go mba len ws0)
   where
-    go :: MBA s -> Int -> [Word8] -> ST s ()
+    go :: MutableByteArray s -> Int -> [Word8] -> ST s ()
     go !_   !_ []     = return ()
     go !mba !i (w:ws) = do
       writeWord8Array mba (i - 1) w

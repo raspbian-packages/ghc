@@ -59,7 +59,7 @@ import GHC.Hs.Instances () -- For Data instances
 import GHC.Utils.Outputable
 import GHC.Types.Fixity         ( Fixity )
 import GHC.Types.SrcLoc
-import GHC.Unit.Module.Warnings ( WarningTxt )
+import GHC.Unit.Module.Warnings
 
 -- libraries:
 import Data.Data hiding ( Fixity )
@@ -68,10 +68,10 @@ import Data.Data hiding ( Fixity )
 data XModulePs
   = XModulePs {
       hsmodAnn :: EpAnn AnnsModule,
-      hsmodLayout :: LayoutInfo GhcPs,
+      hsmodLayout :: EpLayout,
         -- ^ Layout info for the module.
-        -- For incomplete modules (e.g. the output of parseHeader), it is NoLayoutInfo.
-      hsmodDeprecMessage :: Maybe (LocatedP (WarningTxt GhcPs)),
+        -- For incomplete modules (e.g. the output of parseHeader), it is EpNoLayout.
+      hsmodDeprecMessage :: Maybe (LWarningTxt GhcPs),
         -- ^ reason\/explanation for warning/deprecation of this module
         --
         --  - 'GHC.Parser.Annotation.AnnKeywordId's : 'GHC.Parser.Annotation.AnnOpen'
@@ -101,8 +101,14 @@ deriving instance Data (HsModule GhcPs)
 data AnnsModule
   = AnnsModule {
     am_main :: [AddEpAnn],
-    am_decls :: AnnList
+    am_decls :: [TrailingAnn],                 -- ^ Semis before the start of top decls
+    am_cs :: [LEpaComment],                    -- ^ Comments before start of top decl,
+                                               --   used in exact printing only
+    am_eof :: Maybe (RealSrcSpan, RealSrcSpan) -- ^ End of file and end of prior token
     } deriving (Data, Eq)
+
+instance NoAnn AnnsModule where
+  noAnn = AnnsModule [] [] [] Nothing
 
 instance Outputable (HsModule GhcPs) where
     ppr (HsModule { hsmodExt = XModulePs { hsmodHaddockModHeader = mbDoc }

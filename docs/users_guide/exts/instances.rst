@@ -48,7 +48,7 @@ Relaxed rules for the instance head
     :implied by: :extension:`FlexibleInstances`
     :since: 6.8.1
 
-    :status: Included in :extension:`GHC2021`
+    :status: Included in :extension:`GHC2024`, :extension:`GHC2021`
 
     Allow definition of type class instances for type synonyms.
 
@@ -60,7 +60,7 @@ Relaxed rules for the instance head
 
     :since: 6.8.1
 
-    :status: Included in :extension:`GHC2021`
+    :status: Included in :extension:`GHC2024`, :extension:`GHC2021`
 
     Allow definition of type class instances with arbitrary nested types in the
     instance head.
@@ -139,8 +139,8 @@ BNF-style grammar for the tops of instance declarations below.
              |  arg_type infix_cls_tycon arg_type
              |  '(' arg_type infix_cls_tycon arg_type ')' arg_types
 
-  arg_type ::= <empty>
-            |  arg_type arg_types
+  arg_types ::= <empty>
+             |  arg_type arg_types
 
   opt_where ::= <empty>
              |  'where'
@@ -486,8 +486,8 @@ like this:
    -  :math:`IY` is strictly more specific than :math:`IX`.  That
       is, :math:`IY` is a substitution instance of :math:`IX` but not vice versa.
 
-   -  Either :math:`IX` is *overlappable*, or :math:`IY` is *overlapping*. (This
-      "either/or" design, rather than a "both/and" design, allow a
+   -  :math:`IX` is *overlappable* or :math:`IY` is *overlapping*. (This
+      "or" design, rather than an "and" design, allows a
       client to deliberately override an instance from a library,
       without requiring a change to the library.)
 
@@ -671,7 +671,7 @@ Instance signatures: type signatures in instance declarations
 
     :since: 7.6.1
 
-    :status: Included in :extension:`GHC2021`
+    :status: Included in :extension:`GHC2024`, :extension:`GHC2021`
 
     Allow type signatures for members in instance definitions.
 
@@ -718,7 +718,7 @@ Some details:
 -  The instance signature is purely local to the class instance
    declaration. It only affects the typechecking of the method in
    the instance; it does not affect anything outside the class
-   instance. In this way, it is similar to an inline type signature:
+   instance. In this way, it is similar to an inline type signature: ::
 
        instance Eq a => Eq (T a) where
            (==) = (\ x y -> True) :: forall b. b -> b -> Bool

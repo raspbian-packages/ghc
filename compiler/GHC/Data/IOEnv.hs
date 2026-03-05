@@ -28,13 +28,13 @@ module GHC.Data.IOEnv (
         tryM, tryAllM, tryMostM, fixM,
 
         -- I/O operations
-        IORef, newMutVar, readMutVar, writeMutVar, updMutVar, updMutVarM,
+        IORef, newMutVar, readMutVar, writeMutVar, updMutVar,
         atomicUpdMutVar, atomicUpdMutVar'
   ) where
 
 import GHC.Prelude
 
-import GHC.Driver.Session
+import GHC.Driver.DynFlags
 import {-# SOURCE #-} GHC.Driver.Hooks
 import GHC.IO (catchException)
 import GHC.Utils.Exception
@@ -226,12 +226,6 @@ readMutVar var = liftIO (readIORef var)
 
 updMutVar :: IORef a -> (a -> a) -> IOEnv env ()
 updMutVar var upd = liftIO (modifyIORef var upd)
-
-updMutVarM :: IORef a -> (a -> IOEnv env a) -> IOEnv env ()
-updMutVarM ref upd
-  = do { contents     <- liftIO $ readIORef ref
-       ; new_contents <- upd contents
-       ; liftIO $ writeIORef ref new_contents }
 
 -- | Atomically update the reference.  Does not force the evaluation of the
 -- new variable contents.  For strict update, use 'atomicUpdMutVar''.

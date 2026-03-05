@@ -25,6 +25,7 @@
 
 #include "rts/PosixSource.h"
 #include "Rts.h"
+#include "RtsFlags.h"
 
 #include "Storage.h"
 #include "GCThread.h"
@@ -401,7 +402,7 @@ void listAllBlocks (ListBlocksCb cb, void *user)
 
       // list capabilities' current segments
       if(RtsFlags.GcFlags.useNonmoving) {
-        for (s = 0; s < NONMOVING_ALLOCA_CNT; s++) {
+        for (s = 0; s < nonmoving_alloca_cnt; s++) {
           listSegmentBlocks(cb, user, getCapability(i)->current_segments[s]);
         }
       }
@@ -409,7 +410,7 @@ void listAllBlocks (ListBlocksCb cb, void *user)
 
   // list blocks on the nonmoving heap
   if(RtsFlags.GcFlags.useNonmoving) {
-    for(s = 0; s < NONMOVING_ALLOCA_CNT; s++) {
+    for(s = 0; s < nonmoving_alloca_cnt; s++) {
       listSegmentBlocks(cb, user, nonmovingHeap.allocators[s].filled);
       listSegmentBlocks(cb, user, nonmovingHeap.allocators[s].saved_filled);
       listSegmentBlocks(cb, user, nonmovingHeap.allocators[s].active);
@@ -994,7 +995,7 @@ move_STACK (StgStack *src, StgStack *dest)
 void
 accountAllocation(Capability *cap, W_ n)
 {
-    TICK_ALLOC_HEAP_NOCTR(WDS(n));
+    TICK_ALLOC_RTS(WDS(n));
     CCS_ALLOC(cap->r.rCCCS,n);
     if (cap->r.rCurrentTSO != NULL) {
         // cap->r.rCurrentTSO->alloc_limit -= n*sizeof(W_)
@@ -1440,7 +1441,7 @@ dirty_MUT_VAR(StgRegTable *reg, StgMutVar *mvar, StgClosure *old)
     Capability *cap = regTableToCapability(reg);
     // No barrier required here as no other heap object fields are read. See
     // Note [Heap memory barriers] in SMP.h.
-    SET_INFO((StgClosure*) mvar, &stg_MUT_VAR_DIRTY_info);
+    SET_INFO_RELAXED((StgClosure*) mvar, &stg_MUT_VAR_DIRTY_info);
     recordClosureMutated(cap, (StgClosure *) mvar);
     IF_NONMOVING_WRITE_BARRIER_ENABLED {
         // See Note [Dirty flags in the non-moving collector] in NonMoving.c
@@ -1462,7 +1463,7 @@ dirty_TVAR(Capability *cap, StgTVar *p,
     // No barrier required here as no other heap object fields are read. See
     // Note [Heap memory barriers] in SMP.h.
     if (RELAXED_LOAD(&p->header.info) == &stg_TVAR_CLEAN_info) {
-        SET_INFO((StgClosure*) p, &stg_TVAR_DIRTY_info);
+        SET_INFO_RELAXED((StgClosure*) p, &stg_TVAR_DIRTY_info);
         recordClosureMutated(cap,(StgClosure*)p);
         IF_NONMOVING_WRITE_BARRIER_ENABLED {
             // See Note [Dirty flags in the non-moving collector] in NonMoving.c
@@ -1642,20 +1643,59 @@ W_ countOccupied (bdescr *bd)
     return words;
 }
 
+// Returns the total number of live words
 W_ genLiveWords (generation *gen)
 {
-    return (gen->live_estimate ? gen->live_estimate : gen->n_words) +
-        gen->n_large_words + gen->n_compact_blocks * BLOCK_SIZE_W;
+    return genLiveCopiedWords(gen) + genLiveUncopiedWords(gen);
 }
 
-W_ genLiveBlocks (generation *gen)
+// The number of live words which will be copied by the copying collector.
+W_ genLiveCopiedWords (generation *gen)
+{
+  if (gen == oldest_gen && RtsFlags.GcFlags.useNonmoving){
+    // the non-moving generation doesn't contain any copied data
+    return 0;
+  } else {
+    return gen->live_estimate ? gen->live_estimate : gen->n_words;
+  }
+}
+
+// The number of live words which will not be copied by the copying collector
+// This includes data living in non-moving collector segments, compact blocks and large/pinned blocks.
+W_ genLiveUncopiedWords(generation *gen)
+{
+  W_ nonmoving_blocks = 0;
+  // The nonmoving heap contains some blocks that live outside the regular generation structure.
+  if (gen == oldest_gen && RtsFlags.GcFlags.useNonmoving){
+    nonmoving_blocks =
+        (gen->live_estimate ? gen->live_estimate : gen->n_words)
+      + nonmoving_large_words
+      + nonmoving_compact_words;
+  }
+  return gen->n_large_words + gen->n_compact_blocks * BLOCK_SIZE_W + nonmoving_blocks;
+}
+
+// The number of live blocks which will be copied by the copying collector.
+W_ genLiveCopiedBlocks (generation *gen)
+{
+  return gen->n_blocks;
+}
+
+// The number of live blocks which will not be copied by the copying collector
+// This includes non-moving collector segments, compact blocks and large/pinned blocks.
+W_ genLiveUncopiedBlocks (generation *gen)
 {
   W_ nonmoving_blocks = 0;
   // The nonmoving heap contains some blocks that live outside the regular generation structure.
   if (gen == oldest_gen && RtsFlags.GcFlags.useNonmoving){
     nonmoving_blocks = n_nonmoving_large_blocks + n_nonmoving_marked_large_blocks + n_nonmoving_compact_blocks + n_nonmoving_marked_compact_blocks;
   }
-  return gen->n_blocks + gen->n_large_blocks + gen->n_compact_blocks + nonmoving_blocks;
+  return gen->n_large_blocks + gen->n_compact_blocks + nonmoving_blocks;
+}
+
+W_ genLiveBlocks (generation *gen)
+{
+  return genLiveCopiedBlocks(gen) + genLiveUncopiedBlocks(gen);
 }
 
 W_ gcThreadLiveWords (uint32_t i, uint32_t g)
@@ -1963,3 +2003,47 @@ The compacting collector does nothing to improve megablock
 level fragmentation. The role of the compacting GC is to remove object level
 fragmentation and to use less memory when collecting. - see #19248
 */
+
+void rts_clearMemory(void) {
+    ACQUIRE_SM_LOCK;
+
+    clear_free_list();
+
+    for (uint32_t i = 0; i < n_nurseries; ++i) {
+        for (bdescr *bd = nurseries[i].blocks; bd; bd = bd->link) {
+            clear_blocks(bd);
+        }
+    }
+
+    for (unsigned int i = 0; i < getNumCapabilities(); ++i) {
+        for (bdescr *bd = getCapability(i)->pinned_object_empty; bd; bd = bd->link) {
+            clear_blocks(bd);
+        }
+
+        for (bdescr *bd = gc_threads[i]->free_blocks; bd; bd = bd->link) {
+            clear_blocks(bd);
+        }
+    }
+
+    if (RtsFlags.GcFlags.useNonmoving)
+    {
+        for (struct NonmovingSegment *seg = nonmovingHeap.free; seg; seg = seg->link) {
+            nonmovingClearSegment(seg);
+        }
+
+        for (int i = 0; i < nonmoving_alloca_cnt; ++i) {
+            struct NonmovingAllocator *alloc = &nonmovingHeap.allocators[i];
+
+            for (struct NonmovingSegment *seg = alloc->active; seg; seg = seg->link) {
+                nonmovingClearSegmentFreeBlocks(seg);
+            }
+
+            for (unsigned int j = 0; j < getNumCapabilities(); ++j) {
+                Capability *cap = getCapability(j);
+                nonmovingClearSegmentFreeBlocks(cap->current_segments[i]);
+            }
+        }
+    }
+
+    RELEASE_SM_LOCK;
+}

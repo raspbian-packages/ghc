@@ -8,6 +8,8 @@ module Haddock.Backends.Hyperlinker.Utils
     , hypSrcModuleUrlFormat
     , hypSrcModuleNameUrlFormat, hypSrcModuleLineUrlFormat
     , spliceURL, spliceURL'
+    , hypSrcModuleUrlToNameFormat
+    , hypSrcPkgUrlToModuleFormat
 
     -- * HIE file processing
     , PrintedType
@@ -39,7 +41,7 @@ hypSrcModuleFile m = moduleNameString (moduleName m) <.> "html"
 
 hypSrcModuleFile' :: ModuleName -> FilePath
 hypSrcModuleFile' mdl = spliceURL'
-    Nothing (Just mdl) Nothing Nothing moduleFormat
+    (Just mdl) Nothing Nothing moduleFormat
 
 hypSrcModuleUrl :: Module -> String
 hypSrcModuleUrl = hypSrcModuleFile
@@ -71,6 +73,12 @@ hypSrcModuleNameUrlFormat = hypSrcModuleUrlFormat ++ "#" ++ nameFormat
 
 hypSrcModuleLineUrlFormat :: String
 hypSrcModuleLineUrlFormat = hypSrcModuleUrlFormat ++ "#" ++ lineFormat
+
+hypSrcModuleUrlToNameFormat :: String -> String
+hypSrcModuleUrlToNameFormat url = url ++ "#" ++ nameFormat
+
+hypSrcPkgUrlToModuleFormat :: String -> String
+hypSrcPkgUrlToModuleFormat url = url </> moduleFormat
 
 moduleFormat :: String
 moduleFormat = "%{MODULE}.html"

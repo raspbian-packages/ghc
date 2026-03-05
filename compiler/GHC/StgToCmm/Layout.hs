@@ -1,4 +1,3 @@
-{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE CPP #-}
 
 -----------------------------------------------------------------------------
@@ -26,7 +25,7 @@ module GHC.StgToCmm.Layout (
         mkVirtConstrSizes,
         getHpRelOffset,
 
-        ArgRep(..), toArgRep, argRepSizeW, -- re-exported from GHC.StgToCmm.ArgRep
+        ArgRep(..), toArgRep, toArgRepOrV, idArgRep, argRepSizeW, -- re-exported from GHC.StgToCmm.ArgRep
         getArgAmode, getNonVoidArgAmodes
   ) where
 
@@ -50,7 +49,7 @@ import GHC.Cmm.Info
 import GHC.Cmm.CLabel
 import GHC.Stg.Syntax
 import GHC.Types.Id
-import GHC.Core.TyCon    ( PrimRep(..), primRepSizeB )
+import GHC.Core.TyCon    ( PrimRep(..), PrimOrVoidRep(..), primRepSizeB )
 import GHC.Types.Basic   ( RepArity )
 import GHC.Platform
 import GHC.Platform.Profile
@@ -60,7 +59,6 @@ import GHC.Utils.Misc
 import Data.List (mapAccumL, partition)
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
-import GHC.Utils.Panic.Plain
 import GHC.Utils.Constants (debugIsOn)
 import GHC.Data.FastString
 import Control.Monad
@@ -155,9 +153,10 @@ adjustHpBackwards
               adjust_words = vHp -rHp
         ; new_hp <- getHpRelOffset vHp
 
+        ; platform <- getPlatform
         ; emit (if adjust_words == 0
                 then mkNop
-                else mkAssign hpReg new_hp) -- Generates nothing when vHp==rHp
+                else mkAssign (hpReg platform) new_hp) -- Generates nothing when vHp==rHp
 
         ; tickyAllocHeap False adjust_words -- ...ditto
 
@@ -305,10 +304,11 @@ direct_call caller call_conv lbl arity args
 
   | otherwise       -- Note [over-saturated calls]
   = do do_scc_prof <- stgToCmmSCCProfiling <$> getStgToCmmConfig
+       platform <- getPlatform
        emitCallWithExtraStack (call_conv, NativeReturn)
                               target
                               (nonVArgs fast_args)
-                              (nonVArgs (slowArgs rest_args do_scc_prof))
+                              (nonVArgs (slowArgs platform rest_args do_scc_prof))
   where
     target = CmmLit (CmmLabel lbl)
     (fast_args, rest_args) = splitAt real_arity args
@@ -327,10 +327,10 @@ getArgRepsAmodes args = do
    platform <- profilePlatform <$> getProfile
    mapM (getArgRepAmode platform) args
   where getArgRepAmode platform arg
-           | V <- rep  = return (V, Nothing)
-           | otherwise = do expr <- getArgAmode (NonVoid arg)
-                            return (rep, Just expr)
-           where rep = toArgRep platform (argPrimRep arg)
+           = case stgArgRep1 arg of
+               VoidRep -> return (V, Nothing)
+               NVRep rep -> do expr <- getArgAmode (NonVoid arg)
+                               return (toArgRep platform rep, Just expr)
 
 nonVArgs :: [(ArgRep, Maybe CmmExpr)] -> [CmmExpr]
 nonVArgs [] = []
@@ -375,18 +375,18 @@ just more arguments that we are passing on the stack (cml_args).
 -- | 'slowArgs' takes a list of function arguments and prepares them for
 -- pushing on the stack for "extra" arguments to a function which requires
 -- fewer arguments than we currently have.
-slowArgs :: [(ArgRep, Maybe CmmExpr)] -> DoSCCProfiling -> [(ArgRep, Maybe CmmExpr)]
-slowArgs []   _                    = mempty
-slowArgs args sccProfilingEnabled  -- careful: reps contains voids (V), but args does not
-  | sccProfilingEnabled = save_cccs ++ this_pat ++ slowArgs rest_args sccProfilingEnabled
-  | otherwise           =              this_pat ++ slowArgs rest_args sccProfilingEnabled
+slowArgs :: Platform -> [(ArgRep, Maybe CmmExpr)] -> DoSCCProfiling -> [(ArgRep, Maybe CmmExpr)]
+slowArgs _ []  _        = mempty
+slowArgs platform args sccProfilingEnabled  -- careful: reps contains voids (V), but args does not
+  | sccProfilingEnabled = save_cccs ++ this_pat ++ slowArgs platform rest_args sccProfilingEnabled
+  | otherwise           =              this_pat ++ slowArgs platform rest_args sccProfilingEnabled
   where
     (arg_pat, n)            = slowCallPattern (map fst args)
     (call_args, rest_args)  = splitAt n args
 
     stg_ap_pat = mkCmmRetInfoLabel rtsUnitId arg_pat
     this_pat   = (N, Just (mkLblExpr stg_ap_pat)) : call_args
-    save_cccs  = [(N, Just (mkLblExpr save_cccs_lbl)), (N, Just cccsExpr)]
+    save_cccs  = [(N, Just (mkLblExpr save_cccs_lbl)), (N, Just $ cccsExpr platform)]
     save_cccs_lbl = mkCmmRetInfoLabel rtsUnitId (fsLit "stg_restore_cccs")
 
 -------------------------------------------------------------------------
@@ -404,7 +404,7 @@ getHpRelOffset :: VirtualHpOffset -> FCode CmmExpr
 getHpRelOffset virtual_offset
   = do platform <- getPlatform
        hp_usg <- getHpUsage
-       return (cmmRegOffW platform hpReg (hpRel (realHp hp_usg) virtual_offset))
+       return (cmmRegOffW platform (hpReg platform) (hpRel (realHp hp_usg) virtual_offset))
 
 data FieldOffOrPadding a
     = FieldOff (NonVoid a) -- Something that needs an offset.
@@ -437,7 +437,6 @@ mkVirtHeapOffsetsWithPadding
 -- than the unboxed things
 
 mkVirtHeapOffsetsWithPadding profile header things =
-    assert (not (any (isVoidRep . fst . fromNonVoid) things))
     ( tot_wds
     , bytesToWordsRoundUp platform bytes_of_ptrs
     , concat (ptrs_w_offsets ++ non_ptrs_w_offsets) ++ final_pad
@@ -519,13 +518,13 @@ mkVirtConstrOffsets profile = mkVirtHeapOffsets profile StdHeader
 -- | Just like mkVirtConstrOffsets, but used when we don't have the actual
 -- arguments. Useful when e.g. generating info tables; we just need to know
 -- sizes of pointer and non-pointer fields.
-mkVirtConstrSizes :: Profile -> [NonVoid PrimRep] -> (WordOff, WordOff)
+mkVirtConstrSizes :: Profile -> [PrimRep] -> (WordOff, WordOff)
 mkVirtConstrSizes profile field_reps
   = (tot_wds, ptr_wds)
   where
     (tot_wds, ptr_wds, _) =
        mkVirtConstrOffsets profile
-         (map (\nv_rep -> NonVoid (fromNonVoid nv_rep, ())) field_reps)
+         (map (\nv_rep -> NonVoid (nv_rep, ())) field_reps)
 
 -------------------------------------------------------------------------
 --
@@ -554,7 +553,7 @@ mkArgDescr platform args
 argBits :: Platform -> [ArgRep] -> [Bool]        -- True for non-ptr, False for ptr
 argBits _         []           = []
 argBits platform (P   : args) = False : argBits platform args
-argBits platform (arg : args) = take (argRepSizeW platform arg) (repeat True)
+argBits platform (arg : args) = replicate (argRepSizeW platform arg) True
                                  ++ argBits platform args
 
 ----------------------
@@ -602,12 +601,7 @@ getArgAmode (NonVoid (StgLitArg lit)) = cgLit lit
 getNonVoidArgAmodes :: [StgArg] -> FCode [CmmExpr]
 -- NB: Filters out void args,
 --     so the result list may be shorter than the argument list
-getNonVoidArgAmodes [] = return []
-getNonVoidArgAmodes (arg:args)
-  | isVoidRep (argPrimRep arg) = getNonVoidArgAmodes args
-  | otherwise = do { amode  <- getArgAmode (NonVoid arg)
-                   ; amodes <- getNonVoidArgAmodes args
-                   ; return ( amode : amodes ) }
+getNonVoidArgAmodes args = mapM getArgAmode (nonVoidStgArgs args)
 
 -------------------------------------------------------------------------
 --

@@ -31,6 +31,10 @@ module GHC.Tc.Utils.TcType (
   ExpTypeFRR, ExpSigmaType, ExpSigmaTypeFRR,
   ExpRhoType,
   mkCheckExpType,
+  checkingExpType_maybe, checkingExpType,
+
+  ExpPatType(..), mkCheckExpFunPatTy, mkInvisExpPatType,
+  isVisibleExpPatType, isExpFunPatType,
 
   SyntaxOpType(..), synKnownType, mkSynFunTys,
 
@@ -38,7 +42,7 @@ module GHC.Tc.Utils.TcType (
   -- TcLevel
   TcLevel(..), topTcLevel, pushTcLevel, isTopTcLevel,
   strictlyDeeperThan, deeperThanOrSame, sameDepthAs,
-  tcTypeLevel, tcTyVarLevel, maxTcLevel,
+  tcTypeLevel, tcTyVarLevel, maxTcLevel, minTcLevel,
 
   --------------------------------
   -- MetaDetails
@@ -47,7 +51,8 @@ module GHC.Tc.Utils.TcType (
   isImmutableTyVar, isSkolemTyVar, isMetaTyVar,  isMetaTyVarTy, isTyVarTy,
   tcIsTcTyVar, isTyVarTyVar, isOverlappableTyVar,  isTyConableTyVar,
   ConcreteTvOrigin(..), isConcreteTyVar_maybe, isConcreteTyVar,
-  isConcreteTyVarTy, isConcreteTyVarTy_maybe,
+  isConcreteTyVarTy, isConcreteTyVarTy_maybe, isConcreteInfo,
+  ConcreteTyVars, noConcreteTyVars,
   isAmbiguousTyVar, isCycleBreakerTyVar, metaTyVarRef, metaTyVarInfo,
   isFlexi, isIndirect, isRuntimeUnkSkol,
   metaTyVarTcLevel, setMetaTyVarTcLevel, metaTyVarTcLevel_maybe,
@@ -62,7 +67,7 @@ module GHC.Tc.Utils.TcType (
   --------------------------------
   -- Splitters
   getTyVar, getTyVar_maybe, getCastedTyVar_maybe,
-  tcSplitForAllTyVarBinder_maybe,
+  tcSplitForAllTyVarBinder_maybe, tcSplitForAllTyVarsReqTVBindersN,
   tcSplitForAllTyVars, tcSplitForAllInvisTyVars, tcSplitSomeForAllTyVars,
   tcSplitForAllReqTVBinders, tcSplitForAllInvisTVBinders,
   tcSplitPiTys, tcSplitPiTy_maybe, tcSplitForAllTyVarBinders,
@@ -72,7 +77,7 @@ module GHC.Tc.Utils.TcType (
   tcSplitTyConApp, tcSplitTyConApp_maybe,
   tcTyConAppTyCon, tcTyConAppTyCon_maybe, tcTyConAppArgs,
   tcSplitAppTy_maybe, tcSplitAppTy, tcSplitAppTys, tcSplitAppTyNoView_maybe,
-  tcSplitSigmaTy, tcSplitNestedSigmaTys,
+  tcSplitSigmaTy, tcSplitSigmaTyBndrs, tcSplitNestedSigmaTys, tcSplitIOType_maybe,
 
   ---------------------------------
   -- Predicates.
@@ -84,21 +89,19 @@ module GHC.Tc.Utils.TcType (
   isTauTy, isTauTyCon, tcIsTyVarTy,
   isPredTy, isTyVarClassPred,
   checkValidClsArgs, hasTyVarHead,
-  isRigidTy,
+  isRigidTy, anyTy_maybe,
 
 
   -- Re-exported from GHC.Core.TyCo.Compare
   -- mainly just for back-compat reasons
   eqType, eqTypes, nonDetCmpType, nonDetCmpTypes, eqTypeX,
-  pickyEqType, tcEqType, tcEqKind, tcEqTypeNoKindCheck, tcEqTypeVis,
+  pickyEqType, tcEqType, tcEqKind, tcEqTypeNoKindCheck, mayLookIdentical,
   tcEqTyConApps, eqForAllVis, eqVarBndrs,
 
   ---------------------------------
   -- Misc type manipulators
 
   deNoteType,
-  orphNamesOfType, orphNamesOfCo,
-  orphNamesOfTypes, orphNamesOfCoCon,
   getDFunTyKey, evVarPred,
   ambigTkvsOfTy,
 
@@ -117,23 +120,9 @@ module GHC.Tc.Utils.TcType (
   anyRewritableTyVar, anyRewritableTyFamApp,
 
   ---------------------------------
-  -- Foreign import and export
-  IllegalForeignTypeReason(..),
-  TypeCannotBeMarshaledReason(..),
-  isFFIArgumentTy,     -- :: DynFlags -> Safety -> Type -> Bool
-  isFFIImportResultTy, -- :: DynFlags -> Type -> Bool
-  isFFIExportResultTy, -- :: Type -> Bool
-  isFFIExternalTy,     -- :: Type -> Bool
-  isFFIDynTy,          -- :: Type -> Type -> Bool
-  isFFIPrimArgumentTy, -- :: DynFlags -> Type -> Bool
-  isFFIPrimResultTy,   -- :: DynFlags -> Type -> Bool
-  isFFILabelTy,        -- :: Type -> Bool
-  isFunPtrTy,          -- :: Type -> Bool
-  tcSplitIOType_maybe, -- :: Type -> Maybe Type
-
-  ---------------------------------
   -- Patersons sizes
-  PatersonSize(..), PatersonSizeFailure(..),
+  PatersonSize(..), PatersonCondFailure(..),
+  PatersonCondFailureContext(..),
   ltPatersonSize,
   pSizeZero, pSizeOne,
   pSizeType, pSizeTypeX, pSizeTypes,
@@ -163,8 +152,8 @@ module GHC.Tc.Utils.TcType (
   mkTyConTy, mkTyVarTy, mkTyVarTys,
   mkTyCoVarTy, mkTyCoVarTys,
 
-  isClassPred, isEqPrimPred, isIPLikePred, isEqPred, isEqPredClass,
-  mkClassPred,
+  isClassPred, isEqPrimPred, isIPLikePred, isEqPred,
+  isEqualityClass, mkClassPred,
   tcSplitQuantPredTy, tcSplitDFunTy, tcSplitDFunHead, tcSplitMethodTy,
   isRuntimeRepVar, isFixedRuntimeRepKind,
   isVisiblePiTyBinder, isInvisiblePiTyBinder,
@@ -178,7 +167,7 @@ module GHC.Tc.Utils.TcType (
   extendSubstInScopeList, extendSubstInScopeSet, extendTvSubstAndInScope,
   Type.lookupTyVar, Type.extendTCvSubst, Type.substTyVarBndr,
   Type.extendTvSubst,
-  isInScope, mkSubst, mkTvSubst, zipTyEnv, zipCoEnv,
+  isInScope, mkTCvSubst, mkTvSubst, zipTyEnv, zipCoEnv,
   Type.substTy, substTys, substScaledTys, substTyWith, substTyWithCoVars,
   substTyAddInScope,
   substTyUnchecked, substTysUnchecked, substScaledTyUnchecked,
@@ -207,7 +196,7 @@ module GHC.Tc.Utils.TcType (
 
   ---------------------------------
   -- argument visibility
-  tcTyConVisibilities, isNextTyConArgVisible, isNextArgVisible
+  tyConVisibilities, isNextTyConArgVisible, isNextArgVisible
 
   ) where
 
@@ -221,12 +210,10 @@ import GHC.Core.TyCo.FVs
 import GHC.Core.TyCo.Ppr
 import GHC.Core.Class
 import GHC.Types.Var
-import GHC.Types.ForeignCall
 import GHC.Types.Var.Set
 import GHC.Core.Coercion
 import GHC.Core.Type as Type
 import GHC.Core.Predicate
-import GHC.Types.RepType
 import GHC.Core.TyCon
 
 import {-# SOURCE #-} GHC.Tc.Types.Origin
@@ -234,14 +221,13 @@ import {-# SOURCE #-} GHC.Tc.Types.Origin
   , FixedRuntimeRepOrigin, FixedRuntimeRepContext )
 
 -- others:
-import GHC.Driver.Session
-import GHC.Core.FVs
 import GHC.Types.Name as Name
             -- We use this to make dictionaries for type literals.
             -- Perhaps there's a better way to do this?
+import GHC.Types.Name.Env
 import GHC.Types.Name.Set
 import GHC.Builtin.Names
-import GHC.Builtin.Types ( coercibleClass, eqClass, heqClass, unitTyCon, unitTyConKey
+import GHC.Builtin.Types ( coercibleClass, eqClass, heqClass, unitTyConKey
                          , listTyCon, constraintKind )
 import GHC.Types.Basic
 import GHC.Utils.Misc
@@ -249,15 +235,10 @@ import GHC.Data.Maybe
 import GHC.Data.List.SetOps ( getNth, findDupsEq )
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
-import GHC.Utils.Panic.Plain
-import GHC.Utils.Error( Validity'(..) )
-import qualified GHC.LanguageExtensions as LangExt
 
-import Data.IORef
+import Data.IORef ( IORef )
 import Data.List.NonEmpty( NonEmpty(..) )
 import Data.List ( partition, nub, (\\) )
-
-import GHC.Generics ( Generic )
 
 {-
 ************************************************************************
@@ -371,7 +352,7 @@ type TcTyVarBinder     = TyVarBinder
 type TcInvisTVBinder   = InvisTVBinder
 type TcReqTVBinder     = ReqTVBinder
 
--- See Note [TcTyCon, MonoTcTyCon, and PolyTcTyCon]
+-- See Note [TcTyCon, MonoTcTyCon, and PolyTcTyCon] in GHC.Tc.TyCl
 type TcTyCon       = TyCon
 type MonoTcTyCon   = TcTyCon
 type PolyTcTyCon   = TcTyCon
@@ -405,50 +386,6 @@ type TcTyCoVarSet   = TyCoVarSet
 type TcDTyVarSet    = DTyVarSet
 type TcDTyCoVarSet  = DTyCoVarSet
 
-{- Note [TcTyCon, MonoTcTyCon, and PolyTcTyCon]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-See Note [How TcTyCons work] in GHC.Tc.TyCl
-
-Invariants:
-
-* TcTyCon: a TyCon built with the TcTyCon constructor
-
-* TcTyConBinder: a TyConBinder with a TcTyVar inside (not a TyVar)
-
-* TcTyCons contain TcTyVars
-
-* MonoTcTyCon:
-  - Flag tcTyConIsPoly = False
-
-  - tyConScopedTyVars is important; maps a Name to a TyVarTv unification variable
-    The order is important: Specified then Required variables.   E.g. in
-        data T a (b :: k) = ...
-    the order will be [k, a, b].
-
-    NB: There are no Inferred binders in tyConScopedTyVars; 'a' may
-    also be poly-kinded, but that kind variable will be added by
-    generaliseTcTyCon, in the passage to a PolyTcTyCon.
-
-  - tyConBinders are irrelevant; we just use tcTyConScopedTyVars
-    Well not /quite/ irrelevant: its length gives the number of Required binders,
-    and so allows up to distinguish between the Specified and Required elements of
-    tyConScopedTyVars.
-
-* PolyTcTyCon:
-  - Flag tcTyConIsPoly = True; this is used only to short-cut zonking
-
-  - tyConBinders are still TcTyConBinders, but they are /skolem/ TcTyVars,
-    with fixed kinds, and accurate skolem info: no unification variables here
-
-    tyConBinders includes the Inferred binders if any
-
-    tyConBinders uses the Names from the original, renamed program.
-
-  - tcTyConScopedTyVars is irrelevant: just use (binderVars tyConBinders)
-    All the types have been swizzled back to use the original Names
-    See Note [tyConBinders and lexical scoping] in GHC.Core.TyCon
-
--}
 
 {- *********************************************************************
 *                                                                      *
@@ -512,6 +449,39 @@ instance Outputable InferResult where
 mkCheckExpType :: TcType -> ExpType
 mkCheckExpType = Check
 
+-- | Returns the expected type when in checking mode.
+checkingExpType_maybe :: ExpType -> Maybe TcType
+checkingExpType_maybe (Check ty) = Just ty
+checkingExpType_maybe (Infer {}) = Nothing
+
+-- | Returns the expected type when in checking mode.
+--   Panics if in inference mode.
+checkingExpType :: ExpType -> TcType
+checkingExpType (Check ty)    = ty
+checkingExpType et@(Infer {}) = pprPanic "checkingExpType" (ppr et)
+
+-- Expected type of a pattern in a lambda or a function left-hand side.
+data ExpPatType =
+    ExpFunPatTy    (Scaled ExpSigmaTypeFRR)   -- the type A of a function A -> B
+  | ExpForAllPatTy ForAllTyBinder             -- the binder (a::A) of  forall (a::A) -> B or forall (a :: A). B
+
+mkCheckExpFunPatTy :: Scaled TcType -> ExpPatType
+mkCheckExpFunPatTy (Scaled mult ty) = ExpFunPatTy (Scaled mult (mkCheckExpType ty))
+
+mkInvisExpPatType :: InvisTyBinder -> ExpPatType
+mkInvisExpPatType (Bndr tv spec) = ExpForAllPatTy (Bndr tv (Invisible spec))
+
+isVisibleExpPatType :: ExpPatType -> Bool
+isVisibleExpPatType (ExpForAllPatTy (Bndr _ vis)) = isVisibleForAllTyFlag vis
+isVisibleExpPatType (ExpFunPatTy {})              = True
+
+isExpFunPatType :: ExpPatType -> Bool
+isExpFunPatType ExpFunPatTy{}    = True
+isExpFunPatType ExpForAllPatTy{} = False
+
+instance Outputable ExpPatType where
+  ppr (ExpFunPatTy t) = ppr t
+  ppr (ExpForAllPatTy tv) = text "forall" <+> ppr tv
 
 {- *********************************************************************
 *                                                                      *
@@ -604,7 +574,7 @@ TcTyVar.  This is very convenient to a consumer of a SkolemTv, but it is
 a bit awkward for the /producer/.  Why? Because sometimes we can't produce
 the SkolemInfo until we have the TcTyVars!
 
-Example: in `GHC.Tc.Utils.Unify.tcTopSkolemise` we create SkolemTvs whose
+Example: in `GHC.Tc.Utils.Unify.tcSkolemise` we create SkolemTvs whose
 `SkolemInfo` is `SigSkol`, whose arguments in turn mention the newly-created
 SkolemTvs.  So we a RecrusiveDo idiom, like this:
 
@@ -656,7 +626,7 @@ data MetaDetails
   | Indirect TcType
 
 -- | What restrictions are on this metavariable around unification?
--- These are checked in GHC.Tc.Utils.Unify.startSolvingByUnification.
+-- These are checked in GHC.Tc.Utils.Unify.checkTopShape
 data MetaInfo
    = TauTv         -- ^ This MetaTv is an ordinary unification variable
                    -- A TauTv is always filled in with a tau-type, which
@@ -671,7 +641,7 @@ data MetaInfo
 
    | CycleBreakerTv  -- Used to fix occurs-check problems in Givens
                      -- See Note [Type equality cycles] in
-                     -- GHC.Tc.Solver.Canonical
+                     -- GHC.Tc.Solver.Equality
 
    | ConcreteTv ConcreteTvOrigin
         -- ^ A unification variable that can only be unified
@@ -700,6 +670,16 @@ data ConcreteTvOrigin
    -- See 'FixedRuntimeRepOrigin' for more information.
   = ConcreteFRR FixedRuntimeRepOrigin
 
+-- | A mapping from skolem type variable 'Name' to concreteness information,
+--
+-- See Note [Representation-polymorphism checking built-ins] in GHC.Tc.Gen.Head.
+type ConcreteTyVars = NameEnv ConcreteTvOrigin
+
+-- | The 'Id' has no outer forall'd type variables which must be instantiated
+-- to concrete types.
+noConcreteTyVars :: ConcreteTyVars
+noConcreteTyVars = emptyNameEnv
+
 {- *********************************************************************
 *                                                                      *
                 Untouchable type variables
@@ -717,6 +697,9 @@ Note [TcLevel invariants]
   and skolem (SkolemTv)
   and each Implication
   has a level number (of type TcLevel)
+
+* INVARIANT (KindInv) Given a type variable (tv::ki) at at level L,
+                      the free vars of `ki` all have level <= L
 
 * INVARIANTS.  In a tree of Implications,
 
@@ -799,6 +782,9 @@ touchable; but then 'b' has escaped its scope into the outer implication.
 
 maxTcLevel :: TcLevel -> TcLevel -> TcLevel
 maxTcLevel (TcLevel a) (TcLevel b) = TcLevel (a `max` b)
+
+minTcLevel :: TcLevel -> TcLevel -> TcLevel
+minTcLevel (TcLevel a) (TcLevel b) = TcLevel (a `min` b)
 
 topTcLevel :: TcLevel
 -- See Note [TcLevel assignment]
@@ -902,7 +888,8 @@ tcTyFamInsts = map (\(_,b,c) -> (b,c)) . tcTyFamInstsAndVis
 -- to @C@, whereas @F Bool@ is paired with 'False' since it appears an a
 -- /visible/ argument to @C@.
 --
--- See also @Note [Kind arguments in error messages]@ in "GHC.Tc.Errors".
+-- See also Note [Showing invisible bits of types in error messages]
+-- in "GHC.Tc.Errors.Ppr".
 tcTyFamInstsAndVis :: Type -> [(Bool, TyCon, [Type])]
 tcTyFamInstsAndVis = tcTyFamInstsAndVisX False
 
@@ -1203,6 +1190,10 @@ isConcreteTyVar_maybe tv
   | otherwise
   = Nothing
 
+isConcreteInfo :: MetaInfo -> Bool
+isConcreteInfo (ConcreteTv {}) = True
+isConcreteInfo _               = False
+
 -- | Is this type variable a concrete type variable, i.e.
 -- it is a metavariable with 'ConcreteTv' 'MetaInfo'?
 isConcreteTyVar :: TcTyVar -> Bool
@@ -1372,7 +1363,7 @@ getDFunTyLitKey (CharTyLit n) = mkOccName Name.varName (show n)
 -- Always succeeds, even if it returns an empty list.
 tcSplitPiTys :: Type -> ([PiTyVarBinder], Type)
 tcSplitPiTys ty
-  = assert (all isTyBinder (fst sty) )   -- No CoVar binders here
+  = assert (all isTyBinder (fst sty))   -- No CoVar binders here
     sty
   where sty = splitPiTys ty
 
@@ -1395,7 +1386,7 @@ tcSplitForAllTyVarBinder_maybe _                = Nothing
 -- returning just the tyvars.
 tcSplitForAllTyVars :: Type -> ([TyVar], Type)
 tcSplitForAllTyVars ty
-  = assert (all isTyVar (fst sty) ) sty
+  = assert (all isTyVar (fst sty)) sty
   where sty = splitForAllTyCoVars ty
 
 -- | Like 'tcSplitForAllTyVars', but only splits 'ForAllTy's with 'Invisible'
@@ -1415,6 +1406,18 @@ tcSplitSomeForAllTyVars argf_pred ty
       | argf_pred argf                             = split ty ty (tv:tvs)
     split orig_ty ty tvs | Just ty' <- coreView ty = split orig_ty ty' tvs
     split orig_ty _                            tvs = (reverse tvs, orig_ty)
+
+tcSplitForAllTyVarsReqTVBindersN :: Arity -> Type -> (Arity, [ForAllTyBinder], Type)
+-- Split off at most N /required/ (aka visible) binders, plus any invisible ones
+-- in the way, /and/ any trailing invisible ones
+tcSplitForAllTyVarsReqTVBindersN n_req ty
+  = split n_req ty ty []
+  where
+    split n_req _orig_ty (ForAllTy b@(Bndr _ argf) ty) bs
+      | isVisibleForAllTyFlag argf, n_req > 0           = split (n_req - 1) ty ty (b:bs)
+      | otherwise                                       = split n_req       ty ty (b:bs)
+    split n_req orig_ty ty bs | Just ty' <- coreView ty = split n_req orig_ty ty' bs
+    split n_req orig_ty _ty bs                          = (n_req, reverse bs, orig_ty)
 
 -- | Like 'tcSplitForAllTyVars', but only splits 'ForAllTy's with 'Required' type
 -- variable binders. All split tyvars are annotated with '()'.
@@ -1457,6 +1460,11 @@ tcSplitPhiTy ty
 -- will implicitly instantiate.
 tcSplitSigmaTy :: Type -> ([TyVar], ThetaType, Type)
 tcSplitSigmaTy ty = case tcSplitForAllInvisTyVars ty of
+                        (tvs, rho) -> case tcSplitPhiTy rho of
+                                        (theta, tau) -> (tvs, theta, tau)
+
+tcSplitSigmaTyBndrs :: Type -> ([TcInvisTVBinder], ThetaType, Type)
+tcSplitSigmaTyBndrs ty = case tcSplitForAllInvisTVBinders ty of
                         (tvs, rho) -> case tcSplitPhiTy rho of
                                         (theta, tau) -> (tvs, theta, tau)
 
@@ -1849,7 +1857,7 @@ Then
 Notice that in the recursive-superclass case we include C again at
 the end of the chain.  One could exclude C in this case, but
 the code is more awkward and there seems no good reason to do so.
-(However C.f. GHC.Tc.Solver.Canonical.mk_strict_superclasses, which /does/
+(However C.f. GHC.Tc.Solver.Dict.mk_strict_superclasses, which /does/
 appear to do so.)
 
 The algorithm is expand( so_far, pred ):
@@ -1887,18 +1895,22 @@ See also GHC.Tc.TyCl.Utils.checkClassCycles.
 -}
 
 isSigmaTy :: TcType -> Bool
--- isSigmaTy returns true of any qualified type.  It doesn't
--- *necessarily* have any foralls.  E.g
---        f :: (?x::Int) => Int -> Int
-isSigmaTy ty | Just ty' <- coreView ty = isSigmaTy ty'
-isSigmaTy (ForAllTy {})                = True
+-- isSigmaTy returns true of any type with /invisible/ quantifiers at the top:
+--     forall a. blah
+--     Eq a => blah
+--     ?x::Int => blah
+-- But not
+--     forall a -> blah
+isSigmaTy (ForAllTy (Bndr _ af) _)     = isInvisibleForAllTyFlag af
 isSigmaTy (FunTy { ft_af = af })       = isInvisibleFunArg af
+isSigmaTy ty | Just ty' <- coreView ty = isSigmaTy ty'
 isSigmaTy _                            = False
 
+
 isRhoTy :: TcType -> Bool   -- True of TcRhoTypes; see Note [TcRhoType]
-isRhoTy ty | Just ty' <- coreView ty = isRhoTy ty'
-isRhoTy (ForAllTy {})                = False
+isRhoTy (ForAllTy (Bndr _ af) _)     = isVisibleForAllTyFlag af
 isRhoTy (FunTy { ft_af = af })       = isVisibleFunArg af
+isRhoTy ty | Just ty' <- coreView ty = isRhoTy ty'
 isRhoTy _                            = True
 
 -- | Like 'isRhoTy', but also says 'True' for 'Infer' types
@@ -1908,7 +1920,7 @@ isRhoExpTy (Infer {}) = True
 
 isOverloadedTy :: Type -> Bool
 -- Yes for a type of a function that might require evidence-passing
--- Used only by bindLocalMethods
+-- Used by bindLocalMethods and for -fprof-late-overloaded
 isOverloadedTy ty | Just ty' <- coreView ty = isOverloadedTy ty'
 isOverloadedTy (ForAllTy _  ty)             = isOverloadedTy ty
 isOverloadedTy (FunTy { ft_af = af })       = isInvisibleFunArg af
@@ -2036,8 +2048,8 @@ being the )
 -}
 
 tcSplitIOType_maybe :: Type -> Maybe (TyCon, Type)
--- (tcSplitIOType_maybe t) returns Just (IO,t',co)
---              if co : t ~ IO t'
+-- (tcSplitIOType_maybe t) returns Just (IO,t')
+--              if t = IO t'
 --              returns Nothing otherwise
 tcSplitIOType_maybe ty
   = case tcSplitTyConApp_maybe ty of
@@ -2047,249 +2059,6 @@ tcSplitIOType_maybe ty
         _ ->
             Nothing
 
--- | Reason why a type in an FFI signature is invalid
-data IllegalForeignTypeReason
-  = TypeCannotBeMarshaled !Type TypeCannotBeMarshaledReason
-  | ForeignDynNotPtr
-      !Type -- ^ Expected type
-      !Type -- ^ Actual type
-  | SafeHaskellMustBeInIO
-  | IOResultExpected
-  | UnexpectedNestedForall
-  | LinearTypesNotAllowed
-  | OneArgExpected
-  | AtLeastOneArgExpected
-  deriving Generic
-
--- | Reason why a type cannot be marshalled through the FFI.
-data TypeCannotBeMarshaledReason
-  = NotADataType
-  | NewtypeDataConNotInScope !(Maybe TyCon)
-  | UnliftedFFITypesNeeded
-  | NotABoxedMarshalableTyCon
-  | ForeignLabelNotAPtr
-  | NotSimpleUnliftedType
-  | NotBoxedKindAny
-  deriving Generic
-
-isFFIArgumentTy :: DynFlags -> Safety -> Type -> Validity' IllegalForeignTypeReason
--- Checks for valid argument type for a 'foreign import'
-isFFIArgumentTy dflags safety ty
-   = checkRepTyCon (legalOutgoingTyCon dflags safety) ty
-
-isFFIExternalTy :: Type -> Validity' IllegalForeignTypeReason
--- Types that are allowed as arguments of a 'foreign export'
-isFFIExternalTy ty = checkRepTyCon legalFEArgTyCon ty
-
-isFFIImportResultTy :: DynFlags -> Type -> Validity' IllegalForeignTypeReason
-isFFIImportResultTy dflags ty
-  = checkRepTyCon (legalFIResultTyCon dflags) ty
-
-isFFIExportResultTy :: Type -> Validity' IllegalForeignTypeReason
-isFFIExportResultTy ty = checkRepTyCon legalFEResultTyCon ty
-
-isFFIDynTy :: Type -> Type -> Validity' IllegalForeignTypeReason
--- The type in a foreign import dynamic must be Ptr, FunPtr, or a newtype of
--- either, and the wrapped function type must be equal to the given type.
--- We assume that all types have been run through normaliseFfiType, so we don't
--- need to worry about expanding newtypes here.
-isFFIDynTy expected ty
-    -- Note [Foreign import dynamic]
-    -- In the example below, expected would be 'CInt -> IO ()', while ty would
-    -- be 'FunPtr (CDouble -> IO ())'.
-    | Just (tc, [ty']) <- splitTyConApp_maybe ty
-    , tyConUnique tc `elem` [ptrTyConKey, funPtrTyConKey]
-    , eqType ty' expected
-    = IsValid
-    | otherwise
-    = NotValid (ForeignDynNotPtr expected ty)
-
-isFFILabelTy :: Type -> Validity' IllegalForeignTypeReason
--- The type of a foreign label must be Ptr, FunPtr, or a newtype of either.
-isFFILabelTy ty = checkRepTyCon ok ty
-  where
-    ok tc | tc `hasKey` funPtrTyConKey || tc `hasKey` ptrTyConKey
-          = IsValid
-          | otherwise
-          = NotValid ForeignLabelNotAPtr
-
--- | Check validity for a type of the form @Any :: k@.
---
--- This function returns:
---
---  - @Just IsValid@ for @Any :: Type@ and @Any :: UnliftedType@,
---  - @Just (NotValid ..)@ for @Any :: k@ if @k@ is not a kind of boxed types,
---  - @Nothing@ if the type is not @Any@.
-checkAnyTy :: Type -> Maybe (Validity' IllegalForeignTypeReason)
-checkAnyTy ty
-  | Just ki <- anyTy_maybe ty
-  = Just $
-      if isJust $ kindBoxedRepLevity_maybe ki
-      then IsValid
-      -- NB: don't allow things like @Any :: TYPE IntRep@, as per #21305.
-      else NotValid (TypeCannotBeMarshaled ty NotBoxedKindAny)
-  | otherwise
-  = Nothing
-
-isFFIPrimArgumentTy :: DynFlags -> Type -> Validity' IllegalForeignTypeReason
--- Checks for valid argument type for a 'foreign import prim'
--- Currently they must all be simple unlifted types, or Any (at kind Type or UnliftedType),
--- which can be used to pass the address to a Haskell object on the heap to
--- the foreign function.
-isFFIPrimArgumentTy dflags ty
-  | Just validity <- checkAnyTy ty
-  = validity
-  | otherwise
-  = checkRepTyCon (legalFIPrimArgTyCon dflags) ty
-
-isFFIPrimResultTy :: DynFlags -> Type -> Validity' IllegalForeignTypeReason
--- Checks for valid result type for a 'foreign import prim' Currently
--- it must be an unlifted type, including unboxed tuples, unboxed
--- sums, or the well-known type Any (at kind Type or UnliftedType).
-isFFIPrimResultTy dflags ty
-  | Just validity <- checkAnyTy ty
-  = validity
-  | otherwise
-  = checkRepTyCon (legalFIPrimResultTyCon dflags) ty
-
-isFunPtrTy :: Type -> Bool
-isFunPtrTy ty
-  | Just (tc, [_]) <- splitTyConApp_maybe ty
-  = tc `hasKey` funPtrTyConKey
-  | otherwise
-  = False
-
--- normaliseFfiType gets run before checkRepTyCon, so we don't
--- need to worry about looking through newtypes or type functions
--- here; that's already been taken care of.
-checkRepTyCon
-  :: (TyCon -> Validity' TypeCannotBeMarshaledReason)
-  -> Type
-  -> Validity' IllegalForeignTypeReason
-checkRepTyCon check_tc ty
-  = fmap (TypeCannotBeMarshaled ty) $ case splitTyConApp_maybe ty of
-      Just (tc, tys)
-        | isNewTyCon tc -> NotValid (mk_nt_reason tc tys)
-        | otherwise     -> check_tc tc
-      Nothing -> NotValid NotADataType
-  where
-    mk_nt_reason tc tys
-      | null tys  = NewtypeDataConNotInScope Nothing
-      | otherwise = NewtypeDataConNotInScope (Just tc)
-
-{-
-Note [Foreign import dynamic]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-A dynamic stub must be of the form 'FunPtr ft -> ft' where ft is any foreign
-type.  Similarly, a wrapper stub must be of the form 'ft -> IO (FunPtr ft)'.
-
-We use isFFIDynTy to check whether a signature is well-formed. For example,
-given a (illegal) declaration like:
-
-foreign import ccall "dynamic"
-  foo :: FunPtr (CDouble -> IO ()) -> CInt -> IO ()
-
-isFFIDynTy will compare the 'FunPtr' type 'CDouble -> IO ()' with the curried
-result type 'CInt -> IO ()', and return False, as they are not equal.
-
-
-----------------------------------------------
-These chaps do the work; they are not exported
-----------------------------------------------
--}
-
-legalFEArgTyCon :: TyCon -> Validity' TypeCannotBeMarshaledReason
-legalFEArgTyCon tc
-  -- It's illegal to make foreign exports that take unboxed
-  -- arguments.  The RTS API currently can't invoke such things.  --SDM 7/2000
-  = boxedMarshalableTyCon tc
-
-legalFIResultTyCon :: DynFlags -> TyCon -> Validity' TypeCannotBeMarshaledReason
-legalFIResultTyCon dflags tc
-  | tc == unitTyCon         = IsValid
-  | otherwise               = marshalableTyCon dflags tc
-
-legalFEResultTyCon :: TyCon -> Validity' TypeCannotBeMarshaledReason
-legalFEResultTyCon tc
-  | tc == unitTyCon         = IsValid
-  | otherwise               = boxedMarshalableTyCon tc
-
-legalOutgoingTyCon :: DynFlags -> Safety -> TyCon -> Validity' TypeCannotBeMarshaledReason
--- Checks validity of types going from Haskell -> external world
-legalOutgoingTyCon dflags _ tc
-  = marshalableTyCon dflags tc
-
--- Check for marshalability of a primitive type.
--- We exclude lifted types such as RealWorld and TYPE.
--- They can technically appear in types, e.g.
--- f :: RealWorld -> TYPE LiftedRep -> RealWorld
--- f x _ = x
--- but there are no values of type RealWorld or TYPE LiftedRep,
--- so it doesn't make sense to use them in FFI.
-marshalablePrimTyCon :: TyCon -> Bool
-marshalablePrimTyCon tc = isPrimTyCon tc && not (isLiftedTypeKind (tyConResKind tc))
-
-marshalableTyCon :: DynFlags -> TyCon -> Validity' TypeCannotBeMarshaledReason
-marshalableTyCon dflags tc
-  | marshalablePrimTyCon tc
-  , not (null (tyConPrimRep tc)) -- Note [Marshalling void]
-  = validIfUnliftedFFITypes dflags
-  | otherwise
-  = boxedMarshalableTyCon tc
-
-boxedMarshalableTyCon :: TyCon -> Validity' TypeCannotBeMarshaledReason
-boxedMarshalableTyCon tc
-   | getUnique tc `elem` [ intTyConKey, int8TyConKey, int16TyConKey
-                         , int32TyConKey, int64TyConKey
-                         , wordTyConKey, word8TyConKey, word16TyConKey
-                         , word32TyConKey, word64TyConKey
-                         , floatTyConKey, doubleTyConKey
-                         , ptrTyConKey, funPtrTyConKey
-                         , charTyConKey
-                         , stablePtrTyConKey
-                         , boolTyConKey
-                         ]
-  = IsValid
-
-  | otherwise = NotValid NotABoxedMarshalableTyCon
-
-legalFIPrimArgTyCon :: DynFlags -> TyCon -> Validity' TypeCannotBeMarshaledReason
--- Check args of 'foreign import prim', only allow simple unlifted types.
-legalFIPrimArgTyCon dflags tc
-  | marshalablePrimTyCon tc
-  = validIfUnliftedFFITypes dflags
-  | otherwise
-  = NotValid NotSimpleUnliftedType
-
-legalFIPrimResultTyCon :: DynFlags -> TyCon -> Validity' TypeCannotBeMarshaledReason
--- Check result type of 'foreign import prim'. Allow simple unlifted
--- types and also unboxed tuple and sum result types.
-legalFIPrimResultTyCon dflags tc
-  | marshalablePrimTyCon tc
-  , not (null (tyConPrimRep tc))   -- Note [Marshalling void]
-  = validIfUnliftedFFITypes dflags
-
-  | isUnboxedTupleTyCon tc || isUnboxedSumTyCon tc
-  = validIfUnliftedFFITypes dflags
-
-  | otherwise
-  = NotValid $ NotSimpleUnliftedType
-
-validIfUnliftedFFITypes :: DynFlags -> Validity' TypeCannotBeMarshaledReason
-validIfUnliftedFFITypes dflags
-  | xopt LangExt.UnliftedFFITypes dflags =  IsValid
-  | otherwise = NotValid UnliftedFFITypesNeeded
-
-{-
-Note [Marshalling void]
-~~~~~~~~~~~~~~~~~~~~~~~
-We don't treat State# (whose PrimRep is VoidRep) as marshalable.
-In turn that means you can't write
-        foreign import foo :: Int -> State# RealWorld
-
-Reason: the back end falls over with panic "primRepHint:VoidRep";
-        and there is no compelling reason to permit it
--}
 
 {-
 ************************************************************************
@@ -2302,8 +2071,8 @@ Reason: the back end falls over with panic "primRepHint:VoidRep";
 -- | For every arg a tycon can take, the returned list says True if the argument
 -- is taken visibly, and False otherwise. Ends with an infinite tail of Trues to
 -- allow for oversaturation.
-tcTyConVisibilities :: TyCon -> [Bool]
-tcTyConVisibilities tc = tc_binder_viss ++ tc_return_kind_viss ++ repeat True
+tyConVisibilities :: TyCon -> [Bool]
+tyConVisibilities tc = tc_binder_viss ++ tc_return_kind_viss ++ repeat True
   where
     tc_binder_viss      = map isVisibleTyConBinder (tyConBinders tc)
     tc_return_kind_viss = map isVisiblePiTyBinder (fst $ tcSplitPiTys (tyConResKind tc))
@@ -2311,13 +2080,14 @@ tcTyConVisibilities tc = tc_binder_viss ++ tc_return_kind_viss ++ repeat True
 -- | If the tycon is applied to the types, is the next argument visible?
 isNextTyConArgVisible :: TyCon -> [Type] -> Bool
 isNextTyConArgVisible tc tys
-  = tcTyConVisibilities tc `getNth` length tys
+  = tyConVisibilities tc `getNth` length tys
 
 -- | Should this type be applied to a visible argument?
+-- E.g. (s t): is `t` a visible argument of `s`?
 isNextArgVisible :: TcType -> Bool
 isNextArgVisible ty
-  | Just (bndr, _) <- tcSplitPiTy_maybe ty = isVisiblePiTyBinder bndr
-  | otherwise                              = True
+  | Just (bndr, _) <- tcSplitPiTy_maybe (typeKind ty) = isVisiblePiTyBinder bndr
+  | otherwise                                         = True
     -- this second case might happen if, say, we have an unzonked TauTv.
     -- But TauTvs can't range over types that take invisible arguments
 
@@ -2386,17 +2156,28 @@ The type-family termination test, in GHC.Tc.Validity.checkFamInstRhs, already
 has a separate call to isStuckTypeFamily, so the `F` above will still be accepted.
 -}
 
-
--- | Why was the LHS 'PatersonSize' not strictly smaller than the RHS 'PatersonSize'?
+-- | Why did the Paterson conditions fail; that is, why
+-- was the context P not Paterson-smaller than the head H?
 --
 -- See Note [Paterson conditions] in GHC.Tc.Validity.
-data PatersonSizeFailure
-  -- | Either side contains a type family.
-  = PSF_TyFam TyCon
-  -- | The size of the LHS is not strictly less than the size of the RHS.
-  | PSF_Size
-  -- | These type variables appear more often in the LHS than in the RHS.
-  | PSF_TyVar [TyVar] -- ^  no duplicates in this list
+data PatersonCondFailure
+  -- | Some type variables occur more often in P than in H.
+  -- See (PC1) in Note [Paterson conditions] in GHC.Tc.Validity.
+  = PCF_TyVar
+    [TyVar]  -- ^ the type variables which appear more often in the context
+  -- | P is not smaller in size than H.
+  -- See (PC2) in Note [Paterson conditions] in GHC.Tc.Validity.
+  | PCF_Size
+  -- | P contains a type family.
+  -- See (PC3) in Note [Paterson conditions] in GHC.Tc.Validity.
+  | PCF_TyFam
+    TyCon  -- ^ the type constructor of the type family
+
+-- | Indicates whether a Paterson condition failure occurred in an instance declaration or a type family equation.
+-- Useful for differentiating context in error messages.
+data PatersonCondFailureContext
+  = InInstanceDecl
+  | InTyFamEquation
 
 --------------------------------------
 
@@ -2408,7 +2189,6 @@ data PatersonSizeFailure
 data PatersonSize
   -- | The type mentions a type family, so the size could be anything.
   = PS_TyFam TyCon
-
   -- | The type does not mention a type family.
   | PS_Vanilla { ps_tvs :: [TyVar]  -- ^ free tyvars, including repetitions;
                , ps_size :: Int     -- ^ number of type constructors and variables
@@ -2431,14 +2211,14 @@ pSizeOne  = PS_Vanilla { ps_tvs = [], ps_size = 1 }
 --  - @Just ps_fail@ otherwise; @ps_fail@ says what went wrong.
 ltPatersonSize :: PatersonSize
                -> PatersonSize
-               -> Maybe PatersonSizeFailure
+               -> Maybe PatersonCondFailure
 ltPatersonSize (PS_Vanilla { ps_tvs = tvs1, ps_size = s1 })
                (PS_Vanilla { ps_tvs = tvs2, ps_size = s2 })
-  | s1 >= s2                                = Just PSF_Size
-  | bad_tvs@(_:_) <- noMoreTyVars tvs1 tvs2 = Just (PSF_TyVar bad_tvs)
+  | s1 >= s2                                = Just PCF_Size
+  | bad_tvs@(_:_) <- noMoreTyVars tvs1 tvs2 = Just (PCF_TyVar bad_tvs)
   | otherwise                               = Nothing -- OK!
-ltPatersonSize (PS_TyFam tc) _ = Just (PSF_TyFam tc)
-ltPatersonSize _ (PS_TyFam tc) = Just (PSF_TyFam tc)
+ltPatersonSize (PS_TyFam tc) _ = Just (PCF_TyFam tc)
+ltPatersonSize _ (PS_TyFam tc) = Just (PCF_TyFam tc)
   -- NB: this last equation is never taken when checking instances, because
   -- type families are disallowed in instance heads.
   --
@@ -2532,11 +2312,11 @@ isTerminatingClass cls
   = isIPClass cls    -- Implicit parameter constraints always terminate because
                      -- there are no instances for them --- they are only solved
                      -- by "local instances" in expressions
-    || isEqPredClass cls
+    || isEqualityClass cls
     || cls `hasKey` typeableClassKey
             -- Typeable constraints are bigger than they appear due
             -- to kind polymorphism, but we can never get instance divergence this way
-    || cls `hasKey` coercibleTyConKey
+    || cls `hasKey` unsatisfiableClassNameKey
 
 allDistinctTyVars :: TyVarSet -> [KindOrType] -> Bool
 -- (allDistinctTyVars tvs tys) returns True if tys are

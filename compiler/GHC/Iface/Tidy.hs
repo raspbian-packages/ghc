@@ -8,7 +8,34 @@
 (c) The GRASP/AQUA Project, Glasgow University, 1992-1998
 -}
 
--- | Tidying up Core
+{-| Tidying up Core
+
+This module's purpose is to prepare the Core program for two distinct purposes:
+* To be serialised into the module's interface file
+* To feed to the code generator
+
+The most important tasks are:
+* Determine which `Name`s should ultimately be `Internal` and `External`
+  (which may differ to whether they were originally `Internal` or `External`).
+  See `Note [About the NameSorts]` in GHC.Types.Name.
+  For example, in:
+          module M where
+            f x = x + y
+              where y = factorial 4
+  could be optimized during the Core pass to:
+          module M where
+            y = factorial 4
+            f x = x + y
+  in which case `y` would be changed from `Internal` to `External`.
+
+* Rename local identifiers to avoid name clashes, so that unfoldings etc can
+  be serialialised using the OccName, without Uniques.
+
+  For example (`x_5` means `x` with a `Unique` of `5`):
+          f x_12 x_23 = x_12
+  would be changed to:
+          f x_12 x1_23 = x_12
+-}
 module GHC.Iface.Tidy
   ( TidyOpts (..)
   , UnfoldingExposure (..)
@@ -357,6 +384,7 @@ data TidyOpts = TidyOpts
       -- ^ Are rules exposed or not?
   , opt_static_ptr_opts :: !(Maybe StaticPtrOpts)
       -- ^ Options for generated static pointers, if enabled (/= Nothing).
+  , opt_keep_auto_rules :: !Bool
   }
 
 tidyProgram :: TidyOpts -> ModGuts -> IO (CgGuts, ModDetails)
@@ -390,6 +418,8 @@ tidyProgram opts (ModGuts { mg_module           = mod
   (spt_entries, mcstub, tidy_binds') <- case opt_static_ptr_opts opts of
     Nothing    -> pure ([], Nothing, tidy_binds)
     Just sopts -> sptCreateStaticBinds sopts mod tidy_binds
+
+  -- pprTraceM "trimmed_rules" (ppr trimmed_rules)
 
   let all_foreign_stubs = case mcstub of
         Nothing    -> foreign_stubs
@@ -615,8 +645,11 @@ getImplicitBinds tc = cls_binds ++ getTyConImplicitBinds tc
 
 getTyConImplicitBinds :: TyCon -> [CoreBind]
 getTyConImplicitBinds tc
-  | isNewTyCon tc = []  -- See Note [Compulsory newtype unfolding] in GHC.Types.Id.Make
-  | otherwise     = map get_defn (mapMaybe dataConWrapId_maybe (tyConDataCons tc))
+  | isDataTyCon tc = map get_defn (mapMaybe dataConWrapId_maybe (tyConDataCons tc))
+  | otherwise      = []
+    -- The 'otherwise' includes family TyCons of course, but also (less obviously)
+    --  * Newtypes: see Note [Compulsory newtype unfolding] in GHC.Types.Id.Make
+    --  * type data: we don't want any code for type-only stuff (#24620)
 
 getClassImplicitBinds :: Class -> [CoreBind]
 getClassImplicitBinds cls
@@ -851,7 +884,7 @@ dffvExpr :: CoreExpr -> DFFV ()
 dffvExpr (Var v)              = insert v
 dffvExpr (App e1 e2)          = dffvExpr e1 >> dffvExpr e2
 dffvExpr (Lam v e)            = extendScope v (dffvExpr e)
-dffvExpr (Tick (Breakpoint _ _ ids) e) = mapM_ insert ids >> dffvExpr e
+dffvExpr (Tick (Breakpoint _ _ ids _) e) = mapM_ insert ids >> dffvExpr e
 dffvExpr (Tick _other e)    = dffvExpr e
 dffvExpr (Cast e _)           = dffvExpr e
 dffvExpr (Let (NonRec x r) e) = dffvBind (x,r) >> extendScope x (dffvExpr e)
@@ -962,12 +995,18 @@ called in the final code), we keep the rule too.
 
 This stuff is the only reason for the ru_auto field in a Rule.
 
-NB: In #18532 we looked at keeping auto-rules and it turned out to just make
-compiler performance worse while increasing code sizes at the same time. The impact
-varied. Compiling Cabal got ~3% slower, allocated ~3% more and wrote 15% more code to disk.
-Nofib only saw 0.7% more compiler allocations and executable file size growth. But given
-there was no difference in runtime for these benchmarks it turned out to be flat out worse.
-See the ticket for more details.
+We discard auto-rules by default, but keep them if -fkeep-auto-rules is on.
+
+* Discard by default: in #18532 we looked at keeping auto-rules and it turned out to just make
+  compiler performance worse while increasing code sizes at the same time. The
+  impact varied. Compiling Cabal got ~3% slower, allocated ~3% more and wrote 15%
+  more code to disk.  Nofib only saw 0.7% more compiler allocations and executable
+  file size growth. But given there was no difference in runtime for these
+  benchmarks it turned out to be flat out worse.  See the ticket for more details.
+
+* Keep with -fkeep-auto-rules: in #21917 we found cases where we get a lot code
+  duplication when we discard specialisations.  Agda is a case in point.  Having
+  a flag gives us control over the rule-trimming decision.
 -}
 
 findExternalRules :: TidyOpts
@@ -979,11 +1018,12 @@ findExternalRules :: TidyOpts
 findExternalRules opts binds imp_id_rules unfold_env
   = (trimmed_binds, filter keep_rule all_rules)
   where
-    imp_rules | (opt_expose_rules opts) = filter expose_rule imp_id_rules
-              | otherwise               = []
+    imp_rules | opt_expose_rules opts = filter expose_rule imp_id_rules
+              | otherwise             = []
     imp_user_rule_fvs = mapUnionVarSet user_rule_rhs_fvs imp_rules
 
-    user_rule_rhs_fvs rule | isAutoRule rule = emptyVarSet
+    user_rule_rhs_fvs rule | isAutoRule rule && not (opt_keep_auto_rules opts)
+                                             = emptyVarSet
                            | otherwise       = ruleRhsFreeVars rule
 
     (trimmed_binds, local_bndrs, _, all_rules) = trim_binds binds
@@ -1044,7 +1084,7 @@ findExternalRules opts binds imp_id_rules unfold_env
             -- In needed_fvs', we don't bother to delete binders from the fv set
 
          local_rules  = [ rule
-                        | (opt_expose_rules opts)
+                        | opt_expose_rules opts
                         , id <- bndrs
                         , is_external_id id   -- Only collect rules for external Ids
                         , rule <- idCoreRules id
@@ -1080,11 +1120,9 @@ tidyTopName mod name_cache maybe_ref occ_env id
                             -- See #19619
                             let new_local_name = occ' `seq` mkInternalName uniq occ' loc
                             return (occ_env', new_local_name)
-        -- Even local, internal names must get a unique occurrence, because
-        -- if we do -split-objs we externalise the name later, in the code generator
-        --
-        -- Similarly, we must make sure it has a system-wide Unique, because
-        -- the byte-code generator builds a system-wide Name->BCO symbol table
+        -- Even local, internal names must get a unique occurrence.
+        -- This is necessary because the byte-code generator the byte-code
+        -- generator builds a system-wide Name->BCO symbol table.
 
   | local  && external = do new_external_name <- allocateGlobalBinder name_cache mod occ' loc
                             return (occ_env', new_external_name)

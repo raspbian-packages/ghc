@@ -1,6 +1,8 @@
-{-# LANGUAGE ScopedTypeVariables, CPP #-}
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE Unsafe #-}
+
 {-# OPTIONS_HADDOCK not-home #-}
+
 -- |
 -- Copyright   : 2010-2011 Simon Meier, 2010 Jasper van der Jeugt
 -- License     : BSD3-style (see LICENSE)
@@ -73,6 +75,7 @@ import Foreign
 import Prelude hiding (maxBound)
 
 #include "MachDeps.h"
+#include "bytestring-cpp-macros.h"
 
 ------------------------------------------------------------------------------
 -- Supporting infrastructure
@@ -198,14 +201,11 @@ liftFixedToBounded :: FixedPrim a -> BoundedPrim a
 liftFixedToBounded = toB
 
 {-# INLINE CONLIKE storableToF #-}
+{-# DEPRECATED storableToF
+     "Deprecated since @bytestring-0.12.1.0@.\n\nThis function is dangerous in the presence of internal padding\nand makes naive assumptions about alignment.\n\n * For a primitive Haskell type like 'Int64', use the\n   corresponding primitive like 'Data.ByteString.Builder.Prim.int64Host'.\n * For other types, it is recommended to manually write a small\n   function that performs the necessary unaligned write\n   and zeroes or removes any internal padding bits."
+  #-}
 storableToF :: forall a. Storable a => FixedPrim a
--- Not all architectures are forgiving of unaligned accesses; whitelist ones
--- which are known not to trap (either to the kernel for emulation, or crash).
-#if defined(i386_HOST_ARCH) || defined(x86_64_HOST_ARCH) \
-    || ((defined(arm_HOST_ARCH) || defined(aarch64_HOST_ARCH)) \
-        && defined(__ARM_FEATURE_UNALIGNED)) \
-    || defined(powerpc_HOST_ARCH) || defined(powerpc64_HOST_ARCH) \
-    || defined(powerpc64le_HOST_ARCH)
+#if HS_UNALIGNED_POKES_OK
 storableToF = FP (sizeOf (undefined :: a)) (\x op -> poke (castPtr op) x)
 #else
 storableToF = FP (sizeOf (undefined :: a)) $ \x op ->

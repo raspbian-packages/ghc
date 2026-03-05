@@ -1,5 +1,6 @@
+cabal-version:  2.0
 name:           Win32
-version:        2.13.3.0
+version:        2.14.1.0
 license:        BSD3
 license-file:   LICENSE
 author:         Alastair Reid, shelarcy, Tamar Christina
@@ -11,11 +12,16 @@ category:       System, Graphics
 synopsis:       A binding to Windows Win32 API.
 description:    This library contains direct bindings to the Windows Win32 APIs for Haskell.
 build-type:     Simple
-cabal-version:  2.0
 extra-source-files:
     include/diatemp.h include/dumpBMP.h include/ellipse.h include/errors.h
     include/Win32Aux.h include/win32debug.h include/alignment.h
+extra-doc-files:
     changelog.md
+
+flag os-string
+  description: Use the new os-string package
+  default: False
+  manual: False
 
 Library
     default-language: Haskell2010
@@ -32,7 +38,10 @@ Library
 
     -- AFPP support
     if impl(ghc >= 8.0)
-        build-depends:      filepath    >= 1.4.100.0
+      if flag(os-string)
+        build-depends: filepath >= 1.5.0.0, os-string >= 2.0.0
+      else
+        build-depends: filepath >= 1.4.100.0 && < 1.5.0.0
 
     -- Black list hsc2hs 0.68.6 which is horribly broken.
     build-tool-depends: hsc2hs:hsc2hs > 0 && < 0.68.6 || > 0.68.6
@@ -77,6 +86,7 @@ Library
         System.Win32.Event
         System.Win32.File
         System.Win32.FileMapping
+        System.Win32.NamedPipes
         System.Win32.Info
         System.Win32.Path
         System.Win32.Mem
@@ -88,6 +98,7 @@ Library
         System.Win32.Time
         System.Win32.Console
         System.Win32.Security
+        System.Win32.Semaphore
         System.Win32.Types
         System.Win32.Shell
         System.Win32.Automation
@@ -111,6 +122,7 @@ Library
     -- AFPP support
     if impl(ghc >= 8.0)
         exposed-modules:
+            System.Win32.WindowsString.Console
             System.Win32.WindowsString.Types
             System.Win32.WindowsString.DebugApi
             System.Win32.WindowsString.DLL
@@ -126,6 +138,7 @@ Library
             System.Win32.WindowsString.Utils
 
     other-modules:
+        System.Win32.Console.Internal
         System.Win32.DebugApi.Internal
         System.Win32.DLL.Internal
         System.Win32.File.Internal
@@ -141,8 +154,7 @@ Library
         "user32", "gdi32", "winmm", "advapi32", "shell32", "shfolder", "shlwapi", "msimg32", "imm32"
     ghc-options:      -Wall
     include-dirs:     include
-    includes:         "alphablend.h", "diatemp.h", "dumpBMP.h", "ellipse.h", "errors.h", "HsGDI.h", "HsWin32.h", "Win32Aux.h", "win32debug.h", "windows_cconv.h", "WndProc.h", "alignment.h"
-    install-includes: "HsWin32.h", "HsGDI.h", "WndProc.h", "windows_cconv.h", "alphablend.h", "wincon_compat.h", "winternl_compat.h", "winuser_compat.h", "winreg_compat.h", "tlhelp32_compat.h", "winnls_compat.h", "winnt_compat.h"
+    install-includes: "HsWin32.h", "HsGDI.h", "WndProc.h", "windows_cconv.h", "alphablend.h", "wincon_compat.h", "winternl_compat.h", "winuser_compat.h", "winreg_compat.h", "tlhelp32_compat.h", "winnls_compat.h", "winnt_compat.h", "namedpipeapi_compat.h"
     c-sources:
         cbits/HsGDI.c
         cbits/HsWin32.c

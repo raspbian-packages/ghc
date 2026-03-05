@@ -19,6 +19,7 @@ import GHC.Types.Basic ( CbvMark (..) )
 import GHC.Types.Unique.Supply (mkSplitUniqSupply)
 import GHC.Types.RepType (dataConRuntimeRepStrictness)
 import GHC.Core (AltCon(..))
+import GHC.Builtin.PrimOps ( PrimOp(..) )
 import Data.List (mapAccumL)
 import GHC.Utils.Outputable
 import GHC.Utils.Misc( zipWithEqual, zipEqual, notNull )
@@ -27,7 +28,7 @@ import GHC.Stg.InferTags.Types
 import GHC.Stg.InferTags.Rewrite (rewriteTopBinds)
 import Data.Maybe
 import GHC.Types.Name.Env (mkNameEnv, NameEnv)
-import GHC.Driver.Session
+import GHC.Driver.DynFlags
 import GHC.Utils.Logger
 import qualified GHC.Unit.Types
 
@@ -212,7 +213,7 @@ to the tagging of binders in certain situations than the StgToCmm code generator
 a) Tags for let-bindings:
 
   When compiling a binding for a constructor like `let x = Just True`
-  Weither or not `x` results in x pointing depends on the backend.
+  Whether `x` will be properly tagged depends on the backend.
   For the interpreter x points to a BCO which once
   evaluated returns a properly tagged pointer to the heap object.
   In the Cmm backend for the same binding we would allocate the constructor right
@@ -319,14 +320,6 @@ inferTagExpr env (StgApp fun args)
          | otherwise
          = --pprTrace "inferAppUnknown" (ppr fun) $
            TagDunno
--- TODO:
--- If we have something like:
---   let x = thunk in
---   f g = case g of g' -> (# x, g' #)
--- then we *do* know that g' will be properly tagged,
--- so we should return TagTagged [TagDunno,TagProper] but currently we infer
--- TagTagged [TagDunno,TagDunno] because of the unknown arity case in inferTagExpr.
--- Seems not to matter much but should be changed eventually.
 
 inferTagExpr env (StgConApp con cn args tys)
   = (inferConTag env con args, StgConApp con cn args tys)
@@ -340,9 +333,21 @@ inferTagExpr env (StgTick tick body)
     (info, body') = inferTagExpr env body
 
 inferTagExpr _ (StgOpApp op args ty)
-  = -- Do any primops guarantee to return a properly tagged value?
-    -- I think not.  Ditto foreign calls.
-    (TagDunno, StgOpApp op args ty)
+  | StgPrimOp SeqOp <- op
+  -- Recall seq# :: a -> State# s -> (# State# s, a #)
+  -- However the output State# token has been unarised away,
+  -- so we now effectively have
+  --    seq# :: a -> State# s -> (# a #)
+  -- The key point is the result of `seq#` is guaranteed evaluated and properly
+  -- tagged (because that result comes directly from evaluating the arg),
+  -- and we want tag inference to reflect that knowledge (#15226).
+  -- Hence `TagTuple [TagProper]`.
+  -- See Note [seq# magic] in GHC.Core.Opt.ConstantFold
+  = (TagTuple [TagProper], StgOpApp op args ty)
+  -- Do any other primops guarantee to return a properly tagged value?
+  -- Probably not, and that is the conservative assumption anyway.
+  -- (And foreign calls definitely need not make promises.)
+  | otherwise = (TagDunno, StgOpApp op args ty)
 
 inferTagExpr env (StgLet ext bind body)
   = (info, StgLet ext bind' body')
@@ -481,7 +486,7 @@ inferTagBind in_env (StgRec pairs)
 initSig :: forall p. (Id, GenStgRhs p) -> TagSig
 -- Initial signature for the fixpoint loop
 initSig (_bndr, StgRhsCon {})               = TagSig TagTagged
-initSig (bndr, StgRhsClosure _ _ _ _ _) =
+initSig (bndr, StgRhsClosure _ _ _ _ _ _) =
   fromMaybe defaultSig (idTagSig_maybe bndr)
   where defaultSig = (TagSig TagTagged)
 
@@ -516,13 +521,13 @@ inferTagRhs :: forall p.
   -> TagEnv p -- ^
   -> GenStgRhs p -- ^
   -> (TagSig, GenStgRhs 'InferTaggedBinders)
-inferTagRhs bnd_id in_env (StgRhsClosure ext cc upd bndrs body)
+inferTagRhs bnd_id in_env (StgRhsClosure ext cc upd bndrs body typ)
   | isDeadEndId bnd_id && (notNull) bndrs
   -- See Note [Bottom functions are TagTagged]
-  = (TagSig TagTagged, StgRhsClosure ext cc upd out_bndrs body')
+  = (TagSig TagTagged, StgRhsClosure ext cc upd out_bndrs body' typ)
   | otherwise
   = --pprTrace "inferTagRhsClosure" (ppr (_top, _grp_ids, env,info')) $
-    (TagSig info', StgRhsClosure ext cc upd out_bndrs body')
+    (TagSig info', StgRhsClosure ext cc upd out_bndrs body' typ)
   where
     out_bndrs
       | Just marks <- idCbvMarks_maybe bnd_id
@@ -553,11 +558,11 @@ inferTagRhs bnd_id in_env (StgRhsClosure ext cc upd bndrs body)
               | otherwise -> TagDunno
       in (id, TagSig tag)
 
-inferTagRhs _ env _rhs@(StgRhsCon cc con cn ticks args)
+inferTagRhs _ env _rhs@(StgRhsCon cc con cn ticks args typ)
 -- Constructors, which have untagged arguments to strict fields
 -- become thunks. We encode this by giving changing RhsCon nodes the info TagDunno
   = --pprTrace "inferTagRhsCon" (ppr grp_ids) $
-    (TagSig (inferConTag env con args), StgRhsCon cc con cn ticks args)
+    (TagSig (inferConTag env con args), StgRhsCon cc con cn ticks args typ)
 
 -- Adjust let semantics to the targeted backend.
 -- See Note [Tag inference for interpreted code]

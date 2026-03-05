@@ -28,7 +28,6 @@ import GHC.Unit.Module.Status
 import GHC.Unit.Module.ModIface
 import GHC.Driver.Backend
 import GHC.Driver.Session
-import GHC.Driver.CmdLine
 import GHC.Unit.Module.ModSummary
 import qualified GHC.LanguageExtensions as LangExt
 import GHC.Types.SrcLoc
@@ -47,7 +46,6 @@ import Data.Maybe
 import GHC.CmmToLlvm.Mangler
 import GHC.SysTools
 import GHC.SysTools.Cpp
-import GHC.Utils.Panic.Plain
 import System.Directory
 import System.FilePath
 import GHC.Utils.Misc
@@ -73,6 +71,7 @@ import System.IO
 import GHC.Linker.ExtraObj
 import GHC.Linker.Dynamic
 import GHC.Utils.Panic
+import GHC.Utils.Touch
 import GHC.Unit.Module.Env
 import GHC.Driver.Env.KnotVars
 import GHC.Driver.Config.Finder
@@ -122,8 +121,8 @@ runPhase (T_CmmCpp pipe_env hsc_env input_fn) = do
         (hsc_dflags hsc_env)
         (hsc_unit_env hsc_env)
         (CppOpts
-          { cppUseCc       = True
-          , cppLinePragmas = True
+          { sourceCodePreprocessor  = SCPCmmCpp
+          , cppLinePragmas          = True
           })
         input_fn output_fn
   return output_fn
@@ -147,6 +146,8 @@ runPhase (T_LlvmOpt pipe_env hsc_env input_fn) =
   runLlvmOptPhase pipe_env hsc_env input_fn
 runPhase (T_LlvmLlc pipe_env hsc_env input_fn) =
   runLlvmLlcPhase pipe_env hsc_env input_fn
+runPhase (T_LlvmAs cpp pipe_env hsc_env location input_fn) = do
+  runLlvmAsPhase cpp pipe_env hsc_env location input_fn
 runPhase (T_LlvmMangle pipe_env hsc_env input_fn) =
   runLlvmManglePhase pipe_env hsc_env input_fn
 runPhase (T_MergeForeign pipe_env hsc_env input_fn fos) =
@@ -284,20 +285,11 @@ runLlvmOptPhase pipe_env hsc_env input_fn = do
     return output_fn
 
 
-runAsPhase :: Bool -> PipeEnv -> HscEnv -> Maybe ModLocation -> FilePath -> IO FilePath
-runAsPhase with_cpp pipe_env hsc_env location input_fn = do
+-- Run either 'clang' or 'gcc' phases
+runGenericAsPhase :: (Logger -> DynFlags -> [Option] -> IO ()) -> [Option] -> Bool -> PipeEnv -> HscEnv -> Maybe ModLocation -> FilePath -> IO FilePath
+runGenericAsPhase run_as extra_opts with_cpp pipe_env hsc_env location input_fn = do
         let dflags     = hsc_dflags   hsc_env
         let logger     = hsc_logger   hsc_env
-        let unit_env   = hsc_unit_env hsc_env
-        let platform   = ue_platform unit_env
-
-        -- LLVM from version 3.0 onwards doesn't support the OS X system
-        -- assembler, so we use clang as the assembler instead. (#5636)
-        let (as_prog, get_asm_info) =
-                ( applyAssemblerProg $ backendAssemblerProg (backend dflags)
-                , applyAssemblerInfoGetter $ backendAssemblerInfoGetter (backend dflags)
-                )
-        asmInfo <- get_asm_info logger dflags platform
 
         let cmdline_include_paths = includePaths dflags
         let pic_c_flags = picCCOpts dflags
@@ -315,9 +307,8 @@ runAsPhase with_cpp pipe_env hsc_env location input_fn = do
                                 includePathsQuoteImplicit cmdline_include_paths]
         let runAssembler inputFilename outputFilename
               = withAtomicRename outputFilename $ \temp_outputFilename ->
-                    as_prog
+                    run_as
                        logger dflags
-                       platform
                        (local_includes ++ global_includes
                        -- See Note [-fPIC for assembler]
                        ++ map GHC.SysTools.Option pic_c_flags
@@ -331,9 +322,6 @@ runAsPhase with_cpp pipe_env hsc_env location input_fn = do
                        ++ [ GHC.SysTools.Option "-Wa,--no-type-check"
                           | platformArch (targetPlatform dflags) == ArchWasm32]
 
-                       ++ (if any (asmInfo ==) [Clang, AppleClang, AppleClang51]
-                            then [GHC.SysTools.Option "-Qunused-arguments"]
-                            else [])
                        ++ [ GHC.SysTools.Option "-x"
                           , if with_cpp
                               then GHC.SysTools.Option "assembler-with-cpp"
@@ -342,12 +330,23 @@ runAsPhase with_cpp pipe_env hsc_env location input_fn = do
                           , GHC.SysTools.FileOption "" inputFilename
                           , GHC.SysTools.Option "-o"
                           , GHC.SysTools.FileOption "" temp_outputFilename
-                          ])
+                          ] ++ extra_opts)
 
         debugTraceMsg logger 4 (text "Running the assembler")
         runAssembler input_fn output_fn
 
         return output_fn
+
+-- Invoke `clang` to assemble a .S file produced by LLvm toolchain
+runLlvmAsPhase :: Bool -> PipeEnv -> HscEnv -> Maybe ModLocation -> FilePath -> IO FilePath
+runLlvmAsPhase =
+  runGenericAsPhase runLlvmAs [ GHC.SysTools.Option "-Wno-unused-command-line-argument" ]
+
+-- Invoke 'gcc' to assemble a .S file
+runAsPhase :: Bool -> PipeEnv -> HscEnv -> Maybe ModLocation -> FilePath -> IO FilePath
+runAsPhase =
+  runGenericAsPhase runAs []
+
 
 
 -- Note [JS Backend .o file procedure]
@@ -378,14 +377,10 @@ runAsPhase with_cpp pipe_env hsc_env location input_fn = do
 
 -- | Run the JS Backend postHsc phase.
 runJsPhase :: PipeEnv -> HscEnv -> Maybe ModLocation -> FilePath -> IO FilePath
-runJsPhase _pipe_env hsc_env _location input_fn = do
-  let dflags     = hsc_dflags   hsc_env
-  let logger     = hsc_logger   hsc_env
-
+runJsPhase _pipe_env _hsc_env _location input_fn = do
   -- The object file is already generated. We only touch it to ensure the
   -- timestamp is refreshed, see Note [JS Backend .o file procedure].
-  touchObjectFile logger dflags input_fn
-
+  touchObjectFile input_fn
   return input_fn
 
 -- | Deal with foreign JS files (embed them into .o files)
@@ -400,41 +395,12 @@ runForeignJsPhase pipe_env hsc_env _location input_fn = do
   embedJsFile logger dflags tmpfs unit_env input_fn output_fn
   return output_fn
 
-
-applyAssemblerInfoGetter
-    :: DefunctionalizedAssemblerInfoGetter
-    -> Logger -> DynFlags -> Platform -> IO CompilerInfo
-applyAssemblerInfoGetter StandardAssemblerInfoGetter logger dflags _platform =
-    getAssemblerInfo logger dflags
-applyAssemblerInfoGetter JSAssemblerInfoGetter _ _ _ =
-    pure Emscripten
-applyAssemblerInfoGetter DarwinClangAssemblerInfoGetter logger dflags platform =
-    if platformOS platform == OSDarwin then
-        pure Clang
-    else
-        getAssemblerInfo logger dflags
-
-applyAssemblerProg
-    :: DefunctionalizedAssemblerProg
-    -> Logger -> DynFlags -> Platform -> [Option] -> IO ()
-applyAssemblerProg StandardAssemblerProg logger dflags _platform =
-    runAs logger dflags
-applyAssemblerProg JSAssemblerProg logger dflags _platform =
-    runEmscripten logger dflags
-applyAssemblerProg DarwinClangAssemblerProg logger dflags platform =
-    if platformOS platform == OSDarwin then
-        runClang logger dflags
-    else
-        runAs logger dflags
-
-
-
 runCcPhase :: Phase -> PipeEnv -> HscEnv -> Maybe ModLocation -> FilePath -> IO FilePath
 runCcPhase cc_phase pipe_env hsc_env location input_fn = do
   let dflags    = hsc_dflags hsc_env
   let logger    = hsc_logger hsc_env
   let unit_env  = hsc_unit_env hsc_env
-  let home_unit = hsc_home_unit hsc_env
+  let home_unit = hsc_home_unit_maybe hsc_env
   let tmpfs     = hsc_tmpfs hsc_env
   let platform  = ue_platform unit_env
   let hcc       = cc_phase `eqPhase` HCc
@@ -455,19 +421,6 @@ runCcPhase cc_phase pipe_env hsc_env location input_fn = do
         (includePathsQuote cmdline_include_paths ++
          includePathsQuoteImplicit cmdline_include_paths)
   let include_paths = include_paths_quote ++ include_paths_global
-
-  -- pass -D or -optP to preprocessor when compiling foreign C files
-  -- (#16737). Doing it in this way is simpler and also enable the C
-  -- compiler to perform preprocessing and parsing in a single pass,
-  -- but it may introduce inconsistency if a different pgm_P is specified.
-  let opts = getOpts dflags opt_P
-      aug_imports = augmentImports dflags opts
-
-      more_preprocessor_opts = concat
-        [ ["-Xpreprocessor", i]
-        | not hcc
-        , i <- aug_imports
-        ]
 
   let gcc_extra_viac_flags = extraGccViaCFlags dflags
   let pic_c_flags = picCCOpts dflags
@@ -539,10 +492,12 @@ runCcPhase cc_phase pipe_env hsc_env location input_fn = do
           -- These symbols are imported into the stub.c file via RtsAPI.h, and the
           -- way we do the import depends on whether we're currently compiling
           -- the base package or not.
-                 ++ (if platformOS platform == OSMinGW32 &&
-                        isHomeUnitId home_unit baseUnitId
-                          then [ "-DCOMPILING_BASE_PACKAGE" ]
-                          else [])
+                 ++ (case home_unit of
+                        Just hu
+                          | isHomeUnitId hu baseUnitId
+                          , platformOS platform == OSMinGW32
+                          -> ["-DCOMPILING_BASE_PACKAGE"]
+                        _ -> [])
 
                  -- GCC 4.6+ doesn't like -Wimplicit when compiling C++.
                  ++ (if (cc_phase /= Ccxx && cc_phase /= Cobjcxx)
@@ -557,7 +512,6 @@ runCcPhase cc_phase pipe_env hsc_env location input_fn = do
                  ++ [ "-include", ghcVersionH ]
                  ++ framework_paths
                  ++ include_paths
-                 ++ more_preprocessor_opts
                  ++ pkg_extra_cc_opts
                  ))
 
@@ -596,7 +550,7 @@ runHscBackendPhase pipe_env hsc_env mod_name src_flavour location result = do
 
                    -- In the case of hs-boot files, generate a dummy .o-boot
                    -- stamp file for the benefit of Make
-                   HsBootFile -> touchObjectFile logger dflags o_file
+                   HsBootFile -> touchObjectFile o_file
                    HsSrcFile -> panic "HscUpdate not relevant for HscSrcFile"
 
                  -- MP: I wonder if there are any lurking bugs here because we
@@ -661,7 +615,7 @@ runUnlitPhase hsc_env input_fn output_fn = do
        -- GHC.HsToCore.Ticks.isGoodTickSrcSpan where we check that the filename in
        -- a SrcLoc is the same as the source filename, the two will
        -- look bogusly different. See test:
-       -- libraries/hpc/tests/function/subdir/tough2.hs
+       -- testsuite/tests/hpc/function/subdir/tough2.hs
        escape ('\\':cs) = '\\':'\\': escape cs
        escape ('\"':cs) = '\\':'\"': escape cs
        escape ('\'':cs) = '\\':'\'': escape cs
@@ -683,7 +637,7 @@ runUnlitPhase hsc_env input_fn output_fn = do
 
     return output_fn
 
-getFileArgs :: HscEnv -> FilePath -> IO ((DynFlags, Messages PsMessage, [Warn]))
+getFileArgs :: HscEnv -> FilePath -> IO ((DynFlags, Messages PsMessage, Messages DriverMessage))
 getFileArgs hsc_env input_fn = do
   let dflags0 = hsc_dflags hsc_env
       parser_opts = initParserOpts dflags0
@@ -700,8 +654,8 @@ runCppPhase hsc_env input_fn output_fn = do
            (hsc_dflags hsc_env)
            (hsc_unit_env hsc_env)
            (CppOpts
-              { cppUseCc       = False
-              , cppLinePragmas = True
+              { sourceCodePreprocessor  = SCPHsCpp
+              , cppLinePragmas          = True
               })
            input_fn output_fn
   return output_fn
@@ -991,8 +945,6 @@ llvmOptions :: LlvmConfig
 llvmOptions llvm_config dflags =
        [("-relocation-model=" ++ rmodel
         ,"-relocation-model=" ++ rmodel) | not (null rmodel)]
-    ++ [("-stack-alignment=" ++ (show align)
-        ,"-stack-alignment=" ++ (show align)) | align > 0 ]
 
     -- Additional llc flags
     ++ [("", "-mcpu=" ++ mcpu)   | not (null mcpu)
@@ -1010,15 +962,15 @@ llvmOptions llvm_config dflags =
                | otherwise                   = "static"
 
         platform = targetPlatform dflags
-
-        align :: Int
-        align = case platformArch platform of
-                  ArchX86_64 | isAvxEnabled dflags -> 32
-                  _                                -> 0
+        arch = platformArch platform
 
         attrs :: String
         attrs = intercalate "," $ mattr
-              ++ ["+sse42"   | isSse4_2Enabled dflags   ]
+              ++ ["+sse4.2"  | isSse4_2Enabled dflags   ]
+              ++ ["+popcnt"  | isSse4_2Enabled dflags   ]
+                   -- LLVM gates POPCNT instructions behind the popcnt flag,
+                   -- while the GHC NCG (as well as GCC, Clang) gates it
+                   -- behind SSE4.2 instead.
               ++ ["+sse2"    | isSse2Enabled platform   ]
               ++ ["+sse"     | isSseEnabled platform    ]
               ++ ["+avx512f" | isAvx512fEnabled dflags  ]
@@ -1027,6 +979,8 @@ llvmOptions llvm_config dflags =
               ++ ["+avx512cd"| isAvx512cdEnabled dflags ]
               ++ ["+avx512er"| isAvx512erEnabled dflags ]
               ++ ["+avx512pf"| isAvx512pfEnabled dflags ]
+              -- For Arch64 +fma is not a option (it's unconditionally available).
+              ++ ["+fma"     | isFmaEnabled dflags && (arch /= ArchAArch64) ]
               ++ ["+bmi"     | isBmiEnabled dflags      ]
               ++ ["+bmi2"    | isBmi2Enabled dflags     ]
 
@@ -1038,9 +992,8 @@ llvmOptions llvm_config dflags =
 
 -- | What phase to run after one of the backend code generators has run
 hscPostBackendPhase :: HscSource -> Backend -> Phase
-hscPostBackendPhase HsBootFile _    =  StopLn
-hscPostBackendPhase HsigFile _      =  StopLn
-hscPostBackendPhase _ bcknd = backendNormalSuccessorPhase bcknd
+hscPostBackendPhase (HsBootOrSig _) _ =  StopLn
+hscPostBackendPhase HsSrcFile bcknd = backendNormalSuccessorPhase bcknd
 
 
 compileStub :: HscEnv -> FilePath -> IO FilePath
@@ -1195,10 +1148,10 @@ linkDynLibCheck logger tmpfs dflags unit_env o_files dep_units = do
 
 
 
-touchObjectFile :: Logger -> DynFlags -> FilePath -> IO ()
-touchObjectFile logger dflags path = do
+touchObjectFile :: FilePath -> IO ()
+touchObjectFile path = do
   createDirectoryIfMissing True $ takeDirectory path
-  GHC.SysTools.touch logger dflags "Touching object file" path
+  GHC.Utils.Touch.touch path
 
 -- Note [-fPIC for assembler]
 -- ~~~~~~~~~~~~~~~~~~~~~~~~~~

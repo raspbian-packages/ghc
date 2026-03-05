@@ -8,6 +8,7 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE DataKinds #-}
 {-# LANGUAGE UndecidableInstances #-} -- Wrinkle in Note [Trees That Grow]
                                       -- in module Language.Haskell.Syntax.Extension
 
@@ -22,13 +23,14 @@
 
 module GHC.Hs.Pat (
         Pat(..), LPat,
+        isInvisArgPat, isVisArgPat,
         EpAnnSumPat(..),
         ConPatTc (..),
         ConLikeP,
         HsPatExpansion(..),
         XXPatGhcTc(..),
 
-        HsConPatDetails, hsConPatArgs,
+        HsConPatDetails, hsConPatArgs, hsConPatTyArgs,
         HsConPatTyArg(..),
         HsRecFields(..), HsFieldBind(..), LHsFieldBind,
         HsRecField, LHsRecField,
@@ -39,11 +41,11 @@ module GHC.Hs.Pat (
 
         mkPrefixConPat, mkCharLitPat, mkNilPat,
 
-        isSimplePat,
+        isSimplePat, isPatSyn,
         looksLazyPatBind,
         isBangedLPat,
         gParPat, patNeedsParens, parenthesizePat,
-        isIrrefutableHsPat,
+        isIrrefutableHsPatHelper, isIrrefutableHsPatHelperM, isBoringHsPat,
 
         collectEvVarsPat, collectEvVarsPats,
 
@@ -82,10 +84,9 @@ import GHC.Types.SrcLoc
 import GHC.Data.Bag -- collect ev vars from pats
 import GHC.Data.Maybe
 import GHC.Types.Name (Name, dataName)
-import GHC.Driver.Session
-import qualified GHC.LanguageExtensions as LangExt
 import Data.Data
 
+import Data.Functor.Identity
 
 type instance XWildPat GhcPs = NoExtField
 type instance XWildPat GhcRn = NoExtField
@@ -93,21 +94,23 @@ type instance XWildPat GhcTc = Type
 
 type instance XVarPat  (GhcPass _) = NoExtField
 
-type instance XLazyPat GhcPs = EpAnn [AddEpAnn] -- For '~'
+type instance XLazyPat GhcPs = [AddEpAnn] -- For '~'
 type instance XLazyPat GhcRn = NoExtField
 type instance XLazyPat GhcTc = NoExtField
 
-type instance XAsPat   GhcPs = EpAnnCO
+type instance XAsPat   GhcPs = EpToken "@"
 type instance XAsPat   GhcRn = NoExtField
 type instance XAsPat   GhcTc = NoExtField
 
-type instance XParPat (GhcPass _) = EpAnnCO
+type instance XParPat  GhcPs = (EpToken "(", EpToken ")")
+type instance XParPat  GhcRn = NoExtField
+type instance XParPat  GhcTc = NoExtField
 
-type instance XBangPat GhcPs = EpAnn [AddEpAnn] -- For '!'
+type instance XBangPat GhcPs = [AddEpAnn] -- For '!'
 type instance XBangPat GhcRn = NoExtField
 type instance XBangPat GhcTc = NoExtField
 
-type instance XListPat GhcPs = EpAnn AnnList
+type instance XListPat GhcPs = AnnList
   -- After parsing, ListPat can refer to a built-in Haskell list pattern
   -- or an overloaded list pattern.
 type instance XListPat GhcRn = NoExtField
@@ -117,19 +120,19 @@ type instance XListPat GhcRn = NoExtField
 type instance XListPat GhcTc = Type
   -- List element type, for use in hsPatType.
 
-type instance XTuplePat GhcPs = EpAnn [AddEpAnn]
+type instance XTuplePat GhcPs = [AddEpAnn]
 type instance XTuplePat GhcRn = NoExtField
 type instance XTuplePat GhcTc = [Type]
 
-type instance XSumPat GhcPs = EpAnn EpAnnSumPat
+type instance XSumPat GhcPs = EpAnnSumPat
 type instance XSumPat GhcRn = NoExtField
 type instance XSumPat GhcTc = [Type]
 
-type instance XConPat GhcPs = EpAnn [AddEpAnn]
+type instance XConPat GhcPs = [AddEpAnn]
 type instance XConPat GhcRn = NoExtField
 type instance XConPat GhcTc = ConPatTc
 
-type instance XViewPat GhcPs = EpAnn [AddEpAnn]
+type instance XViewPat GhcPs = [AddEpAnn]
 type instance XViewPat GhcRn = Maybe (HsExpr GhcRn)
   -- The @HsExpr GhcRn@ gives an inverse to the view function.
   -- This is used for overloaded lists in particular.
@@ -145,32 +148,111 @@ type instance XSplicePat GhcTc = DataConCantHappen
 
 type instance XLitPat    (GhcPass _) = NoExtField
 
-type instance XNPat GhcPs = EpAnn [AddEpAnn]
-type instance XNPat GhcRn = EpAnn [AddEpAnn]
+type instance XNPat GhcPs = [AddEpAnn]
+type instance XNPat GhcRn = [AddEpAnn]
 type instance XNPat GhcTc = Type
 
-type instance XNPlusKPat GhcPs = EpAnn EpaLocation -- Of the "+"
+type instance XNPlusKPat GhcPs = EpaLocation -- Of the "+"
 type instance XNPlusKPat GhcRn = NoExtField
 type instance XNPlusKPat GhcTc = Type
 
-type instance XSigPat GhcPs = EpAnn [AddEpAnn]
+type instance XSigPat GhcPs = [AddEpAnn]
 type instance XSigPat GhcRn = NoExtField
 type instance XSigPat GhcTc = Type
+
+type instance XEmbTyPat GhcPs = EpToken "type"
+type instance XEmbTyPat GhcRn = NoExtField
+type instance XEmbTyPat GhcTc = Type
 
 type instance XXPat GhcPs = DataConCantHappen
 type instance XXPat GhcRn = HsPatExpansion (Pat GhcRn) (Pat GhcRn)
   -- Original pattern and its desugaring/expansion.
-  -- See Note [Rebindable syntax and HsExpansion].
+  -- See Note [Rebindable syntax and XXExprGhcRn].
 type instance XXPat GhcTc = XXPatGhcTc
-  -- After typechecking, we add extra constructors: CoPat and HsExpansion.
-  -- HsExpansion allows us to handle RebindableSyntax in pattern position:
+  -- After typechecking, we add extra constructors: CoPat and XXExprGhcRn.
+  -- XXExprGhcRn allows us to handle RebindableSyntax in pattern position:
   -- see "XXExpr GhcTc" for the counterpart in expressions.
 
 type instance ConLikeP GhcPs = RdrName -- IdP GhcPs
 type instance ConLikeP GhcRn = Name    -- IdP GhcRn
 type instance ConLikeP GhcTc = ConLike
 
-type instance XHsFieldBind _ = EpAnn [AddEpAnn]
+type instance XConPatTyArg GhcPs = EpToken "@"
+type instance XConPatTyArg GhcRn = NoExtField
+type instance XConPatTyArg GhcTc = NoExtField
+
+type instance XHsFieldBind _ = [AddEpAnn]
+
+type instance XInvisPat GhcPs = EpToken "@"
+type instance XInvisPat GhcRn = NoExtField
+type instance XInvisPat GhcTc = Type
+
+
+{- Note [Invisible binders in functions]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+GHC Proposal #448 (section 1.5 Type arguments in lambda patterns) introduces
+binders for invisible type arguments (@a-binders) in function equations and
+lambdas, e.g.
+
+  1.  {-# LANGUAGE TypeAbstractions #-}
+      id1 :: a -> a
+      id1 @t x = x :: t     -- @t-binder on the LHS of a function equation
+
+  2.  {-# LANGUAGE TypeAbstractions #-}
+      ex :: (Int8, Int16)
+      ex = higherRank (\ @a x -> maxBound @a - x )
+                            -- @a-binder in a lambda pattern in an argument
+                            -- to a higher-order function
+      higherRank :: (forall a. (Num a, Bounded a) => a -> a) -> (Int8, Int16)
+      higherRank f = (f 42, f 42)
+
+In the AST, invisible patterns are represented as InvisPat constructor inside of Pat:
+    data Pat p
+      = ...
+      | InvisPat (LHsType p)
+      ...
+
+Just like `BangPat`, the `Pat` data type allows `InvisPat` to appear in
+nested positions. But this is often not allowed; e.g.
+
+   f @a x = rhs    -- YES
+   f (@a,x) = rhs  -- NO
+
+   g = do { @a <- e1; e2 }         -- NO
+   h x = case x of { @a -> rhs }   -- NO
+
+Rather than excluding these things syntactically, we reject them in the renamer
+(see `rn_pats_general`).  This actually gives a better error message than we
+would get if they were rejected in the parser.
+
+Each pattern is either visible (not prefixed with @) or invisible (prefixed with @):
+    f :: forall a. forall b -> forall c. Int -> ...
+    f @a b @c x  = ...
+
+In this example, the arg-patterns are
+    1. InvisPat @a     -- in the type sig: forall a.
+    2. VarPat b        -- in the type sig: forall b ->
+    3. InvisPat @c     -- in the type sig: forall c.
+    4. VarPat x        -- in the type sig: Int ->
+
+Invisible patterns are always type patterns, i.e. they are matched with
+forall-bound type variables in the signature. Consequently, those variables (and
+their binders) are erased during compilation, having no effect on program
+execution at runtime.
+
+Visible patterns, on the other hand, may be matched with ordinary function
+arguments (Int ->) as well as required type arguments (forall b ->). This means
+that a visible pattern may either be erased or retained, and we only find out in
+the type checker, namely in tcMatchPats, where we match up all arg-patterns with
+quantifiers from the type signature.
+
+In other words, invisible patterns are always /erased/, while visible patterns
+are sometimes /erased/ and sometimes /retained/.
+
+The desugarer has no use for erased patterns, as the type checker generates
+HsWrappers to bind the corresponding type variables. Erased patterns are simply
+discarded inside tcMatchPats, where we know if visible pattern retained or erased.
+-}
 
 -- ---------------------------------------------------------------------
 
@@ -181,6 +263,9 @@ data EpAnnSumPat = EpAnnSumPat
       , sumPatVbarsBefore :: [EpaLocation]
       , sumPatVbarsAfter  :: [EpaLocation]
       } deriving Data
+
+instance NoAnn EpAnnSumPat where
+  noAnn = EpAnnSumPat [] [] []
 
 -- ---------------------------------------------------------------------
 
@@ -204,11 +289,11 @@ data XXPatGhcTc
       }
   -- | Pattern expansion: original pattern, and desugared pattern,
   -- for RebindableSyntax and other overloaded syntax such as OverloadedLists.
-  -- See Note [Rebindable syntax and HsExpansion].
+  -- See Note [Rebindable syntax and XXExprGhcRn].
   | ExpansionPat (Pat GhcRn) (Pat GhcTc)
 
 
--- See Note [Rebindable syntax and HsExpansion].
+-- See Note [Rebindable syntax and XXExprGhcRn].
 data HsPatExpansion a b
   = HsPatExpanded a b
   deriving Data
@@ -244,8 +329,8 @@ data ConPatTc
 hsRecFieldId :: HsRecField GhcTc arg -> Id
 hsRecFieldId = hsRecFieldSel
 
-hsRecUpdFieldRdr :: HsRecUpdField (GhcPass p) -> Located RdrName
-hsRecUpdFieldRdr = fmap rdrNameAmbiguousFieldOcc . reLoc . hfbLHS
+hsRecUpdFieldRdr :: HsRecUpdField (GhcPass p) q -> Located RdrName
+hsRecUpdFieldRdr = fmap ambiguousFieldOccRdrName . reLoc . hfbLHS
 
 hsRecUpdFieldId :: HsFieldBind (LAmbiguousFieldOcc GhcTc) arg -> Located Id
 hsRecUpdFieldId = fmap foExt . reLoc . hsRecUpdFieldOcc
@@ -262,10 +347,10 @@ hsRecUpdFieldOcc = fmap unambiguousFieldOcc . hfbLHS
 ************************************************************************
 -}
 
-instance Outputable (HsPatSigType p) => Outputable (HsConPatTyArg p) where
+instance Outputable (HsTyPat p) => Outputable (HsConPatTyArg p) where
   ppr (HsConPatTyArg _ ty) = char '@' <> ppr ty
 
-instance (Outputable arg, Outputable (XRec p (HsRecField p arg)), XRec p RecFieldsDotDot ~ Located RecFieldsDotDot)
+instance (Outputable arg, Outputable (XRec p (HsRecField p arg)), XRec p RecFieldsDotDot ~ LocatedE RecFieldsDotDot)
       => Outputable (HsRecFields p arg) where
   ppr (HsRecFields { rec_flds = flds, rec_dotdot = Nothing })
         = braces (fsep (punctuate comma (map ppr flds)))
@@ -283,7 +368,7 @@ instance (Outputable p, OutputableBndr p, Outputable arg)
 instance OutputableBndrId p => Outputable (Pat (GhcPass p)) where
     ppr = pprPat
 
--- See Note [Rebindable syntax and HsExpansion].
+-- See Note [Rebindable syntax and XXExprGhcRn].
 instance (Outputable a, Outputable b) => Outputable (HsPatExpansion a b) where
   ppr (HsPatExpanded a b) = ifPprDebug (vcat [ppr a, ppr b]) (ppr a)
 
@@ -328,10 +413,10 @@ pprPat (VarPat _ lvar)          = pprPatBndr (unLoc lvar)
 pprPat (WildPat _)              = char '_'
 pprPat (LazyPat _ pat)          = char '~' <> pprParendLPat appPrec pat
 pprPat (BangPat _ pat)          = char '!' <> pprParendLPat appPrec pat
-pprPat (AsPat _ name _ pat)     = hcat [pprPrefixOcc (unLoc name), char '@',
+pprPat (AsPat _ name pat)       = hcat [pprPrefixOcc (unLoc name), char '@',
                                         pprParendLPat appPrec pat]
 pprPat (ViewPat _ expr pat)     = hcat [pprLExpr expr, text " -> ", ppr pat]
-pprPat (ParPat _ _ pat _)      = parens (ppr pat)
+pprPat (ParPat _ pat)           = parens (ppr pat)
 pprPat (LitPat _ s)             = ppr s
 pprPat (NPat _ l Nothing  _)    = ppr l
 pprPat (NPat _ l (Just _) _)    = char '-' <> ppr l
@@ -378,11 +463,10 @@ pprPat (ConPat { pat_con = con
                        , cpt_dicts = dicts
                        , cpt_binds = binds
                        } = ext
+pprPat (EmbTyPat _ tp) = text "type" <+> ppr tp
+pprPat (InvisPat _ tp) = char '@' <> ppr tp
 
 pprPat (XPat ext) = case ghcPass @p of
-#if __GLASGOW_HASKELL__ < 811
-  GhcPs -> dataConCantHappen ext
-#endif
   GhcRn -> case ext of
     HsPatExpanded orig _ -> pprPat orig
   GhcTc -> case ext of
@@ -474,7 +558,7 @@ isBangedLPat :: LPat (GhcPass p) -> Bool
 isBangedLPat = isBangedPat . unLoc
 
 isBangedPat :: Pat (GhcPass p) -> Bool
-isBangedPat (ParPat _ _ p _) = isBangedLPat p
+isBangedPat (ParPat _ p) = isBangedLPat p
 isBangedPat (BangPat {}) = True
 isBangedPat _            = False
 
@@ -495,29 +579,12 @@ looksLazyLPat :: LPat (GhcPass p) -> Bool
 looksLazyLPat = looksLazyPat . unLoc
 
 looksLazyPat :: Pat (GhcPass p) -> Bool
-looksLazyPat (ParPat _ _ p _)  = looksLazyLPat p
-looksLazyPat (AsPat _ _ _ p)   = looksLazyLPat p
+looksLazyPat (ParPat _ p)  = looksLazyLPat p
+looksLazyPat (AsPat _ _ p) = looksLazyLPat p
 looksLazyPat (BangPat {})  = False
 looksLazyPat (VarPat {})   = False
 looksLazyPat (WildPat {})  = False
 looksLazyPat _             = True
-
-isIrrefutableHsPat :: forall p. (OutputableBndrId p)
-                   => DynFlags -> LPat (GhcPass p) -> Bool
--- (isIrrefutableHsPat p) is true if matching against p cannot fail,
--- in the sense of falling through to the next pattern.
---      (NB: this is not quite the same as the (silly) defn
---      in 3.17.2 of the Haskell 98 report.)
---
--- WARNING: isIrrefutableHsPat returns False if it's in doubt.
--- Specifically on a ConPatIn, which is what it sees for a
--- (LPat Name) in the renamer, it doesn't know the size of the
--- constructor family, so it returns False.  Result: only
--- tuple patterns are considered irrefutable at the renamer stage.
---
--- But if it returns True, the pattern is definitely irrefutable
-isIrrefutableHsPat dflags =
-    isIrrefutableHsPat' (xopt LangExt.Strict dflags)
 
 {-
 Note [-XStrict and irrefutability]
@@ -545,55 +612,98 @@ encounters a LazyPat and -XStrict is enabled.
 See also Note [decideBangHood] in GHC.HsToCore.Utils.
 -}
 
-isIrrefutableHsPat' :: forall p. (OutputableBndrId p)
-                    => Bool -- ^ Are we in a @-XStrict@ context?
-                            -- See Note [-XStrict and irrefutability]
-                    -> LPat (GhcPass p) -> Bool
-isIrrefutableHsPat' is_strict = goL
-  where
-    goL :: LPat (GhcPass p) -> Bool
-    goL = go . unLoc
+type ConLikePIrrefutableCheck m p
+  = Bool                       -- ^ Are we in a @-XStrict@ context?
+                               -- See Note [-XStrict and irrefutability]
+    -> XRec p (ConLikeP p)     -- ^ ConLikeThing
+    -> HsConPatDetails p       -- ^ ConPattern details
+    -> m Bool                  -- ^ is it Irrefutable?
 
-    go :: Pat (GhcPass p) -> Bool
-    go (WildPat {})        = True
-    go (VarPat {})         = True
+type LPatIrrefutableCheck m p
+  = Bool                              -- ^ Are we in a @-XStrict@ context?
+                                      -- See Note [-XStrict and irrefutability]
+    -> ConLikePIrrefutableCheck m p   -- How should I check ConLikeP things
+    -> LPat p                         -- The LPat thing
+    -> m Bool                         -- Is it irrefutable?
+
+-- | (isIrrefutableHsPat p) is true if matching against p cannot fail
+-- in the sense of falling through to the next pattern.
+--      (NB: this is not quite the same as the (silly) defn
+--      in 3.17.2 of the Haskell 98 report.)
+--
+-- WARNING: isIrrefutableHsPat returns False if it's in doubt.
+-- Specifically on a ConPatIn, which is what it sees for a
+-- (LPat Name) in the renamer, it doesn't know the size of the
+-- constructor family, so it returns False.  Result: only
+-- tuple patterns are considered irrefutable at the renamer stage.
+--
+-- But if it returns True, the pattern is definitely irrefutable
+-- Instantiates `isIrrefutableHsPatHelperM` with a trivial identity monad
+isIrrefutableHsPatHelper :: forall p. (OutputableBndrId p)
+                         => Bool -- ^ Are we in a @-XStrict@ context?
+                                 -- See Note [-XStrict and irrefutability]
+                         -> LPat (GhcPass p) -> Bool
+isIrrefutableHsPatHelper is_strict pat = runIdentity $ doWork is_strict pat
+  where
+  doWork :: forall p. (OutputableBndrId p) => Bool -> LPat (GhcPass p) -> Identity Bool
+  doWork is_strict = isIrrefutableHsPatHelperM is_strict isConLikeIrr
+
+  isConLikeIrr :: forall p. (OutputableBndrId p) => ConLikePIrrefutableCheck Identity (GhcPass p)
+  isConLikeIrr is_strict con details
+    = case ghcPass @p of
+        GhcPs -> return False                   -- Conservative
+        GhcRn -> return False                   -- Conservative
+        GhcTc -> case con of
+          L _ (PatSynCon _pat)  -> return False -- Conservative
+          L _ (RealDataCon con) ->
+            do let b = isJust (tyConSingleDataCon_maybe (dataConTyCon con))
+               bs <- mapM (doWork is_strict) (hsConPatArgs details)
+               return $ b && and bs
+
+
+-- This function abstracts 2 things
+-- 1. How to compute irrefutability for a `ConLikeP` thing
+-- 2. The wrapper monad
+isIrrefutableHsPatHelperM :: forall m p. (Monad m, OutputableBndrId p)
+                          => LPatIrrefutableCheck m (GhcPass p)
+isIrrefutableHsPatHelperM is_strict isConLikeIrr pat = go (unLoc pat)
+  where
+    goL = isIrrefutableHsPatHelperM is_strict isConLikeIrr
+
+    go :: Pat (GhcPass p) -> m Bool
+    go (WildPat {})        = return True
+    go (VarPat {})         = return True
     go (LazyPat _ p')
       | is_strict
-      = isIrrefutableHsPat' False p'
-      | otherwise          = True
+      = isIrrefutableHsPatHelperM False isConLikeIrr p'
+      | otherwise          = return True
     go (BangPat _ pat)     = goL pat
-    go (ParPat _ _ pat _)  = goL pat
-    go (AsPat _ _ _ pat)   = goL pat
+    go (ParPat _ pat)      = goL pat
+    go (AsPat _ _ pat)     = goL pat
     go (ViewPat _ _ pat)   = goL pat
     go (SigPat _ pat _)    = goL pat
-    go (TuplePat _ pats _) = all goL pats
-    go (SumPat {})         = False
+    go (TuplePat _ pats _) = do { bs <- mapM goL pats; return $ and bs }
+    go (SumPat {})         = return False
                     -- See Note [Unboxed sum patterns aren't irrefutable]
-    go (ListPat {})        = False
+    go (ListPat {})        = return False
 
     go (ConPat
         { pat_con  = con
-        , pat_args = details })
-                           = case ghcPass @p of
-       GhcPs -> False -- Conservative
-       GhcRn -> False -- Conservative
-       GhcTc -> case con of
-         L _ (PatSynCon _pat)  -> False -- Conservative
-         L _ (RealDataCon con) ->
-           isJust (tyConSingleDataCon_maybe (dataConTyCon con))
-           && all goL (hsConPatArgs details)
-    go (LitPat {})         = False
-    go (NPat {})           = False
-    go (NPlusKPat {})      = False
+        , pat_args = details }) = isConLikeIrr is_strict con details
+    go (LitPat {})         = return False
+    go (NPat {})           = return False
+    go (NPlusKPat {})      = return False
 
     -- We conservatively assume that no TH splices are irrefutable
     -- since we cannot know until the splice is evaluated.
-    go (SplicePat {})      = False
+    go (SplicePat {})      = return False
+
+    -- The behavior of this case is unimportant, as GHC will throw an error shortly
+    -- after reaching this case for other reasons (see TcRnIllegalTypePattern).
+    go (EmbTyPat {})       = return True
+    go (InvisPat {})       = return True
 
     go (XPat ext)          = case ghcPass @p of
-#if __GLASGOW_HASKELL__ < 811
-      GhcPs -> dataConCantHappen ext
-#endif
       GhcRn -> case ext of
         HsPatExpanded _ pat -> go pat
       GhcTc -> case ext of
@@ -609,13 +719,68 @@ isIrrefutableHsPat' is_strict = goL
 -- - x (variable)
 isSimplePat :: LPat (GhcPass x) -> Maybe (IdP (GhcPass x))
 isSimplePat p = case unLoc p of
-  ParPat _ _ x _ -> isSimplePat x
+  ParPat _ x -> isSimplePat x
   SigPat _ x _ -> isSimplePat x
   LazyPat _ x -> isSimplePat x
   BangPat _ x -> isSimplePat x
   VarPat _ x -> Just (unLoc x)
   _ -> Nothing
 
+-- | Is this pattern boring from the perspective of pattern-match checking,
+-- i.e. introduces no new pieces of long-distance information
+-- which could influence pattern-match checking?
+--
+-- See Note [Boring patterns].
+isBoringHsPat :: forall p. OutputableBndrId p => LPat (GhcPass p) -> Bool
+-- NB: it's always safe to return 'False' in this function; that just means
+-- performing potentially-redundant pattern-match checking.
+isBoringHsPat = goL
+  where
+    goL :: forall p. OutputableBndrId p => LPat (GhcPass p) -> Bool
+    goL = go . unLoc
+
+    go :: forall p. OutputableBndrId p => Pat (GhcPass p) -> Bool
+    go = \case
+      WildPat {} -> True
+      VarPat  {} -> True
+      LazyPat {} -> True
+      BangPat _ pat     -> goL pat
+      ParPat _ pat      -> goL pat
+      AsPat {} -> False -- the pattern x@y links x and y together,
+                        -- which is a nontrivial piece of information
+      ViewPat _ _ pat   -> goL pat
+      SigPat _ pat _    -> goL pat
+      TuplePat _ pats _ -> all goL pats
+      SumPat  _ pat _ _ -> goL pat
+      ListPat _ pats    -> all goL pats
+      ConPat { pat_con = con, pat_args = details }
+        -> case ghcPass @p of
+            GhcPs -> False -- conservative
+            GhcRn -> False -- conservative
+            GhcTc
+              | isVanillaConLike (unLoc con)
+              -> all goL (hsConPatArgs details)
+              | otherwise
+              -- A pattern match on a GADT constructor can introduce
+              -- type-level information (for example, T18572).
+              -> False
+      LitPat {}     -> True
+      NPat {}       -> True
+      NPlusKPat {}  -> True
+      SplicePat {}  -> False
+      EmbTyPat {}   -> True
+      InvisPat {}   -> True
+      XPat ext ->
+        case ghcPass @p of
+         GhcRn -> case ext of
+           HsPatExpanded _ pat -> go pat
+         GhcTc -> case ext of
+           CoPat _ pat _      -> go pat
+           ExpansionPat _ pat -> go pat
+
+isPatSyn :: LPat GhcTc -> Bool
+isPatSyn (L _ (ConPat {pat_con = L _ (PatSynCon{})})) = True
+isPatSyn _ = False
 
 {- Note [Unboxed sum patterns aren't irrefutable]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -637,6 +802,58 @@ minimum unboxed sum arity is 2.
 Failing to mark unboxed sum patterns as non-irrefutable would cause the Just'
 case in foo to be unreachable, as GHC would mistakenly believe that Nothing'
 is the only thing that could possibly be matched!
+
+Note [Boring patterns]
+~~~~~~~~~~~~~~~~~~~~~~
+A pattern is called boring when no new information is gained upon successfully
+matching on the pattern.
+
+Some examples of boring patterns:
+
+  - x, for a variable x. We learn nothing about x upon matching this pattern.
+  - Just y. This pattern can fail, but if it matches, we don't learn anything
+    about y.
+
+Some examples of non-boring patterns:
+
+  - x@(Just y). A match on this pattern introduces the fact that x is headed
+    by the constructor Just, which means that a subsequent pattern match such as
+
+      case x of { Just z -> ... }
+
+    should not be marked as incomplete.
+  - a@b. Matching on this pattern introduces a relation between 'a' and 'b',
+    which means that we shouldn't emit any warnings in code of the form
+
+      case a of
+        True -> case b of { True -> .. } -- no warning here!
+        False -> ...
+  - GADT patterns. For example, with the GADT
+
+      data G i where { MkGInt :: G Int }
+
+    a match on the pattern 'MkGInt' introduces type-level information:
+
+      foo :: G i -> i
+      foo MkGInt = 3
+
+    Here we learn that i ~ Int after matching on 'MkGInt', so this pattern
+    is not boring.
+
+When a pattern is boring, and we are only interested in additional long-distance
+information (not whether the pattern itself is fallible), we can skip pattern-match
+checking entirely. Doing this saves about 10% allocations in test T11195.
+
+This happens when we are checking pattern-matches in do-notation, for example:
+
+  do { x@(Just y) <- z
+     ; ...
+     ; return $ case x of { Just w -> ... } }
+
+Here we *do not* want to emit a pattern-match warning on the first line for the
+incomplete pattern-match, as incompleteness inside do-notation is handled
+using MonadFail. However, we still want to propagate the fact that x is headed
+by the 'Just' constructor, to avoid a pattern-match warning on the last line.
 -}
 
 -- | @'patNeedsParens' p pat@ returns 'True' if the pattern @pat@ needs
@@ -653,10 +870,9 @@ patNeedsParens p = go @p
                          = conPatNeedsParens p ds
     go (SigPat {})       = p >= sigPrec
     go (ViewPat {})      = True
+    go (EmbTyPat {})     = True
+    go (InvisPat{})      = False
     go (XPat ext)        = case ghcPass @q of
-#if __GLASGOW_HASKELL__ < 901
-      GhcPs -> dataConCantHappen ext
-#endif
       GhcRn -> case ext of
         HsPatExpanded orig _ -> go orig
       GhcTc -> case ext of
@@ -692,8 +908,13 @@ conPatNeedsParens p = go
 
 
 -- | Parenthesize a pattern without token information
-gParPat :: LPat (GhcPass pass) -> Pat (GhcPass pass)
-gParPat p = ParPat noAnn noHsTok p noHsTok
+gParPat :: forall p. IsPass p => LPat (GhcPass p) -> Pat (GhcPass p)
+gParPat pat = ParPat x pat
+  where
+    x = case ghcPass @p of
+      GhcPs -> noAnn
+      GhcRn -> noExtField
+      GhcTc -> noExtField
 
 -- | @'parenthesizePat' p pat@ checks if @'patNeedsParens' p pat@ is true, and
 -- if so, surrounds @pat@ with a 'ParPat'. Otherwise, it simply returns @pat@.
@@ -704,6 +925,7 @@ parenthesizePat :: IsPass p
 parenthesizePat p lpat@(L loc pat)
   | patNeedsParens p pat = L loc (gParPat lpat)
   | otherwise            = lpat
+
 
 {-
 % Collect all EvVars from all constructor patterns
@@ -720,8 +942,8 @@ collectEvVarsPat :: Pat GhcTc -> Bag EvVar
 collectEvVarsPat pat =
   case pat of
     LazyPat _ p      -> collectEvVarsLPat p
-    AsPat _ _ _ p    -> collectEvVarsLPat p
-    ParPat  _ _ p _  -> collectEvVarsLPat p
+    AsPat _ _ p      -> collectEvVarsLPat p
+    ParPat  _ p      -> collectEvVarsLPat p
     BangPat _ p      -> collectEvVarsLPat p
     ListPat _ ps     -> unionManyBags $ map collectEvVarsLPat ps
     TuplePat _ ps _  -> unionManyBags $ map collectEvVarsLPat ps
@@ -751,7 +973,7 @@ collectEvVarsPat pat =
 -}
 
 type instance Anno (Pat (GhcPass p)) = SrcSpanAnnA
-type instance Anno (HsOverLit (GhcPass p)) = SrcAnn NoEpAnns
+type instance Anno (HsOverLit (GhcPass p)) = EpAnnCO
 type instance Anno ConLike = SrcSpanAnnN
 type instance Anno (HsFieldBind lhs rhs) = SrcSpanAnnA
-type instance Anno RecFieldsDotDot = SrcSpan
+type instance Anno RecFieldsDotDot = EpaLocation

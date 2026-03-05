@@ -21,9 +21,9 @@ import GHC.HsToCore.Pmc.Utils
 import GHC.Core (Expr(Var,App))
 import GHC.Data.FastString (unpackFS, lengthFS)
 import GHC.Data.Bag (bagToList)
-import GHC.Driver.Session
+import GHC.Driver.DynFlags
 import GHC.Hs
-import GHC.Tc.Utils.Zonk (shortCutLit)
+import GHC.Tc.Utils.TcMType (shortCutLit)
 import GHC.Types.Id
 import GHC.Core.ConLike
 import GHC.Types.Name
@@ -48,7 +48,7 @@ import GHC.Data.Maybe
 import qualified GHC.LanguageExtensions as LangExt
 import GHC.Utils.Monad (concatMapM)
 import GHC.Types.SourceText (FractionalLit(..))
-import Control.Monad (zipWithM)
+import Control.Monad (zipWithM, replicateM)
 import Data.List (elemIndex)
 import Data.List.NonEmpty ( NonEmpty(..) )
 import qualified Data.List.NonEmpty as NE
@@ -92,7 +92,7 @@ mkPmLitGrds x (PmLit _ (PmLitString s)) = do
   -- 'GHC.HsToCore.Pmc.Solver.addRefutableAltCon', but it's so much simpler
   -- here. See Note [Representation of Strings in TmState] in
   -- GHC.HsToCore.Pmc.Solver
-  vars <- traverse mkPmId (take (lengthFS s) (repeat charTy))
+  vars <- replicateM (lengthFS s) (mkPmId charTy)
   let mk_char_lit y c = mkPmLitGrds y (PmLit charTy (PmLitChar c))
   char_grdss <- zipWithM mk_char_lit vars (unpackFS s)
   mkListGrds x (zip vars char_grdss)
@@ -110,7 +110,7 @@ desugarPat :: Id -> Pat GhcTc -> DsM [PmGrd]
 desugarPat x pat = case pat of
   WildPat  _ty -> pure []
   VarPat _ y   -> pure (mkPmLetVar (unLoc y) x)
-  ParPat _ _ p _ -> desugarLPat x p
+  ParPat _ p   -> desugarLPat x p
   LazyPat _ _  -> pure [] -- like a wildcard
   BangPat _ p@(L l p') ->
     -- Add the bang in front of the list, because it will happen before any
@@ -120,9 +120,11 @@ desugarPat x pat = case pat of
 
   -- (x@pat)   ==>   Desugar pat with x as match var and handle impedance
   --                 mismatch with incoming match var
-  AsPat _ (L _ y) _ p -> (mkPmLetVar y x ++) <$> desugarLPat y p
+  AsPat _ (L _ y) p -> (mkPmLetVar y x ++) <$> desugarLPat y p
 
   SigPat _ p _ty -> desugarLPat x p
+  EmbTyPat _ _ -> pure []
+  InvisPat _ _ -> pure []
 
   XPat ext -> case ext of
 
@@ -154,8 +156,8 @@ desugarPat x pat = case pat of
       | WpCast co <-  wrapper, isReflexiveCo co -> desugarPat x p
       | otherwise -> do
           (y, grds) <- desugarPatV p
-          wrap_rhs_y <- dsHsWrapper wrapper
-          pure (PmLet y (wrap_rhs_y (Var x)) : grds)
+          dsHsWrapper wrapper $ \wrap_rhs_y ->
+              pure (PmLet y (wrap_rhs_y (Var x)) : grds)
 
   -- (n + k)  ===>   let b = x >= k, True <- b, let n = x-k
   NPlusKPat _pat_ty (L _ n) k1 k2 ge minus -> do

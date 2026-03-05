@@ -25,11 +25,25 @@ given compilation phase:
     Use ⟨cmd⟩ as the literate pre-processor.
 
 .. ghc-flag:: -pgmP ⟨cmd⟩
-    :shortdesc: Use ⟨cmd⟩ as the C pre-processor (with ``-cpp`` only)
+    :shortdesc: Use ⟨cmd⟩ as the C pre-processor (with :ghc-flag:`-cpp` only)
     :type: dynamic
     :category: phase-programs
 
-    Use ⟨cmd⟩ as the C pre-processor (with ``-cpp`` only).
+    Use ⟨cmd⟩ as the C pre-processor (with :ghc-flag:`-cpp` only).
+
+.. ghc-flag:: -pgmJSP ⟨cmd⟩
+    :shortdesc: Use ⟨cmd⟩ as the JavaScript C pre-processor (only for javascript-backend)
+    :type: dynamic
+    :category: phase-programs
+
+    Use ⟨cmd⟩ as the JavaScript C pre-processor (only for javascript-backend).
+
+.. ghc-flag:: -pgmCmmP ⟨cmd⟩
+    :shortdesc: Use ⟨cmd⟩ as the C-- C pre-processor
+    :type: dynamic
+    :category: phase-programs
+
+    Use ⟨cmd⟩ as the C-- C pre-processor.
 
 .. ghc-flag:: -pgmc ⟨cmd⟩
     :shortdesc: Use ⟨cmd⟩ as the C compiler
@@ -59,6 +73,13 @@ given compilation phase:
 
     Use ⟨cmd⟩ as the LLVM compiler.
 
+.. ghc-flag:: -pgmlas ⟨cmd⟩
+    :shortdesc: Use ⟨cmd⟩ as the LLVM assembler
+    :type: dynamic
+    :category: phase-programs
+
+    Use ⟨cmd⟩ as the LLVM assembler
+
 .. ghc-flag:: -pgms ⟨cmd⟩
     :shortdesc: Use ⟨cmd⟩ as the splitter
     :type: dynamic
@@ -87,13 +108,6 @@ given compilation phase:
 
     Use ⟨cmd⟩ as the linker when merging object files (e.g. when generating
     joined objects for loading into GHCi).
-
-.. ghc-flag:: -pgmdll ⟨cmd⟩
-    :shortdesc: Use ⟨cmd⟩ as the DLL generator
-    :type: dynamic
-    :category: phase-programs
-
-    Use ⟨cmd⟩ as the DLL generator.
 
 .. ghc-flag:: -pgmF ⟨cmd⟩
     :shortdesc: Use ⟨cmd⟩ as the pre-processor (with :ghc-flag:`-F` only)
@@ -159,11 +173,29 @@ the following flags:
     Pass ⟨option⟩ to the literate pre-processor
 
 .. ghc-flag:: -optP ⟨option⟩
-    :shortdesc: pass ⟨option⟩ to cpp (with ``-cpp`` only)
+    :shortdesc: pass ⟨option⟩ to cpp (with :ghc-flag:`-cpp` only)
     :type: dynamic
     :category: phase-options
 
-    Pass ⟨option⟩ to CPP (makes sense only if ``-cpp`` is also on).
+    Pass ⟨option⟩ to CPP (makes sense only if :ghc-flag:`-cpp` is also on).
+
+.. ghc-flag:: -optJSP ⟨option⟩
+    :shortdesc: pass ⟨option⟩ to JavaScript C pre-processor (only for javascript-backend)
+    :type: dynamic
+    :category: phase-options
+
+    Pass ⟨option⟩ to JavaScript C pre-processor (only for javascript-backend).
+
+.. ghc-flag:: -optCmmP ⟨option⟩
+    :shortdesc: pass ⟨option⟩ to the C-- C pre-processor.
+    :type: dynamic
+    :category: phase-options
+
+    Pass ⟨option⟩ to the C-- C pre-processor.
+
+    The C-- C pre-processor also receives C compiler flags.  Those flags will
+    come _before_ the flags added by this option.  As a result, the net effect
+    of the following pair of flags is zero: :code:`-optCmmP-UFOO -optc-DFOO`.
 
 .. ghc-flag:: -optF ⟨option⟩
     :shortdesc: pass ⟨option⟩ to the custom pre-processor
@@ -178,7 +210,7 @@ the following flags:
     :type: dynamic
     :category: phase-options
 
-    Pass ⟨option⟩ to the C compiler.
+    Pass ⟨option⟩ to the C compiler and, for compatibility, C-- pre-processor.
 
 .. ghc-flag:: -pgmc-supports-no-pie
     :shortdesc: *(deprecated)*
@@ -225,6 +257,13 @@ the following flags:
 
     Pass ⟨option⟩ to the LLVM compiler.
 
+.. ghc-flag:: -optlas ⟨option⟩
+    :shortdesc: pass ⟨option⟩ to the LLVM assembler
+    :type: dynamic
+    :category: phase-options
+
+    Pass ⟨option⟩ to the LLVM assembler (typically clang).
+
 .. ghc-flag:: -opta ⟨option⟩
     :shortdesc: pass ⟨option⟩ to the assembler
     :type: dynamic
@@ -246,13 +285,6 @@ the following flags:
 
     Pass ⟨option⟩ to the linker when merging object files. In the case of a
     standard ``ld``-style linker this should generally include the ``-r`` flag.
-
-.. ghc-flag:: -optdll ⟨option⟩
-    :shortdesc: pass ⟨option⟩ to the DLL generator
-    :type: dynamic
-    :category: phase-options
-
-    Pass ⟨option⟩ to the DLL generator.
 
 .. ghc-flag:: -optwindres ⟨option⟩
     :shortdesc: pass ⟨option⟩ to ``windres``.
@@ -315,9 +347,9 @@ Options affecting the C pre-processor
     :category: cpp
 
     The C pre-processor :command:`cpp` is run over your Haskell code if
-    the ``-cpp`` option or ``-XCPP`` extension are given. Unless you are building a
-    large system with significant doses of conditional compilation, you
-    really shouldn't need it.
+    the :ghc-flag:`-cpp` option or :extension:`CPP` extension are given. Unless
+    you are building a large system with significant doses of conditional
+    compilation, you really shouldn't need it.
 
 .. ghc-flag:: -D⟨symbol⟩[=⟨value⟩]
     :shortdesc: Define a symbol in the C pre-processor
@@ -470,7 +502,7 @@ defined by your local GHC installation, the following trick is useful:
     .. index::
        single: __GLASGOW_HASKELL_LLVM__
 
-    Only defined when `:ghc-flag:`-fllvm` is specified. When GHC is using version
+    Only defined when :ghc-flag:`-fllvm` is specified. When GHC is using version
     ``x.y.z`` of LLVM, the value of ``__GLASGOW_HASKELL_LLVM__`` is the
     integer ⟨xyy⟩ (if ⟨y⟩ is a single digit, then a leading zero
     is added, so for example when using version 3.7 of LLVM,
@@ -629,8 +661,8 @@ Options affecting code generation
     useful if you're only interested in type checking code.
 
     If a module contains a Template Haskell splice then in ``--make`` mode, code
-    generation will be automatically turned on for all dependencies. By default
-    object files are generated but if ghc-flag:`-fprefer-byte-code` is enable then
+    generation will be automatically turned on for all dependencies. By default,
+    object files are generated, but if ghc-flag:`-fprefer-byte-code` is enabled,
     byte-code will be generated instead.
 
 .. ghc-flag:: -fwrite-interface
@@ -753,19 +785,6 @@ Options affecting code generation
 
     ``-dynamic-too`` is ignored if :ghc-flag:`-dynamic` is also specified.
 
-.. ghc-flag:: -split-objs
-    :shortdesc: Split generated object files into smaller files
-    :type: dynamic
-    :category: codegen
-
-    When using this option, the object file is split into many smaller objects.
-    This feature is used when building libraries, so that a program statically
-    linked against the library will pull in less of the library.
-
-    Since this uses platform specific techniques, it may not be available on
-    all target platforms. See the :ghc-flag:`--print-object-splitting-supported`
-    flag to check whether your GHC supports object splitting.
-
 .. ghc-flag:: -fexpose-internal-symbols
     :shortdesc: Produce symbols for all functions, including internal functions.
     :type: dynamic
@@ -787,7 +806,7 @@ Options affecting code generation
     :category: codegen
 
     If a home package module has byte-code available then use that instead of
-    and object file (if that's available) to evaluate and run TH splices.
+    an object file (if that's available) to evaluate and run TH splices.
 
     This is useful with flags such as :ghc-flag:`-fbyte-code-and-object-code`, which
     tells the compiler to generate byte-code, and :ghc-flag:`-fwrite-if-simplified-core` which
@@ -1079,6 +1098,7 @@ for example).
     :shortdesc: Use the threaded runtime
     :type: dynamic
     :category: linking
+    :reverse: -single-threaded
 
     Link the program with the "threaded" version of the runtime system.
     The threaded runtime system is so-called because it manages multiple
@@ -1101,6 +1121,16 @@ for example).
        Additionally, ``foreign export``\ ed Haskell functions may be
        called from multiple OS threads simultaneously. See
        :ref:`ffi-threads`.
+
+.. ghc-flag:: -single-threaded
+    :shortdesc: Use the single-threaded runtime
+    :type: dynamic
+    :category: linking
+    :reverse: -threaded
+
+    :since: 9.8
+
+    Switch to the single threaded (default) version of the runtime.
 
 .. ghc-flag:: -eventlog
     :shortdesc: Enable runtime event tracing

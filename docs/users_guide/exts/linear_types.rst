@@ -1,8 +1,13 @@
+.. _linear-types:
+
 Linear types
 ============
 
 .. extension:: LinearTypes
     :shortdesc: Enable linear types.
+        Implies :extension:`MonoLocalBinds`.
+
+    :implies: :extension:`MonoLocalBinds`
 
     :since: 9.0.1
     :status: Experimental
@@ -14,7 +19,7 @@ Linear types
 warts, and bad error messages; everything down to the syntax is
 subject to change**.  See, in particular,
 :ref:`linear-types-limitations` below. We encourage you to experiment
-with this extension and report issues in the GHC bug tracker `the GHC
+with this extension and report issues in `the GHC
 bug tracker <https://gitlab.haskell.org/ghc/ghc/issues>`__, adding the
 tag ``LinearTypes``.
 
@@ -58,7 +63,151 @@ partially. See, however :ref:`linear-types-limitations`.
 Linear and multiplicity-polymorphic arrows are *always declared*,
 never inferred. That is, if you don't give an appropriate type
 signature to a function, it will be inferred as being a regular
-function of type ``a -> b``.
+function of type ``a -> b``. The same principle holds for
+representation polymorphism (see :ref:`representation-polymorphism-defaulting`).
+
+Expressions
+-----------
+
+When defining a function either as a lambda ``\x -> u`` or with
+equations ``f x = u``, the multiplicity of the variable ``x`` will be
+inferred from the context. For equations, the context will typically
+be a type signature. For instance here is a linear function
+
+::
+
+    f :: (a -> b) %1 -> a -> b
+    f g x = g x
+
+In this example, ``g`` must be used linearly while ``x`` is
+unrestricted.
+
+Bindings
+~~~~~~~~
+
+Let and where bindings can be linear as well, the multiplicity of
+bindings is typically inferred
+
+::
+
+    f :: A %1 -> B
+    g :: B %1 -> C
+
+    h :: A %1 -> C
+    h x = g y
+      where
+        y = f x
+
+If you don't want, or aren't able, to rely on inference, let and where
+bindings can be annotated with a multiplicity
+
+::
+
+    f :: A %1 -> B
+    g :: B %1 -> C
+
+    h :: A %1 -> C
+    h x = g y
+      where
+        %1 y = f x
+
+The precise rules are, that you can annotate a binding with a
+multiplicity if:
+
+- The binding is not top-level
+- The binding is non-recursive
+- The binding is a pattern binding (including a simple variable)
+  ``p=e`` (you can't write ``let %1 f x = u``, instead write ``let %1
+  f = \x -> u``)
+- Either ``p`` is strict (see infra) or ``p`` is a variable. In
+  particular neither ``x@y`` nor ``(x)`` are covered by “is a
+  variable”
+
+When there's no multiplicity annotation, the multiplicity is inferred
+as follows:
+
+- Toplevel bindings are inferred as having multiplicity ``Many``
+- Recursive bindings are inferred as having multiplicity ``Many``
+- Lazy non-variable pattern bindings are inferred as having
+  multiplicity ``Many`` (note that in let- and where-bindings,
+  patterns are lazy by default, so that ``let (x,y) = rhs`` always
+  have multiplicity ``Many``, whereas ``let !(x,y) = rhs`` can have
+  multiplicity ``1``).
+- In all other cases, including function bindings ``let f x1...xn = rhs``,
+  the multiplicity is inferred from the term.
+
+When ``-XMonoLocalBinds`` is off, the following also holds:
+
+- Multiplicity-annotated non-variable pattern-bindings (such as
+  ``let %1 !(x,y) = rhs``) are never generalised.
+- Non-variable pattern bindings which are inferred as polymorphic or
+  qualified are inferred as having multiplicity ``Many``.
+
+Strict patterns
+~~~~~~~~~~~~~~~
+
+GHC considers that non-variable lazy patterns consume the scrutinee
+with multiplicity ``Many``. In practice, a pattern is strict (hence
+can be linear) if (otherwise the pattern is lazy):
+
+- The pattern is a case alternative and isn't annotated with a ``~``
+- The pattern is a let-binding, and is annotated with a ``!``
+- The pattern is a let-binding, :extension:`Strict` is on, and isn't
+  annotated with a ``~``
+- The pattern is nested inside a strict pattern
+
+Here are some examples of the impact on linear typing:
+
+Without ``-XStrict``::
+
+   -- good
+   let %1 x = u in …
+
+   -- good
+   let %1 !x = u in …
+
+   -- bad
+   let %1 (x, y) = u in …
+
+   -- good
+   let %Many (x, y) = u in …
+
+   -- good
+   let %1 !(x, y) = u in …
+
+   -- good
+   let %1 (!(x, y)) = u in …
+
+   -- inferred unrestricted
+   let (x, y) = u in …
+
+   -- can be inferred linear
+   case u of (x, y) -> …
+
+   -- inferred unrestricted
+   case u of ~(x, y) -> …
+
+With ``-XStrict``::
+   -- good
+   let %1 x = u in …
+
+   -- good
+   let %1 !x = u in …
+
+   -- good
+   let %1 (x, y) = u in …
+
+   -- bad
+   let %1 ~(x, y) = u in …
+
+   -- good
+   let %Many ~(x, y) = u in …
+
+   -- can be inferred linear
+   let (x, y) = u in …
+
+   -- inferred unrestricted
+   let ~(x, y) = u in …
 
 Data types
 ----------
@@ -154,36 +303,12 @@ missing pieces.
 - Multiplicity polymorphism is incomplete and experimental. You may
   have success using it, or you may not. Expect it to be really unreliable.
   (Multiplicity multiplication is not supported yet.)
-- There is currently no support for multiplicity annotations such as
-  ``x :: a %p``, ``\(x :: a %p) -> ...``.
+- There is currently no support for multiplicity annotations on
+  function arguments such as ``\(%p x :: a) -> ...``, only on
+  let-bound variables.
 - A ``case`` expression may consume its scrutinee ``One`` time,
   or ``Many`` times. But the inference is still experimental, and may
   over-eagerly guess that it ought to consume the scrutinee ``Many`` times.
-- All ``let`` and ``where`` statements consume their right hand side
-  ``Many`` times. That is, the following will not type check:
-
-  ::
-
-      g :: A %1 -> (A, B)
-      h :: A %1 -> B %1 -> C
-
-      f :: A %1 -> C
-      f x =
-        let (y, z) = g x in h y z
-
-  This can be worked around by defining extra functions which are
-  specified to be linear, such as:
-
-  ::
-
-      g :: A %1 -> (A, B)
-      h :: A %1 -> B %1 -> C
-
-      f :: A %1 -> C
-      f x = f' (g x)
-        where
-          f' :: (A, B) %1 -> C
-          f' (y, z) = h y z
 - There is no support for linear pattern synonyms.
 - ``@``-patterns and view patterns are not linear.
 - The projection function for a record with a single linear field should be

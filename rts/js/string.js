@@ -479,9 +479,9 @@ function h$decodeUtf16z(v,start) {
 
 function h$decodeUtf16l(v, byteLen, start) {
   // perhaps we can apply it with an Uint16Array view, but that might give us endianness problems
-  var a = [];
+  var arr = [];
   for(var i=0;i<byteLen;i+=2) {
-    a[i>>1] = v.dv.getUint16(i+start,true);
+    arr[i>>1] = v.dv.getUint16(i+start,true);
   }
   return h$charCodeArrayToString(arr);
 }
@@ -590,7 +590,7 @@ function h$charCodeArrayToString(arr) {
 }
 
 function h$hs_iconv_open(to,to_off,from,from_off) {
-  h$errno = h$EINVAL; // no encodings supported
+  h$setErrno("EINVAL"); // no encodings supported
   return -1;
 //  var fromStr = decodeUtf8(from, from_off);
 //  var toStr = decodeUtf8(to, to_off);
@@ -628,7 +628,7 @@ function h$fromHsString(str) {
     var xs = '';
     while(IS_CONS(str)) {
 	var h = CONS_HEAD(str);
-	xs += String.fromCharCode(UNWRAP_NUMBER(h));
+	xs += String.fromCodePoint(UNWRAP_NUMBER(h));
         str = CONS_TAIL(str);
     }
     return xs;
@@ -723,7 +723,10 @@ function h$appendToHsStringA(str, appendTo, cc) {
 function h$appendToHsStringA(str, appendTo) {
 #endif
   var i = str.length - 1;
-  var r = appendTo;
+  // we need to make an updatable thunk here
+  // if we embed the given closure in a CONS cell.
+  // (#24495)
+  var r = i == 0 ? appendTo : MK_UPD_THUNK(appendTo);
   while(i>=0) {
     r = MK_CONS_CC(str.charCodeAt(i), r, cc);
     --i;
@@ -739,7 +742,7 @@ function h$throwJSException(e) {
   if(typeof e === 'string') {
     strVal = e;
   } else if(e instanceof Error) {
-    strVal = e.toString() + '\n' + Array.prototype.join.call(e.stack, '\n');
+    strVal = e.toString() + '\n' + e.stack;
   } else {
     strVal = "" + e;
   }

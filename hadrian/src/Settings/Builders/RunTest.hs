@@ -20,6 +20,8 @@ import System.Directory (findExecutable)
 import Settings.Program
 import qualified Context.Type
 
+import GHC.Toolchain.Target
+
 getTestSetting :: TestSetting -> Action String
 getTestSetting key = testSetting key
 
@@ -32,7 +34,7 @@ getBooleanSetting key = fromMaybe (error msg) <$> parseYesNo <$> getTestSetting 
 -- | Extra flags to send to the Haskell compiler to run tests.
 runTestGhcFlags :: Action String
 runTestGhcFlags = do
-    unregisterised <- flag GhcUnregisterised
+    unregisterised <- queryTargetTarget tgtUnregisterised
 
     let ifMinGhcVer ver opt = do v <- ghcCanonVersion
                                  if ver <= v then pure opt
@@ -49,7 +51,7 @@ runTestGhcFlags = do
     -- Take flags to send to the Haskell compiler from test.mk.
     -- See: https://github.com/ghc/ghc/blob/master/testsuite/mk/test.mk#L37
     unwords <$> sequence
-        [ pure " -dcore-lint -dstg-lint -dcmm-lint -no-user-package-db -fno-dump-with-ways -rtsopts"
+        [ pure " -dcore-lint -dstg-lint -dcmm-lint -no-user-package-db -fno-dump-with-ways -fprint-error-index-links=never -rtsopts"
         , pure ghcOpts
         , pure ghcExtraFlags
         , ifMinGhcVer "711" "-fno-warn-missed-specialisations"
@@ -68,8 +70,11 @@ data TestCompilerArgs = TestCompilerArgs{
  ,   withInterpreter   :: Bool
  ,   unregisterised    :: Bool
  ,   tables_next_to_code :: Bool
- ,   withSMP           :: Bool
- ,   debugAssertions   :: Bool
+ ,   targetWithSMP       :: Bool  -- does the target support SMP
+ ,   debugged            :: Bool
+      -- ^ Whether the compiler has the debug RTS,
+      -- corresponding to the -debug option.
+ ,   debugAssertions     :: Bool
       -- ^ Whether the compiler has debug assertions enabled,
       -- corresponding to the -DDEBUG option.
  ,   profiled          :: Bool
@@ -96,25 +101,32 @@ inTreeCompilerArgs stg = do
     hasDynamic          <- (dynamic ==) . Context.Type.way <$> (programContext stg ghc)
     -- LeadingUnderscore is a property of the system so if cross-compiling stage1/stage2 could
     -- have different values? Currently not possible to express.
-    leadingUnderscore   <- flag LeadingUnderscore
+    leadingUnderscore   <- queryTargetTarget tgtSymbolsHaveLeadingUnderscore
     withInterpreter     <- ghcWithInterpreter
-    unregisterised      <- flag GhcUnregisterised
-    tables_next_to_code <- flag TablesNextToCode
-    withSMP             <- targetSupportsSMP
-    debugAssertions     <- ($ succStage stg) . ghcDebugAssertions <$> flavour
-    profiled            <- ghcProfiled        <$> flavour <*> pure stg
+    unregisterised      <- queryTargetTarget tgtUnregisterised
+    tables_next_to_code <- queryTargetTarget tgtTablesNextToCode
+    targetWithSMP       <- targetSupportsSMP
 
-    os          <- setting HostOs
-    arch        <- setting TargetArch
+    cross <- flag CrossCompiling
+
+    let ghcStage
+          | cross, Stage1 <- stg = Stage1
+          | otherwise = succStage stg
+    debugAssertions     <- ghcDebugAssertions <$> flavour <*> pure ghcStage
+    debugged            <- ghcDebugged        <$> flavour <*> pure ghcStage
+    profiled            <- ghcProfiled        <$> flavour <*> pure ghcStage
+
+    os          <- queryHostTarget queryOS
+    arch        <- queryTargetTarget queryArch
     let codegen_arches = ["x86_64", "i386", "powerpc", "powerpc64", "powerpc64le", "aarch64", "wasm32"]
     let withNativeCodeGen
           | unregisterised = False
           | arch `elem` codegen_arches = True
           | otherwise = False
-    platform    <- setting TargetPlatform
-    wordsize    <- (show @Int . (*8) . read) <$> setting TargetWordSize
+    platform    <- queryTargetTarget targetPlatformTriple
+    wordsize    <- show @Int . (*8) <$> queryTargetTarget (wordSize2Bytes . tgtWordSize)
 
-    llc_cmd   <- settingsFileSetting SettingsFileSetting_LlcCommand
+    llc_cmd   <- settingsFileSetting ToolchainSetting_LlcCommand
     have_llvm <- liftIO (isJust <$> findExecutable llc_cmd)
 
     top         <- topDirectory
@@ -124,7 +136,10 @@ inTreeCompilerArgs stg = do
     libdir           <- System.FilePath.normalise . (top -/-)
                     <$> stageLibPath stg
 
-    rtsLinker <- (== "YES") <$> setting TargetHasRtsLinker
+    -- For this information, we need to query ghc --info, however, that would
+    -- require building ghc, which we don't want to do here. Therefore, the
+    -- logic from `platformHasRTSLinker` is duplicated here.
+    let rtsLinker = not $ arch `elem` ["powerpc", "powerpc64", "powerpc64le", "s390x", "riscv64", "loongarch64", "javascript", "wasm32"]
 
     return TestCompilerArgs{..}
 
@@ -146,13 +161,15 @@ outOfTreeCompilerArgs = do
     withInterpreter     <- getBooleanSetting TestGhcWithInterpreter
     unregisterised      <- getBooleanSetting TestGhcUnregisterised
     tables_next_to_code <- getBooleanSetting TestGhcTablesNextToCode
-    withSMP             <- getBooleanSetting TestGhcWithSMP
-    debugAssertions     <- getBooleanSetting TestGhcDebugged
+    targetWithSMP       <- targetSupportsSMP
+    debugAssertions     <- getBooleanSetting TestGhcDebugAssertions
 
     os          <- getTestSetting TestHostOS
     arch        <- getTestSetting TestTargetARCH_CPP
     platform    <- getTestSetting TestTARGETPLATFORM
     wordsize    <- getTestSetting TestWORDSIZE
+    rtsWay      <- getTestSetting TestRTSWay
+    let debugged = "debug" `isInfixOf` rtsWay
 
     llc_cmd   <- getTestSetting TestLLC
     have_llvm <- liftIO (isJust <$> findExecutable llc_cmd)
@@ -181,7 +198,7 @@ assertSameCompilerArgs stg = do
     ]
 
 
--- Command line arguments for invoking the @runtest.py@ script. A lot of this
+-- Command line arguments for invoking the @runtests.py@ script. A lot of this
 -- mirrors @testsuite/mk/test.mk@.
 runTestBuilderArgs :: Args
 runTestBuilderArgs = builder Testsuite ? do
@@ -202,7 +219,7 @@ runTestBuilderArgs = builder Testsuite ? do
     bignumBackend <- getBignumBackend
     bignumCheck   <- getBignumCheck
 
-    keepFiles           <- expr (testKeepFiles <$> userSetting defaultTestArgs)
+    keepFiles <- expr (testKeepFiles <$> userSetting defaultTestArgs)
 
     accept <- expr (testAccept <$> userSetting defaultTestArgs)
     (acceptPlatform, acceptOS) <- expr . liftIO $
@@ -211,6 +228,7 @@ runTestBuilderArgs = builder Testsuite ? do
     (testEnv, testMetricsFile) <- expr . liftIO $
         (,) <$> lookupEnv "TEST_ENV" <*> lookupEnv "METRICS_FILE"
     perfBaseline <- expr . liftIO $ lookupEnv "PERF_BASELINE_COMMIT"
+    targetWrapper <- expr . liftIO $ lookupEnv "CROSS_EMULATOR"
 
     threads     <- shakeThreads <$> expr getShakeOptions
     top         <- expr $ topDirectory
@@ -227,7 +245,8 @@ runTestBuilderArgs = builder Testsuite ? do
         asBool s b = s ++ show b
 
     -- TODO: set CABAL_MINIMAL_BUILD/CABAL_PLUGIN_BUILD
-    mconcat [ arg $ "testsuite/driver/runtests.py"
+    mconcat [ arg "-Wdefault"  -- see #22727
+            , arg $ "testsuite/driver/runtests.py"
             , pure [ "--rootdir=" ++ testdir | testdir <- rootdirs ]
             , arg "--top", arg (top -/- "testsuite")
             , arg "-e", arg $ "windows=" ++ show windowsHost
@@ -239,6 +258,7 @@ runTestBuilderArgs = builder Testsuite ? do
             , arg "-e", arg $ "config.accept_os=" ++ show acceptOS
             , arg "-e", arg $ "config.exeext=" ++ quote (if null exe then "" else "."<>exe)
             , arg "-e", arg $ "config.compiler_debugged=" ++ show debugAssertions
+            , arg "-e", arg $ "config.debug_rts=" ++ show debugged
 
             -- MP: TODO, we do not need both, they get aliased to the same thing.
             , arg "-e", arg $ asBool "ghc_with_native_codegen=" withNativeCodeGen
@@ -260,10 +280,9 @@ runTestBuilderArgs = builder Testsuite ? do
 
             , arg "-e", arg $ "ghc_compiler_always_flags=" ++ quote ghcFlags
             , arg "-e", arg $ asBool "ghc_with_dynamic_rts="  (hasDynamicRts)
-            , arg "-e", arg $ asBool "ghc_with_threaded_rts=" (hasThreadedRts)
+            , arg "-e", arg $ asBool "config.ghc_with_threaded_rts=" (hasThreadedRts)
             , arg "-e", arg $ asBool "config.have_fast_bignum=" (bignumBackend /= "native" && not bignumCheck)
-            , arg "-e", arg $ asBool "ghc_with_smp=" withSMP
-
+            , arg "-e", arg $ asBool "target_with_smp=" targetWithSMP
             , arg "-e", arg $ "config.ghc_dynamic=" ++ show hasDynamic
             , arg "-e", arg $ "config.leading_underscore=" ++ show leadingUnderscore
 
@@ -280,6 +299,7 @@ runTestBuilderArgs = builder Testsuite ? do
             , case perfBaseline of
                 Just commit | not (null commit) -> arg ("--perf-baseline=" ++ commit)
                 _ -> mempty
+            , emitWhenSet targetWrapper $ \cmd -> arg ("--target-wrapper=" ++ cmd)
             , emitWhenSet testEnv $ \env -> arg ("--test-env=" ++ env)
             , emitWhenSet testMetricsFile $ \file -> arg ("--metrics-file=" ++ file)
             , getTestArgs -- User-provided arguments from command line.
@@ -304,6 +324,7 @@ getTestArgs = do
     bindir          <- expr $ getBinaryDirectory (testCompiler args)
     compiler        <- expr $ getCompilerPath (testCompiler args)
     globalVerbosity <- shakeVerbosity <$> expr getShakeOptions
+    cross_prefix    <- expr crossPrefix
     -- the testsuite driver will itself tell us if we need to generate the docs target
     -- So we always pass the haddock path if the hadrian configuration allows us to build
     -- docs
@@ -343,12 +364,12 @@ getTestArgs = do
                            Just verbosity -> Just $ "--verbose=" ++ verbosity
         wayArgs      = map ("--way=" ++) (testWays args)
         compilerArg  = ["--config", "compiler=" ++ show (compiler)]
-        ghcPkgArg    = ["--config", "ghc_pkg=" ++ show (bindir -/- "ghc-pkg" <.> exe)]
+        ghcPkgArg    = ["--config", "ghc_pkg=" ++ show (bindir -/- (cross_prefix <> "ghc-pkg") <.> exe)]
         haddockArg   = if haveDocs
-          then [ "--config", "haddock=" ++ show (bindir -/- "haddock" <.> exe) ]
+          then [ "--config", "haddock=" ++ show (bindir -/- (cross_prefix <> "haddock") <.> exe) ]
           else [ "--config", "haddock=" ]
-        hp2psArg     = ["--config", "hp2ps=" ++ show (bindir -/- "hp2ps" <.> exe)]
-        hpcArg       = ["--config", "hpc=" ++ show (bindir -/- "hpc" <.> exe)]
+        hp2psArg     = ["--config", "hp2ps=" ++ show (bindir -/- (cross_prefix <> "hp2ps") <.> exe)]
+        hpcArg       = ["--config", "hpc=" ++ show (bindir -/- (cross_prefix <> "hpc") <.> exe)]
         inTreeArg    = [ "-e", "config.in_tree_compiler=" ++
           show (isInTreeCompiler (testCompiler args) || testHasInTreeFiles args) ]
 

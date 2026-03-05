@@ -45,7 +45,7 @@ typedef struct _COFF_HEADER_INFO {
 
 void initLinker_PEi386( void );
 void exitLinker_PEi386( void );
-const char * addDLL_PEi386( pathchar *dll_name, HINSTANCE *instance  );
+const char * addDLL_PEi386( const pathchar *dll_name, HINSTANCE *instance  );
 void freePreloadObjectFile_PEi386( ObjectCode *oc );
 
 bool checkAndLoadImportLibrary( pathchar* arch_name, char* member_name, FILE* f);
@@ -60,6 +60,7 @@ bool ocRunFini_PEi386     ( ObjectCode *oc );
 bool ocGetNames_PEi386    ( ObjectCode* oc );
 bool ocVerifyImage_PEi386 ( ObjectCode* oc );
 SymbolAddr *lookupSymbol_PEi386(SymbolName *lbl, ObjectCode *dependent, SymType *type);
+SymbolAddr *lookupSymbolInDLL_PEi386 (const SymbolName* lbl, HINSTANCE instance, pathchar* dll_name, ObjectCode *dependent);
 
 /* See Note [mingw-w64 name decoration scheme] */
 /* We use myindex to calculate array addresses, rather than

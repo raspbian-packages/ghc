@@ -1,5 +1,4 @@
 {-# LANGUAGE GADTs #-}
-{-# LANGUAGE BangPatterns #-}
 module GHC.Cmm.ContFlowOpt
     ( cmmCfgOpts
     , cmmCfgOptsProc
@@ -11,7 +10,6 @@ where
 import GHC.Prelude hiding (succ, unzip, zip)
 
 import GHC.Cmm.Dataflow.Block hiding (blockConcat)
-import GHC.Cmm.Dataflow.Collections
 import GHC.Cmm.Dataflow.Graph
 import GHC.Cmm.Dataflow.Label
 import GHC.Cmm.BlockId

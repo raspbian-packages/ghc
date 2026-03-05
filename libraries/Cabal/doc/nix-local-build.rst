@@ -5,7 +5,7 @@ Quickstart
 
 Suppose that you are in a directory containing a single Cabal package
 which you wish to build (if you haven't set up a package yet check
-out :doc:`developing packages <developing-packages>` for
+out :doc:`How to package Haskell code <how-to-package-haskell-code>` for
 instructions). You can configure and build it using Nix-style
 local builds with this command (configuring is not necessary):
 
@@ -170,8 +170,9 @@ identify the result of a build; if we compute this identifier and we
 find that we already have this ID built, we can just use the already
 built version.
 
-The global package store is ``~/.cabal/store`` (configurable via
-global `store-dir` option); if you need to clear your store for
+Use ``cabal path --store-dir`` to show where your global package store is located.
+This is configurable via the global ``store-dir`` option.
+If you need to clear your store for
 whatever reason (e.g., to reclaim disk space or because the global
 store is corrupted), deleting this directory is safe (``build``
 will just rebuild everything it needs on its next invocation).
@@ -268,7 +269,7 @@ this folder (the most important two are first):
     ``cabal sdist --list-only``. Thus if you do not list all your
     source files in a Cabal file, Cabal may fail to recompile when you
     edit them.
-``config`` (same format as ``cabal.project``)
+``config`` (binary)
     The full project configuration, merged from ``cabal.project`` (and
     friends) as well as the command line arguments.
 ``compiler`` (binary)

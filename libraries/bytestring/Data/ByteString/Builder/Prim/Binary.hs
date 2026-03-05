@@ -1,5 +1,5 @@
-{-# LANGUAGE CPP #-}
 {-# LANGUAGE Trustworthy #-}
+
 -- | Copyright   : (c) 2010-2011 Simon Meier
 -- License       : BSD3-style (see LICENSE)
 --
@@ -54,10 +54,10 @@ module Data.ByteString.Builder.Prim.Binary (
 
 import Data.ByteString.Builder.Prim.Internal
 import Data.ByteString.Builder.Prim.Internal.Floating
+import Data.ByteString.Utils.ByteOrder
+import Data.ByteString.Utils.UnalignedAccess
 
 import Foreign
-
-#include "MachDeps.h"
 
 ------------------------------------------------------------------------------
 -- Binary encoding
@@ -70,7 +70,7 @@ import Foreign
 --
 {-# INLINE word8 #-}
 word8 :: FixedPrim Word8
-word8 = storableToF
+word8 = fixedPrim 1 (flip poke) -- Word8 is always aligned
 
 --
 -- We rely on the fromIntegral to do the right masking for us.
@@ -80,38 +80,22 @@ word8 = storableToF
 -- | Encoding 'Word16's in big endian format.
 {-# INLINE word16BE #-}
 word16BE :: FixedPrim Word16
-#ifdef WORDS_BIGENDIAN
-word16BE = word16Host
-#else
-word16BE = byteSwap16 >$< word16Host
-#endif
+word16BE = whenLittleEndian byteSwap16 >$< word16Host
 
 -- | Encoding 'Word16's in little endian format.
 {-# INLINE word16LE #-}
 word16LE :: FixedPrim Word16
-#ifdef WORDS_BIGENDIAN
-word16LE = byteSwap16 >$< word16Host
-#else
-word16LE = word16Host
-#endif
+word16LE = whenBigEndian byteSwap16 >$< word16Host
 
 -- | Encoding 'Word32's in big endian format.
 {-# INLINE word32BE #-}
 word32BE :: FixedPrim Word32
-#ifdef WORDS_BIGENDIAN
-word32BE = word32Host
-#else
-word32BE = byteSwap32 >$< word32Host
-#endif
+word32BE = whenLittleEndian byteSwap32 >$< word32Host
 
 -- | Encoding 'Word32's in little endian format.
 {-# INLINE word32LE #-}
 word32LE :: FixedPrim Word32
-#ifdef WORDS_BIGENDIAN
-word32LE = byteSwap32 >$< word32Host
-#else
-word32LE = word32Host
-#endif
+word32LE = whenBigEndian byteSwap32 >$< word32Host
 
 -- on a little endian machine:
 -- word32LE w32 = fixedPrim 4 (\w p -> poke (castPtr p) w32)
@@ -119,20 +103,12 @@ word32LE = word32Host
 -- | Encoding 'Word64's in big endian format.
 {-# INLINE word64BE #-}
 word64BE :: FixedPrim Word64
-#ifdef WORDS_BIGENDIAN
-word64BE = word64Host
-#else
-word64BE = byteSwap64 >$< word64Host
-#endif
+word64BE = whenLittleEndian byteSwap64 >$< word64Host
 
 -- | Encoding 'Word64's in little endian format.
 {-# INLINE word64LE #-}
 word64LE :: FixedPrim Word64
-#ifdef WORDS_BIGENDIAN
-word64LE = byteSwap64 >$< word64Host
-#else
-word64LE = word64Host
-#endif
+word64LE = whenBigEndian byteSwap64 >$< word64Host
 
 
 -- | Encode a single native machine 'Word'. The 'Word's is encoded in host order,
@@ -143,23 +119,25 @@ word64LE = word64Host
 --
 {-# INLINE wordHost #-}
 wordHost :: FixedPrim Word
-wordHost = storableToF
+wordHost = case finiteBitSize (0 :: Word) of
+  32 -> fromIntegral @Word @Word32 >$< word32Host
+  64 -> fromIntegral @Word @Word64 >$< word64Host
+  _ -> error "Data.ByteString.Builder.Prim.Binary.wordHost: unexpected word size"
 
 -- | Encoding 'Word16's in native host order and host endianness.
 {-# INLINE word16Host #-}
 word16Host :: FixedPrim Word16
-word16Host = storableToF
+word16Host = fixedPrim 2 unalignedWriteU16
 
 -- | Encoding 'Word32's in native host order and host endianness.
 {-# INLINE word32Host #-}
 word32Host :: FixedPrim Word32
-word32Host = storableToF
+word32Host = fixedPrim 4 unalignedWriteU32
 
 -- | Encoding 'Word64's in native host order and host endianness.
 {-# INLINE word64Host #-}
 word64Host :: FixedPrim Word64
-word64Host = storableToF
-
+word64Host = fixedPrim 8 unalignedWriteU64
 
 ------------------------------------------------------------------------------
 -- Int encodings
@@ -215,22 +193,22 @@ int64LE = fromIntegral >$< word64LE
 --
 {-# INLINE intHost #-}
 intHost :: FixedPrim Int
-intHost = storableToF
+intHost = fromIntegral @Int @Word >$< wordHost
 
 -- | Encoding 'Int16's in native host order and host endianness.
 {-# INLINE int16Host #-}
 int16Host :: FixedPrim Int16
-int16Host = storableToF
+int16Host = fromIntegral @Int16 @Word16 >$< word16Host
 
 -- | Encoding 'Int32's in native host order and host endianness.
 {-# INLINE int32Host #-}
 int32Host :: FixedPrim Int32
-int32Host = storableToF
+int32Host = fromIntegral @Int32 @Word32 >$< word32Host
 
 -- | Encoding 'Int64's in native host order and host endianness.
 {-# INLINE int64Host #-}
 int64Host :: FixedPrim Int64
-int64Host = storableToF
+int64Host = fromIntegral @Int64 @Word64 >$< word64Host
 
 -- IEEE Floating Point Numbers
 ------------------------------
@@ -261,9 +239,9 @@ doubleLE = encodeDoubleViaWord64F word64LE
 --
 {-# INLINE floatHost #-}
 floatHost :: FixedPrim Float
-floatHost = storableToF
+floatHost = fixedPrim (sizeOf @Float 0) unalignedWriteFloat
 
 -- | Encode a 'Double' in native host order and host endianness.
 {-# INLINE doubleHost #-}
 doubleHost :: FixedPrim Double
-doubleHost = storableToF
+doubleHost = fixedPrim (sizeOf @Double 0) unalignedWriteDouble

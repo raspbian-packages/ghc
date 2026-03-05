@@ -24,7 +24,6 @@ import Haddock.Types
 import Haddock.Utils
 
 import Text.XHtml hiding ( name, p, quote )
-import qualified Data.Map as M
 import Data.List ( stripPrefix )
 
 import GHC hiding (LexicalFixity(..), anchor)
@@ -105,11 +104,6 @@ ppQualifyName qual notation name mdl =
         Just _       -> ppFullQualName notation mdl name
         -- some other module, D.x -> D.x
         Nothing      -> ppFullQualName notation mdl name
-    AliasedQual aliases localmdl ->
-      case (moduleString mdl == moduleString localmdl,
-            M.lookup mdl aliases) of
-        (False, Just alias) -> ppQualName notation alias name
-        _ -> ppName notation name
 
 
 ppFullQualName :: Notation -> Module -> Name -> Html
@@ -117,14 +111,17 @@ ppFullQualName notation mdl name = wrapInfix notation (getOccName name) qname
   where
     qname = toHtml $ moduleString mdl ++ '.' : getOccString name
 
-ppQualName :: Notation -> ModuleName -> Name -> Html
-ppQualName notation mdlName name = wrapInfix notation (getOccName name) qname
-  where
-    qname = toHtml $ moduleNameString mdlName ++ '.' : getOccString name
-
 ppName :: Notation -> Name -> Html
-ppName notation name = wrapInfix notation (getOccName name) $ toHtml (getOccString name)
-
+ppName notation name =
+  case m_pun of
+    Just str -> toHtml (unpackFS str)       -- use the punned form
+    Nothing  -> wrapInfix notation (getOccName name) $
+                toHtml (getOccString name)  -- use the original identifier
+  where
+    m_pun = case notation of
+      Raw    -> namePun_maybe name
+      Prefix -> namePun_maybe name
+      Infix  -> Nothing
 
 ppBinder :: Bool -> OccName -> Html
 ppBinder = ppBinderWith Prefix
@@ -148,14 +145,11 @@ ppBinder' notation n = wrapInfix notation n $ ppOccName n
 
 wrapInfix :: Notation -> OccName -> Html -> Html
 wrapInfix notation n = case notation of
-  Infix | is_star_kind -> id
-        | not is_sym -> quote
-  Prefix | is_star_kind -> id
-         | is_sym -> parens
+  Infix | not is_sym -> quote
+  Prefix | is_sym -> parens
   _ -> id
   where
     is_sym = isSymOcc n
-    is_star_kind = isTcOcc n && occNameString n == "*"
 
 linkId :: Module -> Maybe Name -> Html -> Html
 linkId mdl mbName = linkIdOcc mdl (fmap nameOccName mbName) True

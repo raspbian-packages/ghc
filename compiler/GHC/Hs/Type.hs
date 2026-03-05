@@ -1,5 +1,6 @@
 
 {-# LANGUAGE ConstraintKinds #-}
+{-# LANGUAGE DataKinds #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE DeriveDataTypeable #-}
@@ -25,16 +26,19 @@ module GHC.Hs.Type (
         Mult, HsScaled(..),
         hsMult, hsScaledThing,
         HsArrow(..), arrowToHsType,
-        HsLinearArrowTokens(..),
+        EpLinearArrow(..),
         hsLinear, hsUnrestricted, isUnrestricted,
         pprHsArrow,
 
         HsType(..), HsCoreTy, LHsType, HsKind, LHsKind,
         HsForAllTelescope(..), EpAnnForallTy, HsTyVarBndr(..), LHsTyVarBndr,
+        HsBndrVis(..), isHsBndrInvisible,
         LHsQTyVars(..),
         HsOuterTyVarBndrs(..), HsOuterFamEqnTyVarBndrs, HsOuterSigTyVarBndrs,
         HsWildCardBndrs(..),
         HsPatSigType(..), HsPSRn(..),
+        HsTyPat(..), HsTyPatRn(..),
+        HsTyPatRnBuilder(..), tpBuilderExplicitTV, tpBuilderPatSig, buildHsTyPatRn, builderFromHsTyPatRn,
         HsSigType(..), LHsSigType, LHsSigWcType, LHsWcType,
         HsTupleSort(..),
         HsContext, LHsContext, fromMaybeContext,
@@ -55,22 +59,26 @@ module GHC.Hs.Type (
 
         FieldOcc(..), LFieldOcc, mkFieldOcc,
         AmbiguousFieldOcc(..), LAmbiguousFieldOcc, mkAmbiguousFieldOcc,
-        rdrNameAmbiguousFieldOcc, selectorAmbiguousFieldOcc,
+        ambiguousFieldOccRdrName, ambiguousFieldOccLRdrName,
+        selectorAmbiguousFieldOcc,
         unambiguousFieldOcc, ambiguousFieldOcc,
+
+        OpName(..),
 
         mkAnonWildCardTy, pprAnonWildCard,
 
         hsOuterTyVarNames, hsOuterExplicitBndrs, mapHsOuterImplicit,
         mkHsOuterImplicit, mkHsOuterExplicit,
         mkHsImplicitSigType, mkHsExplicitSigType,
-        mkHsWildCardBndrs, mkHsPatSigType,
+        mkHsWildCardBndrs, mkHsPatSigType, mkHsTyPat,
         mkEmptyWildCardBndrs,
         mkHsForAllVisTele, mkHsForAllInvisTele,
         mkHsQTvs, hsQTvExplicit, emptyLHsQTvs,
         isHsKindedTyVar, hsTvbAllKinded,
-        hsScopedTvs, hsWcScopedTvs, dropWildCards,
+        hsScopedTvs, hsScopedKvs, hsWcScopedTvs, dropWildCards,
         hsTyVarName, hsAllLTyVarNames, hsLTyVarLocNames,
-        hsLTyVarName, hsLTyVarNames, hsLTyVarLocName, hsExplicitLTyVarNames,
+        hsLTyVarName, hsLTyVarNames, hsForAllTelescopeNames,
+        hsLTyVarLocName, hsExplicitLTyVarNames,
         splitLHsInstDeclTy, getLHsInstDeclHead, getLHsInstDeclClass_maybe,
         splitLHsPatSynTy,
         splitLHsForAllTyInvis, splitLHsForAllTyInvis_KP, splitLHsQualTy,
@@ -79,7 +87,7 @@ module GHC.Hs.Type (
         mkHsOpTy, mkHsAppTy, mkHsAppTys, mkHsAppKindTy,
         ignoreParens, hsSigWcType, hsPatSigType,
         hsTyKindSig,
-        setHsTyVarBndrFlag, hsTyVarBndrFlag,
+        setHsTyVarBndrFlag, hsTyVarBndrFlag, updateHsTyVarBndrFlag,
 
         -- Printing
         pprHsType, pprHsForAll,
@@ -102,10 +110,11 @@ import GHC.Parser.Annotation
 import GHC.Types.Fixity ( LexicalFixity(..) )
 import GHC.Types.Id ( Id )
 import GHC.Types.SourceText
-import GHC.Types.Name( Name, NamedThing(getName), tcName, dataName )
+import GHC.Types.Name
 import GHC.Types.Name.Reader ( RdrName )
 import GHC.Types.Var ( VarBndr, visArgTypeLike )
 import GHC.Core.TyCo.Rep ( Type(..) )
+import GHC.Builtin.Names ( negateName )
 import GHC.Builtin.Types( manyDataConName, oneDataConName, mkTupleStr )
 import GHC.Core.Ppr ( pprOccWithTick)
 import GHC.Core.Type
@@ -120,6 +129,7 @@ import Data.Maybe
 import Data.Data (Data)
 
 import qualified Data.Semigroup as S
+import GHC.Data.Bag
 
 {-
 ************************************************************************
@@ -182,7 +192,7 @@ mkHsForAllInvisTele :: EpAnnForallTy
 mkHsForAllInvisTele an invis_bndrs =
   HsForAllInvis { hsf_xinvis = an, hsf_invis_bndrs = invis_bndrs }
 
-mkHsQTvs :: [LHsTyVarBndr () GhcPs] -> LHsQTyVars GhcPs
+mkHsQTvs :: [LHsTyVarBndr (HsBndrVis GhcPs) GhcPs] -> LHsQTyVars GhcPs
 mkHsQTvs tvs = HsQTvs { hsq_ext = noExtField, hsq_explicit = tvs }
 
 emptyLHsQTvs :: LHsQTyVars GhcRn
@@ -211,6 +221,10 @@ type instance XHsPS GhcPs = EpAnnCO
 type instance XHsPS GhcRn = HsPSRn
 type instance XHsPS GhcTc = HsPSRn
 
+type instance XHsTP GhcPs = NoExtField
+type instance XHsTP GhcRn = HsTyPatRn
+type instance XHsTP GhcTc = DataConCantHappen
+
 -- | The extension field for 'HsPatSigType', which is only used in the
 -- renamer onwards. See @Note [Pattern signature binders and scoping]@.
 data HsPSRn = HsPSRn
@@ -219,7 +233,67 @@ data HsPSRn = HsPSRn
   }
   deriving Data
 
+-- HsTyPatRn is the extension field for `HsTyPat`, after renaming
+-- E.g. pattern K @(Maybe (_x, a, b::Proxy k)
+-- In the type pattern @(Maybe ...):
+--    '_x' is a named wildcard
+--    'a'  is explicitly bound
+--    'k'  is implicitly bound
+-- See Note [Implicit and explicit type variable binders] in GHC.Rename.Pat
+data HsTyPatRn = HsTPRn
+  { hstp_nwcs    :: [Name] -- ^ Wildcard names
+  , hstp_imp_tvs :: [Name] -- ^ Implicitly bound variable names
+  , hstp_exp_tvs :: [Name] -- ^ Explicitly bound variable names
+  }
+  deriving Data
+
+-- | A variant of HsTyPatRn that uses Bags for efficient concatenation.
+-- See Note [Implicit and explicit type variable binders]  in GHC.Rename.Pat
+data HsTyPatRnBuilder =
+  HsTPRnB {
+    hstpb_nwcs :: Bag Name,
+    hstpb_imp_tvs :: Bag Name,
+    hstpb_exp_tvs :: Bag Name
+  }
+
+tpBuilderExplicitTV :: Name -> HsTyPatRnBuilder
+tpBuilderExplicitTV name = mempty {hstpb_exp_tvs = unitBag name}
+
+tpBuilderPatSig :: HsPSRn -> HsTyPatRnBuilder
+tpBuilderPatSig HsPSRn {hsps_nwcs, hsps_imp_tvs} =
+  mempty {
+    hstpb_nwcs = listToBag hsps_nwcs,
+    hstpb_imp_tvs = listToBag hsps_imp_tvs
+  }
+
+instance Semigroup HsTyPatRnBuilder where
+  HsTPRnB nwcs1 imp_tvs1 exptvs1 <> HsTPRnB nwcs2 imp_tvs2 exptvs2 =
+    HsTPRnB
+      (nwcs1    `unionBags` nwcs2)
+      (imp_tvs1 `unionBags` imp_tvs2)
+      (exptvs1  `unionBags` exptvs2)
+
+instance Monoid HsTyPatRnBuilder where
+  mempty = HsTPRnB emptyBag emptyBag emptyBag
+
+buildHsTyPatRn :: HsTyPatRnBuilder -> HsTyPatRn
+buildHsTyPatRn HsTPRnB {hstpb_nwcs, hstpb_imp_tvs, hstpb_exp_tvs} =
+  HsTPRn {
+    hstp_nwcs =    bagToList hstpb_nwcs,
+    hstp_imp_tvs = bagToList hstpb_imp_tvs,
+    hstp_exp_tvs = bagToList hstpb_exp_tvs
+  }
+
+builderFromHsTyPatRn :: HsTyPatRn -> HsTyPatRnBuilder
+builderFromHsTyPatRn HsTPRn{hstp_nwcs, hstp_imp_tvs, hstp_exp_tvs} =
+  HsTPRnB {
+    hstpb_nwcs =    listToBag hstp_nwcs,
+    hstpb_imp_tvs = listToBag hstp_imp_tvs,
+    hstpb_exp_tvs = listToBag hstp_exp_tvs
+  }
+
 type instance XXHsPatSigType (GhcPass _) = DataConCantHappen
+type instance XXHsTyPat      (GhcPass _) = DataConCantHappen
 
 type instance XHsSig (GhcPass _) = NoExtField
 type instance XXHsSigType (GhcPass _) = DataConCantHappen
@@ -268,14 +342,18 @@ mkHsPatSigType :: EpAnnCO -> LHsType GhcPs -> HsPatSigType GhcPs
 mkHsPatSigType ann x = HsPS { hsps_ext  = ann
                             , hsps_body = x }
 
+mkHsTyPat :: LHsType GhcPs -> HsTyPat GhcPs
+mkHsTyPat x = HsTP { hstp_ext  = noExtField
+                   , hstp_body = x }
+
 mkEmptyWildCardBndrs :: thing -> HsWildCardBndrs GhcRn thing
 mkEmptyWildCardBndrs x = HsWC { hswc_body = x
                               , hswc_ext  = [] }
 
 --------------------------------------------------
 
-type instance XUserTyVar    (GhcPass _) = EpAnn [AddEpAnn]
-type instance XKindedTyVar  (GhcPass _) = EpAnn [AddEpAnn]
+type instance XUserTyVar    (GhcPass _) = [AddEpAnn]
+type instance XKindedTyVar  (GhcPass _) = [AddEpAnn]
 
 type instance XXTyVarBndr   (GhcPass _) = DataConCantHappen
 
@@ -283,12 +361,22 @@ type instance XXTyVarBndr   (GhcPass _) = DataConCantHappen
 hsTyVarBndrFlag :: HsTyVarBndr flag (GhcPass pass) -> flag
 hsTyVarBndrFlag (UserTyVar _ fl _)     = fl
 hsTyVarBndrFlag (KindedTyVar _ fl _ _) = fl
+-- By specialising to (GhcPass p) we know that XXTyVarBndr is DataConCantHappen
+-- so these two equations are exhaustive: extension construction can't happen
 
 -- | Set the attached flag
 setHsTyVarBndrFlag :: flag -> HsTyVarBndr flag' (GhcPass pass)
   -> HsTyVarBndr flag (GhcPass pass)
 setHsTyVarBndrFlag f (UserTyVar x _ l)     = UserTyVar x f l
 setHsTyVarBndrFlag f (KindedTyVar x _ l k) = KindedTyVar x f l k
+
+-- | Update the attached flag
+updateHsTyVarBndrFlag
+  :: (flag -> flag')
+  -> HsTyVarBndr flag  (GhcPass pass)
+  -> HsTyVarBndr flag' (GhcPass pass)
+updateHsTyVarBndrFlag f (UserTyVar   x flag name)    = UserTyVar   x (f flag) name
+updateHsTyVarBndrFlag f (KindedTyVar x flag name ki) = KindedTyVar x (f flag) name ki
 
 -- | Do all type variables in this 'LHsQTyVars' come with kind annotations?
 hsTvbAllKinded :: LHsQTyVars (GhcPass p) -> Bool
@@ -298,38 +386,48 @@ instance NamedThing (HsTyVarBndr flag GhcRn) where
   getName (UserTyVar _ _ v) = unLoc v
   getName (KindedTyVar _ _ v _) = unLoc v
 
+type instance XBndrRequired (GhcPass _) = NoExtField
+
+type instance XBndrInvisible GhcPs = EpToken "@"
+type instance XBndrInvisible GhcRn = NoExtField
+type instance XBndrInvisible GhcTc = NoExtField
+
+type instance XXBndrVis (GhcPass _) = DataConCantHappen
+
 type instance XForAllTy        (GhcPass _) = NoExtField
 type instance XQualTy          (GhcPass _) = NoExtField
-type instance XTyVar           (GhcPass _) = EpAnn [AddEpAnn]
+type instance XTyVar           (GhcPass _) = [AddEpAnn]
 type instance XAppTy           (GhcPass _) = NoExtField
-type instance XFunTy           (GhcPass _) = EpAnnCO
-type instance XListTy          (GhcPass _) = EpAnn AnnParen
-type instance XTupleTy         (GhcPass _) = EpAnn AnnParen
-type instance XSumTy           (GhcPass _) = EpAnn AnnParen
-type instance XOpTy            (GhcPass _) = EpAnn [AddEpAnn]
-type instance XParTy           (GhcPass _) = EpAnn AnnParen
-type instance XIParamTy        (GhcPass _) = EpAnn [AddEpAnn]
+type instance XFunTy           (GhcPass _) = NoExtField
+type instance XListTy          (GhcPass _) = AnnParen
+type instance XTupleTy         (GhcPass _) = AnnParen
+type instance XSumTy           (GhcPass _) = AnnParen
+type instance XOpTy            (GhcPass _) = [AddEpAnn]
+type instance XParTy           (GhcPass _) = AnnParen
+type instance XIParamTy        (GhcPass _) = [AddEpAnn]
 type instance XStarTy          (GhcPass _) = NoExtField
-type instance XKindSig         (GhcPass _) = EpAnn [AddEpAnn]
+type instance XKindSig         (GhcPass _) = [AddEpAnn]
 
-type instance XAppKindTy       (GhcPass _) = SrcSpan -- Where the `@` lives
+type instance XAppKindTy       GhcPs = EpToken "@"
+type instance XAppKindTy       GhcRn = NoExtField
+type instance XAppKindTy       GhcTc = NoExtField
 
 type instance XSpliceTy        GhcPs = NoExtField
 type instance XSpliceTy        GhcRn = HsUntypedSpliceResult (LHsType GhcRn)
 type instance XSpliceTy        GhcTc = Kind
 
-type instance XDocTy           (GhcPass _) = EpAnn [AddEpAnn]
-type instance XBangTy          (GhcPass _) = EpAnn [AddEpAnn]
+type instance XDocTy           (GhcPass _) = [AddEpAnn]
+type instance XBangTy          (GhcPass _) = [AddEpAnn]
 
-type instance XRecTy           GhcPs = EpAnn AnnList
+type instance XRecTy           GhcPs = AnnList
 type instance XRecTy           GhcRn = NoExtField
 type instance XRecTy           GhcTc = NoExtField
 
-type instance XExplicitListTy  GhcPs = EpAnn [AddEpAnn]
+type instance XExplicitListTy  GhcPs = [AddEpAnn]
 type instance XExplicitListTy  GhcRn = NoExtField
 type instance XExplicitListTy  GhcTc = Kind
 
-type instance XExplicitTupleTy GhcPs = EpAnn [AddEpAnn]
+type instance XExplicitTupleTy GhcPs = [AddEpAnn]
 type instance XExplicitTupleTy GhcRn = NoExtField
 type instance XExplicitTupleTy GhcTc = [Kind]
 
@@ -352,6 +450,27 @@ type instance XStrTy         (GhcPass _) = SourceText
 type instance XCharTy        (GhcPass _) = SourceText
 type instance XXTyLit        (GhcPass _) = DataConCantHappen
 
+data EpLinearArrow
+  = EpPct1 !(EpToken "%1") !(EpUniToken "->" "→")
+  | EpLolly !(EpToken "⊸")
+  deriving Data
+
+instance NoAnn EpLinearArrow where
+  noAnn = EpPct1 noAnn noAnn
+
+type instance XUnrestrictedArrow GhcPs = EpUniToken "->" "→"
+type instance XUnrestrictedArrow GhcRn = NoExtField
+type instance XUnrestrictedArrow GhcTc = NoExtField
+
+type instance XLinearArrow       GhcPs = EpLinearArrow
+type instance XLinearArrow       GhcRn = NoExtField
+type instance XLinearArrow       GhcTc = NoExtField
+
+type instance XExplicitMult      GhcPs = (EpToken "%", EpUniToken "->" "→")
+type instance XExplicitMult      GhcRn = NoExtField
+type instance XExplicitMult      GhcTc = NoExtField
+
+type instance XXArrow            (GhcPass _) = DataConCantHappen
 
 oneDataConHsTy :: HsType GhcRn
 oneDataConHsTy = HsTyVar noAnn NotPromoted (noLocA oneDataConName)
@@ -359,11 +478,21 @@ oneDataConHsTy = HsTyVar noAnn NotPromoted (noLocA oneDataConName)
 manyDataConHsTy :: HsType GhcRn
 manyDataConHsTy = HsTyVar noAnn NotPromoted (noLocA manyDataConName)
 
-hsLinear :: a -> HsScaled (GhcPass p) a
-hsLinear = HsScaled (HsLinearArrow (HsPct1 noHsTok noHsUniTok))
+hsLinear :: forall p a. IsPass p => a -> HsScaled (GhcPass p) a
+hsLinear = HsScaled (HsLinearArrow x)
+  where
+    x = case ghcPass @p of
+      GhcPs -> noAnn
+      GhcRn -> noExtField
+      GhcTc -> noExtField
 
-hsUnrestricted :: a -> HsScaled (GhcPass p) a
-hsUnrestricted = HsScaled (HsUnrestrictedArrow noHsUniTok)
+hsUnrestricted :: forall p a. IsPass p => a -> HsScaled (GhcPass p) a
+hsUnrestricted = HsScaled (HsUnrestrictedArrow x)
+  where
+    x = case ghcPass @p of
+      GhcPs -> noAnn
+      GhcRn -> noExtField
+      GhcTc -> noExtField
 
 isUnrestricted :: HsArrow GhcRn -> Bool
 isUnrestricted (arrowToHsType -> L _ (HsTyVar _ _ (L _ n))) = n == manyDataConName
@@ -375,7 +504,7 @@ isUnrestricted _ = False
 arrowToHsType :: HsArrow GhcRn -> LHsType GhcRn
 arrowToHsType (HsUnrestrictedArrow _) = noLocA manyDataConHsTy
 arrowToHsType (HsLinearArrow _) = noLocA oneDataConHsTy
-arrowToHsType (HsExplicitMult _ p _) = p
+arrowToHsType (HsExplicitMult _ p) = p
 
 instance
       (OutputableBndrId pass) =>
@@ -386,9 +515,9 @@ instance
 pprHsArrow :: (OutputableBndrId pass) => HsArrow (GhcPass pass) -> SDoc
 pprHsArrow (HsUnrestrictedArrow _) = pprArrowWithMultiplicity visArgTypeLike (Left False)
 pprHsArrow (HsLinearArrow _)       = pprArrowWithMultiplicity visArgTypeLike (Left True)
-pprHsArrow (HsExplicitMult _ p _)  = pprArrowWithMultiplicity visArgTypeLike (Right (ppr p))
+pprHsArrow (HsExplicitMult _ p)    = pprArrowWithMultiplicity visArgTypeLike (Right (ppr p))
 
-type instance XConDeclField  (GhcPass _) = EpAnn [AddEpAnn]
+type instance XConDeclField  (GhcPass _) = [AddEpAnn]
 type instance XXConDeclField (GhcPass _) = DataConCantHappen
 
 instance OutputableBndrId p
@@ -414,16 +543,30 @@ hsScopedTvs (L _ (HsSig{sig_bndrs = outer_bndrs}))
   = hsLTyVarNames (hsOuterExplicitBndrs outer_bndrs)
     -- See Note [hsScopedTvs and visible foralls]
 
+hsScopedKvs :: LHsKind GhcRn -> [Name]
+-- Same as hsScopedTvs, but for a LHsKind
+hsScopedKvs  (L _ HsForAllTy { hst_tele = HsForAllInvis { hsf_invis_bndrs = bndrs }})
+  = hsLTyVarNames bndrs
+    -- See Note [hsScopedTvs and visible foralls]
+hsScopedKvs _ = []
+
 ---------------------
+hsTyVarLName :: HsTyVarBndr flag (GhcPass p) -> LIdP (GhcPass p)
+hsTyVarLName (UserTyVar _ _ n)     = n
+hsTyVarLName (KindedTyVar _ _ n _) = n
+
 hsTyVarName :: HsTyVarBndr flag (GhcPass p) -> IdP (GhcPass p)
-hsTyVarName (UserTyVar _ _ (L _ n))     = n
-hsTyVarName (KindedTyVar _ _ (L _ n) _) = n
+hsTyVarName = unLoc . hsTyVarLName
 
 hsLTyVarName :: LHsTyVarBndr flag (GhcPass p) -> IdP (GhcPass p)
 hsLTyVarName = hsTyVarName . unLoc
 
 hsLTyVarNames :: [LHsTyVarBndr flag (GhcPass p)] -> [IdP (GhcPass p)]
 hsLTyVarNames = map hsLTyVarName
+
+hsForAllTelescopeNames :: HsForAllTelescope (GhcPass p) -> [IdP (GhcPass p)]
+hsForAllTelescopeNames (HsForAllVis _ bndrs) = hsLTyVarNames bndrs
+hsForAllTelescopeNames (HsForAllInvis _ bndrs) = hsLTyVarNames bndrs
 
 hsExplicitLTyVarNames :: LHsQTyVars (GhcPass p) -> [IdP (GhcPass p)]
 -- Explicit variables only
@@ -435,10 +578,12 @@ hsAllLTyVarNames (HsQTvs { hsq_ext = kvs
                          , hsq_explicit = tvs })
   = kvs ++ hsLTyVarNames tvs
 
-hsLTyVarLocName :: LHsTyVarBndr flag (GhcPass p) -> LocatedN (IdP (GhcPass p))
-hsLTyVarLocName (L l a) = L (l2l l) (hsTyVarName a)
+hsLTyVarLocName :: Anno (IdGhcP p) ~ SrcSpanAnnN
+                => LHsTyVarBndr flag (GhcPass p) -> LocatedN (IdP (GhcPass p))
+hsLTyVarLocName (L _ a) = hsTyVarLName a
 
-hsLTyVarLocNames :: LHsQTyVars (GhcPass p) -> [LocatedN (IdP (GhcPass p))]
+hsLTyVarLocNames :: Anno (IdGhcP p) ~ SrcSpanAnnN
+                 => LHsQTyVars (GhcPass p) -> [LocatedN (IdP (GhcPass p))]
 hsLTyVarLocNames qtvs = map hsLTyVarLocName (hsQTvExplicit qtvs)
 
 -- | Get the kind signature of a type, ignoring parentheses:
@@ -482,17 +627,16 @@ mkHsOpTy :: (Anno (IdGhcP p) ~ SrcSpanAnnN)
 mkHsOpTy prom ty1 op ty2 = HsOpTy noAnn prom ty1 op ty2
 
 mkHsAppTy :: LHsType (GhcPass p) -> LHsType (GhcPass p) -> LHsType (GhcPass p)
-mkHsAppTy t1 t2
-  = addCLocAA t1 t2 (HsAppTy noExtField t1 (parenthesizeHsType appPrec t2))
+mkHsAppTy t1 t2 = addCLocA t1 t2 (HsAppTy noExtField t1 t2)
 
 mkHsAppTys :: LHsType (GhcPass p) -> [LHsType (GhcPass p)]
            -> LHsType (GhcPass p)
 mkHsAppTys = foldl' mkHsAppTy
 
-mkHsAppKindTy :: XAppKindTy (GhcPass p) -> LHsType (GhcPass p) -> LHsType (GhcPass p)
+mkHsAppKindTy :: XAppKindTy (GhcPass p)
+              -> LHsType (GhcPass p) -> LHsType (GhcPass p)
               -> LHsType (GhcPass p)
-mkHsAppKindTy ext ty k
-  = addCLocAA ty k (HsAppKindTy ext ty k)
+mkHsAppKindTy at ty k = addCLocA ty k (HsAppKindTy at ty k)
 
 {-
 ************************************************************************
@@ -518,15 +662,12 @@ splitHsFunType ty = go ty
       = let
           (anns, cs, args, res) = splitHsFunType ty
           anns' = anns ++ annParen2AddEpAnn an
-          cs' = cs S.<> epAnnComments (ann l) S.<> epAnnComments an
+          cs' = cs S.<> epAnnComments l
         in (anns', cs', args, res)
 
-    go (L ll (HsFunTy (EpAnn _ _ cs) mult x y))
+    go (L ll (HsFunTy _ mult x y))
       | (anns, csy, args, res) <- splitHsFunType y
-      = (anns, csy S.<> epAnnComments (ann ll), HsScaled mult x':args, res)
-      where
-        L l t = x
-        x' = L (addCommentsToSrcAnn l cs) t
+      = (anns, csy S.<> epAnnComments ll, HsScaled mult x:args, res)
 
     go other = ([], emptyComments, [], other)
 
@@ -549,19 +690,29 @@ hsTyGetAppHead_maybe = go
 
 ------------------------------------------------------------
 
+type instance XValArg (GhcPass _) = NoExtField
+
+type instance XTypeArg GhcPs = EpToken "@"
+type instance XTypeArg GhcRn = NoExtField
+type instance XTypeArg GhcTc = NoExtField
+
+type instance XArgPar (GhcPass _) = SrcSpan
+
+type instance XXArg (GhcPass _) = DataConCantHappen
+
 -- | Compute the 'SrcSpan' associated with an 'LHsTypeArg'.
-lhsTypeArgSrcSpan :: LHsTypeArg (GhcPass pass) -> SrcSpan
+lhsTypeArgSrcSpan :: LHsTypeArg GhcPs -> SrcSpan
 lhsTypeArgSrcSpan arg = case arg of
-  HsValArg  tm    -> getLocA tm
-  HsTypeArg at ty -> at `combineSrcSpans` getLocA ty
+  HsValArg  _  tm -> getLocA tm
+  HsTypeArg at ty -> getEpTokenSrcSpan at `combineSrcSpans` getLocA ty
   HsArgPar  sp    -> sp
 
 --------------------------------
 
-numVisibleArgs :: [HsArg tm ty] -> Arity
+numVisibleArgs :: [HsArg p tm ty] -> Arity
 numVisibleArgs = count is_vis
-  where is_vis (HsValArg _) = True
-        is_vis _            = False
+  where is_vis (HsValArg _ _) = True
+        is_vis _              = False
 
 --------------------------------
 
@@ -576,7 +727,7 @@ numVisibleArgs = count is_vis
 -- pprHsArgsApp (++) Infix [HsValArg Char, HsValArg Double, HsVarArg Ordering] = (Char ++ Double) Ordering
 -- @
 pprHsArgsApp :: (OutputableBndr id, Outputable tm, Outputable ty)
-             => id -> LexicalFixity -> [HsArg tm ty] -> SDoc
+             => id -> LexicalFixity -> [HsArg (GhcPass p) tm ty] -> SDoc
 pprHsArgsApp thing fixity (argl:argr:args)
   | Infix <- fixity
   = let pp_op_app = hsep [ ppr_single_hs_arg argl
@@ -591,7 +742,7 @@ pprHsArgsApp thing _fixity args
 
 -- | Pretty-print a prefix identifier to a list of 'HsArg's.
 ppr_hs_args_prefix_app :: (Outputable tm, Outputable ty)
-                        => SDoc -> [HsArg tm ty] -> SDoc
+                        => SDoc -> [HsArg (GhcPass p) tm ty] -> SDoc
 ppr_hs_args_prefix_app acc []         = acc
 ppr_hs_args_prefix_app acc (arg:args) =
   case arg of
@@ -601,8 +752,8 @@ ppr_hs_args_prefix_app acc (arg:args) =
 
 -- | Pretty-print an 'HsArg' in isolation.
 ppr_single_hs_arg :: (Outputable tm, Outputable ty)
-                  => HsArg tm ty -> SDoc
-ppr_single_hs_arg (HsValArg tm)    = ppr tm
+                  => HsArg (GhcPass p) tm ty -> SDoc
+ppr_single_hs_arg (HsValArg _ tm)  = ppr tm
 ppr_single_hs_arg (HsTypeArg _ ty) = char '@' <> ppr ty
 -- GHC shouldn't be constructing ASTs such that this case is ever reached.
 -- Still, it's possible some wily user might construct their own AST that
@@ -611,9 +762,9 @@ ppr_single_hs_arg (HsArgPar{})     = empty
 
 -- | This instance is meant for debug-printing purposes. If you wish to
 -- pretty-print an application of 'HsArg's, use 'pprHsArgsApp' instead.
-instance (Outputable tm, Outputable ty) => Outputable (HsArg tm ty) where
-  ppr (HsValArg tm)     = text "HsValArg"  <+> ppr tm
-  ppr (HsTypeArg sp ty) = text "HsTypeArg" <+> ppr sp <+> ppr ty
+instance (Outputable tm, Outputable ty) => Outputable (HsArg (GhcPass p) tm ty) where
+  ppr (HsValArg _ tm)   = text "HsValArg"  <+> ppr tm
+  ppr (HsTypeArg _ ty)  = text "HsTypeArg" <+> ppr ty
   ppr (HsArgPar sp)     = text "HsArgPar"  <+> ppr sp
 
 --------------------------------
@@ -643,10 +794,10 @@ splitLHsPatSynTy ty = (univs, reqs, exis, provs, ty4)
         HsOuterImplicit{}                      -> ([], ignoreParens body)
         HsOuterExplicit{hso_bndrs = exp_bndrs} -> (exp_bndrs, body)
 
-    (univs,       ty1) = split_sig_ty ty
-    (reqs,        ty2) = splitLHsQualTy ty1
-    ((_an, exis), ty3) = splitLHsForAllTyInvis ty2
-    (provs,       ty4) = splitLHsQualTy ty3
+    (univs, ty1) = split_sig_ty ty
+    (reqs,  ty2) = splitLHsQualTy ty1
+    (exis,  ty3) = splitLHsForAllTyInvis ty2
+    (provs, ty4) = splitLHsQualTy ty3
 
 -- | Decompose a sigma type (of the form @forall <tvs>. context => body@)
 -- into its constituent parts.
@@ -666,8 +817,8 @@ splitLHsSigmaTyInvis :: LHsType (GhcPass p)
                      -> ([LHsTyVarBndr Specificity (GhcPass p)]
                         , Maybe (LHsContext (GhcPass p)), LHsType (GhcPass p))
 splitLHsSigmaTyInvis ty
-  | ((_an,tvs), ty1) <- splitLHsForAllTyInvis ty
-  , (ctxt,      ty2) <- splitLHsQualTy ty1
+  | (tvs,  ty1) <- splitLHsForAllTyInvis ty
+  , (ctxt, ty2) <- splitLHsQualTy ty1
   = (tvs, ctxt, ty2)
 
 -- | Decompose a GADT type into its constituent parts.
@@ -712,11 +863,11 @@ splitLHsGadtTy (L _ sig_ty)
 -- Unlike 'splitLHsSigmaTyInvis', this function does not look through
 -- parentheses, hence the suffix @_KP@ (short for \"Keep Parentheses\").
 splitLHsForAllTyInvis ::
-  LHsType (GhcPass pass) -> ( (EpAnnForallTy, [LHsTyVarBndr Specificity (GhcPass pass)])
+  LHsType (GhcPass pass) -> ( [LHsTyVarBndr Specificity (GhcPass pass)]
                             , LHsType (GhcPass pass))
 splitLHsForAllTyInvis ty
   | ((mb_tvbs), body) <- splitLHsForAllTyInvis_KP (ignoreParens ty)
-  = (fromMaybe (EpAnnNotUsed,[]) mb_tvbs, body)
+  = (fromMaybe [] mb_tvbs, body)
 
 -- | Decompose a type of the form @forall <tvs>. body@ into its constituent
 -- parts. Only splits type variable binders that
@@ -730,14 +881,13 @@ splitLHsForAllTyInvis ty
 -- Unlike 'splitLHsForAllTyInvis', this function does not look through
 -- parentheses, hence the suffix @_KP@ (short for \"Keep Parentheses\").
 splitLHsForAllTyInvis_KP ::
-  LHsType (GhcPass pass) -> (Maybe (EpAnnForallTy, [LHsTyVarBndr Specificity (GhcPass pass)])
+  LHsType (GhcPass pass) -> (Maybe ([LHsTyVarBndr Specificity (GhcPass pass)])
                             , LHsType (GhcPass pass))
 splitLHsForAllTyInvis_KP lty@(L _ ty) =
   case ty of
-    HsForAllTy { hst_tele = HsForAllInvis { hsf_xinvis = an
-                                          , hsf_invis_bndrs = tvs }
+    HsForAllTy { hst_tele = HsForAllInvis {hsf_invis_bndrs = tvs }
                , hst_body = body }
-      -> (Just (an, tvs), body)
+      -> (Just tvs, body)
     _ -> (Nothing, lty)
 
 -- | Decompose a type of the form @context => body@ into its constituent parts.
@@ -913,11 +1063,11 @@ type instance XAmbiguous GhcTc = Id
 type instance XXAmbiguousFieldOcc (GhcPass _) = DataConCantHappen
 
 instance Outputable (AmbiguousFieldOcc (GhcPass p)) where
-  ppr = ppr . rdrNameAmbiguousFieldOcc
+  ppr = ppr . ambiguousFieldOccRdrName
 
 instance OutputableBndr (AmbiguousFieldOcc (GhcPass p)) where
-  pprInfixOcc  = pprInfixOcc . rdrNameAmbiguousFieldOcc
-  pprPrefixOcc = pprPrefixOcc . rdrNameAmbiguousFieldOcc
+  pprInfixOcc  = pprInfixOcc . ambiguousFieldOccRdrName
+  pprPrefixOcc = pprPrefixOcc . ambiguousFieldOccRdrName
 
 instance OutputableBndr (Located (AmbiguousFieldOcc (GhcPass p))) where
   pprInfixOcc  = pprInfixOcc . unLoc
@@ -926,9 +1076,12 @@ instance OutputableBndr (Located (AmbiguousFieldOcc (GhcPass p))) where
 mkAmbiguousFieldOcc :: LocatedN RdrName -> AmbiguousFieldOcc GhcPs
 mkAmbiguousFieldOcc rdr = Unambiguous noExtField rdr
 
-rdrNameAmbiguousFieldOcc :: AmbiguousFieldOcc (GhcPass p) -> RdrName
-rdrNameAmbiguousFieldOcc (Unambiguous _ (L _ rdr)) = rdr
-rdrNameAmbiguousFieldOcc (Ambiguous   _ (L _ rdr)) = rdr
+ambiguousFieldOccRdrName :: AmbiguousFieldOcc (GhcPass p) -> RdrName
+ambiguousFieldOccRdrName = unLoc . ambiguousFieldOccLRdrName
+
+ambiguousFieldOccLRdrName :: AmbiguousFieldOcc (GhcPass p) -> LocatedN RdrName
+ambiguousFieldOccLRdrName (Unambiguous _ rdr) = rdr
+ambiguousFieldOccLRdrName (Ambiguous   _ rdr) = rdr
 
 selectorAmbiguousFieldOcc :: AmbiguousFieldOcc GhcTc -> Id
 selectorAmbiguousFieldOcc (Unambiguous sel _) = sel
@@ -940,6 +1093,26 @@ unambiguousFieldOcc (Ambiguous   rdr sel) = FieldOcc rdr sel
 
 ambiguousFieldOcc :: FieldOcc GhcTc -> AmbiguousFieldOcc GhcTc
 ambiguousFieldOcc (FieldOcc sel rdr) = Unambiguous sel rdr
+
+{-
+************************************************************************
+*                                                                      *
+                OpName
+*                                                                      *
+************************************************************************
+-}
+
+-- | Name of an operator in an operator application or section
+data OpName = NormalOp Name             -- ^ A normal identifier
+            | NegateOp                  -- ^ Prefix negation
+            | UnboundOp RdrName         -- ^ An unbound identifier
+            | RecFldOp (FieldOcc GhcRn) -- ^ A record field occurrence
+
+instance Outputable OpName where
+  ppr (NormalOp n)   = ppr n
+  ppr NegateOp       = ppr negateName
+  ppr (UnboundOp uv) = ppr uv
+  ppr (RecFldOp fld) = ppr fld
 
 {-
 ************************************************************************
@@ -961,6 +1134,15 @@ instance OutputableBndrFlag Specificity p where
     pprTyVarBndr (UserTyVar _ InferredSpec n)      = braces $ ppr n
     pprTyVarBndr (KindedTyVar _ SpecifiedSpec n k) = parens $ hsep [ppr n, dcolon, ppr k]
     pprTyVarBndr (KindedTyVar _ InferredSpec n k)  = braces $ hsep [ppr n, dcolon, ppr k]
+
+instance OutputableBndrFlag (HsBndrVis (GhcPass p')) p where
+    pprTyVarBndr (UserTyVar _ vis n) = pprHsBndrVis vis $ ppr n
+    pprTyVarBndr (KindedTyVar _ vis n k) =
+      pprHsBndrVis vis $ parens $ hsep [ppr n, dcolon, ppr k]
+
+pprHsBndrVis :: HsBndrVis (GhcPass p) -> SDoc -> SDoc
+pprHsBndrVis (HsBndrRequired _) d = d
+pprHsBndrVis (HsBndrInvisible _) d = char '@' <> d
 
 instance OutputableBndrId p => Outputable (HsSigType (GhcPass p)) where
     ppr (HsSig { sig_bndrs = outer_bndrs, sig_body = body }) =
@@ -1003,6 +1185,11 @@ instance Outputable thing
 instance (OutputableBndrId p)
        => Outputable (HsPatSigType (GhcPass p)) where
     ppr (HsPS { hsps_body = ty }) = ppr ty
+
+
+instance (OutputableBndrId p)
+       => Outputable (HsTyPat (GhcPass p)) where
+    ppr (HsTP { hstp_body = ty }) = ppr ty
 
 
 instance (OutputableBndrId p)
@@ -1170,9 +1357,9 @@ ppr_mono_ty (HsExplicitTupleTy _ tys)
     -- Special-case unary boxed tuples so that they are pretty-printed as
     -- `'MkSolo x`, not `'(x)`
   | [ty] <- tys
-  = quote $ sep [text (mkTupleStr Boxed dataName 1), ppr_mono_lty ty]
+  = quoteIfPunsEnabled $ sep [text (mkTupleStr Boxed dataName 1), ppr_mono_lty ty]
   | otherwise
-  = quote $ parens (maybeAddSpace tys $ interpp'SP tys)
+  = quoteIfPunsEnabled $ parens (maybeAddSpace tys $ interpp'SP tys)
 ppr_mono_ty (HsTyLit _ t)       = ppr t
 ppr_mono_ty (HsWildCardTy {})   = char '_'
 
@@ -1340,8 +1527,8 @@ type instance Anno (HsTyVarBndr _flag GhcRn) = SrcSpanAnnA
 type instance Anno (HsTyVarBndr _flag GhcTc) = SrcSpanAnnA
 
 type instance Anno (HsOuterTyVarBndrs _ (GhcPass _)) = SrcSpanAnnA
-type instance Anno HsIPName = SrcAnn NoEpAnns
+type instance Anno HsIPName = EpAnnCO
 type instance Anno (ConDeclField (GhcPass p)) = SrcSpanAnnA
 
-type instance Anno (FieldOcc (GhcPass p)) = SrcAnn NoEpAnns
-type instance Anno (AmbiguousFieldOcc (GhcPass p)) = SrcAnn NoEpAnns
+type instance Anno (FieldOcc (GhcPass p)) = SrcSpanAnnA
+type instance Anno (AmbiguousFieldOcc (GhcPass p)) = SrcSpanAnnA

@@ -61,6 +61,7 @@ module Text.Parsec.Prim
     , many
     , skipMany
     , manyAccum
+    , many1
     , runPT
     , runP
     , runParserT
@@ -148,11 +149,7 @@ newtype ParsecT s u m a
               -> (ParseError -> m b)                   -- empty err
               -> m b
              }
-#if MIN_VERSION_base(4,7,0)
      deriving ( Typeable )
-     -- GHC 7.6 doesn't like deriving instances of Typeable for types with
-     -- non-* type-arguments.
-#endif
 
 -- | Low-level unpacking of the ParsecT type. To run your parser, please look to
 -- runPT, runP, runParserT, runParser and other such functions.
@@ -221,11 +218,7 @@ instance Semigroup.Semigroup a => Semigroup.Semigroup (ParsecT s u m a) where
     --  discarding the first.
     (<>)     = Applicative.liftA2 (Semigroup.<>)
 
-#if MIN_VERSION_base(4,8,0)
     sconcat  = fmap Semigroup.sconcat . sequence
-#else
-    sconcat  = fmap (Semigroup.sconcat . NE.fromList) . sequence . NE.toList
-#endif
     stimes b = Semigroup.sconcat . NE.fromList . genericReplicate b
 
 -- | The 'Monoid' instance for 'ParsecT' is used for the same purposes as
@@ -269,6 +262,12 @@ instance Applicative.Applicative (ParsecT s u m) where
 instance Applicative.Alternative (ParsecT s u m) where
     empty = mzero
     (<|>) = mplus
+
+    -- TODO: https://github.com/haskell/parsec/issues/179
+    -- investigate what's wrong with haddock
+    --
+    -- many = many
+    -- some = many1
 
 instance Monad (ParsecT s u m) where
     return = Applicative.pure
@@ -714,6 +713,15 @@ many :: ParsecT s u m a -> ParsecT s u m [a]
 many p
   = do xs <- manyAccum (:) p
        return (reverse xs)
+
+-- | @many1 p@ applies the parser @p@ /one/ or more times. Returns a
+-- list of the returned values of @p@.
+--
+-- >  word  = many1 letter
+
+many1 :: ParsecT s u m a -> ParsecT s u m [a]
+{-# INLINABLE many1 #-}
+many1 p = do{ x <- p; xs <- many p; return (x:xs) }
 
 -- | @skipMany p@ applies the parser @p@ /zero/ or more times, skipping
 -- its result.

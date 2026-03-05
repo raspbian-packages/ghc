@@ -1,29 +1,20 @@
---
+
 -- Copyright (c) 2019 Andreas Klebinger
 --
 
-{-# LANGUAGE BangPatterns               #-}
 {-# LANGUAGE CPP                        #-}
 {-# LANGUAGE DataKinds                  #-}
-{-# LANGUAGE FlexibleContexts           #-}
-{-# LANGUAGE FlexibleInstances          #-}
 {-# LANGUAGE GADTs                      #-}
-{-# LANGUAGE GeneralisedNewtypeDeriving #-}
-{-# LANGUAGE MultiParamTypeClasses      #-}
-{-# LANGUAGE RankNTypes                 #-}
-{-# LANGUAGE ScopedTypeVariables        #-}
-{-# LANGUAGE TupleSections              #-}
 {-# LANGUAGE TypeFamilies               #-}
 
-module GHC.Stg.InferTags.Rewrite (rewriteTopBinds)
+module GHC.Stg.InferTags.Rewrite (rewriteTopBinds, rewriteOpApp)
 where
 
 import GHC.Prelude
 
 import GHC.Builtin.PrimOps ( PrimOp(..) )
 import GHC.Types.Basic     ( CbvMark (..), isMarkedCbv
-                           , TopLevelFlag(..), isTopLevel
-                           , Levity(..) )
+                           , TopLevelFlag(..), isTopLevel )
 import GHC.Types.Id
 import GHC.Types.Name
 import GHC.Types.Unique.Supply
@@ -37,7 +28,7 @@ import GHC.Core            ( AltCon(..) )
 import GHC.Core.Type
 
 import GHC.StgToCmm.Types
-import GHC.StgToCmm.Closure (mkLFImported)
+import GHC.StgToCmm.Closure (importedIdLFInfo)
 
 import GHC.Stg.Utils
 import GHC.Stg.Syntax as StgSyn
@@ -218,7 +209,7 @@ withLcl fv act = do
 When compiling bytecode we call myCoreToStg to get STG code first.
 myCoreToStg in turn calls out to stg2stg which runs the STG to STG
 passes followed by free variables analysis and the tag inference pass including
-it's rewriting phase at the end.
+its rewriting phase at the end.
 Running tag inference is important as it upholds Note [Strict Field Invariant].
 While code executed by GHCi doesn't take advantage of the SFI it can call into
 compiled code which does. So it must still make sure that the SFI is upheld.
@@ -258,7 +249,7 @@ isTagged v = do
                                     (TagSig TagDunno)
     case nameIsLocalOrFrom this_mod (idName v) of
         True
-            | Just Unlifted <- typeLevity_maybe (idType v)
+            | definitelyUnliftedType (idType v)
               -- NB: v might be the Id of a representation-polymorphic join point,
               -- so we shouldn't use isUnliftedType here. See T22212.
             -> return True
@@ -272,11 +263,11 @@ isTagged v = do
                             TagProper -> True
                             TagTagged -> True
                             TagTuple _ -> True -- Consider unboxed tuples tagged.
-        False -- Imported
-            -> return $!
+        -- Imported
+        False -> return $!
                 -- Determine whether it is tagged from the LFInfo of the imported id.
                 -- See Note [The LFInfo of Imported Ids]
-                case mkLFImported v of
+                case importedIdLFInfo v of
                     -- Function, applied not entered.
                     LFReEntrant {}
                         -> True
@@ -339,7 +330,7 @@ rewriteBinds top_flag b@(StgRec binds) =
 -- Rewrite a RHS
 rewriteRhs :: (Id,TagSig) -> InferStgRhs
            -> RM (TgStgRhs)
-rewriteRhs (_id, _tagSig) (StgRhsCon ccs con cn ticks args) = {-# SCC rewriteRhs_ #-} do
+rewriteRhs (_id, _tagSig) (StgRhsCon ccs con cn ticks args typ) = {-# SCC rewriteRhs_ #-} do
     -- pprTraceM "rewriteRhs" (ppr _id)
 
     -- Look up the nodes representing the constructor arguments.
@@ -355,7 +346,7 @@ rewriteRhs (_id, _tagSig) (StgRhsCon ccs con cn ticks args) = {-# SCC rewriteRhs
     let evalArgs = [v | StgVarArg v <- needsEval] :: [Id]
 
     if (null evalArgs)
-        then return $! (StgRhsCon ccs con cn ticks args)
+        then return $! (StgRhsCon ccs con cn ticks args typ)
         else do
             --assert not (isTaggedSig tagSig)
             -- pprTraceM "CreatingSeqs for " $ ppr _id <+> ppr node_id
@@ -369,13 +360,14 @@ rewriteRhs (_id, _tagSig) (StgRhsCon ccs con cn ticks args) = {-# SCC rewriteRhs
             fvs <- fvArgs args
             -- lcls <- getFVs
             -- pprTraceM "RhsClosureConversion" (ppr (StgRhsClosure fvs ccs ReEntrant [] $! conExpr) $$ text "lcls:" <> ppr lcls)
+
             -- We mark the closure updatable to retain sharing in the case that
             -- conExpr is an infinite recursive data type. See #23783.
-            return $! (StgRhsClosure fvs ccs Updatable [] $! conExpr)
-rewriteRhs _binding (StgRhsClosure fvs ccs flag args body) = do
+            return $! (StgRhsClosure fvs ccs Updatable [] $! conExpr) typ
+rewriteRhs _binding (StgRhsClosure fvs ccs flag args body typ) = do
     withBinders NotTopLevel args $
         withClosureLcls fvs $
-            StgRhsClosure fvs ccs flag (map fst args) <$> rewriteExpr body
+            StgRhsClosure fvs ccs flag (map fst args) <$> rewriteExpr body <*> pure typ
         -- return (closure)
 
 fvArgs :: [StgArg] -> RM DVarSet
@@ -396,17 +388,15 @@ rewriteId v = do
     if is_tagged then return $! setIdTagSig v (TagSig TagProper)
                  else return v
 
-rewriteExpr :: InferStgExpr -> RM TgStgExpr
-rewriteExpr (e@StgCase {})          = rewriteCase e
-rewriteExpr (e@StgLet {})           = rewriteLet e
-rewriteExpr (e@StgLetNoEscape {})   = rewriteLetNoEscape e
-rewriteExpr (StgTick t e)     = StgTick t <$!> rewriteExpr e
-rewriteExpr e@(StgConApp {})        = rewriteConApp e
-rewriteExpr e@(StgApp {})     = rewriteApp e
-rewriteExpr (StgLit lit)           = return $! (StgLit lit)
-rewriteExpr (StgOpApp op@(StgPrimOp DataToTagOp) args res_ty) = do
-        (StgOpApp op) <$!> rewriteArgs args <*> pure res_ty
-rewriteExpr (StgOpApp op args res_ty) = return $! (StgOpApp op args res_ty)
+rewriteExpr :: GenStgExpr 'InferTaggedBinders -> RM (GenStgExpr 'CodeGen)
+rewriteExpr (e@StgCase {})            = rewriteCase e
+rewriteExpr (e@StgLet {})             = rewriteLet e
+rewriteExpr (e@StgLetNoEscape {})     = rewriteLetNoEscape e
+rewriteExpr (StgTick t e)             = StgTick t <$!> rewriteExpr e
+rewriteExpr e@(StgConApp {})          = rewriteConApp e
+rewriteExpr e@(StgApp {})             = rewriteApp e
+rewriteExpr (StgLit lit)              = return $! (StgLit lit)
+rewriteExpr (StgOpApp op args res_ty) = (StgOpApp op) <$!> rewriteArgs args <*> pure res_ty
 
 
 rewriteCase :: InferStgExpr -> RM TgStgExpr
@@ -414,7 +404,7 @@ rewriteCase (StgCase scrut bndr alt_type alts) =
     withBinder NotTopLevel bndr $
         pure StgCase <*>
             rewriteExpr scrut <*>
-            pure (fst bndr) <*>
+            rewriteId (fst bndr) <*>
             pure alt_type <*>
             mapM rewriteAlt alts
 
@@ -487,6 +477,32 @@ rewriteApp (StgApp f args)
 
 rewriteApp (StgApp f args) = return $ StgApp f args
 rewriteApp _ = panic "Impossible"
+
+{-
+Note [Rewriting primop arguments]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Given an application `op# x y`, is it worth applying `rewriteArg` to
+`x` and `y`?  All that will do will be to set the `tagSig` for that
+occurrence of `x` and `y` to record whether it is evaluated and
+properly tagged. For the vast majority of primops that's a waste of
+time: the argument is an `Int#` or something.
+
+But code generation for `seq#` and the `dataToTag#` ops /does/ consult that
+tag, to statically avoid generating an eval.  All three do so via `cgIdApp`,
+which in turn uses `getCallMethod` which looks at the `tagSig`.
+
+So for these we should call `rewriteArgs`.
+
+-}
+
+rewriteOpApp :: InferStgExpr -> RM TgStgExpr
+rewriteOpApp (StgOpApp op args res_ty) = case op of
+  op@(StgPrimOp primOp)
+    | primOp == SeqOp || primOp == DataToTagSmallOp || primOp == DataToTagLargeOp
+    -- see Note [Rewriting primop arguments]
+    -> (StgOpApp op) <$!> rewriteArgs args <*> pure res_ty
+  _ -> pure $! StgOpApp op args res_ty
+rewriteOpApp _ = panic "Impossible"
 
 -- `mkSeq` x x' e generates `case x of x' -> e`
 -- We could also substitute x' for x in e but that's so rarely beneficial

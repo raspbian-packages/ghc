@@ -5,7 +5,7 @@
 
 module GHC.SysTools.Cpp
   ( doCpp
-  , CppOpts (..)
+  , CppOpts(..)
   , getGhcVersionPathName
   , applyCDefs
   , offsetIncludePaths
@@ -15,7 +15,7 @@ where
 import GHC.Prelude
 import GHC.Driver.Session
 import GHC.Driver.Backend
-import GHC.CmmToLlvm.Config
+import GHC.CmmToLlvm.Version
 import GHC.Platform
 import GHC.Platform.ArchOS
 
@@ -40,11 +40,70 @@ import System.Directory
 import System.FilePath
 
 data CppOpts = CppOpts
-  { cppUseCc       :: !Bool -- ^ Use "cc -E" as preprocessor, otherwise use "cpp"
-  , cppLinePragmas :: !Bool -- ^ Enable generation of LINE pragmas
+  { sourceCodePreprocessor  :: !SourceCodePreprocessor
+  , cppLinePragmas          :: !Bool
+  -- ^ Enable generation of LINE pragmas
   }
 
--- | Run CPP
+{-
+Note [Preprocessing invocations]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+We must consider four distinct preprocessors when preprocessing Haskell.
+These are:
+
+(1) The Haskell C preprocessor (HsCpp), which preprocesses Haskell files that make use
+  of the CPP language extension
+
+(2) The C preprocessor (Cpp), which is used to preprocess C files
+
+(3) The JavaScript preprocessor (JsCpp), which preprocesses JavaScript files
+
+(4) The C-- preprocessor (CmmCpp), which preprocesses C-- files
+
+These preprocessors are indeed different. Despite often sharing the same
+underlying program (the C compiler), the set of flags passed determines the
+behaviour of the preprocessor, and Cpp and HsCpp behave differently.
+Specifically, we rely on "traditional" (pre-standard) preprocessing semantics
+(which most compilers expose via the `-traditional` flag) when preprocessing
+Haskell source. This avoids the following situations:
+
+  * Removal of C-style comments, which are not comments in Haskell but valid
+    operators;
+
+  * Errors due to an ANSI C preprocessor lexing the source and failing on
+    names with single quotes (TH quotes, ticked promoted constructors,
+    names with primes in them).
+
+  Both of those cases may be subtle: gcc and clang permit C++-style //
+  comments in C code, and Data.Array and Data.Vector both export a //
+  operator whose type is such that a removed "comment" may leave code that
+  typechecks but does the wrong thing. Another example is that, since ANSI
+  C permits long character constants, an expression involving multiple
+  functions with primes in their names may not expand macros properly when
+  they occur between the primed functions.
+
+Third special type of preprocessor for JavaScript was added laterly due to
+needing to keep JSDoc comments and multiline comments. Various third party
+minifying software (for example, Google Closure Compiler) uses JSDoc
+information to apply more strict rules to code reduction which results in
+better but more dangerous minification. JSDoc comments are usually used to
+instruct minifiers where dangerous optimizations could be applied.
+
+The fourth, the C-- preprocessor, is needed as modern compilers emit defines
+for debug info generation when preprocessing.  The C-- preprocessor avoids this
+by suppressing debug info generation.  The C-- preprocessor also inherits flags
+passed to the C compiler.  This is done for compatibility.  Following those,
+the C-- compiler receives -g0, if it was detected as supported, and flags
+passed via -optCmmP specifically for the C-- preprocessor.  The combined
+command line looks like:
+
+  $pgmCmmP $optCs_without_g3s $g0_if_supported $optCmmP
+
+-}
+
+-- | Run either the Haskell preprocessor, JavaScript preprocessor
+-- or the C preprocessor, as per the 'CppOpts' passed.
+-- See Note [Preprocessing invocations].
 --
 -- UnitEnv is needed to compute MIN_VERSION macros
 doCpp :: Logger -> TmpFs -> DynFlags -> UnitEnv -> CppOpts -> FilePath -> FilePath -> IO ()
@@ -72,10 +131,7 @@ doCpp logger tmpfs dflags unit_env opts input_fn output_fn = do
 
     let verbFlags = getVerbFlags dflags
 
-    let cpp_prog args
-          | cppUseCc opts = GHC.SysTools.runCc Nothing logger tmpfs dflags
-                                               (GHC.SysTools.Option "-E" : args)
-          | otherwise     = GHC.SysTools.runCpp logger dflags args
+    let cpp_prog args = runSourceCodePreprocessor logger tmpfs dflags (sourceCodePreprocessor opts) args
 
     let platform   = targetPlatform dflags
         targetArch = stringEncodeArch $ platformArch platform
@@ -97,6 +153,9 @@ doCpp logger tmpfs dflags unit_env opts input_fn output_fn = do
           [ "-D__SSE__"      | isSseEnabled      platform ] ++
           [ "-D__SSE2__"     | isSse2Enabled     platform ] ++
           [ "-D__SSE4_2__"   | isSse4_2Enabled   dflags ]
+
+    let fma_def =
+         [ "-D__FMA__"       | isFmaEnabled dflags ]
 
     let avx_defs =
           [ "-D__AVX__"      | isAvxEnabled      dflags ] ++
@@ -140,6 +199,7 @@ doCpp logger tmpfs dflags unit_env opts input_fn output_fn = do
                     ++ map GHC.SysTools.Option th_defs
                     ++ map GHC.SysTools.Option hscpp_opts
                     ++ map GHC.SysTools.Option sse_defs
+                    ++ map GHC.SysTools.Option fma_def
                     ++ map GHC.SysTools.Option avx_defs
                     ++ map GHC.SysTools.Option io_manager_defs
                     ++ mb_macro_include
@@ -199,11 +259,17 @@ generateMacros prefix name version =
 -- | Find out path to @ghcversion.h@ file
 getGhcVersionPathName :: DynFlags -> UnitEnv -> IO FilePath
 getGhcVersionPathName dflags unit_env = do
-  candidates <- case ghcVersionFile dflags of
-    Just path -> return [path]
-    Nothing -> do
-        ps <- mayThrowUnitErr (preloadUnitsInfo' unit_env [rtsUnitId])
-        return ((</> "ghcversion.h") <$> collectIncludeDirs ps)
+  let candidates = case ghcVersionFile dflags of
+        -- the user has provided an explicit `ghcversion.h` file to use.
+        Just path -> [path]
+        -- otherwise, try to find it in the rts' include-dirs.
+        -- Note: only in the RTS include-dirs! not all preload units less we may
+        -- use a wrong file. See #25106 where a globally installed
+        -- /usr/include/ghcversion.h file was used instead of the one provided
+        -- by the rts.
+        Nothing -> case lookupUnitId (ue_units unit_env) rtsUnitId of
+          Nothing   -> []
+          Just info -> (</> "ghcversion.h") <$> collectIncludeDirs [info]
 
   found <- filterM doesFileExist candidates
   case found of

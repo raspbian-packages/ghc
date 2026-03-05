@@ -57,6 +57,7 @@ showAstData bs ba a0 = blankLine $$ showAstData' a0
     showAstData' =
       generic
               `ext1Q` list
+              `extQ` list_addEpAnn
               `extQ` string `extQ` fastString `extQ` srcSpan `extQ` realSrcSpan
               `extQ` annotation
               `extQ` annotationModule
@@ -70,6 +71,7 @@ showAstData bs ba a0 = blankLine $$ showAstData' a0
               `extQ` annotationEpaLocation
               `extQ` annotationNoEpAnns
               `extQ` addEpAnn
+              `extQ` annParen
               `extQ` lit `extQ` litr `extQ` litt
               `extQ` sourceText
               `extQ` deltaPos
@@ -100,6 +102,12 @@ showAstData bs ba a0 = blankLine $$ showAstData' a0
 
             bytestring :: B.ByteString -> SDoc
             bytestring = text . normalize_newlines . show
+
+            list_addEpAnn :: [AddEpAnn] -> SDoc
+            list_addEpAnn ls = case ba of
+              BlankEpAnnotations -> parens
+                                       $ text "blanked:" <+> text "[AddEpAnn]"
+              NoBlankEpAnnotations -> list ls
 
             list []    = brackets empty
             list [x]   = brackets (showAstData' x)
@@ -139,12 +147,12 @@ showAstData bs ba a0 = blankLine $$ showAstData' a0
             sourceText :: SourceText -> SDoc
             sourceText NoSourceText = parens $ text "NoSourceText"
             sourceText (SourceText src) = case bs of
-              NoBlankSrcSpan   -> parens $ text "SourceText" <+> text src
-              BlankSrcSpanFile -> parens $ text "SourceText" <+> text src
+              NoBlankSrcSpan   -> parens $ text "SourceText" <+> ftext src
+              BlankSrcSpanFile -> parens $ text "SourceText" <+> ftext src
               _                -> parens $ text "SourceText" <+> text "blanked"
 
             epaAnchor :: EpaLocation -> SDoc
-            epaAnchor (EpaSpan r _) = parens $ text "EpaSpan" <+> realSrcSpan r
+            epaAnchor (EpaSpan s) = parens $ text "EpaSpan" <+> srcSpan s
             epaAnchor (EpaDelta d cs) = case ba of
               NoBlankEpAnnotations -> parens $ text "EpaDelta" <+> deltaPos d <+> showAstData' cs
               BlankEpAnnotations -> parens $ text "EpaDelta" <+> deltaPos d <+> text "blanked"
@@ -166,27 +174,21 @@ showAstData bs ba a0 = blankLine $$ showAstData' a0
             srcSpan :: SrcSpan -> SDoc
             srcSpan ss = case bs of
              BlankSrcSpan -> text "{ ss }"
-             NoBlankSrcSpan -> braces $ char ' ' <>
-                             (hang (ppr ss) 1
-                                   -- TODO: show annotations here
-                                   (text ""))
-             BlankSrcSpanFile -> braces $ char ' ' <>
-                             (hang (pprUserSpan False ss) 1
-                                   -- TODO: show annotations here
-                                   (text ""))
+             NoBlankSrcSpan -> braces $ char ' ' <> (ppr ss) <> char ' '
+             BlankSrcSpanFile -> braces $ char ' ' <> (pprUserSpan False ss) <> char ' '
 
             realSrcSpan :: RealSrcSpan -> SDoc
             realSrcSpan ss = case bs of
              BlankSrcSpan -> text "{ ss }"
-             NoBlankSrcSpan -> braces $ char ' ' <>
-                             (hang (ppr ss) 1
-                                   -- TODO: show annotations here
-                                   (text ""))
-             BlankSrcSpanFile -> braces $ char ' ' <>
-                             (hang (pprUserRealSpan False ss) 1
-                                   -- TODO: show annotations here
-                                   (text ""))
+             NoBlankSrcSpan -> braces $ char ' ' <> (ppr ss) <> char ' '
+             BlankSrcSpanFile -> braces $ char ' ' <> (pprUserRealSpan False ss) <> char ' '
 
+            annParen :: AnnParen -> SDoc
+            annParen (AnnParen a o c) = case ba of
+             BlankEpAnnotations -> parens $ text "blanked:" <+> text "AnnParen"
+             NoBlankEpAnnotations ->
+              parens $ text "AnnParen"
+                        $$ vcat [ppr a, epaAnchor o, epaAnchor c]
 
             addEpAnn :: AddEpAnn -> SDoc
             addEpAnn (AddEpAnn a s) = case ba of
@@ -275,32 +277,32 @@ showAstData bs ba a0 = blankLine $$ showAstData' a0
 
             -- -------------------------
 
-            srcSpanAnnA :: SrcSpanAnn' (EpAnn AnnListItem) -> SDoc
+            srcSpanAnnA :: EpAnn AnnListItem -> SDoc
             srcSpanAnnA = locatedAnn'' (text "SrcSpanAnnA")
 
-            srcSpanAnnL :: SrcSpanAnn' (EpAnn AnnList) -> SDoc
+            srcSpanAnnL :: EpAnn AnnList -> SDoc
             srcSpanAnnL = locatedAnn'' (text "SrcSpanAnnL")
 
-            srcSpanAnnP :: SrcSpanAnn' (EpAnn AnnPragma) -> SDoc
+            srcSpanAnnP :: EpAnn AnnPragma -> SDoc
             srcSpanAnnP = locatedAnn'' (text "SrcSpanAnnP")
 
-            srcSpanAnnC :: SrcSpanAnn' (EpAnn AnnContext) -> SDoc
+            srcSpanAnnC :: EpAnn AnnContext -> SDoc
             srcSpanAnnC = locatedAnn'' (text "SrcSpanAnnC")
 
-            srcSpanAnnN :: SrcSpanAnn' (EpAnn NameAnn) -> SDoc
+            srcSpanAnnN :: EpAnn NameAnn -> SDoc
             srcSpanAnnN = locatedAnn'' (text "SrcSpanAnnN")
 
             locatedAnn'' :: forall a. (Typeable a, Data a)
-              => SDoc -> SrcSpanAnn' a -> SDoc
+              => SDoc -> EpAnn a -> SDoc
             locatedAnn'' tag ss = parens $
               case cast ss of
-                Just ((SrcSpanAnn ann s) :: SrcSpanAnn' a) ->
+                Just (ann :: EpAnn a) ->
                   case ba of
                     BlankEpAnnotations
                       -> parens (text "blanked:" <+> tag)
                     NoBlankEpAnnotations
-                      -> text "SrcSpanAnn" <+> showAstData' ann
-                              <+> srcSpan s
+                      -> text (showConstr (toConstr ann))
+                                          $$ vcat (gmapQ showAstData' ann)
                 Nothing -> text "locatedAnn:unmatched" <+> tag
                            <+> (parens $ text (showConstr (toConstr ss)))
 

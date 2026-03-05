@@ -2,6 +2,7 @@
 {-# LANGUAGE TypeFamilies #-}
 
 {-# OPTIONS_GHC -Wno-incomplete-uni-patterns #-}
+{-# OPTIONS_GHC -Wno-unrecognised-warning-flags -Wno-x-data-list-nonempty-unzip #-}
 
 {-
 (c) The University of Glasgow 2006
@@ -20,7 +21,6 @@ import {-# SOURCE #-} GHC.HsToCore.Match ( match )
 import GHC.Hs
 import GHC.HsToCore.Binds
 import GHC.Core.ConLike
-import GHC.Types.Basic ( Origin(..) )
 import GHC.Tc.Utils.TcType
 import GHC.Core.Multiplicity
 import GHC.HsToCore.Monad
@@ -34,7 +34,6 @@ import GHC.Types.FieldLabel ( flSelector )
 import GHC.Types.SrcLoc
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
-import GHC.Utils.Panic.Plain
 import Control.Monad(liftM)
 import Data.List.NonEmpty (NonEmpty(..))
 import qualified Data.List.NonEmpty as NE
@@ -94,7 +93,7 @@ have-we-used-all-the-constructors? question; the local function
 
 matchConFamily :: NonEmpty Id
                -> Type
-               -> NonEmpty (NonEmpty EquationInfo)
+               -> NonEmpty (NonEmpty EquationInfoNE)
                -> DsM (MatchResult CoreExpr)
 -- Each group of eqns is for a single constructor
 matchConFamily (var :| vars) ty groups
@@ -113,7 +112,7 @@ matchConFamily (var :| vars) ty groups
 
 matchPatSyn :: NonEmpty Id
             -> Type
-            -> NonEmpty EquationInfo
+            -> NonEmpty EquationInfoNE
             -> DsM (MatchResult CoreExpr)
 matchPatSyn (var :| vars) ty eqns
   = do let mult = idMult var
@@ -129,7 +128,7 @@ type ConArgPats = HsConPatDetails GhcTc
 matchOneConLike :: [Id]
                 -> Type
                 -> Mult
-                -> NonEmpty EquationInfo
+                -> NonEmpty EquationInfoNE
                 -> DsM (CaseAlt ConLike)
 matchOneConLike vars ty mult (eqn1 :| eqns)   -- All eqns for a single constructor
   = do  { let inst_tys = assert (all tcIsTcTyVar ex_tvs) $
@@ -143,7 +142,7 @@ matchOneConLike vars ty mult (eqn1 :| eqns)   -- All eqns for a single construct
         -- and returns the types of the *value* args, which is what we want
 
               match_group :: [Id]
-                          -> NonEmpty (ConArgPats, EquationInfo)
+                          -> NonEmpty (ConArgPats, EquationInfoNE)
                           -> DsM (MatchResult CoreExpr)
               -- All members of the group have compatible ConArgPats
               match_group arg_vars arg_eqn_prs
@@ -153,24 +152,21 @@ matchOneConLike vars ty mult (eqn1 :| eqns)   -- All eqns for a single construct
                      ; return $ foldr1 (.) wraps <$> match_result
                      }
 
-              shift (_, eqn@(EqnInfo
-                             { eqn_pats = ConPat
-                               { pat_args = args
-                               , pat_con_ext = ConPatTc
-                                 { cpt_tvs = tvs
-                                 , cpt_dicts = ds
-                                 , cpt_binds = bind
-                                 }
-                               } : pats
-                             }))
-                = do ds_bind <- dsTcEvBinds bind
-                     return ( wrapBinds (tvs `zip` tvs1)
-                            . wrapBinds (ds  `zip` dicts1)
-                            . mkCoreLets ds_bind
-                            , eqn { eqn_orig = Generated
-                                  , eqn_pats = conArgPats val_arg_tys args ++ pats }
-                            )
-              shift (_, (EqnInfo { eqn_pats = ps })) = pprPanic "matchOneCon/shift" (ppr ps)
+              shift (_, EqnMatch {
+                      eqn_pat = L _ (ConPat
+                                    { pat_args = args
+                                    , pat_con_ext = ConPatTc
+                                      { cpt_tvs = tvs
+                                      , cpt_dicts = ds
+                                      , cpt_binds = bind }})
+                    , eqn_rest = rest })
+                = do dsTcEvBinds bind $ \ds_bind ->
+                       return ( wrapBinds (tvs `zip` tvs1)
+                              . wrapBinds (ds  `zip` dicts1)
+                              . mkCoreLets ds_bind
+                              , prependPats (conArgPats val_arg_tys args) rest
+                              )
+              shift (_, eqn) = pprPanic "matchOneCon/shift" (ppr eqn)
         ; let scaled_arg_tys = map (scaleScaled mult) val_arg_tys
             -- The 'val_arg_tys' are taken from the data type definition, they
             -- do not take into account the context multiplicity, therefore we
@@ -184,7 +180,7 @@ matchOneConLike vars ty mult (eqn1 :| eqns)   -- All eqns for a single construct
                 -- suggestions for the new variables
 
         -- Divide into sub-groups; see Note [Record patterns]
-        ; let groups :: NonEmpty (NonEmpty (ConArgPats, EquationInfo))
+        ; let groups :: NonEmpty (NonEmpty (ConArgPats, EquationInfoNE))
               groups = NE.groupBy1 compatible_pats
                      $ fmap (\eqn -> (pat_args (firstPat eqn), eqn)) (eqn1 :| eqns)
 
@@ -256,14 +252,14 @@ conArgPats :: [Scaled Type]-- Instantiated argument types
                           -- Used only to fill in the types of WildPats, which
                           -- are probably never looked at anyway
            -> ConArgPats
-           -> [Pat GhcTc]
-conArgPats _arg_tys (PrefixCon _ ps) = map unLoc ps
-conArgPats _arg_tys (InfixCon p1 p2) = [unLoc p1, unLoc p2]
+           -> [LPat GhcTc]
+conArgPats _arg_tys (PrefixCon _ ps) = ps
+conArgPats _arg_tys (InfixCon p1 p2) = [p1, p2]
 conArgPats  arg_tys (RecCon (HsRecFields { rec_flds = rpats }))
-  | null rpats = map WildPat (map scaledThing arg_tys)
+  | null rpats = map (noLocA . WildPat . scaledThing) arg_tys
         -- Important special case for C {}, which can be used for a
         -- datacon that isn't declared to have fields at all
-  | otherwise  = map (unLoc . hfbRHS . unLoc) rpats
+  | otherwise  = map (hfbRHS . unLoc) rpats
 
 {-
 Note [Record patterns]

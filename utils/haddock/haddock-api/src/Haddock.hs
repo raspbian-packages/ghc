@@ -5,7 +5,6 @@
 {-# LANGUAGE OverloadedStrings   #-}
 {-# LANGUAGE Rank2Types          #-}
 {-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE TupleSections       #-}
 {-# OPTIONS_GHC -Wwarn           #-}
 -----------------------------------------------------------------------------
 -- |
@@ -78,6 +77,7 @@ import GHC.Settings.Config
 import GHC.Driver.Config.Logger (initLogFlags)
 import GHC.Driver.Env
 import GHC.Driver.Session hiding (projectVersion, verbosity)
+import qualified GHC.Driver.Session as DynFlags (DynFlags(..))
 import GHC.Utils.Error
 import GHC.Utils.Logger
 import GHC.Types.Name.Cache
@@ -158,6 +158,12 @@ haddockWithGhc ghc args = handleTopExceptions $ do
   -- or which exits with an error or help message.
   (flags, files) <- parseHaddockOpts args
   shortcutFlags flags
+
+  -- If argument tracing is enabled, print the arguments we were given
+  when (Flag_TraceArgs `elem` flags) $ do
+    putStrLn $ "haddock received arguments:"
+    mapM_ (putStrLn . ("  " ++)) args
+
   qual <- rightOrThrowE (qualification flags)
   sinceQual <- rightOrThrowE (sinceQualification flags)
 
@@ -202,7 +208,7 @@ haddockWithGhc ghc args = handleTopExceptions $ do
     -- If any --show-interface was used, show the given interfaces
     forM_ (optShowInterfaceFile flags) $ \path -> liftIO $ do
       name_cache <- freshNameCache
-      mIfaceFile <- readInterfaceFiles name_cache [(("", Nothing), Visible, path)] noChecks
+      mIfaceFile <- readInterfaceFiles name_cache [(DocPaths "" Nothing, Visible, path)] noChecks
       forM_ mIfaceFile $ \(_,_,_, ifaceFile) -> do
         putMsg logger $ renderJson (jsonInterfaceFile ifaceFile)
 
@@ -294,7 +300,7 @@ renderStep :: Logger -> DynFlags -> UnitState -> [Flag] -> SinceQual -> QualOpti
 renderStep logger dflags unit_state flags sinceQual nameQual pkgs interfaces = do
   updateHTMLXRefs (map (\(docPath, _ifaceFilePath, _showModules, ifaceFile) ->
                           ( case baseUrl flags of
-                              Nothing  -> fst docPath
+                              Nothing  -> docPathsHtml docPath
                               Just url -> url </> packageName (ifUnitId ifaceFile)
                           , ifaceFile)) pkgs)
   let
@@ -304,7 +310,7 @@ renderStep logger dflags unit_state flags sinceQual nameQual pkgs interfaces = d
           -> (ifaceFilePath, mkPackageInterfaces showModules ifaceFile))
         pkgs
     extSrcMap = Map.fromList $ do
-      ((_, Just path), _, _, ifile) <- pkgs
+      (DocPaths {docPathsSources=Just path}, _, _, ifile) <- pkgs
       iface <- ifInstalledIfaces ifile
       return (instMod iface, path)
   render logger dflags unit_state flags sinceQual nameQual interfaces installedIfaces extSrcMap
@@ -388,11 +394,14 @@ render log' dflags unit_state flags sinceQual qual ifaces packages extSrcMap = d
       | Flag_HyperlinkedSource `elem` flags = Just hypSrcModuleUrlFormat
       | otherwise = srcModule
 
+    -- These urls have a template for the module %M
     srcMap = Map.union
-      (Map.map SrcExternal extSrcMap)
+      (Map.map (SrcExternal . hypSrcPkgUrlToModuleFormat) extSrcMap)
       (Map.fromList [ (ifaceMod iface, SrcLocal) | iface <- ifaces ])
 
-    pkgSrcMap = Map.mapKeys moduleUnit extSrcMap
+    -- These urls have a template for the module %M and the name %N
+    pkgSrcMap = Map.map (hypSrcModuleUrlToNameFormat . hypSrcPkgUrlToModuleFormat)
+              $ Map.mapKeys moduleUnit extSrcMap
     pkgSrcMap'
       | Flag_HyperlinkedSource `elem` flags
       , Just k <- pkgKey
@@ -402,6 +411,7 @@ render log' dflags unit_state flags sinceQual qual ifaces packages extSrcMap = d
       = Map.insert k srcNameUrl pkgSrcMap
       | otherwise = pkgSrcMap
 
+    -- These urls have a template for the module %M and the line %L
     -- TODO: Get these from the interface files as with srcMap
     pkgSrcLMap'
       | Flag_HyperlinkedSource `elem` flags
@@ -500,7 +510,7 @@ render log' dflags unit_state flags sinceQual qual ifaces packages extSrcMap = d
 
             pkgVer =
               fromMaybe (makeVersion []) mpkgVer
-          in ppHoogle dflags' pkgNameStr pkgVer title (fmap _doc prologue)
+          in ppHoogle dflags' unit_state pkgNameStr pkgVer title (fmap _doc prologue)
                visibleIfaces odir
       _ -> putStrLn . unlines $
           [ "haddock: Unable to find a package providing module "
@@ -559,10 +569,16 @@ readInterfaceFiles name_cache_accessor pairs bypass_version_check = do
 withGhc' :: String -> Bool -> [String] -> (DynFlags -> Ghc a) -> IO a
 withGhc' libDir needHieFiles flags ghcActs = runGhc (Just libDir) $ do
     logger <- getLogger
-    dynflags' <- parseGhcFlags logger =<< getSessionDynFlags
 
-    -- We disable pattern match warnings because than can be very
-    -- expensive to check
+    -- Set default GHC verbosity to 1. This is better for hi-haddock since -v0
+    -- creates an awkward silence during the load operation
+    default_dflags <- getSessionDynFlags >>= \dflags ->
+      pure dflags { DynFlags.verbosity = 1 }
+
+    dynflags' <- parseGhcFlags logger default_dflags
+
+    -- Disable pattern match warnings because they can be very expensive to
+    -- check, set optimization level to 0 for fastest compilation.
     let dynflags'' = unsetPatternMatchWarnings $ updOptLevel 0 dynflags'
 
     -- ignore the following return-value, which is a list of packages
@@ -585,8 +601,17 @@ withGhc' libDir needHieFiles flags ghcActs = runGhc (Just libDir) $ do
     parseGhcFlags logger dynflags = do
       -- TODO: handle warnings?
 
-      let extra_opts | needHieFiles = [Opt_WriteHie, Opt_Haddock]
-                     | otherwise = [Opt_Haddock]
+      let extra_opts =
+            [ -- Include docstrings in .hi files.
+              Opt_Haddock
+
+              -- Do not recompile because of changes to optimization flags
+            , Opt_IgnoreOptimChanges
+            ]
+              -- Write .hie files if we need them for hyperlinked src
+              ++ if needHieFiles
+                    then [Opt_WriteHie] -- Generate .hie-files
+                    else []
           dynflags' = (foldl' gopt_set dynflags extra_opts)
                         { backend = noBackend
                         , ghcMode = CompManager

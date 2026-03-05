@@ -8,9 +8,12 @@
 Haskell. [WDP 94/11])
 -}
 
-
-{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE BinaryLiterals #-}
+{-# LANGUAGE DataKinds #-}
+{-# LANGUAGE DeriveDataTypeable #-}
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE TypeFamilies #-}
 
 {-# OPTIONS_GHC -Wno-incomplete-record-updates #-}
 
@@ -18,7 +21,8 @@ module GHC.Types.Id.Info (
         -- * The IdDetails type
         IdDetails(..), pprIdDetails, coVarDetails, isCoVarDetails,
         JoinArity, isJoinIdDetails_maybe,
-        RecSelParent(..),
+        RecSelParent(..), recSelParentName, recSelFirstConName,
+        recSelParentCons, idDetailsConcreteTvs,
 
         -- * The IdInfo type
         IdInfo,         -- Abstract
@@ -31,7 +35,8 @@ module GHC.Types.Id.Info (
 
         -- ** Zapping various forms of Info
         zapLamInfo, zapFragileInfo,
-        zapDemandInfo, zapUsageInfo, zapUsageEnvInfo, zapUsedOnceInfo,
+        lazifyDemandInfo, floatifyDemandInfo,
+        zapUsageInfo, zapUsageEnvInfo, zapUsedOnceInfo,
         zapTailCallInfo, zapCallArityInfo, trimUnfolding,
 
         -- ** The ArityInfo type
@@ -95,20 +100,22 @@ import GHC.Types.Var.Set
 import GHC.Types.Basic
 import GHC.Core.DataCon
 import GHC.Core.TyCon
+import GHC.Core.Type (mkTyConApp)
 import GHC.Core.PatSyn
+import GHC.Core.ConLike
 import GHC.Types.ForeignCall
 import GHC.Unit.Module
 import GHC.Types.Demand
 import GHC.Types.Cpr
+import {-# SOURCE #-} GHC.Tc.Utils.TcType ( ConcreteTyVars, noConcreteTyVars )
 
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
-import GHC.Utils.Panic.Plain
 import GHC.Stg.InferTags.TagSig
-
-import Data.Word
-
 import GHC.StgToCmm.Types (LambdaFormInfo)
+
+import Data.Data ( Data )
+import Data.Word
 
 -- infixl so you can say (id `set` a `set` b)
 infixl  1 `setRuleInfo`,
@@ -120,7 +127,8 @@ infixl  1 `setRuleInfo`,
           `setCafInfo`,
           `setDmdSigInfo`,
           `setCprSigInfo`,
-          `setDemandInfo`
+          `setDemandInfo`,
+          `setLFInfo`
 {-
 ************************************************************************
 *                                                                      *
@@ -138,10 +146,17 @@ data IdDetails
 
   -- | The 'Id' for a record selector
   | RecSelId
-    { sel_tycon   :: RecSelParent
-    , sel_naughty :: Bool       -- True <=> a "naughty" selector which can't actually exist, for example @x@ in:
+    { sel_tycon      :: RecSelParent
+    , sel_fieldLabel :: FieldLabel
+    , sel_naughty    :: Bool    -- True <=> a "naughty" selector which can't actually exist, for example @x@ in:
                                 --    data T = forall a. MkT { x :: a }
-    }                           -- See Note [Naughty record selectors] in GHC.Tc.TyCl
+                                -- See Note [Naughty record selectors] in GHC.Tc.TyCl
+    , sel_cons       :: ([ConLike], [ConLike])
+                                -- If record selector is not defined for all constructors
+                                -- of a parent type, this is the pair of lists of constructors that
+                                -- it is and is not defined for. Otherwise, it's Nothing.
+                                -- Cached here based on the RecSelParent.
+    }                           -- See Note [Detecting incomplete record selectors] in GHC.HsToCore.Pmc
 
   | DataConWorkId DataCon       -- ^ The 'Id' is for a data constructor /worker/
   | DataConWrapId DataCon       -- ^ The 'Id' is for a data constructor /wrapper/
@@ -150,13 +165,35 @@ data IdDetails
                                 --  a) to support isImplicitId
                                 --  b) when desugaring a RecordCon we can get
                                 --     from the Id back to the data con]
-  | ClassOpId Class             -- ^ The 'Id' is a superclass selector,
-                                -- or class operation of a class
 
-  | PrimOpId PrimOp Bool        -- ^ The 'Id' is for a primitive operator
-                                -- True <=> is representation-polymorphic,
-                                --          and hence has no binding
-                                -- This lev-poly flag is used only in GHC.Types.Id.hasNoBinding
+  | ClassOpId                   -- ^ The 'Id' is a superclass selector or class operation
+      Class                     --    for this class
+      Bool                      --   True <=> given a non-bottom dictionary, the class op will
+                                --            definitely return a non-bottom result
+                                --   and Note [exprOkForSpeculation and type classes]
+                                --       in GHC.Core.Utils
+
+  -- | A representation-polymorphic pseudo-op.
+  | RepPolyId
+      { id_concrete_tvs :: ConcreteTyVars }
+        -- ^ Which type variables of this representation-polymorphic 'Id
+        -- should be instantiated to concrete type variables?
+        --
+        -- See Note [Representation-polymorphism checking built-ins]
+        -- in GHC.Tc.Gen.Head.
+
+  -- | The 'Id' is for a primitive operator.
+  | PrimOpId
+     { id_primop :: PrimOp
+     , id_concrete_tvs :: ConcreteTyVars }
+        -- ^ Which type variables of this primop should be instantiated
+        -- to concrete type variables?
+        --
+        -- Only ever non-empty when the PrimOp has representation-polymorphic
+        -- type variables.
+        --
+        -- See Note [Representation-polymorphism checking built-ins]
+        -- in GHC.Tc.Gen.Head.
 
   | FCallId ForeignCall         -- ^ The 'Id' is for a foreign call.
                                 -- Type will be simple: no type families, newtypes, etc
@@ -186,6 +223,15 @@ data IdDetails
         -- See Note [Tag Inference]
         -- The [CbvMark] is always empty (and ignored) until after Tidy for ids from the current
         -- module.
+
+idDetailsConcreteTvs :: IdDetails -> ConcreteTyVars
+idDetailsConcreteTvs = \ case
+    PrimOpId _ conc_tvs -> conc_tvs
+    RepPolyId  conc_tvs -> conc_tvs
+    DataConWorkId dc    -> dataConConcreteTyVars dc
+    DataConWrapId dc    -> dataConConcreteTyVars dc
+    _                   -> noConcreteTyVars
+
 
 {- Note [CBV Function Ids]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -268,17 +314,49 @@ some applied arguments as we won't inline the wrapper/apply their rule
 if there are unapplied occurrences like `map f xs`.
 -}
 
--- | Recursive Selector Parent
-data RecSelParent = RecSelData TyCon | RecSelPatSyn PatSyn deriving Eq
-  -- Either `TyCon` or `PatSyn` depending
-  -- on the origin of the record selector.
-  -- For a data type family, this is the
-  -- /instance/ 'TyCon' not the family 'TyCon'
+-- | Parent of a record selector function.
+--
+-- Either the parent 'TyCon' or 'PatSyn' depending
+-- on the origin of the record selector.
+--
+-- For a data family, this is the /instance/ 'TyCon',
+-- **not** the family 'TyCon'.
+data RecSelParent
+  -- | Parent of a data constructor record field.
+  --
+  -- For a data family, this is the /instance/ 'TyCon'.
+  = RecSelData TyCon
+  -- | Parent of a pattern synonym record field:
+  -- the 'PatSyn' itself.
+  | RecSelPatSyn PatSyn
+  deriving (Eq, Data)
+
+recSelParentName :: RecSelParent -> Name
+recSelParentName (RecSelData   tc) = tyConName tc
+recSelParentName (RecSelPatSyn ps) = patSynName ps
+
+recSelFirstConName :: RecSelParent -> Name
+recSelFirstConName (RecSelData   tc) = dataConName $ head $ tyConDataCons tc
+recSelFirstConName (RecSelPatSyn ps) = patSynName ps
+
+recSelParentCons :: RecSelParent -> [ConLike]
+recSelParentCons (RecSelData tc)
+  | isAlgTyCon tc
+      = map RealDataCon $ visibleDataCons
+      $ algTyConRhs tc
+  | otherwise
+      = []
+recSelParentCons (RecSelPatSyn ps) = [PatSynCon ps]
 
 instance Outputable RecSelParent where
   ppr p = case p of
-            RecSelData ty_con -> ppr ty_con
-            RecSelPatSyn ps   -> ppr ps
+    RecSelData tc
+      | Just (parent_tc, tys) <- tyConFamInst_maybe tc
+      -> ppr (mkTyConApp parent_tc tys)
+      | otherwise
+      -> ppr tc
+    RecSelPatSyn ps
+      -> ppr ps
 
 -- | Just a synonym for 'CoVarId'. Written separately so it can be
 -- exported in the hs-boot file.
@@ -302,10 +380,11 @@ pprIdDetails VanillaId = empty
 pprIdDetails other     = brackets (pp other)
  where
    pp VanillaId               = panic "pprIdDetails"
-   pp (WorkerLikeId dmds)   = text "StrictWorker" <> parens (ppr dmds)
+   pp (WorkerLikeId dmds)     = text "StrictWorker" <> parens (ppr dmds)
    pp (DataConWorkId _)       = text "DataCon"
    pp (DataConWrapId _)       = text "DataConWrapper"
    pp (ClassOpId {})          = text "ClassOp"
+   pp (RepPolyId {})          = text "RepPolyId"
    pp (PrimOpId {})           = text "PrimOp"
    pp (FCallId _)             = text "ForeignCall"
    pp (TickBoxOpId _)         = text "TickBoxOp"
@@ -369,7 +448,12 @@ data IdInfo
         --
         -- See documentation of the getters for what these packed fields mean.
         lfInfo          :: !(Maybe LambdaFormInfo),
-        -- ^ See Note [The LFInfo of Imported Ids] in GHC.StgToCmm.Closure
+        -- ^ If lfInfo = Just info, then the `info` is guaranteed /correct/.
+        --   If lfInfo = Nothing, then we do not have a `LambdaFormInfo` for this Id,
+        --                so (for imported Ids) we make a conservative version.
+        --                See Note [The LFInfo of Imported Ids] in GHC.StgToCmm.Closure
+        -- For locally-defined Ids other than DataCons, the `lfInfo` field is always Nothing.
+        -- See also Note [LFInfo of DataCon workers and wrappers]
 
         -- See documentation of the getters for what these packed fields mean.
         tagSig          :: !(Maybe TagSig)
@@ -772,11 +856,21 @@ zapLamInfo info@(IdInfo {occInfo = occ, demandInfo = demand})
 
     is_safe_dmd dmd = not (isStrUsedDmd dmd)
 
--- | Remove all demand info on the 'IdInfo'
-zapDemandInfo :: IdInfo -> Maybe IdInfo
-zapDemandInfo info = Just (info {demandInfo = topDmd})
+-- | Lazify (remove the top-level demand, only) the demand in `IdInfo`
+-- Keep nested demands; see Note [Floatifying demand info when floating]
+-- in GHC.Core.Opt.SetLevels
+lazifyDemandInfo :: IdInfo -> Maybe IdInfo
+lazifyDemandInfo info@(IdInfo { demandInfo = dmd })
+  = Just (info {demandInfo = lazifyDmd dmd })
 
--- | Remove usage (but not strictness) info on the 'IdInfo'
+-- | Floatify the demand in `IdInfo`
+-- But keep /nested/ demands; see Note [Floatifying demand info when floating]
+-- in GHC.Core.Opt.SetLevels
+floatifyDemandInfo :: IdInfo -> Maybe IdInfo
+floatifyDemandInfo info@(IdInfo { demandInfo = dmd })
+  = Just (info {demandInfo = floatifyDmd dmd })
+
+-- | Remove usage (but not strictness) info on the `IdInfo`
 zapUsageInfo :: IdInfo -> Maybe IdInfo
 zapUsageInfo info = Just (info {demandInfo = zapUsageDemand (demandInfo info)})
 

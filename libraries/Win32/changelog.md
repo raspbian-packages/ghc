@@ -1,5 +1,29 @@
 # Changelog for [`Win32` package](http://hackage.haskell.org/package/Win32)
 
+## 2.14.1.0 November 2024
+
+* Add getTempFileName
+* Add WindowsString variant for getEnv etc
+* Implement getEnv and getEnvironment
+
+## 2.14.0.0 January 2023
+
+* Add support for named pipes [#220](https://github.com/haskell/win32/pull/220)
+* Ensure that FilePaths don't contain interior NULs wrt [#218](https://github.com/haskell/win32/pull/218)
+* Add support for GetCommandLineW [#218](https://github.com/haskell/win32/pull/221)
+* Support filepath >= 1.5.0.0 and os-string [#226](https://github.com/haskell/win32/pull/226)
+* Remove unused imports [#225](https://github.com/haskell/win32/pull/225)
+
+## 2.13.4.0 October 2022
+
+* Add support for semaphores with `System.Win32.Semaphore` (See #214).
+* Add function `createFile_NoRetry` (see #208)
+* The type signatures for `loadLibrary` and `loadLibraryEx` now refer to
+  `HMODULE` instead of `HINSTANCE` for consistency with the official Win32
+  API documentation. Note that `HMODULE` and `HINSTANCE` are both type synonyms
+  for the same thing, so this only changes the presentation of these functions'
+  type signatures, not their behavior.
+
 ## 2.13.3.0 July 2022
 
 * Add AFPP support (see #198)

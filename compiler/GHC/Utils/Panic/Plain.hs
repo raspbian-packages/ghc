@@ -5,15 +5,10 @@
 -- type.  It omits the exception constructors that involve
 -- pretty-printing via 'GHC.Utils.Outputable.SDoc'.
 --
--- There are two reasons for this:
---
--- 1. To avoid import cycles / use of boot files. "GHC.Utils.Outputable" has
--- many transitive dependencies. To throw exceptions from these
--- modules, the functions here can be used without introducing import
--- cycles.
---
--- 2. To reduce the number of modules that need to be compiled to
--- object code when loading GHC into GHCi. See #13101
+-- The reason for this is to avoid import cycles / use of boot files.
+-- "GHC.Utils.Outputable" has many transitive dependencies.
+-- To throw exceptions from these modules, the functions here can be used
+-- without introducing import cycles.
 module GHC.Utils.Panic.Plain
   ( PlainGhcException(..)
   , showPlainGhcException
@@ -29,6 +24,8 @@ import GHC.Utils.Constants
 import GHC.Utils.Exception as Exception
 import GHC.Stack
 import GHC.Prelude.Basic
+
+import Control.Monad (when)
 import System.IO.Unsafe
 
 -- | This type is very similar to 'GHC.Utils.Panic.GhcException', but it omits
@@ -150,4 +147,8 @@ massert cond = withFrozenCallStack (assert cond (pure ()))
 
 assertM :: (HasCallStack, Monad m) => m Bool -> m ()
 {-# INLINE assertM #-}
-assertM mcond = withFrozenCallStack (mcond >>= massert)
+assertM mcond
+  | debugIsOn = withFrozenCallStack $ do
+      res <- mcond
+      when (not res) assertPanic'
+  | otherwise = return ()

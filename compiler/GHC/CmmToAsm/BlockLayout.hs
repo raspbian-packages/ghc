@@ -14,6 +14,7 @@ module GHC.CmmToAsm.BlockLayout
 where
 
 import GHC.Prelude hiding (head, init, last, tail)
+import qualified GHC.Prelude as Partial (head, tail)
 
 import GHC.Platform
 
@@ -25,7 +26,6 @@ import GHC.CmmToAsm.Config
 
 import GHC.Cmm
 import GHC.Cmm.BlockId
-import GHC.Cmm.Dataflow.Collections
 import GHC.Cmm.Dataflow.Label
 
 import GHC.Types.Unique.FM
@@ -37,11 +37,9 @@ import GHC.Data.OrdList
 
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
-import GHC.Utils.Panic.Plain
 import GHC.Utils.Misc
 
 import Data.List (sortOn, sortBy, nub)
-import qualified Data.List as Partial (head, tail)
 import Data.List.NonEmpty (nonEmpty)
 import qualified Data.List.NonEmpty as NE
 import Data.Foldable (toList)
@@ -739,10 +737,6 @@ sequenceChain  info weights     blocks@((BasicBlock entry _):_) =
             = [masterChain]
             | (rest,entry) <- breakChainAt entry masterChain
             = [entry,rest]
-#if __GLASGOW_HASKELL__ <= 810
-            | otherwise = pprPanic "Entry point eliminated" $
-                            ppr masterChain
-#endif
 
         blockList
             = assert (noDups [masterChain])

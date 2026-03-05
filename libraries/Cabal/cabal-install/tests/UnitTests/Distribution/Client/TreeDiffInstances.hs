@@ -6,6 +6,7 @@ module UnitTests.Distribution.Client.TreeDiffInstances () where
 import Distribution.Solver.Types.ConstraintSource
 import Distribution.Solver.Types.OptionalStanza
 import Distribution.Solver.Types.PackageConstraint
+import Distribution.Solver.Types.ProjectConfigPath
 import Distribution.Solver.Types.Settings
 
 import Distribution.Client.BuildReports.Types
@@ -17,10 +18,10 @@ import Distribution.Client.IndexUtils.Timestamp
 import Distribution.Client.ProjectConfig.Types
 import Distribution.Client.Targets
 import Distribution.Client.Types
-import Distribution.Client.Types.OverwritePolicy         (OverwritePolicy)
-import Distribution.Client.Types.SourceRepo              (SourceRepositoryPackage)
+import Distribution.Client.Types.OverwritePolicy (OverwritePolicy)
+import Distribution.Client.Types.SourceRepo (SourceRepositoryPackage)
 
-import Distribution.Simple.Compiler                      (PackageDB)
+import Distribution.Simple.Compiler (PackageDB)
 
 import Data.TreeDiff.Class
 import Data.TreeDiff.Instances.Cabal ()
@@ -39,6 +40,7 @@ instance ToExpr AllowOlder
 instance ToExpr BuildReport
 instance ToExpr ClientInstallFlags
 instance ToExpr CombineStrategy
+instance ToExpr ProjectConfigPath
 instance ToExpr ConstraintSource
 instance ToExpr CountConflicts
 instance ToExpr FineGrainedConflicts

@@ -27,12 +27,14 @@ module GHC.Core.Opt.ConstantFold
    ( primOpRules
    , builtinRules
    , caseRules
+   , caseRules2
    )
 where
 
 import GHC.Prelude
 
 import GHC.Platform
+import GHC.Float
 
 import GHC.Types.Id.Make ( unboxedUnitExpr )
 import GHC.Types.Id
@@ -53,9 +55,8 @@ import GHC.Core.Rules.Config
 import GHC.Core.Type
 import GHC.Core.TyCo.Compare( eqType )
 import GHC.Core.TyCon
-   ( tyConDataCons_maybe, isAlgTyCon, isEnumerationTyCon
-   , isNewTyCon, tyConDataCons
-   , tyConFamilySize )
+   ( TyCon, tyConDataCons_maybe, tyConDataCons, tyConFamilySize
+   , isEnumerationTyCon, isValidDTT2TyCon, isNewTyCon )
 import GHC.Core.Map.Expr ( eqCoreExpr )
 
 import GHC.Builtin.PrimOps ( PrimOp(..), tagToEnumKey )
@@ -64,13 +65,15 @@ import GHC.Builtin.Types
 import GHC.Builtin.Types.Prim
 import GHC.Builtin.Names
 
+import GHC.Cmm.MachOp ( FMASign(..) )
+import GHC.Cmm.Type ( Width(..) )
+
 import GHC.Data.FastString
 import GHC.Data.Maybe      ( orElse )
 
 import GHC.Utils.Outputable
 import GHC.Utils.Misc
 import GHC.Utils.Panic
-import GHC.Utils.Panic.Plain
 
 import Control.Applicative ( Alternative(..) )
 import Control.Monad
@@ -100,7 +103,8 @@ That is why these rules are built in here.
 primOpRules ::  Name -> PrimOp -> Maybe CoreRule
 primOpRules nm = \case
    TagToEnumOp -> mkPrimOpRule nm 2 [ tagToEnumRule ]
-   DataToTagOp -> mkPrimOpRule nm 2 [ dataToTagRule ]
+   DataToTagSmallOp -> mkPrimOpRule nm 3 [ dataToTagRule ]
+   DataToTagLargeOp -> mkPrimOpRule nm 3 [ dataToTagRule ]
 
    -- Int8 operations
    Int8AddOp   -> mkPrimOpRule nm 2 [ binaryLit (int8Op2 (+))
@@ -120,7 +124,9 @@ primOpRules nm = \case
    Int8QuotOp  -> mkPrimOpRule nm 2 [ nonZeroLit 1 >> binaryLit (int8Op2 quot)
                                     , leftZero
                                     , rightIdentity oneI8
-                                    , equalArgs $> Lit oneI8 ]
+                                    , equalArgs $> Lit oneI8
+                                    , quotFoldingRules int8Ops
+                                    ]
    Int8RemOp   -> mkPrimOpRule nm 2 [ nonZeroLit 1 >> binaryLit (int8Op2 rem)
                                     , leftZero
                                     , oneLit 1 $> Lit zeroI8
@@ -149,7 +155,9 @@ primOpRules nm = \case
                                     , mulFoldingRules Word8MulOp word8Ops
                                     ]
    Word8QuotOp -> mkPrimOpRule nm 2 [ nonZeroLit 1 >> binaryLit (word8Op2 quot)
-                                    , rightIdentity oneW8 ]
+                                    , rightIdentity oneW8
+                                    , quotFoldingRules word8Ops
+                                    ]
    Word8RemOp  -> mkPrimOpRule nm 2 [ nonZeroLit 1 >> binaryLit (word8Op2 rem)
                                     , leftZero
                                     , oneLit 1 $> Lit zeroW8
@@ -194,7 +202,9 @@ primOpRules nm = \case
    Int16QuotOp -> mkPrimOpRule nm 2 [ nonZeroLit 1 >> binaryLit (int16Op2 quot)
                                     , leftZero
                                     , rightIdentity oneI16
-                                    , equalArgs $> Lit oneI16 ]
+                                    , equalArgs $> Lit oneI16
+                                    , quotFoldingRules int16Ops
+                                    ]
    Int16RemOp  -> mkPrimOpRule nm 2 [ nonZeroLit 1 >> binaryLit (int16Op2 rem)
                                     , leftZero
                                     , oneLit 1 $> Lit zeroI16
@@ -223,7 +233,9 @@ primOpRules nm = \case
                                     , mulFoldingRules Word16MulOp word16Ops
                                     ]
    Word16QuotOp-> mkPrimOpRule nm 2 [ nonZeroLit 1 >> binaryLit (word16Op2 quot)
-                                    , rightIdentity oneW16 ]
+                                    , rightIdentity oneW16
+                                    , quotFoldingRules word16Ops
+                                    ]
    Word16RemOp -> mkPrimOpRule nm 2 [ nonZeroLit 1 >> binaryLit (word16Op2 rem)
                                     , leftZero
                                     , oneLit 1 $> Lit zeroW16
@@ -268,7 +280,9 @@ primOpRules nm = \case
    Int32QuotOp -> mkPrimOpRule nm 2 [ nonZeroLit 1 >> binaryLit (int32Op2 quot)
                                     , leftZero
                                     , rightIdentity oneI32
-                                    , equalArgs $> Lit oneI32 ]
+                                    , equalArgs $> Lit oneI32
+                                    , quotFoldingRules int32Ops
+                                    ]
    Int32RemOp  -> mkPrimOpRule nm 2 [ nonZeroLit 1 >> binaryLit (int32Op2 rem)
                                     , leftZero
                                     , oneLit 1 $> Lit zeroI32
@@ -297,7 +311,9 @@ primOpRules nm = \case
                                     , mulFoldingRules Word32MulOp word32Ops
                                     ]
    Word32QuotOp-> mkPrimOpRule nm 2 [ nonZeroLit 1 >> binaryLit (word32Op2 quot)
-                                    , rightIdentity oneW32 ]
+                                    , rightIdentity oneW32
+                                    , quotFoldingRules word32Ops
+                                    ]
    Word32RemOp -> mkPrimOpRule nm 2 [ nonZeroLit 1 >> binaryLit (word32Op2 rem)
                                     , leftZero
                                     , oneLit 1 $> Lit zeroW32
@@ -341,7 +357,9 @@ primOpRules nm = \case
    Int64QuotOp -> mkPrimOpRule nm 2 [ nonZeroLit 1 >> binaryLit (int64Op2 quot)
                                     , leftZero
                                     , rightIdentity oneI64
-                                    , equalArgs $> Lit oneI64 ]
+                                    , equalArgs $> Lit oneI64
+                                    , quotFoldingRules int64Ops
+                                    ]
    Int64RemOp  -> mkPrimOpRule nm 2 [ nonZeroLit 1 >> binaryLit (int64Op2 rem)
                                     , leftZero
                                     , oneLit 1 $> Lit zeroI64
@@ -370,7 +388,9 @@ primOpRules nm = \case
                                     , mulFoldingRules Word64MulOp word64Ops
                                     ]
    Word64QuotOp-> mkPrimOpRule nm 2 [ nonZeroLit 1 >> binaryLit (word64Op2 quot)
-                                    , rightIdentity oneW64 ]
+                                    , rightIdentity oneW64
+                                    , quotFoldingRules word64Ops
+                                    ]
    Word64RemOp -> mkPrimOpRule nm 2 [ nonZeroLit 1 >> binaryLit (word64Op2 rem)
                                     , leftZero
                                     , oneLit 1 $> Lit zeroW64
@@ -451,7 +471,9 @@ primOpRules nm = \case
    IntQuotOp   -> mkPrimOpRule nm 2 [ nonZeroLit 1 >> binaryLit (intOp2 quot)
                                     , leftZero
                                     , rightIdentityPlatform onei
-                                    , equalArgs >> retLit onei ]
+                                    , equalArgs >> retLit onei
+                                    , quotFoldingRules intOps
+                                    ]
    IntRemOp    -> mkPrimOpRule nm 2 [ nonZeroLit 1 >> binaryLit (intOp2 rem)
                                     , leftZero
                                     , oneLit 1 >> retLit zeroi
@@ -503,7 +525,9 @@ primOpRules nm = \case
                                     , mulFoldingRules WordMulOp wordOps
                                     ]
    WordQuotOp  -> mkPrimOpRule nm 2 [ nonZeroLit 1 >> binaryLit (wordOp2 quot)
-                                    , rightIdentityPlatform onew ]
+                                    , rightIdentityPlatform onew
+                                    , quotFoldingRules wordOps
+                                    ]
    WordRemOp   -> mkPrimOpRule nm 2 [ nonZeroLit 1 >> binaryLit (wordOp2 rem)
                                     , leftZero
                                     , oneLit 1 >> retLit zerow
@@ -634,6 +658,38 @@ primOpRules nm = \case
                                        , removeOp32
                                        , narrowSubsumesAnd WordAndOp Narrow32WordOp 32 ]
 
+   CastWord64ToDoubleOp -> mkPrimOpRule nm 1
+      [ unaryLit $ \_env -> \case
+         LitNumber _ n
+             | v <- castWord64ToDouble (fromInteger n)
+             -- we can't represent those float literals in Core until #18897 is fixed
+             , not (isNaN v || isInfinite v || isNegativeZero v)
+             -> Just (mkDoubleLitDouble v)
+         _   -> Nothing
+      ]
+
+   CastWord32ToFloatOp -> mkPrimOpRule nm 1
+      [ unaryLit $ \_env -> \case
+          LitNumber _ n
+              | v <- castWord32ToFloat (fromInteger n)
+              -- we can't represent those float literals in Core until #18897 is fixed
+              , not (isNaN v || isInfinite v || isNegativeZero v)
+              -> Just (mkFloatLitFloat v)
+          _   -> Nothing
+      ]
+
+   CastDoubleToWord64Op -> mkPrimOpRule nm 1
+      [ unaryLit $ \_env -> \case
+         LitDouble n -> Just (mkWord64LitWord64 (castDoubleToWord64 (fromRational n)))
+         _           -> Nothing
+      ]
+
+   CastFloatToWord32Op -> mkPrimOpRule nm 1
+      [ unaryLit $ \_env -> \case
+          LitFloat n -> Just (mkWord32LitWord32 (castFloatToWord32 (fromRational n)))
+          _          -> Nothing
+      ]
+
    OrdOp          -> mkPrimOpRule nm 1 [ liftLit charToIntLit
                                        , semiInversePrimOp ChrOp ]
    ChrOp          -> mkPrimOpRule nm 1 [ do [Lit lit] <- getArgs
@@ -656,6 +712,11 @@ primOpRules nm = \case
    FloatMulOp        -> mkPrimOpRule nm 2 [ binaryLit (floatOp2 (*))
                                           , identity onef
                                           , strengthReduction twof FloatAddOp  ]
+   FloatFMAdd        -> mkPrimOpRule nm 3 (fmaRules FMAdd  W32)
+   FloatFMSub        -> mkPrimOpRule nm 3 (fmaRules FMSub  W32)
+   FloatFNMAdd       -> mkPrimOpRule nm 3 (fmaRules FNMAdd W32)
+   FloatFNMSub       -> mkPrimOpRule nm 3 (fmaRules FNMSub W32)
+
              -- zeroElem zerof doesn't hold because of NaN
    FloatDivOp        -> mkPrimOpRule nm 2 [ guardFloatDiv >> binaryLit (floatOp2 (/))
                                           , rightIdentity onef ]
@@ -671,6 +732,10 @@ primOpRules nm = \case
    DoubleMulOp          -> mkPrimOpRule nm 2 [ binaryLit (doubleOp2 (*))
                                              , identity oned
                                              , strengthReduction twod DoubleAddOp  ]
+   DoubleFMAdd          -> mkPrimOpRule nm 3 (fmaRules FMAdd  W64)
+   DoubleFMSub          -> mkPrimOpRule nm 3 (fmaRules FMSub  W64)
+   DoubleFNMAdd         -> mkPrimOpRule nm 3 (fmaRules FNMAdd W64)
+   DoubleFNMSub         -> mkPrimOpRule nm 3 (fmaRules FNMSub W64)
               -- zeroElem zerod doesn't hold because of NaN
    DoubleDivOp          -> mkPrimOpRule nm 2 [ guardDoubleDiv >> binaryLit (doubleOp2 (/))
                                              , rightIdentity oned ]
@@ -1066,7 +1131,7 @@ shiftRule lit_num_ty shift_op = do
     _ | shift_len == 0 -> pure e1
 
       -- See Note [Guarding against silly shifts]
-    _ | shift_len < 0 || shift_len > bit_size
+    _ | shift_len < 0 || shift_len >= bit_size
       -> pure $ Lit $ mkLitNumberWrap platform lit_num_ty 0
            -- Be sure to use lit_num_ty here, so we get a correctly typed zero.
            -- See #18589
@@ -1116,6 +1181,150 @@ doubleDecodeOp env (LitDouble ((decodeFloat . fromRational @Double) -> (m, e)))
     platform = roPlatform env
 doubleDecodeOp _   _
   = Nothing
+
+--------------------------
+
+-- | Constant folding rules for fused multiply-add operations.
+fmaRules :: FMASign -> Width -> [RuleM CoreExpr]
+fmaRules signs width =
+     [ fmaLit signs width
+     , fmaZero_z signs width
+     , fmaOne signs width ]
+
+-- | Compute @a * b + c@ when @a@, @b@, @c@ are all literals.
+fmaLit :: FMASign -> Width -> RuleM CoreExpr
+fmaLit signs width = do
+  env <- getRuleOpts
+  [Lit l1, Lit l2, Lit l3] <- getArgs
+  liftMaybe $
+    op env
+      (convFloating env l1)
+      (convFloating env l2)
+      (convFloating env l3)
+
+  where
+    op env l1 l2 l3 =
+      case width of
+        W32
+          | LitFloat x <- l1
+          , LitFloat y <- l2
+          , LitFloat z <- l3
+          -> Just $ mkFloatVal env $
+            case signs of
+              FMAdd  -> x * y + z
+              FMSub  -> x * y - z
+              FNMAdd -> negate ( x * y ) + z
+              FNMSub -> negate ( x * y ) - z
+        W64
+          | LitDouble x <- l1
+          , LitDouble y <- l2
+          , LitDouble z <- l3
+          -> Just $ mkDoubleVal env $
+            case signs of
+              FMAdd  -> x * y + z
+              FMSub  -> x * y - z
+              FNMAdd -> negate ( x * y ) + z
+              FNMSub -> negate ( x * y ) - z
+        _ -> Nothing
+
+-- | @x * y + 0 = x * y@.
+fmaZero_z :: FMASign -> Width -> RuleM CoreExpr
+fmaZero_z signs width = do
+  [x, y, Lit z] <- getArgs
+  let
+    -- TODO: we should additionally check the sign of z.
+    -- FMAdd, FNMAdd: should be -0.0.
+    -- FMSub, FNMSub: should be +0.0.
+    ok =
+      case width of
+        W32
+          | LitFloat 0 <- z
+          -> True
+        W64
+          | LitDouble 0 <- z
+          -> True
+        _ -> False
+    neg = case width of
+      W32 ->  FloatNegOp
+      W64 -> DoubleNegOp
+      _   -> panic "fmaZero_xy: not Float# or Double#"
+    mul = case width of
+      W32 ->  FloatMulOp
+      W64 -> DoubleMulOp
+      _   -> panic "fmaZero_z: not Float# or Double#"
+  if ok
+  then return $ case signs of
+    FMAdd  -> Var (primOpId mul) `App` x `App` y
+    FMSub  -> Var (primOpId mul) `App` x `App` y
+    FNMAdd -> Var (primOpId neg) `App` (Var (primOpId mul) `App` x `App` y)
+    FNMSub -> Var (primOpId neg) `App` (Var (primOpId mul) `App` x `App` y)
+  else mzero
+
+-- | @±1 * y + z ==> z ± y@ and @x * ±1 + z ==> z ± x@.
+fmaOne :: FMASign -> Width -> RuleM CoreExpr
+fmaOne signs width = do
+  [x, y, z] <- getArgs
+  let
+    posNegOne_maybe :: Rational -> Maybe Bool
+    posNegOne_maybe i
+      | i == 1
+      = Just False
+      | i == -1
+      = Just True
+      | otherwise
+      = Nothing
+    ok =
+      case width of
+        W32
+          | Lit (LitFloat i) <- x
+          , Just sgn <- posNegOne_maybe i
+          -> Just (sgn, y)
+          | Lit (LitFloat i) <- y
+          , Just sgn <- posNegOne_maybe i
+          -> Just (sgn, x)
+        W64
+          | Lit (LitDouble i) <- x
+          , Just sgn <- posNegOne_maybe i
+          -> Just (sgn, y)
+          | Lit (LitDouble i) <- y
+          , Just sgn <- posNegOne_maybe i
+          -> Just (sgn, x)
+        _ -> Nothing
+    neg = case width of
+      W32 ->  FloatNegOp
+      W64 -> DoubleNegOp
+      _   -> panic "fmaOne: not Float# or Double#"
+    add = case width of
+      W32 ->  FloatAddOp
+      W64 -> DoubleAddOp
+      _   -> panic "fmaOne: not Float# or Double#"
+    sub = case width of
+      W32 ->  FloatSubOp
+      W64 -> DoubleSubOp
+      _   -> panic "fmaOne: not Float# or Double#"
+  case ok of
+    Nothing  -> mzero
+    Just (sgn, t) -> return $
+      if -- t + z
+         |  ( signs ==  FMAdd && sgn == False )
+         || ( signs == FNMAdd && sgn == True  )
+         -> Var (primOpId add) `App` t `App` z
+         -- - t + z
+         |  signs ==  FMAdd
+         || signs == FNMAdd
+         -> Var (primOpId sub) `App` z `App` t
+         -- t - z
+         |  ( signs ==  FMSub && sgn == False )
+         || ( signs == FNMSub && sgn == True  )
+         -> Var (primOpId sub) `App` t `App` z
+         -- - t - z
+         |  signs ==  FMSub
+         || signs == FNMSub
+         -> Var (primOpId neg) `App` (Var (primOpId add) `App` t `App` z)
+         | otherwise
+         -> pprPanic "fmaOne: non-exhaustive pattern match" $
+              vcat [ text "signs:" <+> text (show signs)
+                   , text "sign:" <+> ppr sgn ]
 
 --------------------------
 {- Note [The litEq rule: converting equality to case]
@@ -1404,15 +1613,15 @@ as follows:
     let x = I# (error "invalid shift")
     in ...
 
-This was originally done in the fix to #16449 but this breaks the let-can-float
-invariant (see Note [Core let-can-float invariant] in GHC.Core) as noted in #16742.
-For the reasons discussed in Note [Checking versus non-checking
-primops] (in the PrimOp module) there is no safe way to rewrite the argument of I#
-such that it bottoms.
+This was originally done in the fix to #16449 but this breaks the
+let-can-float invariant (see Note [Core let-can-float invariant] in
+GHC.Core) as noted in #16742.  For the reasons discussed under
+"NoEffect" in Note [Classifying primop effects] (in GHC.Builtin.PrimOps)
+there is no safe way to rewrite the argument of I# such that it bottoms.
 
-Consequently we instead take advantage of the fact that large shifts are
-undefined behavior (see associated documentation in primops.txt.pp) and
-transform the invalid shift into an "obviously incorrect" value.
+Consequently we instead take advantage of the fact that the result of a
+large shift is unspecified (see associated documentation in primops.txt.pp)
+and transform the invalid shift into an "obviously incorrect" value.
 
 There are two cases:
 
@@ -1810,12 +2019,14 @@ tagToEnumRule = do
 
 ------------------------------
 dataToTagRule :: RuleM CoreExpr
--- See Note [dataToTag# magic].
+-- Used for both dataToTagSmall# and dataToTagLarge#.
+-- See Note [DataToTag overview] in GHC.Tc.Instance.Class,
+-- particularly wrinkle DTW5.
 dataToTagRule = a `mplus` b
   where
     -- dataToTag (tagToEnum x)   ==>   x
     a = do
-      [Type ty1, Var tag_to_enum `App` Type ty2 `App` tag] <- getArgs
+      [Type _lev, Type ty1, Var tag_to_enum `App` Type ty2 `App` tag] <- getArgs
       guard $ tag_to_enum `hasKey` tagToEnumKey
       guard $ ty1 `eqType` ty2
       return tag
@@ -1826,41 +2037,12 @@ dataToTagRule = a `mplus` b
     -- where x's unfolding is a constructor application
     b = do
       platform <- getPlatform
-      [_, val_arg] <- getArgs
+      [_lev, _ty, val_arg] <- getArgs
       in_scope <- getInScopeEnv
       (_,floats, dc,_,_) <- liftMaybe $ exprIsConApp_maybe in_scope val_arg
       massert (not (isNewTyCon (dataConTyCon dc)))
       return $ wrapFloats floats (mkIntVal platform (toInteger (dataConTagZ dc)))
 
-{- Note [dataToTag# magic]
-~~~~~~~~~~~~~~~~~~~~~~~~~~
-The primop dataToTag# is unusual because it evaluates its argument.
-Only `SeqOp` shares that property.  (Other primops do not do anything
-as fancy as argument evaluation.)  The special handling for dataToTag#
-is:
-
-* GHC.Core.Utils.exprOkForSpeculation has a special case for DataToTagOp,
-  (actually in app_ok).  Most primops with lifted arguments do not
-  evaluate those arguments, but DataToTagOp and SeqOp are two
-  exceptions.  We say that they are /never/ ok-for-speculation,
-  regardless of the evaluated-ness of their argument.
-  See GHC.Core.Utils Note [exprOkForSpeculation and SeqOp/DataToTagOp]
-
-* There is a special case for DataToTagOp in GHC.StgToCmm.Expr.cgExpr,
-  that evaluates its argument and then extracts the tag from
-  the returned value.
-
-* An application like (dataToTag# (Just x)) is optimised by
-  dataToTagRule in GHC.Core.Opt.ConstantFold.
-
-* A case expression like
-     case (dataToTag# e) of <alts>
-  gets transformed t
-     case e of <transformed alts>
-  by GHC.Core.Opt.ConstantFold.caseRules; see Note [caseRules for dataToTag]
-
-See #15696 for a long saga.
--}
 
 {- *********************************************************************
 *                                                                      *
@@ -1911,7 +2093,7 @@ Things to note
 * Why do we need a primop at all?  That is, instead of
       case seq# x s of (# x, s #) -> blah
   why not instead say this?
-      case x of { DEFAULT -> blah)
+      case x of { DEFAULT -> blah }
 
   Reason (see #5129): if we saw
     catch# (\s -> case x of { DEFAULT -> raiseIO# exn s }) handler
@@ -1936,12 +2118,12 @@ Implementing seq#.  The compiler has magic for SeqOp in
 
 - GHC.StgToCmm.Expr.cgExpr, and cgCase: special case for seq#
 
-- GHC.Core.Utils.exprOkForSpeculation;
-  see Note [exprOkForSpeculation and SeqOp/DataToTagOp] in GHC.Core.Utils
-
 - Simplify.addEvals records evaluated-ness for the result; see
   Note [Adding evaluatedness info to pattern-bound variables]
-  in GHC.Core.Opt.Simplify
+  in GHC.Core.Opt.Simplify.Iteration
+
+- Likewise, GHC.Stg.InferTags.inferTagExpr knows that seq# returns a
+  properly-tagged pointer inside of its unboxed-tuple result.
 -}
 
 seqRule :: RuleM CoreExpr
@@ -2478,6 +2660,10 @@ The moving parts are simple:
      inline f_ty (f a b c) = <f's unfolding> a b c
   (if f has an unfolding, EVEN if it's a loop breaker)
 
+  Additionally the rule looks through ticks/casts as well (#24808):
+      inline f_ty (f a b c |> co) = <f's unfolding> a b c |> co
+      inline f_ty <tick> ( f a b c ) = <tick> <f's unfolding> a b c
+
   It's important to allow the argument to 'inline' to have args itself
   (a) because its more forgiving to allow the programmer to write
       either  inline f a b c
@@ -2490,11 +2676,17 @@ The moving parts are simple:
 -}
 
 match_inline :: [Expr CoreBndr] -> Maybe (Expr CoreBndr)
-match_inline (Type _ : e : _)
-  | (Var f, args1) <- collectArgs e,
-    Just unf <- maybeUnfoldingTemplate (realIdUnfolding f)
-             -- Ignore the IdUnfoldingFun here!
-  = Just (mkApps unf args1)
+match_inline (Type _ : e : _) = go e
+  -- Maybe Monad ahead:
+  where
+    go (Var f)      = -- Ignore the IdUnfoldingFun here!
+                      (maybeUnfoldingTemplate (realIdUnfolding f))
+    go (App f a)    = do { f' <- go f; pure $ App f' a }
+    -- inline (f |> co)
+    go (Cast e co)  = do { app <- go e; pure (Cast app co) }
+    -- inline (<tick> f)
+    go (Tick t e)   = do { app <- go e; pure (Tick t app) }
+    go _            = Nothing
 
 match_inline _ = Nothing
 
@@ -2651,6 +2843,14 @@ orFoldingRules num_ops = do
       -- commutativity for `or` is handled here
       (orFoldingRules' platform arg1 arg2 num_ops
        <|> orFoldingRules' platform arg2 arg1 num_ops)
+
+quotFoldingRules :: NumOps -> RuleM CoreExpr
+quotFoldingRules num_ops = do
+   env <- getRuleOpts
+   guard (roNumConstantFolding env)
+   [arg1,arg2] <- getArgs
+   platform <- getPlatform
+   liftMaybe (quotFoldingRules' platform arg1 arg2 num_ops)
 
 addFoldingRules' :: Platform -> CoreExpr -> CoreExpr -> NumOps -> Maybe CoreExpr
 addFoldingRules' platform arg1 arg2 num_ops = case (arg1, arg2) of
@@ -2942,6 +3142,29 @@ orFoldingRules' platform arg1 arg2 num_ops = case (arg1, arg2) of
       mkL = Lit . mkNumLiteral platform num_ops
       or x y = BinOpApp x (fromJust (numOr num_ops)) y
 
+quotFoldingRules' :: Platform -> CoreExpr -> CoreExpr -> NumOps -> Maybe CoreExpr
+quotFoldingRules' platform arg1 arg2 num_ops = case (arg1, arg2) of
+
+  -- (x / l1) / l2
+  -- l1 and l2 /= 0
+  -- l1*l2 doesn't overflow
+  -- ==> x / (l1 * l2)
+  (is_div num_ops -> Just (x, L l1), L l2)
+    | l1 /= 0
+    , l2 /= 0
+    -- check that the result of the multiplication is in range
+    , Just l <- mkNumLiteralMaybe platform num_ops (l1 * l2)
+    -> Just (div x (Lit l))
+      -- NB: we could directly return 0 or (-1) in case of overflow,
+      -- but we would need to know
+      --  (1) if we're dealing with a quot or a div operation
+      --  (2) if it's an underflow or an overflow.
+      -- Left as future work for now.
+
+  _ -> Nothing
+  where
+    div x y = BinOpApp x (fromJust (numDiv num_ops)) y
+
 is_binop :: PrimOp -> CoreExpr -> Maybe (Arg CoreBndr, Arg CoreBndr)
 is_binop op e = case e of
  BinOpApp x op' y | op == op' -> Just (x,y)
@@ -2952,12 +3175,13 @@ is_op op e = case e of
  App (OpVal op') x | op == op' -> Just x
  _                             -> Nothing
 
-is_add, is_sub, is_mul, is_and, is_or :: NumOps -> CoreExpr -> Maybe (Arg CoreBndr, Arg CoreBndr)
+is_add, is_sub, is_mul, is_and, is_or, is_div :: NumOps -> CoreExpr -> Maybe (Arg CoreBndr, Arg CoreBndr)
 is_add num_ops e = is_binop (numAdd num_ops) e
 is_sub num_ops e = is_binop (numSub num_ops) e
 is_mul num_ops e = is_binop (numMul num_ops) e
 is_and num_ops e = numAnd num_ops >>= \op -> is_binop op e
 is_or  num_ops e = numOr  num_ops >>= \op -> is_binop op e
+is_div num_ops e = numDiv num_ops >>= \op -> is_binop op e
 
 is_neg :: NumOps -> CoreExpr -> Maybe (Arg CoreBndr)
 is_neg num_ops e = numNeg num_ops >>= \op -> is_op op e
@@ -3006,6 +3230,7 @@ data NumOps = NumOps
    { numAdd     :: !PrimOp         -- ^ Add two numbers
    , numSub     :: !PrimOp         -- ^ Sub two numbers
    , numMul     :: !PrimOp         -- ^ Multiply two numbers
+   , numDiv     :: !(Maybe PrimOp) -- ^ Divide two numbers
    , numAnd     :: !(Maybe PrimOp) -- ^ And two numbers
    , numOr      :: !(Maybe PrimOp) -- ^ Or two numbers
    , numNeg     :: !(Maybe PrimOp) -- ^ Negate a number
@@ -3016,15 +3241,20 @@ data NumOps = NumOps
 mkNumLiteral :: Platform -> NumOps -> Integer -> Literal
 mkNumLiteral platform ops i = mkLitNumberWrap platform (numLitType ops) i
 
+-- | Create a numeric literal if it is in range
+mkNumLiteralMaybe :: Platform -> NumOps -> Integer -> Maybe Literal
+mkNumLiteralMaybe platform ops i = mkLitNumberMaybe platform (numLitType ops) i
+
 int8Ops :: NumOps
 int8Ops = NumOps
    { numAdd     = Int8AddOp
    , numSub     = Int8SubOp
    , numMul     = Int8MulOp
-   , numLitType = LitNumInt8
+   , numDiv     = Just Int8QuotOp
    , numAnd     = Nothing
    , numOr      = Nothing
    , numNeg     = Just Int8NegOp
+   , numLitType = LitNumInt8
    }
 
 word8Ops :: NumOps
@@ -3032,6 +3262,7 @@ word8Ops = NumOps
    { numAdd     = Word8AddOp
    , numSub     = Word8SubOp
    , numMul     = Word8MulOp
+   , numDiv     = Just Word8QuotOp
    , numAnd     = Just Word8AndOp
    , numOr      = Just Word8OrOp
    , numNeg     = Nothing
@@ -3043,10 +3274,11 @@ int16Ops = NumOps
    { numAdd     = Int16AddOp
    , numSub     = Int16SubOp
    , numMul     = Int16MulOp
-   , numLitType = LitNumInt16
+   , numDiv     = Just Int16QuotOp
    , numAnd     = Nothing
    , numOr      = Nothing
    , numNeg     = Just Int16NegOp
+   , numLitType = LitNumInt16
    }
 
 word16Ops :: NumOps
@@ -3054,6 +3286,7 @@ word16Ops = NumOps
    { numAdd     = Word16AddOp
    , numSub     = Word16SubOp
    , numMul     = Word16MulOp
+   , numDiv     = Just Word16QuotOp
    , numAnd     = Just Word16AndOp
    , numOr      = Just Word16OrOp
    , numNeg     = Nothing
@@ -3065,10 +3298,11 @@ int32Ops = NumOps
    { numAdd     = Int32AddOp
    , numSub     = Int32SubOp
    , numMul     = Int32MulOp
-   , numLitType = LitNumInt32
+   , numDiv     = Just Int32QuotOp
    , numAnd     = Nothing
    , numOr      = Nothing
    , numNeg     = Just Int32NegOp
+   , numLitType = LitNumInt32
    }
 
 word32Ops :: NumOps
@@ -3076,6 +3310,7 @@ word32Ops = NumOps
    { numAdd     = Word32AddOp
    , numSub     = Word32SubOp
    , numMul     = Word32MulOp
+   , numDiv     = Just Word32QuotOp
    , numAnd     = Just Word32AndOp
    , numOr      = Just Word32OrOp
    , numNeg     = Nothing
@@ -3087,10 +3322,11 @@ int64Ops = NumOps
    { numAdd     = Int64AddOp
    , numSub     = Int64SubOp
    , numMul     = Int64MulOp
-   , numLitType = LitNumInt64
+   , numDiv     = Just Int64QuotOp
    , numAnd     = Nothing
    , numOr      = Nothing
    , numNeg     = Just Int64NegOp
+   , numLitType = LitNumInt64
    }
 
 word64Ops :: NumOps
@@ -3098,6 +3334,7 @@ word64Ops = NumOps
    { numAdd     = Word64AddOp
    , numSub     = Word64SubOp
    , numMul     = Word64MulOp
+   , numDiv     = Just Word64QuotOp
    , numAnd     = Just Word64AndOp
    , numOr      = Just Word64OrOp
    , numNeg     = Nothing
@@ -3109,6 +3346,7 @@ intOps = NumOps
    { numAdd     = IntAddOp
    , numSub     = IntSubOp
    , numMul     = IntMulOp
+   , numDiv     = Just IntQuotOp
    , numAnd     = Just IntAndOp
    , numOr      = Just IntOrOp
    , numNeg     = Just IntNegOp
@@ -3120,6 +3358,7 @@ wordOps = NumOps
    { numAdd     = WordAddOp
    , numSub     = WordSubOp
    , numMul     = WordMulOp
+   , numDiv     = Just WordQuotOp
    , numAnd     = Just WordAndOp
    , numOr      = Just WordOrOp
    , numNeg     = Nothing
@@ -3180,14 +3419,79 @@ caseRules platform (App (App (Var f) type_arg) v)
            , \v -> (App (App (Var f) type_arg) (Var v)))
 
 -- See Note [caseRules for dataToTag]
-caseRules _ (App (App (Var f) (Type ty)) v)       -- dataToTag x
-  | Just DataToTagOp <- isPrimOpId_maybe f
-  , Just (tc, _) <- tcSplitTyConApp_maybe ty
-  , isAlgTyCon tc
-  = Just (v, tx_con_dtt ty
-           , \v -> App (App (Var f) (Type ty)) (Var v))
+caseRules _ (Var f `App` Type lev `App` Type ty `App` v) -- dataToTag x
+  | Just op <- isPrimOpId_maybe f
+  , op == DataToTagSmallOp || op == DataToTagLargeOp
+  = case splitTyConApp_maybe ty of
+      Just (tc, _) | isValidDTT2TyCon tc
+        -> Just (v, tx_con_dtt tc
+                , \v' -> Var f `App` Type lev `App` Type ty `App` Var v')
+      _ -> pprTraceUserWarning warnMsg Nothing
+  where
+    warnMsg = vcat $ map text
+      [ "Found dataToTag primop applied to a non-ADT type. This could"
+      , "be a future bug in GHC, or it may be caused by an unsupported"
+      , "use of the ghc-internal primops dataToTagSmall# and dataToTagLarge#."
+      , "In either case, the GHC developers would like to know about it!"
+      , "Please report this as a GHC bug:  http://www.haskell.org/ghc/reportabug"
+      ]
 
 caseRules _ _ = Nothing
+
+
+-- | Case rules
+--
+-- It's important that occurrence info are present, hence the use of In* types.
+caseRules2
+   :: InExpr  -- ^ Scutinee
+   -> InId    -- ^ Case-binder
+   -> [InAlt] -- ^ Alternatives in standard (increasing) order
+   -> Maybe (InExpr, InId, [InAlt])
+caseRules2 scrut bndr alts
+
+  -- case quotRem# x y of
+  --    (# q, _ #) -> body
+  -- ====>
+  --  case quot# x y of
+  --    q -> body
+  --
+  -- case quotRem# x y of
+  --    (# _, r #) -> body
+  -- ====>
+  --  case rem# x y of
+  --    r -> body
+  | BinOpApp x op y <- scrut
+  , Just (quot,rem) <- is_any_quot_rem op
+  , [Alt (DataAlt _) [q,r] body] <- alts
+  , isDeadBinder bndr
+  , dead_q <- isDeadBinder q
+  , dead_r <- isDeadBinder r
+  , dead_q || dead_r
+  = if
+      | dead_q    -> Just $ (BinOpApp x rem  y, r, [Alt DEFAULT [] body])
+      | dead_r    -> Just $ (BinOpApp x quot y, q, [Alt DEFAULT [] body])
+      | otherwise -> Nothing
+
+  | otherwise
+  = Nothing
+
+
+-- | If the given primop is a quotRem, return the corresponding (quot,rem).
+is_any_quot_rem :: PrimOp -> Maybe (PrimOp, PrimOp)
+is_any_quot_rem = \case
+  IntQuotRemOp    -> Just (IntQuotOp ,  IntRemOp)
+  Int8QuotRemOp   -> Just (Int8QuotOp,  Int8RemOp)
+  Int16QuotRemOp  -> Just (Int16QuotOp, Int16RemOp)
+  Int32QuotRemOp  -> Just (Int32QuotOp, Int32RemOp)
+  -- Int64QuotRemOp doesn't exist (yet)
+
+  WordQuotRemOp   -> Just (WordQuotOp,   WordRemOp)
+  Word8QuotRemOp  -> Just (Word8QuotOp,  Word8RemOp)
+  Word16QuotRemOp -> Just (Word16QuotOp, Word16RemOp)
+  Word32QuotRemOp -> Just (Word32QuotOp, Word32RemOp)
+  -- Word64QuotRemOp doesn't exist (yet)
+
+  _ -> Nothing
 
 
 tx_lit_con :: Platform -> (Integer -> Integer) -> AltCon -> Maybe AltCon
@@ -3238,9 +3542,9 @@ tx_con_tte _        alt@(LitAlt {}) = pprPanic "caseRules" (ppr alt)
 tx_con_tte platform (DataAlt dc)  -- See Note [caseRules for tagToEnum]
   = Just $ LitAlt $ mkLitInt platform $ toInteger $ dataConTagZ dc
 
-tx_con_dtt :: Type -> AltCon -> Maybe AltCon
+tx_con_dtt :: TyCon -> AltCon -> Maybe AltCon
 tx_con_dtt _  DEFAULT = Just DEFAULT
-tx_con_dtt ty (LitAlt (LitNumber LitNumInt i))
+tx_con_dtt tc (LitAlt (LitNumber LitNumInt i))
    | tag >= 0
    , tag < n_data_cons
    = Just (DataAlt (data_cons !! tag))   -- tag is zero-indexed, as is (!!)
@@ -3248,17 +3552,16 @@ tx_con_dtt ty (LitAlt (LitNumber LitNumInt i))
    = Nothing
    where
      tag         = fromInteger i :: ConTagZ
-     tc          = tyConAppTyCon ty
      n_data_cons = tyConFamilySize tc
      data_cons   = tyConDataCons tc
 
-tx_con_dtt _ alt = pprPanic "caseRules" (ppr alt)
+tx_con_dtt _ alt = pprPanic "caseRules/dataToTag: bad alt" (ppr alt)
 
 
 {- Note [caseRules for tagToEnum]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 We want to transform
-   case tagToEnum x of
+   case tagToEnum# x of
      False -> e1
      True  -> e2
 into
@@ -3266,13 +3569,13 @@ into
      0# -> e1
      1# -> e2
 
-This rule eliminates a lot of boilerplate. For
+See #8317.   This rule eliminates a lot of boilerplate. For
   if (x>y) then e2 else e1
 we generate
-  case tagToEnum (x ># y) of
+  case tagToEnum# (x ># y) of
     False -> e1
     True  -> e2
-and it is nice to then get rid of the tagToEnum.
+and it is nice to then get rid of the tagToEnum#.
 
 Beware (#14768): avoid the temptation to map constructor 0 to
 DEFAULT, in the hope of getting this
@@ -3290,15 +3593,16 @@ We don't want to get this!
       DEFAULT -> e1
       DEFAULT -> e2
 
-Instead, we deal with turning one branch into DEFAULT in GHC.Core.Opt.Simplify.Utils
-(add_default in mkCase3).
+Instead, when possible, we turn one branch into DEFAULT in
+GHC.Core.Opt.Simplify.Utils.mkCase2; see Note [Literal cases]
+in that module.
 
 Note [caseRules for dataToTag]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-See also Note [dataToTag# magic].
+See also Note [DataToTag overview] in GHC.Tc.Instance.Class.
 
 We want to transform
-  case dataToTag x of
+  case dataToTagSmall# x of
     DEFAULT -> e1
     1# -> e2
 into
@@ -3306,14 +3610,23 @@ into
     DEFAULT -> e1
     (:) _ _ -> e2
 
-Note the need for some wildcard binders in
-the 'cons' case.
+(Note the need for some wildcard binders in the 'cons' case.)
 
-For the time, we only apply this transformation when the type of `x` is a type
-headed by a normal tycon. In particular, we do not apply this in the case of a
-data family tycon, since that would require carefully applying coercion(s)
-between the data family and the data family instance's representation type,
-which caseRules isn't currently engineered to handle (#14680).
+This transformation often enables further optimisation via
+case-flattening and case-of-known-constructor and can be very
+important for code using derived Eq instances.
+
+We can apply this transformation only when we can easily get the
+constructors from the type at which dataToTagSmall# is used.  And we
+cannot apply this transformation at "type data"-related types without
+breaking invariant I1 from Note [Type data declarations] in
+GHC.Rename.Module.  That leaves exactly the types satisfying condition
+DTT2 from Note [DataToTag overview] in GHC.Tc.Instance.Class.
+
+All of the above applies identically for `dataToTagLarge#`.  And
+thanks to wrinkle DTW5, there is no need to worry about large-tag
+arguments for `dataToTagSmall#`; those cause undefined behavior anyway.
+
 
 Note [Unreachable caseRules alternatives]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

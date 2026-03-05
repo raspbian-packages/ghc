@@ -43,10 +43,12 @@ module GHC.Core.Opt.Simplify.Utils (
     ) where
 
 import GHC.Prelude hiding (head, init, last, tail)
+import qualified GHC.Prelude as Partial (head)
 
 import GHC.Core
 import GHC.Types.Literal ( isLitRubbish )
 import GHC.Core.Opt.Simplify.Env
+import GHC.Core.Opt.Simplify.Inline
 import GHC.Core.Opt.Stats ( Tick(..) )
 import qualified GHC.Core.Subst
 import GHC.Core.Ppr
@@ -72,6 +74,7 @@ import GHC.Types.Demand
 import GHC.Types.Var.Set
 import GHC.Types.Basic
 
+import GHC.Data.Maybe ( orElse )
 import GHC.Data.OrdList ( isNilOL )
 import GHC.Data.FastString ( fsLit )
 
@@ -79,11 +82,11 @@ import GHC.Utils.Misc
 import GHC.Utils.Monad
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
-import GHC.Utils.Panic.Plain
 
 import Control.Monad    ( when )
 import Data.List        ( sortBy )
-import qualified Data.List as Partial ( head )
+import GHC.Types.Name.Env
+import Data.Graph
 
 {- *********************************************************************
 *                                                                      *
@@ -190,10 +193,11 @@ data SimplCont
   | StrictBind          -- (StrictBind x b K)[e] = let x = e in K[b]
                         --       or, equivalently,  = K[ (\x.b) e ]
       { sc_dup   :: DupFlag        -- See Note [DupFlag invariants]
-      , sc_bndr  :: InId
       , sc_from  :: FromWhat
+      , sc_bndr  :: InId
       , sc_body  :: InExpr
-      , sc_env   :: StaticEnv      -- See Note [StaticEnv invariant]
+      , sc_env   :: StaticEnv      -- Static env for both sc_bndr (stable unfolding thereof)
+                                   -- and sc_body.  Also see Note [StaticEnv invariant]
       , sc_cont  :: SimplCont }
 
   | StrictArg           -- (StrictArg (f e1 ..en) K)[e] = K[ f e1 .. en e ]
@@ -213,7 +217,7 @@ data SimplCont
 
 type StaticEnv = SimplEnv       -- Just the static part is relevant
 
-data FromWhat = FromLet | FromBeta OutType
+data FromWhat = FromLet | FromBeta Levity
 
 -- See Note [DupFlag invariants]
 data DupFlag = NoDup       -- Unsimplified, might be big
@@ -687,7 +691,7 @@ mkArgInfo env rule_base fun cont
       | Just (_, _, arg_ty, fun_ty') <- splitFunTy_maybe fun_ty        -- Add strict-type info
       , dmd : rest_dmds <- dmds
       , let dmd'
-             | Just Unlifted <- typeLevity_maybe arg_ty
+             | definitelyUnliftedType arg_ty
              = strictifyDmd dmd
              | otherwise
              -- Something that's not definitely unlifted.
@@ -1470,6 +1474,18 @@ preInlineUnconditionally env top_lvl bndr rhs rhs_env
     -- simplifications).  Until phase zero we take no special notice of
     -- top level things, but then we become more leery about inlining
     -- them.
+    --
+    -- What exactly to check in `early_phase` above is the subject of #17910.
+    --
+    -- !10088 introduced an additional Simplifier iteration in LargeRecord
+    -- because we first FloatOut `case unsafeEqualityProof of ... -> I# 2#`
+    -- (a non-trivial value) which we immediately inline back in.
+    -- Ideally, we'd never have inlined it because the binding turns out to
+    -- be expandable; unfortunately we need an iteration of the Simplifier to
+    -- attach the proper unfolding and can't check isExpandableUnfolding right
+    -- here.
+    -- (Nor can we check for `exprIsExpandable rhs`, because that needs to look
+    -- at the non-existent unfolding for the `I# 2#` which is also floated out.)
 
 {-
 ************************************************************************
@@ -1858,11 +1874,12 @@ tryEtaExpandRhs :: SimplEnv -> BindContext -> OutId -> OutExpr
                 -> SimplM (ArityType, OutExpr)
 -- See Note [Eta-expanding at let bindings]
 tryEtaExpandRhs env bind_cxt bndr rhs
-  | do_eta_expand           -- If the current manifest arity isn't enough
-                            --    (never true for join points)
-  , seEtaExpand env         -- and eta-expansion is on
-  , wantEtaExpansion rhs
-  = -- Do eta-expansion.
+  | seEtaExpand env         -- If Eta-expansion is on
+  , wantEtaExpansion rhs    -- and we'd like to eta-expand e
+  , do_eta_expand           -- and e's manifest arity is lower than
+                            --     what it could be
+                            --     (never true for join points)
+  =                         -- Do eta-expansion.
     assertPpr( not (isJoinBC bind_cxt) ) (ppr bndr) $
        -- assert: this never happens for join points; see GHC.Core.Opt.Arity
        --         Note [Do not eta-expand join points]
@@ -2093,6 +2110,27 @@ new binding is abstracted.  Several points worth noting
       which showed that it's harder to do polymorphic specialisation well
       if there are dictionaries abstracted over unnecessary type variables.
       See Note [Weird special case for SpecDict] in GHC.Core.Opt.Specialise
+
+(AB5) We do dependency analysis on recursive groups prior to determining
+      which variables to abstract over.
+      This is useful, because ANFisation in prepareBinding may float out
+      values out of a complex recursive binding, e.g.,
+          letrec { xs = g @a "blah"# ((:) 1 []) xs } in ...
+        ==> { prepareBinding }
+          letrec { foo = "blah"#
+                   bar = [42]
+                   xs = g @a foo bar xs } in
+          ...
+      and we don't want to abstract foo and bar over @a.
+
+      (Why is it OK to float the unlifted `foo` there?
+      See Note [Core top-level string literals] in GHC.Core;
+      it is controlled by GHC.Core.Opt.Simplify.Env.unitLetFloat.)
+
+      It is also necessary to do dependency analysis, because
+      otherwise (in #24551) we might get `foo = \@_ -> "missing"#` at the
+      top-level, and that triggers a CoreLint error because `foo` is *not*
+      manifestly a literal string.
 -}
 
 abstractFloats :: UnfoldingOpts -> TopLevelFlag -> [OutTyVar] -> SimplFloats
@@ -2100,15 +2138,27 @@ abstractFloats :: UnfoldingOpts -> TopLevelFlag -> [OutTyVar] -> SimplFloats
 abstractFloats uf_opts top_lvl main_tvs floats body
   = assert (notNull body_floats) $
     assert (isNilOL (sfJoinFloats floats)) $
-    do  { (subst, float_binds) <- mapAccumLM abstract empty_subst body_floats
+    do  { let sccs = concatMap to_sccs body_floats
+        ; (subst, float_binds) <- mapAccumLM abstract empty_subst sccs
         ; return (float_binds, GHC.Core.Subst.substExpr subst body) }
   where
     is_top_lvl  = isTopLevel top_lvl
     body_floats = letFloatBinds (sfLetFloats floats)
     empty_subst = GHC.Core.Subst.mkEmptySubst (sfInScope floats)
 
-    abstract :: GHC.Core.Subst.Subst -> OutBind -> SimplM (GHC.Core.Subst.Subst, OutBind)
-    abstract subst (NonRec id rhs)
+    -- See wrinkle (AB5) in Note [Which type variables to abstract over]
+    -- for why we need to re-do dependency analysis
+    to_sccs :: OutBind -> [SCC (Id, CoreExpr, VarSet)]
+    to_sccs (NonRec id e) = [AcyclicSCC (id, e, emptyVarSet)] -- emptyVarSet: abstract doesn't need it
+    to_sccs (Rec prs)     = sccs
+      where
+        (ids,rhss) = unzip prs
+        sccs = depAnal (\(id,_rhs,_fvs) -> [getName id])
+                       (\(_id,_rhs,fvs) -> nonDetStrictFoldVarSet ((:) . getName) [] fvs) -- Wrinkle (AB3)
+                       (zip3 ids rhss (map exprFreeVars rhss))
+
+    abstract :: GHC.Core.Subst.Subst -> SCC (Id, CoreExpr, VarSet) -> SimplM (GHC.Core.Subst.Subst, OutBind)
+    abstract subst (AcyclicSCC (id, rhs, _empty_var_set))
       = do { (poly_id1, poly_app) <- mk_poly1 tvs_here id
            ; let (poly_id2, poly_rhs) = mk_poly2 poly_id1 tvs_here rhs'
                  !subst' = GHC.Core.Subst.extendIdSubst subst id poly_app
@@ -2119,7 +2169,7 @@ abstractFloats uf_opts top_lvl main_tvs floats body
         -- tvs_here: see Note [Which type variables to abstract over]
         tvs_here = choose_tvs (exprSomeFreeVars isTyVar rhs')
 
-    abstract subst (Rec prs)
+    abstract subst (CyclicSCC trpls)
       = do { (poly_ids, poly_apps) <- mapAndUnzipM (mk_poly1 tvs_here) ids
            ; let subst' = GHC.Core.Subst.extendSubstList subst (ids `zip` poly_apps)
                  poly_pairs = [ mk_poly2 poly_id tvs_here rhs'
@@ -2127,20 +2177,23 @@ abstractFloats uf_opts top_lvl main_tvs floats body
                               , let rhs' = GHC.Core.Subst.substExpr subst' rhs ]
            ; return (subst', Rec poly_pairs) }
       where
-        (ids,rhss) = unzip prs
-
+        (ids,rhss,_fvss) = unzip3 trpls
 
         -- tvs_here: see Note [Which type variables to abstract over]
-        tvs_here = choose_tvs (mapUnionVarSet get_bind_fvs prs)
+        tvs_here = choose_tvs (mapUnionVarSet get_bind_fvs trpls)
 
         -- See wrinkle (AB4) in Note [Which type variables to abstract over]
-        get_bind_fvs (id,rhs) = tyCoVarsOfType (idType id) `unionVarSet` get_rec_rhs_tvs rhs
-        get_rec_rhs_tvs rhs   = nonDetStrictFoldVarSet get_tvs emptyVarSet (exprFreeVars rhs)
+        get_bind_fvs (id,_rhs,rhs_fvs) = tyCoVarsOfType (idType id) `unionVarSet` get_rec_rhs_tvs rhs_fvs
+        get_rec_rhs_tvs rhs_fvs        = nonDetStrictFoldVarSet get_tvs emptyVarSet rhs_fvs
+                                  -- nonDet is safe because of wrinkle (AB3)
 
         get_tvs :: Var -> VarSet -> VarSet
         get_tvs var free_tvs
            | isTyVar var      -- CoVars have been substituted away
            = extendVarSet free_tvs var
+           | isCoVar var  -- CoVars can be free in the RHS, but they are never let-bound;
+           = free_tvs     -- Do not call lookupIdSubst_maybe, though (#23426)
+                          --    because it has a non-CoVar precondition
            | Just poly_app <- GHC.Core.Subst.lookupIdSubst_maybe subst var
            = -- 'var' is like 'x' in (AB4)
              exprSomeFreeVars isTyVar poly_app `unionVarSet` free_tvs
@@ -2274,7 +2327,7 @@ Note [Shadowing in prepareAlts]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Note that we pass case_bndr::InId to prepareAlts; an /InId/, not an
 /OutId/.  This is vital, because `refineDefaultAlt` uses `tys` to build
-a new /InAlt/.  If you pass an OutId, we'll end up appling the
+a new /InAlt/.  If you pass an OutId, we'll end up applying the
 substitution twice: disaster (#23012).
 
 However this does mean that filling in the default alt might be
@@ -2340,6 +2393,44 @@ which merges two cases in one case when -- the default alternative of
 the outer case scrutinises the same variable as the outer case. This
 transformation is called Case Merging.  It avoids that the same
 variable is scrutinised multiple times.
+
+Wrinkles
+
+(MC1) `tryCaseMerge` "looks though" an inner single-alternative case-on-variable.
+     For example
+       case x of {
+          ...outer-alts...
+          DEFAULT -> case y of (a,b) ->
+                     case x of { A -> rhs1; B -> rhs2 }
+    ===>
+       case x of
+         ...outer-alts...
+         a -> case y of (a,b) -> rhs1
+         B -> case y of (a,b) -> rhs2
+
+    This duplicates the `case y` but it removes the case x; so it is a win
+    in terms of execution time (combining the cases on x) at the cost of
+    perhaps duplicating the `case y`.  A case in point is integerEq, which
+    is defined thus
+        integerEq :: Integer -> Integer -> Bool
+        integerEq !x !y = isTrue# (integerEq# x y)
+    which becomes
+        integerEq
+          = \ (x :: Integer) (y_aAL :: Integer) ->
+              case x of x1 { __DEFAULT ->
+              case y of y1 { __DEFAULT ->
+              case x1 of {
+                IS x2 -> case y1 of {
+                           __DEFAULT -> GHC.Types.False;
+                           IS y2     -> tagToEnum# @Bool (==# x2 y2) };
+                IP x2 -> ...
+                IN x2 -> ...
+    We want to merge the outer `case x` with the inner `case x1`.
+
+    This story is not fully robust; it will be defeated by a let-binding,
+    whih we don't want to duplicate.   But accounting for single-alternative
+    case-on-variable is easy to do, and seems useful in common cases so
+    `tryMergeCase` does it.
 
 Note [Eliminate Identity Case]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -2448,9 +2539,9 @@ subtle example from #22375.  We start with
 
 In Core after a bit of simplification we get:
 
-    f x = case dataToTag# x of a# { _DEFAULT ->
+    f x = case dataToTagLarge# x of a# { _DEFAULT ->
           case a# of
-            _DEFAULT -> case dataToTag# x of b# { _DEFAULT ->
+            _DEFAULT -> case dataToTagLarge# x of b# { _DEFAULT ->
                         case b# of
                            _DEFAULT -> ...
                            1# -> "two"
@@ -2462,8 +2553,8 @@ Now consider what mkCase does to these case expressions.
 The case-merge transformation Note [Merge Nested Cases]
 does this (affecting both pairs of cases):
 
-    f x = case dataToTag# x of a# {
-             _DEFAULT -> case dataToTag# x of b# {
+    f x = case dataToTagLarge# x of a# {
+             _DEFAULT -> case dataToTagLarge# x of b# {
                           _DEFAULT -> ...
                           1# -> "two"
                          }
@@ -2471,22 +2562,22 @@ does this (affecting both pairs of cases):
           }
 
 Now Note [caseRules for dataToTag] does its work, again
-on both dataToTag# cases:
+on both dataToTagLarge# cases:
 
     f x = case x of x1 {
-             _DEFAULT -> case dataToTag# x1 of a# { _DEFAULT ->
+             _DEFAULT -> case dataToTagLarge# x1 of a# { _DEFAULT ->
                          case x of x2 {
-                           _DEFAULT -> case dataToTag# x2 of b# { _DEFAULT -> ... }
+                           _DEFAULT -> case dataToTagLarge# x2 of b# { _DEFAULT -> ... }
                            B -> "two"
                          }}
              A -> "one"
           }
 
 
-The new dataToTag# calls come from the "reconstruct scrutinee" part of
+The new dataToTagLarge# calls come from the "reconstruct scrutinee" part of
 caseRules (note that a# and b# were not dead in the original program
 before all this merging).  However, since a# and b# /are/ in fact dead
-in the resulting program, we are left with redundant dataToTag# calls.
+in the resulting program, we are left with redundant dataToTagLarge# calls.
 But they are easily eliminated by doing caseRules again, in
 the next Simplifier iteration, this time noticing that a# and b# are
 dead.  Hence the "dead-binder" sub-case of Wrinkle 1 of Note
@@ -2520,24 +2611,25 @@ mkCase, mkCase1, mkCase2, mkCase3
 --      1. Merge Nested Cases
 --------------------------------------------------
 
-mkCase mode scrut outer_bndr alts_ty (Alt DEFAULT _ deflt_rhs : outer_alts)
+mkCase mode scrut outer_bndr alts_ty alts
   | sm_case_merge mode
-  , (ticks, Case (Var inner_scrut_var) inner_bndr _ inner_alts)
-       <- stripTicksTop tickishFloatable deflt_rhs
-  , inner_scrut_var == outer_bndr
+  , Just alts' <- tryMergeCase outer_bndr alts
   = do  { tick (CaseMerge outer_bndr)
+        ; mkCase1 mode scrut outer_bndr alts_ty alts' }
+        -- Warning: don't call mkCase recursively!
+        -- Firstly, there's no point, because inner alts have already had
+        -- mkCase applied to them, so they won't have a case in their default
+        -- Secondly, if you do, you get an infinite loop, because the bindCaseBndr
+        -- in munge_rhs may put a case into the DEFAULT branch!
+  | otherwise
+  = mkCase1 mode scrut outer_bndr alts_ty alts
 
-        ; let wrap_alt (Alt con args rhs) = assert (outer_bndr `notElem` args)
-                                            (Alt con args (wrap_rhs rhs))
-                -- Simplifier's no-shadowing invariant should ensure
-                -- that outer_bndr is not shadowed by the inner patterns
-              wrap_rhs rhs = Let (NonRec inner_bndr (Var outer_bndr)) rhs
-                -- The let is OK even for unboxed binders,
-
-              wrapped_alts | isDeadBinder inner_bndr = inner_alts
-                           | otherwise               = map wrap_alt inner_alts
-
-              merged_alts = mergeAlts outer_alts wrapped_alts
+tryMergeCase :: OutId -> [OutAlt] -> Maybe [OutAlt]
+-- See Note [Merge Nested Cases]
+tryMergeCase outer_bndr (Alt DEFAULT _ deflt_rhs : outer_alts)
+  = case go 5 (\e -> e) emptyVarSet deflt_rhs of
+       Nothing         -> Nothing
+       Just inner_alts -> Just (mergeAlts outer_alts inner_alts)
                 -- NB: mergeAlts gives priority to the left
                 --      case x of
                 --        A -> e1
@@ -2546,17 +2638,42 @@ mkCase mode scrut outer_bndr alts_ty (Alt DEFAULT _ deflt_rhs : outer_alts)
                 --                      B -> e3
                 -- When we merge, we must ensure that e1 takes
                 -- precedence over e2 as the value for A!
+  where
+    go :: Int -> (OutExpr -> OutExpr) -> VarSet -> OutExpr -> Maybe [OutAlt]
+    -- In the call (go wrap free_bndrs rhs), the `wrap` function has free `free_bndrs`;
+    -- so do not push `wrap` under any binders that would shadow `free_bndrs`
+    --
+    -- The 'n' is just a depth-bound to avoid pathalogical quadratic behaviour with
+    --   case x1 of DEFAULT -> case x2 of DEFAULT -> case x3 of DEFAULT -> ...
+    -- when for each `case` we'll look down the whole chain to see if there is
+    -- another `case` on that same variable.  Also all of these (case xi) evals
+    -- get duplicated in each branch of the outer case, so 'n' controls how much
+    -- duplication we are prepared to put up with.
+    go 0 _ _ _ = Nothing
 
-        ; fmap (mkTicks ticks) $
-          mkCase1 mode scrut outer_bndr alts_ty merged_alts
-        }
-        -- Warning: don't call mkCase recursively!
-        -- Firstly, there's no point, because inner alts have already had
-        -- mkCase applied to them, so they won't have a case in their default
-        -- Secondly, if you do, you get an infinite loop, because the bindCaseBndr
-        -- in munge_rhs may put a case into the DEFAULT branch!
+    go n wrap free_bndrs (Tick t rhs)
+       = go n (wrap . Tick t) free_bndrs rhs
+    go _ wrap free_bndrs (Case (Var inner_scrut_var) inner_bndr _ inner_alts)
+       | inner_scrut_var == outer_bndr
+       , let wrap_let rhs' | isDeadBinder inner_bndr = rhs'
+                           | otherwise = Let (NonRec inner_bndr (Var outer_bndr)) rhs'
+                              -- The let is OK even for unboxed binders,
+             free_bndrs' = extendVarSet free_bndrs outer_bndr
+       = Just [ assert (not (any (`elemVarSet` free_bndrs') bndrs)) $
+                Alt con bndrs (wrap (wrap_let rhs))
+              | Alt con bndrs rhs <- inner_alts ]
+    go n wrap free_bndrs (Case (Var inner_scrut) inner_bndr ty inner_alts)
+       | [Alt con bndrs rhs] <- inner_alts -- Wrinkle (MC1)
+       , let wrap_case rhs' = Case (Var inner_scrut) inner_bndr ty $
+                              tryMergeCase inner_bndr alts `orElse` alts
+                where
+                  alts = [Alt con bndrs rhs']
+        = assert (not (outer_bndr `elem` (inner_bndr : bndrs))) $
+         go (n-1) (wrap . wrap_case) (free_bndrs `extendVarSet` inner_scrut) rhs
 
-mkCase mode scrut bndr alts_ty alts = mkCase1 mode scrut bndr alts_ty alts
+    go _ _ _ _ = Nothing
+
+tryMergeCase _ _ = Nothing
 
 --------------------------------------------------
 --      2. Eliminate Identity Case

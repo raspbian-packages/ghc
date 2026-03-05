@@ -13,6 +13,8 @@ import Control.Exception (assert)
 import qualified Data.Set as Set
 import System.Directory
 import Settings.Program (programContext)
+import GHC.Toolchain (ccLinkProgram, tgtCCompilerLink)
+import GHC.Toolchain.Program (prgFlags)
 
 cabalBuilderArgs :: Args
 cabalBuilderArgs = cabalSetupArgs <> cabalInstallArgs
@@ -57,8 +59,6 @@ commonReinstallCabalArgs :: Args
 commonReinstallCabalArgs = do
     top       <- expr topDirectory
     root      <- getBuildRoot
-    threads   <- shakeThreads <$> expr getShakeOptions
-    _pkg      <- getPackage
     compiler  <- expr $ programPath =<< programContext Stage1 ghc
     mconcat [ arg "--project-file"
             , arg $ top -/- "cabal.project-reinstall"
@@ -83,9 +83,8 @@ cabalSetupArgs = builder (Cabal Setup) ? do
 
 commonCabalArgs :: Stage -> Args
 commonCabalArgs stage = do
-  verbosity <- expr getVerbosity
   pkg       <- getPackage
-  package_id <- expr $ pkgIdentifier pkg
+  package_id <- expr $ pkgUnitId stage pkg
   let prefix = "${pkgroot}" ++ (if windowsHost then "" else "/..")
   mconcat [ -- Don't strip libraries when cross compiling.
             -- TODO: We need to set @--with-strip=(stripCmdPath :: Action FilePath)@,
@@ -101,7 +100,7 @@ commonCabalArgs stage = do
             , arg "--cabal-file"
             , arg $ pkgCabalFile pkg
             , arg "--ipid"
-            , arg "$pkg-$version"
+            , arg package_id
             , arg "--prefix"
             , arg prefix
 
@@ -127,9 +126,7 @@ commonCabalArgs stage = do
             , with Alex
             , with Happy
             -- Update Target.trackArgument if changing these:
-            , verbosity < Verbose ?
-              pure [ "-v0", "--configure-option=--quiet"
-                   , "--configure-option=--disable-option-checking" ] ]
+            ]
 
 -- TODO: Isn't vanilla always built? If yes, some conditions are redundant.
 -- TODO: Need compiler_stage1_CONFIGURE_OPTS += --disable-library-for-ghci?
@@ -166,14 +163,18 @@ libraryArgs = do
 -- | Configure args with stage/lib specific include directories and settings
 configureStageArgs :: Args
 configureStageArgs = do
-  let cFlags  = getStagedSettingList ConfCcArgs
-      ldFlags = getStagedSettingList ConfGccLinkerArgs
-  mconcat [ configureArgs cFlags ldFlags
-          , notStage0 ? arg "--ghc-option=-ghcversion-file=rts/include/ghcversion.h"
+  let cFlags  = getStagedCCFlags
+      linkFlags = prgFlags . ccLinkProgram . tgtCCompilerLink <$> getStagedTarget
+  mconcat [ configureArgs cFlags linkFlags
+          , ghcVersionH
           ]
 
+ghcVersionH :: Args
+ghcVersionH = notStage0 ? do
+    let h = "rts/include/ghcversion.h"
+    expr $ need [h]
+    arg $ "--ghc-option=-ghcversion-file=" <> h
 
--- TODO: LD_OPTS?
 configureArgs :: Args -> Args -> Args
 configureArgs cFlags' ldFlags' = do
 
@@ -184,7 +185,7 @@ configureArgs cFlags' ldFlags' = do
             not (null values) ?
                 arg ("--configure-option=" ++ key ++ "=" ++ values)
         cFlags   = mconcat [ remove ["-Werror"] cArgs
-                           , getStagedSettingList ConfCcArgs
+                           , getStagedCCFlags
                            -- See https://github.com/snowleopard/hadrian/issues/523
                            , arg $ "-iquote"
 
@@ -192,19 +193,18 @@ configureArgs cFlags' ldFlags' = do
                            , cFlags'
                            ]
         ldFlags  = ldArgs <> ldFlags'
-    cldFlags <- unwords <$> (cFlags <> ldFlags)
     mconcat
         [ conf "CFLAGS"   cFlags
         , conf "LDFLAGS"  ldFlags
-        , not (null cldFlags) ? arg ("--gcc-options=" ++ cldFlags)
         , conf "--with-iconv-includes"    $ arg =<< getSetting IconvIncludeDir
         , conf "--with-iconv-libraries"   $ arg =<< getSetting IconvLibDir
         , conf "--with-gmp-includes"      $ arg =<< getSetting GmpIncludeDir
         , conf "--with-gmp-libraries"     $ arg =<< getSetting GmpLibDir
         , conf "--with-curses-libraries"  $ arg =<< getSetting CursesLibDir
+        -- ROMES:TODO: how is the Host set to TargetPlatformFull? That would be the target
         , conf "--host"                   $ arg =<< getSetting TargetPlatformFull
         , conf "--with-cc" $ arg =<< getBuilderPath . (Cc CompileC) =<< getStage
-        , notStage0 ? arg "--ghc-option=-ghcversion-file=rts/include/ghcversion.h"
+        , ghcVersionH
         ]
 
 bootPackageConstraints :: Args

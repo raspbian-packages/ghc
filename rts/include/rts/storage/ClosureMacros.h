@@ -47,6 +47,11 @@
 
 EXTERN_INLINE void SET_INFO(StgClosure *c, const StgInfoTable *info);
 EXTERN_INLINE void SET_INFO(StgClosure *c, const StgInfoTable *info) {
+    c->header.info = info;
+}
+
+EXTERN_INLINE void SET_INFO_RELAXED(StgClosure *c, const StgInfoTable *info);
+EXTERN_INLINE void SET_INFO_RELAXED(StgClosure *c, const StgInfoTable *info) {
     RELAXED_STORE(&c->header.info, info);
 }
 
@@ -70,6 +75,7 @@ EXTERN_INLINE StgThunkInfoTable *itbl_to_thunk_itbl     (const StgInfoTable *i);
 EXTERN_INLINE StgConInfoTable   *itbl_to_con_itbl       (const StgInfoTable *i);
 
 #if defined(TABLES_NEXT_TO_CODE)
+NO_WARN(-Warray-bounds,
 EXTERN_INLINE StgInfoTable *INFO_PTR_TO_STRUCT(const StgInfoTable *info) {return (StgInfoTable *)info - 1;}
 EXTERN_INLINE StgRetInfoTable *RET_INFO_PTR_TO_STRUCT(const StgInfoTable *info) {return (StgRetInfoTable *)info - 1;}
 EXTERN_INLINE StgFunInfoTable *FUN_INFO_PTR_TO_STRUCT(const StgInfoTable *info) {return (StgFunInfoTable *)info - 1;}
@@ -79,6 +85,7 @@ EXTERN_INLINE StgFunInfoTable *itbl_to_fun_itbl(const StgInfoTable *i) {return (
 EXTERN_INLINE StgRetInfoTable *itbl_to_ret_itbl(const StgInfoTable *i) {return (StgRetInfoTable *)(i + 1) - 1;}
 EXTERN_INLINE StgThunkInfoTable *itbl_to_thunk_itbl(const StgInfoTable *i) {return (StgThunkInfoTable *)(i + 1) - 1;}
 EXTERN_INLINE StgConInfoTable *itbl_to_con_itbl(const StgInfoTable *i) {return (StgConInfoTable *)(i + 1) - 1;}
+)
 #else
 EXTERN_INLINE StgInfoTable *INFO_PTR_TO_STRUCT(const StgInfoTable *info) {return (StgInfoTable *)info;}
 EXTERN_INLINE StgRetInfoTable *RET_INFO_PTR_TO_STRUCT(const StgInfoTable *info) {return (StgRetInfoTable *)info;}
@@ -138,22 +145,44 @@ EXTERN_INLINE StgHalfWord GET_TAG(const StgClosure *con)
    -------------------------------------------------------------------------- */
 
 #if defined(PROFILING)
+
+/*
+  These prototypes are in RtsFlags.h. We can't include RtsFlags.h here
+  because that's a private header, but we do need these prototypes to
+  be duplicated here, otherwise there will be some
+  -Wimplicit-function-declaration compilation errors. Especially when
+  GHC compiles out-of-tree cbits that rely on SET_HDR in RTS API.
+*/
+bool doingLDVProfiling(void);
+bool doingRetainerProfiling(void);
+bool doingErasProfiling(void);
+
 /*
   The following macro works for both retainer profiling and LDV profiling. For
- retainer profiling, 'era' remains 0, so by setting the 'ldvw' field we also set
- 'rs' to zero.
-
- Note that we don't have to bother handling the 'flip' bit properly[1] since the
- retainer profiling code will just set 'rs' to NULL upon visiting a closure with
- an invalid 'flip' bit anyways.
-
- See Note [Profiling heap traversal visited bit] for details.
-
- [1]: Technically we should set 'rs' to `NULL | flip`.
+ retainer profiling, we set 'trav' to 0, which is an invalid
+ RetainerSet.
  */
-#define SET_PROF_HDR(c,ccs_)            \
-        ((c)->header.prof.ccs = ccs_,   \
-        LDV_RECORD_CREATE((c)))
+
+/*
+  MP: Various other places use the check era > 0 to check whether LDV profiling
+  is enabled. The use of these predicates here is the reason for including RtsFlags.h in
+  a lot of places.
+
+  We could also check user_era > 0 for eras profiling, which would remove the need
+  for so many includes.
+*/
+#define SET_PROF_HDR(c, ccs_) \
+  { \
+    (c)->header.prof.ccs = ccs_; \
+    if (doingLDVProfiling()) { \
+      LDV_RECORD_CREATE((c)); \
+    } else if (doingRetainerProfiling()) { \
+      (c)->header.prof.hp.trav = 0; \
+    } else if (doingErasProfiling()){ \
+      ERA_RECORD_CREATE((c)); \
+    } \
+  }
+
 #else
 #define SET_PROF_HDR(c,ccs)
 #endif
@@ -177,7 +206,8 @@ EXTERN_INLINE StgHalfWord GET_TAG(const StgClosure *con)
 // Use when changing a closure from one kind to another
 #define OVERWRITE_INFO(c, new_info)                             \
     OVERWRITING_CLOSURE((StgClosure *)(c));                     \
-    SET_INFO((StgClosure *)(c), (new_info));                    \
+    SET_INFO_RELAXED((StgClosure *)(c), (new_info));                    \
+    /* MP: Should this be SET_PROF_HEADER?  */ \
     LDV_RECORD_CREATE(c);
 
 /* -----------------------------------------------------------------------------
@@ -253,22 +283,35 @@ EXTERN_INLINE StgClosure *TAG_CLOSURE(StgWord tag,StgClosure * p)
 #define MK_FORWARDING_PTR(p) (((StgWord)p) | 1)
 #define UN_FORWARDING_PTR(p) (((StgWord)p) - 1)
 
-/* -----------------------------------------------------------------------------
-   DEBUGGING predicates for pointers
+/*
+ * Note [Debugging predicates for pointers]
+ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ * LOOKS_LIKE_PTR(p)         returns False if p is definitely not a valid pointer
+ * LOOKS_LIKE_INFO_PTR(p)    returns False if p is definitely not an info ptr
+ * LOOKS_LIKE_CLOSURE_PTR(p) returns False if p is definitely not a closure ptr
+ *
+ * These macros are complete but not sound.  That is, they might
+ * return false positives.  Do not rely on them to distinguish info
+ * pointers from closure pointers, for example.
+ *
+ * We for the most part don't use address-space predicates these days, for
+ * portability reasons, and the fact that code/data can be scattered about the
+ * address space in a dynamically-linked environment.  Our best option is to
+ * look at the alleged info table and see whether it seems to make sense.
+ *
+ * The one exception here is the use of INVALID_GHC_POINTER, which catches
+ * the bit-pattern used by `+RTS -DZ` to zero freed memory (that is 0xaaaaa...).
+ * In the case of most 64-bit platforms, this INVALID_GHC_POINTER is a
+ * kernel-mode address, making this check free of false-negatives. On the other
+ * hand, on 32-bit platforms this typically isn't the case. Consequently, we
+ * only use this check in the DEBUG RTS.
+ */
 
-   LOOKS_LIKE_INFO_PTR(p)    returns False if p is definitely not an info ptr
-   LOOKS_LIKE_CLOSURE_PTR(p) returns False if p is definitely not a closure ptr
-
-   These macros are complete but not sound.  That is, they might
-   return false positives.  Do not rely on them to distinguish info
-   pointers from closure pointers, for example.
-
-   We don't use address-space predicates these days, for portability
-   reasons, and the fact that code/data can be scattered about the
-   address space in a dynamically-linked environment.  Our best option
-   is to look at the alleged info table and see whether it seems to
-   make sense...
-   -------------------------------------------------------------------------- */
+EXTERN_INLINE bool LOOKS_LIKE_PTR (const void* p);
+EXTERN_INLINE bool LOOKS_LIKE_PTR (const void* p)
+{
+    return p && (p != (const void*) INVALID_GHC_POINTER);
+}
 
 EXTERN_INLINE bool LOOKS_LIKE_INFO_PTR_NOT_NULL (StgWord p);
 EXTERN_INLINE bool LOOKS_LIKE_INFO_PTR_NOT_NULL (StgWord p)
@@ -280,12 +323,13 @@ EXTERN_INLINE bool LOOKS_LIKE_INFO_PTR_NOT_NULL (StgWord p)
 EXTERN_INLINE bool LOOKS_LIKE_INFO_PTR (StgWord p);
 EXTERN_INLINE bool LOOKS_LIKE_INFO_PTR (StgWord p)
 {
-    return p && (IS_FORWARDING_PTR(p) || LOOKS_LIKE_INFO_PTR_NOT_NULL(p));
+    return LOOKS_LIKE_PTR((const void*) p) && (IS_FORWARDING_PTR(p) || LOOKS_LIKE_INFO_PTR_NOT_NULL(p));
 }
 
 EXTERN_INLINE bool LOOKS_LIKE_CLOSURE_PTR (const void *p);
 EXTERN_INLINE bool LOOKS_LIKE_CLOSURE_PTR (const void *p)
 {
+    if (!LOOKS_LIKE_PTR(p)) return false;
     const StgInfoTable *info = RELAXED_LOAD(&UNTAG_CONST_CLOSURE((const StgClosure *) (p))->header.info);
     return LOOKS_LIKE_INFO_PTR((StgWord) info);
 }
@@ -519,16 +563,12 @@ void LDV_recordDead (const StgClosure *c, uint32_t size);
 RTS_PRIVATE bool isInherentlyUsed ( StgHalfWord closure_type );
 #endif
 
-EXTERN_INLINE void
-zeroSlop (
-    StgClosure *p,
-    uint32_t offset, /*< offset to start zeroing at, in words */
-    uint32_t size,   /*< total closure size, in words */
-    bool known_mutable /*< is this a closure who's slop we can always zero? */
-    );
-
-EXTERN_INLINE void
-zeroSlop (StgClosure *p, uint32_t offset, uint32_t size, bool known_mutable)
+INLINE_HEADER void
+zeroSlop (StgClosure *p,
+          uint32_t offset,    /*< offset to start zeroing at, in words */
+          uint32_t size,      /*< total closure size, in words */
+          bool known_mutable  /*< is this a closure who's slop we can always zero? */
+         )
 {
     // see Note [zeroing slop when overwriting closures], also #8402
 
@@ -543,7 +583,7 @@ zeroSlop (StgClosure *p, uint32_t offset, uint32_t size, bool known_mutable)
 
     const bool can_zero_immutable_slop =
         // Only if we're running single threaded.
-        RTS_DEREF(RtsFlags).ParFlags.nCapabilities <= 1
+        getNumCapabilities() == 1
         && !RTS_DEREF(RtsFlags).GcFlags.useNonmoving; // see #23170
 
     const bool zero_slop_immutable =
@@ -577,8 +617,10 @@ zeroSlop (StgClosure *p, uint32_t offset, uint32_t size, bool known_mutable)
     }
 }
 
-EXTERN_INLINE void overwritingClosure (StgClosure *p);
-EXTERN_INLINE void overwritingClosure (StgClosure *p)
+// N.B. the stg_* variants of the utilities below are only for calling from
+// Cmm. The INLINE_HEADER functions should be used when in C.
+void stg_overwritingClosure (StgClosure *p);
+INLINE_HEADER void overwritingClosure (StgClosure *p)
 {
     W_ size = closure_sizeW(p);
 #if defined(PROFILING)
@@ -588,15 +630,13 @@ EXTERN_INLINE void overwritingClosure (StgClosure *p)
     zeroSlop(p, sizeofW(StgThunkHeader), size, /*known_mutable=*/false);
 }
 
+
 // Version of 'overwritingClosure' which overwrites only a suffix of a
 // closure.  The offset is expressed in words relative to 'p' and shall
 // be less than or equal to closure_sizeW(p), and usually at least as
 // large as the respective thunk header.
-EXTERN_INLINE void
-overwritingMutableClosureOfs (StgClosure *p, uint32_t offset);
-
-EXTERN_INLINE void
-overwritingMutableClosureOfs (StgClosure *p, uint32_t offset)
+void stg_overwritingMutableClosureOfs (StgClosure *p, uint32_t offset);
+INLINE_HEADER void overwritingMutableClosureOfs (StgClosure *p, uint32_t offset)
 {
     // Since overwritingClosureOfs is only ever called by:
     //
@@ -613,8 +653,8 @@ overwritingMutableClosureOfs (StgClosure *p, uint32_t offset)
 }
 
 // Version of 'overwritingClosure' which takes closure size as argument.
-EXTERN_INLINE void overwritingClosureSize (StgClosure *p, uint32_t size /* in words */);
-EXTERN_INLINE void overwritingClosureSize (StgClosure *p, uint32_t size)
+void stg_overwritingClosureSize (StgClosure *p, uint32_t size /* in words */);
+INLINE_HEADER void overwritingClosureSize (StgClosure *p, uint32_t size)
 {
     // This function is only called from stg_AP_STACK so we can assume it's not
     // inherently used.

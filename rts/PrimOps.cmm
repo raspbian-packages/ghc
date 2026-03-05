@@ -29,10 +29,10 @@
 import pthread_mutex_lock;
 import pthread_mutex_unlock;
 #endif
-import CLOSURE base_ControlziExceptionziBase_nestedAtomically_closure;
-import CLOSURE base_GHCziIOziException_heapOverflow_closure;
-import CLOSURE base_GHCziIOziException_blockedIndefinitelyOnMVar_closure;
-import CLOSURE base_GHCziIOPort_doubleReadException_closure;
+import CLOSURE ghczminternal_GHCziInternalziControlziExceptionziBase_nestedAtomically_closure;
+import CLOSURE ghczminternal_GHCziInternalziIOziException_heapOverflow_closure;
+import CLOSURE ghczminternal_GHCziInternalziIOziException_blockedIndefinitelyOnMVar_closure;
+import CLOSURE ghczminternal_GHCziInternalziIOPort_doubleReadException_closure;
 import AcquireSRWLockExclusive;
 import ReleaseSRWLockExclusive;
 import CLOSURE ghczmprim_GHCziTypes_False_closure;
@@ -125,7 +125,7 @@ stg_newByteArrayzh ( W_ n )
     words = BYTES_TO_WDS(SIZEOF_StgArrBytes) + payload_words;
     ("ptr" p) = ccall allocateMightFail(MyCapability() "ptr", words);
     if (p == NULL) {
-        jump stg_raisezh(base_GHCziIOziException_heapOverflow_closure);
+        jump stg_raisezh(ghczminternal_GHCziInternalziIOziException_heapOverflow_closure);
     }
     TICK_ALLOC_PRIM(SIZEOF_StgArrBytes,WDS(payload_words),0);
     SET_HDR(p, stg_ARR_WORDS_info, CCCS);
@@ -154,7 +154,7 @@ stg_newPinnedByteArrayzh ( W_ n )
 
     ("ptr" p) = ccall allocatePinned(MyCapability() "ptr", words, BA_ALIGN, SIZEOF_StgArrBytes);
     if (p == NULL) {
-        jump stg_raisezh(base_GHCziIOziException_heapOverflow_closure);
+        jump stg_raisezh(ghczminternal_GHCziInternalziIOziException_heapOverflow_closure);
     }
     TICK_ALLOC_PRIM(SIZEOF_StgArrBytes,WDS(payload_words),0);
 
@@ -189,7 +189,7 @@ stg_newAlignedPinnedByteArrayzh ( W_ n, W_ alignment )
 
     ("ptr" p) = ccall allocatePinned(MyCapability() "ptr", words, alignment, SIZEOF_StgArrBytes);
     if (p == NULL) {
-        jump stg_raisezh(base_GHCziIOziException_heapOverflow_closure);
+        jump stg_raisezh(ghczminternal_GHCziInternalziIOziException_heapOverflow_closure);
     }
     TICK_ALLOC_PRIM(SIZEOF_StgArrBytes,WDS(payload_words),0);
 
@@ -227,7 +227,7 @@ stg_isMutableByteArrayPinnedzh ( gcptr mba )
  * means we don't track their time of use and eventual destruction. We just
  * assume they get used.
  *
- * Thus it is not necessary to call LDV_RECORD_CREATE when resizing them as we
+ * Thus it is not necessary to call PROF_HEADER_CREATE when resizing them as we
  * used to as the LDV profiler will essentially ignore arrays anyways.
  */
 
@@ -240,7 +240,7 @@ stg_shrinkMutableByteArrayzh ( gcptr mba, W_ new_size )
    OVERWRITING_CLOSURE_MUTABLE(mba, (BYTES_TO_WDS(SIZEOF_StgArrBytes) +
                                      ROUNDUP_BYTES_TO_WDS(new_size)));
    StgArrBytes_bytes(mba) = new_size;
-   // No need to call LDV_RECORD_CREATE. See Note [LDV profiling and resizing arrays]
+   // No need to call PROF_HEADER_CREATE. See Note [LDV profiling and resizing arrays]
 
    return ();
 }
@@ -264,7 +264,7 @@ stg_resizzeMutableByteArrayzh ( gcptr mba, W_ new_size )
       OVERWRITING_CLOSURE_MUTABLE(mba, (BYTES_TO_WDS(SIZEOF_StgArrBytes) +
                                         new_size_wds));
       StgArrBytes_bytes(mba) = new_size;
-      // No need to call LDV_RECORD_CREATE. See Note [LDV profiling and resizing arrays]
+      // No need to call PROF_HEADER_CREATE. See Note [LDV profiling and resizing arrays]
 
       return (mba);
    } else {
@@ -308,7 +308,7 @@ again:
    OVERWRITING_CLOSURE_MUTABLE(mba, (BYTES_TO_WDS(SIZEOF_StgSmallMutArrPtrs) +
                                      new_size));
    StgSmallMutArrPtrs_ptrs(mba) = new_size;
-   // No need to call LDV_RECORD_CREATE. See Note [LDV profiling and resizing arrays]
+   // No need to call PROF_HEADER_CREATE. See Note [LDV profiling and resizing arrays]
 
    return ();
 }
@@ -398,7 +398,7 @@ stg_newArrayzh ( W_ n /* words */, gcptr init )
     words = BYTES_TO_WDS(SIZEOF_StgMutArrPtrs) + size;
     ("ptr" arr) = ccall allocateMightFail(MyCapability() "ptr",words);
     if (arr == NULL) {
-        jump stg_raisezh(base_GHCziIOziException_heapOverflow_closure);
+        jump stg_raisezh(ghczminternal_GHCziInternalziIOziException_heapOverflow_closure);
     }
     TICK_ALLOC_PRIM(SIZEOF_StgMutArrPtrs, WDS(size), 0);
 
@@ -517,7 +517,7 @@ stg_newSmallArrayzh ( W_ n /* words */, gcptr init )
     words = BYTES_TO_WDS(SIZEOF_StgSmallMutArrPtrs) + n;
     ("ptr" arr) = ccall allocateMightFail(MyCapability() "ptr",words);
     if (arr == NULL) (likely: False) {
-        jump stg_raisezh(base_GHCziIOziException_heapOverflow_closure);
+        jump stg_raisezh(ghczminternal_GHCziInternalziIOziException_heapOverflow_closure);
     }
     TICK_ALLOC_PRIM(SIZEOF_StgSmallMutArrPtrs, WDS(n), 0);
 
@@ -740,25 +740,15 @@ stg_atomicModifyMutVar2zh ( gcptr mv, gcptr f )
 
         obviously we can share (f x).
 
-         z = [stg_ap_2 f x]  (max (HS + 2) MIN_UPD_SIZE)
-         y = [stg_sel_0 z]   (max (HS + 1) MIN_UPD_SIZE)
+         z = [stg_ap_2 f x]  (SIZEOF_StgThunkHeader + WDS(2))
+         y = [stg_sel_0 z]   (SIZEOF_StgThunkHeader + WDS(1))
     */
 
-#if defined(MIN_UPD_SIZE) && MIN_UPD_SIZE > 1
-#define THUNK_1_SIZE (SIZEOF_StgThunkHeader + WDS(MIN_UPD_SIZE))
-#define TICK_ALLOC_THUNK_1() TICK_ALLOC_UP_THK(WDS(1),WDS(MIN_UPD_SIZE-1))
-#else
 #define THUNK_1_SIZE (SIZEOF_StgThunkHeader + WDS(1))
 #define TICK_ALLOC_THUNK_1() TICK_ALLOC_UP_THK(WDS(1),0)
-#endif
 
-#if defined(MIN_UPD_SIZE) && MIN_UPD_SIZE > 2
-#define THUNK_2_SIZE (SIZEOF_StgThunkHeader + WDS(MIN_UPD_SIZE))
-#define TICK_ALLOC_THUNK_2() TICK_ALLOC_UP_THK(WDS(2),WDS(MIN_UPD_SIZE-2))
-#else
 #define THUNK_2_SIZE (SIZEOF_StgThunkHeader + WDS(2))
 #define TICK_ALLOC_THUNK_2() TICK_ALLOC_UP_THK(WDS(2),0)
-#endif
 
 #define SIZE (THUNK_2_SIZE + THUNK_1_SIZE)
 
@@ -768,14 +758,14 @@ stg_atomicModifyMutVar2zh ( gcptr mv, gcptr f )
     CCCS_ALLOC(THUNK_2_SIZE);
     z = Hp - THUNK_2_SIZE + WDS(1);
     SET_HDR(z, stg_ap_2_upd_info, CCCS);
-    LDV_RECORD_CREATE(z);
+    PROF_HEADER_CREATE(z);
     StgThunk_payload(z,0) = f;
 
     TICK_ALLOC_THUNK_1();
     CCCS_ALLOC(THUNK_1_SIZE);
     y = z - THUNK_1_SIZE;
     SET_HDR(y, stg_sel_0_upd_info, CCCS);
-    LDV_RECORD_CREATE(y);
+    PROF_HEADER_CREATE(y);
     StgThunk_payload(y,0) = z;
 
   retry:
@@ -785,12 +775,13 @@ stg_atomicModifyMutVar2zh ( gcptr mv, gcptr f )
     (h) = prim %cmpxchgW(mv + SIZEOF_StgHeader + OFFSET_StgMutVar_var, x, y);
     if (h != x) { goto retry; }
 #else
-    h = StgMutVar_var(mv);
     StgMutVar_var(mv) = y;
 #endif
 
-    if (GET_INFO(mv) == stg_MUT_VAR_CLEAN_info) {
-        ccall dirty_MUT_VAR(BaseReg "ptr", mv "ptr", h "ptr");
+    W_ info;
+    info = %relaxed GET_INFO(mv);
+    if (info == stg_MUT_VAR_CLEAN_info) {
+        ccall dirty_MUT_VAR(BaseReg "ptr", mv "ptr", x "ptr");
     }
 
     return (x,z);
@@ -814,13 +805,8 @@ stg_atomicModifyMutVarzuzh ( gcptr mv, gcptr f )
          z = [stg_ap_2 f x]  (max (HS + 2) MIN_UPD_SIZE)
     */
 
-#if defined(MIN_UPD_SIZE) && MIN_UPD_SIZE > 2
-#define THUNK_SIZE (SIZEOF_StgThunkHeader + WDS(MIN_UPD_SIZE))
-#define TICK_ALLOC_THUNK() TICK_ALLOC_UP_THK(WDS(2),WDS(MIN_UPD_SIZE-2))
-#else
 #define THUNK_SIZE (SIZEOF_StgThunkHeader + WDS(2))
 #define TICK_ALLOC_THUNK() TICK_ALLOC_UP_THK(WDS(2),0)
-#endif
 
     HP_CHK_GEN_TICKY(THUNK_SIZE);
 
@@ -828,7 +814,7 @@ stg_atomicModifyMutVarzuzh ( gcptr mv, gcptr f )
     CCCS_ALLOC(THUNK_SIZE);
     z = Hp - THUNK_SIZE + WDS(1);
     SET_HDR(z, stg_ap_2_upd_info, CCCS);
-    LDV_RECORD_CREATE(z);
+    PROF_HEADER_CREATE(z);
     StgThunk_payload(z,0) = f;
 
   retry:
@@ -841,7 +827,9 @@ stg_atomicModifyMutVarzuzh ( gcptr mv, gcptr f )
     StgMutVar_var(mv) = z;
 #endif
 
-    if (GET_INFO(mv) == stg_MUT_VAR_CLEAN_info) {
+    W_ info;
+    info = %relaxed GET_INFO(mv);
+    if (info == stg_MUT_VAR_CLEAN_info) {
         ccall dirty_MUT_VAR(BaseReg "ptr", mv "ptr", x "ptr");
     }
 
@@ -961,7 +949,7 @@ stg_finalizzeWeakzh ( gcptr w )
     //
     unlockClosure(w, stg_DEAD_WEAK_info);
 
-    LDV_RECORD_CREATE(w);
+    PROF_HEADER_CREATE(w);
 
     if (list != stg_NO_FINALIZER_closure) {
       ccall runCFinalizers(list);
@@ -1170,12 +1158,11 @@ stg_threadLabelzh ( gcptr tso )
 
 stg_threadStatuszh ( gcptr tso )
 {
-    W_ why_blocked;
-    W_ what_next;
-    W_ ret, cap, locked;
+    W_ why_blocked, what_next, flags, cap;
+    W_ ret, cap_no, locked;
 
-    what_next   = TO_W_(StgTSO_what_next(tso));
-    why_blocked = TO_W_(StgTSO_why_blocked(tso));
+    what_next   = TO_W_(RELAXED_LOAD_CLOSURE_FIELD(StgTSO_what_next, tso));
+    why_blocked = TO_W_(RELAXED_LOAD_CLOSURE_FIELD(StgTSO_why_blocked, tso));
     // Note: these two reads are not atomic, so they might end up
     // being inconsistent.  It doesn't matter, since we
     // only return one or the other.  If we wanted to return the
@@ -1191,15 +1178,17 @@ stg_threadStatuszh ( gcptr tso )
         }
     }
 
-    cap = TO_W_(Capability_no(StgTSO_cap(tso)));
+    cap = RELAXED_LOAD_CLOSURE_FIELD(StgTSO_cap, tso);
+    cap_no = TO_W_(Capability_no(cap));
 
-    if ((TO_W_(StgTSO_flags(tso)) & TSO_LOCKED) != 0) {
+    flags = TO_W_(RELAXED_LOAD_CLOSURE_FIELD(StgTSO_flags, tso));
+    if ((flags & TSO_LOCKED) != 0) {
         locked = 1;
     } else {
         locked = 0;
     }
 
-    return (ret,cap,locked);
+    return (ret,cap_no,locked);
 }
 
 /* -----------------------------------------------------------------------------
@@ -1413,7 +1402,7 @@ stg_atomicallyzh (P_ stm)
 
     /* Nested transactions are not allowed; raise an exception */
     if (old_trec != NO_TREC) {
-        jump stg_raisezh(base_ControlziExceptionziBase_nestedAtomically_closure);
+        jump stg_raisezh(ghczminternal_GHCziInternalziControlziExceptionziBase_nestedAtomically_closure);
     }
 
     code = stm;
@@ -1728,21 +1717,17 @@ stg_takeMVarzh ( P_ mvar /* :: MVar a */ )
         StgMVarTSOQueue_link(q) = END_TSO_QUEUE;
         StgMVarTSOQueue_tso(q)  = CurrentTSO;
         SET_HDR(q, stg_MVAR_TSO_QUEUE_info, CCS_SYSTEM);
-        // Write barrier before we make the new MVAR_TSO_QUEUE
-        // visible to other cores.
-        // See Note [Heap memory barriers]
-        RELEASE_FENCE;
 
         if (StgMVar_head(mvar) == stg_END_TSO_QUEUE_closure) {
-            StgMVar_head(mvar) = q;
+            %release StgMVar_head(mvar) = q;
         } else {
-            StgMVarTSOQueue_link(StgMVar_tail(mvar)) = q;
+            %release StgMVarTSOQueue_link(StgMVar_tail(mvar)) = q;
             ccall recordClosureMutated(MyCapability() "ptr",
                                              StgMVar_tail(mvar));
         }
         StgTSO__link(CurrentTSO)       = q;
         StgTSO_block_info(CurrentTSO)  = mvar;
-        StgTSO_why_blocked(CurrentTSO) = BlockedOnMVar::I16;
+        %release StgTSO_why_blocked(CurrentTSO) = BlockedOnMVar::I32;
         StgMVar_tail(mvar)             = q;
 
         jump stg_block_takemvar(mvar);
@@ -1783,7 +1768,7 @@ loop:
         StgMVar_tail(mvar) = stg_END_TSO_QUEUE_closure;
     }
 
-    ASSERT(StgTSO_why_blocked(tso) == BlockedOnMVar::I16);
+    ASSERT(StgTSO_why_blocked(tso) == BlockedOnMVar::I32);
     ASSERT(StgTSO_block_info(tso) == mvar);
 
     // actually perform the putMVar for the thread that we just woke up
@@ -1851,7 +1836,7 @@ loop:
         StgMVar_tail(mvar) = stg_END_TSO_QUEUE_closure;
     }
 
-    ASSERT(StgTSO_why_blocked(tso) == BlockedOnMVar::I16);
+    ASSERT(StgTSO_why_blocked(tso) == BlockedOnMVar::I32);
     ASSERT(StgTSO_block_info(tso) == mvar);
 
     // actually perform the putMVar for the thread that we just woke up
@@ -1897,19 +1882,17 @@ stg_putMVarzh ( P_ mvar, /* :: MVar a */
         StgMVarTSOQueue_tso(q)  = CurrentTSO;
 
         SET_HDR(q, stg_MVAR_TSO_QUEUE_info, CCS_SYSTEM);
-        // See Note [Heap memory barriers]
-        RELEASE_FENCE;
 
         if (StgMVar_head(mvar) == stg_END_TSO_QUEUE_closure) {
-            StgMVar_head(mvar) = q;
+            %release StgMVar_head(mvar) = q;
         } else {
-            StgMVarTSOQueue_link(StgMVar_tail(mvar)) = q;
+            %release StgMVarTSOQueue_link(StgMVar_tail(mvar)) = q;
             ccall recordClosureMutated(MyCapability() "ptr",
                                              StgMVar_tail(mvar));
         }
         StgTSO__link(CurrentTSO)       = q;
         StgTSO_block_info(CurrentTSO)  = mvar;
-        StgTSO_why_blocked(CurrentTSO) = BlockedOnMVar::I16;
+        %release StgTSO_why_blocked(CurrentTSO) = BlockedOnMVar::I32;
         StgMVar_tail(mvar)             = q;
 
         jump stg_block_putmvar(mvar,val);
@@ -2046,11 +2029,11 @@ loop:
         }
     }
 
-    ASSERT(StgTSO_block_info(tso) == mvar);
     // save why_blocked here, because waking up the thread destroys
     // this information
     W_ why_blocked;
-    why_blocked = TO_W_(StgTSO_why_blocked(tso));
+    why_blocked = TO_W_(StgTSO_why_blocked(tso)); // TODO: Missing barrier
+    ASSERT(StgTSO_block_info(tso) == mvar);
 
     // actually perform the takeMVar
     W_ stack;
@@ -2106,13 +2089,11 @@ stg_readMVarzh ( P_ mvar, /* :: MVar a */ )
         StgMVarTSOQueue_tso(q)  = CurrentTSO;
 
         SET_HDR(q, stg_MVAR_TSO_QUEUE_info, CCS_SYSTEM);
-        // See Note [Heap memory barriers]
-        RELEASE_FENCE;
 
+        %release StgMVar_head(mvar) = q;
         StgTSO__link(CurrentTSO)       = q;
         StgTSO_block_info(CurrentTSO)  = mvar;
-        StgTSO_why_blocked(CurrentTSO) = BlockedOnMVarRead::I16;
-        StgMVar_head(mvar) = q;
+        %release StgTSO_why_blocked(CurrentTSO) = BlockedOnMVarRead::I16;
 
         if (StgMVar_tail(mvar) == stg_END_TSO_QUEUE_closure) {
             StgMVar_tail(mvar) = q;
@@ -2219,7 +2200,7 @@ stg_readIOPortzh ( P_ ioport /* :: IOPort a */ )
         if (StgMVar_head(ioport) != stg_END_TSO_QUEUE_closure ||
             StgMVar_tail(ioport) != stg_END_TSO_QUEUE_closure) {
                 unlockClosure(ioport, info);
-                jump stg_raiseIOzh(base_GHCziIOPort_doubleReadException_closure);
+                jump stg_raiseIOzh(ghczminternal_GHCziInternalziIOPort_doubleReadException_closure);
         }
 
         if (info == stg_MVAR_CLEAN_info) {
@@ -2239,17 +2220,16 @@ stg_readIOPortzh ( P_ ioport /* :: IOPort a */ )
         StgMVarTSOQueue_tso(q)  = CurrentTSO;
 
         SET_HDR(q, stg_MVAR_TSO_QUEUE_info, CCS_SYSTEM);
-        // See Note [Heap memory barriers]
-        RELEASE_FENCE;
 
-        StgMVar_head(ioport) = q;
+        %release StgMVar_head(ioport) = q;
         StgTSO__link(CurrentTSO)       = q;
         StgTSO_block_info(CurrentTSO)  = ioport;
-        StgTSO_why_blocked(CurrentTSO) = BlockedOnMVar::I16;
+
+        // See Note [Heap memory barriers]
+        %release StgTSO_why_blocked(CurrentTSO) = BlockedOnMVar::I32;
 
         //Unlocks the closure as well
         jump stg_block_readmvar(ioport);
-
     }
 
     //This way we can check of there has been a read already.
@@ -2260,7 +2240,7 @@ stg_readIOPortzh ( P_ ioport /* :: IOPort a */ )
     } else {
          //Or another thread has read already: Throw an exception.
         unlockClosure(ioport, info);
-        jump stg_raiseIOzh(base_GHCziIOPort_doubleReadException_closure);
+        jump stg_raiseIOzh(ghczminternal_GHCziInternalziIOPort_doubleReadException_closure);
     }
 
     val = StgMVar_value(ioport);
@@ -2282,7 +2262,7 @@ stg_writeIOPortzh ( P_ ioport, /* :: IOPort a */
        write. */
     if (StgMVar_value(ioport) != stg_END_TSO_QUEUE_closure) {
         unlockClosure(ioport, info);
-        jump stg_raiseIOzh(base_GHCziIOPort_doubleReadException_closure);
+        jump stg_raiseIOzh(ghczminternal_GHCziInternalziIOPort_doubleReadException_closure);
         return (0);
     }
 
@@ -2327,11 +2307,11 @@ loop:
     // next element in the waiting list here, as there can only ever
     // be one thread blocked on a port.
 
-    ASSERT(StgTSO_block_info(tso) == ioport);
     // save why_blocked here, because waking up the thread destroys
     // this information
     W_ why_blocked;
-    why_blocked = TO_W_(StgTSO_why_blocked(tso));
+    why_blocked = TO_W_(StgTSO_why_blocked(tso)); // TODO Missing acquire
+    ASSERT(StgTSO_block_info(tso) == ioport);
 
     // actually perform the takeMVar
     W_ stack;
@@ -2505,8 +2485,8 @@ stg_unpackClosurezh ( P_ closure )
 {
     W_ info, ptrs, nptrs, p, ptrs_arr, dat_arr;
     MAYBE_GC_P(stg_unpackClosurezh, closure);
-    info  = %GET_STD_INFO(UNTAG(closure));
-    prim_read_barrier;
+    info  = GET_INFO_ACQUIRE(UNTAG(closure));
+    info  = %STD_INFO(info);
 
     ptrs  = TO_W_(%INFO_PTRS(info));
     nptrs = TO_W_(%INFO_NPTRS(info));
@@ -2524,7 +2504,7 @@ stg_unpackClosurezh ( P_ closure )
     dat_arr_sz = SIZEOF_StgArrBytes + WDS(len);
     ("ptr" dat_arr) = ccall allocateMightFail(MyCapability() "ptr", BYTES_TO_WDS(dat_arr_sz));
     if (dat_arr == NULL) (likely: False) {
-        jump stg_raisezh(base_GHCziIOziException_heapOverflow_closure);
+        jump stg_raisezh(ghczminternal_GHCziInternalziIOziException_heapOverflow_closure);
     }
     TICK_ALLOC_PRIM(SIZEOF_StgArrBytes, WDS(len), 0);
 
@@ -2553,13 +2533,13 @@ stg_closureSizzezh (P_ clos)
     return (len);
 }
 
-stg_whereFromzh (P_ clos)
+stg_whereFromzh (P_ clos, W_ buf)
 {
-    P_ ipe;
+    CBool success;
     W_ info;
     info = GET_INFO(UNTAG(clos));
-    (ipe) = foreign "C" lookupIPE(info "ptr");
-    return (ipe);
+    (success) = foreign "C" lookupIPE(info, buf);
+    return (TO_W_(success));
 }
 
 /* -----------------------------------------------------------------------------
@@ -2572,9 +2552,9 @@ stg_waitReadzh ( W_ fd )
     ccall barf("waitRead# on threaded RTS") never returns;
 #else
 
-    ASSERT(StgTSO_why_blocked(CurrentTSO) == NotBlocked::I16);
-    StgTSO_why_blocked(CurrentTSO) = BlockedOnRead::I16;
+    ASSERT(StgTSO_why_blocked(CurrentTSO) == NotBlocked::I32);
     StgTSO_block_info(CurrentTSO) = fd;
+    %release StgTSO_why_blocked(CurrentTSO) = BlockedOnRead::I32;
     // No locking - we're not going to use this interface in the
     // threaded RTS anyway.
     ccall appendToIOBlockedQueue(MyCapability() "ptr", CurrentTSO "ptr");
@@ -2588,9 +2568,9 @@ stg_waitWritezh ( W_ fd )
     ccall barf("waitWrite# on threaded RTS") never returns;
 #else
 
-    ASSERT(StgTSO_why_blocked(CurrentTSO) == NotBlocked::I16);
-    StgTSO_why_blocked(CurrentTSO) = BlockedOnWrite::I16;
+    ASSERT(StgTSO_why_blocked(CurrentTSO) == NotBlocked::I32);
     StgTSO_block_info(CurrentTSO) = fd;
+    %release StgTSO_why_blocked(CurrentTSO) = BlockedOnWrite::I32;
     // No locking - we're not going to use this interface in the
     // threaded RTS anyway.
     ccall appendToIOBlockedQueue(MyCapability() "ptr", CurrentTSO "ptr");
@@ -2611,8 +2591,7 @@ stg_delayzh ( W_ us_delay )
     ccall barf("delay# on threaded RTS") never returns;
 #else
 
-    ASSERT(StgTSO_why_blocked(CurrentTSO) == NotBlocked::I16);
-    StgTSO_why_blocked(CurrentTSO) = BlockedOnDelay::I16;
+    ASSERT(StgTSO_why_blocked(CurrentTSO) == NotBlocked::I32);
 
 #if defined(mingw32_HOST_OS)
 
@@ -2629,12 +2608,13 @@ stg_delayzh ( W_ us_delay )
      * simplifies matters, so change the status to OnDoProc put the
      * delayed thread on the blocked_queue.
      */
-    StgTSO_why_blocked(CurrentTSO) = BlockedOnDoProc::I16;
+    %release StgTSO_why_blocked(CurrentTSO) = BlockedOnDoProc::I32;
     ccall appendToIOBlockedQueue(MyCapability() "ptr", CurrentTSO "ptr");
     jump stg_block_async_void();
 
 #else
 
+    %relaxed StgTSO_why_blocked(CurrentTSO) = BlockedOnDelay::I32;
     (target) = ccall getDelayTarget(us_delay);
 
     StgTSO_block_info(CurrentTSO) = target;
@@ -2656,9 +2636,6 @@ stg_asyncReadzh ( W_ fd, W_ is_sock, W_ len, W_ buf )
     ccall barf("asyncRead# on threaded RTS") never returns;
 #else
 
-    ASSERT(StgTSO_why_blocked(CurrentTSO) == NotBlocked::I16);
-    StgTSO_why_blocked(CurrentTSO) = BlockedOnRead::I16;
-
     /* could probably allocate this on the heap instead */
     ("ptr" ares) = ccall stgMallocBytes(SIZEOF_StgAsyncIOResult,
                                         "stg_asyncReadzh");
@@ -2667,6 +2644,10 @@ stg_asyncReadzh ( W_ fd, W_ is_sock, W_ len, W_ buf )
     StgAsyncIOResult_len(ares)     = 0;
     StgAsyncIOResult_errCode(ares) = 0;
     StgTSO_block_info(CurrentTSO)  = ares;
+
+    ASSERT(StgTSO_why_blocked(CurrentTSO) == NotBlocked::I32);
+    %release StgTSO_why_blocked(CurrentTSO) = BlockedOnRead::I32;
+
     ccall appendToIOBlockedQueue(MyCapability() "ptr", CurrentTSO "ptr");
     jump stg_block_async();
 #endif
@@ -2681,9 +2662,6 @@ stg_asyncWritezh ( W_ fd, W_ is_sock, W_ len, W_ buf )
     ccall barf("asyncWrite# on threaded RTS") never returns;
 #else
 
-    ASSERT(StgTSO_why_blocked(CurrentTSO) == NotBlocked::I16);
-    StgTSO_why_blocked(CurrentTSO) = BlockedOnWrite::I16;
-
     ("ptr" ares) = ccall stgMallocBytes(SIZEOF_StgAsyncIOResult,
                                         "stg_asyncWritezh");
     (reqID) = ccall addIORequest(fd, 1/*TRUE*/,is_sock,len,buf "ptr");
@@ -2692,6 +2670,10 @@ stg_asyncWritezh ( W_ fd, W_ is_sock, W_ len, W_ buf )
     StgAsyncIOResult_len(ares)     = 0;
     StgAsyncIOResult_errCode(ares) = 0;
     StgTSO_block_info(CurrentTSO)  = ares;
+
+    ASSERT(StgTSO_why_blocked(CurrentTSO) == NotBlocked::I32);
+    %release StgTSO_why_blocked(CurrentTSO) = BlockedOnWrite::I32;
+
     ccall appendToIOBlockedQueue(MyCapability() "ptr", CurrentTSO "ptr");
     jump stg_block_async();
 #endif
@@ -2706,9 +2688,6 @@ stg_asyncDoProczh ( W_ proc, W_ param )
     ccall barf("asyncDoProc# on threaded RTS") never returns;
 #else
 
-    ASSERT(StgTSO_why_blocked(CurrentTSO) == NotBlocked::I16);
-    StgTSO_why_blocked(CurrentTSO) = BlockedOnDoProc::I16;
-
     /* could probably allocate this on the heap instead */
     ("ptr" ares) = ccall stgMallocBytes(SIZEOF_StgAsyncIOResult,
                                         "stg_asyncDoProczh");
@@ -2717,6 +2696,10 @@ stg_asyncDoProczh ( W_ proc, W_ param )
     StgAsyncIOResult_len(ares)     = 0;
     StgAsyncIOResult_errCode(ares) = 0;
     StgTSO_block_info(CurrentTSO) = ares;
+
+    ASSERT(StgTSO_why_blocked(CurrentTSO) == NotBlocked::I32);
+    %release StgTSO_why_blocked(CurrentTSO) = BlockedOnDoProc::I32;
+
     ccall appendToIOBlockedQueue(MyCapability() "ptr", CurrentTSO "ptr");
     jump stg_block_async();
 #endif
@@ -2820,8 +2803,7 @@ stg_noDuplicatezh /* no arg list: explicit stack layout */
 stg_getApStackValzh ( P_ ap_stack, W_ offset )
 {
    W_ ap_stackinfo;
-   ap_stackinfo = %INFO_PTR(UNTAG(ap_stack));
-   prim_read_barrier;
+   ap_stackinfo = GET_INFO_ACQUIRE(UNTAG(ap_stack));
    if (ap_stackinfo == stg_AP_STACK_info) {
        return (1,StgAP_STACK_payload(ap_stack,offset));
    } else {
@@ -2972,3 +2954,73 @@ INFO_TABLE_RET(stg_keepAlive_frame, RET_SMALL, KEEP_ALIVE_FRAME_FIELDS(W_,P_, in
 {
     return (ret);
 }
+
+
+
+#if WORD_SIZE_IN_BITS == 64
+#define DOUBLE_SIZE_WDS   1
+#else
+#define DOUBLE_SIZE_WDS   2
+#endif
+
+stg_castWord64ToDoublezh(I64 w)
+{
+    D_ d;
+    P_ ptr;
+
+    ASSERT(RESERVED_STACK_WORDS >= DOUBLE_SIZE_WDS);
+
+    reserve DOUBLE_SIZE_WDS = ptr {
+        I64[ptr] = w;
+        d = D_[ptr];
+    }
+
+    return (d);
+}
+
+stg_castDoubleToWord64zh(D_ d)
+{
+    I64 w;
+    P_ ptr;
+
+    ASSERT(RESERVED_STACK_WORDS >= DOUBLE_SIZE_WDS);
+
+    reserve DOUBLE_SIZE_WDS = ptr {
+        D_[ptr] = d;
+        w = I64[ptr];
+    }
+
+    return (w);
+}
+
+stg_castWord32ToFloatzh(W_ w)
+{
+    F_ f;
+    P_ ptr;
+
+    ASSERT(RESERVED_STACK_WORDS >= 1);
+
+    reserve 1 = ptr {
+        I32[ptr] = %lobits32(w);
+        f = F_[ptr];
+    }
+
+    return (f);
+}
+
+stg_castFloatToWord32zh(F_ f)
+{
+    W_ w;
+    P_ ptr;
+
+    ASSERT(RESERVED_STACK_WORDS >= 1);
+
+    reserve 1 = ptr {
+        F_[ptr] = f;
+        // Fix #16617: use zero-extending (TO_ZXW_) here
+        w = TO_ZXW_(I32[ptr]);
+    }
+
+    return (w);
+}
+

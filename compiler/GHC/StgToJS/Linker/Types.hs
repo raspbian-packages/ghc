@@ -2,8 +2,6 @@
 {-# LANGUAGE PartialTypeSignatures #-}
 {-# LANGUAGE LambdaCase #-}
 
-{-# OPTIONS_GHC -Wno-orphans #-} -- for Ident's Binary instance
-
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  GHC.StgToJS.Linker.Types
@@ -19,26 +17,19 @@
 -----------------------------------------------------------------------------
 
 module GHC.StgToJS.Linker.Types
-  ( GhcjsEnv (..)
-  , newGhcjsEnv
-  , JSLinkConfig (..)
-  , defaultJSLinkConfig
-  , generateAllJs
-  , LinkedObj (..)
-  , LinkableUnit
+  ( JSLinkConfig (..)
+  , LinkPlan (..)
   )
 where
 
 import GHC.StgToJS.Object
 
 import GHC.Unit.Types
-import GHC.Utils.Outputable (hsep,Outputable(..),text,ppr)
+import GHC.Utils.Outputable (Outputable(..),text,ppr, hang, IsDoc (vcat), IsLine (hcat))
 
 import Data.Map.Strict      (Map)
-import qualified Data.Map.Strict as M
 import Data.Set             (Set)
-
-import Control.Concurrent.MVar
+import qualified Data.Set        as S
 
 import System.IO
 
@@ -49,53 +40,45 @@ import Prelude
 --------------------------------------------------------------------------------
 
 data JSLinkConfig = JSLinkConfig
-  { lcNoJSExecutables    :: Bool
-  , lcNoHsMain           :: Bool
-  , lcOnlyOut            :: Bool
-  , lcNoRts              :: Bool
-  , lcNoStats            :: Bool
+  { lcNoJSExecutables :: !Bool         -- ^ Dont' build JS executables
+  , lcNoHsMain        :: !Bool         -- ^ Don't generate Haskell main entry
+  , lcNoRts           :: !Bool         -- ^ Don't dump the generated RTS
+  , lcNoStats         :: !Bool         -- ^ Disable .stats file generation
+  , lcForeignRefs     :: !Bool         -- ^ Dump .frefs (foreign references) files
+  , lcCombineAll      :: !Bool         -- ^ Generate all.js (combined js) + wrappers
+  , lcForceEmccRts    :: !Bool
+      -- ^ Force the link with the emcc rts. Use this if you plan to dynamically
+      -- load wasm modules made from C files (e.g. in iserv).
+  , lcLinkCsources    :: !Bool
+      -- ^ Link C sources (compiled to JS/Wasm) with Haskell code compiled to
+      -- JS. This implies the use of the Emscripten RTS to load this code.
   }
 
--- | we generate a runnable all.js only if we link a complete application,
---   no incremental linking and no skipped parts
-generateAllJs :: JSLinkConfig -> Bool
-generateAllJs s = not (lcOnlyOut s) && not (lcNoRts s)
+data LinkPlan = LinkPlan
+  { lkp_block_info :: Map Module LocatedBlockInfo
+      -- ^ Block information
 
-defaultJSLinkConfig :: JSLinkConfig
-defaultJSLinkConfig = JSLinkConfig
-  { lcNoJSExecutables = False
-  , lcNoHsMain        = False
-  , lcOnlyOut         = False
-  , lcNoRts           = False
-  , lcNoStats         = False
+  , lkp_dep_blocks :: Set BlockRef
+      -- ^ Blocks to link
+
+  , lkp_archives   :: !(Set FilePath)
+      -- ^ Archives to load JS and Cc sources from (JS code corresponding to
+      -- Haskell code is handled with blocks above)
+
+  , lkp_objs_js   :: !(Set FilePath)
+      -- ^ JS objects to link
+
+  , lkp_objs_cc   :: !(Set FilePath)
+      -- ^ Cc objects to link
   }
 
---------------------------------------------------------------------------------
--- Linker Environment
---------------------------------------------------------------------------------
-
--- | A @LinkableUnit@ is a pair of a module and the index of the block in the
--- object file
-type LinkableUnit = (Module, Int)
-
--- | An object file that's either already in memory (with name) or on disk
-data LinkedObj
-  = ObjFile   FilePath      -- ^ load from this file
-  | ObjLoaded String Object -- ^ already loaded: description and payload
-
-instance Outputable LinkedObj where
-  ppr = \case
-    ObjFile fp    -> hsep [text "ObjFile", text fp]
-    ObjLoaded s o -> hsep [text "ObjLoaded", text s, ppr (objModuleName o)]
-
-data GhcjsEnv = GhcjsEnv
-  { linkerArchiveDeps :: MVar (Map (Set FilePath)
-                                   (Map Module (Deps, DepsLocation)
-                                   , [LinkableUnit]
-                                   )
-                              )
-  }
-
--- | return a fresh @GhcjsEnv@
-newGhcjsEnv :: IO GhcjsEnv
-newGhcjsEnv = GhcjsEnv <$> newMVar M.empty
+instance Outputable LinkPlan where
+  ppr s = hang (text "LinkPlan") 2 $ vcat
+            -- Hidden because it's too verbose and it's not really part of the
+            -- plan, just meta info used to retrieve actual block contents
+            -- [ hcat [ text "Block info: ", ppr (lkp_block_info s)]
+            [ hcat [ text "Blocks: ", ppr (S.size (lkp_dep_blocks s))]
+            , hang (text "Archives:") 2 (vcat (fmap text (S.toList (lkp_archives s))))
+            , hang (text "Extra JS objects:") 2 (vcat (fmap text (S.toList (lkp_objs_js s))))
+            , hang (text "Extra Cc objects:") 2 (vcat (fmap text (S.toList (lkp_objs_cc s))))
+            ]

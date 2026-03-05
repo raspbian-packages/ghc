@@ -6,7 +6,7 @@ module GHC.Core.Make (
         mkCoreLet, mkCoreLets,
         mkCoreApp, mkCoreApps, mkCoreConApps,
         mkCoreLams, mkWildCase, mkIfThenElse,
-        mkWildValBinder, mkWildEvBinder,
+        mkWildValBinder,
         mkSingleAltCase,
         sortQuantVars, castBottomExpr,
 
@@ -54,7 +54,7 @@ import GHC.Prelude
 import GHC.Platform
 
 import GHC.Types.Id
-import GHC.Types.Var  ( EvVar, setTyVarUnique, visArgConstraintLike )
+import GHC.Types.Var  ( setTyVarUnique, visArgConstraintLike )
 import GHC.Types.TyThing
 import GHC.Types.Id.Info
 import GHC.Types.Cpr
@@ -79,7 +79,6 @@ import GHC.Builtin.Types.Prim
 import GHC.Utils.Outputable
 import GHC.Utils.Misc
 import GHC.Utils.Panic
-import GHC.Utils.Panic.Plain
 
 import GHC.Settings.Constants( mAX_TUPLE_SIZE )
 import GHC.Data.FastString
@@ -172,9 +171,6 @@ mkCoreAppTyped d (fun, fun_ty) arg
               Building case expressions
 *                                                                      *
 ********************************************************************* -}
-
-mkWildEvBinder :: PredType -> EvVar
-mkWildEvBinder pred = mkWildValBinder ManyTy pred
 
 -- | Make a /wildcard binder/. This is typically used when you need a binder
 -- that you expect to use only at a *binding* site.  Do not use it at
@@ -472,12 +468,12 @@ mkBigCoreTup exprs = mkChunkified mkCoreTup (map wrapBox exprs)
 
 -- | Build the type of a big tuple that holds the specified variables
 -- One-tuples are flattened; see Note [Flattening one-tuples]
-mkBigCoreVarTupTy :: [Id] -> Type
+mkBigCoreVarTupTy :: HasDebugCallStack => [Id] -> Type
 mkBigCoreVarTupTy ids = mkBigCoreTupTy (map idType ids)
 
 -- | Build the type of a big tuple that holds the specified type of thing
 -- One-tuples are flattened; see Note [Flattening one-tuples]
-mkBigCoreTupTy :: [Type] -> Type
+mkBigCoreTupTy :: HasDebugCallStack => [Type] -> Type
 mkBigCoreTupTy tys = mkChunkified mkBoxedTupleTy $
                      map boxTy tys
 
@@ -502,7 +498,7 @@ wrapBox e
   where
     e_ty = exprType e
 
-boxTy :: Type -> Type
+boxTy :: HasDebugCallStack => Type -> Type
 -- ^ `boxTy ty` is the boxed version of `ty`. That is,
 -- if `e :: ty`, then `wrapBox e :: boxTy ty`.
 -- Note that if `ty :: Type`, `boxTy ty` just returns `ty`.
@@ -559,7 +555,8 @@ chunkify xs
   where
     n_xs     = length xs
     split [] = []
-    split xs = take mAX_TUPLE_SIZE xs : split (drop mAX_TUPLE_SIZE xs)
+    split xs = let (as, bs) = splitAt mAX_TUPLE_SIZE xs
+               in as : split bs
 
 
 {-
@@ -651,12 +648,12 @@ mkSmallTupleSelector1 vars the_var scrut_var scrut
 -- To avoid shadowing, we use uniques to invent new variables.
 --
 -- If necessary we pattern match on a "big" tuple.
-mkBigTupleCase :: UniqSupply       -- ^ For inventing names of intermediate variables
-               -> [Id]             -- ^ The tuple identifiers to pattern match on;
+mkBigTupleCase :: MonadUnique m    --   For inventing names of intermediate variables
+               => [Id]             -- ^ The tuple identifiers to pattern match on;
                                    --   Bring these into scope in the body
                -> CoreExpr         -- ^ Body of the case
                -> CoreExpr         -- ^ Scrutinee
-               -> CoreExpr
+               -> m CoreExpr
 -- ToDo: eliminate cases where none of the variables are needed.
 --
 --         mkBigTupleCase uniqs [a,b,c,d] body v e
@@ -664,11 +661,11 @@ mkBigTupleCase :: UniqSupply       -- ^ For inventing names of intermediate vari
 --             case p of p { (a,b) ->
 --             case q of q { (c,d) ->
 --             body }}}
-mkBigTupleCase us vars body scrut
-  = mk_tuple_case wrapped_us (chunkify wrapped_vars) wrapped_body
+mkBigTupleCase vars body scrut
+  = do us <- getUniqueSupplyM
+       let (wrapped_us, wrapped_vars, wrapped_body) = foldr unwrap (us,[],body) vars
+       return $ mk_tuple_case wrapped_us (chunkify wrapped_vars) wrapped_body
   where
-    (wrapped_us, wrapped_vars, wrapped_body) = foldr unwrap (us,[],body) vars
-
     scrut_ty = exprType scrut
 
     unwrap var (us,vars,body)
@@ -910,7 +907,7 @@ nonExhaustiveGuardsErrorName = err_nm "nonExhaustiveGuardsError"
                                   nonExhaustiveGuardsErrorIdKey nON_EXHAUSTIVE_GUARDS_ERROR_ID
 
 err_nm :: String -> Unique -> Id -> Name
-err_nm str uniq id = mkWiredInIdName cONTROL_EXCEPTION_BASE (fsLit str) uniq id
+err_nm str uniq id = mkWiredInIdName gHC_INTERNAL_CONTROL_EXCEPTION_BASE (fsLit str) uniq id
 
 rEC_SEL_ERROR_ID, rEC_CON_ERROR_ID :: Id
 pAT_ERROR_ID, nO_METHOD_BINDING_ERROR_ID, nON_EXHAUSTIVE_GUARDS_ERROR_ID :: Id
@@ -1082,8 +1079,9 @@ mkImpossibleExpr :: Type -> String -> CoreExpr
 mkImpossibleExpr res_ty str
   = mkRuntimeErrorApp err_id res_ty str
   where    -- See Note [Type vs Constraint for error ids]
-    err_id | isConstraintLikeKind (typeKind res_ty) = iMPOSSIBLE_CONSTRAINT_ERROR_ID
-           | otherwise                              = iMPOSSIBLE_ERROR_ID
+    err_id = case typeTypeOrConstraint res_ty of
+               TypeLike       -> iMPOSSIBLE_ERROR_ID
+               ConstraintLike -> iMPOSSIBLE_CONSTRAINT_ERROR_ID
 
 {- Note [Type vs Constraint for error ids]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1207,8 +1205,9 @@ mkAbsentErrorApp :: Type         -- The type to instantiate 'a'
 mkAbsentErrorApp res_ty err_msg
   = mkApps (Var err_id) [ Type res_ty, err_string ]
   where
-    err_id | isConstraintLikeKind (typeKind res_ty) = aBSENT_CONSTRAINT_ERROR_ID
-           | otherwise                              = aBSENT_ERROR_ID
+    err_id = case typeTypeOrConstraint res_ty of
+               TypeLike       -> aBSENT_ERROR_ID
+               ConstraintLike -> aBSENT_CONSTRAINT_ERROR_ID
     err_string = Lit (mkLitString err_msg)
 
 absentErrorName, absentConstraintErrorName :: Name
@@ -1251,7 +1250,7 @@ aBSENT_CONSTRAINT_ERROR_ID -- See Note [aBSENT_ERROR_ID]
 
 mkRuntimeErrorId :: TypeOrConstraint -> Name -> Id
 -- Error function
---   with type:  forall (r:RuntimeRep) (a:TYPE r). Addr# -> a
+--   with type:  forall (r::RuntimeRep) (a::TYPE r). Addr# -> a
 --   with arity: 1
 -- which diverges after being given one argument
 -- The Addr# is expected to be the address of

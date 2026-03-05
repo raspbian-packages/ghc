@@ -40,14 +40,13 @@ import GHC.Runtime.Heap.Layout
 import GHC.Data.Bitmap
 import GHC.Data.Stream (Stream)
 import qualified GHC.Data.Stream as Stream
-import GHC.Cmm.Dataflow.Collections
+import GHC.Cmm.Dataflow.Label
 
 import GHC.Platform
 import GHC.Platform.Profile
 import GHC.Data.Maybe
 import GHC.Utils.Error (withTimingSilent)
 import GHC.Utils.Panic
-import GHC.Utils.Panic.Plain
 import GHC.Types.Unique.Supply
 import GHC.Utils.Logger
 import GHC.Utils.Monad
@@ -450,7 +449,7 @@ wordAligned platform align_check e
 -- | Takes a closure pointer and returns the info table pointer
 closureInfoPtr :: Platform -> DoAlignSanitisation -> CmmExpr -> CmmExpr
 closureInfoPtr platform align_check e =
-    cmmLoadBWord platform (wordAligned platform align_check e)
+    CmmMachOp (MO_RelaxedRead (wordWidth platform)) [wordAligned platform align_check e]
 
 -- | Takes an info pointer (the first word of a closure) and returns its entry
 -- code

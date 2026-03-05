@@ -1,5 +1,3 @@
-{-# LANGUAGE ScopedTypeVariables, ForeignFunctionInterface #-}
-{-# LANGUAGE Trustworthy #-}
 -- | Copyright   : (c) 2010 Jasper Van der Jeugt
 --                 (c) 2010 - 2011 Simon Meier
 -- License       : BSD3-style (see LICENSE)
@@ -77,15 +75,16 @@ module Data.ByteString.Builder.Prim.ASCII
 
     ) where
 
+import Data.ByteString.Internal.Type
 import Data.ByteString.Builder.Prim.Binary
 import Data.ByteString.Builder.Prim.Internal
 import Data.ByteString.Builder.Prim.Internal.Floating
 import Data.ByteString.Builder.Prim.Internal.Base16
+import Data.ByteString.Utils.UnalignedAccess
 
 import Data.Char (ord)
 
 import Foreign
-import Foreign.C.Types
 
 -- | Encode the least 7-bits of a 'Char' using the ASCII encoding.
 {-# INLINE char7 #-}
@@ -99,12 +98,6 @@ char7 = (\c -> fromIntegral $ ord c .&. 0x7f) >$< word8
 
 -- Signed integers
 ------------------
-
-foreign import ccall unsafe "static _hs_bytestring_int_dec" c_int_dec
-    :: CInt -> Ptr Word8 -> IO (Ptr Word8)
-
-foreign import ccall unsafe "static _hs_bytestring_long_long_int_dec" c_long_long_int_dec
-    :: CLLong -> Ptr Word8 -> IO (Ptr Word8)
 
 {-# INLINE encodeIntDecimal #-}
 encodeIntDecimal :: Integral a => Int -> BoundedPrim a
@@ -141,12 +134,6 @@ intDec = caseWordSize_32_64
 
 -- Unsigned integers
 --------------------
-
-foreign import ccall unsafe "static _hs_bytestring_uint_dec" c_uint_dec
-    :: CUInt -> Ptr Word8 -> IO (Ptr Word8)
-
-foreign import ccall unsafe "static _hs_bytestring_long_long_uint_dec" c_long_long_uint_dec
-    :: CULLong -> Ptr Word8 -> IO (Ptr Word8)
 
 {-# INLINE encodeWordDecimal #-}
 encodeWordDecimal :: Integral a => Int -> BoundedPrim a
@@ -185,12 +172,6 @@ wordDec = caseWordSize_32_64
 
 -- without lead
 ---------------
-
-foreign import ccall unsafe "static _hs_bytestring_uint_hex" c_uint_hex
-    :: CUInt -> Ptr Word8 -> IO (Ptr Word8)
-
-foreign import ccall unsafe "static _hs_bytestring_long_long_uint_hex" c_long_long_uint_hex
-    :: CULLong -> Ptr Word8 -> IO (Ptr Word8)
 
 {-# INLINE encodeWordHex #-}
 encodeWordHex :: forall a. (Storable a, Integral a) => BoundedPrim a
@@ -231,8 +212,9 @@ wordHex = caseWordSize_32_64
 -- | Encode a 'Word8' using 2 nibbles (hexadecimal digits).
 {-# INLINE word8HexFixed #-}
 word8HexFixed :: FixedPrim Word8
-word8HexFixed = fixedPrim 2 $
-    \x op -> poke (castPtr op) =<< encode8_as_16h lowerTable x
+word8HexFixed = fixedPrim 2 $ \x op -> do
+  enc <- encode8_as_16h lowerTable x
+  unalignedWriteU16 enc op
 
 -- | Encode a 'Word16' using 4 nibbles.
 {-# INLINE word16HexFixed #-}
@@ -247,6 +229,7 @@ word32HexFixed :: FixedPrim Word32
 word32HexFixed =
     (\x -> (fromIntegral $ x `shiftR` 16, fromIntegral x))
       >$< pairF word16HexFixed word16HexFixed
+
 -- | Encode a 'Word64' using 16 nibbles.
 {-# INLINE word64HexFixed #-}
 word64HexFixed :: FixedPrim Word64

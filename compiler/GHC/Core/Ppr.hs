@@ -44,7 +44,6 @@ import GHC.Core.TyCon
 import GHC.Core.TyCo.Ppr
 import GHC.Core.Coercion
 import GHC.Types.Basic
-import GHC.Data.Maybe
 import GHC.Utils.Misc
 import GHC.Utils.Outputable
 import GHC.Types.SrcLoc ( pprUserRealSpan )
@@ -140,8 +139,8 @@ ppr_binding ann (val_bdr, expr)
     pp_val_bdr = pprPrefixOcc val_bdr
 
     pp_bind = case bndrIsJoin_maybe val_bdr of
-                Nothing -> pp_normal_bind
-                Just ar -> pp_join_bind ar
+                NotJoinPoint -> pp_normal_bind
+                JoinPoint ar -> pp_join_bind ar
 
     pp_normal_bind = hang pp_val_bdr 2 (equals <+> pprCoreExpr expr)
 
@@ -159,9 +158,9 @@ ppr_binding ann (val_bdr, expr)
                   -- So refer to printing  j = e
       = pp_normal_bind
       where
-        (bndrs, body) = collectBinders expr
-        lhs_bndrs = take join_arity bndrs
-        rhs       = mkLams (drop join_arity bndrs) body
+        (bndrs, body)     = collectBinders expr
+        (lhs_bndrs, rest) = splitAt join_arity bndrs
+        rhs               = mkLams rest body
 
 pprParendExpr expr = ppr_expr parens expr
 pprCoreExpr   expr = ppr_expr noParens expr
@@ -240,7 +239,13 @@ ppr_expr add_par expr@(App {})
         _ -> parens (hang (pprParendExpr fun) 2 pp_args)
     }
 
-ppr_expr add_par (Case expr var ty [Alt con args rhs])
+ppr_expr add_par (Case expr _ ty []) -- Empty Case
+  = add_par $ sep [text "case"
+                      <+> pprCoreExpr expr
+                      <+> whenPprDebug (text "return" <+> ppr ty),
+                    text "of {}"]
+
+ppr_expr add_par (Case expr var ty [Alt con args rhs]) -- Single alt Case
   = sdocOption sdocPrintCaseAsLet $ \case
       True -> add_par $  -- See Note [Print case as let]
                sep [ sep [ text "let! {"
@@ -264,7 +269,7 @@ ppr_expr add_par (Case expr var ty [Alt con args rhs])
   where
     ppr_bndr = pprBndr CaseBind
 
-ppr_expr add_par (Case expr var ty alts)
+ppr_expr add_par (Case expr var ty alts) -- Multi alt Case
   = add_par $
     sep [sep [text "case"
                 <+> pprCoreExpr expr
@@ -306,12 +311,12 @@ ppr_expr add_par (Let bind expr)
          pprCoreExpr expr]
   where
     keyword (NonRec b _)
-     | isJust (bndrIsJoin_maybe b) = text "join"
-     | otherwise                   = text "let"
+     | isJoinPoint (bndrIsJoin_maybe b) = text "join"
+     | otherwise                        = text "let"
     keyword (Rec pairs)
      | ((b,_):_) <- pairs
-     , isJust (bndrIsJoin_maybe b) = text "joinrec"
-     | otherwise                   = text "letrec"
+     , isJoinPoint (bndrIsJoin_maybe b) = text "joinrec"
+     | otherwise                        = text "letrec"
 
 ppr_expr add_par (Tick tickish expr)
   = sdocOption sdocSuppressTicks $ \case
@@ -382,13 +387,13 @@ instance OutputableBndr Var where
   pprBndr = pprCoreBinder
   pprInfixOcc  = pprInfixName  . varName
   pprPrefixOcc = pprPrefixName . varName
-  bndrIsJoin_maybe = isJoinId_maybe
+  bndrIsJoin_maybe = idJoinPointHood
 
 instance Outputable b => OutputableBndr (TaggedBndr b) where
   pprBndr _    b = ppr b   -- Simple
   pprInfixOcc  b = ppr b
   pprPrefixOcc b = ppr b
-  bndrIsJoin_maybe (TB b _) = isJoinId_maybe b
+  bndrIsJoin_maybe (TB b _) = idJoinPointHood b
 
 pprOcc :: OutputableBndr a => LexicalFixity -> a -> SDoc
 pprOcc Infix  = pprInfixOcc
@@ -689,8 +694,9 @@ instance Outputable (XTickishId pass) => Outputable (GenTickish pass) where
             ppr modl, comma,
             ppr ix,
             text ">"]
-  ppr (Breakpoint _ext ix vars) =
+  ppr (Breakpoint _ext ix vars modl) =
       hcat [text "break<",
+            ppr modl, comma,
             ppr ix,
             text ">",
             parens (hcat (punctuate comma (map ppr vars)))]

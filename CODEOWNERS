@@ -36,6 +36,8 @@
 /compiler/GHC/Rename/              @simonpj @rae
 /compiler/GHC/Types/               @simonpj @rae
 /compiler/GHC/HsToCore/            @simonpj @rae
+/compiler/GHC/HsToCore/Pmc*        @sgraf
+/compiler/GHC/HsToCore/Foreign/Wasm.hs @TerrorJack
 /compiler/GHC/Tc/Deriv/            @RyanGlScott
 /compiler/GHC/CmmToAsm/            @simonmar @bgamari @AndreasK
 /compiler/GHC/CmmToAsm/Wasm/       @TerrorJack
@@ -43,15 +45,16 @@
 /compiler/GHC/StgToCmm/            @simonmar @osa1
 /compiler/GHC/Cmm/                 @simonmar @osa1
 /compiler/ghci/                    @simonmar
-/compiler/GHC/Core/Op/CallArity.hs @nomeata
-/compiler/utils/UnVarGraph.hs      @nomeata
-/compiler/GHC/Core/Op/Exitify.hs   @nomeata
+/compiler/GHC/Core/Opt/CallArity.hs @nomeata
+/compiler/GHC/Core/Opt/Exitify.hs   @nomeata
 /compiler/GHC/Stg/CSE.hs           @nomeata
-/compiler/GHC/Stg/Lift.hs          @sgraf
+/compiler/GHC/Stg/Lift*            @sgraf
 /compiler/GHC/Cmm/Switch.hs        @nomeata
-/compiler/GHC/Core/Op/DmdAnal.hs   @simonpj @sgraf
+/compiler/GHC/Core/Opt/            @simonpj @sgraf
 /compiler/GHC/ThToHs.hs            @rae
 /compiler/GHC/Wasm/                @nrnrnr
+/compiler/GHC/JS/                  @luite @doyougnu @hsyl20 @JoshMeredith
+/compiler/GHC/StgToJS/             @luite @doyougnu @hsyl20 @JoshMeredith
 
 [Core libraries]
 /libraries/base/                  @hvr
@@ -59,10 +62,10 @@
 /libraries/template-haskell/      @rae
 
 [Internal utilities and libraries]
-/libraries/libiserv/              @angerman @simonmar
 /utils/iserv-proxy/               @angerman @simonmar
 /utils/iserv/                     @angerman @simonmar
 /utils/fs/                        @Phyx
+/utils/jsffi                      @TerrorJack
 
 [WinIO related code]
 /libraries/base/GHC/Event/Windows/                   @Phyx
@@ -79,3 +82,7 @@
 /libraries/base/cbits/Win32Utils.c                   @Phyx
 /libraries/base/cbits/consUtils.c                    @Phyx
 /libraries/base/include/winio_structs.h              @Phyx
+
+[CI]
+/.gitlab/                         @chreekat @bgamari @mpickering
+/.gitlab-ci.yml                   @chreekat @bgamari @mpickering

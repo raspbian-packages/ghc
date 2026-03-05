@@ -14,7 +14,7 @@
 #include "NonMovingShortcut.h"
 #include "NonMoving.h"
 #include "BlockAlloc.h"  /* for countBlocks */
-#include "HeapAlloc.h"
+#include "rts/storage/HeapAlloc.h"
 #include "Task.h"
 #include "Trace.h"
 #include "HeapUtils.h"
@@ -39,7 +39,7 @@ static void trace_PAP_payload (MarkQueue *queue,
                                StgClosure *fun,
                                StgClosure **payload,
                                StgWord size);
-static bool is_nonmoving_weak(StgWeak *weak);
+static bool is_nonmoving_weak(StgWeak *weak) USED_IF_DEBUG;
 
 // How many Array# entries to add to the mark queue at once?
 #define MARK_ARRAY_CHUNK_LENGTH 128
@@ -918,9 +918,10 @@ static MarkQueueEnt markQueuePop (MarkQueue *q)
         // The entry may not be a MARK_CLOSURE but it doesn't matter, our
         // MarkQueueEnt encoding always places the pointer to the object to be
         // marked first.
-        prefetchForRead(&new.mark_closure.p->header.info);
         prefetchForRead(&(UNTAG_CLOSURE(new.mark_closure.p)->header.info));
+#if !defined(ASSERTS_ENABLED)
         prefetchForRead(Bdescr((StgPtr) new.mark_closure.p));
+#endif
         q->prefetch_queue[i] = new;
         i = (i + 1) % MARK_PREFETCH_QUEUE_DEPTH;
     }
@@ -976,7 +977,7 @@ static void nonmovingResetUpdRemSetQueue (MarkQueue *rset)
     rset->top->head = 0;
 }
 
-void nonmovingResetUpdRemSet (UpdRemSet *rset)
+static void nonmovingResetUpdRemSet (UpdRemSet *rset)
 {
     nonmovingResetUpdRemSetQueue(&rset->queue);
 }
@@ -1053,13 +1054,16 @@ trace_tso (MarkQueue *queue, StgTSO *tso)
     if (tso->label != NULL) {
         markQueuePushClosure_(queue, (StgClosure *) tso->label);
     }
-    if (   tso->why_blocked == BlockedOnMVar
-        || tso->why_blocked == BlockedOnMVarRead
-        || tso->why_blocked == BlockedOnBlackHole
-        || tso->why_blocked == BlockedOnMsgThrowTo
-        || tso->why_blocked == NotBlocked
-        ) {
+    switch (ACQUIRE_LOAD(&tso->why_blocked)) {
+    case BlockedOnMVar:
+    case BlockedOnMVarRead:
+    case BlockedOnBlackHole:
+    case BlockedOnMsgThrowTo:
+    case NotBlocked:
         markQueuePushClosure_(queue, tso->block_info.closure);
+        break;
+    default:
+        break;
     }
 }
 
@@ -1589,7 +1593,7 @@ mark_closure (MarkQueue *queue, const StgClosure *p0, StgClosure **origin)
         // Synchronizes with the release-store in updateWithIndirection.
         // See Note [Heap memory barriers] in SMP.h.
         StgInd *ind = (StgInd *) p;
-        ACQUIRE_FENCE();
+        ACQUIRE_FENCE_ON(&p->header.info);
         StgClosure *indirectee = RELAXED_LOAD(&ind->indirectee);
         markQueuePushClosure(queue, indirectee, &ind->indirectee);
         if (GET_CLOSURE_TAG(indirectee) == 0 || origin == NULL) {

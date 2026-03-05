@@ -47,7 +47,7 @@ rst_prolog = """
 
 # General information about the project.
 project = u'Glasgow Haskell Compiler'
-copyright = u'2020, GHC Team'
+copyright = u'2023, GHC Team'
 # N.B. version comes from ghc_config
 release = version  # The full version, including alpha/beta/rc tags.
 
@@ -202,6 +202,10 @@ def parse_flag(env, sig, signode):
     # Reference name left unchanged
     return sig
 
+def isascii(c):
+    """ N.B. str.isascii isn't available until Python 3.7 """
+    return ord(c) < 128
+
 def haddock_role(lib):
     """
     For instance,
@@ -225,7 +229,7 @@ def haddock_role(lib):
       # for the template_haskell.rst example this will be '..'
       current_doc_to_topdir = os.path.relpath(topdir, os.path.dirname(current_doc))
 
-      relative_path = '%s/%s/%s-%s' % (current_doc_to_topdir, libs_base_uri, lib, lib_version)
+      relative_path = '%s/%s/%s' % (current_doc_to_topdir, libs_base_uri, lib_version)
 
       uri = '%s/%s.html%s' % (relative_path, module, anchor)
 
@@ -237,6 +241,15 @@ def haddock_role(lib):
             parts = text.split('.')
             module_parts = parts[:-1]
             thing = parts[-1]
+
+            # Escape any symbols in the identifier;
+            # see also Haddock.Utils.makeAnchorId
+            def escapeChar(c):
+                if (c in ':_.') or (isascii(c) and c.isalnum()):
+                    return c
+                return '-%d-' % ord(c)
+            thing = ''.join(escapeChar(c) for c in thing)
+
             if thing != '':
                 # reference to type or identifier
                 tag = 't' if thing[0].isupper() else 'v'
@@ -277,7 +290,6 @@ def setup(app):
     app.add_role('cabal-ref', haddock_role('Cabal'))
     app.add_role('ghc-compact-ref', haddock_role('ghc-compact'))
     app.add_role('ghc-prim-ref', haddock_role('ghc-prim'))
-    app.add_role('parallel-ref', haddock_role('parallel'))
     app.add_role('array-ref', haddock_role('array'))
 
     app.add_object_type('rts-flag', 'rts-flag',

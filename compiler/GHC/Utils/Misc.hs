@@ -1,10 +1,6 @@
 -- (c) The University of Glasgow 2006
 
 {-# LANGUAGE CPP #-}
-{-# LANGUAGE KindSignatures #-}
-{-# LANGUAGE ConstraintKinds #-}
-{-# LANGUAGE BangPatterns #-}
-{-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE MagicHash #-}
 
 -- | Highly random utility functions
@@ -22,8 +18,8 @@ module GHC.Utils.Misc (
         unzipWith,
 
         mapFst, mapSnd, chkAppend,
-        mapAndUnzip, mapAndUnzip3,
-        filterOut, partitionWith,
+        mapAndUnzip, mapAndUnzip3, mapAndUnzip4,
+        filterOut, partitionWith, partitionWithM,
 
         dropWhileEndLE, spanEnd, last2, lastMaybe, onJust,
 
@@ -35,14 +31,11 @@ module GHC.Utils.Misc (
         equalLength, compareLength, leLength, ltLength,
 
         isSingleton, only, expectOnly, GHC.Utils.Misc.singleton,
-        notNull, snocView,
-
-        chunkList,
+        notNull, expectNonEmpty, snocView,
 
         holes,
 
         changeLast,
-        mapLastM,
 
         whenNonEmpty,
 
@@ -55,6 +48,7 @@ module GHC.Utils.Misc (
 
         -- * Tuples
         fstOf3, sndOf3, thdOf3,
+        fstOf4, sndOf4,
         fst3, snd3, third3,
         uncurry3,
 
@@ -121,6 +115,7 @@ module GHC.Utils.Misc (
     ) where
 
 import GHC.Prelude.Basic hiding ( head, init, last, tail )
+import qualified GHC.Prelude.Basic as Partial ( head )
 
 import GHC.Utils.Exception
 import GHC.Utils.Panic.Plain
@@ -129,9 +124,7 @@ import GHC.Utils.Fingerprint
 
 import Data.Data
 import qualified Data.List as List
-import qualified Data.List as Partial ( head )
 import Data.List.NonEmpty  ( NonEmpty(..), last, nonEmpty )
-import qualified Data.List.NonEmpty as NE
 
 import GHC.Exts
 import GHC.Stack (HasCallStack)
@@ -183,6 +176,11 @@ fstOf3      (a,_,_) =  a
 sndOf3      (_,b,_) =  b
 thdOf3      (_,_,c) =  c
 
+fstOf4   :: (a,b,c,d) -> a
+sndOf4   :: (a,b,c,d) -> b
+fstOf4      (a,_,_,_) =  a
+sndOf4      (_,b,_,_) =  b
+
 fst3 :: (a -> d) -> (a, b, c) -> (d, b, c)
 fst3 f (a, b, c) = (f a, b, c)
 
@@ -214,6 +212,17 @@ partitionWith f (x:xs) = case f x of
                          Left  b -> (b:bs, cs)
                          Right c -> (bs, c:cs)
     where (bs,cs) = partitionWith f xs
+
+partitionWithM :: Monad m => (a -> m (Either b c)) -> [a] -> m ([b], [c])
+-- ^ Monadic version of `partitionWith`
+partitionWithM _ [] = return ([], [])
+partitionWithM f (x:xs) = do
+  y <- f x
+  (bs, cs) <- partitionWithM f xs
+  case y of
+    Left  b -> return (b:bs, cs)
+    Right c -> return (bs, c:cs)
+{-# INLINEABLE partitionWithM #-}
 
 chkAppend :: [a] -> [a] -> [a]
 -- Checks for the second argument being empty
@@ -324,13 +333,20 @@ mapAndUnzip f (x:xs)
     (r1:rs1, r2:rs2)
 
 mapAndUnzip3 :: (a -> (b, c, d)) -> [a] -> ([b], [c], [d])
-
 mapAndUnzip3 _ [] = ([], [], [])
 mapAndUnzip3 f (x:xs)
   = let (r1,  r2,  r3)  = f x
         (rs1, rs2, rs3) = mapAndUnzip3 f xs
     in
     (r1:rs1, r2:rs2, r3:rs3)
+
+mapAndUnzip4 :: (a -> (b, c, d, e)) -> [a] -> ([b], [c], [d], [e])
+mapAndUnzip4 _ [] = ([], [], [], [])
+mapAndUnzip4 f (x:xs)
+  = let (r1,  r2,  r3, r4)  = f x
+        (rs1, rs2, rs3, rs4) = mapAndUnzip4 f xs
+    in
+    (r1:rs1, r2:rs2, r3:rs3, r4:rs4)
 
 zipWithAndUnzip :: (a -> b -> (c,d)) -> [a] -> [b] -> ([c],[d])
 zipWithAndUnzip f (a:as) (b:bs)
@@ -481,12 +497,6 @@ expectOnly _   (a:_) = a
 #endif
 expectOnly msg _     = panic ("expectOnly: " ++ msg)
 
-
--- | Split a list into chunks of /n/ elements
-chunkList :: Int -> [a] -> [[a]]
-chunkList _ [] = []
-chunkList n xs = as : chunkList n bs where (as,bs) = splitAt n xs
-
 -- | Compute all the ways of removing a single element from a list.
 --
 --  > holes [1,2,3] = [(1, [2,3]), (2, [1,3]), (3, [1,2])]
@@ -500,10 +510,15 @@ changeLast []     _  = panic "changeLast"
 changeLast [_]    x  = [x]
 changeLast (x:xs) x' = x : changeLast xs x'
 
--- | Apply an effectful function to the last list element.
-mapLastM :: Functor f => (a -> f a) -> NonEmpty a -> f (NonEmpty a)
-mapLastM f (x:|[]) = NE.singleton <$> f x
-mapLastM f (x0:|x1:xs) = (x0 NE.<|) <$> mapLastM f (x1:|xs)
+-- | Like @expectJust msg . nonEmpty@; a better alternative to 'NE.fromList'.
+expectNonEmpty :: HasCallStack => String -> [a] -> NonEmpty a
+{-# INLINE expectNonEmpty #-}
+expectNonEmpty _   (x:xs) = x:|xs
+expectNonEmpty msg []     = expectNonEmptyPanic msg
+
+expectNonEmptyPanic :: String -> a
+expectNonEmptyPanic msg = panic ("expectNonEmpty: " ++ msg)
+{-# NOINLINE expectNonEmptyPanic #-}
 
 whenNonEmpty :: Applicative m => [a] -> (NonEmpty a -> m ()) -> m ()
 whenNonEmpty []     _ = pure ()

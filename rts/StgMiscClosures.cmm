@@ -31,6 +31,7 @@ import CLOSURE ENT_VIA_NODE_ctr;
 import CLOSURE RtsFlags;
 import CLOSURE stg_BLOCKING_QUEUE_CLEAN_info;
 import CLOSURE stg_BLOCKING_QUEUE_DIRTY_info;
+import CLOSURE stg_END_TSO_QUEUE_closure;
 import CLOSURE stg_IND_info;
 import CLOSURE stg_MSG_BLACKHOLE_info;
 import CLOSURE stg_TSO_info;
@@ -44,6 +45,17 @@ import CLOSURE stg_ret_p_info;
 import CLOSURE stg_ret_t_info;
 import CLOSURE stg_ret_v_info;
 #endif
+
+/* See Note [Original thunk info table frames] in GHC.StgToCmm.Bind. */
+INFO_TABLE_RET (stg_orig_thunk_info_frame, RET_SMALL,
+                W_ info_ptr,
+                W_ thunk_info_ptr)
+    /* no args => explicit stack */
+{
+    unwind Sp = W_[Sp + SIZEOF_StgOrigThunkInfoFrame];
+    Sp = Sp + SIZEOF_StgOrigThunkInfoFrame;
+    jump %ENTRY_CODE(Sp(0)) [*]; // NB. all registers live!
+}
 
 /* ----------------------------------------------------------------------------
    Stack underflow
@@ -509,7 +521,7 @@ INFO_TABLE(stg_IND,1,0,IND,"IND","IND")
     (P_ node)
 {
     TICK_ENT_DYN_IND(); /* tick */
-    ACQUIRE_FENCE;
+    ACQUIRE_FENCE_ON(node + OFFSET_StgHeader_info);
     node = %acquire StgInd_indirectee(node);
     node = UNTAG(node);
     TICK_ENT_VIA_NODE();
@@ -519,7 +531,7 @@ INFO_TABLE(stg_IND,1,0,IND,"IND","IND")
     /* explicit stack */
 {
     TICK_ENT_DYN_IND(); /* tick */
-    ACQUIRE_FENCE;
+    ACQUIRE_FENCE_ON(R1 + OFFSET_StgHeader_info);
     P_ p;
     p = %acquire StgInd_indirectee(R1);
     R1 = UNTAG(p);
@@ -532,7 +544,7 @@ INFO_TABLE(stg_IND_STATIC,1,0,IND_STATIC,"IND_STATIC","IND_STATIC")
     /* explicit stack */
 {
     TICK_ENT_STATIC_IND(); /* tick */
-    ACQUIRE_FENCE;
+    ACQUIRE_FENCE_ON(R1 + OFFSET_StgHeader_info);
     P_ p;
     p = %acquire StgInd_indirectee(R1);
     R1 = UNTAG(p);
@@ -558,14 +570,11 @@ INFO_TABLE(stg_BLACKHOLE,1,0,BLACKHOLE,"BLACKHOLE","BLACKHOLE")
     TICK_ENT_DYN_IND(); /* tick */
 
 retry:
-#if defined(TSAN_ENABLED)
-    // See Note [ThreadSanitizer and fences]
-    W_ unused; unused = %acquire GET_INFO(node);
-#endif
-    // Synchronizes with the release-store in updateWithIndirection.
+    // Synchronizes with the release-store in
+    // updateWithIndirection.
     // See Note [Heap memory barriers] in SMP.h.
-    ACQUIRE_FENCE;
-    p = %relaxed StgInd_indirectee(node);
+    ACQUIRE_FENCE_ON(node + OFFSET_StgHeader_info);
+    p = %acquire StgInd_indirectee(node);
     if (GETTAG(p) != 0) {
         return (p);
     }
@@ -589,6 +598,9 @@ retry:
 
         MessageBlackHole_tso(msg) = CurrentTSO;
         MessageBlackHole_bh(msg) = node;
+        // Ensure that the link field is a valid closure,
+        // since we might turn this into an indirection in wakeBlockingQueue()
+        MessageBlackHole_link(msg) = stg_END_TSO_QUEUE_closure;
         SET_HDR(msg, stg_MSG_BLACKHOLE_info, CCS_SYSTEM);
         // messageBlackHole has appropriate memory barriers when this object is exposed.
         // See Note [Heap memory barriers].
@@ -598,8 +610,8 @@ retry:
         if (r == 0) {
             goto retry;
         } else {
-            StgTSO_why_blocked(CurrentTSO) = BlockedOnBlackHole::I16;
             StgTSO_block_info(CurrentTSO) = msg;
+            %release StgTSO_why_blocked(CurrentTSO) = BlockedOnBlackHole::I16;
             jump stg_block_blackhole(node);
         }
     }
@@ -650,7 +662,7 @@ INFO_TABLE(stg_WHITEHOLE, 0,0, WHITEHOLE, "WHITEHOLE", "WHITEHOLE")
     i = 0;
 loop:
     // spin until the WHITEHOLE is updated
-    info = StgHeader_info(node);
+    info = %relaxed StgHeader_info(node);
     if (info == stg_WHITEHOLE_info) {
 #if defined(PROF_SPIN)
         W_[whitehole_lockClosure_spin] =
@@ -669,7 +681,7 @@ loop:
         // defined in CMM.
         goto loop;
     }
-    ACQUIRE_FENCE;
+    ACQUIRE_FENCE_ON(node + OFFSET_StgHeader_info);
     jump %ENTRY_CODE(info) (node);
 #else
     ccall barf("WHITEHOLE object (%p) entered!", R1) never returns;

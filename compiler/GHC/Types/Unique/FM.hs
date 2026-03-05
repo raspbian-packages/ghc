@@ -44,7 +44,7 @@ module GHC.Types.Unique.FM (
         addListToUFM,addListToUFM_C,
         addToUFM_Directly,
         addListToUFM_Directly,
-        adjustUFM, alterUFM,
+        adjustUFM, alterUFM, alterUFM_Directly,
         adjustUFM_Directly,
         delFromUFM,
         delFromUFM_Directly,
@@ -57,6 +57,7 @@ module GHC.Types.Unique.FM (
         mergeUFM,
         plusMaybeUFM_C,
         plusUFMList,
+        plusUFMListWith,
         sequenceUFMList,
         minusUFM,
         minusUFM_C,
@@ -64,11 +65,13 @@ module GHC.Types.Unique.FM (
         intersectUFM_C,
         disjointUFM,
         equalKeysUFM,
-        nonDetStrictFoldUFM, foldUFM, nonDetStrictFoldUFM_DirectlyM,
+        diffUFM,
+        nonDetStrictFoldUFM, nonDetFoldUFM, nonDetStrictFoldUFM_DirectlyM,
+        nonDetFoldWithKeyUFM,
         nonDetStrictFoldUFM_Directly,
         anyUFM, allUFM, seqEltsUFM,
-        mapUFM, mapUFM_Directly,
-        mapMaybeUFM,
+        mapUFM, mapUFM_Directly, strictMapUFM,
+        mapMaybeUFM, mapMaybeWithKeyUFM,
         elemUFM, elemUFM_Directly,
         filterUFM, filterUFM_Directly, partitionUFM,
         sizeUFM,
@@ -84,12 +87,12 @@ module GHC.Types.Unique.FM (
 
 import GHC.Prelude
 
-import GHC.Types.Unique ( Uniquable(..), Unique, getKey )
+import GHC.Types.Unique ( Uniquable(..), Unique, getKey, mkUniqueGrimily )
 import GHC.Utils.Outputable
 import GHC.Utils.Panic.Plain
-import qualified Data.IntMap as M
-import qualified Data.IntMap.Strict as MS
-import qualified Data.IntSet as S
+import qualified GHC.Data.Word64Map as M
+import qualified GHC.Data.Word64Map.Strict as MS
+import qualified GHC.Data.Word64Set as S
 import Data.Data
 import qualified Data.Semigroup as Semi
 import Data.Functor.Classes (Eq1 (..))
@@ -103,7 +106,7 @@ import Data.Coerce
 -- If two types don't overlap in their uniques it's also safe
 -- to index the same map at multiple key types. But this is
 -- very much discouraged.
-newtype UniqFM key ele = UFM (M.IntMap ele)
+newtype UniqFM key ele = UFM (M.Word64Map ele)
   deriving (Data, Eq, Functor)
   -- Nondeterministic Foldable and Traversable instances are accessible through
   -- use of the 'NonDetUniqFM' wrapper.
@@ -137,9 +140,11 @@ zipToUFM ks vs = assert (length ks == length vs ) innerZip emptyUFM ks vs
 
 listToUFM :: Uniquable key => [(key,elt)] -> UniqFM key elt
 listToUFM = foldl' (\m (k, v) -> addToUFM m k v) emptyUFM
+{-# INLINEABLE listToUFM #-}
 
 listToUFM_Directly :: [(Unique, elt)] -> UniqFM key elt
 listToUFM_Directly = foldl' (\m (u, v) -> addToUFM_Directly m u v) emptyUFM
+{-# INLINEABLE listToUFM_Directly #-}
 
 listToIdentityUFM :: Uniquable key => [key] -> UniqFM key key
 listToIdentityUFM = foldl' (\m x -> addToUFM m x x) emptyUFM
@@ -150,6 +155,7 @@ listToUFM_C
   -> [(key, elt)]
   -> UniqFM key elt
 listToUFM_C f = foldl' (\m (k, v) -> addToUFM_C f m k v) emptyUFM
+{-# INLINEABLE listToUFM_C #-}
 
 addToUFM :: Uniquable key => UniqFM key elt -> key -> elt  -> UniqFM key elt
 addToUFM (UFM m) k v = UFM (M.insert (getKey $ getUnique k) v m)
@@ -165,10 +171,10 @@ addToUFM_Directly (UFM m) u v = UFM (M.insert (getKey u) v m)
 
 addToUFM_C
   :: Uniquable key
-  => (elt -> elt -> elt)  -- old -> new -> result
-  -> UniqFM key elt           -- old
-  -> key -> elt           -- new
-  -> UniqFM key elt           -- result
+  => (elt -> elt -> elt)  -- ^ old -> new -> result
+  -> UniqFM key elt       -- ^ old
+  -> key -> elt           -- ^ new
+  -> UniqFM key elt       -- ^ result
 -- Arguments of combining function of M.insertWith and addToUFM_C are flipped.
 addToUFM_C f (UFM m) k v =
   UFM (M.insertWith (flip f) (getKey $ getUnique k) v m)
@@ -177,9 +183,9 @@ addToUFM_Acc
   :: Uniquable key
   => (elt -> elts -> elts)  -- Add to existing
   -> (elt -> elts)          -- New element
-  -> UniqFM key elts            -- old
+  -> UniqFM key elts        -- old
   -> key -> elt             -- new
-  -> UniqFM key elts            -- result
+  -> UniqFM key elts        -- result
 addToUFM_Acc exi new (UFM m) k v =
   UFM (M.insertWith (\_new old -> exi v old) (getKey $ getUnique k) (new v) m)
 
@@ -188,11 +194,11 @@ addToUFM_Acc exi new (UFM m) k v =
 -- otherwise compute the element to add using the passed function.
 addToUFM_L
   :: Uniquable key
-  => (key -> elt -> elt -> elt) -- key,old,new
+  => (key -> elt -> elt -> elt) -- ^ key,old,new
   -> key
   -> elt -- new
   -> UniqFM key elt
-  -> (Maybe elt, UniqFM key elt) -- old, result
+  -> (Maybe elt, UniqFM key elt) -- ^ old, result
 addToUFM_L f k v (UFM m) =
   coerce $
     M.insertLookupWithKey
@@ -203,11 +209,18 @@ addToUFM_L f k v (UFM m) =
 
 alterUFM
   :: Uniquable key
-  => (Maybe elt -> Maybe elt)  -- How to adjust
-  -> UniqFM key elt                -- old
-  -> key                       -- new
-  -> UniqFM key elt                -- result
+  => (Maybe elt -> Maybe elt)  -- ^ How to adjust
+  -> UniqFM key elt            -- ^ old
+  -> key                       -- ^ new
+  -> UniqFM key elt            -- ^ result
 alterUFM f (UFM m) k = UFM (M.alter f (getKey $ getUnique k) m)
+
+alterUFM_Directly
+  :: (Maybe elt -> Maybe elt)  -- ^ How to adjust
+  -> UniqFM key elt            -- ^ old
+  -> Unique                    -- ^ new
+  -> UniqFM key elt            -- ^ result
+alterUFM_Directly f (UFM m) k = UFM (M.alter f (getKey k) m)
 
 -- | Add elements to the map, combining existing values with inserted ones using
 -- the given function.
@@ -323,6 +336,9 @@ plusMaybeUFM_C f (UFM xm) (UFM ym)
 plusUFMList :: [UniqFM key elt] -> UniqFM key elt
 plusUFMList = foldl' plusUFM emptyUFM
 
+plusUFMListWith :: (elt -> elt -> elt) -> [UniqFM key elt] -> UniqFM key elt
+plusUFMListWith f xs = unsafeIntMapToUFM $ M.unionsWith f (map ufmToIntMap xs)
+
 sequenceUFMList :: forall key elt. [UniqFM key elt] -> UniqFM key [elt]
 sequenceUFMList = foldr (plusUFM_CD2 cons) emptyUFM
   where
@@ -356,8 +372,18 @@ intersectUFM_C f (UFM x) (UFM y) = UFM (M.intersectionWith f x y)
 disjointUFM :: UniqFM key elt1 -> UniqFM key elt2 -> Bool
 disjointUFM (UFM x) (UFM y) = M.disjoint x y
 
-foldUFM :: (elt -> a -> a) -> a -> UniqFM key elt -> a
-foldUFM k z (UFM m) = M.foldr k z m
+-- | Fold over a 'UniqFM'.
+--
+-- Non-deterministic, unless the folding function is commutative
+-- (i.e. @a1 `f` ( a2 `f` b ) == a2 `f` ( a1 `f` b )@ for all @a1@, @a2@, @b@).
+nonDetFoldUFM :: (elt -> a -> a) -> a -> UniqFM key elt -> a
+nonDetFoldUFM f z (UFM m) = M.foldr f z m
+
+-- | Like 'nonDetFoldUFM', but with the 'Unique' key as well.
+nonDetFoldWithKeyUFM :: (Unique -> elt -> a -> a) -> a -> UniqFM key elt -> a
+nonDetFoldWithKeyUFM f z (UFM m) = M.foldrWithKey f' z m
+  where
+    f' k e a = f (mkUniqueGrimily k) e a
 
 mapUFM :: (elt1 -> elt2) -> UniqFM key elt1 -> UniqFM key elt2
 mapUFM f (UFM m) = UFM (M.map f m)
@@ -365,14 +391,20 @@ mapUFM f (UFM m) = UFM (M.map f m)
 mapMaybeUFM :: (elt1 -> Maybe elt2) -> UniqFM key elt1 -> UniqFM key elt2
 mapMaybeUFM f (UFM m) = UFM (M.mapMaybe f m)
 
+mapMaybeWithKeyUFM :: (Unique -> elt1 -> Maybe elt2) -> UniqFM key elt1 -> UniqFM key elt2
+mapMaybeWithKeyUFM f (UFM m) = UFM (M.mapMaybeWithKey (f . mkUniqueGrimily) m)
+
 mapUFM_Directly :: (Unique -> elt1 -> elt2) -> UniqFM key elt1 -> UniqFM key elt2
-mapUFM_Directly f (UFM m) = UFM (M.mapWithKey (f . getUnique) m)
+mapUFM_Directly f (UFM m) = UFM (M.mapWithKey (f . mkUniqueGrimily) m)
+
+strictMapUFM :: (a -> b) -> UniqFM k a -> UniqFM k b
+strictMapUFM f (UFM a) = UFM $ MS.map f a
 
 filterUFM :: (elt -> Bool) -> UniqFM key elt -> UniqFM key elt
 filterUFM p (UFM m) = UFM (M.filter p m)
 
 filterUFM_Directly :: (Unique -> elt -> Bool) -> UniqFM key elt -> UniqFM key elt
-filterUFM_Directly p (UFM m) = UFM (M.filterWithKey (p . getUnique) m)
+filterUFM_Directly p (UFM m) = UFM (M.filterWithKey (p . mkUniqueGrimily) m)
 
 partitionUFM :: (elt -> Bool) -> UniqFM key elt -> (UniqFM key elt, UniqFM key elt)
 partitionUFM p (UFM m) =
@@ -401,7 +433,7 @@ lookupWithDefaultUFM (UFM m) v k = M.findWithDefault v (getKey $ getUnique k) m
 lookupWithDefaultUFM_Directly :: UniqFM key elt -> elt -> Unique -> elt
 lookupWithDefaultUFM_Directly (UFM m) v u = M.findWithDefault v (getKey u) m
 
-ufmToSet_Directly :: UniqFM key elt -> S.IntSet
+ufmToSet_Directly :: UniqFM key elt -> S.Word64Set
 ufmToSet_Directly (UFM m) = M.keysSet m
 
 anyUFM :: (elt -> Bool) -> UniqFM key elt -> Bool
@@ -411,7 +443,7 @@ allUFM :: (elt -> Bool) -> UniqFM key elt -> Bool
 allUFM p (UFM m) = M.foldr ((&&) . p) True m
 
 seqEltsUFM :: (elt -> ()) -> UniqFM key elt -> ()
-seqEltsUFM seqElt = foldUFM (\v rest -> seqElt v `seq` rest) ()
+seqEltsUFM seqElt = nonDetFoldUFM (\v rest -> seqElt v `seq` rest) ()
 
 -- See Note [Deterministic UniqFM] to learn about nondeterminism.
 -- If you use this please provide a justification why it doesn't introduce
@@ -423,7 +455,7 @@ nonDetEltsUFM (UFM m) = M.elems m
 -- If you use this please provide a justification why it doesn't introduce
 -- nondeterminism.
 nonDetKeysUFM :: UniqFM key elt -> [Unique]
-nonDetKeysUFM (UFM m) = map getUnique $ M.keys m
+nonDetKeysUFM (UFM m) = map mkUniqueGrimily $ M.keys m
 
 -- See Note [Deterministic UniqFM] to learn about nondeterminism.
 -- If you use this please provide a justification why it doesn't introduce
@@ -440,18 +472,18 @@ nonDetStrictFoldUFM k z (UFM m) = M.foldl' (flip k) z m
 nonDetStrictFoldUFM_DirectlyM :: (Monad m) => (Unique -> b -> elt -> m b) -> b -> UniqFM key elt -> m b
 nonDetStrictFoldUFM_DirectlyM f z0 (UFM xs) = M.foldrWithKey c return xs z0
   -- See Note [List fusion and continuations in 'c']
-  where c u x k z = f (getUnique u) z x >>= k
+  where c u x k z = f (mkUniqueGrimily u) z x >>= k
         {-# INLINE c #-}
 
 nonDetStrictFoldUFM_Directly:: (Unique -> elt -> a -> a) -> a -> UniqFM key elt -> a
-nonDetStrictFoldUFM_Directly k z (UFM m) = M.foldlWithKey' (\z' i x -> k (getUnique i) x z') z m
+nonDetStrictFoldUFM_Directly k z (UFM m) = M.foldlWithKey' (\z' i x -> k (mkUniqueGrimily i) x z') z m
 {-# INLINE nonDetStrictFoldUFM_Directly #-}
 
 -- See Note [Deterministic UniqFM] to learn about nondeterminism.
 -- If you use this please provide a justification why it doesn't introduce
 -- nondeterminism.
 nonDetUFMToList :: UniqFM key elt -> [(Unique, elt)]
-nonDetUFMToList (UFM m) = map (\(k, v) -> (getUnique k, v)) $ M.toList m
+nonDetUFMToList (UFM m) = map (\(k, v) -> (mkUniqueGrimily k, v)) $ M.toList m
 
 -- | A wrapper around 'UniqFM' with the sole purpose of informing call sites
 -- that the provided 'Foldable' and 'Traversable' instances are
@@ -476,10 +508,10 @@ instance forall key. Foldable (NonDetUniqFM key) where
 instance forall key. Traversable (NonDetUniqFM key) where
   traverse f (NonDetUniqFM (UFM m)) = NonDetUniqFM . UFM <$> traverse f m
 
-ufmToIntMap :: UniqFM key elt -> M.IntMap elt
+ufmToIntMap :: UniqFM key elt -> M.Word64Map elt
 ufmToIntMap (UFM m) = m
 
-unsafeIntMapToUFM :: M.IntMap elt -> UniqFM key elt
+unsafeIntMapToUFM :: M.Word64Map elt -> UniqFM key elt
 unsafeIntMapToUFM = UFM
 
 -- | Cast the key domain of a UniqFM.
@@ -492,6 +524,28 @@ unsafeCastUFMKey (UFM m) = UFM m
 -- Determines whether two 'UniqFM's contain the same keys.
 equalKeysUFM :: UniqFM key a -> UniqFM key b -> Bool
 equalKeysUFM (UFM m1) (UFM m2) = liftEq (\_ _ -> True) m1 m2
+
+-- | An edit on type @a@, relating an element of a container (like an entry in a
+-- map or a line in a file) before and after.
+data Edit a
+  = Removed !a    -- ^ Element was removed from the container
+  | Added !a      -- ^ Element was added to the container
+  | Changed !a !a -- ^ Element was changed. Carries the values before and after
+  deriving Eq
+
+instance Outputable a => Outputable (Edit a) where
+  ppr (Removed a) = text "-" <> ppr a
+  ppr (Added a) = text "+" <> ppr a
+  ppr (Changed l r) = ppr l <> text "->" <> ppr r
+
+-- A very convient function to have for debugging:
+-- | Computes the diff of two 'UniqFM's in terms of 'Edit's.
+-- Equal points will not be present in the result map at all.
+diffUFM :: Eq a => UniqFM key a -> UniqFM key a -> UniqFM key (Edit a)
+diffUFM = mergeUFM both (mapUFM Removed) (mapUFM Added)
+  where
+    both x y | x == y    = Nothing
+             | otherwise = Just $! Changed x y
 
 -- Instances
 

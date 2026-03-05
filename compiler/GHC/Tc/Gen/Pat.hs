@@ -1,6 +1,7 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE TypeFamilies #-}
 
@@ -18,8 +19,9 @@ module GHC.Tc.Gen.Pat
    , newLetBndr
    , LetBndrSpec(..)
    , tcCheckPat, tcCheckPat_O, tcInferPat
-   , tcPats
+   , tcMatchPats
    , addDataConStupidTheta
+   , isIrrefutableHsPatRnTcM
    )
 where
 
@@ -31,7 +33,6 @@ import GHC.Hs
 import GHC.Hs.Syn.Type
 import GHC.Rename.Utils
 import GHC.Tc.Errors.Types
-import GHC.Tc.Utils.Zonk
 import GHC.Tc.Gen.Sig( TcPragEnv, lookupPragEnv, addInlinePrags )
 import GHC.Tc.Utils.Monad
 import GHC.Tc.Utils.Instantiate
@@ -44,7 +45,7 @@ import GHC.Core.Multiplicity
 import GHC.Tc.Utils.Concrete ( hasFixedRuntimeRep_syntactic )
 import GHC.Tc.Utils.Env
 import GHC.Tc.Utils.TcMType
-import GHC.Tc.Validity( arityErr )
+import GHC.Tc.Zonk.TcType
 import GHC.Core.TyCo.Ppr ( pprTyVars )
 import GHC.Tc.Utils.TcType
 import GHC.Tc.Utils.Unify
@@ -60,13 +61,12 @@ import GHC.Core.PatSyn
 import GHC.Core.ConLike
 import GHC.Builtin.Names
 import GHC.Types.Basic hiding (SuccessFlag(..))
-import GHC.Driver.Session
+import GHC.Driver.DynFlags
 import GHC.Types.SrcLoc
 import GHC.Types.Var.Set
 import GHC.Utils.Misc
 import GHC.Utils.Outputable as Outputable
 import GHC.Utils.Panic
-import GHC.Utils.Panic.Plain
 import qualified GHC.LanguageExtensions as LangExt
 import Control.Arrow  ( second )
 import Control.Monad
@@ -77,6 +77,9 @@ import GHC.Data.List.SetOps ( getNth )
 import Language.Haskell.Syntax.Basic (FieldLabelString(..))
 
 import Data.List( partition )
+import Data.Maybe (isJust)
+import Control.Monad.Trans.Writer.CPS
+import Control.Monad.Trans.Class
 
 {-
 ************************************************************************
@@ -99,34 +102,122 @@ tcLetPat sig_fn no_gen pat pat_ty thing_inside
              penv = PE { pe_lazy = True
                        , pe_ctxt = ctxt
                        , pe_orig = PatOrigin }
+       ; dflags <- getDynFlags
+       ; mult_co_wrap <- manyIfLazy dflags pat
+       -- The wrapper checks for correct multiplicities.
+       -- See Note [Wrapper returned from tcSubMult] in GHC.Tc.Utils.Unify.
+       ; (pat', r) <- tc_lpat pat_ty penv pat thing_inside
+       ; pat_ty' <- readExpType (scaledThing pat_ty)
+       ; return (mkLHsWrapPat mult_co_wrap pat' pat_ty', r) }
+  where
+    -- The logic is partly duplicated from decideBangHood in
+    -- GHC.HsToCore.Utils. Ugh…
+    manyIfLazy dflags lpat
+      | xopt LangExt.Strict dflags = xstrict lpat
+      | otherwise = not_xstrict lpat
+      where
+        xstrict p@(L _ (LazyPat _ _)) = checkManyPattern LazyPatternReason p pat_ty
+        xstrict (L _ (ParPat _ p)) = xstrict p
+        xstrict _ = return WpHole
 
-       ; tc_lpat pat_ty penv pat thing_inside }
+        not_xstrict (L _ (BangPat _ _)) = return WpHole
+        not_xstrict (L _ (VarPat _ _)) = return WpHole
+        not_xstrict (L _ (ParPat _ p)) = not_xstrict p
+        not_xstrict p = checkManyPattern LazyPatternReason p pat_ty
 
 -----------------
-tcPats :: HsMatchContext GhcTc
-       -> [LPat GhcRn]             -- ^ atterns
-       -> [Scaled ExpSigmaTypeFRR] -- ^ types of the patterns
-       -> TcM a                    -- ^ checker for the body
-       -> TcM ([LPat GhcTc], a)
+tcMatchPats :: forall a.
+               HsMatchContextRn
+            -> [LPat GhcRn]          -- ^ patterns
+            -> [ExpPatType]             -- ^ types of the patterns
+            -> TcM a                    -- ^ checker for the body
+            -> TcM ([LPat GhcTc], a)
+-- See Note [tcMatchPats]
+--
+-- PRECONDITION:
+--    number of visible pats::[LPat GhcRn]   (p is visible, @p is invisible)
+--      ==
+--    number of visible pat_tys::[ExpPatType]   (ExpFunPatTy is visible,
+--                                               ExpForAllPatTy b is visible iff b is Required)
+--
+-- POSTCONDITION:
+--   Returns only the /value/ patterns; see Note [tcMatchPats]
 
--- This is the externally-callable wrapper function
--- Typecheck the patterns, extend the environment to bind the variables,
--- do the thing inside, use any existentially-bound dictionaries to
--- discharge parts of the returning LIE, and deal with pattern type
--- signatures
+tcMatchPats match_ctxt pats pat_tys thing_inside
+  = assertPpr (count isVisibleExpPatType pat_tys == count (isVisArgPat . unLoc) pats)
+              (ppr pats $$ ppr pat_tys) $
+       -- Check PRECONDITION
+       -- When we get @patterns the (length pats) will change
+    do { err_ctxt <- getErrCtxt
+       ; let loop :: [LPat GhcRn] -> [ExpPatType] -> TcM ([LPat GhcTc], a)
 
---   1. Initialise the PatState
---   2. Check the patterns
---   3. Check the body
---   4. Check that no existentials escape
+             -- No more patterns.  Discard excess pat_tys;
+             -- they should all be invisible.  Example:
+             --    f :: Int -> forall a b. blah
+             --    f x @p = rhs
+             -- We will call tcMatchPats with
+             --   pats = [x, @p]
+             --   pat_tys = [Int, @a, @b]
+             loop [] pat_tys
+               = assertPpr (not (any isVisibleExpPatType pat_tys)) (ppr pats $$ ppr pat_tys) $
+                 do { res <- setErrCtxt err_ctxt thing_inside
+                    ; return ([], res) }
 
-tcPats ctxt pats pat_tys thing_inside
-  = tc_lpats pat_tys penv pats thing_inside
+             -- ExpForAllPat: expecting a type pattern
+             loop all_pats@(pat : pats) (ExpForAllPatTy (Bndr tv vis) : pat_tys)
+               | isVisibleForAllTyFlag vis
+               = do { (_p, (ps, res)) <- tc_forall_lpat tv penv pat $
+                                         loop pats pat_tys
+
+                    ; return (ps, res) }
+                    -- This VisPat is Erased.
+                    -- See Note [Invisible binders in functions] in GHC.Hs.Pat
+
+               -- Invisible (Specified) forall in type, and an @a type pattern
+               -- E.g.    f :: forall a. Bool -> a -> blah
+               --         f @b True  x = rhs1  -- b is bound to skolem a
+               --         f @c False y = rhs2  -- c is bound to skolem a
+               | L _ (InvisPat _ tp) <- pat
+               , isSpecifiedForAllTyFlag vis
+               = do { (_p, (ps, res)) <- tc_ty_pat tp tv $
+                                         loop pats pat_tys
+                    ; return (ps, res) }
+
+               | otherwise  -- Discard invisible pat_ty
+               = loop all_pats pat_tys
+
+             -- This case handles the user error when an InvisPat is used
+             -- without a corresponding invisible (Specified) forall in the type
+             -- E.g. 1.  f :: Int
+             --          f @a = ...   -- loop (InvisPat{} : _) []
+             --      2.  f :: Int -> Int
+             --          f @a x = ... -- loop (InvisPat{} : _) (ExpFunPatTy{} : _)
+             --      3.  f :: forall a -> Int
+             --          f @a t = ... -- loop (InvisPat{} : _) (ExpForAllPatTy (Bndr _ Required) : _)
+             --      4.  f :: forall {a}. Int
+             --          f @a t = ... -- loop (InvisPat{} : _) (ExpForAllPatTy (Bndr _ Inferred) : _)
+             loop (L loc (InvisPat _ tp) : _) _ =
+                failAt (locA loc) (TcRnInvisPatWithNoForAll tp)
+
+             -- ExpFunPatTy: expecting a value pattern
+             -- tc_lpat will error if it sees a @t type pattern
+             loop (pat : pats) (ExpFunPatTy pat_ty : pat_tys)
+               = do { (p, (ps, res)) <- tc_lpat pat_ty penv pat $
+                                        loop pats pat_tys
+                    ; return (p : ps, res) }
+                    -- This VisPat is Retained.
+                    -- See Note [Invisible binders in functions] in GHC.Hs.Pat
+
+             loop pats@(_:_) [] = pprPanic "tcMatchPats" (ppr pats)
+                    -- Failure of PRECONDITION
+
+       ; loop pats pat_tys }
   where
-    penv = PE { pe_lazy = False, pe_ctxt = LamPat ctxt, pe_orig = PatOrigin }
+    penv = PE { pe_lazy = False, pe_ctxt = LamPat match_ctxt, pe_orig = PatOrigin }
+
 
 tcInferPat :: FixedRuntimeRepContext
-           -> HsMatchContext GhcTc
+           -> HsMatchContextRn
            -> LPat GhcRn
            -> TcM a
            -> TcM ((LPat GhcTc, a), TcSigmaTypeFRR)
@@ -136,14 +227,14 @@ tcInferPat frr_orig ctxt pat thing_inside
  where
     penv = PE { pe_lazy = False, pe_ctxt = LamPat ctxt, pe_orig = PatOrigin }
 
-tcCheckPat :: HsMatchContext GhcTc
+tcCheckPat :: HsMatchContextRn
            -> LPat GhcRn -> Scaled TcSigmaTypeFRR
            -> TcM a                     -- Checker for body
            -> TcM (LPat GhcTc, a)
 tcCheckPat ctxt = tcCheckPat_O ctxt PatOrigin
 
 -- | A variant of 'tcPat' that takes a custom origin
-tcCheckPat_O :: HsMatchContext GhcTc
+tcCheckPat_O :: HsMatchContextRn
              -> CtOrigin              -- ^ origin to use if the type needs inst'ing
              -> LPat GhcRn -> Scaled TcSigmaTypeFRR
              -> TcM a                 -- Checker for body
@@ -154,7 +245,26 @@ tcCheckPat_O ctxt orig pat (Scaled pat_mult pat_ty) thing_inside
     penv = PE { pe_lazy = False, pe_ctxt = LamPat ctxt, pe_orig = orig }
 
 
-{-
+{- Note [tcMatchPats]
+~~~~~~~~~~~~~~~~~~~~~
+tcMatchPats is the externally-callable wrapper function for
+  function definitions  f p1 .. pn = rhs
+  lambdas               \p1 .. pn -> body
+Typecheck the patterns, extend the environment to bind the variables, do the
+thing inside, use any existentially-bound dictionaries to discharge parts of
+the returning LIE, and deal with pattern type signatures
+
+It takes the list of patterns writen by the user, but it returns only the
+/value/ patterns.  For example:
+     f :: forall a. forall b -> a -> Mabye b -> blah
+     f @a w x (Just y) = ....
+tcMatchPats returns only the /value/ patterns [x, Just y].  Why?  The
+desugarer expects only value patterns.  (We could change that, but we would
+have to do so carefullly.)  However, distinguishing value patterns from type
+patterns is a bit tricky; e.g. the `w` in this example.  So it's very
+convenient to filter them out right here.
+
+
 ************************************************************************
 *                                                                      *
                 PatEnv, PatCtxt, LetBndrSpec
@@ -170,7 +280,7 @@ data PatEnv
 
 data PatCtxt
   = LamPat   -- Used for lambdas, case etc
-       (HsMatchContext GhcTc)
+      HsMatchContextRn
 
   | LetPat   -- Used only for let(rec) pattern bindings
              -- See Note [Typing patterns in pattern bindings]
@@ -326,21 +436,21 @@ tcMultiple_ tc_pat penv args thing_inside
 tcMultiple :: Checker inp out -> Checker [inp] [out]
 tcMultiple tc_pat penv args thing_inside
   = do  { err_ctxt <- getErrCtxt
-        ; let loop _ []
+        ; let loop []
                 = do { res <- thing_inside
                      ; return ([], res) }
 
-              loop penv (arg:args)
+              loop (arg:args)
                 = do { (p', (ps', res))
                                 <- tc_pat penv arg $
                                    setErrCtxt err_ctxt $
-                                   loop penv args
+                                   loop args
                 -- setErrCtxt: restore context before doing the next pattern
                 -- See Note [Nesting] above
 
                      ; return (p':ps', res) }
 
-        ; loop penv args }
+        ; loop args }
 
 --------------------
 tc_lpat :: Scaled ExpSigmaTypeFRR
@@ -361,8 +471,152 @@ tc_lpats tys penv pats
 
 --------------------
 -- See Note [Wrapper returned from tcSubMult] in GHC.Tc.Utils.Unify.
-checkManyPattern :: Scaled a -> TcM HsWrapper
-checkManyPattern pat_ty = tcSubMult NonLinearPatternOrigin ManyTy (scaledMult pat_ty)
+checkManyPattern :: NonLinearPatternReason -> LPat GhcRn -> Scaled a -> TcM HsWrapper
+checkManyPattern reason pat pat_ty = tcSubMult (NonLinearPatternOrigin reason pat) ManyTy (scaledMult pat_ty)
+
+
+tc_forall_lpat :: TcTyVar -> Checker (LPat GhcRn) (LPat GhcTc)
+tc_forall_lpat tv penv (L span pat) thing_inside
+  = setSrcSpanA span $
+    do  { (pat', res) <- maybeWrapPatCtxt pat (tc_forall_pat tv penv pat)
+                                          thing_inside
+        ; return (L span pat', res) }
+
+tc_forall_pat :: TcTyVar -> Checker (Pat GhcRn) (Pat GhcTc)
+tc_forall_pat tv penv (ParPat x lpat) thing_inside
+  = do { (lpat', res) <- tc_forall_lpat tv penv lpat thing_inside
+       ; return (ParPat x lpat', res) }
+
+tc_forall_pat tv _ (EmbTyPat _ tp) thing_inside
+  -- The entire type pattern is guarded with the `type` herald:
+  --    f (type t) (x :: t) = ...
+  -- This special case is not necessary for correctness but avoids
+  -- a redundant `ExpansionPat` node.
+  = do { (arg_ty, result) <- tc_ty_pat tp tv thing_inside
+       ; return (EmbTyPat arg_ty tp, result) }
+
+tc_forall_pat tv _ pat thing_inside
+  -- The type pattern is not guarded with the `type` herald, or perhaps
+  -- only parts of it are, e.g.
+  --    f (t :: Type)        (x :: t) = ...    -- no `type` herald
+  --    f ((type t) :: Type) (x :: t) = ...    -- nested `type` herald
+  -- Apply a recursive T2T transformation.
+  = do { tp <- pat_to_type_pat pat
+       ; (arg_ty, result) <- tc_ty_pat tp tv thing_inside
+       ; let pat' = XPat $ ExpansionPat pat (EmbTyPat arg_ty tp)
+       ; return (pat', result) }
+
+
+-- Convert a Pat into the equivalent HsTyPat.
+-- See `expr_to_type` (GHC.Tc.Gen.App) for the HsExpr counterpart.
+-- The `TcM` monad is only used to fail on ill-formed type patterns.
+pat_to_type_pat :: Pat GhcRn -> TcM (HsTyPat GhcRn)
+pat_to_type_pat pat = do
+  (ty, x) <- runWriterT (pat_to_type pat)
+  pure (HsTP (buildHsTyPatRn x) ty)
+
+pat_to_type :: Pat GhcRn -> WriterT HsTyPatRnBuilder TcM (LHsType GhcRn)
+pat_to_type (EmbTyPat _ (HsTP x t)) =
+  do { tell (builderFromHsTyPatRn x)
+     ; return t }
+pat_to_type (VarPat _ lname)  =
+  do { tell (tpBuilderExplicitTV (unLoc lname))
+     ; return b }
+  where b = noLocA (HsTyVar noAnn NotPromoted lname)
+pat_to_type (WildPat _) = return b
+  where b = noLocA (HsWildCardTy noExtField)
+pat_to_type (SigPat _ pat sig_ty)
+  = do { t <- pat_to_type (unLoc pat)
+       ; let { !(HsPS x_hsps k) = sig_ty
+             ; b = noLocA (HsKindSig noAnn t k) }
+       ; tell (tpBuilderPatSig x_hsps)
+       ; return b }
+pat_to_type (ParPat _ pat)
+  = do { t <- pat_to_type (unLoc pat)
+       ; return (noLocA (HsParTy noAnn t)) }
+pat_to_type (SplicePat (HsUntypedSpliceTop mod_finalizers pat) splice) = do
+      { t <- pat_to_type pat
+      ; return (noLocA (HsSpliceTy (HsUntypedSpliceTop mod_finalizers t) splice)) }
+
+pat_to_type (TuplePat _ pats Boxed)
+  = do { tys <- traverse (pat_to_type . unLoc) pats
+       ; let t = noLocA (HsExplicitTupleTy noExtField tys)
+       ; pure t }
+pat_to_type (ListPat _ pats)
+  = do { tys <- traverse (pat_to_type . unLoc) pats
+       ; let t = noLocA (HsExplicitListTy NoExtField NotPromoted tys)
+       ; pure t }
+
+pat_to_type (LitPat _ lit)
+  | Just ty_lit <- tyLitFromLit lit
+  = do { let t = noLocA (HsTyLit noExtField ty_lit)
+      ; pure t }
+pat_to_type (NPat _ (L _ lit) _ _)
+  | Just ty_lit <- tyLitFromOverloadedLit (ol_val lit)
+  = do { let t = noLocA (HsTyLit noExtField ty_lit)
+       ; pure t}
+
+pat_to_type (ConPat _ lname (InfixCon left right))
+  = do { lty <- pat_to_type (unLoc left)
+       ; rty <- pat_to_type (unLoc right)
+       ; let { t = noLocA (HsOpTy noAnn NotPromoted lty lname rty)}
+       ; pure t }
+pat_to_type (ConPat _ lname (PrefixCon invis_args vis_args))
+  = do { let { appHead = noLocA (HsTyVar noAnn NotPromoted lname)}
+       ; ty_invis <- foldM apply_invis_arg appHead invis_args
+       ; tys_vis <- traverse (pat_to_type . unLoc) vis_args
+       ; let t = foldl' mkHsAppTy ty_invis tys_vis
+       ; pure t }
+      where
+        apply_invis_arg :: LHsType GhcRn -> HsConPatTyArg GhcRn -> WriterT HsTyPatRnBuilder TcM (LHsType GhcRn)
+        apply_invis_arg !t (HsConPatTyArg _ (HsTP argx arg))
+          = do { tell (builderFromHsTyPatRn argx)
+               ; pure (mkHsAppKindTy noExtField t arg)}
+
+pat_to_type pat = lift $
+  failWith $ TcRnIllformedTypePattern pat
+  -- This failure is the only use of the TcM monad in `pat_to_type_pat`
+
+{-
+Note [Pattern to type (P2T) conversion]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Consider this:
+
+  data T a b where
+    MkT :: forall a. forall b -> a -> b -> T a b
+    -- NB: `a` is invisible, but `b` is required
+
+  f (MkT @[Int] (Maybe Bool) x y) = ...
+
+The second type argument of `MkT` is Required, so we write it without
+an `@` sign in the pattern match.  So the (Maybe Bool) will be
+  * parsed and renamed as a term pattern
+  * converted to a type when typechecking the pattern-match: the P2T conversion
+
+This is the only place we have P2T. In type-lambdas, the "pattern" is always a
+type variable:
+
+   f :: forall a -> a -> blah
+   f b (x::b) = ...
+
+The `b` argument must be a simple variable; we can't pattern-match on types.
+
+The function `pat_to_type` does the P2T conversion:
+   pat_to_type :: Pat GhcRn -> WriterT HsTyPatRnBuilder TcM (LHsType GhcRn)
+
+It is arranged as a writer monad, where the `HsTyPatRnBuilder` accumulates the
+binders bound by the type.  (We could discover these binders by a subsequent
+traversal, that would mean writing another traversal.)
+-}
+
+tc_ty_pat :: HsTyPat GhcRn -> TcTyVar -> TcM r -> TcM (TcType, r)
+tc_ty_pat tp tv thing_inside
+  = do { (sig_wcs, sig_ibs, arg_ty) <- tcHsTyPat tp (varType tv)
+       ; _ <- unifyType Nothing arg_ty (mkTyVarTy tv)
+       ; result <- tcExtendNameTyVarEnv sig_wcs $
+                   tcExtendNameTyVarEnv sig_ibs $
+                   thing_inside
+       ; return (arg_ty, result) }
 
 tc_pat  :: Scaled ExpSigmaTypeFRR
         -- ^ Fully refined result type
@@ -379,16 +633,16 @@ tc_pat pat_ty penv ps_pat thing_inside = case ps_pat of
         ; pat_ty <- readExpType (scaledThing pat_ty)
         ; return (mkHsWrapPat (wrap <.> mult_wrap) (VarPat x (L l id)) pat_ty, res) }
 
-  ParPat x lpar pat rpar -> do
+  ParPat x pat -> do
         { (pat', res) <- tc_lpat pat_ty penv pat thing_inside
-        ; return (ParPat x lpar pat' rpar, res) }
+        ; return (ParPat x pat', res) }
 
   BangPat x pat -> do
         { (pat', res) <- tc_lpat pat_ty penv pat thing_inside
         ; return (BangPat x pat', res) }
 
   LazyPat x pat -> do
-        { mult_wrap <- checkManyPattern pat_ty
+        { mult_wrap <- checkManyPattern LazyPatternReason (noLocA ps_pat) pat_ty
             -- See Note [Wrapper returned from tcSubMult] in GHC.Tc.Utils.Unify.
         ; (pat', (res, pat_ct))
                 <- tc_lpat pat_ty (makeLazy penv) pat $
@@ -406,14 +660,14 @@ tc_pat pat_ty penv ps_pat thing_inside = case ps_pat of
         ; return (mkHsWrapPat mult_wrap (LazyPat x pat') pat_ty, res) }
 
   WildPat _ -> do
-        { mult_wrap <- checkManyPattern pat_ty
+        { mult_wrap <- checkManyPattern OtherPatternReason (noLocA ps_pat) pat_ty
             -- See Note [Wrapper returned from tcSubMult] in GHC.Tc.Utils.Unify.
         ; res <- thing_inside
         ; pat_ty <- expTypeToType (scaledThing pat_ty)
         ; return (mkHsWrapPat mult_wrap (WildPat pat_ty) pat_ty, res) }
 
-  AsPat x (L nm_loc name) at pat -> do
-        { mult_wrap <- checkManyPattern pat_ty
+  AsPat x (L nm_loc name) pat -> do
+        { mult_wrap <- checkManyPattern OtherPatternReason (noLocA ps_pat) pat_ty
             -- See Note [Wrapper returned from tcSubMult] in GHC.Tc.Utils.Unify.
         ; (wrap, bndr_id) <- setSrcSpanA nm_loc (tcPatBndr penv name pat_ty)
         ; (pat', res) <- tcExtendIdEnv1 name bndr_id $
@@ -427,10 +681,10 @@ tc_pat pat_ty penv ps_pat thing_inside = case ps_pat of
             --
             -- If you fix it, don't forget the bindInstsOfPatIds!
         ; pat_ty <- readExpType (scaledThing pat_ty)
-        ; return (mkHsWrapPat (wrap <.> mult_wrap) (AsPat x (L nm_loc bndr_id) at pat') pat_ty, res) }
+        ; return (mkHsWrapPat (wrap <.> mult_wrap) (AsPat x (L nm_loc bndr_id) pat') pat_ty, res) }
 
   ViewPat _ expr pat -> do
-        { mult_wrap <- checkManyPattern pat_ty
+        { mult_wrap <- checkManyPattern ViewPatternReason (noLocA ps_pat) pat_ty
          -- See Note [Wrapper returned from tcSubMult] in GHC.Tc.Utils.Unify.
          --
          -- It should be possible to have view patterns at linear (or otherwise
@@ -444,7 +698,7 @@ tc_pat pat_ty penv ps_pat thing_inside = case ps_pat of
          -- Expression must be a function
         ; let herald = ExpectedFunTyViewPat $ unLoc expr
         ; (expr_wrap1, Scaled _mult inf_arg_ty, inf_res_sigma)
-            <- matchActualFunTySigma herald (Just . HsExprRnThing $ unLoc expr) (1,[]) expr_ty
+            <- matchActualFunTy herald (Just . HsExprRnThing $ unLoc expr) (1,expr_ty) expr_ty
                -- See Note [View patterns and polymorphism]
                -- expr_wrap1 :: expr_ty "->" (inf_arg_ty -> inf_res_sigma)
 
@@ -461,7 +715,7 @@ tc_pat pat_ty penv ps_pat thing_inside = case ps_pat of
                               (Scaled w pat_ty) inf_res_sigma
           -- expr_wrap2' :: (inf_arg_ty -> inf_res_sigma) "->"
           --                (pat_ty -> inf_res_sigma)
-          -- NB: pat_ty comes from matchActualFunTySigma, so it has a
+          -- NB: pat_ty comes from matchActualFunTy, so it has a
           -- fixed RuntimeRep, as needed to call mkWpFun.
         ; let
               expr_wrap = expr_wrap2' <.> expr_wrap1 <.> mult_wrap
@@ -483,7 +737,7 @@ arrow type (t1 -> t2); hence using (tcInferRho expr).
 
 Then, when taking that arrow apart we want to get a *sigma* type
 (forall b. b->(Int,b)), because that's what we want to bind 'x' to.
-Fortunately that's what matchActualFunTySigma returns anyway.
+Fortunately that's what matchActualFunTy returns anyway.
 -}
 
 -- Type signatures in patterns
@@ -596,7 +850,7 @@ Fortunately that's what matchActualFunTySigma returns anyway.
 --
 -- When there is no negation, neg_lit_ty and lit_ty are the same
   NPat _ (L l over_lit) mb_neg eq -> do
-        { mult_wrap <- checkManyPattern pat_ty
+        { mult_wrap <- checkManyPattern OtherPatternReason (noLocA ps_pat) pat_ty
           -- See Note [Wrapper returned from tcSubMult] in GHC.Tc.Utils.Unify.
           --
           -- It may be possible to refine linear pattern so that they work in
@@ -649,7 +903,7 @@ AST is used for the subtraction operation.
 -- See Note [NPlusK patterns]
   NPlusKPat _ (L nm_loc name)
                (L loc lit) _ ge minus -> do
-        { mult_wrap <- checkManyPattern pat_ty
+        { mult_wrap <- checkManyPattern OtherPatternReason (noLocA ps_pat) pat_ty
             -- See Note [Wrapper returned from tcSubMult] in GHC.Tc.Utils.Unify.
         ; let pat_exp_ty = scaledThing pat_ty
               orig = LiteralOrigin lit
@@ -702,6 +956,10 @@ AST is used for the subtraction operation.
       ; tc_pat pat_ty penv pat thing_inside }
 
   SplicePat (HsUntypedSpliceNested _) _ -> panic "tc_pat: nested splice in splice pat"
+
+  EmbTyPat _ _ -> failWith TcRnIllegalTypePattern
+
+  InvisPat _ _ -> panic "tc_pat: invisible pattern appears recursively in the pattern"
 
   XPat (HsPatExpanded lpat rpat) -> do
     { (rpat', res) <- tc_pat pat_ty penv rpat thing_inside
@@ -1029,7 +1287,7 @@ tcPatSynPat (L con_span con_name) pat_syn pat_ty penv arg_pats thing_inside
 
         ; when (any isEqPred prov_theta) warnMonoLocalBinds
 
-        ; mult_wrap <- checkManyPattern pat_ty
+        ; mult_wrap <- checkManyPattern PatternSynonymReason nlWildPatName pat_ty
             -- See Note [Wrapper returned from tcSubMult] in GHC.Tc.Utils.Unify.
 
         ; (univ_ty_args, ex_ty_args) <- splitConTyArgs con_like arg_pats
@@ -1059,7 +1317,7 @@ tcPatSynPat (L con_span con_name) pat_syn pat_ty penv arg_pats thing_inside
           -- 'tcDataConPat'.)
         ; let
             bad_arg_tys :: [(Int, Scaled Type)]
-            bad_arg_tys = filter (\ (_, Scaled _ arg_ty) -> typeLevity_maybe arg_ty == Nothing)
+            bad_arg_tys = filter (\ (_, Scaled _ arg_ty) -> not (typeHasFixedRuntimeRep arg_ty))
                         $ zip [0..] arg_tys'
         ; massertPpr (null bad_arg_tys) $
             vcat [ text "tcPatSynPat: pattern arguments do not have a fixed RuntimeRep"
@@ -1113,7 +1371,7 @@ to see `Annotated` in the call stack.
 This is achieve easily, but a bit trickily.  When we instantiate
 Annotated's "required" constraints, in tcPatSynPat, give them a
 CtOrigin of (OccurrenceOf "Annotated"). That way the special magic
-in GHC.Tc.Solver.Canonical.canClassNC which deals with CallStack
+in GHC.Tc.Solver.Dict.solveCallStack which deals with CallStack
 constraints will kick in: that logic only fires on constraints
 whose Origin is (OccurrenceOf f).
 
@@ -1329,7 +1587,7 @@ tcConValArgs con_like arg_tys penv con_args thing_inside = case con_args of
         -- NB: type_args already dealt with
         -- See Note [Type applications in patterns]
         { checkTc (con_arity == no_of_args)     -- Check correct arity
-                  (arityErr (text "constructor") con_like con_arity no_of_args)
+                  (TcRnArityMismatch (AConLike con_like) con_arity no_of_args)
 
         ; let pats_w_tys = zipEqual "tcConArgs" arg_pats arg_tys
         ; (arg_pats', res) <- tcMultiple tcConArg penv pats_w_tys thing_inside
@@ -1341,7 +1599,7 @@ tcConValArgs con_like arg_tys penv con_args thing_inside = case con_args of
 
   InfixCon p1 p2 -> do
         { checkTc (con_arity == 2)      -- Check correct arity
-                  (arityErr (text "constructor") con_like con_arity 2)
+                  (TcRnArityMismatch (AConLike con_like) con_arity 2)
         ; let [arg_ty1,arg_ty2] = arg_tys       -- This can't fail after the arity check
         ; ([p1',p2'], res) <- tcMultiple tcConArg penv [(p1,arg_ty1),(p2,arg_ty2)]
                                                   thing_inside
@@ -1427,12 +1685,7 @@ tcConTyArgs tenv penv prs thing_inside
 
 tcConTyArg :: Subst -> Checker (HsConPatTyArg GhcRn, TyVar) ()
 tcConTyArg tenv penv (HsConPatTyArg _ rn_ty, con_tv) thing_inside
-  = do { (sig_wcs, sig_ibs, arg_ty) <- tcHsPatSigType TypeAppCtxt HM_TyAppPat rn_ty AnyKind
-               -- AnyKind is a bit suspect: it really should be the kind gotten
-               -- from instantiating the constructor type. But this would be
-               -- hard to get right, because earlier type patterns might influence
-               -- the kinds of later patterns. In any case, it all gets checked
-               -- by the calls to unifyType below which unifies kinds
+  = do { (sig_wcs, sig_ibs, arg_ty) <- tcHsTyPat rn_ty (substTy tenv (varType con_tv))
 
        ; case NE.nonEmpty sig_ibs of
            Just sig_ibs_ne | inPatBind penv ->
@@ -1619,3 +1872,27 @@ checkGADT conlike ex_tvs arg_tys = \case
   where
     has_existentials :: Bool
     has_existentials = any (`elemVarSet` tyCoVarsOfTypes arg_tys) ex_tvs
+
+-- | Very similar to GHC.Tc.Pat.isIrrefutableHsPat, but doesn't typecheck the pattern
+--   It does depend on the type checker monad (`TcM`) however as we need to check ConPat case in more detail.
+--   Specifically, we call `tcLookupGlobal` to obtain constructor details from global packages
+--   for a comprehensive irrefutability check and avoid false negatives. (testcase pattern-fails.hs)
+isIrrefutableHsPatRnTcM :: Bool -> LPat GhcRn -> TcM Bool
+isIrrefutableHsPatRnTcM is_strict = isIrrefutableHsPatHelperM is_strict isConLikeIrr
+  where
+      doWork is_strict = isIrrefutableHsPatHelperM is_strict isConLikeIrr
+
+      isConLikeIrr is_strict (L _ dcName) details =
+        do { tyth <- tcLookupGlobal dcName
+           ; case tyth of
+               (ATyCon tycon) -> doCheck is_strict tycon details
+               (AConLike cl) ->
+                 case cl of
+                   RealDataCon dc -> doCheck is_strict (dataConTyCon dc) details
+                   PatSynCon _pat -> return False -- conservative
+               _ -> return False                  -- conservative
+           }
+
+      doCheck is_strict tycon details =  do { let b = isJust (tyConSingleDataCon_maybe tycon)
+                                            ; bs <- mapM (doWork is_strict) (hsConPatArgs details)
+                                            ; return (b && and bs) }

@@ -1,6 +1,8 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TupleSections       #-}
 {-# LANGUAGE RecursiveDo         #-}
+{-# LANGUAGE MultiWayIf          #-}
+{-# LANGUAGE RecordWildCards     #-}
 
 {-
 (c) The University of Glasgow 2006
@@ -11,16 +13,21 @@
 module GHC.Tc.Utils.Unify (
   -- Full-blown subsumption
   tcWrapResult, tcWrapResultO, tcWrapResultMono,
-  tcTopSkolemise, tcSkolemiseScoped, tcSkolemiseExpType,
   tcSubType, tcSubTypeSigma, tcSubTypePat, tcSubTypeDS,
   tcSubTypeAmbiguity, tcSubMult,
   checkConstraints, checkTvConstraints,
   buildImplicationFor, buildTvImplication, emitResidualTvConstraint,
 
+  -- Skolemisation
+  DeepSubsumptionFlag(..), getDeepSubsumptionFlag,
+  tcSkolemise, tcSkolemiseCompleteSig, tcSkolemiseExpectedType,
+
   -- Various unifications
-  unifyType, unifyKind, unifyExpectedType,
-  uType, promoteTcType,
-  swapOverTyVars, startSolvingByUnification,
+  unifyType, unifyKind, unifyInvisibleType, unifyExpectedType,
+  unifyTypeAndEmit, promoteTcType,
+  swapOverTyVars, touchabilityAndShapeTest,
+  UnifyEnv(..), updUEnvLoc, setUEnvRole,
+  uType,
 
   --------------------------------
   -- Holes
@@ -30,53 +37,60 @@ module GHC.Tc.Utils.Unify (
   matchExpectedAppTy,
   matchExpectedFunTys,
   matchExpectedFunKind,
-  matchActualFunTySigma, matchActualFunTysRho,
+  matchActualFunTy, matchActualFunTys,
 
-  checkTyVarEq, checkTyFamEq, checkTypeEq
-
+  checkTyEqRhs, recurseIntoTyConApp,
+  PuResult(..), failCheckWith, okCheckRefl, mapCheck,
+  TyEqFlags(..), TyEqFamApp(..), AreUnifying(..), LevelCheck(..), FamAppBreaker,
+  famAppArgFlags, simpleUnifyCheck, checkPromoteFreeVars,
   ) where
 
 import GHC.Prelude
 
 import GHC.Hs
 
-import GHC.Tc.Utils.Concrete ( hasFixedRuntimeRep, makeTypeConcrete, hasFixedRuntimeRep_syntactic )
+import GHC.Tc.Utils.Concrete ( hasFixedRuntimeRep, hasFixedRuntimeRep_syntactic )
 import GHC.Tc.Utils.Env
 import GHC.Tc.Utils.Instantiate
 import GHC.Tc.Utils.Monad
 import GHC.Tc.Utils.TcMType
 import GHC.Tc.Utils.TcType
-
-import GHC.Core.Type
-import GHC.Core.TyCo.Rep
-import GHC.Core.TyCo.Ppr( debugPprType )
-import GHC.Core.TyCon
-import GHC.Core.Coercion
-import GHC.Core.Multiplicity
-
-import qualified GHC.LanguageExtensions as LangExt
-
 import GHC.Tc.Types.Evidence
 import GHC.Tc.Types.Constraint
 import GHC.Tc.Types.Origin
-import GHC.Types.Name( Name, isSystemName )
+import GHC.Tc.Zonk.TcType
+
+import GHC.Core.Type
+import GHC.Core.TyCo.Rep
+import GHC.Core.TyCo.FVs( isInjectiveInType )
+import GHC.Core.TyCo.Ppr( debugPprType {- pprTyVar -} )
+import GHC.Core.TyCon
+import GHC.Core.Coercion
+import GHC.Core.Multiplicity
+import GHC.Core.Reduction
+
+import qualified GHC.LanguageExtensions as LangExt
 
 import GHC.Builtin.Types
+import GHC.Types.Name
+import GHC.Types.Id( idType )
 import GHC.Types.Var as Var
 import GHC.Types.Var.Set
 import GHC.Types.Var.Env
-import GHC.Utils.Error
-import GHC.Driver.Session
 import GHC.Types.Basic
-import GHC.Data.Bag
-import GHC.Data.FastString( fsLit )
+import GHC.Types.Unique.Set (nonDetEltsUniqSet)
+
+import GHC.Utils.Error
 import GHC.Utils.Misc
 import GHC.Utils.Outputable as Outputable
 import GHC.Utils.Panic
-import GHC.Utils.Panic.Plain
 
-import GHC.Exts      ( inline )
+import GHC.Driver.DynFlags
+import GHC.Data.Bag
+import GHC.Data.FastString( fsLit )
+
 import Control.Monad
+import Data.Monoid as DM ( Any(..) )
 import qualified Data.Semigroup as S ( (<>) )
 
 {- *********************************************************************
@@ -85,7 +99,7 @@ import qualified Data.Semigroup as S ( (<>) )
 *                                                                      *
 ********************************************************************* -}
 
--- | 'matchActualFunTySigma' looks for just one function arrow,
+-- | 'matchActualFunTy' looks for just one function arrow,
 -- returning an uninstantiated sigma-type.
 --
 -- Invariant: the returned argument type has a syntactically fixed
@@ -93,15 +107,14 @@ import qualified Data.Semigroup as S ( (<>) )
 -- in GHC.Tc.Utils.Concrete.
 --
 -- See Note [Return arguments with a fixed RuntimeRep].
-matchActualFunTySigma
+matchActualFunTy
   :: ExpectedFunTyOrigin
       -- ^ See Note [Herald for matchExpectedFunTys]
   -> Maybe TypedThing
       -- ^ The thing with type TcSigmaType
-  -> (Arity, [Scaled TcSigmaType])
+  -> (Arity, TcType)
       -- ^ Total number of value args in the call, and
-      -- types of values args to which function has
-      --   been applied already (reversed)
+      --   the original function type
       -- (Both are used only for error messages)
   -> TcRhoType
       -- ^ Type to analyse: a TcRhoType
@@ -113,11 +126,11 @@ matchActualFunTySigma
 --
 -- See Note [matchActualFunTy error handling] for the first three arguments
 
--- If   (wrap, arg_ty, res_ty) = matchActualFunTySigma ... fun_ty
+-- If   (wrap, arg_ty, res_ty) = matchActualFunTy ... fun_ty
 -- then wrap :: fun_ty ~> (arg_ty -> res_ty)
 -- and NB: res_ty is an (uninstantiated) SigmaType
 
-matchActualFunTySigma herald mb_thing err_info fun_ty
+matchActualFunTy herald mb_thing err_info fun_ty
   = assertPpr (isRhoTy fun_ty) (ppr fun_ty) $
     go fun_ty
   where
@@ -163,28 +176,23 @@ matchActualFunTySigma herald mb_thing err_info fun_ty
 
     ------------
     defer fun_ty
-      = do { arg_ty <- newOpenFlexiTyVarTy
+      = do { arg_ty <- new_check_arg_ty herald 1
            ; res_ty <- newOpenFlexiTyVarTy
-           ; mult <- newFlexiTyVarTy multiplicityTy
-           ; let unif_fun_ty = tcMkVisFunTy mult arg_ty res_ty
+           ; let unif_fun_ty = mkScaledFunTys [arg_ty] res_ty
            ; co <- unifyType mb_thing fun_ty unif_fun_ty
-           ; hasFixedRuntimeRep_syntactic (FRRExpectedFunTy herald 1) arg_ty
-           ; return (mkWpCastN co, Scaled mult arg_ty, res_ty) }
+           ; return (mkWpCastN co, arg_ty, res_ty) }
 
     ------------
-    mk_ctxt :: TcType -> TidyEnv -> TcM (TidyEnv, SDoc)
-    mk_ctxt res_ty env = mkFunTysMsg env herald (reverse arg_tys_so_far)
-                                     res_ty n_val_args_in_call
-    (n_val_args_in_call, arg_tys_so_far) = err_info
+    mk_ctxt :: TcType -> TidyEnv -> ZonkM (TidyEnv, SDoc)
+    mk_ctxt _res_ty = mkFunTysMsg herald err_info
 
 {- Note [matchActualFunTy error handling]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-matchActualFunTySigma is made much more complicated by the
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+matchActualFunTy is made much more complicated by the
 desire to produce good error messages. Consider the application
     f @Int x y
-In GHC.Tc.Gen.Expr.tcArgs we deal with visible type arguments,
-and then call matchActualFunTysPart for each individual value
-argument. It, in turn, must instantiate any type/dictionary args,
+In GHC.Tc.Gen.Head.tcInstFun we instantiate the function type, one
+argument at a time.  It must instantiate any type/dictionary args,
 before looking for an arrow type.
 
 But if it doesn't find an arrow type, it wants to generate a message
@@ -206,18 +214,17 @@ Ugh!
 -- INVARIANT: the returned argument types all have a syntactically fixed RuntimeRep
 -- in the sense of Note [Fixed RuntimeRep] in GHC.Tc.Utils.Concrete.
 -- See Note [Return arguments with a fixed RuntimeRep].
-matchActualFunTysRho :: ExpectedFunTyOrigin -- ^ See Note [Herald for matchExpectedFunTys]
-                     -> CtOrigin
-                     -> Maybe TypedThing -- ^ the thing with type TcSigmaType
-                     -> Arity
-                     -> TcSigmaType
-                     -> TcM (HsWrapper, [Scaled TcSigmaTypeFRR], TcRhoType)
--- If    matchActualFunTysRho n ty = (wrap, [t1,..,tn], res_ty)
+matchActualFunTys :: ExpectedFunTyOrigin -- ^ See Note [Herald for matchExpectedFunTys]
+                  -> CtOrigin
+                  -> Arity
+                  -> TcSigmaType
+                  -> TcM (HsWrapper, [Scaled TcSigmaTypeFRR], TcRhoType)
+-- If    matchActualFunTys n ty = (wrap, [t1,..,tn], res_ty)
 -- then  wrap : ty ~> (t1 -> ... -> tn -> res_ty)
 --       and res_ty is a RhoType
 -- NB: the returned type is top-instantiated; it's a RhoType
-matchActualFunTysRho herald ct_orig mb_thing n_val_args_wanted fun_ty
-  = go n_val_args_wanted [] fun_ty
+matchActualFunTys herald ct_orig n_val_args_wanted top_ty
+  = go n_val_args_wanted [] top_ty
   where
     go n so_far fun_ty
       | not (isRhoTy fun_ty)
@@ -228,22 +235,402 @@ matchActualFunTysRho herald ct_orig mb_thing n_val_args_wanted fun_ty
     go 0 _ fun_ty = return (idHsWrapper, [], fun_ty)
 
     go n so_far fun_ty
-      = do { (wrap_fun1, arg_ty1, res_ty1) <- matchActualFunTySigma
-                                                 herald mb_thing
-                                                 (n_val_args_wanted, so_far)
+      = do { (wrap_fun1, arg_ty1, res_ty1) <- matchActualFunTy
+                                                 herald Nothing
+                                                 (n_val_args_wanted, top_ty)
                                                  fun_ty
            ; (wrap_res, arg_tys, res_ty)   <- go (n-1) (arg_ty1:so_far) res_ty1
            ; let wrap_fun2 = mkWpFun idHsWrapper wrap_res arg_ty1 res_ty
-           -- NB: arg_ty1 comes from matchActualFunTySigma, so it has
+           -- NB: arg_ty1 comes from matchActualFunTy, so it has
            -- a syntactically fixed RuntimeRep as needed to call mkWpFun.
            ; return (wrap_fun2 <.> wrap_fun1, arg_ty1:arg_tys, res_ty) }
 
 {-
 ************************************************************************
 *                                                                      *
-             matchExpected functions
+          Skolemisation and matchExpectedFunTys
 *                                                                      *
 ************************************************************************
+
+Note [Skolemisation overview]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Suppose f :: (forall a. a->a) -> blah, and we have the application (f e)
+Then we want to typecheck `e` pushing in the type `forall a. a->a`. But we
+need to be careful:
+
+* Roughly speaking, in (tcPolyExpr e (forall a b. rho)), we skolemise `a` and `b`,
+  and then call (tcExpr e rho)
+
+* But not quite!  We must be careful if `e` is a type lambda (\ @p @q -> blah).
+  Then we want to line up the skolemised variables `a`,`b`
+  with `p`,`q`, so we can't just call (tcExpr (\ @p @q -> blah) rho)
+
+* A very similar situation arises with
+     (\ @p @q -> blah) :: forall a b. rho
+  Again, we must line up `p`, `q` with the skolemised `a` and `b`.
+
+* Another similar situation arises with
+    g :: forall a b. rho
+    g @p @q x y = ....
+  Here again when skolemising `a` and `b` we must be careful to match them up
+  with `p` and `q`.
+
+OK, so how exactly do we check @p binders in lambdas?  First note that we only
+we only attempt to deal with @p binders when /checking/. We don't do inference for
+(\ @a -> blah), not yet anyway.
+
+For checking, there are two cases to consider:
+  * Function LHS, where the function has a type signature
+                  f :: forall a. a -> forall b. [b] -> blah
+                  f @p x @q y = ...
+
+  * Lambda        \ @p x @q y -> ...
+                  \cases { @p x @q y -> ... }
+    (\case p behaves like \cases { p -> ... }, and p is always a term pattern.)
+
+Both ultimately handled by matchExpectedFunTys.
+
+* Function LHS case is handled by `GHC.Tc.Gen.Bind.tcPolyCheck`:
+  * It calls `tcSkolemiseCompleteSig`
+  * Passes the skolemised variables into `tcFunBindMatches`
+  * Which uses `matchExpectedFunTys` to decompose the function type to
+    match the arguments
+  * And then passes the (skolemised-variables ++ arg tys) on to `tcMatches`
+
+* For the Lambda case there are two sub-cases:
+   * An expression with a type signature: (\ @a x y -> blah) :: hs_ty
+     This is handled by `GHC.Tc.Gen.Head.tcExprWithSig`, which kind-checks
+     the signature and hands off to `tcExprPolyCheck` vai `tcPolyLExprSig`
+     Note that the foralls at the top of hs_ty scope over the expression.
+
+   * A higher order call: h e, where h :: poly_ty -> blah
+     This is handlded by `GHC.Tc.Gen.Expr.tcPolyExpr`, which (in the
+     checking case) again hands off to `tcExprPolyCheck`.  Here there is
+     no type-variable scoping to worry about.
+
+  So both sub-cases end up in `GHC.Tc.Gen.Expr.tcPolyExprCheck`
+  * This skolemises the /top-level/ invisible binders, but remembers
+    the binders as [ExpPatType]
+  * Then it looks for a lambda, and if so, calls `tcLambdaMatches` passing in
+    the skolemised binders so they can be matched up with the lambda binders.
+  * Otherwise it does deep-skolemisation if DeepSubsumption is on,
+    and then calls tcExpr to typecheck `e`
+
+  The outer skolemisation in tcPolyExprCheck is done using
+    * tcSkolemiseCompleteSig when there is a user-written signature
+    * tcSkolemiseGeneral when the polytype just comes from the context e.g. (f e)
+  The former just calls the latter, so the two cases differ only slightly:
+    * Both do shallow skolemisation
+    * Both go via checkConstraints, which uses implicationNeeded to decide whether
+      to build an implication constraint even if there /are/ no skolems.
+      See Note [When to build an implication] below.
+
+  The difference between the two cases is that `tcSkolemiseCompleteSig`
+  also brings the outer type variables into scope.  It would do no
+  harm to do so in both cases, but I found that (to my surprise) doing
+  so caused a non-trivial (1%-ish) perf hit on the compiler.
+
+* `tcFunBindMatches` and `tcLambdaMatches` both use `matchExpectedFunTys`, which
+  ensures that any trailing invisible binders are skolemised; and does so deeply
+  if DeepSubsumption is on.
+
+  This corresponds to the plan: "skolemise at the '=' of a function binding or
+  at the '->' of a lambda binding".  (See #17594 and "Plan B2".)
+
+Some wrinkles
+
+(SK1) tcSkolemiseGeneral and tcSkolemiseCompleteSig make fresh type variables
+      See Note [Instantiate sig with fresh variables]
+
+(SK2) All skolemisation (even without DeepSubsumption) builds just one implication
+      constraint for a nested forall like:
+          forall a. Eq a => forall b. Ord b => blah
+      The implication constraint will look like
+          forall a b. (Eq a, Ord b) => <constraints>
+      See the loop in GHC.Tc.Utils.Instantiate.topSkolemise.
+      and Note [Skolemisation en-bloc] in that module
+
+
+Some examples:
+
+*     f :: forall a b. blah
+      f @p x = rhs
+  `tcPolyCheck` calls `tcSkolemiseCompleteSig` to skolemise the signature, and
+  then calls `tcFunBindMatches` passing in [a_sk, b_sk], the skolemsed
+  variables. The latter ultimately calls `tcMatches`, and thence `tcMatchPats`.
+  The latter matches up the `a_sk` with `@p`, and discards the `b_sk`.
+
+*     f :: forall (a::Type) (b::a). blah
+      f @(p::b) x = rhs
+  `tcSkolemiseCompleteSig` brings `a` and `b` into scope, bound to `a_sk` and `b_sk` resp.
+  When `tcMatchPats` typechecks the pattern `@(p::b)` it'll find that `b` is in
+  scope (as a result of tcSkolemiseCompleteSig) which is a bit strange.  But
+  it'll then unify the kinds `Type ~ b`, which will fail as it should.
+
+*     f :: Int -> forall (a::Type) (b::a). blah
+      f x  @p = rhs
+  `matchExpectedFunTys` does shallow skolemisation eagerly, so we'll skolemise the
+  forall a b.  Then `tcMatchPats` will bind [p :-> a_sk], and discard `b_sk`.
+  Discarding the `b_sk` means that
+      f x @p = \ @q -> blah
+  or  f x @p = let .. in \ @q -> blah
+  will both be rejected: this is Plan B2: skolemise at the "=".
+
+* Suppose DeepSubsumption is on
+    f :: forall a. a -> forall b. b -> b -> forall z. z
+    f @p x @q y = rhs
+  The `tcSkolemiseCompleteSig` uses shallow skolemisation, so it only skolemises
+  and brings into scope [a :-> a_sk]. Then `matchExpectedFunTys` skolemises the
+  forall b, because it needs to expose two value arguments.  Finally
+  `matchExpectedFunTys` concludes with deeply skolemising the remaining type.
+
+  So we end up with `[p :-> a_sk, q :-> b_sk]`.  Notice that we must not
+  deeply-skolemise /first/ or we'd get the tyvars [a_sk, b_sk, c_sk] which would
+  not line up with the patterns [@p, x, @q, y]
+-}
+
+tcSkolemiseGeneral
+  :: DeepSubsumptionFlag
+  -> UserTypeCtxt
+  -> TcType -> TcType   -- top_ty and expected_ty
+        -- Here, top_ty      is the type we started to skolemise; used only in SigSkol
+        -- -     expected_ty is the type we are actually skolemising
+        -- matchExpectedFunTys walks down the type, skolemising as it goes,
+        -- keeping the same top_ty, but successively smaller expected_tys
+  -> ([(Name, TcInvisTVBinder)] -> TcType -> TcM result)
+  -> TcM (HsWrapper, result)
+tcSkolemiseGeneral ds_flag ctxt top_ty expected_ty thing_inside
+  | definitely_mono ds_flag expected_ty
+    -- Fast path for a very very common case: no skolemisation to do
+    -- But still call checkConstraints in case we need an implication regardless
+  = do { let sig_skol = SigSkol ctxt top_ty []
+       ; (ev_binds, result) <- checkConstraints sig_skol [] [] $
+                               thing_inside [] expected_ty
+       ; return (mkWpLet ev_binds, result) }
+
+  | otherwise
+  = do { -- rec {..}: see Note [Keeping SkolemInfo inside a SkolemTv]
+         --           in GHC.Tc.Utils.TcType
+       ; rec { (wrap, tv_prs, given, rho_ty) <- case ds_flag of
+                    Deep    -> deeplySkolemise skol_info expected_ty
+                    Shallow -> topSkolemise skol_info expected_ty
+             ; let sig_skol = SigSkol ctxt top_ty (map (fmap binderVar) tv_prs)
+             ; skol_info <- mkSkolemInfo sig_skol }
+
+       ; let skol_tvs = map (binderVar . snd) tv_prs
+       ; traceTc "tcSkolemiseGeneral" (pprUserTypeCtxt ctxt <+> ppr skol_tvs <+> ppr given)
+       ; (ev_binds, result) <- checkConstraints sig_skol skol_tvs given $
+                               thing_inside tv_prs rho_ty
+
+       ; return (wrap <.> mkWpLet ev_binds, result) }
+         -- The ev_binds returned by checkConstraints is very
+         -- often empty, in which case mkWpLet is a no-op
+
+tcSkolemiseCompleteSig :: TcCompleteSig
+                       -> ([ExpPatType] -> TcRhoType -> TcM result)
+                       -> TcM (HsWrapper, result)
+-- ^ The wrapper has type: spec_ty ~> expected_ty
+-- See Note [Skolemisation] for the differences between
+-- tcSkolemiseCompleteSig and tcTopSkolemise
+
+tcSkolemiseCompleteSig (CSig { sig_bndr = poly_id, sig_ctxt = ctxt, sig_loc = loc })
+                       thing_inside
+  = do { cur_loc <- getSrcSpanM
+       ; let poly_ty = idType poly_id
+       ; setSrcSpan loc $   -- Sets the location for the implication constraint
+         tcSkolemiseGeneral Shallow ctxt poly_ty poly_ty $ \tv_prs rho_ty ->
+         setSrcSpan cur_loc $ -- Revert to the original location
+         tcExtendNameTyVarEnv (map (fmap binderVar) tv_prs) $
+         thing_inside (map (mkInvisExpPatType . snd) tv_prs) rho_ty }
+
+tcSkolemiseExpectedType :: TcSigmaType
+                        -> ([ExpPatType] -> TcRhoType -> TcM result)
+                        -> TcM (HsWrapper, result)
+-- Just like tcSkolemiseCompleteSig, except that we don't have a user-written
+-- type signature, we only have a type comimg from the context.
+-- Eg. f :: (forall a. blah) -> blah
+--     In the call (f e) we will call tcSkolemiseExpectedType on (forall a.blah)
+--     before typececking `e`
+tcSkolemiseExpectedType exp_ty thing_inside
+  = tcSkolemiseGeneral Shallow GenSigCtxt exp_ty exp_ty $ \tv_prs rho_ty ->
+    thing_inside (map (mkInvisExpPatType . snd) tv_prs) rho_ty
+
+tcSkolemise :: DeepSubsumptionFlag -> UserTypeCtxt -> TcSigmaType
+            -> (TcRhoType -> TcM result)
+            -> TcM (HsWrapper, result)
+tcSkolemise ds_flag ctxt expected_ty thing_inside
+  = tcSkolemiseGeneral ds_flag ctxt expected_ty expected_ty $ \_ rho_ty ->
+    thing_inside rho_ty
+
+checkConstraints :: SkolemInfoAnon
+                 -> [TcTyVar]           -- Skolems
+                 -> [EvVar]             -- Given
+                 -> TcM result
+                 -> TcM (TcEvBinds, result)
+-- checkConstraints is careful to build an implication even if
+-- `skol_tvs` and `given` are both empty, under certain circumstances
+-- See Note [When to build an implication]
+checkConstraints skol_info skol_tvs given thing_inside
+  = do { implication_needed <- implicationNeeded skol_info skol_tvs given
+
+       ; if implication_needed
+         then do { (tclvl, wanted, result) <- pushLevelAndCaptureConstraints thing_inside
+                 ; (implics, ev_binds) <- buildImplicationFor tclvl skol_info skol_tvs given wanted
+                 ; traceTc "checkConstraints" (ppr tclvl $$ ppr skol_tvs)
+                 ; emitImplications implics
+                 ; return (ev_binds, result) }
+
+         else -- Fast path.  We check every function argument with tcCheckPolyExpr,
+              -- which uses tcTopSkolemise and hence checkConstraints.
+              -- So this fast path is well-exercised
+              do { res <- thing_inside
+                 ; return (emptyTcEvBinds, res) } }
+
+checkTvConstraints :: SkolemInfo
+                   -> [TcTyVar]          -- Skolem tyvars
+                   -> TcM result
+                   -> TcM result
+
+checkTvConstraints skol_info skol_tvs thing_inside
+  = do { (tclvl, wanted, result) <- pushLevelAndCaptureConstraints thing_inside
+       ; emitResidualTvConstraint skol_info skol_tvs tclvl wanted
+       ; return result }
+
+emitResidualTvConstraint :: SkolemInfo -> [TcTyVar]
+                         -> TcLevel -> WantedConstraints -> TcM ()
+emitResidualTvConstraint skol_info skol_tvs tclvl wanted
+  | not (isEmptyWC wanted) ||
+    checkTelescopeSkol skol_info_anon
+  = -- checkTelescopeSkol: in this case, /always/ emit this implication
+    -- even if 'wanted' is empty. We need the implication so that we check
+    -- for a bad telescope. See Note [Skolem escape and forall-types] in
+    -- GHC.Tc.Gen.HsType
+    do { implic <- buildTvImplication skol_info_anon skol_tvs tclvl wanted
+       ; emitImplication implic }
+
+  | otherwise  -- Empty 'wanted', emit nothing
+  = return ()
+  where
+     skol_info_anon = getSkolemInfo skol_info
+
+buildTvImplication :: SkolemInfoAnon -> [TcTyVar]
+                   -> TcLevel -> WantedConstraints -> TcM Implication
+buildTvImplication skol_info skol_tvs tclvl wanted
+  = assertPpr (all (isSkolemTyVar <||> isTyVarTyVar) skol_tvs) (ppr skol_tvs) $
+    do { ev_binds <- newNoTcEvBinds  -- Used for equalities only, so all the constraints
+                                     -- are solved by filling in coercion holes, not
+                                     -- by creating a value-level evidence binding
+       ; implic   <- newImplication
+
+       ; let implic' = implic { ic_tclvl     = tclvl
+                              , ic_skols     = skol_tvs
+                              , ic_given_eqs = NoGivenEqs
+                              , ic_wanted    = wanted
+                              , ic_binds     = ev_binds
+                              , ic_info      = skol_info }
+
+       ; checkImplicationInvariants implic'
+       ; return implic' }
+
+implicationNeeded :: SkolemInfoAnon -> [TcTyVar] -> [EvVar] -> TcM Bool
+-- See Note [When to build an implication]
+implicationNeeded skol_info skol_tvs given
+  | null skol_tvs
+  , null given
+  , not (alwaysBuildImplication skol_info)
+  = -- Empty skolems and givens
+    do { tc_lvl <- getTcLevel
+       ; if not (isTopTcLevel tc_lvl)  -- No implication needed if we are
+         then return False             -- already inside an implication
+         else
+    do { dflags <- getDynFlags       -- If any deferral can happen,
+                                     -- we must build an implication
+       ; return (gopt Opt_DeferTypeErrors dflags ||
+                 gopt Opt_DeferTypedHoles dflags ||
+                 gopt Opt_DeferOutOfScopeVariables dflags) } }
+
+  | otherwise     -- Non-empty skolems or givens
+  = return True   -- Definitely need an implication
+
+alwaysBuildImplication :: SkolemInfoAnon -> Bool
+-- See Note [When to build an implication]
+alwaysBuildImplication _ = False
+
+{-  Commmented out for now while I figure out about error messages.
+    See #14185
+
+alwaysBuildImplication (SigSkol ctxt _ _)
+  = case ctxt of
+      FunSigCtxt {} -> True  -- RHS of a binding with a signature
+      _             -> False
+alwaysBuildImplication (RuleSkol {})      = True
+alwaysBuildImplication (InstSkol {})      = True
+alwaysBuildImplication (FamInstSkol {})   = True
+alwaysBuildImplication _                  = False
+-}
+
+buildImplicationFor :: TcLevel -> SkolemInfoAnon -> [TcTyVar]
+                   -> [EvVar] -> WantedConstraints
+                   -> TcM (Bag Implication, TcEvBinds)
+buildImplicationFor tclvl skol_info skol_tvs given wanted
+  | isEmptyWC wanted && null given
+             -- Optimisation : if there are no wanteds, and no givens
+             -- don't generate an implication at all.
+             -- Reason for the (null given): we don't want to lose
+             -- the "inaccessible alternative" error check
+  = return (emptyBag, emptyTcEvBinds)
+
+  | otherwise
+  = assertPpr (all (isSkolemTyVar <||> isTyVarTyVar) skol_tvs) (ppr skol_tvs) $
+      -- Why allow TyVarTvs? Because implicitly declared kind variables in
+      -- non-CUSK type declarations are TyVarTvs, and we need to bring them
+      -- into scope as a skolem in an implication. This is OK, though,
+      -- because TyVarTvs will always remain tyvars, even after unification.
+    do { ev_binds_var <- newTcEvBinds
+       ; implic <- newImplication
+       ; let implic' = implic { ic_tclvl  = tclvl
+                              , ic_skols  = skol_tvs
+                              , ic_given  = given
+                              , ic_wanted = wanted
+                              , ic_binds  = ev_binds_var
+                              , ic_info   = skol_info }
+       ; checkImplicationInvariants implic'
+
+       ; return (unitBag implic', TcEvBinds ev_binds_var) }
+
+{- Note [When to build an implication]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Suppose we have some 'skolems' and some 'givens', and we are
+considering whether to wrap the constraints in their scope into an
+implication.  We must /always/ do so if either 'skolems' or 'givens' are
+non-empty.  But what if both are empty?  You might think we could
+always drop the implication.  Other things being equal, the fewer
+implications the better.  Less clutter and overhead.  But we must
+take care:
+
+* If we have an unsolved [W] g :: a ~# b, and -fdefer-type-errors,
+  we'll make a /term-level/ evidence binding for 'g = error "blah"'.
+  We must have an EvBindsVar those bindings!, otherwise they end up as
+  top-level unlifted bindings, which are verboten. This only matters
+  at top level, so we check for that
+  See also Note [Deferred errors for coercion holes] in GHC.Tc.Errors.
+  cf #14149 for an example of what goes wrong.
+
+* This is /necessary/ for top level but may be /desirable/ even for
+  nested bindings, because if the deferred coercion is bound too far
+  out it will be reported even if that thunk (say) is not evaluated.
+
+* If you have
+     f :: Int;  f = f_blah
+     g :: Bool; g = g_blah
+  If we don't build an implication for f or g (no tyvars, no givens),
+  the constraints for f_blah and g_blah are solved together.  And that
+  can yield /very/ confusing error messages, because we can get
+      [W] C Int b1    -- from f_blah
+      [W] C Int b2    -- from g_blan
+  and fundeps can yield [W] b1 ~ b2, even though the two functions have
+  literally nothing to do with each other.  #14185 is an example.
+  Building an implication keeps them separate.
 
 Note [Herald for matchExpectedFunTys]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -305,8 +692,8 @@ Note [Return arguments with a fixed RuntimeRep]
 The functions
 
   - matchExpectedFunTys,
-  - matchActualFunTySigma,
-  - matchActualFunTysRho,
+  - matchActualFunTy,
+  - matchActualFunTys,
 
 peel off argument types, as explained in Note [matchExpectedFunTys].
 It's important that these functions return argument types that have
@@ -334,7 +721,7 @@ Example:
 
   The body of `f` is a lambda abstraction, so we must be able to split off
   one argument type from its type. This is handled by `matchExpectedFunTys`
-  (see 'GHC.Tc.Gen.Match.tcMatchLambda'). We end up with desugared Core that
+  (see 'GHC.Tc.Gen.Match.tcLambdaMatches'). We end up with desugared Core that
   looks like this:
 
     f :: forall (a :: TYPE (F Int)). Dual (a |> (TYPE F[0]))
@@ -362,54 +749,104 @@ Example:
 -- in the sense of Note [Fixed RuntimeRep] in GHC.Tc.Utils.Concrete.
 -- See Note [Return arguments with a fixed RuntimeRep].
 matchExpectedFunTys :: forall a.
-                       ExpectedFunTyOrigin -- See Note [Herald for matchExpectedFunTys]
+                       ExpectedFunTyOrigin  -- See Note [Herald for matchExpectedFunTys]
                     -> UserTypeCtxt
-                    -> Arity
-                    -> ExpRhoType      -- Skolemised
-                    -> ([Scaled ExpSigmaTypeFRR] -> ExpRhoType -> TcM a)
+                    -> VisArity
+                    -> ExpSigmaType
+                    -> ([ExpPatType] -> ExpRhoType -> TcM a)
                     -> TcM (HsWrapper, a)
 -- If    matchExpectedFunTys n ty = (wrap, _)
 -- then  wrap : (t1 -> ... -> tn -> ty_r) ~> ty,
 --   where [t1, ..., tn], ty_r are passed to the thing_inside
-matchExpectedFunTys herald ctx arity orig_ty thing_inside
-  = case orig_ty of
-      Check ty -> go [] arity ty
-      _        -> defer [] arity orig_ty
+--
+-- Unconditionally concludes by skolemising any trailing invisible
+-- binders and, if DeepSubsumption is on, it does so deeply.
+--
+-- Postcondition:
+--   If exp_ty is Check {}, then [ExpPatType] and ExpRhoType results are all Check{}
+--   If exp_ty is Infer {}, then [ExpPatType] and ExpRhoType results are all Infer{}
+matchExpectedFunTys herald _ arity (Infer inf_res) thing_inside
+  = do { arg_tys <- mapM (new_infer_arg_ty herald) [1 .. arity]
+       ; res_ty  <- newInferExpType
+       ; result  <- thing_inside (map ExpFunPatTy arg_tys) res_ty
+       ; arg_tys <- mapM (\(Scaled m t) -> Scaled m <$> readExpType t) arg_tys
+       ; res_ty  <- readExpType res_ty
+       ; co <- fillInferResult (mkScaledFunTys arg_tys res_ty) inf_res
+       ; return (mkWpCastN co, result) }
+
+matchExpectedFunTys herald ctx arity (Check top_ty) thing_inside
+  = check arity [] top_ty
   where
-    -- Skolemise any foralls /before/ the zero-arg case
-    -- so that we guarantee to return a rho-type
-    go acc_arg_tys n ty
-      | (tvs, theta, _) <- tcSplitSigmaTy ty
-      , not (null tvs && null theta)
-      = do { (wrap_gen, (wrap_res, result)) <- tcTopSkolemise ctx ty $ \ty' ->
-                                               go acc_arg_tys n ty'
-           ; return (wrap_gen <.> wrap_res, result) }
+    check :: VisArity -> [ExpPatType] -> TcSigmaType -> TcM (HsWrapper, a)
+    -- `check` is called only in the Check{} case
+    -- It collects rev_pat_tys in reversed order
+    -- n_req is the number of /visible/ arguments still needed
 
-    -- No more args; do this /before/ coreView, so
-    -- that we do not unnecessarily unwrap synonyms
-    go acc_arg_tys 0 rho_ty
-      = do { result <- thing_inside (reverse acc_arg_tys) (mkCheckExpType rho_ty)
-           ; return (idHsWrapper, result) }
+    ----------------------------
+    -- Skolemise quantifiers, both visible (up to n_req) and invisible
+    -- See Note [Visible type application and abstraction] in GHC.Tc.Gen.App
+    check n_req rev_pat_tys ty
+      | isSigmaTy ty                     -- An invisible quantifier at the top
+        || (n_req > 0 && isForAllTy ty)  -- A visible quantifier at top, and we need it
+      = do { rec { (n_req', wrap_gen, tv_nms, bndrs, given, inner_ty) <- skolemiseRequired skol_info n_req ty
+                 ; let sig_skol = SigSkol ctx top_ty (tv_nms `zip` skol_tvs)
+                       skol_tvs = binderVars bndrs
+                 ; skol_info <- mkSkolemInfo sig_skol }
+             -- rec {..}: see Note [Keeping SkolemInfo inside a SkolemTv]
+             --           in GHC.Tc.Utils.TcType
+           ; (ev_binds, (wrap_res, result))
+                  <- checkConstraints (getSkolemInfo skol_info) skol_tvs given $
+                     check n_req'
+                           (reverse (map ExpForAllPatTy bndrs) ++ rev_pat_tys)
+                           inner_ty
+           ; assertPpr (not (null bndrs && null given)) (ppr ty) $
+                       -- The guard ensures that we made some progress
+             return (wrap_gen <.> mkWpLet ev_binds <.> wrap_res, result) }
 
-    go acc_arg_tys n ty
-      | Just ty' <- coreView ty = go acc_arg_tys n ty'
+    ----------------------------
+    -- Base case: (n_req == 0): no more args
+    --    The earlier skolemisation ensurs that rho_ty has no top-level invisible quantifiers
+    --    If there is deep subsumption, do deep skolemisation now
+    check n_req rev_pat_tys rho_ty
+      | n_req == 0
+      = do { let pat_tys = reverse rev_pat_tys
+           ; ds_flag <- getDeepSubsumptionFlag
+           ; case ds_flag of
+               Shallow -> do { res <- thing_inside pat_tys (mkCheckExpType rho_ty)
+                             ; return (idHsWrapper, res) }
+               Deep    -> tcSkolemiseGeneral Deep ctx top_ty rho_ty $ \_ rho_ty ->
+                          -- "_" drop the /deeply/-skolemise binders
+                          -- They do not line up with binders in the Match
+                          thing_inside pat_tys (mkCheckExpType rho_ty) }
 
-    go acc_arg_tys n (FunTy { ft_af = af, ft_mult = mult, ft_arg = arg_ty, ft_res = res_ty })
+    ----------------------------
+    -- Function types
+    check n_req rev_pat_tys (FunTy { ft_af = af, ft_mult = mult
+                                   , ft_arg = arg_ty, ft_res = res_ty })
       = assert (isVisibleFunArg af) $
-        do { let arg_pos = 1 + length acc_arg_tys -- for error messages only
+        do { let arg_pos = arity - n_req + 1   -- 1 for the first argument etc
            ; (arg_co, arg_ty) <- hasFixedRuntimeRep (FRRExpectedFunTy herald arg_pos) arg_ty
-           ; (wrap_res, result) <- go ((Scaled mult $ mkCheckExpType arg_ty) : acc_arg_tys)
-                                      (n-1) res_ty
+           ; (wrap_res, result) <- check (n_req - 1)
+                                         (mkCheckExpFunPatTy (Scaled mult arg_ty) : rev_pat_tys)
+                                         res_ty
            ; let wrap_arg = mkWpCastN arg_co
                  fun_wrap = mkWpFun wrap_arg wrap_res (Scaled mult arg_ty) res_ty
            ; return (fun_wrap, result) }
 
-    go acc_arg_tys n ty@(TyVarTy tv)
+    ----------------------------
+    -- Type variables
+    check n_req rev_pat_tys ty@(TyVarTy tv)
       | isMetaTyVar tv
       = do { cts <- readMetaTyVar tv
            ; case cts of
-               Indirect ty' -> go acc_arg_tys n ty'
-               Flexi        -> defer acc_arg_tys n (mkCheckExpType ty) }
+               Indirect ty' -> check n_req rev_pat_tys ty'
+               Flexi        -> defer n_req rev_pat_tys ty }
+
+    ----------------------------
+    -- NOW do coreView.  We didn't do it before, so that we do not unnecessarily
+    -- unwrap a synonym in the returned rho_ty
+    check n_req rev_pat_tys ty
+      | Just ty' <- coreView ty = check n_req rev_pat_tys ty'
 
        -- In all other cases we bale out into ordinary unification
        -- However unlike the meta-tyvar case, we are sure that the
@@ -426,62 +863,94 @@ matchExpectedFunTys herald ctx arity orig_ty thing_inside
        --
        -- But in that case we add specialized type into error context
        -- anyway, because it may be useful. See also #9605.
-    go acc_arg_tys n ty = addErrCtxtM (mk_ctxt acc_arg_tys ty) $
-                          defer acc_arg_tys n (mkCheckExpType ty)
+    check n_req rev_pat_tys res_ty
+      = addErrCtxtM (mkFunTysMsg herald (arity, top_ty))  $
+        defer n_req rev_pat_tys res_ty
 
     ------------
-    defer :: [Scaled ExpSigmaTypeFRR] -> Arity -> ExpRhoType -> TcM (HsWrapper, a)
-    defer acc_arg_tys n fun_ty
-      = do { let last_acc_arg_pos = length acc_arg_tys
-           ; more_arg_tys <- mapM new_exp_arg_ty [last_acc_arg_pos + 1 .. last_acc_arg_pos + n]
-           ; res_ty       <- newInferExpType
-           ; result       <- thing_inside (reverse acc_arg_tys ++ more_arg_tys) res_ty
-           ; more_arg_tys <- mapM (\(Scaled m t) -> Scaled m <$> readExpType t) more_arg_tys
-           ; res_ty       <- readExpType res_ty
-           ; let unif_fun_ty = mkScaledFunTys more_arg_tys res_ty
-           ; wrap <- tcSubType AppOrigin ctx unif_fun_ty fun_ty
-                         -- Not a good origin at all :-(
-           ; return (wrap, result) }
+    defer :: VisArity -> [ExpPatType] -> TcRhoType -> TcM (HsWrapper, a)
+    defer n_req rev_pat_tys fun_ty
+      = do { more_arg_tys <- mapM (new_check_arg_ty herald) [arity - n_req + 1 .. arity]
+           ; let all_pats = reverse rev_pat_tys ++ map mkCheckExpFunPatTy more_arg_tys
+           ; res_ty <- newOpenFlexiTyVarTy
+           ; result <- thing_inside all_pats (mkCheckExpType res_ty)
 
-    new_exp_arg_ty :: Int -> TcM (Scaled ExpSigmaTypeFRR)
-    new_exp_arg_ty arg_pos -- position for error messages only
-      = mkScaled <$> newFlexiTyVarTy multiplicityTy
-                 <*> newInferExpTypeFRR (FRRExpectedFunTy herald arg_pos)
+           ; co <- unifyType Nothing (mkScaledFunTys more_arg_tys res_ty) fun_ty
+           ; return (mkWpCastN co, result) }
 
-    ------------
-    mk_ctxt :: [Scaled ExpSigmaTypeFRR] -> TcType -> TidyEnv -> TcM (TidyEnv, SDoc)
-    mk_ctxt arg_tys res_ty env
-      = mkFunTysMsg env herald arg_tys' res_ty arity
-      where
-        arg_tys' = map (\(Scaled u v) -> Scaled u (checkingExpType "matchExpectedFunTys" v)) $
-                   reverse arg_tys
-            -- this is safe b/c we're called from "go"
+new_infer_arg_ty :: ExpectedFunTyOrigin -> Int -> TcM (Scaled ExpSigmaTypeFRR)
+new_infer_arg_ty herald arg_pos -- position for error messages only
+  = do { mult     <- newFlexiTyVarTy multiplicityTy
+       ; inf_hole <- newInferExpTypeFRR (FRRExpectedFunTy herald arg_pos)
+       ; return (mkScaled mult inf_hole) }
 
-mkFunTysMsg :: TidyEnv
-            -> ExpectedFunTyOrigin
-            -> [Scaled TcType] -> TcType -> Arity
-            -> TcM (TidyEnv, SDoc)
-mkFunTysMsg env herald arg_tys res_ty n_val_args_in_call
-  = do { (env', fun_rho) <- zonkTidyTcType env $
-                            mkScaledFunTys arg_tys res_ty
+new_check_arg_ty :: ExpectedFunTyOrigin -> Int -> TcM (Scaled TcType)
+new_check_arg_ty herald arg_pos -- Position for error messages only, 1 for first arg
+  = do { mult   <- newFlexiTyVarTy multiplicityTy
+       ; arg_ty <- newOpenFlexiFRRTyVarTy (FRRExpectedFunTy herald arg_pos)
+       ; return (mkScaled mult arg_ty) }
 
-       ; let (all_arg_tys, _) = splitFunTys fun_rho
-             n_fun_args = length all_arg_tys
+mkFunTysMsg :: ExpectedFunTyOrigin
+            -> (VisArity, TcType)
+            -> TidyEnv -> ZonkM (TidyEnv, SDoc)
+-- See Note [Reporting application arity errors]
+mkFunTysMsg herald (n_vis_args_in_call, fun_ty) env
+  = do { (env', fun_ty) <- zonkTidyTcType env fun_ty
 
-             msg | n_val_args_in_call <= n_fun_args  -- Enough args, in the end
+       ; let (pi_ty_bndrs, _) = splitPiTys fun_ty
+             n_fun_args = count isVisiblePiTyBinder pi_ty_bndrs
+             msg | n_vis_args_in_call <= n_fun_args  -- Enough args, in the end
                  = text "In the result of a function call"
                  | otherwise
                  = hang (full_herald <> comma)
-                      2 (sep [ text "but its type" <+> quotes (pprType fun_rho)
+                      2 (sep [ text "but its type" <+> quotes (pprSigmaType fun_ty)
                              , if n_fun_args == 0 then text "has none"
                                else text "has only" <+> speakN n_fun_args])
 
        ; return (env', msg) }
  where
   full_herald = pprExpectedFunTyHerald herald
-            <+> speakNOf n_val_args_in_call (text "value argument")
+            <+> speakNOf n_vis_args_in_call (text "visible argument")
+             -- What are "visible" arguments? See Note [Visibility and arity] in GHC.Types.Basic
 
-----------------------
+
+{- Note [Reporting application arity errors]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Consider      f :: Int -> Int -> Int
+and the call  foo = f 3 4 5
+We'd like to get an error like:
+
+    • Couldn't match expected type ‘t0 -> t’ with actual type ‘Int’
+    • The function ‘f’ is applied to three visible arguments,           -- What are "visible" arguments?
+        but its type ‘Int -> Int -> Int’ has only two                   -- See Note [Visibility and arity] in GHC.Types.Basic
+
+That is what `mkFunTysMsg` tries to do.  But what is the "type of the function".
+Most obviously, we can report its full, polymorphic type; that is simple and
+explicable.  But sometimes a bit odd.  Consider
+    f :: Bool -> t Int Int
+    foo = f True 5 10
+We get this error:
+    • Couldn't match type ‘Int’ with ‘t0 -> t’
+      Expected: Int -> t0 -> t
+        Actual: Int -> Int
+    • The function ‘f’ is applied to three visible arguments,
+        but its type ‘Bool -> t Int Int’ has only one
+
+That's not /quite/ right beause we can instantiate `t` to an arrow and get
+two arrows (but not three!).  With that in mind, one could consider reporting
+the /instantiated/ type, and GHC used to do so.  But it's more work, and in
+some ways more confusing, especially when nested quantifiers are concerned, e.g.
+    f :: Bool -> forall t. t Int Int
+
+So we just keep it simple and report the original function type.
+
+
+************************************************************************
+*                                                                      *
+                    Other matchExpected functions
+*                                                                      *
+********************************************************************* -}
+
 matchExpectedListTy :: TcRhoType -> TcM (TcCoercionN, TcRhoType)
 -- Special case for lists
 matchExpectedListTy exp_ty
@@ -861,8 +1330,8 @@ tcSubTypeDS :: HsExpr GhcRn
 -- Only one call site, in GHC.Tc.Gen.App.tcApp
 tcSubTypeDS rn_expr act_rho res_ty
   = case res_ty of
-      Check exp_rho -> tc_sub_type_deep (unifyType m_thing) orig
-                                        GenSigCtxt act_rho exp_rho
+      Check exp_rho -> tc_sub_type_ds Deep (unifyType m_thing) orig
+                                      GenSigCtxt act_rho exp_rho
 
       Infer inf_res -> do { co <- fillInferResult act_rho inf_res
                           ; return (mkWpCastN co) }
@@ -903,9 +1372,9 @@ tcSubTypeAmbiguity :: UserTypeCtxt   -- Where did this type arise
                    -> TcSigmaType -> TcSigmaType -> TcM HsWrapper
 -- See Note [Ambiguity check and deep subsumption]
 tcSubTypeAmbiguity ctxt ty_actual ty_expected
-  = tc_sub_type_shallow (unifyType Nothing)
-                        (AmbiguityCheckOrigin ctxt)
-                        ctxt ty_actual ty_expected
+  = tc_sub_type_ds Shallow (unifyType Nothing)
+                           (AmbiguityCheckOrigin ctxt)
+                           ctxt ty_actual ty_expected
 
 ---------------
 addSubTypeCtxt :: TcType -> ExpType -> TcM a -> TcM a
@@ -966,13 +1435,12 @@ command. See Note [Implementing :type] in GHC.Tc.Module.
 -}
 
 ---------------
-tc_sub_type, tc_sub_type_deep, tc_sub_type_shallow
-    :: (TcType -> TcType -> TcM TcCoercionN)  -- How to unify
-    -> CtOrigin       -- Used when instantiating
-    -> UserTypeCtxt   -- Used when skolemising
-    -> TcSigmaType    -- Actual; a sigma-type
-    -> TcSigmaType    -- Expected; also a sigma-type
-    -> TcM HsWrapper
+tc_sub_type :: (TcType -> TcType -> TcM TcCoercionN)  -- How to unify
+            -> CtOrigin       -- Used when instantiating
+            -> UserTypeCtxt   -- Used when skolemising
+            -> TcSigmaType    -- Actual; a sigma-type
+            -> TcSigmaType    -- Expected; also a sigma-type
+            -> TcM HsWrapper
 -- Checks that actual_ty is more polymorphic than expected_ty
 -- If wrap = tc_sub_type t1 t2
 --    => wrap :: t1 ~> t2
@@ -983,16 +1451,19 @@ tc_sub_type, tc_sub_type_deep, tc_sub_type_shallow
 
 ----------------------
 tc_sub_type unify inst_orig ctxt ty_actual ty_expected
-  = do { deep_subsumption <- xoptM LangExt.DeepSubsumption
-       ; if deep_subsumption
-         then tc_sub_type_deep    unify inst_orig ctxt ty_actual ty_expected
-         else tc_sub_type_shallow unify inst_orig ctxt ty_actual ty_expected
-  }
+  = do { ds_flag <- getDeepSubsumptionFlag
+       ; tc_sub_type_ds ds_flag unify inst_orig ctxt ty_actual ty_expected }
 
 ----------------------
-tc_sub_type_shallow unify inst_orig ctxt ty_actual ty_expected
+tc_sub_type_ds :: DeepSubsumptionFlag
+               -> (TcType -> TcType -> TcM TcCoercionN)
+               -> CtOrigin -> UserTypeCtxt -> TcSigmaType
+               -> TcSigmaType -> TcM HsWrapper
+-- tc_sub_type_ds is the main subsumption worker function
+-- It takes an explicit DeepSubsumptionFlag
+tc_sub_type_ds ds_flag unify inst_orig ctxt ty_actual ty_expected
   | definitely_poly ty_expected   -- See Note [Don't skolemise unnecessarily]
-  , definitely_mono_shallow ty_actual
+  , definitely_mono ds_flag ty_actual
   = do { traceTc "tc_sub_type (drop to equality)" $
          vcat [ text "ty_actual   =" <+> ppr ty_actual
               , text "ty_expected =" <+> ppr ty_expected ]
@@ -1005,46 +1476,24 @@ tc_sub_type_shallow unify inst_orig ctxt ty_actual ty_expected
               , text "ty_expected =" <+> ppr ty_expected ]
 
        ; (sk_wrap, inner_wrap)
-           <- tcTopSkolemise ctxt ty_expected $ \ sk_rho ->
-              do { (wrap, rho_a) <- topInstantiate inst_orig ty_actual
-                 ; cow           <- unify rho_a sk_rho
-                 ; return (mkWpCastN cow <.> wrap) }
+           <- case ds_flag of
+                Shallow -> -- Shallow: skolemise, instantiate and unify
+                           tcSkolemise Shallow ctxt ty_expected $ \sk_rho ->
+                           do { (wrap, rho_a) <- topInstantiate inst_orig ty_actual
+                              ; cow           <- unify rho_a sk_rho
+                              ; return (mkWpCastN cow <.> wrap) }
+                Deep -> -- Deep: we have co/contra work to do
+                        tcSkolemise Deep ctxt ty_expected $ \sk_rho ->
+                        tc_sub_type_deep unify inst_orig ctxt ty_actual sk_rho
 
        ; return (sk_wrap <.> inner_wrap) }
 
 ----------------------
-tc_sub_type_deep unify inst_orig ctxt ty_actual ty_expected
-  | definitely_poly ty_expected      -- See Note [Don't skolemise unnecessarily]
-  , definitely_mono_deep ty_actual
-  = do { traceTc "tc_sub_type_deep (drop to equality)" $
-         vcat [ text "ty_actual   =" <+> ppr ty_actual
-              , text "ty_expected =" <+> ppr ty_expected ]
-       ; mkWpCastN <$>
-         unify ty_actual ty_expected }
-
-  | otherwise   -- This is the general case
-  = do { traceTc "tc_sub_type_deep (general case)" $
-         vcat [ text "ty_actual   =" <+> ppr ty_actual
-              , text "ty_expected =" <+> ppr ty_expected ]
-
-       ; (sk_wrap, inner_wrap)
-           <- tcDeeplySkolemise ctxt ty_expected $ \ sk_rho ->
-              -- See Note [Deep subsumption]
-              tc_sub_type_ds unify inst_orig ctxt ty_actual sk_rho
-
-       ; return (sk_wrap <.> inner_wrap) }
-
-definitely_mono_shallow :: TcType -> Bool
-definitely_mono_shallow ty = isRhoTy ty
-    -- isRhoTy: no top level forall or (=>)
-
-definitely_mono_deep :: TcType -> Bool
-definitely_mono_deep ty
-  | not (definitely_mono_shallow ty)     = False
-    -- isRhoTy: False means top level forall or (=>)
-  | Just (_, res) <- tcSplitFunTy_maybe ty = definitely_mono_deep res
-    -- Top level (->)
-  | otherwise                              = True
+definitely_mono :: DeepSubsumptionFlag -> TcType -> Bool
+definitely_mono ds_flag ty
+  = case ds_flag of
+      Shallow -> isRhoTy ty      -- isRhoTy: no top level forall or (=>)
+      Deep    -> isDeepRhoTy ty  -- "deep" version: no nested forall or (=>)
 
 definitely_poly :: TcType -> Bool
 -- A very conservative test:
@@ -1053,11 +1502,9 @@ definitely_poly ty
   | (tvs, theta, tau) <- tcSplitSigmaTy ty
   , (tv:_) <- tvs   -- At least one tyvar
   , null theta      -- No constraints; see (DP1)
-  , checkTyVarEq tv tau `cterHasProblem` cteInsolubleOccurs
+  , tv `isInjectiveInType` tau
        -- The tyvar actually occurs (DP2),
-       --     and occurs in an injective position (DP3).
-       -- Fortunately checkTyVarEq, used for the occur check,
-       -- is just what we need.
+       -- and occurs in an injective position (DP3).
   = True
   | otherwise
   = False
@@ -1138,7 +1585,7 @@ tcEqMult origin w_actual w_expected = do
   {
   -- Note that here we do not call to `submult`, so we check
   -- for strict equality.
-  ; coercion <- uType TypeLevel origin w_actual w_expected
+  ; coercion <- unifyTypeAndEmit TypeLevel origin w_actual w_expected
   ; return $ if isReflCo coercion then WpHole else WpMultCoercion coercion }
 
 
@@ -1162,10 +1609,10 @@ prior to the Simplify Subsumption proposal:
 The effects are in these main places:
 
 1. In the subsumption check, tcSubType, we must do deep skolemisation:
-   see the call to tcDeeplySkolemise in tc_sub_type_deep
+   see the call to tcSkolemise Deep in tc_sub_type_deep
 
 2. In tcPolyExpr we must do deep skolemisation:
-   see the call to tcDeeplySkolemise in tcSkolemiseExpType
+   see the call to tcSkolemise in tcSkolemiseExpType
 
 3. for expression type signatures (e :: ty), and functions with type
    signatures (e.g. f :: ty; f = e), we must deeply skolemise the type;
@@ -1255,24 +1702,30 @@ where we eta-expanded that (:).  But now foldr expects an argument
 with ->{Many} and gets an argument with ->{m1} or ->{m2}, and Lint
 complains.
 
-The easiest solution was to use tcEqMult in tc_sub_type_ds, and
+The easiest solution was to use tcEqMult in tc_sub_type_deep, and
 insist on equality. This is only in the DeepSubsumption code anyway.
 -}
 
-tc_sub_type_ds :: (TcType -> TcType -> TcM TcCoercionN)  -- How to unify
-               -> CtOrigin       -- Used when instantiating
-               -> UserTypeCtxt   -- Used when skolemising
-               -> TcSigmaType    -- Actual; a sigma-type
-               -> TcRhoType      -- Expected; deeply skolemised
-               -> TcM HsWrapper
+data DeepSubsumptionFlag = Deep | Shallow
 
--- If wrap = tc_sub_type_ds t1 t2
+getDeepSubsumptionFlag :: TcM DeepSubsumptionFlag
+getDeepSubsumptionFlag = do { ds <- xoptM LangExt.DeepSubsumption
+                            ; if ds then return Deep else return Shallow }
+
+tc_sub_type_deep :: (TcType -> TcType -> TcM TcCoercionN)  -- How to unify
+                 -> CtOrigin       -- Used when instantiating
+                 -> UserTypeCtxt   -- Used when skolemising
+                 -> TcSigmaType    -- Actual; a sigma-type
+                 -> TcRhoType      -- Expected; deeply skolemised
+                 -> TcM HsWrapper
+
+-- If wrap = tc_sub_type_deep t1 t2
 --    => wrap :: t1 ~> t2
 -- Here is where the work actually happens!
 -- Precondition: ty_expected is deeply skolemised
 
-tc_sub_type_ds unify inst_orig ctxt ty_actual ty_expected
-  = do { traceTc "tc_sub_type_ds" $
+tc_sub_type_deep unify inst_orig ctxt ty_actual ty_expected
+  = do { traceTc "tc_sub_type_deep" $
          vcat [ text "ty_actual   =" <+> ppr ty_actual
               , text "ty_expected =" <+> ppr ty_expected ]
        ; go ty_actual ty_expected }
@@ -1285,9 +1738,9 @@ tc_sub_type_ds unify inst_orig ctxt ty_actual ty_expected
       = do { lookup_res <- isFilledMetaTyVar_maybe tv_a
            ; case lookup_res of
                Just ty_a' ->
-                 do { traceTc "tc_sub_type_ds following filled meta-tyvar:"
+                 do { traceTc "tc_sub_type_deep following filled meta-tyvar:"
                         (ppr tv_a <+> text "-->" <+> ppr ty_a')
-                    ; tc_sub_type_ds unify inst_orig ctxt ty_a' ty_e }
+                    ; tc_sub_type_deep unify inst_orig ctxt ty_a' ty_e }
                Nothing -> just_unify ty_actual ty_expected }
 
     go ty_a@(FunTy { ft_af = af1, ft_mult = act_mult, ft_arg = act_arg, ft_res = act_res })
@@ -1298,9 +1751,9 @@ tc_sub_type_ds unify inst_orig ctxt ty_actual ty_expected
         else
         -- This is where we do the co/contra thing, and generate a WpFun, which in turn
         -- causes eta-expansion, which we don't like; hence encouraging NoDeepSubsumption
-        do { arg_wrap  <- tc_sub_type_deep unify given_orig GenSigCtxt exp_arg act_arg
+        do { arg_wrap  <- tc_sub_type_ds Deep unify given_orig GenSigCtxt exp_arg act_arg
                           -- GenSigCtxt: See Note [Setting the argument context]
-           ; res_wrap  <- tc_sub_type_ds   unify inst_orig  ctxt       act_res exp_res
+           ; res_wrap  <- tc_sub_type_deep unify inst_orig ctxt act_res exp_res
            ; mult_wrap <- tcEqMult inst_orig act_mult exp_mult
                           -- See Note [Multiplicity in deep subsumption]
            ; return (mult_wrap <.>
@@ -1314,7 +1767,7 @@ tc_sub_type_ds unify inst_orig ctxt ty_actual ty_expected
       | let (tvs, theta, _) = tcSplitSigmaTy ty_a
       , not (null tvs && null theta)
       = do { (in_wrap, in_rho) <- topInstantiate inst_orig ty_a
-           ; body_wrap <- tc_sub_type_ds unify inst_orig ctxt in_rho ty_e
+           ; body_wrap <- tc_sub_type_deep unify inst_orig ctxt in_rho ty_e
            ; return (body_wrap <.> in_wrap) }
 
       | otherwise   -- Revert to unification
@@ -1331,39 +1784,11 @@ tc_sub_type_ds unify inst_orig ctxt ty_actual ty_expected
     just_unify ty_a ty_e = do { cow <- unify ty_a ty_e
                               ; return (mkWpCastN cow) }
 
-tcDeeplySkolemise
-    :: UserTypeCtxt -> TcSigmaType
-    -> (TcType -> TcM result)
-    -> TcM (HsWrapper, result)
-        -- ^ The wrapper has type: spec_ty ~> expected_ty
--- Just like tcTopSkolemise, but calls
--- deeplySkolemise instead of topSkolemise
--- See Note [Deep skolemisation]
-tcDeeplySkolemise ctxt expected_ty thing_inside
-  | isTauTy expected_ty  -- Short cut for common case
-  = do { res <- thing_inside expected_ty
-       ; return (idHsWrapper, res) }
-  | otherwise
-  = do  { -- This (unpleasant) rec block allows us to pass skol_info to deeplySkolemise;
-          -- but skol_info can't be built until we have tv_prs
-          rec { (wrap, tv_prs, given, rho_ty) <- deeplySkolemise skol_info expected_ty
-              ; skol_info <- mkSkolemInfo (SigSkol ctxt expected_ty tv_prs) }
-
-        ; traceTc "tcDeeplySkolemise" (ppr expected_ty $$ ppr rho_ty $$ ppr tv_prs)
-
-        ; let skol_tvs  = map snd tv_prs
-        ; (ev_binds, result)
-              <- checkConstraints (getSkolemInfo skol_info) skol_tvs given $
-                 thing_inside rho_ty
-
-        ; return (wrap <.> mkWpLet ev_binds, result) }
-          -- The ev_binds returned by checkConstraints is very
-          -- often empty, in which case mkWpLet is a no-op
-
+-----------------------
 deeplySkolemise :: SkolemInfo -> TcSigmaType
                 -> TcM ( HsWrapper
-                       , [(Name,TyVar)]     -- All skolemised variables
-                       , [EvVar]            -- All "given"s
+                       , [(Name,TcInvisTVBinder)]     -- All skolemised variables
+                       , [EvVar]                      -- All "given"s
                        , TcRhoType )
 -- See Note [Deep skolemisation]
 deeplySkolemise skol_info ty
@@ -1372,13 +1797,15 @@ deeplySkolemise skol_info ty
     init_subst = mkEmptySubst (mkInScopeSet (tyCoVarsOfType ty))
 
     go subst ty
-      | Just (arg_tys, tvs, theta, ty') <- tcDeepSplitSigmaTy_maybe ty
+      | Just (arg_tys, bndrs, theta, ty') <- tcDeepSplitSigmaTy_maybe ty
       = do { let arg_tys' = substScaledTys subst arg_tys
-           ; ids1           <- newSysLocalIds (fsLit "dk") arg_tys'
-           ; (subst', tvs1) <- tcInstSkolTyVarsX skol_info subst tvs
-           ; ev_vars1       <- newEvVars (substTheta subst' theta)
+           ; ids1             <- newSysLocalIds (fsLit "dk") arg_tys'
+           ; (subst', bndrs1) <- tcInstSkolTyVarBndrsX skol_info subst bndrs
+           ; ev_vars1         <- newEvVars (substTheta subst' theta)
            ; (wrap, tvs_prs2, ev_vars2, rho) <- go subst' ty'
-           ; let tv_prs1 = map tyVarName tvs `zip` tvs1
+           ; let tvs     = binderVars bndrs
+                 tvs1    = binderVars bndrs1
+                 tv_prs1 = map tyVarName tvs `zip` bndrs1
            ; return ( mkWpEta ids1 (mkWpTyLams tvs1
                                     <.> mkWpEvLams ev_vars1
                                     <.> wrap)
@@ -1397,8 +1824,9 @@ deeplyInstantiate orig ty
     init_subst = mkEmptySubst (mkInScopeSet (tyCoVarsOfType ty))
 
     go subst ty
-      | Just (arg_tys, tvs, theta, rho) <- tcDeepSplitSigmaTy_maybe ty
-      = do { (subst', tvs') <- newMetaTyVarsX subst tvs
+      | Just (arg_tys, bndrs, theta, rho) <- tcDeepSplitSigmaTy_maybe ty
+      = do { let tvs = binderVars bndrs
+           ; (subst', tvs') <- newMetaTyVarsX subst tvs
            ; let arg_tys' = substScaledTys   subst' arg_tys
                  theta'   = substTheta subst' theta
            ; ids1  <- newSysLocalIds (fsLit "di") arg_tys'
@@ -1412,280 +1840,33 @@ deeplyInstantiate orig ty
            ; return (idHsWrapper, ty') }
 
 tcDeepSplitSigmaTy_maybe
-  :: TcSigmaType -> Maybe ([Scaled TcType], [TyVar], ThetaType, TcSigmaType)
+  :: TcSigmaType -> Maybe ([Scaled TcType], [TcInvisTVBinder], ThetaType, TcSigmaType)
 -- Looks for a *non-trivial* quantified type, under zero or more function arrows
 -- By "non-trivial" we mean either tyvars or constraints are non-empty
-
 tcDeepSplitSigmaTy_maybe ty
-  | Just (arg_ty, res_ty)           <- tcSplitFunTy_maybe ty
-  , Just (arg_tys, tvs, theta, rho) <- tcDeepSplitSigmaTy_maybe res_ty
-  = Just (arg_ty:arg_tys, tvs, theta, rho)
-
-  | (tvs, theta, rho) <- tcSplitSigmaTy ty
-  , not (null tvs && null theta)
-  = Just ([], tvs, theta, rho)
-
-  | otherwise = Nothing
-
-
-{- *********************************************************************
-*                                                                      *
-                    Generalisation
-*                                                                      *
-********************************************************************* -}
-
-{- Note [Skolemisation]
-~~~~~~~~~~~~~~~~~~~~~~~
-tcTopSkolemise takes "expected type" and strip off quantifiers to expose the
-type underneath, binding the new skolems for the 'thing_inside'
-The returned 'HsWrapper' has type (specific_ty -> expected_ty).
-
-Note that for a nested type like
-   forall a. Eq a => forall b. Ord b => blah
-we still only build one implication constraint
-   forall a b. (Eq a, Ord b) => <constraints>
-This is just an optimisation, but it's why we use topSkolemise to
-build the pieces from all the layers, before making a single call
-to checkConstraints.
-
-tcSkolemiseScoped is very similar, but differs in two ways:
-
-* It deals specially with just the outer forall, bringing those type
-  variables into lexical scope.  To my surprise, I found that doing
-  this unconditionally in tcTopSkolemise (i.e. doing it even if we don't
-  need to bring the variables into lexical scope, which is harmless)
-  caused a non-trivial (1%-ish) perf hit on the compiler.
-
-* It handles deep subumption, wheres tcTopSkolemise never looks under
-  function arrows.
-
-* It always calls checkConstraints, even if there are no skolem
-  variables at all.  Reason: there might be nested deferred errors
-  that must not be allowed to float to top level.
-  See Note [When to build an implication] below.
--}
-
-tcTopSkolemise, tcSkolemiseScoped
-    :: UserTypeCtxt -> TcSigmaType
-    -> (TcType -> TcM result)
-    -> TcM (HsWrapper, result)
-        -- ^ The wrapper has type: spec_ty ~> expected_ty
--- See Note [Skolemisation] for the differences between
--- tcSkolemiseScoped and tcTopSkolemise
-
-tcSkolemiseScoped ctxt expected_ty thing_inside
-  = do { deep_subsumption <- xoptM LangExt.DeepSubsumption
-       ; let skolemise | deep_subsumption = deeplySkolemise
-                       | otherwise        = topSkolemise
-       ; -- rec {..}: see Note [Keeping SkolemInfo inside a SkolemTv]
-         --           in GHC.Tc.Utils.TcType
-         rec { (wrap, tv_prs, given, rho_ty) <- skolemise skol_info expected_ty
-             ; skol_info <- mkSkolemInfo (SigSkol ctxt expected_ty tv_prs) }
-
-       ; let skol_tvs = map snd tv_prs
-       ; (ev_binds, res)
-             <- checkConstraints (getSkolemInfo skol_info) skol_tvs given $
-                tcExtendNameTyVarEnv tv_prs               $
-                thing_inside rho_ty
-
-       ; return (wrap <.> mkWpLet ev_binds, res) }
-
-tcTopSkolemise ctxt expected_ty thing_inside
-  | isRhoTy expected_ty  -- Short cut for common case
-  = do { res <- thing_inside expected_ty
-       ; return (idHsWrapper, res) }
-  | otherwise
-  = do { -- rec {..}: see Note [Keeping SkolemInfo inside a SkolemTv]
-         --           in GHC.Tc.Utils.TcType
-         rec { (wrap, tv_prs, given, rho_ty) <- topSkolemise skol_info expected_ty
-             ; skol_info <- mkSkolemInfo (SigSkol ctxt expected_ty tv_prs) }
-
-       ; let skol_tvs = map snd tv_prs
-       ; (ev_binds, result)
-             <- checkConstraints (getSkolemInfo skol_info) skol_tvs given $
-                thing_inside rho_ty
-
-       ; return (wrap <.> mkWpLet ev_binds, result) }
-         -- The ev_binds returned by checkConstraints is very
-        -- often empty, in which case mkWpLet is a no-op
-
--- | Variant of 'tcTopSkolemise' that takes an ExpType
-tcSkolemiseExpType :: UserTypeCtxt -> ExpSigmaType
-                   -> (ExpRhoType -> TcM result)
-                   -> TcM (HsWrapper, result)
-tcSkolemiseExpType _ et@(Infer {}) thing_inside
-  = (idHsWrapper, ) <$> thing_inside et
-tcSkolemiseExpType ctxt (Check ty) thing_inside
-  = do { deep_subsumption <- xoptM LangExt.DeepSubsumption
-       ; let skolemise | deep_subsumption = tcDeeplySkolemise
-                       | otherwise        = tcTopSkolemise
-       ; skolemise ctxt ty $ \rho_ty ->
-         thing_inside (mkCheckExpType rho_ty) }
-
-checkConstraints :: SkolemInfoAnon
-                 -> [TcTyVar]           -- Skolems
-                 -> [EvVar]             -- Given
-                 -> TcM result
-                 -> TcM (TcEvBinds, result)
-
-checkConstraints skol_info skol_tvs given thing_inside
-  = do { implication_needed <- implicationNeeded skol_info skol_tvs given
-
-       ; if implication_needed
-         then do { (tclvl, wanted, result) <- pushLevelAndCaptureConstraints thing_inside
-                 ; (implics, ev_binds) <- buildImplicationFor tclvl skol_info skol_tvs given wanted
-                 ; traceTc "checkConstraints" (ppr tclvl $$ ppr skol_tvs)
-                 ; emitImplications implics
-                 ; return (ev_binds, result) }
-
-         else -- Fast path.  We check every function argument with tcCheckPolyExpr,
-              -- which uses tcTopSkolemise and hence checkConstraints.
-              -- So this fast path is well-exercised
-              do { res <- thing_inside
-                 ; return (emptyTcEvBinds, res) } }
-
-checkTvConstraints :: SkolemInfo
-                   -> [TcTyVar]          -- Skolem tyvars
-                   -> TcM result
-                   -> TcM result
-
-checkTvConstraints skol_info skol_tvs thing_inside
-  = do { (tclvl, wanted, result) <- pushLevelAndCaptureConstraints thing_inside
-       ; emitResidualTvConstraint skol_info skol_tvs tclvl wanted
-       ; return result }
-
-emitResidualTvConstraint :: SkolemInfo -> [TcTyVar]
-                         -> TcLevel -> WantedConstraints -> TcM ()
-emitResidualTvConstraint skol_info skol_tvs tclvl wanted
-  | not (isEmptyWC wanted) ||
-    checkTelescopeSkol skol_info_anon
-  = -- checkTelescopeSkol: in this case, /always/ emit this implication
-    -- even if 'wanted' is empty. We need the implication so that we check
-    -- for a bad telescope. See Note [Skolem escape and forall-types] in
-    -- GHC.Tc.Gen.HsType
-    do { implic <- buildTvImplication skol_info_anon skol_tvs tclvl wanted
-       ; emitImplication implic }
-
-  | otherwise  -- Empty 'wanted', emit nothing
-  = return ()
+  = go ty
   where
-     skol_info_anon = getSkolemInfo skol_info
+  go ty | Just (arg_ty, res_ty)           <- tcSplitFunTy_maybe ty
+        , Just (arg_tys, tvs, theta, rho) <- go res_ty
+        = Just (arg_ty:arg_tys, tvs, theta, rho)
 
-buildTvImplication :: SkolemInfoAnon -> [TcTyVar]
-                   -> TcLevel -> WantedConstraints -> TcM Implication
-buildTvImplication skol_info skol_tvs tclvl wanted
-  = assertPpr (all (isSkolemTyVar <||> isTyVarTyVar) skol_tvs) (ppr skol_tvs) $
-    do { ev_binds <- newNoTcEvBinds  -- Used for equalities only, so all the constraints
-                                     -- are solved by filling in coercion holes, not
-                                     -- by creating a value-level evidence binding
-       ; implic   <- newImplication
+        | (tvs, theta, rho) <- tcSplitSigmaTyBndrs ty
+        , not (null tvs && null theta)
+        = Just ([], tvs, theta, rho)
 
-       ; let implic' = implic { ic_tclvl     = tclvl
-                              , ic_skols     = skol_tvs
-                              , ic_given_eqs = NoGivenEqs
-                              , ic_wanted    = wanted
-                              , ic_binds     = ev_binds
-                              , ic_info      = skol_info }
+        | otherwise = Nothing
 
-       ; checkImplicationInvariants implic'
-       ; return implic' }
-
-implicationNeeded :: SkolemInfoAnon -> [TcTyVar] -> [EvVar] -> TcM Bool
--- See Note [When to build an implication]
-implicationNeeded skol_info skol_tvs given
-  | null skol_tvs
-  , null given
-  , not (alwaysBuildImplication skol_info)
-  = -- Empty skolems and givens
-    do { tc_lvl <- getTcLevel
-       ; if not (isTopTcLevel tc_lvl)  -- No implication needed if we are
-         then return False             -- already inside an implication
-         else
-    do { dflags <- getDynFlags       -- If any deferral can happen,
-                                     -- we must build an implication
-       ; return (gopt Opt_DeferTypeErrors dflags ||
-                 gopt Opt_DeferTypedHoles dflags ||
-                 gopt Opt_DeferOutOfScopeVariables dflags) } }
-
-  | otherwise     -- Non-empty skolems or givens
-  = return True   -- Definitely need an implication
-
-alwaysBuildImplication :: SkolemInfoAnon -> Bool
--- See Note [When to build an implication]
-alwaysBuildImplication _ = False
-
-{-  Commmented out for now while I figure out about error messages.
-    See #14185
-
-alwaysBuildImplication (SigSkol ctxt _ _)
-  = case ctxt of
-      FunSigCtxt {} -> True  -- RHS of a binding with a signature
-      _             -> False
-alwaysBuildImplication (RuleSkol {})      = True
-alwaysBuildImplication (InstSkol {})      = True
-alwaysBuildImplication (FamInstSkol {})   = True
-alwaysBuildImplication _                  = False
--}
-
-buildImplicationFor :: TcLevel -> SkolemInfoAnon -> [TcTyVar]
-                   -> [EvVar] -> WantedConstraints
-                   -> TcM (Bag Implication, TcEvBinds)
-buildImplicationFor tclvl skol_info skol_tvs given wanted
-  | isEmptyWC wanted && null given
-             -- Optimisation : if there are no wanteds, and no givens
-             -- don't generate an implication at all.
-             -- Reason for the (null given): we don't want to lose
-             -- the "inaccessible alternative" error check
-  = return (emptyBag, emptyTcEvBinds)
-
-  | otherwise
-  = assertPpr (all (isSkolemTyVar <||> isTyVarTyVar) skol_tvs) (ppr skol_tvs) $
-      -- Why allow TyVarTvs? Because implicitly declared kind variables in
-      -- non-CUSK type declarations are TyVarTvs, and we need to bring them
-      -- into scope as a skolem in an implication. This is OK, though,
-      -- because TyVarTvs will always remain tyvars, even after unification.
-    do { ev_binds_var <- newTcEvBinds
-       ; implic <- newImplication
-       ; let implic' = implic { ic_tclvl  = tclvl
-                              , ic_skols  = skol_tvs
-                              , ic_given  = given
-                              , ic_wanted = wanted
-                              , ic_binds  = ev_binds_var
-                              , ic_info   = skol_info }
-       ; checkImplicationInvariants implic'
-
-       ; return (unitBag implic', TcEvBinds ev_binds_var) }
-
-{- Note [When to build an implication]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Suppose we have some 'skolems' and some 'givens', and we are
-considering whether to wrap the constraints in their scope into an
-implication.  We must /always/ so if either 'skolems' or 'givens' are
-non-empty.  But what if both are empty?  You might think we could
-always drop the implication.  Other things being equal, the fewer
-implications the better.  Less clutter and overhead.  But we must
-take care:
-
-* If we have an unsolved [W] g :: a ~# b, and -fdefer-type-errors,
-  we'll make a /term-level/ evidence binding for 'g = error "blah"'.
-  We must have an EvBindsVar those bindings!, otherwise they end up as
-  top-level unlifted bindings, which are verboten. This only matters
-  at top level, so we check for that
-  See also Note [Deferred errors for coercion holes] in GHC.Tc.Errors.
-  cf #14149 for an example of what goes wrong.
-
-* If you have
-     f :: Int;  f = f_blah
-     g :: Bool; g = g_blah
-  If we don't build an implication for f or g (no tyvars, no givens),
-  the constraints for f_blah and g_blah are solved together.  And that
-  can yield /very/ confusing error messages, because we can get
-      [W] C Int b1    -- from f_blah
-      [W] C Int b2    -- from g_blan
-  and fundpes can yield [W] b1 ~ b2, even though the two functions have
-  literally nothing to do with each other.  #14185 is an example.
-  Building an implication keeps them separate.
--}
+isDeepRhoTy :: TcType -> Bool
+-- True if there are no foralls or (=>) at the top, or nested under
+-- arrows to the right.  e.g
+--    forall a. a                  False
+--    Int -> forall a. a           False
+--    (forall a. a) -> Int         True
+-- Returns True iff tcDeepSplitSigmaTy_maybe returns Nothing
+isDeepRhoTy ty
+  | not (isRhoTy ty)                       = False  -- Foralls or (=>) at top
+  | Just (_, res) <- tcSplitFunTy_maybe ty = isDeepRhoTy res
+  | otherwise                              = True   -- No forall, (=>), or (->) at top
 
 {-
 ************************************************************************
@@ -1704,18 +1885,30 @@ unifyType :: Maybe TypedThing  -- ^ If present, the thing that has type ty1
 -- Actual and expected types
 -- Returns a coercion : ty1 ~ ty2
 unifyType thing ty1 ty2
-  = uType TypeLevel origin ty1 ty2
+  = unifyTypeAndEmit TypeLevel origin ty1 ty2
   where
     origin = TypeEqOrigin { uo_actual   = ty1
                           , uo_expected = ty2
                           , uo_thing    = thing
                           , uo_visible  = True }
 
+unifyInvisibleType :: TcTauType -> TcTauType    -- ty1 (actual), ty2 (expected)
+                   -> TcM TcCoercionN           -- :: ty1 ~# ty2
+-- Actual and expected types
+-- Returns a coercion : ty1 ~ ty2
+unifyInvisibleType ty1 ty2
+  = unifyTypeAndEmit TypeLevel origin ty1 ty2
+  where
+    origin = TypeEqOrigin { uo_actual   = ty1
+                          , uo_expected = ty2
+                          , uo_thing    = Nothing
+                          , uo_visible  = False }  -- This is the "invisible" bit
+
 unifyTypeET :: TcTauType -> TcTauType -> TcM CoercionN
 -- Like unifyType, but swap expected and actual in error messages
 -- This is used when typechecking patterns
 unifyTypeET ty1 ty2
-  = uType TypeLevel origin ty1 ty2
+  = unifyTypeAndEmit TypeLevel origin ty1 ty2
   where
     origin = TypeEqOrigin { uo_actual   = ty2   -- NB swapped
                           , uo_expected = ty1   -- NB swapped
@@ -1725,13 +1918,28 @@ unifyTypeET ty1 ty2
 
 unifyKind :: Maybe TypedThing -> TcKind -> TcKind -> TcM CoercionN
 unifyKind mb_thing ty1 ty2
-  = uType KindLevel origin ty1 ty2
+  = unifyTypeAndEmit KindLevel origin ty1 ty2
   where
     origin = TypeEqOrigin { uo_actual   = ty1
                           , uo_expected = ty2
                           , uo_thing    = mb_thing
                           , uo_visible  = True }
 
+unifyTypeAndEmit :: TypeOrKind -> CtOrigin -> TcType -> TcType -> TcM CoercionN
+-- Make a ref-cell, unify, emit the collected constraints
+unifyTypeAndEmit t_or_k orig ty1 ty2
+  = do { ref <- newTcRef emptyBag
+       ; loc <- getCtLocM orig (Just t_or_k)
+       ; let env = UE { u_loc = loc, u_role = Nominal
+                      , u_rewriters = emptyRewriterSet  -- ToDo: check this
+                      , u_defer = ref, u_unified = Nothing }
+
+       -- The hard work happens here
+       ; co <- uType env ty1 ty2
+
+       ; cts <- readTcRef ref
+       ; unless (null cts) (emitSimples cts)
+       ; return co }
 
 {-
 %************************************************************************
@@ -1740,45 +1948,110 @@ unifyKind mb_thing ty1 ty2
 %*                                                                      *
 %************************************************************************
 
-uType is the heart of the unifier.
+Note [The eager unifier]
+~~~~~~~~~~~~~~~~~~~~~~~~
+The eager unifier, `uType`, is called by
+
+  * The constraint generator (e.g. in GHC.Tc.Gen.Expr),
+    via the wrappers `unifyType`, `unifyKind` etc
+
+  * The constraint solver (e.g. in GHC.Tc.Solver.Equality),
+    via `GHC.Tc.Solver.Monad.wrapUnifierTcS`.
+
+`uType` runs in the TcM monad, but it carries a UnifyEnv that tells it
+what to do when unifying a variable or deferring a constraint. Specifically,
+  * it collects deferred constraints in `u_defer`, and
+  * it records which unification variables it has unified in `u_unified`
+Then it is up to the wrappers (one for the constraint generator, one for
+the constraint solver) to deal with these collected sets.
+
+Although `uType` runs in the TcM monad for convenience, really it could
+operate just with the ability to
+  * write to the accumulators of deferred constraints
+    and unification variables in UnifyEnv.
+  * read and update existing unification variables
+  * zonk types befire unifying (`zonkTcType` in `uUnfilledVar`, and
+    `zonkTyCoVarKind` in `uUnfilledVar1`
+  * create fresh coercion holes (`newCoercionHole`)
+  * emit tracing info for debugging
+  * look at the ambient TcLevel: `getTcLevel`
+A job for the future.
 -}
 
+data UnifyEnv
+  = UE { u_role      :: Role
+       , u_loc       :: CtLoc
+       , u_rewriters :: RewriterSet
+
+         -- Deferred constraints
+       , u_defer     :: TcRef (Bag Ct)
+
+         -- Which variables are unified;
+         -- if Nothing, we don't care
+       , u_unified :: Maybe (TcRef [TcTyVar])
+    }
+
+setUEnvRole :: UnifyEnv -> Role -> UnifyEnv
+setUEnvRole uenv role = uenv { u_role = role }
+
+updUEnvLoc :: UnifyEnv -> (CtLoc -> CtLoc) -> UnifyEnv
+updUEnvLoc uenv@(UE { u_loc = loc }) upd = uenv { u_loc = upd loc }
+
+mkKindEnv :: UnifyEnv -> TcType -> TcType -> UnifyEnv
+-- Modify the UnifyEnv to be right for unifing
+-- the kinds of these two types
+mkKindEnv env@(UE { u_loc = ctloc }) ty1 ty2
+  = env { u_role = Nominal, u_loc = mkKindEqLoc ty1 ty2 ctloc }
+
 uType, uType_defer
-  :: TypeOrKind
-  -> CtOrigin
+  :: UnifyEnv
   -> TcType    -- ty1 is the *actual* type
   -> TcType    -- ty2 is the *expected* type
   -> TcM CoercionN
 
---------------
 -- It is always safe to defer unification to the main constraint solver
 -- See Note [Deferred unification]
---    ty1 is "actual"
---    ty2 is "expected"
-uType_defer t_or_k origin ty1 ty2
-  = do { co <- emitWantedEq origin t_or_k Nominal ty1 ty2
+uType_defer (UE { u_loc = loc, u_defer = ref
+                , u_role = role, u_rewriters = rewriters })
+            ty1 ty2  -- ty1 is "actual", ty2 is "expected"
+  = do { let pred_ty = mkPrimEqPredRole role ty1 ty2
+       ; hole <- newCoercionHole loc pred_ty
+       ; let ct = mkNonCanonical $
+                  CtWanted { ctev_pred      = pred_ty
+                           , ctev_dest      = HoleDest hole
+                           , ctev_loc       = loc
+                           , ctev_rewriters = rewriters }
+             co = HoleCo hole
+       ; updTcRef ref (`snocBag` ct)
+         -- snocBag: see Note [Work-list ordering] in GHC.Tc.Solver.Equality
 
        -- Error trace only
        -- NB. do *not* call mkErrInfo unless tracing is on,
        --     because it is hugely expensive (#5631)
-       ; whenDOptM Opt_D_dump_tc_trace $ do
-            { ctxt <- getErrCtxt
-            ; doc <- mkErrInfo emptyTidyEnv ctxt
-            ; traceTc "utype_defer" (vcat [ debugPprType ty1
+       ; whenDOptM Opt_D_dump_tc_trace $
+         do { ctxt <- getErrCtxt
+            ; doc  <- mkErrInfo emptyTidyEnv ctxt
+            ; traceTc "utype_defer" (vcat [ ppr role
+                                          , debugPprType ty1
                                           , debugPprType ty2
-                                          , pprCtOrigin origin
                                           , doc])
-            ; traceTc "utype_defer2" (ppr co)
-            }
+            ; traceTc "utype_defer2" (ppr co) }
+
        ; return co }
 
+
 --------------
-uType t_or_k origin orig_ty1 orig_ty2
+uType env@(UE { u_role = role }) orig_ty1 orig_ty2
+  | Phantom <- role
+  = do { kind_co <- uType (mkKindEnv env orig_ty1 orig_ty2)
+                          (typeKind orig_ty1) (typeKind orig_ty2)
+       ; return (mkPhantomCo kind_co orig_ty1 orig_ty2) }
+
+  | otherwise
   = do { tclvl <- getTcLevel
        ; traceTc "u_tys" $ vcat
               [ text "tclvl" <+> ppr tclvl
-              , sep [ ppr orig_ty1, text "~", ppr orig_ty2]
-              , pprCtOrigin origin]
+              , sep [ ppr orig_ty1, text "~" <> ppr role, ppr orig_ty2] ]
        ; co <- go orig_ty1 orig_ty2
        ; if isReflCo co
             then traceTc "u_tys yields no coercion" Outputable.empty
@@ -1793,12 +2066,12 @@ uType t_or_k origin orig_ty1 orig_ty2
      -- recognize (t |> co) ~ (t |> co), which is nice. Previously, we
      -- didn't do it this way, and then the unification above was deferred.
     go (CastTy t1 co1) t2
-      = do { co_tys <- uType t_or_k origin t1 t2
-           ; return (mkCoherenceLeftCo Nominal t1 co1 co_tys) }
+      = do { co_tys <- uType env t1 t2
+           ; return (mkCoherenceLeftCo role t1 co1 co_tys) }
 
     go t1 (CastTy t2 co2)
-      = do { co_tys <- uType t_or_k origin t1 t2
-           ; return (mkCoherenceRightCo Nominal t2 co2 co_tys) }
+      = do { co_tys <- uType env t1 t2
+           ; return (mkCoherenceRightCo role t2 co2 co_tys) }
 
         -- Variables; go for uUnfilledVar
         -- Note that we pass in *original* (before synonym expansion),
@@ -1808,19 +2081,20 @@ uType t_or_k origin orig_ty1 orig_ty2
       = do { lookup_res <- isFilledMetaTyVar_maybe tv1
            ; case lookup_res of
                Just ty1 -> do { traceTc "found filled tyvar" (ppr tv1 <+> text ":->" <+> ppr ty1)
-                                ; go ty1 ty2 }
-               Nothing  -> uUnfilledVar origin t_or_k NotSwapped tv1 ty2 }
+                              ; uType env ty1 orig_ty2 }
+               Nothing -> uUnfilledVar env NotSwapped tv1 ty2 }
+
     go ty1 (TyVarTy tv2)
       = do { lookup_res <- isFilledMetaTyVar_maybe tv2
            ; case lookup_res of
                Just ty2 -> do { traceTc "found filled tyvar" (ppr tv2 <+> text ":->" <+> ppr ty2)
-                              ; go ty1 ty2 }
-               Nothing  -> uUnfilledVar origin t_or_k IsSwapped tv2 ty1 }
+                              ; uType env orig_ty1 ty2 }
+               Nothing -> uUnfilledVar env IsSwapped tv2 ty1 }
 
       -- See Note [Expanding synonyms during unification]
     go ty1@(TyConApp tc1 []) (TyConApp tc2 [])
       | tc1 == tc2
-      = return $ mkNomReflCo ty1
+      = return $ mkReflCo role ty1
 
         -- See Note [Expanding synonyms during unification]
         --
@@ -1835,14 +2109,14 @@ uType t_or_k origin orig_ty1 orig_ty2
       | Just ty2' <- coreView ty2 = go ty1  ty2'
 
     -- Functions (t1 -> t2) just check the two parts
-    -- Do not attempt (c => t); just defer
     go (FunTy { ft_af = af1, ft_mult = w1, ft_arg = arg1, ft_res = res1 })
        (FunTy { ft_af = af2, ft_mult = w2, ft_arg = arg2, ft_res = res2 })
-      | isVisibleFunArg af1, af1 == af2
-      = do { co_l <- uType t_or_k origin arg1 arg2
-           ; co_r <- uType t_or_k origin res1 res2
-           ; co_w <- uType t_or_k origin w1 w2
-           ; return $ mkNakedFunCo1 Nominal af1 co_w co_l co_r }
+      | isVisibleFunArg af1  -- Do not attempt (c => t); just defer
+      , af1 == af2           -- Important!  See #21530
+      = do { co_w <- uType (env { u_role = funRole role SelMult }) w1   w2
+           ; co_l <- uType (env { u_role = funRole role SelArg })  arg1 arg2
+           ; co_r <- uType (env { u_role = funRole role SelRes })  res1 res2
+           ; return $ mkNakedFunCo role af1 co_w co_l co_r }
 
         -- Always defer if a type synonym family (type function)
         -- is involved.  (Data families behave rigidly.)
@@ -1854,41 +2128,40 @@ uType t_or_k origin orig_ty1 orig_ty2
     go (TyConApp tc1 tys1) (TyConApp tc2 tys2)
       -- See Note [Mismatched type lists and application decomposition]
       | tc1 == tc2, equalLength tys1 tys2
-      = assertPpr (isGenerativeTyCon tc1 Nominal) (ppr tc1) $
-        do { cos <- zipWith3M (uType t_or_k) origins' tys1 tys2
-           ; return $ mkTyConAppCo Nominal tc1 cos }
-      where
-        origins' = map (\is_vis -> if is_vis then origin else toInvisibleOrigin origin)
-                       (tcTyConVisibilities tc1)
+      , isInjectiveTyCon tc1 role -- don't look under newtypes at Rep equality
+      = assertPpr (isGenerativeTyCon tc1 role) (ppr tc1) $
+        do { traceTc "go-tycon" (ppr tc1 $$ ppr tys1 $$ ppr tys2 $$ ppr (take 10 (tyConRoleListX role tc1)))
+           ; cos <- zipWith4M u_tc_arg (tyConVisibilities tc1)   -- Infinite
+                                       (tyConRoleListX role tc1) -- Infinite
+                                       tys1 tys2
+           ; return $ mkTyConAppCo role tc1 cos }
 
     go (LitTy m) ty@(LitTy n)
       | m == n
-      = return $ mkNomReflCo ty
+      = return $ mkReflCo role ty
 
         -- See Note [Care with type applications]
         -- Do not decompose FunTy against App;
         -- it's often a type error, so leave it for the constraint solver
-    go (AppTy s1 t1) (AppTy s2 t2)
-      = go_app (isNextArgVisible s1) s1 t1 s2 t2
+    go ty1@(AppTy s1 t1) ty2@(AppTy s2 t2)
+      = go_app (isNextArgVisible s1) ty1 s1 t1 ty2 s2 t2
 
-    go (AppTy s1 t1) (TyConApp tc2 ts2)
+    go ty1@(AppTy s1 t1) ty2@(TyConApp tc2 ts2)
       | Just (ts2', t2') <- snocView ts2
       = assert (not (tyConMustBeSaturated tc2)) $
-        go_app (isNextTyConArgVisible tc2 ts2') s1 t1 (TyConApp tc2 ts2') t2'
+        go_app (isNextTyConArgVisible tc2 ts2')
+               ty1 s1 t1 ty2 (TyConApp tc2 ts2') t2'
 
-    go (TyConApp tc1 ts1) (AppTy s2 t2)
+    go ty1@(TyConApp tc1 ts1) ty2@(AppTy s2 t2)
       | Just (ts1', t1') <- snocView ts1
       = assert (not (tyConMustBeSaturated tc1)) $
-        go_app (isNextTyConArgVisible tc1 ts1') (TyConApp tc1 ts1') t1' s2 t2
+        go_app (isNextTyConArgVisible tc1 ts1')
+               ty1 (TyConApp tc1 ts1') t1' ty2 s2 t2
 
-    go (CoercionTy co1) (CoercionTy co2)
-      = do { let ty1 = coercionType co1
-                 ty2 = coercionType co2
-           ; kco <- uType KindLevel
-                          (KindEqOrigin orig_ty1 orig_ty2 origin
-                                        (Just t_or_k))
-                          ty1 ty2
-           ; return $ mkProofIrrelCo Nominal kco co1 co2 }
+    go ty1@(CoercionTy co1) ty2@(CoercionTy co2)
+      = do { kco <- uType (mkKindEnv env ty1 ty2)
+                          (coercionType co1) (coercionType co2)
+           ; return $ mkProofIrrelCo role kco co1 co2 }
 
         -- Anything else fails
         -- E.g. unifying for-all types, which is relative unusual
@@ -1896,17 +2169,33 @@ uType t_or_k origin orig_ty1 orig_ty2
 
     ------------------
     defer ty1 ty2   -- See Note [Check for equality before deferring]
-      | ty1 `tcEqType` ty2 = return (mkNomReflCo ty1)
-      | otherwise          = uType_defer t_or_k origin ty1 ty2
+      | ty1 `tcEqType` ty2 = return (mkReflCo role ty1)
+      | otherwise          = uType_defer env orig_ty1 orig_ty2
+
 
     ------------------
-    go_app vis s1 t1 s2 t2
-      = do { co_s <- uType t_or_k origin s1 s2
-           ; let arg_origin
-                   | vis       = origin
-                   | otherwise = toInvisibleOrigin origin
-           ; co_t <- uType t_or_k arg_origin t1 t2
+    u_tc_arg is_vis role ty1 ty2
+      = do { traceTc "u_tc_arg" (ppr role $$ ppr ty1 $$ ppr ty2)
+           ; uType env_arg ty1 ty2 }
+      where
+        env_arg = env { u_loc = adjustCtLoc is_vis False (u_loc env)
+                      , u_role = role }
+
+    ------------------
+    -- For AppTy, decompose only nominal equalities
+    -- See Note [Decomposing AppTy equalities] in GHC.Tc.Solver.Equality
+    go_app vis ty1 s1 t1 ty2 s2 t2
+      | Nominal <- role
+      = -- Unify arguments t1/t2 before function s1/s2, because
+        -- the former have smaller kinds, and hence simpler error messages
+        -- c.f. GHC.Tc.Solver.Equality.can_eq_app
+        -- Example: test T8603
+        do { let env_arg = env { u_loc = adjustCtLoc vis False (u_loc env) }
+           ; co_t <- uType env_arg t1 t2
+           ; co_s <- uType env s1 s2
            ; return $ mkAppCo co_s co_t }
+      | otherwise
+      = defer ty1 ty2
 
 {- Note [Check for equality before deferring]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -2002,38 +2291,36 @@ back into @uTys@ if it turns out that the variable is already bound.
 -}
 
 ----------
-uUnfilledVar :: CtOrigin
-             -> TypeOrKind
-             -> SwapFlag
-             -> TcTyVar        -- Tyvar 1: not necessarily a meta-tyvar
-                               --    definitely not a /filled/ meta-tyvar
-             -> TcTauType      -- Type 2
-             -> TcM Coercion
+uUnfilledVar, uUnfilledVar1
+    :: UnifyEnv
+    -> SwapFlag
+    -> TcTyVar        -- Tyvar 1: not necessarily a meta-tyvar
+                      --    definitely not a /filled/ meta-tyvar
+    -> TcTauType      -- Type 2
+    -> TcM CoercionN
 -- "Unfilled" means that the variable is definitely not a filled-in meta tyvar
 --            It might be a skolem, or untouchable, or meta
+uUnfilledVar env swapped tv1 ty2
+  | Nominal <- u_role env
+  = do { ty2 <- liftZonkM $ zonkTcType ty2
+                  -- Zonk to expose things to the occurs check, and so
+                  -- that if ty2 looks like a type variable then it
+                  -- /is/ a type variable
+       ; uUnfilledVar1 env swapped tv1 ty2 }
 
-uUnfilledVar origin t_or_k swapped tv1 ty2
-  = do { ty2 <- zonkTcType ty2
-             -- Zonk to expose things to the
-             -- occurs check, and so that if ty2
-             -- looks like a type variable then it
-             -- /is/ a type variable
-       ; uUnfilledVar1 origin t_or_k swapped tv1 ty2 }
+  | otherwise  -- See Note [Do not unify representational equalities]
+               -- in GHC.Tc.Solver.Equality
+  = unSwap swapped (uType_defer env) (mkTyVarTy tv1) ty2
 
-----------
-uUnfilledVar1 :: CtOrigin
-              -> TypeOrKind
-              -> SwapFlag
-              -> TcTyVar        -- Tyvar 1: not necessarily a meta-tyvar
-                                --    definitely not a /filled/ meta-tyvar
-              -> TcTauType      -- Type 2, zonked
-              -> TcM Coercion
-uUnfilledVar1 origin t_or_k swapped tv1 ty2
+uUnfilledVar1 env       -- Precondition: u_role==Nominal
+              swapped
+              tv1
+              ty2       -- ty2 is zonked
   | Just tv2 <- getTyVar_maybe ty2
   = go tv2
 
   | otherwise
-  = uUnfilledVar2 origin t_or_k swapped tv1 ty2
+  = uUnfilledVar2 env swapped tv1 ty2
 
   where
     -- 'go' handles the case where both are
@@ -2044,62 +2331,69 @@ uUnfilledVar1 origin t_or_k swapped tv1 ty2
 
            | swapOverTyVars False tv1 tv2   -- Distinct type variables
                -- Swap meta tyvar to the left if poss
-           = do { tv1 <- zonkTyCoVarKind tv1
+           = do { tv1 <- liftZonkM $ zonkTyCoVarKind tv1
                      -- We must zonk tv1's kind because that might
                      -- not have happened yet, and it's an invariant of
                      -- uUnfilledTyVar2 that ty2 is fully zonked
                      -- Omitting this caused #16902
-                ; uUnfilledVar2 origin t_or_k (flipSwap swapped)
-                           tv2 (mkTyVarTy tv1) }
+                ; uUnfilledVar2 env (flipSwap swapped) tv2 (mkTyVarTy tv1) }
 
            | otherwise
-           = uUnfilledVar2 origin t_or_k swapped tv1 ty2
+           = uUnfilledVar2 env swapped tv1 ty2
 
 ----------
-uUnfilledVar2 :: CtOrigin
-              -> TypeOrKind
+uUnfilledVar2 :: UnifyEnv       -- Precondition: u_role==Nominal
               -> SwapFlag
               -> TcTyVar        -- Tyvar 1: not necessarily a meta-tyvar
                                 --    definitely not a /filled/ meta-tyvar
               -> TcTauType      -- Type 2, zonked
-              -> TcM Coercion
-uUnfilledVar2 origin t_or_k swapped tv1 ty2
+              -> TcM CoercionN
+uUnfilledVar2 env@(UE { u_defer = def_eq_ref }) swapped tv1 ty2
   = do { cur_lvl <- getTcLevel
-       ; go cur_lvl }
-  where
-    go cur_lvl
-      | isTouchableMetaTyVar cur_lvl tv1
            -- See Note [Unification preconditions], (UNTOUCHABLE) wrinkles
-      , cterHasNoProblem (checkTyVarEq tv1 ty2)
-           -- See Note [Prevent unification with type families]
-      = do { mb_continue_solving <- startSolvingByUnification (metaTyVarInfo tv1) ty2
-           ; case mb_continue_solving of
-           { Nothing -> not_ok_so_defer
-           ; Just ty2 ->
-        do { co_k <- uType KindLevel kind_origin (typeKind ty2) (tyVarKind tv1)
-           ; traceTc "uUnfilledVar2 ok" $
-             vcat [ ppr tv1 <+> dcolon <+> ppr (tyVarKind tv1)
-                  , ppr ty2 <+> dcolon <+> ppr (typeKind  ty2)
-                  , ppr (isReflCo co_k), ppr co_k ]
+           -- Here we don't know about given equalities here; so we treat
+           -- /any/ level outside this one as untouchable.  Hence cur_lvl.
+       ; if not (touchabilityAndShapeTest cur_lvl tv1 ty2
+                 && simpleUnifyCheck False tv1 ty2)
+         then not_ok_so_defer
+         else
+    do { def_eqs <- readTcRef def_eq_ref  -- Capture current state of def_eqs
 
-           ; if isReflCo co_k
-               -- Only proceed if the kinds match
-               -- NB: tv1 should still be unfilled, despite the kind unification
-               --     because tv1 is not free in ty2 (or, hence, in its kind)
-             then do { writeMetaTyVar tv1 ty2
-                     ; return (mkNomReflCo ty2) }
+       -- Attempt to unify kinds
+       -- When doing so, be careful to preserve orientation;
+       --    see Note [Kind Equality Orientation] in GHC.Tc.Solver.Equality
+       --    and wrinkle (W2) in Note [Fundeps with instances, and equality orientation]
+       --        in GHC.Tc.Solver.Dict
+       -- Failing to preserve orientation led to #25597.
+       ; let kind_env = unSwap swapped (mkKindEnv env) ty1 ty2
+       ; co_k <- unSwap swapped (uType kind_env) (tyVarKind tv1) (typeKind ty2)
 
-             else defer }}} -- This cannot be solved now.  See GHC.Tc.Solver.Canonical
-                            -- Note [Equalities with incompatible kinds] for how
-                            -- this will be dealt with in the solver
+       ; traceTc "uUnfilledVar2 ok" $
+         vcat [ ppr tv1 <+> dcolon <+> ppr (tyVarKind tv1)
+              , ppr ty2 <+> dcolon <+> ppr (typeKind  ty2)
+              , ppr (isReflCo co_k), ppr co_k ]
 
-      | otherwise
-      = not_ok_so_defer
+       ; if isReflCo co_k
+           -- Only proceed if the kinds match
+           -- NB: tv1 should still be unfilled, despite the kind unification
+           --     because tv1 is not free in ty2' (or, hence, in its kind)
+         then do { liftZonkM $ writeMetaTyVar tv1 ty2
+                 ; case u_unified env of
+                     Nothing -> return ()
+                     Just uref -> updTcRef uref (tv1 :)
+                 ; return (mkNomReflCo ty2) }  -- Unification is always Nominal
 
+         else -- The kinds don't match yet, so defer instead.
+              do { writeTcRef def_eq_ref def_eqs
+                     -- Since we are discarding co_k, also discard any constraints
+                     -- emitted by kind unification; they are just useless clutter.
+                     -- Do this dicarding by simply restoring the previous state
+                     -- of def_eqs; a bit imperative/yukky but works fine.
+                 ; defer }
+         }}
+  where
     ty1 = mkTyVarTy tv1
-    kind_origin = KindEqOrigin ty1 ty2 origin (Just t_or_k)
-
-    defer = unSwap swapped (uType_defer t_or_k origin) ty1 ty2
+    defer = unSwap swapped (uType_defer env) ty1 ty2
 
     not_ok_so_defer =
       do { traceTc "uUnfilledVar2 not ok" (ppr tv1 $$ ppr ty2)
@@ -2107,42 +2401,6 @@ uUnfilledVar2 origin t_or_k swapped tv1 ty2
                -- NB: occurs check isn't necessarily fatal:
                --     eg tv1 occurred in type family parameter
           ; defer }
-
--- | Checks (TYVAR-TV), (COERCION-HOLE) and (CONCRETE) of
--- Note [Unification preconditions]; returns True if these conditions
--- are satisfied. But see the Note for other preconditions, too.
-startSolvingByUnification :: MetaInfo -> TcType -- zonked
-                          -> TcM (Maybe TcType)
-startSolvingByUnification _ xi
-  | hasCoercionHoleTy xi  -- (COERCION-HOLE) check
-  = return Nothing
-startSolvingByUnification info xi
-  = case info of
-      CycleBreakerTv -> return Nothing
-      ConcreteTv conc_orig ->
-        do { (xi, not_conc_reasons) <- makeTypeConcrete conc_orig xi
-                 -- NB: makeTypeConcrete has the side-effect of turning
-                 -- some TauTvs into ConcreteTvs, e.g.
-                 -- alpha[conc] ~# TYPE (TupleRep '[ beta[tau], IntRep ])
-                 -- will write `beta[tau] := beta[conc]`.
-                 --
-                 -- We return the new type, so that callers of this function
-                 -- aren't required to zonk.
-           ; case not_conc_reasons of
-               [] -> return $ Just xi
-               _  -> return Nothing }
-      TyVarTv ->
-        case getTyVar_maybe xi of
-           Nothing -> return Nothing
-           Just tv ->
-             case tcTyVarDetails tv of -- (TYVAR-TV) wrinkle
-                SkolemTv {} -> return $ Just xi
-                RuntimeUnk  -> return $ Just xi
-                MetaTv { mtv_info = info } ->
-                  case info of
-                    TyVarTv -> return $ Just xi
-                    _       -> return Nothing
-      _ -> return $ Just xi
 
 swapOverTyVars :: Bool -> TcTyVar -> TcTyVar -> Bool
 swapOverTyVars is_given tv1 tv2
@@ -2254,18 +2512,10 @@ There are five reasons not to unify:
 5. (COERCION-HOLE) Confusing coercion holes
    Suppose our equality is
      (alpha :: k) ~ (Int |> {co})
-   where co :: Type ~ k is an unsolved wanted. Note that this
-   equality is homogeneous; both sides have kind k. Unifying here
-   is sensible, but it can lead to very confusing error messages.
-   It's very much like a Wanted rewriting a Wanted. Even worse,
-   unifying a variable essentially turns an equality into a Given,
-   and so we could not use the tracking mechanism in
-   Note [Wanteds rewrite Wanteds] in GHC.Tc.Types.Constraint.
-   We thus simply do not unify in this case.
-
-   This is expanded as Wrinkle (2) in Note [Equalities with incompatible kinds]
-   in GHC.Tc.Solver.Canonical.
-
+   where co :: Type ~ k is an unsolved wanted. Note that this equality
+   is homogeneous; both sides have kind k. We refrain from unifying here, because
+   of the coercion hole in the RHS -- see Wrinkle (EIK2) in
+   Note [Equalities with incompatible kinds] in GHC.Solver.Equality.
 
 Needless to say, all there are wrinkles:
 
@@ -2295,8 +2545,9 @@ Needless to say, all there are wrinkles:
     isTouchableMetaTyVar.
 
   * In the constraint solver, we track where Given equalities occur
-    and use that to guard unification in GHC.Tc.Solver.Canonical.touchabilityTest
-    More details in Note [Tracking Given equalities] in GHC.Tc.Solver.InertSet
+    and use that to guard unification in
+    GHC.Tc.Utils.Unify.touchabilityAndShapeTest. More details in
+    Note [Tracking Given equalities] in GHC.Tc.Solver.InertSet
 
     Historical note: in the olden days (pre 2021) the constraint solver
     also used to unify only if l=n.  Equalities were "floated" out of the
@@ -2311,12 +2562,12 @@ Note [TyVar/TyVar orientation]
 See also Note [Fundeps with instances, and equality orientation]
 where the kind equality orientation is important
 
-Given (a ~ b), should we orient the CEqCan as (a~b) or (b~a)?
-This is a surprisingly tricky question! This is invariant (TyEq:TV).
+Given (a ~ b), should we orient the equality as (a~b) or (b~a)?
+This is a surprisingly tricky question!
 
 The question is answered by swapOverTyVars, which is used
   - in the eager unifier, in GHC.Tc.Utils.Unify.uUnfilledVar1
-  - in the constraint solver, in GHC.Tc.Solver.Canonical.canEqCanLHS2
+  - in the constraint solver, in GHC.Tc.Solver.Equality.canEqCanLHS2
 
 First note: only swap if you have to!
    See Note [Avoid unnecessary swaps]
@@ -2329,11 +2580,9 @@ So we look for a positive reason to swap, using a three-step test:
 * Priority.  If the levels are the same, look at what kind of
   type variable it is, using 'lhsPriority'.
 
-  Generally speaking we always try to put a MetaTv on the left
-  in preference to SkolemTv or RuntimeUnkTv:
-     a) Because the MetaTv may be touchable and can be unified
-     b) Even if it's not touchable, GHC.Tc.Solver.floatConstraints
-        looks for meta tyvars on the left
+  Generally speaking we always try to put a MetaTv on the left in
+  preference to SkolemTv or RuntimeUnkTv, because the MetaTv may be
+  touchable and can be unified.
 
   Tie-breaking rules for MetaTvs:
   - CycleBreakerTv: This is essentially a stand-in for another type;
@@ -2460,31 +2709,6 @@ better in practice.
 Revisited in Nov '20, along with removing flattening variables. Problem
 is still present, and the solution is still the same.
 
-Note [Type synonyms and the occur check]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Generally speaking we try to update a variable with type synonyms not
-expanded, which improves later error messages, unless looking
-inside a type synonym may help resolve a spurious occurs check
-error. Consider:
-          type A a = ()
-
-          f :: (A a -> a -> ()) -> ()
-          f = \ _ -> ()
-
-          x :: ()
-          x = f (\ x p -> p x)
-
-We will eventually get a constraint of the form t ~ A t. The ok function above will
-properly expand the type (A t) to just (), which is ok to be unified with t. If we had
-unified with the original type A t, we would lead the type checker into an infinite loop.
-
-Hence, if the occurs check fails for a type synonym application, then (and *only* then),
-the ok function expands the synonym to detect opportunities for occurs check success using
-the underlying definition of the type synonym.
-
-The same applies later on in the constraint interaction code; see GHC.Tc.Solver.Interact,
-function @occ_check_ok@.
-
 Note [Non-TcTyVars in GHC.Tc.Utils.Unify]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Because the same code is now shared between unifying types and unifying
@@ -2536,7 +2760,7 @@ matchExpectedFunKind hs_ty n k = go n k
     go n (FunTy { ft_af = af, ft_mult = w, ft_arg = arg, ft_res = res })
       | isVisibleFunArg af
       = do { co <- go (n-1) res
-           ; return (mkNakedFunCo1 Nominal af (mkNomReflCo w) (mkNomReflCo arg) co) }
+           ; return (mkNakedFunCo Nominal af (mkNomReflCo w) (mkNomReflCo arg) co) }
 
     go n other
      = defer n other
@@ -2550,7 +2774,83 @@ matchExpectedFunKind hs_ty n k = go n k
                                         , uo_thing    = Just hs_ty
                                         , uo_visible  = True
                                         }
-           ; uType KindLevel origin k new_fun }
+           ; unifyTypeAndEmit KindLevel origin k new_fun }
+
+{- *********************************************************************
+*                                                                      *
+                 Checking alpha ~ ty
+              for the on-the-fly unifier
+*                                                                      *
+********************************************************************* -}
+
+simpleUnifyCheck :: Bool -> TcTyVar -> TcType -> Bool
+-- A fast check: True <=> unification is OK
+-- If it says 'False' then unification might still be OK, but
+-- it'll take more work to do -- use the full checkTypeEq
+--
+-- * Always rejects foralls unless lhs_tv is RuntimeUnk
+--   (used by GHCi debugger)
+-- * Rejects a non-concrete type if lhs_tv is concrete
+-- * Rejects type families unless fam_ok=True
+-- * Does a level-check for type variables
+--
+-- This function is pretty heavily used, so it's optimised not to allocate
+simpleUnifyCheck fam_ok lhs_tv rhs
+  = go rhs
+  where
+    !(occ_in_ty, occ_in_co) = mkOccFolders lhs_tv
+
+    lhs_tv_lvl         = tcTyVarLevel lhs_tv
+    lhs_tv_is_concrete = isConcreteTyVar lhs_tv
+    forall_ok          = case tcTyVarDetails lhs_tv of
+                            MetaTv { mtv_info = RuntimeUnkTv } -> True
+                            _                                  -> False
+
+    go (TyVarTy tv)
+      | lhs_tv == tv                                 = False
+      | tcTyVarLevel tv > lhs_tv_lvl                 = False
+      | lhs_tv_is_concrete, not (isConcreteTyVar tv) = False
+      | occ_in_ty $! (tyVarKind tv)                  = False
+      | otherwise                                    = True
+
+    go (FunTy {ft_af = af, ft_mult = w, ft_arg = a, ft_res = r})
+      | isInvisibleFunArg af, not forall_ok = False
+      | otherwise                           = go w && go a && go r
+
+    go (TyConApp tc tys)
+      | lhs_tv_is_concrete, not (isConcreteTyCon tc) = False
+      | not (isTauTyCon tc)                          = False
+      | not fam_ok, not (isFamFreeTyCon tc)          = False
+      | otherwise                                    = all go tys
+
+    go (AppTy t1 t2)    = go t1 && go t2
+    go (ForAllTy (Bndr tv _) ty)
+      | forall_ok = go (tyVarKind tv) && (tv == lhs_tv || go ty)
+      | otherwise = False
+
+    go (CastTy ty co)   = not (occ_in_co co) && go ty
+    go (CoercionTy co)  = not (occ_in_co co)
+    go (LitTy {})       = True
+
+
+mkOccFolders :: TcTyVar -> (TcType -> Bool, TcCoercion -> Bool)
+-- These functions return True
+--   * if lhs_tv occurs (incl deeply, in the kind of variable)
+--   * if there is a coercion hole
+-- No expansion of type synonyms
+mkOccFolders lhs_tv = (getAny . check_ty, getAny . check_co)
+  where
+    !(check_ty, _, check_co, _) = foldTyCo occ_folder emptyVarSet
+    occ_folder = TyCoFolder { tcf_view  = noView  -- Don't expand synonyms
+                            , tcf_tyvar = do_tcv, tcf_covar = do_tcv
+                            , tcf_hole  = do_hole
+                            , tcf_tycobinder = do_bndr }
+
+    do_tcv is v = Any (not (v `elemVarSet` is) && v == lhs_tv)
+                  `mappend` check_ty (varType v)
+
+    do_bndr is tcv _faf = extendVarSet is tcv
+    do_hole _is _hole = DM.Any True  -- Reject coercion holes
 
 {- *********************************************************************
 *                                                                      *
@@ -2561,8 +2861,7 @@ matchExpectedFunKind hs_ty n k = go n k
 
 {-  Note [Checking for foralls]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Unless we have -XImpredicativeTypes (which is a totally unsupported
-feature), we do not want to unify
+We never want to unify
     alpha ~ (forall a. a->a) -> Int
 So we look for foralls hidden inside the type, and it's convenient
 to do that at the same time as the occurs check (which looks for
@@ -2589,134 +2888,568 @@ kind had instead been
 then this kind equality would rightly complain about unifying kappa
 with (forall k. k->*)
 
+Note [Forgetful synonyms in checkTyConApp]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Consider
+   type S a b = b   -- Forgets 'a'
+
+   [W] alpha[2] ~ Maybe (S beta[4] gamma[2])
+
+We don't want to promote beta to level 2; rather, we should
+expand the synonym. (Currently, in checkTypeEqRhs promotion
+is irrevocable, by side effect.)
+
+To avoid this risk we eagerly expand forgetful synonyms.
+This also means we won't get an occurs check in
+   a ~ Maybe (S a b)
+
+The annoyance is that we might expand the synonym unnecessarily,
+something we generally try to avoid.  But for now, this seems
+simple.
+
+In a forgetful case like a ~ Maybe (S a b), `checkTyEqRhs` returns
+a Reduction that looks
+    Reduction { reductionCoercion    = Refl
+              , reductionReducedType = Maybe b }
+We must jolly well use that reductionReduced type, even though the
+reductionCoercion is Refl.  See `canEqCanLHSFinish_no_unification`.
 -}
 
-----------------
-{-# NOINLINE checkTyVarEq #-}  -- checkTyVarEq becomes big after the `inline` fires
-checkTyVarEq :: TcTyVar -> TcType -> CheckTyEqResult
-checkTyVarEq tv ty
-  = inline checkTypeEq (TyVarLHS tv) ty
-    -- inline checkTypeEq so that the `case`s over the CanEqLHS get blasted away
+data PuResult a b = PuFail CheckTyEqResult
+                  | PuOK (Bag a) b
 
-{-# NOINLINE checkTyFamEq #-}  -- checkTyFamEq becomes big after the `inline` fires
-checkTyFamEq :: TyCon     -- type function
-             -> [TcType]  -- args, exactly saturated
-             -> TcType    -- RHS
-             -> CheckTyEqResult   -- always drops cteTypeFamily
-checkTyFamEq fun_tc fun_args ty
-  = inline checkTypeEq (TyFamLHS fun_tc fun_args) ty
-    `cterRemoveProblem` cteTypeFamily
-    -- inline checkTypeEq so that the `case`s over the CanEqLHS get blasted away
+instance Functor (PuResult a) where
+  fmap _ (PuFail prob) = PuFail prob
+  fmap f (PuOK cts x)  = PuOK cts (f x)
 
-checkTypeEq :: CanEqLHS -> TcType -> CheckTyEqResult
--- If cteHasNoProblem (checkTypeEq dflags lhs rhs), then lhs ~ rhs
--- is a canonical CEqCan.
+instance Applicative (PuResult a) where
+  pure x = PuOK emptyBag x
+  PuFail p1 <*> PuFail p2 = PuFail (p1 S.<> p2)
+  PuFail p1 <*> PuOK {}   = PuFail p1
+  PuOK {}   <*> PuFail p2 = PuFail p2
+  PuOK c1 f <*> PuOK c2 x = PuOK (c1 `unionBags` c2) (f x)
+
+instance (Outputable a, Outputable b) => Outputable (PuResult a b) where
+  ppr (PuFail prob) = text "PuFail" <+> (ppr prob)
+  ppr (PuOK cts x)  = text "PuOK" <> braces
+                        (vcat [ text "redn:" <+> ppr x
+                              , text "cts:" <+> ppr cts ])
+
+pprPur :: PuResult a b -> SDoc
+-- For debugging
+pprPur (PuFail prob) = text "PuFail:" <> ppr prob
+pprPur (PuOK {})     = text "PuOK"
+
+okCheckRefl :: TcType -> TcM (PuResult a Reduction)
+okCheckRefl ty = return (PuOK emptyBag (mkReflRedn Nominal ty))
+
+failCheckWith :: CheckTyEqResult -> TcM (PuResult a b)
+failCheckWith p = return (PuFail p)
+
+mapCheck :: (x -> TcM (PuResult a Reduction))
+         -> [x]
+         -> TcM (PuResult a Reductions)
+mapCheck f xs
+  = do { (ress :: [PuResult a Reduction]) <- mapM f xs
+       ; return (unzipRedns <$> sequenceA ress) }
+         -- sequenceA :: [PuResult a Reduction] -> PuResult a [Reduction]
+         -- unzipRedns :: [Reduction] -> Reductions
+
+-----------------------------
+-- | Options describing how to deal with a type equality
+-- in the pure unifier. See 'checkTyEqRhs'
+data TyEqFlags a
+  = TEF { tef_foralls  :: Bool         -- Allow foralls
+        , tef_lhs      :: CanEqLHS     -- LHS of the constraint
+        , tef_unifying :: AreUnifying  -- Always NotUnifying if tef_lhs is TyFamLHS
+        , tef_fam_app  :: TyEqFamApp a
+        , tef_occurs   :: CheckTyEqProblem }  -- Soluble or insoluble occurs check
+
+-- | What to do when encountering a type-family application while processing
+-- a type equality in the pure unifier.
 --
--- In particular, this looks for:
---   (a) a forall type (forall a. blah)
---   (b) a predicate type (c => ty)
---   (c) a type family; see Note [Prevent unification with type families]
---   (d) an occurrence of the LHS (occurs check)
---
--- Note that an occurs-check does not mean "definite error".  For example
---   type family F a
---   type instance F Int = Int
--- consider
---   b0 ~ F b0
--- This is perfectly reasonable, if we later get b0 ~ Int.  But we
--- certainly can't unify b0 := F b0
---
--- For (a), (b), and (c) we check only the top level of the type, NOT
--- inside the kinds of variables it mentions, and for (d) see
--- Note [CEqCan occurs check] in GHC.Tc.Types.Constraint.
---
--- checkTypeEq is called from
---    * checkTyFamEq, checkTyVarEq (which inline it to specialise away the
---      case-analysis on 'lhs')
---    * checkEqCanLHSFinish, which does not know the form of 'lhs'
-checkTypeEq lhs ty
-  = go ty
+-- See Note [Family applications in canonical constraints]
+data TyEqFamApp a
+  = TEFA_Fail                    -- Always fail
+  | TEFA_Recurse                 -- Just recurse
+  | TEFA_Break (FamAppBreaker a) -- Recurse, but replace with cycle breaker if fails,
+                                 -- using the FamAppBreaker
+
+data AreUnifying
+  = Unifying
+       MetaInfo         -- MetaInfo of the LHS tyvar (which is a meta-tyvar)
+       TcLevel          -- Level of the LHS tyvar
+       LevelCheck
+
+  | NotUnifying         -- Not attempting to unify
+
+data LevelCheck
+  = LC_None       -- Level check not needed: we should never encounter
+                  -- a tyvar at deeper level than the LHS
+
+  | LC_Check      -- Do a level check between the LHS tyvar and the occurrence tyvar
+                  -- Fail if the level check fails
+
+  | LC_Promote    -- Do a level check between the LHS tyvar and the occurrence tyvar
+                  -- If the level check fails, and the occurrence is a unification
+                  -- variable, promote it
+
+instance Outputable (TyEqFlags a) where
+  ppr (TEF { .. }) = text "TEF" <> braces (
+                        vcat [ text "tef_foralls =" <+> ppr tef_foralls
+                             , text "tef_lhs =" <+> ppr tef_lhs
+                             , text "tef_unifying =" <+> ppr tef_unifying
+                             , text "tef_fam_app =" <+> ppr tef_fam_app
+                             , text "tef_occurs =" <+> ppr tef_occurs ])
+
+instance Outputable (TyEqFamApp a) where
+  ppr TEFA_Fail       = text "TEFA_Fail"
+  ppr TEFA_Recurse    = text "TEFA_Fail"
+  ppr (TEFA_Break {}) = text "TEFA_Break"
+
+instance Outputable AreUnifying where
+  ppr NotUnifying = text "NotUnifying"
+  ppr (Unifying mi lvl lc) = text "Unifying" <+>
+         braces (ppr mi <> comma <+> ppr lvl <> comma <+> ppr lc)
+
+instance Outputable LevelCheck where
+  ppr LC_None    = text "LC_None"
+  ppr LC_Check   = text "LC_Check"
+  ppr LC_Promote = text "LC_Promote"
+
+famAppArgFlags :: TyEqFlags a -> TyEqFlags a
+-- Adjust the flags when going undter a type family
+-- Only the outer family application gets the loop-breaker treatment
+-- Ditto tyvar promotion.  E.g.
+--        [W] alpha[2] ~ Maybe (F beta[3])
+-- Do not promote beta[3]; instead promote (F beta[3])
+famAppArgFlags flags@(TEF { tef_unifying = unifying })
+  = flags { tef_fam_app  = TEFA_Recurse
+          , tef_unifying = zap_promotion unifying
+          , tef_occurs   = cteSolubleOccurs }
+            -- tef_occurs: under a type family, an occurs check is not definitely-insoluble
   where
-    impredicative      = cteProblem cteImpredicative
-    type_family        = cteProblem cteTypeFamily
-    insoluble_occurs   = cteProblem cteInsolubleOccurs
-    soluble_occurs     = cteProblem cteSolubleOccurs
+    zap_promotion (Unifying info lvl LC_Promote) = Unifying info lvl LC_Check
+    zap_promotion unifying                       = unifying
 
-    -- The GHCi runtime debugger does its type-matching with
-    -- unification variables that can unify with a polytype
-    -- or a TyCon that would usually be disallowed by bad_tc
-    -- See Note [RuntimeUnkTv] in GHC.Runtime.Heap.Inspect
-    ghci_tv
-      | TyVarLHS tv <- lhs
-      , MetaTv { mtv_info = RuntimeUnkTv } <- tcTyVarDetails tv
-      = True
+type FamAppBreaker a = TcType -> TcM (PuResult a Reduction)
+     -- Given a family-application ty, return a Reduction :: ty ~ cvb
+     -- where 'cbv' is a fresh loop-breaker tyvar (for Given), or
+     -- just a fresh TauTv (for Wanted)
+
+checkTyEqRhs :: forall a. TyEqFlags a -> TcType -> TcM (PuResult a Reduction)
+checkTyEqRhs flags ty
+  = case ty of
+      LitTy {}        -> okCheckRefl ty
+      TyConApp tc tys -> checkTyConApp flags ty tc tys
+      TyVarTy tv      -> checkTyVar flags tv
+        -- Don't worry about foralls inside the kind; see Note [Checking for foralls]
+        -- Nor can we expand synonyms; see Note [Occurrence checking: look inside kinds]
+        --                             in GHC.Core.FVs
+
+      FunTy {ft_af = af, ft_mult = w, ft_arg = a, ft_res = r}
+       | isInvisibleFunArg af  -- e.g.  Num a => blah
+       , not (tef_foralls flags)
+       -> failCheckWith impredicativeProblem -- Not allowed (TyEq:F)
+       | otherwise
+       -> do { w_res <- checkTyEqRhs flags w
+             ; a_res <- checkTyEqRhs flags a
+             ; r_res <- checkTyEqRhs flags r
+             ; return (mkFunRedn Nominal af <$> w_res <*> a_res <*> r_res) }
+
+      AppTy fun arg -> do { fun_res <- checkTyEqRhs flags fun
+                          ; arg_res <- checkTyEqRhs flags arg
+                          ; return (mkAppRedn <$> fun_res <*> arg_res) }
+
+      CastTy ty co  -> do { ty_res <- checkTyEqRhs flags ty
+                          ; co_res <- checkCo flags co
+                          ; return (mkCastRedn1 Nominal ty <$> co_res <*> ty_res) }
+
+      CoercionTy co -> do { co_res <- checkCo flags co
+                          ; return (mkReflCoRedn Nominal <$> co_res) }
+
+      ForAllTy {}
+         | tef_foralls flags -> okCheckRefl ty
+         | otherwise         -> failCheckWith impredicativeProblem  -- Not allowed (TyEq:F)
+
+
+-------------------
+checkCo :: TyEqFlags a -> Coercion -> TcM (PuResult a Coercion)
+-- See Note [checkCo]
+checkCo (TEF { tef_lhs = TyFamLHS {} }) co
+  = return (pure co)
+
+checkCo (TEF { tef_lhs = TyVarLHS lhs_tv
+             , tef_unifying = unifying
+             , tef_occurs = occ_prob }) co
+  -- Check for coercion holes, if unifying
+  -- See (COERCION-HOLE) in Note [Unification preconditions]
+  | hasCoercionHoleCo co
+  = failCheckWith (cteProblem cteCoercionHole)
+
+  -- Occurs check (can promote)
+  | Unifying _ lhs_tv_lvl LC_Promote <- unifying
+  = do { reason <- checkPromoteFreeVars occ_prob lhs_tv lhs_tv_lvl (tyCoVarsOfCo co)
+       ; if cterHasNoProblem reason
+         then return (pure co)
+         else failCheckWith reason }
+
+  -- Occurs check (no promotion)
+  | lhs_tv `elemVarSet` tyCoVarsOfCo co
+  = failCheckWith (cteProblem occ_prob)
+
+  | otherwise
+  = return (pure co)
+
+{- Note [checkCo]
+~~~~~~~~~~~~~~~~~
+We don't often care about the contents of coercions, so checking
+coercions before making an equality constraint may be surprising.
+But there are several cases we need to be wary of:
+
+(1) When we're unifying a variable, we must make sure that the variable
+    appears nowhere on the RHS -- even in a coercion. Otherwise, we'll
+    create a loop.
+
+(2) We must still make sure that no variable in a coercion is at too
+    high a level. But, when unifying, we can promote any variables we encounter.
+
+(3) We do not unify variables with a type with a free coercion hole.
+    See (COERCION-HOLE) in Note [Unification preconditions].
+
+
+Note [Promotion and level-checking]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+"Promotion" happens when we have this:
+
+  [W] w1: alpha[2] ~ Maybe beta[4]
+
+Here we must NOT unify alpha := Maybe beta, because beta may turn out
+to stand for a type involving some inner skolem.  Yikes!
+Skolem-escape.  So instead we /promote/ beta, like this:
+
+  beta[4] := beta'[2]
+  [W] w1: alpha[2] ~ Maybe beta'[2]
+
+Now we can unify alpha := Maybe beta', which might unlock other
+constraints.  But if some other constraint wants to unify beta with a
+nested skolem, it'll get stuck with a skolem-escape error.
+
+Now consider `w2` where a type family is involved (#22194):
+
+  [W] w2: alpha[2] ~ Maybe (F gamma beta[4])
+
+In `w2`, it may or may not be the case that `beta` is level 2; suppose
+we later discover gamma := Int, and type instance F Int _ = Int.
+So, instead, we promote the entire funcion call:
+
+  [W] w2': alpha[2] ~ Maybe gamma[2]
+  [W] w3:  gamma[2] ~ F gamma beta[4]
+
+Now we can unify alpha := Maybe gamma, which is a Good Thng.
+
+Wrinkle (W1)
+
+There is an important wrinkle: /all this only applies when unifying/.
+For example, suppose we have
+ [G] a[2] ~ Maybe b[4]
+where 'a' is a skolem.  This Given might arise from a GADT match, and
+we can absolutely use it to rewrite locally. In fact we must do so:
+that is how we exploit local knowledge about the outer skolem a[2].
+This applies equally for a Wanted [W] a[2] ~ Maybe b[4]. Using it for
+local rewriting is fine. (It's not clear to me that it is /useful/,
+but it's fine anyway.)
+
+So we only do the level-check in checkTyVar when /unifying/ not for
+skolems (or untouchable unification variables).
+
+Note [Family applications in canonical constraints]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A constraint with a type family application in the RHS needs special care.
+
+* First, occurs checks.  If we have
+     [G] a ~ Maybe (F (Maybe a))
+     [W] alpha ~ Maybe (F (Maybe alpha))
+  it looks as if we have an occurs check.  But go read
+  Note [Type equality cycles] in GHC.Tc.Solver.Equality
+
+  The same considerations apply when the LHS is a type family:
+     [G] G a ~ Maybe (F (Maybe (G a)))
+     [W] G alpha ~ Maybe (F (Maybe (G alpha)))
+
+* Second, promotion. If we have (#22194)
+     [W] alpha[2] ~ Maybe (F beta[4])
+  it is wrong to promote beta.  Instead we want to split to
+     [W] alpha[2] ~ Maybe gamma[2]
+     [W] gamma[2] ~ F beta[4]
+  See Note [Promotion and level-checking] above.
+
+* Third, concrete type variables.  If we have
+     [W] alpha[conc] ~ Maybe (F tys)
+  we want to add an extra variable thus:
+     [W] alpha[conc] ~ Maybe gamma[conc]
+     [W] gamma[conc] ~ F tys
+  Now we can unify alpha, and that might unlock something else.
+
+In all these cases we want to create a fresh type variable, and
+emit a new equality connecting it to the type family application.
+
+The `tef_fam_app` field of `TypeEqFlags` says what to do at a type
+family application in the RHS of the constraint.  `TEFA_Fail` and
+`TEFA_Recurse` are straightforward.  `TEFA_Break` is the clever
+one. As you can see in `checkFamApp`, it
+  * Checks the arguments, but using `famAppArgFlags` to record that
+    we are now "under" a type-family application. It `tef_fam_app` to
+    `TEFA_Recurse`.
+  * If any of the arguments fail (level-check error, occurs check)
+    use the `FamAppBreaker` to create the extra binding.
+
+Note that this always cycle-breaks the /outermost/ family application.
+If we have  [W] alpha ~ Maybe (F (G alpha))
+* We'll use checkFamApp on `(F (G alpha))`
+* It will recurse into `(G alpha)` with TEFA_Recurse, but not cycle-break it
+* The occurs check will fire when we hit `alpha`
+* `checkFamApp` on `(F (G alpha))` will see the failure and invoke
+  the `FamAppBreaker`.
+-}
+
+-------------------
+checkTyConApp :: TyEqFlags a
+              -> TcType -> TyCon -> [TcType]
+              -> TcM (PuResult a Reduction)
+checkTyConApp flags@(TEF { tef_unifying = unifying, tef_foralls = foralls_ok })
+              tc_app tc tys
+  | isTypeFamilyTyCon tc
+  , let arity = tyConArity tc
+  = if tys `lengthIs` arity
+    then checkFamApp flags tc_app tc tys  -- Common case
+    else do { let (fun_args, extra_args) = splitAt (tyConArity tc) tys
+                  fun_app                = mkTyConApp tc fun_args
+            ; fun_res   <- checkFamApp flags fun_app tc fun_args
+            ; extra_res <- mapCheck (checkTyEqRhs flags) extra_args
+            ; traceTc "Over-sat" (ppr tc <+> ppr tys $$ ppr arity $$ pprPur fun_res $$ pprPur extra_res)
+            ; return (mkAppRedns <$> fun_res <*> extra_res) }
+
+  | Just ty' <- rewriterView tc_app
+       -- e.g. S a  where  type S a = F [a]
+       --             or   type S a = Int
+       -- See Note [Forgetful synonyms in checkTyConApp]
+  = checkTyEqRhs flags ty'
+
+  | not (isTauTyCon tc || foralls_ok)
+  = failCheckWith impredicativeProblem
+
+  | Unifying info _ _ <- unifying
+  , isConcreteInfo info
+  , not (isConcreteTyCon tc)
+  = failCheckWith (cteProblem cteConcrete)
+
+  | otherwise  -- Recurse on arguments
+  = recurseIntoTyConApp flags tc tys
+
+recurseIntoTyConApp :: TyEqFlags a -> TyCon -> [TcType] -> TcM (PuResult a Reduction)
+recurseIntoTyConApp flags tc tys
+  = do { tys_res <- mapCheck (checkTyEqRhs flags) tys
+       ; return (mkTyConAppRedn Nominal tc <$> tys_res) }
+
+-------------------
+checkFamApp :: TyEqFlags a
+            -> TcType -> TyCon -> [TcType]  -- Saturated family application
+            -> TcM (PuResult a Reduction)
+-- See Note [Family applications in canonical constraints]
+checkFamApp flags@(TEF { tef_unifying = unifying, tef_occurs = occ_prob
+                       , tef_fam_app = fam_app_flag, tef_lhs = lhs })
+            fam_app tc tys
+  = case fam_app_flag of
+      TEFA_Fail -> failCheckWith (cteProblem cteTypeFamily)
+
+      _ | TyFamLHS lhs_tc lhs_tys <- lhs
+        , tcEqTyConApps lhs_tc lhs_tys tc tys   -- F ty ~ ...(F ty)...
+        -> case fam_app_flag of
+             TEFA_Recurse       -> failCheckWith (cteProblem occ_prob)
+             TEFA_Break breaker -> breaker fam_app
+
+      _ | Unifying lhs_info _ _ <- unifying
+        , isConcreteInfo lhs_info
+        -> case fam_app_flag of
+             TEFA_Recurse       -> failCheckWith (cteProblem cteConcrete)
+             TEFA_Break breaker -> breaker fam_app
+
+      TEFA_Recurse
+        -> do { tys_res <- mapCheck (checkTyEqRhs arg_flags) tys
+              ; traceTc "under" (ppr tc $$ pprPur tys_res $$ ppr flags)
+              ; return (mkTyConAppRedn Nominal tc <$> tys_res) }
+
+      TEFA_Break breaker    -- Recurse; and break if there is a problem
+        -> do { tys_res <- mapCheck (checkTyEqRhs arg_flags) tys
+              ; case tys_res of
+                  PuOK cts redns -> return (PuOK cts (mkTyConAppRedn Nominal tc redns))
+                  PuFail {}      -> breaker fam_app }
+  where
+    arg_flags = famAppArgFlags flags
+
+-------------------
+checkTyVar :: forall a. TyEqFlags a -> TcTyVar -> TcM (PuResult a Reduction)
+checkTyVar (TEF { tef_lhs = lhs, tef_unifying = unifying, tef_occurs = occ_prob }) occ_tv
+  = case lhs of
+      TyFamLHS {}     -> success   -- Nothing to do if the LHS is a type-family
+      TyVarLHS lhs_tv -> check_tv unifying lhs_tv
+  where
+    lvl_occ = tcTyVarLevel occ_tv
+    success = okCheckRefl (mkTyVarTy occ_tv)
+
+    ---------------------
+    check_tv NotUnifying lhs_tv
+      = simple_occurs_check lhs_tv
+      -- We need an occurs-check here, but no level check
+      -- See Note [Promotion and level-checking] wrinkle (W1)
+
+    check_tv (Unifying info lvl prom) lhs_tv
+      = do { mb_done <- isFilledMetaTyVar_maybe occ_tv
+           ; case mb_done of
+               Just {} -> success
+               -- Already promoted; job done
+               -- Example alpha[2] ~ Maybe (beta[4], beta[4])
+               -- We promote the first occurrence, and then encounter it
+               -- a second time; we don't want to re-promote it!
+               -- Remember, the entire process started with a fully zonked type
+
+               Nothing -> check_unif info lvl prom lhs_tv }
+
+    ---------------------
+    -- We are in the Unifying branch of AreUnifing
+    check_unif :: MetaInfo -> TcLevel -> LevelCheck
+               -> TcTyVar -> TcM (PuResult a Reduction)
+    check_unif lhs_tv_info lhs_tv_lvl prom lhs_tv
+      | isConcreteInfo lhs_tv_info
+      , not (isConcreteTyVar occ_tv)
+      = if can_make_concrete occ_tv
+        then promote lhs_tv lhs_tv_info lhs_tv_lvl
+        else failCheckWith (cteProblem cteConcrete)
+
+      | lvl_occ `strictlyDeeperThan` lhs_tv_lvl
+      = case prom of
+           LC_None    -> pprPanic "check_unif" (ppr lhs_tv $$ ppr occ_tv)
+           LC_Check   -> failCheckWith (cteProblem cteSkolemEscape)
+           LC_Promote
+             | isSkolemTyVar occ_tv  -> failCheckWith (cteProblem cteSkolemEscape)
+             | otherwise             -> promote lhs_tv lhs_tv_info lhs_tv_lvl
 
       | otherwise
-      = False
+      = simple_occurs_check lhs_tv
 
-    go :: TcType -> CheckTyEqResult
-    go (TyVarTy tv')           = go_tv tv'
-    go (TyConApp tc tys)       = go_tc tc tys
-    go (LitTy {})              = cteOK
-    go (FunTy {ft_af = af, ft_mult = w, ft_arg = a, ft_res = r})
-                               = go w S.<> go a S.<> go r S.<>
-                                 if not ghci_tv && isInvisibleFunArg af
-                                   then impredicative
-                                   else cteOK
-    go (AppTy fun arg) = go fun S.<> go arg
-    go (CastTy ty co)  = go ty  S.<> go_co co
-    go (CoercionTy co) = go_co co
-    go (ForAllTy (Bndr tv' _) ty) = (case lhs of
-      TyVarLHS tv | tv == tv' -> go_occ (tyVarKind tv') S.<> cterClearOccursCheck (go ty)
-                  | otherwise -> go_occ (tyVarKind tv') S.<> go ty
-      _                       -> go ty)
-      S.<>
-      if ghci_tv then cteOK else impredicative
+    ---------------------
+    simple_occurs_check lhs_tv
+      | lhs_tv == occ_tv || check_kind (tyVarKind occ_tv)
+      = failCheckWith (cteProblem occ_prob)
+      | otherwise
+      = success
+      where
+        (check_kind, _) = mkOccFolders lhs_tv
 
-    go_tv :: TcTyVar -> CheckTyEqResult
-      -- this slightly peculiar way of defining this means
-      -- we don't have to evaluate this `case` at every variable
-      -- occurrence
-    go_tv = case lhs of
-      TyVarLHS tv -> \ tv' -> go_occ (tyVarKind tv') S.<>
-                              if tv == tv' then insoluble_occurs else cteOK
-      TyFamLHS {} -> \ _tv' -> cteOK
-           -- See Note [Occurrence checking: look inside kinds] in GHC.Core.Type
+    ---------------------
+    can_make_concrete occ_tv = case tcTyVarDetails occ_tv of
+      MetaTv { mtv_info = info } -> case info of
+                                      ConcreteTv {} -> True
+                                      TauTv {}      -> True
+                                      _             -> False
+      _ -> False  -- Don't attempt to make other type variables concrete
+                  -- (e.g. SkolemTv, TyVarTv, CycleBreakerTv, RuntimeUnkTv).
 
-     -- For kinds, we only do an occurs check; we do not worry
-     -- about type families or foralls
-     -- See Note [Checking for foralls]
-    go_occ k = cterFromKind $ go k
+    ---------------------
+    -- occ_tv is definitely a MetaTyVar
+    promote lhs_tv lhs_tv_info lhs_tv_lvl
+      | MetaTv { mtv_info = info_occ, mtv_tclvl = lvl_occ } <- tcTyVarDetails occ_tv
+      = do { let new_info | isConcreteInfo lhs_tv_info = lhs_tv_info
+                          | otherwise                  = info_occ
+                 new_lvl = lhs_tv_lvl `minTcLevel` lvl_occ
+                           -- c[conc,3] ~ p[tau,2]: want to clone p:=p'[conc,2]
+                           -- c[tau,2]  ~ p[tau,3]: want to clone p:=p'[tau,2]
 
-    go_tc :: TyCon -> [TcType] -> CheckTyEqResult
-      -- this slightly peculiar way of defining this means
-      -- we don't have to evaluate this `case` at every tyconapp
-    go_tc = case lhs of
-      TyVarLHS {} -> \ tc tys -> check_tc tc S.<> go_tc_args tc tys
-      TyFamLHS fam_tc fam_args -> \ tc tys ->
-        if tcEqTyConApps fam_tc fam_args tc tys
-          then insoluble_occurs
-          else check_tc tc S.<> go_tc_args tc tys
+           -- Check the kind of occ_tv
+           ; reason <- checkPromoteFreeVars occ_prob lhs_tv lhs_tv_lvl (tyCoVarsOfType (tyVarKind occ_tv))
 
-      -- just look at arguments, not the tycon itself
-    go_tc_args :: TyCon -> [TcType] -> CheckTyEqResult
-    go_tc_args tc tys | isGenerativeTyCon tc Nominal = foldMap go tys
-                      | otherwise
-                      = let (tf_args, non_tf_args) = splitAt (tyConArity tc) tys in
-                        cterSetOccursCheckSoluble (foldMap go tf_args) S.<> foldMap go non_tf_args
+           ; if cterHasNoProblem reason  -- Successfully promoted
+             then do { new_tv_ty <- promote_meta_tyvar new_info new_lvl occ_tv
+                     ; okCheckRefl new_tv_ty }
+             else failCheckWith reason }
 
-     -- no bother about impredicativity in coercions, as they're
-     -- inferred
-    go_co co | TyVarLHS tv <- lhs
-             , tv `elemVarSet` tyCoVarsOfCo co
-             = soluble_occurs
+      | otherwise = pprPanic "promote" (ppr occ_tv)
 
-        -- Don't check coercions for type families; see commentary at top of function
-             | otherwise
-             = cteOK
+-------------------------
+checkPromoteFreeVars :: CheckTyEqProblem    -- What occurs check problem to report
+                     -> TcTyVar -> TcLevel
+                     -> TyCoVarSet -> TcM CheckTyEqResult
+-- Check this set of TyCoVars for
+--   (a) occurs check
+--   (b) promote if necessary, or report skolem escape
+checkPromoteFreeVars occ_prob lhs_tv lhs_tv_lvl vs
+  = do { oks <- mapM do_one (nonDetEltsUniqSet vs)
+       ; return (mconcat oks) }
+  where
+    do_one :: TyCoVar -> TcM CheckTyEqResult
+    do_one v | isCoVar v           = return cteOK
+             | lhs_tv == v         = return (cteProblem occ_prob)
+             | no_promotion        = return cteOK
+             | not (isMetaTyVar v) = return (cteProblem cteSkolemEscape)
+             | otherwise           = promote_one v
+      where
+        no_promotion = not (tcTyVarLevel v `strictlyDeeperThan` lhs_tv_lvl)
 
-    check_tc :: TyCon -> CheckTyEqResult
-    check_tc
-      | ghci_tv   = \ _tc -> cteOK
-      | otherwise = \ tc  -> (if isTauTyCon tc then cteOK else impredicative) S.<>
-                             (if isFamFreeTyCon tc then cteOK else type_family)
+    -- isCoVar case: coercion variables are not an escape risk
+    -- If an implication binds a coercion variable, it'll have equalities,
+    -- so the "intervening given equalities" test above will catch it
+    -- Coercion holes get filled with coercions, so again no problem.
+
+    promote_one tv = do { _ <- promote_meta_tyvar TauTv lhs_tv_lvl tv
+                        ; return cteOK }
+
+promote_meta_tyvar :: MetaInfo -> TcLevel -> TcTyVar -> TcM TcType
+promote_meta_tyvar info dest_lvl occ_tv
+  = do { -- Check whether occ_tv is already unified. The rhs-type
+         -- started zonked, but we may have promoted one of its type
+         -- variables, and we then encounter it for the second time.
+         -- But if so, it'll definitely be another already-checked TyVar
+         mb_filled <- isFilledMetaTyVar_maybe occ_tv
+       ; case mb_filled of {
+           Just ty -> return ty ;
+           Nothing ->
+
+    -- OK, not done already, so clone/promote it
+    do { new_tv <- cloneMetaTyVarWithInfo info dest_lvl occ_tv
+       ; liftZonkM $ writeMetaTyVar occ_tv (mkTyVarTy new_tv)
+       ; traceTc "promoteTyVar" (ppr occ_tv <+> text "-->" <+> ppr new_tv)
+       ; return (mkTyVarTy new_tv) } } }
+
+
+
+-------------------------
+touchabilityAndShapeTest :: TcLevel -> TcTyVar -> TcType -> Bool
+-- This is the key test for untouchability:
+-- See Note [Unification preconditions] in GHC.Tc.Utils.Unify
+-- and Note [Solve by unification] in GHC.Tc.Solver.Equality
+-- True <=> touchability and shape are OK
+touchabilityAndShapeTest given_eq_lvl tv rhs
+  | MetaTv { mtv_info = info, mtv_tclvl = tv_lvl } <- tcTyVarDetails tv
+  , checkTopShape info rhs
+  = tv_lvl `deeperThanOrSame` given_eq_lvl
+  | otherwise
+  = False
+
+-------------------------
+-- | checkTopShape checks (TYVAR-TV)
+-- Note [Unification preconditions]; returns True if these conditions
+-- are satisfied. But see the Note for other preconditions, too.
+checkTopShape :: MetaInfo -> TcType -> Bool
+checkTopShape info xi
+  = case info of
+      TyVarTv ->
+        case getTyVar_maybe xi of   -- Looks through type synonyms
+           Nothing -> False
+           Just tv -> case tcTyVarDetails tv of -- (TYVAR-TV) wrinkle
+                        SkolemTv {} -> True
+                        RuntimeUnk  -> True
+                        MetaTv { mtv_info = TyVarTv } -> True
+                        _                             -> False
+      CycleBreakerTv -> False  -- We never unify these
+      _ -> True

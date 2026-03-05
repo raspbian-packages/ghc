@@ -16,9 +16,7 @@ import GHC.CmmToAsm.Types
 import GHC.CmmToAsm.Utils
 
 import GHC.Cmm hiding (topInfoTable)
-import GHC.Cmm.Dataflow.Collections
 import GHC.Cmm.Dataflow.Label
-import GHC.Types.Basic (Alignment, mkAlignment, alignmentBytes)
 
 import GHC.Cmm.BlockId
 import GHC.Cmm.CLabel
@@ -29,18 +27,16 @@ import GHC.Utils.Outputable
 
 import GHC.Utils.Panic
 
-pprProcAlignment :: IsDoc doc => NCGConfig -> doc
-pprProcAlignment config = maybe empty (pprAlign platform . mkAlignment) (ncgProcAlignment config)
-   where
-      platform = ncgPlatform config
-
 pprNatCmmDecl :: IsDoc doc => NCGConfig -> NatCmmDecl RawCmmStatics Instr -> doc
 pprNatCmmDecl config (CmmData section dats) =
-  pprSectionAlign config section $$ pprDatas config dats
+  let platform = ncgPlatform config
+  in
+  pprSectionAlign config section $$ pprDatas platform dats
 
 pprNatCmmDecl config proc@(CmmProc top_info lbl _ (ListGraph blocks)) =
-  let platform = ncgPlatform config in
-  pprProcAlignment config $$
+  let platform = ncgPlatform config
+      with_dwarf = ncgDwarfEnabled config
+  in
   case topInfoTable proc of
     Nothing ->
         -- special case for code without info table:
@@ -48,7 +44,7 @@ pprNatCmmDecl config proc@(CmmProc top_info lbl _ (ListGraph blocks)) =
         -- do not
         -- pprProcAlignment config $$
         pprLabel platform lbl $$ -- blocks guaranteed not null, so label needed
-        vcat (map (pprBasicBlock config top_info) blocks) $$
+        vcat (map (pprBasicBlock platform with_dwarf top_info) blocks) $$
         (if ncgDwarfEnabled config
          then line (pprAsmLabel platform (mkAsmTempEndLabel lbl) <> char ':') else empty) $$
         pprSizeDecl platform lbl
@@ -59,7 +55,7 @@ pprNatCmmDecl config proc@(CmmProc top_info lbl _ (ListGraph blocks)) =
       (if platformHasSubsectionsViaSymbols platform
           then line (pprAsmLabel platform (mkDeadStripPreventer info_lbl) <> char ':')
           else empty) $$
-      vcat (map (pprBasicBlock config top_info) blocks) $$
+      vcat (map (pprBasicBlock platform with_dwarf top_info) blocks) $$
       -- above: Even the first block gets a label, because with branch-chain
       -- elimination, it might be the target of a goto.
       (if platformHasSubsectionsViaSymbols platform
@@ -79,10 +75,6 @@ pprLabel platform lbl =
    pprGloblDecl platform lbl
    $$ pprTypeDecl platform lbl
    $$ line (pprAsmLabel platform lbl <> char ':')
-
-pprAlign :: IsDoc doc => Platform -> Alignment -> doc
-pprAlign _platform alignment
-        = line $ text "\t.balign " <> int (alignmentBytes alignment)
 
 -- | Print appropriate alignment for the given section type.
 pprAlignForSection :: IsDoc doc => Platform -> SectionType -> doc
@@ -111,13 +103,13 @@ pprSizeDecl platform lbl
    then line (text "\t.size" <+> pprAsmLabel platform lbl <> text ", .-" <> pprAsmLabel platform lbl)
    else empty
 
-pprBasicBlock :: IsDoc doc => NCGConfig -> LabelMap RawCmmStatics -> NatBasicBlock Instr
+pprBasicBlock :: IsDoc doc => Platform -> {- dwarf enabled -} Bool -> LabelMap RawCmmStatics -> NatBasicBlock Instr
               -> doc
-pprBasicBlock config info_env (BasicBlock blockid instrs)
+pprBasicBlock platform with_dwarf info_env (BasicBlock blockid instrs)
   = maybe_infotable $
     pprLabel platform asmLbl $$
     vcat (map (pprInstr platform) (id {-detectTrivialDeadlock-} optInstrs)) $$
-    (if  ncgDwarfEnabled config
+    (if  with_dwarf
       then line (pprAsmLabel platform (mkAsmTempEndLabel asmLbl) <> char ':')
       else empty
     )
@@ -128,16 +120,15 @@ pprBasicBlock config info_env (BasicBlock blockid instrs)
             f _ = True
 
     asmLbl = blockLbl blockid
-    platform = ncgPlatform config
     maybe_infotable c = case mapLookup blockid info_env of
        Nothing   -> c
        Just (CmmStaticsRaw info_lbl info) ->
           --  pprAlignForSection platform Text $$
            infoTableLoc $$
-           vcat (map (pprData config) info) $$
+           vcat (map (pprData platform) info) $$
            pprLabel platform info_lbl $$
            c $$
-           (if ncgDwarfEnabled config
+           (if with_dwarf
              then line (pprAsmLabel platform (mkAsmTempEndLabel info_lbl) <> char ':')
              else empty)
     -- Make sure the info table has the right .loc for the block
@@ -146,34 +137,31 @@ pprBasicBlock config info_env (BasicBlock blockid instrs)
       (l@LOCATION{} : _) -> pprInstr platform l
       _other             -> empty
 
-pprDatas :: IsDoc doc => NCGConfig -> RawCmmStatics -> doc
+pprDatas :: IsDoc doc => Platform -> RawCmmStatics -> doc
 -- See Note [emit-time elimination of static indirections] in "GHC.Cmm.CLabel".
-pprDatas config (CmmStaticsRaw alias [CmmStaticLit (CmmLabel lbl), CmmStaticLit ind, _, _])
+pprDatas platform (CmmStaticsRaw alias [CmmStaticLit (CmmLabel lbl), CmmStaticLit ind, _, _])
   | lbl == mkIndStaticInfoLabel
   , let labelInd (CmmLabelOff l _) = Just l
         labelInd (CmmLabel l) = Just l
         labelInd _ = Nothing
   , Just ind' <- labelInd ind
   , alias `mayRedirectTo` ind'
-  = pprGloblDecl (ncgPlatform config) alias
-    $$ line (text ".equiv" <+> pprAsmLabel (ncgPlatform config) alias <> comma <> pprAsmLabel (ncgPlatform config) ind')
+  = pprGloblDecl platform alias
+    $$ line (text ".equiv" <+> pprAsmLabel platform alias <> comma <> pprAsmLabel platform ind')
 
-pprDatas config (CmmStaticsRaw lbl dats)
-  = vcat (pprLabel platform lbl : map (pprData config) dats)
-   where
-      platform = ncgPlatform config
+pprDatas platform (CmmStaticsRaw lbl dats)
+  = vcat (pprLabel platform lbl : map (pprData platform) dats)
 
-pprData :: IsDoc doc => NCGConfig -> CmmStatic -> doc
-pprData _config (CmmString str) = line (pprString str)
-pprData _config (CmmFileEmbed path _) = line (pprFileEmbed path)
+pprData :: IsDoc doc => Platform -> CmmStatic -> doc
+pprData _platform (CmmString str) = line (pprString str)
+pprData _platform (CmmFileEmbed path _) = line (pprFileEmbed path)
 
-pprData config (CmmUninitialised bytes)
- = line $ let platform = ncgPlatform config
-          in if platformOS platform == OSDarwin
+pprData platform (CmmUninitialised bytes)
+ = line $ if platformOS platform == OSDarwin
                 then text ".space " <> int bytes
                 else text ".skip "  <> int bytes
 
-pprData config (CmmStaticLit lit) = pprDataItem config lit
+pprData platform (CmmStaticLit lit) = pprDataItem platform lit
 
 pprGloblDecl :: IsDoc doc => Platform -> CLabel -> doc
 pprGloblDecl platform lbl
@@ -207,12 +195,10 @@ pprTypeDecl platform lbl
       then line (text ".type " <> pprAsmLabel platform lbl <> text ", " <> pprLabelType' platform lbl)
       else empty
 
-pprDataItem :: IsDoc doc => NCGConfig -> CmmLit -> doc
-pprDataItem config lit
+pprDataItem :: IsDoc doc => Platform -> CmmLit -> doc
+pprDataItem platform lit
   = lines_ (ppr_item (cmmTypeFormat $ cmmLitType platform lit) lit)
     where
-        platform = ncgPlatform config
-
         imm = litToImm lit
 
         ppr_item II8  _ = [text "\t.byte\t"  <> pprImm platform imm]
@@ -330,6 +316,7 @@ pprReg w r = case r of
          | w == W64 = text "sp"
          | w == W32 = text "wsp"
 
+    -- See Note [AArch64 Register assignments]
     ppr_reg_no w i
          | i < 0, w == W32 = text "wzr"
          | i < 0, w == W64 = text "xzr"
@@ -370,7 +357,6 @@ pprInstr platform instr = case instr of
                       -- in the final instruction stream. But we still want to be able to
                       -- print it for debugging purposes.
                       line (text "BLOCK " <> pprAsmLabel platform (blockLbl blockid))
-  LDATA _ _  -> panic "pprInstr: LDATA"
 
   -- Pseudo Instructions -------------------------------------------------------
 
@@ -384,16 +370,18 @@ pprInstr platform instr = case instr of
   ADD  o1 o2 o3
     | isFloatOp o1 && isFloatOp o2 && isFloatOp o3 -> op3 (text "\tfadd") o1 o2 o3
     | otherwise -> op3 (text "\tadd") o1 o2 o3
-  CMN  o1 o2    -> op2 (text "\tcmn") o1 o2
   CMP  o1 o2
     | isFloatOp o1 && isFloatOp o2 -> op2 (text "\tfcmp") o1 o2
     | otherwise -> op2 (text "\tcmp") o1 o2
+  CMN  o1 o2       -> op2 (text "\tcmn") o1 o2
   MSUB o1 o2 o3 o4 -> op4 (text "\tmsub") o1 o2 o3 o4
   MUL  o1 o2 o3
     | isFloatOp o1 && isFloatOp o2 && isFloatOp o3 -> op3 (text "\tfmul") o1 o2 o3
     | otherwise -> op3 (text "\tmul") o1 o2 o3
   SMULH o1 o2 o3 -> op3 (text "\tsmulh") o1 o2 o3
   SMULL o1 o2 o3 -> op3 (text "\tsmull") o1 o2 o3
+  UMULH o1 o2 o3 -> op3 (text "\tumulh") o1 o2 o3
+  UMULL o1 o2 o3 -> op3 (text "\tumull") o1 o2 o3
   NEG  o1 o2
     | isFloatOp o1 && isFloatOp o2 -> op2 (text "\tfneg") o1 o2
     | otherwise -> op2 (text "\tneg") o1 o2
@@ -409,6 +397,11 @@ pprInstr platform instr = case instr of
   -- 2. Bit Manipulation Instructions ------------------------------------------
   SBFM o1 o2 o3 o4 -> op4 (text "\tsbfm") o1 o2 o3 o4
   UBFM o1 o2 o3 o4 -> op4 (text "\tubfm") o1 o2 o3 o4
+  CLZ  o1 o2       -> op2 (text "\tclz")  o1 o2
+  RBIT  o1 o2      -> op2 (text "\trbit")  o1 o2
+  REV o1 o2        -> op2 (text "\trev")  o1 o2
+  REV16 o1 o2      -> op2 (text "\trev16")  o1 o2
+  -- REV32 o1 o2      -> op2 (text "\trev32")  o1 o2
   -- signed and unsigned bitfield extract
   SBFX o1 o2 o3 o4 -> op4 (text "\tsbfx") o1 o2 o3 o4
   UBFX o1 o2 o3 o4 -> op4 (text "\tubfx") o1 o2 o3 o4
@@ -419,11 +412,7 @@ pprInstr platform instr = case instr of
 
   -- 3. Logical and Move Instructions ------------------------------------------
   AND o1 o2 o3  -> op3 (text "\tand") o1 o2 o3
-  ANDS o1 o2 o3 -> op3 (text "\tands") o1 o2 o3
   ASR o1 o2 o3  -> op3 (text "\tasr") o1 o2 o3
-  BIC o1 o2 o3  -> op3 (text "\tbic") o1 o2 o3
-  BICS o1 o2 o3 -> op3 (text "\tbics") o1 o2 o3
-  EON o1 o2 o3  -> op3 (text "\teon") o1 o2 o3
   EOR o1 o2 o3  -> op3 (text "\teor") o1 o2 o3
   LSL o1 o2 o3  -> op3 (text "\tlsl") o1 o2 o3
   LSR o1 o2 o3  -> op3 (text "\tlsr") o1 o2 o3
@@ -431,11 +420,9 @@ pprInstr platform instr = case instr of
     | isFloatOp o1 || isFloatOp o2 -> op2 (text "\tfmov") o1 o2
     | otherwise                    -> op2 (text "\tmov") o1 o2
   MOVK o1 o2    -> op2 (text "\tmovk") o1 o2
+  MOVZ o1 o2    -> op2 (text "\tmovz") o1 o2
   MVN o1 o2     -> op2 (text "\tmvn") o1 o2
-  ORN o1 o2 o3  -> op3 (text "\torn") o1 o2 o3
   ORR o1 o2 o3  -> op3 (text "\torr") o1 o2 o3
-  ROR o1 o2 o3  -> op3 (text "\tror") o1 o2 o3
-  TST o1 o2     -> op2 (text "\ttst") o1 o2
 
   -- 4. Branch Instructions ----------------------------------------------------
   J t            -> pprInstr platform (B t)
@@ -443,9 +430,9 @@ pprInstr platform instr = case instr of
   B (TLabel lbl) -> line $ text "\tb" <+> pprAsmLabel platform lbl
   B (TReg r)     -> line $ text "\tbr" <+> pprReg W64 r
 
-  BL (TBlock bid) _ _ -> line $ text "\tbl" <+> pprAsmLabel platform (mkLocalBlockLabel (getUnique bid))
-  BL (TLabel lbl) _ _ -> line $ text "\tbl" <+> pprAsmLabel platform lbl
-  BL (TReg r)     _ _ -> line $ text "\tblr" <+> pprReg W64 r
+  BL (TBlock bid) _ -> line $ text "\tbl" <+> pprAsmLabel platform (mkLocalBlockLabel (getUnique bid))
+  BL (TLabel lbl) _ -> line $ text "\tbl" <+> pprAsmLabel platform lbl
+  BL (TReg r)     _ -> line $ text "\tblr" <+> pprReg W64 r
 
   BCOND c (TBlock bid) -> line $ text "\t" <> pprBcond c <+> pprAsmLabel platform (mkLocalBlockLabel (getUnique bid))
   BCOND c (TLabel lbl) -> line $ text "\t" <> pprBcond c <+> pprAsmLabel platform lbl
@@ -539,16 +526,22 @@ pprInstr platform instr = case instr of
   LDR _f o1 o2 -> op2 (text "\tldr") o1 o2
   LDAR _f o1 o2 -> op2 (text "\tldar") o1 o2
 
-  STP _f o1 o2 o3 -> op3 (text "\tstp") o1 o2 o3
-  LDP _f o1 o2 o3 -> op3 (text "\tldp") o1 o2 o3
-
   -- 8. Synchronization Instructions -------------------------------------------
-  DMBSY -> line $ text "\tdmb sy"
+  DMBISH -> line $ text "\tdmb ish"
+
   -- 9. Floating Point Instructions --------------------------------------------
   FCVT o1 o2 -> op2 (text "\tfcvt") o1 o2
   SCVTF o1 o2 -> op2 (text "\tscvtf") o1 o2
   FCVTZS o1 o2 -> op2 (text "\tfcvtzs") o1 o2
   FABS o1 o2 -> op2 (text "\tfabs") o1 o2
+  FSQRT o1 o2 -> op2 (text "\tfsqrt") o1 o2
+  FMA variant d r1 r2 r3 ->
+    let fma = case variant of
+                FMAdd  -> text "\tfmadd"
+                FMSub  -> text "\tfmsub"
+                FNMAdd -> text "\tfnmadd"
+                FNMSub -> text "\tfnmsub"
+    in op4 fma d r1 r2 r3
  where op2 op o1 o2        = line $ op <+> pprOp platform o1 <> comma <+> pprOp platform o2
        op3 op o1 o2 o3     = line $ op <+> pprOp platform o1 <> comma <+> pprOp platform o2 <> comma <+> pprOp platform o3
        op4 op o1 o2 o3 o4  = line $ op <+> pprOp platform o1 <> comma <+> pprOp platform o2 <> comma <+> pprOp platform o3 <> comma <+> pprOp platform o4

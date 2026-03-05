@@ -1,6 +1,8 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE RecordWildCards            #-}
 {-# LANGUAGE TypeApplications           #-}
+{-# LANGUAGE MagicHash                  #-}
+{-# LANGUAGE UnliftedNewtypes           #-}
 --
 --  (c) The University of Glasgow 2002-2006
 --
@@ -8,22 +10,24 @@
 -- | Bytecode assembler types
 module GHC.ByteCode.Types
   ( CompiledByteCode(..), seqCompiledByteCode
+  , BCOByteArray(..), mkBCOByteArray
   , FFIInfo(..)
   , RegBitmap(..)
   , NativeCallType(..), NativeCallInfo(..), voidTupleReturnInfo, voidPrimCallInfo
-  , ByteOff(..), WordOff(..)
+  , ByteOff(..), WordOff(..), HalfWord(..)
   , UnlinkedBCO(..), BCOPtr(..), BCONPtr(..)
   , ItblEnv, ItblPtr(..)
   , AddrEnv, AddrPtr(..)
   , CgBreakInfo(..)
   , ModBreaks (..), BreakIndex, emptyModBreaks
   , CCostCentre
+  , FlatBag, sizeFlatBag, fromSizedSeq, elemsFlatBag
   ) where
 
 import GHC.Prelude
 
 import GHC.Data.FastString
-import GHC.Data.SizedSeq
+import GHC.Data.FlatBag
 import GHC.Types.Name
 import GHC.Types.Name.Env
 import GHC.Utils.Outputable
@@ -33,10 +37,10 @@ import GHCi.BreakArray
 import GHCi.RemoteTypes
 import GHCi.FFI
 import Control.DeepSeq
+import GHCi.ResolvedBCO ( BCOByteArray(..), mkBCOByteArray )
 
 import Foreign
 import Data.Array
-import Data.Array.Base  ( UArray(..) )
 import Data.ByteString (ByteString)
 import Data.IntMap (IntMap)
 import qualified Data.IntMap as IntMap
@@ -44,6 +48,7 @@ import qualified GHC.Exts.Heap as Heap
 import GHC.Stack.CCS
 import GHC.Cmm.Expr ( GlobalRegSet, emptyRegSet, regSetToList )
 import GHC.Iface.Syntax
+import Language.Haskell.Syntax.Module.Name (ModuleName)
 
 -- -----------------------------------------------------------------------------
 -- Compiled Byte Code
@@ -77,6 +82,12 @@ newtype ByteOff = ByteOff Int
     deriving (Enum, Eq, Show, Integral, Num, Ord, Real, Outputable)
 
 newtype WordOff = WordOff Int
+    deriving (Enum, Eq, Show, Integral, Num, Ord, Real, Outputable)
+
+-- A type for values that are half the size of a word on the target
+-- platform where the interpreter runs (which may be a different
+-- wordsize than the compiler).
+newtype HalfWord = HalfWord Word
     deriving (Enum, Eq, Show, Integral, Num, Ord, Real, Outputable)
 
 newtype RegBitmap = RegBitmap { unRegBitmap :: Word32 }
@@ -145,10 +156,10 @@ data UnlinkedBCO
    = UnlinkedBCO {
         unlinkedBCOName   :: !Name,
         unlinkedBCOArity  :: {-# UNPACK #-} !Int,
-        unlinkedBCOInstrs :: !(UArray Int Word16),      -- insns
-        unlinkedBCOBitmap :: !(UArray Int Word64),      -- bitmap
-        unlinkedBCOLits   :: !(SizedSeq BCONPtr),       -- non-ptrs
-        unlinkedBCOPtrs   :: !(SizedSeq BCOPtr)         -- ptrs
+        unlinkedBCOInstrs :: !(BCOByteArray Word16),      -- insns
+        unlinkedBCOBitmap :: !(BCOByteArray Word),      -- bitmap
+        unlinkedBCOLits   :: !(FlatBag BCONPtr),       -- non-ptrs
+        unlinkedBCOPtrs   :: !(FlatBag BCOPtr)         -- ptrs
    }
 
 instance NFData UnlinkedBCO where
@@ -160,7 +171,8 @@ data BCOPtr
   = BCOPtrName   !Name
   | BCOPtrPrimOp !PrimOp
   | BCOPtrBCO    !UnlinkedBCO
-  | BCOPtrBreakArray  -- a pointer to this module's BreakArray
+  | BCOPtrBreakArray (ForeignRef BreakArray)
+    -- ^ a pointer to a breakpoint's module's BreakArray in GHCi's memory
 
 instance NFData BCOPtr where
   rnf (BCOPtrBCO bco) = rnf bco
@@ -188,7 +200,7 @@ instance NFData BCONPtr where
 data CgBreakInfo
    = CgBreakInfo
    { cgb_tyvars :: ![IfaceTvBndr] -- ^ Type variables in scope at the breakpoint
-   , cgb_vars   :: ![Maybe (IfaceIdBndr, Word16)]
+   , cgb_vars   :: ![Maybe (IfaceIdBndr, Word)]
    , cgb_resty  :: !IfaceType
    }
 -- See Note [Syncing breakpoint info] in GHC.Runtime.Eval
@@ -202,8 +214,8 @@ seqCgBreakInfo CgBreakInfo{..} =
 instance Outputable UnlinkedBCO where
    ppr (UnlinkedBCO nm _arity _insns _bitmap lits ptrs)
       = sep [text "BCO", ppr nm, text "with",
-             ppr (sizeSS lits), text "lits",
-             ppr (sizeSS ptrs), text "ptrs" ]
+             ppr (sizeFlatBag lits), text "lits",
+             ppr (sizeFlatBag ptrs), text "ptrs" ]
 
 instance Outputable CgBreakInfo where
    ppr info = text "CgBreakInfo" <+>
@@ -236,6 +248,7 @@ data ModBreaks
         -- ^ Array pointing to cost centre for each breakpoint
    , modBreaks_breakInfo :: IntMap CgBreakInfo
         -- ^ info about each breakpoint from the bytecode generator
+   , modBreaks_module :: RemotePtr ModuleName
    }
 
 seqModBreaks :: ModBreaks -> ()
@@ -245,7 +258,8 @@ seqModBreaks ModBreaks{..} =
   rnf modBreaks_vars `seq`
   rnf modBreaks_decls `seq`
   rnf modBreaks_ccs `seq`
-  rnf (fmap seqCgBreakInfo modBreaks_breakInfo)
+  rnf (fmap seqCgBreakInfo modBreaks_breakInfo) `seq`
+  rnf modBreaks_module
 
 -- | Construct an empty ModBreaks
 emptyModBreaks :: ModBreaks
@@ -257,6 +271,7 @@ emptyModBreaks = ModBreaks
    , modBreaks_decls = array (0,-1) []
    , modBreaks_ccs = array (0,-1) []
    , modBreaks_breakInfo = IntMap.empty
+   , modBreaks_module = toRemotePtr nullPtr
    }
 
 {-

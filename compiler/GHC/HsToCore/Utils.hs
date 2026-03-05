@@ -15,7 +15,7 @@ This module exports some utility functions of no great interest.
 -- | Utility functions for constructing Core syntax, principally for desugaring
 module GHC.HsToCore.Utils (
         EquationInfo(..),
-        firstPat, shiftEqns,
+        firstPat, shiftEqns, combineEqnRhss,
 
         MatchResult (..), CaseAlt(..),
         cantFailMatchResult, alwaysFailMatchResult,
@@ -41,7 +41,7 @@ module GHC.HsToCore.Utils (
 
         selectSimpleMatchVarL, selectMatchVars, selectMatchVar,
         mkOptTickBox, mkBinaryTickBox, decideBangHood,
-        isTrueLHsExpr
+        isTrueLHsExpr,
     ) where
 
 import GHC.Prelude
@@ -75,13 +75,11 @@ import GHC.Builtin.Names
 import GHC.Types.Name( isInternalName )
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
-import GHC.Utils.Panic.Plain
 import GHC.Types.SrcLoc
 import GHC.Types.Tickish
 import GHC.Utils.Misc
-import GHC.Driver.Session
+import GHC.Driver.DynFlags
 import GHC.Driver.Ppr
-import GHC.Data.FastString
 import qualified GHC.LanguageExtensions as LangExt
 
 import GHC.Tc.Types.Evidence
@@ -133,7 +131,7 @@ selectMatchVar :: Mult -> Pat GhcTc -> DsM Id
 -- Postcondition: the returned Id has an Internal Name
 selectMatchVar w (BangPat _ pat)    = selectMatchVar w (unLoc pat)
 selectMatchVar w (LazyPat _ pat)    = selectMatchVar w (unLoc pat)
-selectMatchVar w (ParPat _ _ pat _) = selectMatchVar w (unLoc pat)
+selectMatchVar w (ParPat _  pat)    = selectMatchVar w (unLoc pat)
 selectMatchVar _w (VarPat _ var)    = return (localiseId (unLoc var))
                                   -- Note [Localise pattern binders]
                                   --
@@ -142,7 +140,7 @@ selectMatchVar _w (VarPat _ var)    = return (localiseId (unLoc var))
                                   -- multiplicity stored within the variable
                                   -- itself. It's easier to pull it from the
                                   -- variable, so we ignore the multiplicity.
-selectMatchVar _w (AsPat _ var _ _) = assert (isManyTy _w ) (return (unLoc var))
+selectMatchVar _w (AsPat _ var _) = assert (isManyTy _w ) (return (localiseId (unLoc var)))
 selectMatchVar w other_pat        = newSysLocalDs w (hsPatType other_pat)
 
 {- Note [Localise pattern binders]
@@ -195,12 +193,16 @@ The ``equation info'' used by @match@ is relatively complicated and
 worthy of a type synonym and a few handy functions.
 -}
 
-firstPat :: EquationInfo -> Pat GhcTc
-firstPat eqn = assert (notNull (eqn_pats eqn)) $ head (eqn_pats eqn)
+firstPat :: EquationInfoNE -> Pat GhcTc
+firstPat (EqnMatch { eqn_pat = pat }) = unLoc pat
+firstPat (EqnDone {}) = error "firstPat: no patterns"
 
-shiftEqns :: Functor f => f EquationInfo -> f EquationInfo
+shiftEqns :: Functor f => f EquationInfoNE -> f EquationInfo
 -- Drop the first pattern in each equation
-shiftEqns = fmap $ \eqn -> eqn { eqn_pats = tail (eqn_pats eqn) }
+shiftEqns = fmap eqn_rest
+
+combineEqnRhss :: NonEmpty EquationInfo -> DsM (MatchResult CoreExpr)
+combineEqnRhss eqns = return $ foldr1 combineMatchResults $ map eqnMatchResult (NEL.toList eqns)
 
 -- Functions on MatchResult CoreExprs
 
@@ -248,6 +250,9 @@ wrapBind new old body   -- NB: this function must deal with term
   | new==old    = body  -- variables, type variables or coercion variables
   | otherwise   = Let (NonRec new (varToCoreExpr old)) body
 
+-- Used to force variables when desugaring strict binders. It's crucial that the
+-- variable is shadowed by the case binder. See Wrinkle 1 in
+-- Note [Desugar Strict binds] in GHC.HsToCore.Binds.
 seqVar :: Var -> CoreExpr -> CoreExpr
 seqVar var body = mkDefaultCase (Var var) var body
 
@@ -454,7 +459,7 @@ For uniformity, calls to 'error' in both cases are wrapped even if -XLinearTypes
 is disabled.
 -}
 
-mkFailExpr :: HsMatchContext GhcRn -> Type -> DsM CoreExpr
+mkFailExpr :: HsMatchContextRn -> Type -> DsM CoreExpr
 mkFailExpr ctxt ty
   = mkErrorAppDs pAT_ERROR_ID ty (matchContextErrString ctxt)
 
@@ -595,7 +600,12 @@ mkSelectorBinds is used to desugar a pattern binding {p = e},
 in a binding group:
   let { ...; p = e; ... } in body
 where p binds x,y (this list of binders can be empty).
-There are two cases.
+
+mkSelectorBinds is also used to desugar irrefutable patterns, which is the
+pattern syntax equivalent of a lazy pattern binding:
+   f (~(a:as)) = rhs    ==>    f x = let (a:as) = x in rhs
+
+There are three cases.
 
 ------ Special case (A) -------
   For a pattern that is just a variable,
@@ -632,7 +642,7 @@ There are two cases.
   Note that (C) /includes/ the situation where
 
    * The pattern binds exactly one variable
-        let !(Just (Just x) = e in body
+        let !(Just (Just x)) = e in body
      ==>
        let { t = case e of Just (Just v) -> Solo v
            ; v = case t of Solo v -> v }
@@ -640,7 +650,7 @@ There are two cases.
     The 'Solo' is a one-tuple; see Note [One-tuples] in GHC.Builtin.Types
     Note that forcing 't' makes the pattern match happen,
     but does not force 'v'.  That's why we call `mkBigCoreVarTupSolo`
-    in `mkSeletcorBinds`
+    in `mkSelectorBinds`
 
   * The pattern binds no variables
         let !(True,False) = e in body
@@ -724,15 +734,16 @@ work out well:
 -}
 -- Remark: pattern selectors only occur in unrestricted patterns so we are free
 -- to select Many as the multiplicity of every let-expression introduced.
-mkSelectorBinds :: [[CoreTickish]] -- ^ ticks to add, possibly
-                -> LPat GhcTc      -- ^ The pattern
-                -> CoreExpr        -- ^ Expression to which the pattern is bound
+mkSelectorBinds :: [[CoreTickish]]       -- ^ ticks to add, possibly
+                -> LPat GhcTc            -- ^ The pattern
+                -> HsMatchContextRn      -- ^ Where the pattern occurs
+                -> CoreExpr              -- ^ Expression to which the pattern is bound
                 -> DsM (Id,[(Id,CoreExpr)])
                 -- ^ Id the rhs is bound to, for desugaring strict
                 -- binds (see Note [Desugar Strict binds] in "GHC.HsToCore.Binds")
                 -- and all the desugared binds
 
-mkSelectorBinds ticks pat val_expr
+mkSelectorBinds ticks pat ctx val_expr
   | L _ (VarPat _ (L _ v)) <- pat'     -- Special case (A)
   = return (v, [(v, val_expr)])
 
@@ -743,7 +754,7 @@ mkSelectorBinds ticks pat val_expr
        ; let mk_bind tick bndr_var
                -- (mk_bind sv bv)  generates  bv = case sv of { pat -> bv }
                -- Remember, 'pat' binds 'bv'
-               = do { rhs_expr <- matchSimply (Var val_var) PatBindRhs pat'
+               = do { rhs_expr <- matchSimply (Var val_var) ctx ManyTy pat'
                                        (Var bndr_var)
                                        (Var bndr_var)  -- Neat hack
                       -- Neat hack: since 'pat' can't fail, the
@@ -758,7 +769,7 @@ mkSelectorBinds ticks pat val_expr
   | otherwise                          -- General case (C)
   = do { tuple_var  <- newSysLocalDs ManyTy tuple_ty
        ; error_expr <- mkErrorAppDs pAT_ERROR_ID tuple_ty (ppr pat')
-       ; tuple_expr <- matchSimply val_expr PatBindRhs pat
+       ; tuple_expr <- matchSimply val_expr ctx ManyTy pat
                                    local_tuple error_expr
        ; let mk_tup_bind tick binder
                = (binder, mkOptTickBox tick $
@@ -780,7 +791,7 @@ mkSelectorBinds ticks pat val_expr
 
 strip_bangs :: LPat (GhcPass p) -> LPat (GhcPass p)
 -- Remove outermost bangs and parens
-strip_bangs (L _ (ParPat _ _ p _))  = strip_bangs p
+strip_bangs (L _ (ParPat _ p))  = strip_bangs p
 strip_bangs (L _ (BangPat _ p)) = strip_bangs p
 strip_bangs lp                  = lp
 
@@ -789,7 +800,7 @@ is_flat_prod_lpat :: LPat GhcTc -> Bool
 is_flat_prod_lpat = is_flat_prod_pat . unLoc
 
 is_flat_prod_pat :: Pat GhcTc -> Bool
-is_flat_prod_pat (ParPat _ _ p _)      = is_flat_prod_lpat p
+is_flat_prod_pat (ParPat _ p)          = is_flat_prod_lpat p
 is_flat_prod_pat (TuplePat _ ps Boxed) = all is_triv_lpat ps
 is_flat_prod_pat (ConPat { pat_con  = L _ pcon
                          , pat_args = ps})
@@ -806,7 +817,7 @@ is_triv_lpat = is_triv_pat . unLoc
 is_triv_pat :: Pat (GhcPass p) -> Bool
 is_triv_pat (VarPat {})  = True
 is_triv_pat (WildPat{})  = True
-is_triv_pat (ParPat _ _ p _) = is_triv_lpat p
+is_triv_pat (ParPat _ p) = is_triv_lpat p
 is_triv_pat _            = False
 
 
@@ -910,7 +921,7 @@ anyway, and the Void# doesn't do much harm.
 mkFailurePair :: CoreExpr       -- Result type of the whole case expression
               -> DsM (CoreBind, -- Binds the newly-created fail variable
                                 -- to \ _ -> expression
-                      CoreExpr) -- Fail variable applied to realWorld#
+                      CoreExpr) -- Fail variable applied to (# #)
 -- See Note [Failure thunks and CPR]
 mkFailurePair expr
   = do { fail_fun_var <- newFailLocalDs ManyTy (unboxedUnitTy `mkVisFunTyMany` ty)
@@ -995,19 +1006,10 @@ mkOptTickBox = flip (foldr Tick)
 
 mkBinaryTickBox :: Int -> Int -> CoreExpr -> DsM CoreExpr
 mkBinaryTickBox ixT ixF e = do
-       uq <- newUnique
        this_mod <- getModule
-       let bndr1 = mkSysLocal (fsLit "t1") uq OneTy boolTy
-         -- It's always sufficient to pattern-match on a boolean with
-         -- multiplicity 'One'.
-       let
+       let trueBox  = Tick (HpcTick this_mod ixT) (Var trueDataConId)
            falseBox = Tick (HpcTick this_mod ixF) (Var falseDataConId)
-           trueBox  = Tick (HpcTick this_mod ixT) (Var trueDataConId)
-       --
-       return $ Case e bndr1 boolTy
-                       [ Alt (DataAlt falseDataCon) [] falseBox
-                       , Alt (DataAlt trueDataCon)  [] trueBox
-                       ]
+       return $ mkIfThenElse e trueBox falseBox
 
 
 
@@ -1056,7 +1058,7 @@ decideBangHood dflags lpat
   where
     go lp@(L l p)
       = case p of
-           ParPat x lpar p rpar -> L l (ParPat x lpar (go p) rpar)
+           ParPat x p -> L l (ParPat x (go p))
            LazyPat _ lp' -> lp'
            BangPat _ _   -> lp
            _             -> L l (BangPat noExtField lp)
@@ -1088,5 +1090,5 @@ isTrueLHsExpr (L _ (XExpr (HsBinTick ixT _ e)))
                      this_mod <- getModule
                      return (Tick (HpcTick this_mod ixT) e))
 
-isTrueLHsExpr (L _ (HsPar _ _ e _)) = isTrueLHsExpr e
-isTrueLHsExpr _                     = Nothing
+isTrueLHsExpr (L _ (HsPar _ e)) = isTrueLHsExpr e
+isTrueLHsExpr _                 = Nothing

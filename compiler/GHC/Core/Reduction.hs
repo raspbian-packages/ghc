@@ -1,6 +1,3 @@
-{-# LANGUAGE BangPatterns #-}
-{-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE FlexibleContexts #-}
 
 module GHC.Core.Reduction
   (
@@ -361,8 +358,8 @@ mkFunRedn r af
   (Reduction arg_co arg_ty)
   (Reduction res_co res_ty)
     = mkReduction
-        (mkFunCo1 r af w_co arg_co res_co)
-        (mkFunTy    af w_ty arg_ty res_ty)
+        (mkFunCo r af w_co arg_co res_co)
+        (mkFunTy   af w_ty arg_ty res_ty)
 {-# INLINE mkFunRedn #-}
 
 -- | Create a 'Reduction' associated to a Π type,
@@ -376,7 +373,7 @@ mkForAllRedn :: ForAllTyFlag
              -> Reduction
 mkForAllRedn vis tv1 (Reduction h ki') (Reduction co ty)
   = mkReduction
-      (mkForAllCo tv1 h co)
+      (mkForAllCo tv1 vis vis h co)
       (mkForAllTy (Bndr tv2 vis) ty)
   where
     tv2 = setTyVarKind tv1 ki'
@@ -389,7 +386,7 @@ mkForAllRedn vis tv1 (Reduction h ki') (Reduction co ty)
 mkHomoForAllRedn :: [TyVarBinder] -> Reduction -> Reduction
 mkHomoForAllRedn bndrs (Reduction co ty)
   = mkReduction
-      (mkHomoForAllCos (binderVars bndrs) co)
+      (mkHomoForAllCos bndrs co)
       (mkForAllTys bndrs ty)
 {-# INLINE mkHomoForAllRedn #-}
 

@@ -1,3 +1,5 @@
+{-# LANGUAGE LambdaCase #-}
+
 {-# OPTIONS_GHC -Wno-incomplete-uni-patterns #-}
 
 module GHC.Cmm.MachOp
@@ -26,6 +28,9 @@ module GHC.Cmm.MachOp
     -- Atomic read-modify-write
     , MemoryOrdering(..)
     , AtomicMachOp(..)
+
+    -- Fused multiply-add
+    , FMASign(..), pprFMASign
    )
 where
 
@@ -68,7 +73,7 @@ assume that the code produced for a MachOp does not introduce new blocks.
 --
 -- (1) has the benefit that its interpretation is completely independent of the
 -- architecture. So, the mid-term plan is to migrate to this
--- interpretation/sematics.
+-- interpretation/semantics.
 
 data MachOp
   -- Integer operations (insensitive to signed/unsigned)
@@ -107,6 +112,10 @@ data MachOp
   | MO_F_Neg  Width             -- unary -
   | MO_F_Mul  Width
   | MO_F_Quot Width
+
+  -- Floating-point fused multiply-add operations
+  -- | Fused multiply-add, see 'FMASign'.
+  | MO_FMA FMASign Width
 
   -- Floating point comparison
   | MO_F_Eq Width
@@ -173,6 +182,10 @@ data MachOp
   | MO_VF_Mul  Length Width
   | MO_VF_Quot Length Width
 
+  -- | An atomic read with no memory ordering. Address msut
+  -- be naturally aligned.
+  | MO_RelaxedRead Width
+
   -- Alignment check (for -falignment-sanitisation)
   | MO_AlignmentCheck Int Width
   deriving (Eq, Show)
@@ -180,7 +193,30 @@ data MachOp
 pprMachOp :: MachOp -> SDoc
 pprMachOp mo = text (show mo)
 
+-- | Where are the signs in a fused multiply-add instruction?
+--
+-- @x*y + z@ vs @x*y - z@ vs @-x*y+z@ vs @-x*y-z@.
+--
+-- Warning: the signs aren't consistent across architectures (X86, PowerPC, AArch64).
+-- The user-facing implementation uses the X86 convention, while the relevant
+-- backends use their corresponding conventions.
+data FMASign
+  -- | Fused multiply-add @x*y + z@.
+  = FMAdd
+  -- | Fused multiply-subtract. On X86: @x*y - z@.
+  | FMSub
+  -- | Fused multiply-add. On X86: @-x*y + z@.
+  | FNMAdd
+  -- | Fused multiply-subtract. On X86: @-x*y - z@.
+  | FNMSub
+  deriving (Eq, Show)
 
+pprFMASign :: IsLine doc => FMASign -> doc
+pprFMASign = \case
+  FMAdd  -> text "fmadd"
+  FMSub  -> text "fmsub"
+  FNMAdd -> text "fnmadd"
+  FNMSub -> text "fnmsub"
 
 -- -----------------------------------------------------------------------------
 -- Some common MachReps
@@ -418,6 +454,9 @@ machOpResultType platform mop tys =
     MO_F_Mul r          -> cmmFloat r
     MO_F_Quot r         -> cmmFloat r
     MO_F_Neg r          -> cmmFloat r
+
+    MO_FMA _ r          -> cmmFloat r
+
     MO_F_Eq  {}         -> comparisonResultRep platform
     MO_F_Ne  {}         -> comparisonResultRep platform
     MO_F_Ge  {}         -> comparisonResultRep platform
@@ -463,6 +502,7 @@ machOpResultType platform mop tys =
     MO_VF_Quot l w      -> cmmVec l (cmmFloat w)
     MO_VF_Neg  l w      -> cmmVec l (cmmFloat w)
 
+    MO_RelaxedRead r    -> cmmBits r
     MO_AlignmentCheck _ _ -> ty1
   where
     (ty1:_) = tys
@@ -509,6 +549,9 @@ machOpArgReps platform op =
     MO_F_Mul r          -> [r,r]
     MO_F_Quot r         -> [r,r]
     MO_F_Neg r          -> [r]
+
+    MO_FMA _ r          -> [r,r,r]
+
     MO_F_Eq  r          -> [r,r]
     MO_F_Ne  r          -> [r,r]
     MO_F_Ge  r          -> [r,r]
@@ -554,6 +597,7 @@ machOpArgReps platform op =
     MO_VF_Quot _ r      -> [r,r]
     MO_VF_Neg  _ r      -> [r]
 
+    MO_RelaxedRead _    -> [wordWidth platform]
     MO_AlignmentCheck _ r -> [r]
 
 -----------------------------------------------------------------------------
@@ -652,8 +696,6 @@ data CallishMachOp
   | MO_SubIntC   Width
   | MO_U_Mul2    Width
 
-  | MO_ReadBarrier
-  | MO_WriteBarrier
   | MO_Touch         -- Keep variables live (when using interior pointers)
 
   -- Prefetch
@@ -682,6 +724,10 @@ data CallishMachOp
 
   | MO_BSwap Width
   | MO_BRev Width
+
+  | MO_AcquireFence
+  | MO_ReleaseFence
+  | MO_SeqCstFence
 
   -- | Atomic read-modify-write. Arguments are @[dest, n]@.
   | MO_AtomicRMW Width AtomicMachOp

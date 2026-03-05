@@ -1,4 +1,4 @@
-
+{-# LANGUAGE MultiWayIf #-}
 
 module GHC.Core.TyCo.FVs
   (     shallowTyCoVarsOfType, shallowTyCoVarsOfTypes,
@@ -23,7 +23,7 @@ module GHC.Core.TyCo.FVs
         almostDevoidCoVarOfCo,
 
         -- Injective free vars
-        injectiveVarsOfType, injectiveVarsOfTypes,
+        injectiveVarsOfType, injectiveVarsOfTypes, isInjectiveInType,
         invisibleVarsOfType, invisibleVarsOfTypes,
 
         -- Any and No Free vars
@@ -53,7 +53,7 @@ module GHC.Core.TyCo.FVs
 
 import GHC.Prelude
 
-import {-# SOURCE #-} GHC.Core.Type( partitionInvisibleTypes, coreView )
+import {-# SOURCE #-} GHC.Core.Type( partitionInvisibleTypes, coreView, rewriterView )
 import {-# SOURCE #-} GHC.Core.Coercion( coercionLKind )
 
 import GHC.Builtin.Types.Prim( funTyFlagTyCon )
@@ -631,7 +631,7 @@ tyCoFVsOfCo (GRefl _ ty mco) fv_cand in_scope acc
 tyCoFVsOfCo (TyConAppCo _ _ cos) fv_cand in_scope acc = tyCoFVsOfCos cos fv_cand in_scope acc
 tyCoFVsOfCo (AppCo co arg) fv_cand in_scope acc
   = (tyCoFVsOfCo co `unionFV` tyCoFVsOfCo arg) fv_cand in_scope acc
-tyCoFVsOfCo (ForAllCo tv kind_co co) fv_cand in_scope acc
+tyCoFVsOfCo (ForAllCo { fco_tcv = tv, fco_kind = kind_co, fco_body = co }) fv_cand in_scope acc
   = (tyCoFVsVarBndr tv (tyCoFVsOfCo co) `unionFV` tyCoFVsOfCo kind_co) fv_cand in_scope acc
 tyCoFVsOfCo (FunCo { fco_mult = w, fco_arg = co1, fco_res = co2 }) fv_cand in_scope acc
   = (tyCoFVsOfCo co1 `unionFV` tyCoFVsOfCo co2 `unionFV` tyCoFVsOfCo w) fv_cand in_scope acc
@@ -661,7 +661,6 @@ tyCoFVsOfProv :: UnivCoProvenance -> FV
 tyCoFVsOfProv (PhantomProv co)    fv_cand in_scope acc = tyCoFVsOfCo co fv_cand in_scope acc
 tyCoFVsOfProv (ProofIrrelProv co) fv_cand in_scope acc = tyCoFVsOfCo co fv_cand in_scope acc
 tyCoFVsOfProv (PluginProv _)      fv_cand in_scope acc = emptyFV fv_cand in_scope acc
-tyCoFVsOfProv (CorePrepProv _)    fv_cand in_scope acc = emptyFV fv_cand in_scope acc
 
 tyCoFVsOfCos :: [Coercion] -> FV
 tyCoFVsOfCos []       fv_cand in_scope acc = emptyFV fv_cand in_scope acc
@@ -672,7 +671,7 @@ tyCoFVsOfCos (co:cos) fv_cand in_scope acc = (tyCoFVsOfCo co `unionFV` tyCoFVsOf
 
 -- | Given a covar and a coercion, returns True if covar is almost devoid in
 -- the coercion. That is, covar can only appear in Refl and GRefl.
--- See last wrinkle in Note [Unused coercion variable in ForAllCo] in "GHC.Core.Coercion"
+-- See (FC6) in Note [ForAllCo] in "GHC.Core.TyCo.Rep"
 almostDevoidCoVarOfCo :: CoVar -> Coercion -> Bool
 almostDevoidCoVarOfCo cv co =
   almost_devoid_co_var_of_co co cv
@@ -686,7 +685,7 @@ almost_devoid_co_var_of_co (TyConAppCo _ _ cos) cv
 almost_devoid_co_var_of_co (AppCo co arg) cv
   = almost_devoid_co_var_of_co co cv
   && almost_devoid_co_var_of_co arg cv
-almost_devoid_co_var_of_co (ForAllCo v kind_co co) cv
+almost_devoid_co_var_of_co (ForAllCo { fco_tcv = v, fco_kind = kind_co, fco_body = co }) cv
   = almost_devoid_co_var_of_co kind_co cv
   && (v == cv || almost_devoid_co_var_of_co co cv)
 almost_devoid_co_var_of_co (FunCo { fco_mult = w, fco_arg = co1, fco_res = co2 }) cv
@@ -731,8 +730,7 @@ almost_devoid_co_var_of_prov (PhantomProv co) cv
   = almost_devoid_co_var_of_co co cv
 almost_devoid_co_var_of_prov (ProofIrrelProv co) cv
   = almost_devoid_co_var_of_co co cv
-almost_devoid_co_var_of_prov (PluginProv _)   _ = True
-almost_devoid_co_var_of_prov (CorePrepProv _) _ = True
+almost_devoid_co_var_of_prov (PluginProv _) _ = True
 
 almost_devoid_co_var_of_type :: Type -> CoVar -> Bool
 almost_devoid_co_var_of_type (TyVarTy _) _ = True
@@ -806,6 +804,28 @@ visVarsOfTypes = foldMap visVarsOfType
 *                                                                      *
 ********************************************************************* -}
 
+isInjectiveInType :: TyVar -> Type -> Bool
+-- True <=> tv /definitely/ appears injectively in ty
+-- A bit more efficient that (tv `elemVarSet` injectiveTyVarsOfType ty)
+-- Ignore occurrence in coercions, and even in injective positions of
+-- type families.
+isInjectiveInType tv ty
+  = go ty
+  where
+    go ty | Just ty' <- rewriterView ty = go ty'
+    go (TyVarTy tv')                    = tv' == tv
+    go (AppTy f a)                      = go f || go a
+    go (FunTy _ w ty1 ty2)              = go w || go ty1 || go ty2
+    go (TyConApp tc tys)                = go_tc tc tys
+    go (ForAllTy (Bndr tv' _) ty)       = go (tyVarKind tv')
+                                          || (tv /= tv' && go ty)
+    go LitTy{}                          = False
+    go (CastTy ty _)                    = go ty
+    go CoercionTy{}                     = False
+
+    go_tc tc tys | isTypeFamilyTyCon tc = False
+                 | otherwise            = any go tys
+
 -- | Returns the free variables of a 'Type' that are in injective positions.
 -- Specifically, it finds the free variables while:
 --
@@ -836,24 +856,29 @@ injectiveVarsOfType :: Bool   -- ^ Should we look under injective type families?
                     -> Type -> FV
 injectiveVarsOfType look_under_tfs = go
   where
-    go ty                  | Just ty' <- coreView ty
-                           = go ty'
-    go (TyVarTy v)         = unitFV v `unionFV` go (tyVarKind v)
-    go (AppTy f a)         = go f `unionFV` go a
-    go (FunTy _ w ty1 ty2) = go w `unionFV` go ty1 `unionFV` go ty2
-    go (TyConApp tc tys)   =
-      case tyConInjectivityInfo tc of
-        Injective inj
-          |  look_under_tfs || not (isTypeFamilyTyCon tc)
-          -> mapUnionFV go $
-             filterByList (inj ++ repeat True) tys
+    go ty | Just ty' <- rewriterView ty = go ty'
+    go (TyVarTy v)                      = unitFV v `unionFV` go (tyVarKind v)
+    go (AppTy f a)                      = go f `unionFV` go a
+    go (FunTy _ w ty1 ty2)              = go w `unionFV` go ty1 `unionFV` go ty2
+    go (TyConApp tc tys)                = go_tc tc tys
+    go (ForAllTy (Bndr tv _) ty)        = go (tyVarKind tv) `unionFV` delFV tv (go ty)
+    go LitTy{}                          = emptyFV
+    go (CastTy ty _)                    = go ty
+    go CoercionTy{}                     = emptyFV
+
+    go_tc tc tys
+      | isTypeFamilyTyCon tc
+      = if | look_under_tfs
+           , Injective flags <- tyConInjectivityInfo tc
+           -> mapUnionFV go $
+              filterByList (flags ++ repeat True) tys
                          -- Oversaturated arguments to a tycon are
                          -- always injective, hence the repeat True
-        _ -> emptyFV
-    go (ForAllTy (Bndr tv _) ty) = go (tyVarKind tv) `unionFV` delFV tv (go ty)
-    go LitTy{}                   = emptyFV
-    go (CastTy ty _)             = go ty
-    go CoercionTy{}              = emptyFV
+           | otherwise   -- No injectivity info for this type family
+           -> emptyFV
+
+      | otherwise        -- Data type, injective in all positions
+      = mapUnionFV go tys
 
 -- | Returns the free variables of a 'Type' that are in injective positions.
 -- Specifically, it finds the free variables while:
@@ -1082,7 +1107,8 @@ tyConsOfType ty
      go_co (GRefl _ ty mco)        = go ty `unionUniqSets` go_mco mco
      go_co (TyConAppCo _ tc args)  = go_tc tc `unionUniqSets` go_cos args
      go_co (AppCo co arg)          = go_co co `unionUniqSets` go_co arg
-     go_co (ForAllCo _ kind_co co) = go_co kind_co `unionUniqSets` go_co co
+     go_co (ForAllCo { fco_kind = kind_co, fco_body = co })
+                                   = go_co kind_co `unionUniqSets` go_co co
      go_co (FunCo { fco_mult = m, fco_arg = a, fco_res = r })
                                    = go_co m `unionUniqSets` go_co a `unionUniqSets` go_co r
      go_co (AxiomInstCo ax _ args) = go_ax ax `unionUniqSets` go_cos args
@@ -1104,9 +1130,6 @@ tyConsOfType ty
      go_prov (PhantomProv co)    = go_co co
      go_prov (ProofIrrelProv co) = go_co co
      go_prov (PluginProv _)      = emptyUniqSet
-     go_prov (CorePrepProv _)    = emptyUniqSet
-        -- this last case can happen from the tyConsOfType used from
-        -- checkTauTvUpdate
 
      go_cos cos   = foldr (unionUniqSets . go_co)  emptyUniqSet cos
 
@@ -1266,14 +1289,14 @@ occCheckExpand vs_to_avoid ty
     go_co cxt (AppCo co arg)            = do { co' <- go_co cxt co
                                              ; arg' <- go_co cxt arg
                                              ; return (AppCo co' arg') }
-    go_co cxt@(as, env) (ForAllCo tv kind_co body_co)
+    go_co cxt@(as, env) co@(ForAllCo { fco_tcv = tv, fco_kind = kind_co, fco_body = body_co })
       = do { kind_co' <- go_co cxt kind_co
            ; let tv' = setVarType tv $
                        coercionLKind kind_co'
                  env' = extendVarEnv env tv tv'
                  as'  = as `delVarSet` tv
            ; body' <- go_co (as', env') body_co
-           ; return (ForAllCo tv' kind_co' body') }
+           ; return (co { fco_tcv = tv', fco_kind = kind_co', fco_body = body' }) }
     go_co cxt co@(FunCo { fco_mult = w, fco_arg = co1 ,fco_res = co2 })
       = do { co1' <- go_co cxt co1
            ; co2' <- go_co cxt co2
@@ -1318,5 +1341,3 @@ occCheckExpand vs_to_avoid ty
     go_prov cxt (PhantomProv co)    = PhantomProv <$> go_co cxt co
     go_prov cxt (ProofIrrelProv co) = ProofIrrelProv <$> go_co cxt co
     go_prov _   p@(PluginProv _)    = return p
-    go_prov _   p@(CorePrepProv _)  = return p
-

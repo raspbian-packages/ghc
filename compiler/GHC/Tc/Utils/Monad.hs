@@ -1,6 +1,3 @@
-{-# LANGUAGE BangPatterns      #-}
-{-# LANGUAGE ExplicitForAll    #-}
-{-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE RecordWildCards   #-}
 
 {-# OPTIONS_GHC -fno-warn-orphans #-}
@@ -19,7 +16,7 @@ module GHC.Tc.Utils.Monad(
   -- * Simple accessors
   discardResult,
   getTopEnv, updTopEnv, getGblEnv, updGblEnv,
-  setGblEnv, getLclEnv, updLclEnv, setLclEnv, restoreLclEnv,
+  setGblEnv, getLclEnv, updLclEnv, updLclCtxt, setLclEnv, restoreLclEnv,
   updTopFlags,
   getEnvs, setEnvs, updEnvs, restoreEnvs,
   xoptM, doptM, goptM, woptM,
@@ -41,7 +38,7 @@ module GHC.Tc.Utils.Monad(
   newSysName, newSysLocalId, newSysLocalIds,
 
   -- * Accessing input/output
-  newTcRef, readTcRef, writeTcRef, updTcRef,
+  newTcRef, readTcRef, writeTcRef, updTcRef, updTcRefM,
 
   -- * Debugging
   traceTc, traceRn, traceOptTcRn, dumpOptTcRn,
@@ -53,21 +50,22 @@ module GHC.Tc.Utils.Monad(
 
   -- * Typechecker global environment
   getIsGHCi, getGHCiMonad, getInteractivePrintName,
-  tcIsHsBootOrSig, tcIsHsig, tcSelfBootInfo, getGlobalRdrEnv,
+  tcHscSource, tcIsHsBootOrSig, tcIsHsig, tcSelfBootInfo, getGlobalRdrEnv,
   getRdrEnvs, getImports,
-  getFixityEnv, extendFixityEnv, getRecFieldEnv,
+  getFixityEnv, extendFixityEnv,
   getDeclaredDefaultTys,
   addDependentFiles,
 
   -- * Error management
-  getSrcSpanM, setSrcSpan, setSrcSpanA, addLocM, addLocMA, inGeneratedCode,
-  wrapLocM, wrapLocAM, wrapLocFstM, wrapLocFstMA, wrapLocSndM, wrapLocSndMA, wrapLocM_,
+  getSrcSpanM, setSrcSpan, setSrcSpanA, addLocM,
+  inGeneratedCode, setInGeneratedCode,
+  wrapLocM, wrapLocFstM, wrapLocFstMA, wrapLocSndM, wrapLocSndMA, wrapLocM_,
   wrapLocMA_,wrapLocMA,
   getErrsVar, setErrsVar,
   addErr,
   failWith, failAt,
   addErrAt, addErrs,
-  checkErr,
+  checkErr, checkErrAt,
   addMessages,
   discardWarnings, mkDetailedMessage,
 
@@ -83,7 +81,7 @@ module GHC.Tc.Utils.Monad(
 
   -- * Context management for the type checker
   getErrCtxt, setErrCtxt, addErrCtxt, addErrCtxtM, addLandmarkErrCtxt,
-  addLandmarkErrCtxtM, popErrCtxt, getCtLocM, setCtLocM,
+  addLandmarkErrCtxtM, popErrCtxt, getCtLocM, setCtLocM, mkCtLocEnv,
 
   -- * Diagnostic message generation (type checker)
   addErrTc,
@@ -104,7 +102,7 @@ module GHC.Tc.Utils.Monad(
   chooseUniqueOccTc,
   getConstraintVar, setConstraintVar,
   emitConstraints, emitStaticConstraints, emitSimple, emitSimples,
-  emitImplication, emitImplications, emitInsoluble,
+  emitImplication, emitImplications,
   emitDelayedErrors, emitHole, emitHoles, emitNotConcreteError,
   discardConstraints, captureConstraints, tryCaptureConstraints,
   pushLevelAndCaptureConstraints,
@@ -138,10 +136,13 @@ module GHC.Tc.Utils.Monad(
   forkM,
   setImplicitEnvM,
 
-  withException,
+  withException, withIfaceErr,
 
   -- * Stuff for cost centres.
   getCCIndexM, getCCIndexTcM,
+
+  -- * Zonking
+  liftZonkM, newZonkAnyType,
 
   -- * Types etc.
   module GHC.Tc.Types,
@@ -152,12 +153,16 @@ import GHC.Prelude
 
 
 import GHC.Builtin.Names
+import GHC.Builtin.Types( zonkAnyTyCon )
 
+import GHC.Tc.Errors.Types
 import GHC.Tc.Types     -- Re-export all
 import GHC.Tc.Types.Constraint
 import GHC.Tc.Types.Evidence
 import GHC.Tc.Types.Origin
+import GHC.Tc.Types.TcRef
 import GHC.Tc.Utils.TcType
+import GHC.Tc.Zonk.TcType
 
 import GHC.Hs hiding (LIE)
 
@@ -171,6 +176,7 @@ import GHC.Core.UsageEnv
 import GHC.Core.Multiplicity
 import GHC.Core.InstEnv
 import GHC.Core.FamInstEnv
+import GHC.Core.Type( mkNumLitTy )
 
 import GHC.Driver.Env
 import GHC.Driver.Session
@@ -215,13 +221,13 @@ import qualified GHC.LanguageExtensions as LangExt
 import Data.IORef
 import Control.Monad
 
-import GHC.Tc.Errors.Types
-import {-# SOURCE #-} GHC.Tc.Utils.Env    ( tcInitTidyEnv )
-
 import qualified Data.Map as Map
 import GHC.Driver.Env.KnotVars
 import GHC.Linker.Types
 import GHC.Types.Unique.DFM
+import GHC.Iface.Errors.Types
+import GHC.Iface.Errors.Ppr
+import GHC.Tc.Types.LclEnv
 
 {-
 ************************************************************************
@@ -250,6 +256,7 @@ initTc hsc_env hsc_src keep_rn_syntax mod loc do_this
         infer_var    <- newIORef True ;
         infer_reasons_var <- newIORef emptyMessages ;
         dfun_n_var   <- newIORef emptyOccSet ;
+        zany_n_var   <- newIORef 0 ;
         let { type_env_var = hsc_type_env_vars hsc_env };
 
         dependent_files_var <- newIORef [] ;
@@ -300,7 +307,6 @@ initTc hsc_env hsc_src keep_rn_syntax mod loc do_this
                 tcg_src            = hsc_src,
                 tcg_rdr_env        = emptyGlobalRdrEnv,
                 tcg_fix_env        = emptyNameEnv,
-                tcg_field_env      = emptyNameEnv,
                 tcg_default        = if moduleUnit mod == primUnit
                                      || moduleUnit mod == bignumUnit
                                      then Just []  -- See Note [Default types]
@@ -332,7 +338,7 @@ initTc hsc_env hsc_src keep_rn_syntax mod loc do_this
                 tcg_sigs           = emptyNameSet,
                 tcg_ksigs          = emptyNameSet,
                 tcg_ev_binds       = emptyBag,
-                tcg_warns          = NoWarnings,
+                tcg_warns          = emptyWarn,
                 tcg_anns           = [],
                 tcg_tcs            = [],
                 tcg_insts          = [],
@@ -342,8 +348,9 @@ initTc hsc_env hsc_src keep_rn_syntax mod loc do_this
                 tcg_patsyns        = [],
                 tcg_merged         = [],
                 tcg_dfun_n         = dfun_n_var,
+                tcg_zany_n         = zany_n_var,
                 tcg_keep           = keep_var,
-                tcg_doc_hdr        = Nothing,
+                tcg_hdr_info        = (Nothing,Nothing),
                 tcg_hpc            = False,
                 tcg_main           = Nothing,
                 tcg_self_boot      = NoSelfBoot,
@@ -377,7 +384,7 @@ initTcWithGbl hsc_env gbl_env loc do_this
       ; errs_var     <- newIORef emptyMessages
       ; usage_var    <- newIORef zeroUE
       ; let lcl_env = TcLclEnv {
-                tcl_errs       = errs_var,
+                tcl_lcl_ctxt   = TcLclCtxt {
                 tcl_loc        = loc,
                 -- tcl_loc should be over-ridden very soon!
                 tcl_in_gen_code = False,
@@ -387,10 +394,12 @@ initTcWithGbl hsc_env gbl_env loc do_this
                 tcl_th_bndrs   = emptyNameEnv,
                 tcl_arrow_ctxt = NoArrowCtxt,
                 tcl_env        = emptyNameEnv,
-                tcl_usage      = usage_var,
                 tcl_bndrs      = [],
-                tcl_lie        = lie_var,
                 tcl_tclvl      = topTcLevel
+                },
+                tcl_usage      = usage_var,
+                tcl_lie        = lie_var,
+                tcl_errs       = errs_var
                 }
 
       ; maybe_res <- initTcRnIf 'a' hsc_env gbl_env lcl_env $
@@ -445,14 +454,14 @@ an actual crash (attempting to look up the Integer type).
 ************************************************************************
 -}
 
-initTcRnIf :: Char              -- ^ Mask for unique supply
+initTcRnIf :: Char              -- ^ Tag for unique supply
            -> HscEnv
            -> gbl -> lcl
            -> TcRnIf gbl lcl a
            -> IO a
-initTcRnIf uniq_mask hsc_env gbl_env lcl_env thing_inside
+initTcRnIf uniq_tag hsc_env gbl_env lcl_env thing_inside
    = do { let { env = Env { env_top = hsc_env,
-                            env_um  = uniq_mask,
+                            env_ut  = uniq_tag,
                             env_gbl = gbl_env,
                             env_lcl = lcl_env} }
 
@@ -494,6 +503,8 @@ updLclEnv :: (lcl -> lcl) -> TcRnIf gbl lcl a -> TcRnIf gbl lcl a
 updLclEnv upd = updEnv (\ env@(Env { env_lcl = lcl }) ->
                           env { env_lcl = upd lcl })
 
+updLclCtxt :: (TcLclCtxt -> TcLclCtxt) -> TcRnIf gbl TcLclEnv a -> TcRnIf gbl TcLclEnv a
+updLclCtxt upd = updLclEnv (modifyLclCtxt upd)
 
 setLclEnv :: lcl' -> TcRnIf gbl lcl' a -> TcRnIf gbl lcl a
 setLclEnv lcl_env = updEnv (\ env -> env { env_lcl = lcl_env })
@@ -662,6 +673,16 @@ withException ctx do_this = do
         Failed err -> liftIO $ throwGhcExceptionIO (ProgramError (renderWithContext ctx err))
         Succeeded result -> return result
 
+withIfaceErr :: MonadIO m => SDocContext -> m (MaybeErr MissingInterfaceError a) -> m a
+withIfaceErr ctx do_this = do
+    r <- do_this
+    case r of
+        Failed err -> do
+          let opts = defaultDiagnosticOpts @IfaceMessage
+              msg   = missingInterfaceErrorDiagnostic opts err
+          liftIO $ throwGhcExceptionIO (ProgramError (renderWithContext ctx msg))
+        Succeeded result -> return result
+
 {-
 ************************************************************************
 *                                                                      *
@@ -672,17 +693,18 @@ withException ctx do_this = do
 
 newArrowScope :: TcM a -> TcM a
 newArrowScope
-  = updLclEnv $ \env -> env { tcl_arrow_ctxt = ArrowCtxt (tcl_rdr env) (tcl_lie env) }
+  = updLclEnv $ \env ->
+      modifyLclCtxt (\ctx -> ctx { tcl_arrow_ctxt = ArrowCtxt (getLclEnvRdrEnv env) (tcl_lie env) } ) env
 
 -- Return to the stored environment (from the enclosing proc)
 escapeArrowScope :: TcM a -> TcM a
 escapeArrowScope
   = updLclEnv $ \ env ->
-    case tcl_arrow_ctxt env of
+    case getLclEnvArrowCtxt env of
       NoArrowCtxt       -> env
-      ArrowCtxt rdr_env lie -> env { tcl_arrow_ctxt = NoArrowCtxt
-                                   , tcl_lie = lie
-                                   , tcl_rdr = rdr_env }
+      ArrowCtxt rdr_env lie -> env { tcl_lcl_ctxt = (tcl_lcl_ctxt env) { tcl_arrow_ctxt = NoArrowCtxt
+                                                                       , tcl_rdr = rdr_env }
+                                   , tcl_lie = lie }
 
 {-
 ************************************************************************
@@ -695,14 +717,14 @@ escapeArrowScope
 newUnique :: TcRnIf gbl lcl Unique
 newUnique
  = do { env <- getEnv
-      ; let mask = env_um env
-      ; liftIO $! uniqFromMask mask }
+      ; let tag = env_ut env
+      ; liftIO $! uniqFromTag tag }
 
 newUniqueSupply :: TcRnIf gbl lcl UniqSupply
 newUniqueSupply
  = do { env <- getEnv
-      ; let mask = env_um env
-      ; liftIO $! mkSplitUniqSupply mask }
+      ; let tag = env_ut env
+      ; liftIO $! mkSplitUniqSupply tag }
 
 cloneLocalName :: Name -> TcM Name
 -- Make a fresh Internal name with the same OccName and SrcSpan
@@ -729,34 +751,13 @@ newSysLocalId fs w ty
 
 newSysLocalIds :: FastString -> [Scaled TcType] -> TcRnIf gbl lcl [TcId]
 newSysLocalIds fs tys
-  = do  { us <- newUniqueSupply
+  = do  { us <- getUniquesM
         ; let mkId' n (Scaled w t) = mkSysLocal fs n w t
-        ; return (zipWith mkId' (uniqsFromSupply us) tys) }
+        ; return (zipWith mkId' us tys) }
 
 instance MonadUnique (IOEnv (Env gbl lcl)) where
         getUniqueM = newUnique
         getUniqueSupplyM = newUniqueSupply
-
-{-
-************************************************************************
-*                                                                      *
-                Accessing input/output
-*                                                                      *
-************************************************************************
--}
-
-newTcRef :: a -> TcRnIf gbl lcl (TcRef a)
-newTcRef = newMutVar
-
-readTcRef :: TcRef a -> TcRnIf gbl lcl a
-readTcRef = readMutVar
-
-writeTcRef :: TcRef a -> a -> TcRnIf gbl lcl ()
-writeTcRef = writeMutVar
-
-updTcRef :: TcRef a -> (a -> a) -> TcRnIf gbl lcl ()
--- Returns ()
-updTcRef ref fn = liftIO $ modifyIORef' ref fn
 
 {-
 ************************************************************************
@@ -917,7 +918,10 @@ getInteractivePrintName :: TcRn Name
 getInteractivePrintName = do { hsc <- getTopEnv; return (ic_int_print $ hsc_IC hsc) }
 
 tcIsHsBootOrSig :: TcRn Bool
-tcIsHsBootOrSig = do { env <- getGblEnv; return (isHsBootOrSig (tcg_src env)) }
+tcIsHsBootOrSig = isHsBootOrSig <$> tcHscSource
+
+tcHscSource :: TcRn HscSource
+tcHscSource = do { env <- getGblEnv; return (tcg_src env)}
 
 tcIsHsig :: TcRn Bool
 tcIsHsig = do { env <- getGblEnv; return (isHsigFile (tcg_src env)) }
@@ -929,7 +933,7 @@ getGlobalRdrEnv :: TcRn GlobalRdrEnv
 getGlobalRdrEnv = do { env <- getGblEnv; return (tcg_rdr_env env) }
 
 getRdrEnvs :: TcRn (GlobalRdrEnv, LocalRdrEnv)
-getRdrEnvs = do { (gbl,lcl) <- getEnvs; return (tcg_rdr_env gbl, tcl_rdr lcl) }
+getRdrEnvs = do { (gbl,lcl) <- getEnvs; return (tcg_rdr_env gbl, getLclEnvRdrEnv lcl) }
 
 getImports :: TcRn ImportAvails
 getImports = do { env <- getGblEnv; return (tcg_imports env) }
@@ -941,9 +945,6 @@ extendFixityEnv :: [(Name,FixItem)] -> RnM a -> RnM a
 extendFixityEnv new_bit
   = updGblEnv (\env@(TcGblEnv { tcg_fix_env = old_fix_env }) ->
                 env {tcg_fix_env = extendNameEnvList old_fix_env new_bit})
-
-getRecFieldEnv :: TcRn RecFieldEnv
-getRecFieldEnv = do { env <- getGblEnv; return (tcg_field_env env) }
 
 getDeclaredDefaultTys :: TcRn (Maybe [Type])
 getDeclaredDefaultTys = do { env <- getGblEnv; return (tcg_default env) }
@@ -964,43 +965,47 @@ addDependentFiles fs = do
 
 getSrcSpanM :: TcRn SrcSpan
         -- Avoid clash with Name.getSrcLoc
-getSrcSpanM = do { env <- getLclEnv; return (RealSrcSpan (tcl_loc env) Strict.Nothing) }
+getSrcSpanM = do { env <- getLclEnv; return (RealSrcSpan (getLclEnvLoc env) Strict.Nothing) }
 
 -- See Note [Error contexts in generated code]
 inGeneratedCode :: TcRn Bool
-inGeneratedCode = tcl_in_gen_code <$> getLclEnv
+inGeneratedCode = lclEnvInGeneratedCode <$> getLclEnv
 
 setSrcSpan :: SrcSpan -> TcRn a -> TcRn a
 -- See Note [Error contexts in generated code]
 -- for the tcl_in_gen_code manipulation
 setSrcSpan (RealSrcSpan loc _) thing_inside
-  = updLclEnv (\env -> env { tcl_loc = loc, tcl_in_gen_code = False })
+  = updLclCtxt (\env -> env { tcl_loc = loc, tcl_in_gen_code = False })
               thing_inside
 
 setSrcSpan loc@(UnhelpfulSpan _) thing_inside
   | isGeneratedSrcSpan loc
-  = updLclEnv (\env -> env { tcl_in_gen_code = True }) thing_inside
+  = setInGeneratedCode thing_inside
 
   | otherwise
   = thing_inside
 
-setSrcSpanA :: SrcSpanAnn' ann -> TcRn a -> TcRn a
+-- | Mark the inner computation as being done inside generated code.
+--
+-- See Note [Error contexts in generated code]
+setInGeneratedCode :: TcRn a -> TcRn a
+setInGeneratedCode thing_inside =
+  updLclCtxt (\env -> env { tcl_in_gen_code = True }) thing_inside
+
+setSrcSpanA :: EpAnn ann -> TcRn a -> TcRn a
 setSrcSpanA l = setSrcSpan (locA l)
 
-addLocM :: (a -> TcM b) -> Located a -> TcM b
-addLocM fn (L loc a) = setSrcSpan loc $ fn a
+addLocM :: (HasLoc t) => (a -> TcM b) -> GenLocated t a -> TcM b
+addLocM fn (L loc a) = setSrcSpan (getHasLoc loc) $ fn a
 
-addLocMA :: (a -> TcM b) -> GenLocated (SrcSpanAnn' ann) a -> TcM b
-addLocMA fn (L loc a) = setSrcSpanA loc $ fn a
+wrapLocM :: (HasLoc t) =>  (a -> TcM b) -> GenLocated t a -> TcM (Located b)
+wrapLocM fn (L loc a) =
+  let
+    loc' = getHasLoc loc
+  in setSrcSpan loc' $ do { b <- fn a
+                          ; return (L loc' b) }
 
-wrapLocM :: (a -> TcM b) -> Located a -> TcM (Located b)
-wrapLocM fn (L loc a) = setSrcSpan loc $ do { b <- fn a
-                                            ; return (L loc b) }
-
-wrapLocAM :: (a -> TcM b) -> LocatedAn an a -> TcM (Located b)
-wrapLocAM fn a = wrapLocM fn (reLoc a)
-
-wrapLocMA :: (a -> TcM b) -> GenLocated (SrcSpanAnn' ann) a -> TcRn (GenLocated (SrcSpanAnn' ann) b)
+wrapLocMA :: (a -> TcM b) -> GenLocated (EpAnn ann) a -> TcRn (GenLocated (EpAnn ann) b)
 wrapLocMA fn (L loc a) = setSrcSpanA loc $ do { b <- fn a
                                               ; return (L loc b) }
 
@@ -1015,7 +1020,7 @@ wrapLocFstM fn (L loc a) =
 --    wrapLocFstMA :: (a -> TcM (b,c)) -> LocatedN    a -> TcM (LocatedN    b, c)
 --    wrapLocFstMA :: (a -> TcM (b,c)) -> LocatedAn t a -> TcM (LocatedAn t b, c)
 -- and so on.
-wrapLocFstMA :: (a -> TcM (b,c)) -> GenLocated (SrcSpanAnn' ann) a -> TcM (GenLocated (SrcSpanAnn' ann) b, c)
+wrapLocFstMA :: (a -> TcM (b,c)) -> GenLocated (EpAnn ann) a -> TcM (GenLocated (EpAnn ann) b, c)
 wrapLocFstMA fn (L loc a) =
   setSrcSpanA loc $ do
     (b,c) <- fn a
@@ -1032,7 +1037,7 @@ wrapLocSndM fn (L loc a) =
 --    wrapLocSndMA :: (a -> TcM (b, c)) -> LocatedN    a -> TcM (b, LocatedN    c)
 --    wrapLocSndMA :: (a -> TcM (b, c)) -> LocatedAn t a -> TcM (b, LocatedAn t c)
 -- and so on.
-wrapLocSndMA :: (a -> TcM (b, c)) -> GenLocated (SrcSpanAnn' ann) a -> TcM (b, GenLocated (SrcSpanAnn' ann) c)
+wrapLocSndMA :: (a -> TcM (b, c)) -> GenLocated (EpAnn ann) a -> TcM (b, GenLocated (EpAnn ann) c)
 wrapLocSndMA fn (L loc a) =
   setSrcSpanA loc $ do
     (b,c) <- fn a
@@ -1066,7 +1071,7 @@ addErrAt :: SrcSpan -> TcRnMessage -> TcRn ()
 -- tidying is not an issue, but it's all lazy so the extra
 -- work doesn't matter
 addErrAt loc msg = do { ctxt <- getErrCtxt
-                      ; tidy_env <- tcInitTidyEnv
+                      ; tidy_env <- liftZonkM $ tcInitTidyEnv
                       ; err_info <- mkErrInfo tidy_env ctxt
                       ; let detailed_msg = mkDetailedMessage (ErrInfo err_info Outputable.empty) msg
                       ; add_long_err_at loc detailed_msg }
@@ -1083,6 +1088,9 @@ addErrs msgs = mapM_ add msgs
 checkErr :: Bool -> TcRnMessage -> TcRn ()
 -- Add the error if the bool is False
 checkErr ok msg = unless ok (addErr msg)
+
+checkErrAt :: SrcSpan -> Bool -> TcRnMessage -> TcRn ()
+checkErrAt loc ok msg = unless ok (addErrAt loc msg)
 
 addMessages :: Messages TcRnMessage -> TcRn ()
 addMessages msgs1
@@ -1201,23 +1209,25 @@ problem.
 
 Note [Error contexts in generated code]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-* setSrcSpan sets tc_in_gen_code to True if the SrcSpan is GeneratedSrcSpan,
+* setSrcSpan sets tcl_in_gen_code to True if the SrcSpan is GeneratedSrcSpan,
   and back to False when we get a useful SrcSpan
 
-* When tc_in_gen_code is True, addErrCtxt becomes a no-op.
+* When tcl_in_gen_code is True, addErrCtxt becomes a no-op.
 
 So typically it's better to do setSrcSpan /before/ addErrCtxt.
 
-See Note [Rebindable syntax and HsExpansion] in GHC.Hs.Expr for
-more discussion of this fancy footwork.
+See Note [Rebindable syntax and XXExprGhcRn] in GHC.Hs.Expr for
+more discussion of this fancy footwork, as well as
+Note [Generated code and pattern-match checking] in GHC.Types.Basic for the
+relation with pattern-match checks.
 -}
 
 getErrCtxt :: TcM [ErrCtxt]
-getErrCtxt = do { env <- getLclEnv; return (tcl_ctxt env) }
+getErrCtxt = do { env <- getLclEnv; return (getLclEnvErrCtxt env) }
 
 setErrCtxt :: [ErrCtxt] -> TcM a -> TcM a
 {-# INLINE setErrCtxt #-}   -- Note [Inlining addErrCtxt]
-setErrCtxt ctxt = updLclEnv (\ env -> env { tcl_ctxt = ctxt })
+setErrCtxt ctxt = updLclEnv (setLclEnvErrCtxt ctxt)
 
 -- | Add a fixed message to the error context. This message should not
 -- do any tidying.
@@ -1226,7 +1236,7 @@ addErrCtxt :: SDoc -> TcM a -> TcM a
 addErrCtxt msg = addErrCtxtM (\env -> return (env, msg))
 
 -- | Add a message to the error context. This message may do tidying.
-addErrCtxtM :: (TidyEnv -> TcM (TidyEnv, SDoc)) -> TcM a -> TcM a
+addErrCtxtM :: (TidyEnv -> ZonkM (TidyEnv, SDoc)) -> TcM a -> TcM a
 {-# INLINE addErrCtxtM #-}  -- Note [Inlining addErrCtxt]
 addErrCtxtM ctxt = pushCtxt (False, ctxt)
 
@@ -1240,7 +1250,7 @@ addLandmarkErrCtxt msg = addLandmarkErrCtxtM (\env -> return (env, msg))
 
 -- | Variant of 'addLandmarkErrCtxt' that allows for monadic operations
 -- and tidying.
-addLandmarkErrCtxtM :: (TidyEnv -> TcM (TidyEnv, SDoc)) -> TcM a -> TcM a
+addLandmarkErrCtxtM :: (TidyEnv -> ZonkM (TidyEnv, SDoc)) -> TcM a -> TcM a
 {-# INLINE addLandmarkErrCtxtM #-}  -- Note [Inlining addErrCtxt]
 addLandmarkErrCtxtM ctxt = pushCtxt (True, ctxt)
 
@@ -1250,14 +1260,14 @@ pushCtxt ctxt = updLclEnv (updCtxt ctxt)
 
 updCtxt :: ErrCtxt -> TcLclEnv -> TcLclEnv
 -- Do not update the context if we are in generated code
--- See Note [Rebindable syntax and HsExpansion] in GHC.Hs.Expr
-updCtxt ctxt env@(TcLclEnv { tcl_ctxt = ctxts, tcl_in_gen_code = in_gen })
-  | in_gen    = env
-  | otherwise = env { tcl_ctxt = ctxt : ctxts }
+-- See Note [Rebindable syntax and XXExprGhcRn] in GHC.Hs.Expr
+updCtxt ctxt env
+  | lclEnvInGeneratedCode env = env
+  | otherwise = addLclEnvErrCtxt ctxt env
 
 popErrCtxt :: TcM a -> TcM a
-popErrCtxt = updLclEnv (\ env@(TcLclEnv { tcl_ctxt = ctxt }) ->
-                          env { tcl_ctxt = pop ctxt })
+popErrCtxt thing_inside = updLclEnv (\env -> setLclEnvErrCtxt (pop $ getLclEnvErrCtxt env) env) $
+                          thing_inside
            where
              pop []       = []
              pop (_:msgs) = msgs
@@ -1266,18 +1276,27 @@ getCtLocM :: CtOrigin -> Maybe TypeOrKind -> TcM CtLoc
 getCtLocM origin t_or_k
   = do { env <- getLclEnv
        ; return (CtLoc { ctl_origin   = origin
-                       , ctl_env      = env
+                       , ctl_env      = mkCtLocEnv env
                        , ctl_t_or_k   = t_or_k
                        , ctl_depth    = initialSubGoalDepth }) }
+
+mkCtLocEnv :: TcLclEnv -> CtLocEnv
+mkCtLocEnv lcl_env =
+  CtLocEnv { ctl_bndrs = getLclEnvBinderStack lcl_env
+           , ctl_ctxt  = getLclEnvErrCtxt lcl_env
+           , ctl_loc = getLclEnvLoc lcl_env
+           , ctl_tclvl = getLclEnvTcLevel lcl_env
+           , ctl_in_gen_code = lclEnvInGeneratedCode lcl_env
+           , ctl_rdr = getLclEnvRdrEnv lcl_env
+           }
 
 setCtLocM :: CtLoc -> TcM a -> TcM a
 -- Set the SrcSpan and error context from the CtLoc
 setCtLocM (CtLoc { ctl_env = lcl }) thing_inside
-  = updLclEnv (\env -> env { tcl_loc   = tcl_loc lcl
-                           , tcl_bndrs = tcl_bndrs lcl
-                           , tcl_ctxt  = tcl_ctxt lcl })
-              thing_inside
-
+  = updLclEnv (\env -> setLclEnvLoc (ctl_loc lcl)
+                     $ setLclEnvErrCtxt (ctl_ctxt lcl)
+                     $ setLclEnvBinderStack (ctl_bndrs lcl)
+                     $ env) thing_inside
 
 {- *********************************************************************
 *                                                                      *
@@ -1315,7 +1334,7 @@ capture_constraints thing_inside
 
 capture_messages :: TcM r -> TcM (r, Messages TcRnMessage)
 -- capture_messages simply captures and returns the
---                  errors arnd warnings generated by thing_inside
+--                  errors and warnings generated by thing_inside
 -- Precondition: thing_inside must not throw an exception!
 -- Reason for precondition: an exception would blow past the place
 -- where we read the msg_var, and we'd lose the constraints altogether
@@ -1534,8 +1553,19 @@ tryTcDiscardingErrs recover thing_inside
     tidy up the message; we then use it to tidy the context messages
 -}
 
+{-
+
+Note [Reporting warning diagnostics]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+We use functions below to report warnings.  For the most part,
+we do /not/ need to check any warning flags before doing so.
+See https://gitlab.haskell.org/ghc/ghc/-/wikis/Errors-as-(structured)-values
+for the design.
+
+-}
+
 addErrTc :: TcRnMessage -> TcM ()
-addErrTc err_msg = do { env0 <- tcInitTidyEnv
+addErrTc err_msg = do { env0 <- liftZonkM tcInitTidyEnv
                       ; addErrTcM (env0, err_msg) }
 
 addErrTcM :: (TidyEnv, TcRnMessage) -> TcM ()
@@ -1597,8 +1627,8 @@ diagnosticTcM should_report warn_msg
 -- | Display a diagnostic in the current context.
 addDiagnosticTc :: TcRnMessage -> TcM ()
 addDiagnosticTc msg
- = do { env0 <- tcInitTidyEnv ;
-      addDiagnosticTcM (env0, msg) }
+ = do { env0 <- liftZonkM tcInitTidyEnv
+      ; addDiagnosticTcM (env0, msg) }
 
 -- | Display a diagnostic in a given context.
 addDiagnosticTcM :: (TidyEnv, TcRnMessage) -> TcM ()
@@ -1616,7 +1646,7 @@ addDetailedDiagnostic mkMsg = do
   loc <- getSrcSpanM
   name_ppr_ctx <- getNamePprCtx
   !diag_opts  <- initDiagOpts <$> getDynFlags
-  env0 <- tcInitTidyEnv
+  env0 <- liftZonkM tcInitTidyEnv
   ctxt <- getErrCtxt
   err_info <- mkErrInfo env0 ctxt
   reportDiagnostic (mkMsgEnvelope diag_opts loc name_ppr_ctx (mkMsg (ErrInfo err_info empty)))
@@ -1674,7 +1704,7 @@ mkErrInfo env ctxts
    go _ _ _   [] = return empty
    go dbg n env ((is_landmark, ctxt) : ctxts)
      | is_landmark || n < mAX_CONTEXTS -- Too verbose || dbg
-     = do { (env', msg) <- ctxt env
+     = do { (env', msg) <- liftZonkM $ ctxt env
           ; let n' = if is_landmark then n else n+1
           ; rest <- go dbg n' env' ctxts
           ; return (msg $$ rest) }
@@ -1776,6 +1806,18 @@ chooseUniqueOccTc fn =
      ; writeTcRef dfun_n_var (extendOccSet set occ)
      ; return occ }
 
+newZonkAnyType :: Kind -> TcM Type
+-- Return a type (ZonkAny @k n), where n is fresh
+-- Recall  ZonkAny :: forall k. Natural -> k
+-- See Note [Any types] in GHC.Builtin.Types, wrinkle (Any4)
+newZonkAnyType kind
+  = do { env <- getGblEnv
+       ; let zany_n_var = tcg_zany_n env
+       ; i <- readTcRef zany_n_var
+       ; let !i2 = i+1
+       ; writeTcRef zany_n_var i2
+       ; return (mkTyConApp zonkAnyTyCon [kind, mkNumLitTy i]) }
+
 getConstraintVar :: TcM (TcRef WantedConstraints)
 getConstraintVar = do { env <- getLclEnv; return (tcl_lie env) }
 
@@ -1816,12 +1858,6 @@ emitImplications ct
     do { lie_var <- getConstraintVar ;
          updTcRef lie_var (`addImplics` ct) }
 
-emitInsoluble :: Ct -> TcM ()
-emitInsoluble ct
-  = do { traceTc "emitInsoluble" (ppr ct)
-       ; lie_var <- getConstraintVar
-       ; updTcRef lie_var (`addInsols` unitBag ct) }
-
 emitDelayedErrors :: Bag DelayedError -> TcM ()
 emitDelayedErrors errs
   = do { traceTc "emitDelayedErrors" (ppr errs)
@@ -1856,29 +1892,29 @@ pushLevelAndCaptureConstraints thing_inside
   = do { tclvl <- getTcLevel
        ; let tclvl' = pushTcLevel tclvl
        ; traceTc "pushLevelAndCaptureConstraints {" (ppr tclvl')
-       ; (res, lie) <- updLclEnv (\env -> env { tcl_tclvl = tclvl' }) $
+       ; (res, lie) <- updLclEnv (setLclEnvTcLevel tclvl') $
                        captureConstraints thing_inside
        ; traceTc "pushLevelAndCaptureConstraints }" (ppr tclvl')
        ; return (tclvl', lie, res) }
 
 pushTcLevelM_ :: TcM a -> TcM a
-pushTcLevelM_ x = updLclEnv (\ env -> env { tcl_tclvl = pushTcLevel (tcl_tclvl env) }) x
+pushTcLevelM_ = updLclEnv (modifyLclEnvTcLevel pushTcLevel)
 
 pushTcLevelM :: TcM a -> TcM (TcLevel, a)
 -- See Note [TcLevel assignment] in GHC.Tc.Utils.TcType
 pushTcLevelM thing_inside
   = do { tclvl <- getTcLevel
        ; let tclvl' = pushTcLevel tclvl
-       ; res <- updLclEnv (\env -> env { tcl_tclvl = tclvl' }) thing_inside
+       ; res <- updLclEnv (setLclEnvTcLevel tclvl') thing_inside
        ; return (tclvl', res) }
 
 getTcLevel :: TcM TcLevel
 getTcLevel = do { env <- getLclEnv
-                ; return (tcl_tclvl env) }
+                ; return $! getLclEnvTcLevel env }
 
 setTcLevel :: TcLevel -> TcM a -> TcM a
 setTcLevel tclvl thing_inside
-  = updLclEnv (\env -> env { tcl_tclvl = tclvl }) thing_inside
+  = updLclEnv (setLclEnvTcLevel tclvl) thing_inside
 
 isTouchableTcM :: TcTyVar -> TcM Bool
 isTouchableTcM tv
@@ -1886,15 +1922,13 @@ isTouchableTcM tv
        ; return (isTouchableMetaTyVar lvl tv) }
 
 getLclTypeEnv :: TcM TcTypeEnv
-getLclTypeEnv = do { env <- getLclEnv; return (tcl_env env) }
+getLclTypeEnv = do { env <- getLclEnv; return (getLclEnvTypeEnv env) }
 
 setLclTypeEnv :: TcLclEnv -> TcM a -> TcM a
 -- Set the local type envt, but do *not* disturb other fields,
 -- notably the lie_var
 setLclTypeEnv lcl_env thing_inside
-  = updLclEnv upd thing_inside
-  where
-    upd env = env { tcl_env = tcl_env lcl_env }
+  = updLclEnv (setLclEnvTypeEnv (getLclEnvTypeEnv lcl_env)) thing_inside
 
 traceTcConstraints :: String -> TcM ()
 traceTcConstraints msg
@@ -2042,17 +2076,17 @@ keepAlive name
        ; updTcRef (tcg_keep env) (`extendNameSet` name) }
 
 getStage :: TcM ThStage
-getStage = do { env <- getLclEnv; return (tcl_th_ctxt env) }
+getStage = do { env <- getLclEnv; return (getLclEnvThStage env) }
 
 getStageAndBindLevel :: Name -> TcRn (Maybe (TopLevelFlag, ThLevel, ThStage))
 getStageAndBindLevel name
   = do { env <- getLclEnv;
-       ; case lookupNameEnv (tcl_th_bndrs env) name of
+       ; case lookupNameEnv (getLclEnvThBndrs env) name of
            Nothing                  -> return Nothing
-           Just (top_lvl, bind_lvl) -> return (Just (top_lvl, bind_lvl, tcl_th_ctxt env)) }
+           Just (top_lvl, bind_lvl) -> return (Just (top_lvl, bind_lvl, getLclEnvThStage env)) }
 
 setStage :: ThStage -> TcM a -> TcRn a
-setStage s = updLclEnv (\ env -> env { tcl_th_ctxt = s })
+setStage s = updLclEnv (setLclEnvThStage s)
 
 -- | Adds the given modFinalizers to the global environment and set them to use
 -- the current local environment.
@@ -2104,11 +2138,11 @@ fixSafeInstances _ = map fixSafe
 -}
 
 getLocalRdrEnv :: RnM LocalRdrEnv
-getLocalRdrEnv = do { env <- getLclEnv; return (tcl_rdr env) }
+getLocalRdrEnv = do { env <- getLclEnv; return (getLclEnvRdrEnv env) }
 
 setLocalRdrEnv :: LocalRdrEnv -> RnM a -> RnM a
 setLocalRdrEnv rdr_env thing_inside
-  = updLclEnv (\env -> env {tcl_rdr = rdr_env}) thing_inside
+  = updLclEnv (setLclEnvRdrEnv rdr_env) thing_inside
 
 {-
 ************************************************************************
@@ -2281,3 +2315,22 @@ getCCIndexM get_ccs nm = do
 -- | See 'getCCIndexM'.
 getCCIndexTcM :: FastString -> TcM CostCentreIndex
 getCCIndexTcM = getCCIndexM tcg_cc_st
+
+--------------------------------------------------------------------------------
+
+-- | Lift a computation from the dedicated zonking monad 'ZonkM' to the
+-- full-fledged 'TcM' monad.
+liftZonkM :: ZonkM a -> TcM a
+liftZonkM (ZonkM f) =
+  do { logger       <- getLogger
+     ; name_ppr_ctx <- getNamePprCtx
+     ; lvl          <- getTcLevel
+     ; src_span     <- getSrcSpanM
+     ; bndrs        <- getLclEnvBinderStack <$> getLclEnv
+     ; let zge = ZonkGblEnv { zge_logger = logger
+                            , zge_name_ppr_ctx = name_ppr_ctx
+                            , zge_src_span = src_span
+                            , zge_tc_level = lvl
+                            , zge_binder_stack = bndrs }
+     ; liftIO $ f zge }
+{-# INLINE liftZonkM #-}

@@ -47,6 +47,9 @@ module Data.Binary.Class (
 
     ) where
 
+import Prelude hiding (Foldable(..))
+import Data.Foldable (Foldable(..))
+
 import Data.Word
 import Data.Bits
 import Data.Int
@@ -79,7 +82,7 @@ import Data.ByteString.Lazy (ByteString)
 import qualified Data.ByteString.Lazy as L
 import qualified Data.ByteString.Builder.Prim as Prim
 
-import Data.List    (unfoldr, foldl')
+import Data.List    (unfoldr)
 
 -- And needed for the instances:
 #if MIN_VERSION_base(4,10,0)
@@ -683,6 +686,7 @@ instance (Binary e) => Binary (Seq.Seq e) where
 ------------------------------------------------------------------------
 -- Floating point
 
+-- | Uses non-IEEE754 encoding. Does not round-trip NaN.
 instance Binary Double where
     put d = put (decodeFloat d)
     get   = do
@@ -690,6 +694,7 @@ instance Binary Double where
         y <- get
         return $! encodeFloat x y
 
+-- | Uses non-IEEE754 encoding. Does not round-trip NaN.
 instance Binary Float where
     put f = put (decodeFloat f)
     get   =  do

@@ -11,6 +11,7 @@ import GHC.Unit.Module
 import GHC.Utils.Outputable
 import GHC.Utils.TmpFs
 
+import GHC.Cmm.MachOp ( FMASign(..) )
 import GHC.Prelude
 
 
@@ -49,6 +50,7 @@ data StgToCmmConfig = StgToCmmConfig
   , stgToCmmFastPAPCalls   :: !Bool              -- ^
   , stgToCmmSCCProfiling   :: !Bool              -- ^ Check if cost-centre profiling is enabled
   , stgToCmmEagerBlackHole :: !Bool              -- ^
+  , stgToCmmOrigThunkInfo  :: !Bool              -- ^ Push @stg_orig_thunk_info@ frames during thunk update.
   , stgToCmmInfoTableMap   :: !Bool              -- ^ true means generate C Stub for IPE map, See Note [Mapping Info Tables to Source Positions]
   , stgToCmmInfoTableMapWithFallback :: !Bool    -- ^ Include info tables with fallback source locations in the info table map
   , stgToCmmInfoTableMapWithStack :: !Bool       -- ^ Include info tables for STACK closures in the info table map
@@ -63,11 +65,16 @@ data StgToCmmConfig = StgToCmmConfig
   , stgToCmmDoTagCheck     :: !Bool              -- ^ Verify tag inference predictions.
   ------------------------------ Backend Flags ----------------------------------
   , stgToCmmAllowBigArith             :: !Bool   -- ^ Allowed to emit larger than native size arithmetic (only LLVM and C backends)
+  , stgToCmmAllowBigQuot              :: !Bool   -- ^ Allowed to emit larger than native size division operations
   , stgToCmmAllowQuotRemInstr         :: !Bool   -- ^ Allowed to generate QuotRem instructions
   , stgToCmmAllowQuotRem2             :: !Bool   -- ^ Allowed to generate QuotRem
   , stgToCmmAllowExtendedAddSubInstrs :: !Bool   -- ^ Allowed to generate AddWordC, SubWordC, Add2, etc.
   , stgToCmmAllowIntMul2Instr         :: !Bool   -- ^ Allowed to generate IntMul2 instruction
+  , stgToCmmAllowWordMul2Instr        :: !Bool   -- ^ Allowed to generate WordMul2 instruction
+  , stgToCmmAllowFMAInstr             :: FMASign -> Bool -- ^ Allowed to generate FMA instruction
   , stgToCmmTickyAP                   :: !Bool   -- ^ Disable use of precomputed standard thunks.
+  , stgToCmmSaveFCallTargetToLocal    :: !Bool   -- ^ Save a foreign call target to a Cmm local, see
+                                                 -- Note [Saving foreign call target to local] for details
   ------------------------------ SIMD flags ------------------------------------
   -- Each of these flags checks vector compatibility with the backend requested
   -- during compilation. In essence, this means checking for @-fllvm@ which is

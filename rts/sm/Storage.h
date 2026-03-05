@@ -43,15 +43,6 @@ extern Mutex sm_mutex;
 #define ASSERT_SM_LOCK()
 #endif
 
-#if defined(THREADED_RTS)
-// needed for HEAP_ALLOCED below
-extern SpinLock gc_alloc_block_sync;
-#endif
-
-#define ACQUIRE_ALLOC_BLOCK_SPIN_LOCK() ACQUIRE_SPIN_LOCK(&gc_alloc_block_sync)
-#define RELEASE_ALLOC_BLOCK_SPIN_LOCK() RELEASE_SPIN_LOCK(&gc_alloc_block_sync)
-
-
 /* -----------------------------------------------------------------------------
    The write barrier for MVARs and TVARs
    -------------------------------------------------------------------------- */
@@ -120,7 +111,11 @@ StgWord gcThreadLiveWords  (uint32_t i, uint32_t g);
 StgWord gcThreadLiveBlocks (uint32_t i, uint32_t g);
 
 StgWord genLiveWords  (generation *gen);
+StgWord genLiveCopiedWords (generation *gen);
+StgWord genLiveUncopiedWords (generation *gen);
 StgWord genLiveBlocks (generation *gen);
+StgWord genLiveCopiedBlocks (generation *gen);
+StgWord genLiveUncopiedBlocks (generation *gen);
 
 StgWord calcTotalLargeObjectsW (void);
 StgWord calcTotalCompactW (void);
@@ -216,5 +211,10 @@ extern uint32_t prev_static_flag, static_flag;
 extern StgIndStatic * dyn_caf_list;
 extern StgIndStatic * debug_caf_list;
 extern StgIndStatic * revertible_caf_list;
+
+INLINE_HEADER void clear_blocks(bdescr *bd) {
+  memset(bd->start, RtsFlags.DebugFlags.zero_on_gc ? 0xaa : 0,
+         BLOCK_SIZE * bd->blocks);
+}
 
 #include "EndPrivate.h"

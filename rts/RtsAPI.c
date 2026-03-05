@@ -9,6 +9,7 @@
 #include "rts/PosixSource.h"
 #include "Rts.h"
 #include "RtsAPI.h"
+#include "RtsFlags.h"
 #include "HsFFI.h"
 
 #include "RtsUtils.h"
@@ -508,7 +509,7 @@ void rts_evalStableIOMain(/* inout */ Capability **cap,
     SchedulerStatus stat;
 
     p = (StgClosure *)deRefStablePtr(s);
-    w = rts_apply(*cap, &base_GHCziTopHandler_runMainIO_closure, p);
+    w = rts_apply(*cap, &ghczminternal_GHCziInternalziTopHandler_runMainIO_closure, p);
     tso = createStrictIOThread(*cap, RtsFlags.GcFlags.initialStkSize, w);
     // async exceptions are always blocked by default in the created
     // thread.  See #1048.
@@ -716,7 +717,7 @@ PauseToken *rts_pause (void)
     // so pausing the mutator while a collection is ongoing might lead to deadlock or
     // capabilities being prematurely re-awoken.
     if (RtsFlags.GcFlags.useNonmoving) {
-      ACQUIRE_LOCK(&nonmoving_collection_mutex);
+        nonmovingBlockConcurrentMark(true);
     }
 
 
@@ -784,7 +785,7 @@ void rts_resume (PauseToken *pauseToken)
     stgFree(pauseToken);
 
     if (RtsFlags.GcFlags.useNonmoving) {
-      RELEASE_LOCK(&nonmoving_collection_mutex);
+        nonmovingUnblockConcurrentMark();
     }
 }
 

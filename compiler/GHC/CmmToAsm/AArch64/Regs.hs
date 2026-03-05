@@ -17,6 +17,7 @@ import GHC.Utils.Outputable
 import GHC.Utils.Panic
 import GHC.Platform
 
+-- TODO: Should this include the zero register?
 allMachRegNos   :: [RegNo]
 allMachRegNos   = [0..31] ++ [32..63]
 -- allocatableRegs is allMachRegNos with the fixed-use regs removed.
@@ -77,6 +78,8 @@ litToImm (CmmInt i w)        = ImmInteger (narrowS w i)
                 -- narrow to the width: a CmmInt might be out of
                 -- range, but we assume that ImmInteger only contains
                 -- in-range values.  A signed value should be fine here.
+                -- AK: We do call this with out of range values, however
+                -- it just truncates as we would expect.
 litToImm (CmmFloat f W32)    = ImmFloat f
 litToImm (CmmFloat f W64)    = ImmDouble f
 litToImm (CmmLabel l)        = ImmCLbl l
@@ -146,6 +149,13 @@ classOfRealReg :: RealReg -> RegClass
 classOfRealReg (RealRegSingle i)
         | i < 32        = RcInteger
         | otherwise     = RcDouble
+
+fmtOfRealReg :: RealReg -> Format
+fmtOfRealReg real_reg =
+  case classOfRealReg real_reg of
+            RcInteger -> II64
+            RcDouble  -> FF64
+            RcFloat   -> panic "No float regs on arm"
 
 regDotColor :: RealReg -> SDoc
 regDotColor reg

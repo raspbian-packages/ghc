@@ -68,6 +68,10 @@
     pointer.
    ------------------------------------------------------------------------- */
 
+static /* STATIC_INLINE */ P_
+thread_obj (const StgInfoTable *info, P_ p);
+
+
 STATIC_INLINE W_
 UNTAG_PTR(W_ p)
 {
@@ -463,13 +467,16 @@ thread_TSO (StgTSO *tso)
     thread_(&tso->_link);
     thread_(&tso->global_link);
 
-    if (   tso->why_blocked == BlockedOnMVar
-        || tso->why_blocked == BlockedOnMVarRead
-        || tso->why_blocked == BlockedOnBlackHole
-        || tso->why_blocked == BlockedOnMsgThrowTo
-        || tso->why_blocked == NotBlocked
-        ) {
+    switch (ACQUIRE_LOAD(&tso->why_blocked)) {
+    case BlockedOnMVar:
+    case BlockedOnMVarRead:
+    case BlockedOnBlackHole:
+    case BlockedOnMsgThrowTo:
+    case NotBlocked:
         thread_(&tso->block_info.closure);
+        break;
+    default:
+        break;
     }
     thread_(&tso->blocked_exceptions);
     thread_(&tso->bq);
@@ -563,6 +570,13 @@ update_fwd_large( bdescr *bd )
     case ARR_WORDS:
       // nothing to follow
       continue;
+
+    // See Note [Black holes in large objects] in Evac.c for why.
+    case BLACKHOLE:
+      {
+        thread_obj(info, p);
+        continue;
+      }
 
     case MUT_ARR_PTRS_CLEAN:
     case MUT_ARR_PTRS_DIRTY:

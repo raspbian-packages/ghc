@@ -8,6 +8,7 @@
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE UndecidableInstances #-} -- Wrinkle in Note [Trees That Grow]
+{-# LANGUAGE LambdaCase #-}
                                       -- in module Language.Haskell.Syntax.Extension
 {-
 (c) The University of Glasgow 2006
@@ -21,21 +22,24 @@ GHC.Hs.Type: Abstract syntax: user-defined types
 module Language.Haskell.Syntax.Type (
         HsScaled(..),
         hsMult, hsScaledThing,
-        HsArrow(..),
-        HsLinearArrowTokens(..),
+        HsArrow(..), XUnrestrictedArrow, XLinearArrow, XExplicitMult, XXArrow,
 
         HsType(..), LHsType, HsKind, LHsKind,
+        HsBndrVis(..), XBndrRequired, XBndrInvisible, XXBndrVis,
+        isHsBndrInvisible,
         HsForAllTelescope(..), HsTyVarBndr(..), LHsTyVarBndr,
         LHsQTyVars(..),
         HsOuterTyVarBndrs(..), HsOuterFamEqnTyVarBndrs, HsOuterSigTyVarBndrs,
         HsWildCardBndrs(..),
         HsPatSigType(..),
         HsSigType(..), LHsSigType, LHsSigWcType, LHsWcType,
+        HsTyPat(..), LHsTyPat,
         HsTupleSort(..),
         HsContext, LHsContext,
         HsTyLit(..),
         HsIPName(..), hsIPNameFS,
-        HsArg(..),
+        HsArg(..), XValArg, XTypeArg, XArgPar, XXArg,
+
         LHsTypeArg,
 
         LBangType, BangType,
@@ -44,7 +48,7 @@ module Language.Haskell.Syntax.Type (
 
         ConDeclField(..), LConDeclField,
 
-        HsConDetails(..), noTypeArgs,
+        HsConDetails(..), noTypeArgs, conDetailsArity,
 
         FieldOcc(..), LFieldOcc,
         AmbiguousFieldOcc(..), LAmbiguousFieldOcc,
@@ -57,13 +61,12 @@ module Language.Haskell.Syntax.Type (
 
 import {-# SOURCE #-} Language.Haskell.Syntax.Expr ( HsUntypedSplice )
 
-import Language.Haskell.Syntax.Concrete
 import Language.Haskell.Syntax.Extension
 
 import GHC.Types.Name.Reader ( RdrName )
 import GHC.Core.DataCon( HsSrcBang(..) )
 import GHC.Core.Type (Specificity)
-import GHC.Types.SrcLoc (SrcSpan)
+import GHC.Types.Basic (Arity)
 
 import GHC.Hs.Doc (LHsDoc)
 import GHC.Data.FastString (FastString)
@@ -74,7 +77,7 @@ import Data.Maybe
 import Data.Eq
 import Data.Bool
 import Data.Char
-import Prelude (Integer)
+import Prelude (Integer, length)
 
 {-
 ************************************************************************
@@ -342,12 +345,12 @@ type LHsTyVarBndr flag pass = XRec pass (HsTyVarBndr flag pass)
 data LHsQTyVars pass   -- See Note [HsType binders]
   = HsQTvs { hsq_ext :: XHsQTvs pass
 
-           , hsq_explicit :: [LHsTyVarBndr () pass]
+           , hsq_explicit :: [LHsTyVarBndr (HsBndrVis pass) pass]
                 -- Explicit variables, written by the user
     }
   | XLHsQTyVars !(XXLHsQTyVars pass)
 
-hsQTvExplicit :: LHsQTyVars pass -> [LHsTyVarBndr () pass]
+hsQTvExplicit :: LHsQTyVars pass -> [LHsTyVarBndr (HsBndrVis pass) pass]
 hsQTvExplicit = hsq_explicit
 
 ------------------------------------------------
@@ -356,7 +359,7 @@ hsQTvExplicit = hsq_explicit
 -- the forall-or-nothing rule. These are used to represent the outermost
 -- quantification in:
 --    * Type signatures (LHsSigType/LHsSigWcType)
---    * Patterns in a type/data family instance (HsTyPats)
+--    * Patterns in a type/data family instance (HsFamEqnPats)
 --
 -- We support two forms:
 --   HsOuterImplicit (implicit quantification, added by renamer)
@@ -444,6 +447,14 @@ type LHsWcType    pass = HsWildCardBndrs pass (LHsType pass)    -- Wildcard only
 
 -- | Located Haskell Signature Wildcard Type
 type LHsSigWcType pass = HsWildCardBndrs pass (LHsSigType pass) -- Both
+
+data HsTyPat pass
+  = HsTP { hstp_ext  :: XHsTP pass   -- ^ After renamer: 'HsTyPatRn'
+         , hstp_body :: LHsType pass -- ^ Main payload (the type itself)
+    }
+  | XHsTyPat !(XXHsTyPat pass)
+
+type LHsTyPat  pass = XRec pass (HsTyPat pass)
 
 -- | A type signature that obeys the @forall@-or-nothing rule. In other
 -- words, an 'LHsType' that uses an 'HsOuterSigTyVarBndrs' to represent its
@@ -713,6 +724,28 @@ data HsTyVarBndr flag pass
   | XTyVarBndr
       !(XXTyVarBndr pass)
 
+data HsBndrVis pass
+  = HsBndrRequired !(XBndrRequired pass)
+      -- Binder for a visible (required) variable:
+      --     type Dup a = (a, a)
+      --             ^^^
+
+  | HsBndrInvisible !(XBndrInvisible pass)
+      -- Binder for an invisible (specified) variable:
+      --     type KindOf @k (a :: k) = k
+      --                ^^^
+
+  | XXBndrVis !(XXBndrVis pass)
+
+type family XBndrRequired  p
+type family XBndrInvisible p
+type family XXBndrVis      p
+
+isHsBndrInvisible :: HsBndrVis pass -> Bool
+isHsBndrInvisible HsBndrInvisible{} = True
+isHsBndrInvisible HsBndrRequired{}  = False
+isHsBndrInvisible (XXBndrVis _)     = False
+
 -- | Does this 'HsTyVarBndr' come with an explicit kind annotation?
 isHsKindedTyVar :: HsTyVarBndr flag pass -> Bool
 isHsKindedTyVar (UserTyVar {})   = False
@@ -904,21 +937,24 @@ data HsTyLit pass
 
 -- | Denotes the type of arrows in the surface language
 data HsArrow pass
-  = HsUnrestrictedArrow !(LHsUniToken "->" "→" pass)
+  = HsUnrestrictedArrow !(XUnrestrictedArrow pass)
     -- ^ a -> b or a → b
 
-  | HsLinearArrow !(HsLinearArrowTokens pass)
+  | HsLinearArrow !(XLinearArrow pass)
     -- ^ a %1 -> b or a %1 → b, or a ⊸ b
 
-  | HsExplicitMult !(LHsToken "%" pass) !(LHsType pass) !(LHsUniToken "->" "→" pass)
+  | HsExplicitMult !(XExplicitMult pass) !(LHsType pass)
     -- ^ a %m -> b or a %m → b (very much including `a %Many -> b`!
     -- This is how the programmer wrote it). It is stored as an
     -- `HsType` so as to preserve the syntax as written in the
     -- program.
 
-data HsLinearArrowTokens pass
-  = HsPct1 !(LHsToken "%1" pass) !(LHsUniToken "->" "→" pass)
-  | HsLolly !(LHsToken "⊸" pass)
+  | XArrow !(XXArrow pass)
+
+type family XUnrestrictedArrow p
+type family XLinearArrow       p
+type family XExplicitMult      p
+type family XXArrow            p
 
 -- | This is used in the syntax. In constructor declaration. It must keep the
 -- arrow representation.
@@ -1071,6 +1107,12 @@ data HsConDetails tyarg arg rec
 noTypeArgs :: [Void]
 noTypeArgs = []
 
+conDetailsArity :: (rec -> Arity) -> HsConDetails tyarg arg rec -> Arity
+conDetailsArity recToArity = \case
+  PrefixCon _ args -> length args
+  RecCon rec -> recToArity rec
+  InfixCon _ _ -> 2
+
 {-
 Note [ConDeclField pass]
 ~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1112,35 +1154,61 @@ I don't know if this is a good idea, but there it is.
 
 {- Note [hsScopedTvs and visible foralls]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
--XScopedTypeVariables can be defined in terms of a desugaring to
--XTypeAbstractions (GHC Proposal #50):
+ScopedTypeVariables can be defined in terms of a desugaring to TypeAbstractions
+(GHC Proposals #155 and #448):
 
     fn :: forall a b c. tau(a,b,c)            fn :: forall a b c. tau(a,b,c)
     fn = defn(a,b,c)                   ==>    fn @x @y @z = defn(x,y,z)
 
-That is, for every type variable of the leading 'forall' in the type signature,
-we add an invisible binder at term level.
+That is, for every type variable of the leading `forall` in the type signature,
+we add an invisible binder at the term level.
 
-This model does not extend to visible forall, as discussed here:
+This model does not extend to visible forall. (Visible forall is the one written
+with an arrow instead of a dot, i.e. `forall a ->`. See GHC Proposal #281 and
+the RequiredTypeArguments extension).  Here is an example that demonstrates the
+issue:
 
-* https://gitlab.haskell.org/ghc/ghc/issues/16734#note_203412
-* https://github.com/ghc-proposals/ghc-proposals/pull/238
+  vfn :: forall a b -> tau(a, b)
+  vfn = case <scrutinee> of (p,q) -> \x y -> ...
 
-The conclusion of these discussions can be summarized as follows:
+The `a` and `b` cannot scope over the equations of `vfn`.  In particular,
+`a` and `b` cannot be in scope in <scrutinee> because those type variables
+are bound by the `\x y ->`.
 
-  > Assuming support for visible 'forall' in terms, consider this example:
-  >
-  >     vfn :: forall x y -> tau(x,y)
-  >     vfn = \a b -> ...
-  >
-  > The user has written their own binders 'a' and 'b' to stand for 'x' and
-  > 'y', and we definitely should not desugar this into:
-  >
-  >     vfn :: forall x y -> tau(x,y)
-  >     vfn x y = \a b -> ...         -- bad!
+Our solution is simple: ScopedTypeVariables has no effect on visible forall.
+It follows naturally from the fact that ScopedTypeVariables is already subject
+to several restrictions:
 
-This design choice is reflected in the design of HsOuterSigTyVarBndrs, which are
-used in every place that ScopedTypeVariables takes effect:
+  1. The type signature must be headed by an /explicit/ forall
+      * `f :: forall a. a -> blah` brings `a` into scope in the body
+      * `f ::           a -> blah` does not
+
+  2. The forall is /not nested/
+      * `f :: forall a b. blah`         brings `a` and `b` into scope in the body
+      * `f :: forall a. forall b. blah` brings `a` but not `b` into scope in the body
+
+With the introduction of visible forall, we also introduce a third condition:
+
+  3. The forall has to be /invisible/
+      * `f :: forall a b.   blah` brings `a` and `b` into scope in the body
+      * `f :: forall a b -> blah` does not
+
+For example:
+
+   f1 :: forall a. a -> a
+   f1 x = (x::a)          -- OK: `a` is in scope in the body
+
+   f2 :: forall a b. a -> b -> (a, b)
+   f2 x y = (x::a, y::b)  -- OK: both `a` and `b` are in scope in the body
+
+   f3 :: forall a. forall b. a -> b -> (a, b)
+   f3 x y = (x::a, y::b)  -- Wrong: the `forall b.` is not the outermost forall
+
+   f4 :: forall a -> a -> a
+   f4 t (x::t) = (x::a)   -- Wrong: the `forall a ->` does not bring `a` into scope
+
+This design choice is reflected in the definition of HsOuterSigTyVarBndrs, which are
+used in every place where ScopedTypeVariables takes effect:
 
   data HsOuterTyVarBndrs flag pass
     = HsOuterImplicit { ... }
@@ -1155,21 +1223,6 @@ which type variables to bring into scope over the body of a function
 (in hsScopedTvs), we /only/ bring the type variables bound by the hso_bndrs in
 an HsOuterExplicit into scope. If we have an HsOuterImplicit instead, then we
 do not bring any type variables into scope over the body of a function at all.
-
-At the moment, GHC does not support visible 'forall' in terms. Nevertheless,
-it is still possible to write erroneous programs that use visible 'forall's in
-terms, such as this example:
-
-    x :: forall a -> a -> a
-    x = x
-
-Previous versions of GHC would bring `a` into scope over the body of `x` in the
-hopes that the typechecker would error out later
-(see `GHC.Tc.Validity.vdqAllowed`). However, this can wreak havoc in the
-renamer before GHC gets to that point (see #17687 for an example of this).
-Bottom line: nip problems in the bud by refraining from bringing any type
-variables in an HsOuterImplicit into scope over the body of a function, even
-if they correspond to a visible 'forall'.
 -}
 
 {-
@@ -1181,14 +1234,19 @@ if they correspond to a visible 'forall'.
 -}
 
 -- | Arguments in an expression/type after splitting
-data HsArg tm ty
-  = HsValArg tm   -- Argument is an ordinary expression     (f arg)
-  | HsTypeArg SrcSpan ty -- Argument is a visible type application (f @ty)
-                         -- SrcSpan is location of the `@`
-  | HsArgPar SrcSpan -- See Note [HsArgPar]
+data HsArg p tm ty
+  = HsValArg !(XValArg p) tm   -- Argument is an ordinary expression     (f arg)
+  | HsTypeArg !(XTypeArg p) ty -- Argument is a visible type application (f @ty)
+  | HsArgPar !(XArgPar p)      -- See Note [HsArgPar]
+  | XArg !(XXArg p)
+
+type family XValArg  p
+type family XTypeArg p
+type family XArgPar  p
+type family XXArg    p
 
 -- type level equivalent
-type LHsTypeArg p = HsArg (LHsType p) (LHsKind p)
+type LHsTypeArg p = HsArg p (LHsType p) (LHsKind p)
 
 {-
 Note [HsArgPar]
@@ -1239,7 +1297,7 @@ deriving instance (
   , Eq (XXFieldOcc pass)
   ) => Eq (FieldOcc pass)
 
--- | Located Ambiguous Field Occurence
+-- | Located Ambiguous Field Occurrence
 type LAmbiguousFieldOcc pass = XRec pass (AmbiguousFieldOcc pass)
 
 -- | Ambiguous Field Occurrence

@@ -2,6 +2,7 @@
 
 module GHC.Llvm.MetaData
   ( MetaId(..)
+  , ppMetaId
   , MetaExpr(..)
   , MetaAnnot(..)
   , MetaDecl(..)
@@ -73,7 +74,12 @@ newtype MetaId = MetaId Int
                deriving (Eq, Ord, Enum)
 
 instance Outputable MetaId where
-    ppr (MetaId n) = char '!' <> int n
+    ppr = ppMetaId
+
+ppMetaId :: IsLine doc => MetaId -> doc
+ppMetaId (MetaId n) = char '!' <> int n
+{-# SPECIALIZE ppMetaId :: MetaId -> SDoc #-}
+{-# SPECIALIZE ppMetaId :: MetaId -> HLine #-} -- see Note [SPECIALIZE to HDoc] in GHC.Utils.Outputable
 
 -- | LLVM metadata expressions
 data MetaExpr = MetaStr !LMString

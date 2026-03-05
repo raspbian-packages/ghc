@@ -35,6 +35,7 @@ import GHC.Core.FamInstEnv
 import GHC.Tc.Gen.HsType
 import GHC.Core.TyCo.Rep
 import GHC.Core.TyCo.Ppr ( pprTyVars )
+import GHC.Unit.Module.Warnings
 
 import GHC.Rename.Bind
 import GHC.Rename.Env
@@ -60,11 +61,11 @@ import GHC.Types.SrcLoc
 import GHC.Utils.Misc
 import GHC.Utils.Outputable as Outputable
 import GHC.Utils.Panic
-import GHC.Utils.Panic.Plain
 import GHC.Utils.Logger
 import GHC.Data.Bag
 import GHC.Utils.FV as FV (fvVarList, unionFV, mkFVs)
 import qualified GHC.LanguageExtensions as LangExt
+import GHC.Data.BooleanFormula ( isUnsatisfied )
 
 import Control.Monad
 import Control.Monad.Trans.Class
@@ -293,7 +294,7 @@ renameDeriv inst_infos bagBinds
         -- Importantly, we use rnLocalValBindsLHS, not rnTopBindsLHS, to rename
         -- auxiliary bindings as if they were defined locally.
         -- See Note [Auxiliary binders] in GHC.Tc.Deriv.Generate.
-        ; (bndrs, rn_aux_lhs) <- rnLocalValBindsLHS emptyFsEnv aux_val_binds
+        ; (bndrs, rn_aux_lhs) <- rnLocalValBindsLHS emptyMiniFixityEnv aux_val_binds
         ; bindLocalNames bndrs $
     do  { (rn_aux, dus_aux) <- rnLocalValBindsRHS (mkNameSet bndrs) rn_aux_lhs
         ; (rn_inst_infos, fvs_insts) <- mapAndUnzipM rn_inst_info inst_infos
@@ -606,7 +607,7 @@ deriveStandalone :: LDerivDecl GhcRn -> TcM (Maybe EarlyDerivSpec)
 --
 -- This returns a Maybe because the user might try to derive Typeable, which is
 -- a no-op nowadays.
-deriveStandalone (L loc (DerivDecl _ deriv_ty mb_lderiv_strat overlap_mode))
+deriveStandalone (L loc (DerivDecl (warn, _) deriv_ty mb_lderiv_strat overlap_mode))
   = setSrcSpanA loc                       $
     addErrCtxt (standaloneCtxt deriv_ty)  $
     do { traceTc "Standalone deriving decl for" (ppr deriv_ty)
@@ -679,7 +680,8 @@ deriveStandalone (L loc (DerivDecl _ deriv_ty mb_lderiv_strat overlap_mode))
                  return Nothing
          else Just <$> mkEqnHelp (fmap unLoc overlap_mode)
                                  tvs' cls inst_tys'
-                                 deriv_ctxt' mb_deriv_strat' }
+                                 deriv_ctxt' mb_deriv_strat'
+                                 (fmap unLoc warn) }
 
 -- Typecheck the type in a standalone deriving declaration.
 --
@@ -854,6 +856,7 @@ deriveTyData tc tc_args mb_deriv_strat deriv_tvs cls cls_tys cls_arg_kind
 
         ; spec <- mkEqnHelp Nothing final_tkvs cls final_cls_args
                             (InferContext Nothing) final_mb_deriv_strat
+                            Nothing
         ; traceTc "deriveTyData 3" (ppr spec)
         ; return spec }
 
@@ -1133,13 +1136,14 @@ mkEqnHelp :: Maybe OverlapMode
                -- InferContext  => context inferred (deriving on data decl, or
                --                  standalone deriving decl with a wildcard)
           -> Maybe (DerivStrategy GhcTc)
+          -> Maybe (WarningTxt GhcRn)
           -> TcRn EarlyDerivSpec
 -- Make the EarlyDerivSpec for an instance
 --      forall tvs. theta => cls (tys ++ [ty])
 -- where the 'theta' is optional (that's the Maybe part)
 -- Assumes that this declaration is well-kinded
 
-mkEqnHelp overlap_mode tvs cls cls_args deriv_ctxt deriv_strat = do
+mkEqnHelp overlap_mode tvs cls cls_args deriv_ctxt deriv_strat warn = do
   is_boot <- tcIsHsBootOrSig
   when is_boot $ bale_out DerivErrBootFileFound
 
@@ -1154,7 +1158,8 @@ mkEqnHelp overlap_mode tvs cls cls_args deriv_ctxt deriv_strat = do
                     , denv_inst_tys     = cls_args'
                     , denv_ctxt         = deriv_ctxt
                     , denv_skol_info    = skol_info
-                    , denv_strat        = deriv_strat' }
+                    , denv_strat        = deriv_strat'
+                    , denv_warn         = warn }
   runReaderT mk_eqn deriv_env
   where
     skolemise_when_inferring_context ::
@@ -1340,7 +1345,8 @@ mk_eqn_from_mechanism mechanism
                 , denv_cls          = cls
                 , denv_inst_tys     = inst_tys
                 , denv_ctxt         = deriv_ctxt
-                , denv_skol_info    = skol_info } <- ask
+                , denv_skol_info    = skol_info
+                , denv_warn         = warn } <- ask
        user_ctxt <- askDerivUserTypeCtxt
        doDerivInstErrorChecks1 mechanism
        loc       <- lift getSrcSpanM
@@ -1358,7 +1364,8 @@ mk_eqn_from_mechanism mechanism
                    , ds_user_ctxt = user_ctxt
                    , ds_overlap = overlap_mode
                    , ds_standalone_wildcard = wildcard
-                   , ds_mechanism = mechanism' } }
+                   , ds_mechanism = mechanism'
+                   , ds_warn = warn } }
 
         SupplyContext theta ->
             return $ GivenTheta $ DS
@@ -1370,7 +1377,8 @@ mk_eqn_from_mechanism mechanism
                    , ds_user_ctxt = user_ctxt
                    , ds_overlap = overlap_mode
                    , ds_standalone_wildcard = Nothing
-                   , ds_mechanism = mechanism }
+                   , ds_mechanism = mechanism
+                   , ds_warn = warn }
 
 mk_eqn_stock :: DerivInstTys -- Information about the arguments to the class
              -> DerivM EarlyDerivSpec
@@ -1442,19 +1450,24 @@ mk_eqn_no_strategy = do
                  -- See Note [DerivEnv and DerivSpecMechanism] in GHC.Tc.Deriv.Utils
                  whenIsJust (hasStockDeriving cls) $ \_ ->
                    expectNonDataFamTyCon dit
-                 mk_eqn_originative dit
+                 mk_eqn_originative cls dit
 
      |  otherwise
      -> mk_eqn_anyclass
   where
     -- Use heuristics (checkOriginativeSideConditions) to determine whether
     -- stock or anyclass deriving should be used.
-    mk_eqn_originative :: DerivInstTys -> DerivM EarlyDerivSpec
-    mk_eqn_originative dit@(DerivInstTys { dit_tc     = tc
-                                         , dit_rep_tc = rep_tc }) = do
+    mk_eqn_originative :: Class -> DerivInstTys -> DerivM EarlyDerivSpec
+    mk_eqn_originative cls dit@(DerivInstTys { dit_tc     = tc
+                                             , dit_rep_tc = rep_tc }) = do
       dflags <- getDynFlags
-      let isDeriveAnyClassEnabled =
-            deriveAnyClassEnabled (xopt LangExt.DeriveAnyClass dflags)
+      let isDeriveAnyClassEnabled
+            | canSafelyDeriveAnyClass cls
+            = deriveAnyClassEnabled (xopt LangExt.DeriveAnyClass dflags)
+            | otherwise
+            -- Pretend that the extension is enabled so that we won't suggest
+            -- enabling it.
+            = YesDeriveAnyClassEnabled
 
       -- See Note [Deriving instances for classes themselves]
       let dac_error
@@ -1470,6 +1483,12 @@ mk_eqn_no_strategy = do
                                   DerivSpecStock { dsm_stock_dit     = dit
                                                  , dsm_stock_gen_fns = gen_fns }
         CanDeriveAnyClass      -> mk_eqn_from_mechanism DerivSpecAnyClass
+
+    canSafelyDeriveAnyClass cls =
+      -- If the set of minimal required definitions is nonempty,
+      -- `DeriveAnyClass` will generate an instance with undefined methods or
+      -- associated types, so don't suggest enabling it.
+      isNothing $ isUnsatisfied (const False) (classMinimalDef cls)
 
 {-
 ************************************************************************
@@ -1960,9 +1979,13 @@ doDerivInstErrorChecks1 mechanism =
   case mechanism of
     DerivSpecStock{dsm_stock_dit = dit}
       -> data_cons_in_scope_check dit
-    DerivSpecNewtype{dsm_newtype_dit = dit}
-      -> do atf_coerce_based_error_checks
-            data_cons_in_scope_check dit
+    -- No need to 'data_cons_in_scope_check' for newtype deriving.
+    -- Additionally, we also don't need to mark the constructors as
+    -- used because newtypes are handled separately elsewhere.
+    -- See Note [Tracking unused binding and imports] in GHC.Tc.Types
+    -- or #17328 for more.
+    DerivSpecNewtype{}
+      -> atf_coerce_based_error_checks
     DerivSpecAnyClass{}
       -> pure ()
     DerivSpecVia{}

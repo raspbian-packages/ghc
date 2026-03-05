@@ -2,11 +2,11 @@ module GHC.Driver.Config.Core.Opt.LiberateCase
   ( initLiberateCaseOpts
   ) where
 
-import GHC.Driver.Session
+import GHC.Driver.DynFlags
 
 import GHC.Core.Opt.LiberateCase ( LibCaseOpts(..) )
 
--- | Initialize configuration for the liberate case Core optomization
+-- | Initialize configuration for the liberate case Core optimization
 -- pass.
 initLiberateCaseOpts :: DynFlags -> LibCaseOpts
 initLiberateCaseOpts dflags = LibCaseOpts

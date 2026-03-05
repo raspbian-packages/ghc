@@ -39,7 +39,6 @@ import GHC.Stg.Syntax
 import GHC.Core.Utils
 import GHC.Types.Unique.Supply
 import GHC.Utils.Panic
-import GHC.Utils.Panic.Plain
 import GHC.Types.Var.Env
 import GHC.Types.Var.Set
 import GHC.Core.Multiplicity
@@ -197,12 +196,12 @@ collectFloats = go (0 :: Int) []
 -- | Omitting this makes for strange closure allocation schemes that crash the
 -- GC.
 removeRhsCCCS :: GenStgRhs pass -> GenStgRhs pass
-removeRhsCCCS (StgRhsClosure ext ccs upd bndrs body)
+removeRhsCCCS (StgRhsClosure ext ccs upd bndrs body typ)
   | isCurrentCCS ccs
-  = StgRhsClosure ext dontCareCCS upd bndrs body
-removeRhsCCCS (StgRhsCon ccs con mu ts args)
+  = StgRhsClosure ext dontCareCCS upd bndrs body typ
+removeRhsCCCS (StgRhsCon ccs con mu ts args typ)
   | isCurrentCCS ccs
-  = StgRhsCon dontCareCCS con mu ts args
+  = StgRhsCon dontCareCCS con mu ts args typ
 removeRhsCCCS rhs = rhs
 
 -- | The analysis monad consists of the following 'RWST' components:
@@ -275,15 +274,13 @@ withSubstBndrs = runContT . traverse (ContT . withSubstBndr)
 -- binder and fresh name generation.
 withLiftedBndr :: DIdSet -> Id -> (Id -> LiftM a) -> LiftM a
 withLiftedBndr abs_ids bndr inner = do
-  uniq <- getUniqueM
   let str = fsLit "$l" `appendFS` occNameFS (getOccName bndr)
   let ty = mkLamTypes (dVarSetElems abs_ids) (idType bndr)
-  let bndr'
+  bndr' <-
         -- See Note [transferPolyIdInfo] in GHC.Types.Id. We need to do this at least
         -- for arity information.
-        = transferPolyIdInfo bndr (dVarSetElems abs_ids)
-        . mkSysLocal str uniq ManyTy
-        $ ty
+            transferPolyIdInfo bndr (dVarSetElems abs_ids)
+        <$> mkSysLocalM str ManyTy ty
   LiftM $ RWS.local
     (\e -> e
       { e_subst = extendSubst bndr bndr' $ extendInScope bndr' $ e_subst e

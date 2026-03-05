@@ -11,10 +11,34 @@ http://cabal.readthedocs.io/
 
 ### How to build it
 
-Building the documentation requires Python 3 be installed
-* `> make users-guide`
-* Python on Mac OS X dislikes `LC_CTYPE=UTF-8`, unset the env var in
-terminal preferences and instead set `LC_ALL=en_US.UTF-8` or something
+Building the documentation requires Python 3, PIP, and `pip-tools` (see the second note below for how to install it). Run the following command either from the root of the cabal repository or from the `docs/` subdirectory:
+
+``` console
+> make users-guide
+```
+
+Note: Python on Mac OS X dislikes `LC_CTYPE=UTF-8`, so unset the variable
+and instead set `LC_ALL=en_US.UTF-8`.
+
+Note: You can use a vendor package for `pip-tools`, or run
+
+``` console
+> pip install pip-tools
+```
+
+Make sure the installation directory (often `$HOME/.local/bin`) is on your `$PATH`.
+
+### How to update dependencies
+
+The list of transitive dependencies (`requirements.txt`) is generated from the list of direct dependencies in `requirements.in`. To perform the generation step, run
+
+```console
+> make users-guide-requirements
+```
+
+either from the root of the cabal repository or from the `docs/` subdirectory. You will need to do this before building documentation the first time, but should only need to repeat it after a `git clean` or if the dependencies in `requirements.in` change.
+
+In some cases, you may have to add a bound manually to `requirements.in`, e.g. `requests >= 2.31.0`.
 
 ### Gitpod workflow
 
@@ -32,6 +56,7 @@ Make your edits, rebuild the guide and refresh the browser to preview the
 changes. When happy, commit your changes with git in the included terminal.
 
 ### Caveats, for newcomers to RST from MD
+
 RST does not allow you to skip section levels when nesting, like MD
 does.
 So, you cannot have

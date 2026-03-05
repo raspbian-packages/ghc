@@ -136,11 +136,13 @@
 -- Int64X2#, SCALAR expands to Int64#, and VECTUPLE expands to (# Int64#, Int64# #).
 
 defaults
-   has_side_effects = False
+   effect           = NoEffect -- See Note [Classifying primop effects] in GHC.Builtin.PrimOps
+   can_fail_warning = WarnIfEffectIsCanFail
    out_of_line      = False   -- See Note [When do out-of-line primops go in primops.txt.pp]
-   can_fail         = False   -- See Note [PrimOp can_fail and has_side_effects] in PrimOp
    commutable       = False
    code_size        = { primOpCodeSizeDefault }
+   work_free        = { primOpCodeSize _thisOp == 0 }
+   cheap            = { primOpOkForSpeculation _thisOp }
    strictness       = { \ arity -> mkClosedDmdSig (replicate arity topDmd) topDiv }
    fixity           = Nothing
    llvm_only        = False
@@ -166,8 +168,7 @@ defaults
 --
 --   - No polymorphism in type
 --   - `strictness       = <default>`
---   - `can_fail         = False`
---   - `has_side_effects = True`
+--   - `effect           = ReadWriteEffect`
 --
 -- https://gitlab.haskell.org/ghc/ghc/issues/16929 tracks this issue,
 -- and has a table of which external-only primops are blocked by which
@@ -187,41 +188,48 @@ defaults
 --
 -- * The names `a,b,c,s` stand for type variables of kind Type
 --
--- * The names `v` and `w` stand for levity-polymorphic
---   type variables.
---   For example:
---      op :: v -> w -> Int
+-- * The names `a_reppoly` and `b_reppoly` stand for representation-polymorphic
+--   type variables. For example:
+--      op :: a_reppoly -> b_reppoly -> Int
 --   really means
---      op :: forall {l :: Levity} (a :: TYPE (BoxedRep l))
---                   {k :: Levity} (b :: TYPE (BoxedRep k)).
+--      op :: forall {rep1 :: RuntimeRep} {rep2 :: RuntimeRep}
+--                   (a :: TYPE rep1) (b :: TYPE rep2).
 --            a -> b -> Int
---  Two important things to note:
---     - `v` and `w` have independent levities `l` and `k` (respectively), and
---       these are inferred (not specified), as seen from the curly brackets.
---     - `v` and `w` end up written as `a` and `b` (respectively) in types,
---       which means that one shouldn't write a primop type involving both
---       `a` and `v`, nor `b` and `w`.
 --
--- * The names `o` and `p` stand for representation-polymorphic
---   type variables, similarly to `v` and `w` above. For example:
---      op :: o -> p -> Int
+--   Note:
+--     - `a_reppoly` and `b_reppoly` have independent `RuntimeRep`s, which
+--       are *inferred* type variables.
+--     - any use-site of a primop in which the kind of a type appearing in
+--       negative position is `a_reppoly` and `b_reppoly`
+--       must instantiate the representation to a concrete RuntimeRep.
+--       See Note [Representation-polymorphism checking built-ins] in GHC.Tc.Gen.Head.
+--     - `a_reppoly` and `b_reppoly` share textual names with `a` and `b` (respectively).
+--       This means one shouldn't write a type involving both `a` and `a_reppoly`.
+--
+-- * The names `a_levpoly` and `b_levpoly` stand for levity-polymorphic
+--   type variables, similar to `a_reppoly` and `b_reppoly`.
+--   For example:
+--      op :: a_levpoly -> b_levpoly -> Int
 --   really means
---      op :: forall {q :: RuntimeRep} (a :: TYPE q)
---                   {r :: RuntimeRep} (b :: TYPE r)
+--      op :: forall {l :: Levity} {k :: Levity}
+--                   (a :: TYPE (BoxedRep l)) (b :: TYPE (BoxedRep k)).
 --            a -> b -> Int
---   We note:
---    - `o` and `p` have independent `RuntimeRep`s `q` and `r`, which are
---       inferred type variables (like for `v` and `w` above).
---    - `o` and `p` share textual names with `a` and `b` (respectively).
---      This means one shouldn't write a type involving both `a` and `o`,
---      nor `b` and `p`, nor `o` and `v`, etc.
+--  Note:
+--     - `a_levpoly` and `b_levpoly` have independent levities `l` and `k` (respectively), and
+--       these are inferred (not specified), as seen from the curly brackets.
+--     - any use site of a primop in which `a_levpoly` or `b_levpoly` appear as
+--       the kind of a type appearing in negative position in the type of the
+--       primop, we require the Levity to be instantiated to a concrete Levity.
+--     - `a_levpoly` and `b_levpoly` share textual names with `a` and `b` (respectively).
+--       This means one shouldn't write a type involving both `a` and `a_levpoly`,
+--       nor `a_levpoly` and `a_reppoly`, etc.
 
 section "The word size story."
         {Haskell98 specifies that signed integers (type 'Int')
          must contain at least 30 bits. GHC always implements
          'Int' using the primitive type 'Int#', whose size equals
          the @MachDeps.h@ constant @WORD\_SIZE\_IN\_BITS@.
-         This is normally set based on the @config.h@ parameter
+         This is normally set based on the RTS @ghcautoconf.h@ parameter
          @SIZEOF\_HSWORD@, i.e., 32 bits on 32-bit machines, 64
          bits on 64-bit machines.
 
@@ -288,15 +296,15 @@ primop Int8MulOp "timesInt8#" GenPrimOp Int8# -> Int8# -> Int8#
 
 primop Int8QuotOp "quotInt8#" GenPrimOp Int8# -> Int8# -> Int8#
   with
-    can_fail = True
+    effect = CanFail
 
 primop Int8RemOp "remInt8#" GenPrimOp Int8# -> Int8# -> Int8#
   with
-    can_fail = True
+    effect = CanFail
 
 primop Int8QuotRemOp "quotRemInt8#" GenPrimOp Int8# -> Int8# -> (# Int8#, Int8# #)
   with
-    can_fail = True
+    effect = CanFail
 
 primop Int8SllOp "uncheckedShiftLInt8#"  GenPrimOp Int8# -> Int# -> Int8#
 primop Int8SraOp "uncheckedShiftRAInt8#" GenPrimOp Int8# -> Int# -> Int8#
@@ -334,15 +342,15 @@ primop Word8MulOp "timesWord8#" GenPrimOp Word8# -> Word8# -> Word8#
 
 primop Word8QuotOp "quotWord8#" GenPrimOp Word8# -> Word8# -> Word8#
   with
-    can_fail = True
+    effect = CanFail
 
 primop Word8RemOp "remWord8#" GenPrimOp Word8# -> Word8# -> Word8#
   with
-    can_fail = True
+    effect = CanFail
 
 primop Word8QuotRemOp "quotRemWord8#" GenPrimOp Word8# -> Word8# -> (# Word8#, Word8# #)
   with
-    can_fail = True
+    effect = CanFail
 
 primop Word8AndOp "andWord8#" GenPrimOp Word8# -> Word8# -> Word8#
    with commutable = True
@@ -392,15 +400,15 @@ primop Int16MulOp "timesInt16#" GenPrimOp Int16# -> Int16# -> Int16#
 
 primop Int16QuotOp "quotInt16#" GenPrimOp Int16# -> Int16# -> Int16#
   with
-    can_fail = True
+    effect = CanFail
 
 primop Int16RemOp "remInt16#" GenPrimOp Int16# -> Int16# -> Int16#
   with
-    can_fail = True
+    effect = CanFail
 
 primop Int16QuotRemOp "quotRemInt16#" GenPrimOp Int16# -> Int16# -> (# Int16#, Int16# #)
   with
-    can_fail = True
+    effect = CanFail
 
 primop Int16SllOp "uncheckedShiftLInt16#"  GenPrimOp Int16# -> Int# -> Int16#
 primop Int16SraOp "uncheckedShiftRAInt16#" GenPrimOp Int16# -> Int# -> Int16#
@@ -438,15 +446,15 @@ primop Word16MulOp "timesWord16#" GenPrimOp Word16# -> Word16# -> Word16#
 
 primop Word16QuotOp "quotWord16#" GenPrimOp Word16# -> Word16# -> Word16#
   with
-    can_fail = True
+    effect = CanFail
 
 primop Word16RemOp "remWord16#" GenPrimOp Word16# -> Word16# -> Word16#
   with
-    can_fail = True
+    effect = CanFail
 
 primop Word16QuotRemOp "quotRemWord16#" GenPrimOp Word16# -> Word16# -> (# Word16#, Word16# #)
   with
-    can_fail = True
+    effect = CanFail
 
 primop Word16AndOp "andWord16#" GenPrimOp Word16# -> Word16# -> Word16#
    with commutable = True
@@ -496,15 +504,15 @@ primop Int32MulOp "timesInt32#" GenPrimOp Int32# -> Int32# -> Int32#
 
 primop Int32QuotOp "quotInt32#" GenPrimOp Int32# -> Int32# -> Int32#
   with
-    can_fail = True
+    effect = CanFail
 
 primop Int32RemOp "remInt32#" GenPrimOp Int32# -> Int32# -> Int32#
   with
-    can_fail = True
+    effect = CanFail
 
 primop Int32QuotRemOp "quotRemInt32#" GenPrimOp Int32# -> Int32# -> (# Int32#, Int32# #)
   with
-    can_fail = True
+    effect = CanFail
 
 primop Int32SllOp "uncheckedShiftLInt32#"  GenPrimOp Int32# -> Int# -> Int32#
 primop Int32SraOp "uncheckedShiftRAInt32#" GenPrimOp Int32# -> Int# -> Int32#
@@ -542,15 +550,15 @@ primop Word32MulOp "timesWord32#" GenPrimOp Word32# -> Word32# -> Word32#
 
 primop Word32QuotOp "quotWord32#" GenPrimOp Word32# -> Word32# -> Word32#
   with
-    can_fail = True
+    effect = CanFail
 
 primop Word32RemOp "remWord32#" GenPrimOp Word32# -> Word32# -> Word32#
   with
-    can_fail = True
+    effect = CanFail
 
 primop Word32QuotRemOp "quotRemWord32#" GenPrimOp Word32# -> Word32# -> (# Word32#, Word32# #)
   with
-    can_fail = True
+    effect = CanFail
 
 primop Word32AndOp "andWord32#" GenPrimOp Word32# -> Word32# -> Word32#
    with commutable = True
@@ -600,11 +608,11 @@ primop Int64MulOp "timesInt64#" GenPrimOp Int64# -> Int64# -> Int64#
 
 primop Int64QuotOp "quotInt64#" GenPrimOp Int64# -> Int64# -> Int64#
   with
-    can_fail = True
+    effect = CanFail
 
 primop Int64RemOp "remInt64#" GenPrimOp Int64# -> Int64# -> Int64#
   with
-    can_fail = True
+    effect = CanFail
 
 primop Int64SllOp "uncheckedIShiftL64#"  GenPrimOp Int64# -> Int# -> Int64#
 primop Int64SraOp "uncheckedIShiftRA64#" GenPrimOp Int64# -> Int# -> Int64#
@@ -642,11 +650,11 @@ primop Word64MulOp "timesWord64#" GenPrimOp Word64# -> Word64# -> Word64#
 
 primop Word64QuotOp "quotWord64#" GenPrimOp Word64# -> Word64# -> Word64#
   with
-    can_fail = True
+    effect = CanFail
 
 primop Word64RemOp "remWord64#" GenPrimOp Word64# -> Word64# -> Word64#
   with
-    can_fail = True
+    effect = CanFail
 
 primop Word64AndOp "and64#" GenPrimOp Word64# -> Word64# -> Word64#
    with commutable = True
@@ -729,19 +737,19 @@ primop   IntQuotOp    "quotInt#"    GenPrimOp
    {Rounds towards zero. The behavior is undefined if the second argument is
     zero.
    }
-   with can_fail = True
+   with effect = CanFail
 
 primop   IntRemOp    "remInt#"    GenPrimOp
    Int# -> Int# -> Int#
    {Satisfies @('quotInt#' x y) '*#' y '+#' ('remInt#' x y) == x@. The
     behavior is undefined if the second argument is zero.
    }
-   with can_fail = True
+   with effect = CanFail
 
 primop   IntQuotRemOp "quotRemInt#"    GenPrimOp
    Int# -> Int# -> (# Int#, Int# #)
    {Rounds towards zero.}
-   with can_fail = True
+   with effect = CanFail
 
 primop   IntAndOp   "andI#"   GenPrimOp    Int# -> Int# -> Int#
    {Bitwise "and".}
@@ -878,20 +886,20 @@ primop   WordMul2Op  "timesWord2#"   GenPrimOp
    with commutable = True
 
 primop   WordQuotOp   "quotWord#"   GenPrimOp   Word# -> Word# -> Word#
-   with can_fail = True
+   with effect = CanFail
 
 primop   WordRemOp   "remWord#"   GenPrimOp   Word# -> Word# -> Word#
-   with can_fail = True
+   with effect = CanFail
 
 primop   WordQuotRemOp "quotRemWord#" GenPrimOp
    Word# -> Word# -> (# Word#, Word# #)
-   with can_fail = True
+   with effect = CanFail
 
 primop   WordQuotRem2Op "quotRemWord2#" GenPrimOp
    Word# -> Word# -> Word# -> (# Word#, Word# #)
          { Takes high word of dividend, then low word of dividend, then divisor.
            Requires that high word < divisor.}
-   with can_fail = True
+   with effect = CanFail
 
 primop   WordAndOp   "and#"   GenPrimOp   Word# -> Word# -> Word#
    with commutable = True
@@ -933,26 +941,75 @@ primop   PopCntOp   "popCnt#"   GenPrimOp   Word# -> Word#
     {Count the number of set bits in a word.}
 
 primop   Pdep8Op   "pdep8#"   GenPrimOp   Word# -> Word# -> Word#
-    {Deposit bits to lower 8 bits of a word at locations specified by a mask.}
+    {Deposit bits to lower 8 bits of a word at locations specified by a mask.
+
+    @since 0.5.2.0}
 primop   Pdep16Op   "pdep16#"   GenPrimOp   Word# -> Word# -> Word#
-    {Deposit bits to lower 16 bits of a word at locations specified by a mask.}
+    {Deposit bits to lower 16 bits of a word at locations specified by a mask.
+
+    @since 0.5.2.0}
 primop   Pdep32Op   "pdep32#"   GenPrimOp   Word# -> Word# -> Word#
-    {Deposit bits to lower 32 bits of a word at locations specified by a mask.}
+    {Deposit bits to lower 32 bits of a word at locations specified by a mask.
+
+    @since 0.5.2.0}
 primop   Pdep64Op   "pdep64#"   GenPrimOp   Word64# -> Word64# -> Word64#
-    {Deposit bits to a word at locations specified by a mask.}
+    {Deposit bits to a word at locations specified by a mask.
+
+    @since 0.5.2.0}
 primop   PdepOp   "pdep#"   GenPrimOp   Word# -> Word# -> Word#
-    {Deposit bits to a word at locations specified by a mask.}
+    {Deposit bits to a word at locations specified by a mask, aka
+    [parallel bit deposit](https://en.wikipedia.org/wiki/Bit_Manipulation_Instruction_Sets#Parallel_bit_deposit_and_extract).
+
+    Software emulation:
+
+    > pdep :: Word -> Word -> Word
+    > pdep src mask = go 0 src mask
+    >   where
+    >     go :: Word -> Word -> Word -> Word
+    >     go result _ 0 = result
+    >     go result src mask = go newResult newSrc newMask
+    >       where
+    >         maskCtz   = countTrailingZeros mask
+    >         newResult = if testBit src 0 then setBit result maskCtz else result
+    >         newSrc    = src `shiftR` 1
+    >         newMask   = clearBit mask maskCtz
+
+    @since 0.5.2.0}
 
 primop   Pext8Op   "pext8#"   GenPrimOp   Word# -> Word# -> Word#
-    {Extract bits from lower 8 bits of a word at locations specified by a mask.}
+    {Extract bits from lower 8 bits of a word at locations specified by a mask.
+
+    @since 0.5.2.0}
 primop   Pext16Op   "pext16#"   GenPrimOp   Word# -> Word# -> Word#
-    {Extract bits from lower 16 bits of a word at locations specified by a mask.}
+    {Extract bits from lower 16 bits of a word at locations specified by a mask.
+
+    @since 0.5.2.0}
 primop   Pext32Op   "pext32#"   GenPrimOp   Word# -> Word# -> Word#
-    {Extract bits from lower 32 bits of a word at locations specified by a mask.}
+    {Extract bits from lower 32 bits of a word at locations specified by a mask.
+
+    @since 0.5.2.0}
 primop   Pext64Op   "pext64#"   GenPrimOp   Word64# -> Word64# -> Word64#
-    {Extract bits from a word at locations specified by a mask.}
+    {Extract bits from a word at locations specified by a mask.
+
+    @since 0.5.2.0}
 primop   PextOp   "pext#"   GenPrimOp   Word# -> Word# -> Word#
-    {Extract bits from a word at locations specified by a mask.}
+    {Extract bits from a word at locations specified by a mask, aka
+    [parallel bit extract](https://en.wikipedia.org/wiki/Bit_Manipulation_Instruction_Sets#Parallel_bit_deposit_and_extract).
+
+    Software emulation:
+
+    > pext :: Word -> Word -> Word
+    > pext src mask = loop 0 0 0
+    >   where
+    >     loop i count result
+    >       | i >= finiteBitSize (0 :: Word)
+    >       = result
+    >       | testBit mask i
+    >       = loop (i + 1) (count + 1) (if testBit src i then setBit result count else result)
+    >       | otherwise
+    >       = loop (i + 1) count result
+
+    @since 0.5.2.0}
 
 primop   Clz8Op   "clz8#" GenPrimOp   Word# -> Word#
     {Count leading zeros in the lower 8 bits of a word.}
@@ -1052,7 +1109,7 @@ primop   DoubleMulOp   "*##"   GenPrimOp
 
 primop   DoubleDivOp   "/##"   GenPrimOp
    Double# -> Double# -> Double#
-   with can_fail = True
+   with effect = CanFail -- Can this one really fail?
         fixity = infixl 7
 
 primop   DoubleNegOp   "negateDouble#"  GenPrimOp   Double# -> Double#
@@ -1080,13 +1137,13 @@ primop   DoubleLogOp   "logDouble#"      GenPrimOp
    Double# -> Double#
    with
    code_size = { primOpCodeSizeForeignCall }
-   can_fail = True
+   effect = CanFail
 
 primop   DoubleLog1POp   "log1pDouble#"      GenPrimOp
    Double# -> Double#
    with
    code_size = { primOpCodeSizeForeignCall }
-   can_fail = True
+   effect = CanFail
 
 primop   DoubleSqrtOp   "sqrtDouble#"      GenPrimOp
    Double# -> Double#
@@ -1112,13 +1169,13 @@ primop   DoubleAsinOp   "asinDouble#"      GenPrimOp
    Double# -> Double#
    with
    code_size = { primOpCodeSizeForeignCall }
-   can_fail = True
+   effect = CanFail
 
 primop   DoubleAcosOp   "acosDouble#"      GenPrimOp
    Double# -> Double#
    with
    code_size = { primOpCodeSizeForeignCall }
-   can_fail = True
+   effect = CanFail
 
 primop   DoubleAtanOp   "atanDouble#"      GenPrimOp
    Double# -> Double#
@@ -1174,6 +1231,14 @@ primop   DoubleDecode_Int64Op   "decodeDouble_Int64#" GenPrimOp
    {Decode 'Double#' into mantissa and base-2 exponent.}
    with out_of_line = True
 
+primop CastDoubleToWord64Op "castDoubleToWord64#" GenPrimOp
+   Double# -> Word64#
+   {Bitcast a 'Double#' into a 'Word64#'}
+
+primop CastWord64ToDoubleOp "castWord64ToDouble#" GenPrimOp
+   Word64# -> Double#
+   {Bitcast a 'Word64#' into a 'Double#'}
+
 ------------------------------------------------------------------------
 section "Float#"
         {Operations on single-precision (32-bit) floating-point numbers.}
@@ -1207,7 +1272,7 @@ primop   FloatMulOp   "timesFloat#"      GenPrimOp
 
 primop   FloatDivOp   "divideFloat#"      GenPrimOp
    Float# -> Float# -> Float#
-   with can_fail = True
+   with effect = CanFail
 
 primop   FloatNegOp   "negateFloat#"      GenPrimOp    Float# -> Float#
 
@@ -1232,13 +1297,13 @@ primop   FloatLogOp   "logFloat#"      GenPrimOp
    Float# -> Float#
    with
    code_size = { primOpCodeSizeForeignCall }
-   can_fail = True
+   effect = CanFail
 
 primop   FloatLog1POp  "log1pFloat#"     GenPrimOp
    Float# -> Float#
    with
    code_size = { primOpCodeSizeForeignCall }
-   can_fail = True
+   effect = CanFail
 
 primop   FloatSqrtOp   "sqrtFloat#"      GenPrimOp
    Float# -> Float#
@@ -1264,13 +1329,13 @@ primop   FloatAsinOp   "asinFloat#"      GenPrimOp
    Float# -> Float#
    with
    code_size = { primOpCodeSizeForeignCall }
-   can_fail = True
+   effect = CanFail
 
 primop   FloatAcosOp   "acosFloat#"      GenPrimOp
    Float# -> Float#
    with
    code_size = { primOpCodeSizeForeignCall }
-   can_fail = True
+   effect = CanFail
 
 primop   FloatAtanOp   "atanFloat#"      GenPrimOp
    Float# -> Float#
@@ -1320,6 +1385,83 @@ primop   FloatDecode_IntOp   "decodeFloat_Int#" GenPrimOp
     First 'Int#' in result is the mantissa; second is the exponent.}
    with out_of_line = True
 
+primop CastFloatToWord32Op "castFloatToWord32#" GenPrimOp
+   Float# -> Word32#
+   {Bitcast a 'Float#' into a 'Word32#'}
+
+primop CastWord32ToFloatOp "castWord32ToFloat#" GenPrimOp
+   Word32# -> Float#
+   {Bitcast a 'Word32#' into a 'Float#'}
+
+------------------------------------------------------------------------
+section "Fused multiply-add operations"
+  { #fma#
+
+    The fused multiply-add primops 'fmaddFloat#' and 'fmaddDouble#'
+    implement the operation
+
+    \[
+    \lambda\ x\ y\ z \rightarrow x * y + z
+    \]
+
+    with a single floating-point rounding operation at the end, as opposed to
+    rounding twice (which can accumulate rounding errors).
+
+    These primops can be compiled directly to a single machine instruction on
+    architectures that support them. Currently, these are:
+
+      1. x86 with CPUs that support the FMA3 extended instruction set (which
+         includes most processors since 2013).
+      2. PowerPC.
+      3. AArch64.
+
+    This requires users pass the '-mfma' flag to GHC. Otherwise, the primop
+    is implemented by falling back to the C standard library, which might
+    perform software emulation (this may yield results that are not IEEE
+    compliant on some platforms).
+
+    The additional operations 'fmsubFloat#'/'fmsubDouble#',
+    'fnmaddFloat#'/'fnmaddDouble#' and 'fnmsubFloat#'/'fnmsubDouble#' provide
+    variants on 'fmaddFloat#'/'fmaddDouble#' in which some signs are changed:
+
+    \[
+    \begin{aligned}
+    \mathrm{fmadd}\ x\ y\ z &= \phantom{+} x * y + z \\[8pt]
+    \mathrm{fmsub}\ x\ y\ z &= \phantom{+} x * y - z \\[8pt]
+    \mathrm{fnmadd}\ x\ y\ z &= - x * y + z \\[8pt]
+    \mathrm{fnmsub}\ x\ y\ z &= - x * y - z
+    \end{aligned}
+    \]
+
+    }
+------------------------------------------------------------------------
+
+primop   FloatFMAdd   "fmaddFloat#" GenPrimOp
+   Float# -> Float# -> Float# -> Float#
+   {Fused multiply-add operation @x*y+z@. See "GHC.Prim#fma".}
+primop   FloatFMSub   "fmsubFloat#" GenPrimOp
+   Float# -> Float# -> Float# -> Float#
+   {Fused multiply-subtract operation @x*y-z@. See "GHC.Prim#fma".}
+primop   FloatFNMAdd   "fnmaddFloat#" GenPrimOp
+   Float# -> Float# -> Float# -> Float#
+   {Fused negate-multiply-add operation @-x*y+z@. See "GHC.Prim#fma".}
+primop   FloatFNMSub   "fnmsubFloat#" GenPrimOp
+   Float# -> Float# -> Float# -> Float#
+   {Fused negate-multiply-subtract operation @-x*y-z@. See "GHC.Prim#fma".}
+
+primop   DoubleFMAdd   "fmaddDouble#" GenPrimOp
+   Double# -> Double# -> Double# -> Double#
+   {Fused multiply-add operation @x*y+z@. See "GHC.Prim#fma".}
+primop   DoubleFMSub   "fmsubDouble#" GenPrimOp
+   Double# -> Double# -> Double# -> Double#
+   {Fused multiply-subtract operation @x*y-z@. See "GHC.Prim#fma".}
+primop   DoubleFNMAdd   "fnmaddDouble#" GenPrimOp
+   Double# -> Double# -> Double# -> Double#
+   {Fused negate-multiply-add operation @-x*y+z@. See "GHC.Prim#fma".}
+primop   DoubleFNMSub   "fnmsubDouble#" GenPrimOp
+   Double# -> Double# -> Double# -> Double#
+   {Fused negate-multiply-subtract operation @-x*y-z@. See "GHC.Prim#fma".}
+
 ------------------------------------------------------------------------
 section "Arrays"
         {Operations on 'Array#'.}
@@ -1330,39 +1472,39 @@ primtype Array# a
 primtype MutableArray# s a
 
 primop  NewArrayOp "newArray#" GenPrimOp
-   Int# -> v -> State# s -> (# State# s, MutableArray# s v #)
+   Int# -> a_levpoly -> State# s -> (# State# s, MutableArray# s a_levpoly #)
    {Create a new mutable array with the specified number of elements,
     in the specified state thread,
     with each element containing the specified initial value.}
    with
    out_of_line = True
-   has_side_effects = True
+   effect = ReadWriteEffect
 
 primop  ReadArrayOp "readArray#" GenPrimOp
-   MutableArray# s v -> Int# -> State# s -> (# State# s, v #)
+   MutableArray# s a_levpoly -> Int# -> State# s -> (# State# s, a_levpoly #)
    {Read from specified index of mutable array. Result is not yet evaluated.}
    with
-   has_side_effects = True
-   can_fail         = True
+   effect = ReadWriteEffect
+   can_fail_warning = YesWarnCanFail
 
 primop  WriteArrayOp "writeArray#" GenPrimOp
-   MutableArray# s v -> Int# -> v -> State# s -> State# s
+   MutableArray# s a_levpoly -> Int# -> a_levpoly -> State# s -> State# s
    {Write to specified index of mutable array.}
    with
-   has_side_effects = True
-   can_fail         = True
-   code_size        = 2 -- card update too
+   effect = ReadWriteEffect
+   can_fail_warning = YesWarnCanFail
+   code_size = 2 -- card update too
 
 primop  SizeofArrayOp "sizeofArray#" GenPrimOp
-   Array# v -> Int#
+   Array# a_levpoly -> Int#
    {Return the number of elements in the array.}
 
 primop  SizeofMutableArrayOp "sizeofMutableArray#" GenPrimOp
-   MutableArray# s v -> Int#
+   MutableArray# s a_levpoly -> Int#
    {Return the number of elements in the array.}
 
 primop  IndexArrayOp "indexArray#" GenPrimOp
-   Array# v -> Int# -> (# v #)
+   Array# a_levpoly -> Int# -> (# a_levpoly #)
    {Read from the specified index of an immutable array. The result is packaged
     into an unboxed unary tuple; the result itself is not yet
     evaluated. Pattern matching on the tuple forces the indexing of the
@@ -1371,23 +1513,45 @@ primop  IndexArrayOp "indexArray#" GenPrimOp
     heap. Avoiding these thunks, in turn, reduces references to the
     argument array, allowing it to be garbage collected more promptly.}
    with
-   can_fail         = True
+   effect = CanFail
+
+-- Note [primOpEffect of unsafe freezes and thaws]
+-- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+-- Mutable and immutable pointer arrays have different info table
+-- pointers; this is for the benefit of the garbage collector.
+-- Consequently, unsafe freeze/thaw operations on pointer arrays are
+-- NOT no-ops: They at least have to update the info table pointer. (For
+-- thaw, they also add the array to the mutable set.)
+--
+-- We don't want to duplicate this, so these operations are considered
+-- to have effect = ReadWriteEffect.
+--
+-- (Actually, these operations /are/ no-ops in the JS backend, where
+-- mutable and immutable arrays are the same because JS. But we don't
+-- have target-dependent primOpEffect yet.)
+--
+-- This reasoning does not apply to byte arrays, which the garbage
+-- collector can always ignore the contents of.  Their unsafe freeze
+-- and thaw operations really are no-ops; their underlying heap
+-- objects are always ARR_WORDS.
 
 primop  UnsafeFreezeArrayOp "unsafeFreezeArray#" GenPrimOp
-   MutableArray# s v -> State# s -> (# State# s, Array# v #)
+   MutableArray# s a_levpoly -> State# s -> (# State# s, Array# a_levpoly #)
    {Make a mutable array immutable, without copying.}
    with
-   has_side_effects = True
+   effect = ReadWriteEffect
+   -- see Note [primOpEffect of unsafe freezes and thaws]
 
 primop  UnsafeThawArrayOp  "unsafeThawArray#" GenPrimOp
-   Array# v -> State# s -> (# State# s, MutableArray# s v #)
+   Array# a_levpoly -> State# s -> (# State# s, MutableArray# s a_levpoly #)
    {Make an immutable array mutable, without copying.}
    with
    out_of_line = True
-   has_side_effects = True
+   effect = ReadWriteEffect
+   -- see Note [primOpEffect of unsafe freezes and thaws]
 
 primop  CopyArrayOp "copyArray#" GenPrimOp
-  Array# v -> Int# -> MutableArray# s v -> Int# -> Int# -> State# s -> State# s
+  Array# a_levpoly -> Int# -> MutableArray# s a_levpoly -> Int# -> Int# -> State# s -> State# s
   {Given a source array, an offset into the source array, a
    destination array, an offset into the destination array, and a
    number of elements to copy, copy the elements from the source array
@@ -1397,11 +1561,11 @@ primop  CopyArrayOp "copyArray#" GenPrimOp
    either.}
   with
   out_of_line      = True
-  has_side_effects = True
-  can_fail         = True
+  effect = ReadWriteEffect
+  can_fail_warning = YesWarnCanFail
 
 primop  CopyMutableArrayOp "copyMutableArray#" GenPrimOp
-  MutableArray# s v -> Int# -> MutableArray# s v -> Int# -> Int# -> State# s -> State# s
+  MutableArray# s a_levpoly -> Int# -> MutableArray# s a_levpoly -> Int# -> Int# -> State# s -> State# s
   {Given a source array, an offset into the source array, a
    destination array, an offset into the destination array, and a
    number of elements to copy, copy the elements from the source array
@@ -1411,55 +1575,55 @@ primop  CopyMutableArrayOp "copyMutableArray#" GenPrimOp
    destination regions may overlap.}
   with
   out_of_line      = True
-  has_side_effects = True
-  can_fail         = True
+  effect = ReadWriteEffect
+  can_fail_warning = YesWarnCanFail
 
 primop  CloneArrayOp "cloneArray#" GenPrimOp
-  Array# v -> Int# -> Int# -> Array# v
+  Array# a_levpoly -> Int# -> Int# -> Array# a_levpoly
   {Given a source array, an offset into the source array, and a number
    of elements to copy, create a new array with the elements from the
    source array. The provided array must fully contain the specified
    range, but this is not checked.}
   with
   out_of_line      = True
-  has_side_effects = True
-  can_fail         = True
+  effect = ReadWriteEffect -- assumed too expensive to duplicate?
+  can_fail_warning = YesWarnCanFail
 
 primop  CloneMutableArrayOp "cloneMutableArray#" GenPrimOp
-  MutableArray# s v -> Int# -> Int# -> State# s -> (# State# s, MutableArray# s v #)
+  MutableArray# s a_levpoly -> Int# -> Int# -> State# s -> (# State# s, MutableArray# s a_levpoly #)
   {Given a source array, an offset into the source array, and a number
    of elements to copy, create a new array with the elements from the
    source array. The provided array must fully contain the specified
    range, but this is not checked.}
   with
   out_of_line      = True
-  has_side_effects = True
-  can_fail         = True
+  effect = ReadWriteEffect
+  can_fail_warning = YesWarnCanFail
 
 primop  FreezeArrayOp "freezeArray#" GenPrimOp
-  MutableArray# s v -> Int# -> Int# -> State# s -> (# State# s, Array# v #)
+  MutableArray# s a_levpoly -> Int# -> Int# -> State# s -> (# State# s, Array# a_levpoly #)
   {Given a source array, an offset into the source array, and a number
    of elements to copy, create a new array with the elements from the
    source array. The provided array must fully contain the specified
    range, but this is not checked.}
   with
   out_of_line      = True
-  has_side_effects = True
-  can_fail         = True
+  effect = ReadWriteEffect
+  can_fail_warning = YesWarnCanFail
 
 primop  ThawArrayOp "thawArray#" GenPrimOp
-  Array# v -> Int# -> Int# -> State# s -> (# State# s, MutableArray# s v #)
+  Array# a_levpoly -> Int# -> Int# -> State# s -> (# State# s, MutableArray# s a_levpoly #)
   {Given a source array, an offset into the source array, and a number
    of elements to copy, create a new array with the elements from the
    source array. The provided array must fully contain the specified
    range, but this is not checked.}
   with
   out_of_line      = True
-  has_side_effects = True
-  can_fail         = True
+  effect = ReadWriteEffect
+  can_fail_warning = YesWarnCanFail
 
 primop CasArrayOp  "casArray#" GenPrimOp
-   MutableArray# s v -> Int# -> v -> v -> State# s -> (# State# s, Int#, v #)
+   MutableArray# s a_levpoly -> Int# -> a_levpoly -> a_levpoly -> State# s -> (# State# s, Int#, a_levpoly #)
    {Given an array, an offset, the expected old value, and
     the new value, perform an atomic compare and swap (i.e. write the new
     value if the current value and the old value are the same pointer).
@@ -1474,8 +1638,8 @@ primop CasArrayOp  "casArray#" GenPrimOp
    }
    with
    out_of_line = True
-   has_side_effects = True
-   can_fail = True -- Might index out of bounds
+   effect = ReadWriteEffect
+   can_fail_warning = YesWarnCanFail
 
 
 ------------------------------------------------------------------------
@@ -1506,76 +1670,92 @@ primtype SmallArray# a
 primtype SmallMutableArray# s a
 
 primop  NewSmallArrayOp "newSmallArray#" GenPrimOp
-   Int# -> v -> State# s -> (# State# s, SmallMutableArray# s v #)
+   Int# -> a_levpoly -> State# s -> (# State# s, SmallMutableArray# s a_levpoly #)
    {Create a new mutable array with the specified number of elements,
     in the specified state thread,
     with each element containing the specified initial value.}
    with
    out_of_line = True
-   has_side_effects = True
+   effect = ReadWriteEffect
 
 primop  ShrinkSmallMutableArrayOp_Char "shrinkSmallMutableArray#" GenPrimOp
-   SmallMutableArray# s v -> Int# -> State# s -> State# s
+   SmallMutableArray# s a_levpoly -> Int# -> State# s -> State# s
    {Shrink mutable array to new specified size, in
     the specified state thread. The new size argument must be less than or
-    equal to the current size as reported by 'getSizeofSmallMutableArray#'.}
+    equal to the current size as reported by 'getSizeofSmallMutableArray#'.
+
+    Assuming the non-profiling RTS, for the copying garbage collector
+    (default) this primitive compiles to an O(1) operation in C--, modifying
+    the array in-place. For the non-moving garbage collector, however, the
+    time is proportional to the number of elements shrinked out. Backends
+    bypassing C-- representation (such as JavaScript) might behave
+    differently.
+
+    @since 0.6.1}
    with out_of_line = True
-        has_side_effects = True
+        effect = ReadWriteEffect
+        can_fail_warning = YesWarnCanFail
+        -- can fail because of the "newSize <= oldSize" requirement
 
 primop  ReadSmallArrayOp "readSmallArray#" GenPrimOp
-   SmallMutableArray# s v -> Int# -> State# s -> (# State# s, v #)
+   SmallMutableArray# s a_levpoly -> Int# -> State# s -> (# State# s, a_levpoly #)
    {Read from specified index of mutable array. Result is not yet evaluated.}
    with
-   has_side_effects = True
-   can_fail         = True
+   effect = ReadWriteEffect
+   can_fail_warning = YesWarnCanFail
 
 primop  WriteSmallArrayOp "writeSmallArray#" GenPrimOp
-   SmallMutableArray# s v -> Int# -> v -> State# s -> State# s
+   SmallMutableArray# s a_levpoly -> Int# -> a_levpoly -> State# s -> State# s
    {Write to specified index of mutable array.}
    with
-   has_side_effects = True
-   can_fail         = True
+   effect = ReadWriteEffect
+   can_fail_warning = YesWarnCanFail
 
 primop  SizeofSmallArrayOp "sizeofSmallArray#" GenPrimOp
-   SmallArray# v -> Int#
+   SmallArray# a_levpoly -> Int#
    {Return the number of elements in the array.}
 
 primop  SizeofSmallMutableArrayOp "sizeofSmallMutableArray#" GenPrimOp
-   SmallMutableArray# s v -> Int#
-   {Return the number of elements in the array. Note that this is deprecated
-   as it is unsafe in the presence of shrink and resize operations on the
-   same small mutable array.}
+   SmallMutableArray# s a_levpoly -> Int#
+   {Return the number of elements in the array. __Deprecated__, it is
+   unsafe in the presence of 'shrinkSmallMutableArray#' and @resizeSmallMutableArray#@
+   operations on the same small mutable array.}
    with deprecated_msg = { Use 'getSizeofSmallMutableArray#' instead }
 
 primop  GetSizeofSmallMutableArrayOp "getSizeofSmallMutableArray#" GenPrimOp
-   SmallMutableArray# s v -> State# s -> (# State# s, Int# #)
-   {Return the number of elements in the array.}
+   SmallMutableArray# s a_levpoly -> State# s -> (# State# s, Int# #)
+   {Return the number of elements in the array, correctly accounting for
+   the effect of 'shrinkSmallMutableArray#' and @resizeSmallMutableArray#@.
+
+   @since 0.6.1}
 
 primop  IndexSmallArrayOp "indexSmallArray#" GenPrimOp
-   SmallArray# v -> Int# -> (# v #)
+   SmallArray# a_levpoly -> Int# -> (# a_levpoly #)
    {Read from specified index of immutable array. Result is packaged into
     an unboxed singleton; the result itself is not yet evaluated.}
    with
-   can_fail         = True
+   effect = CanFail
 
 primop  UnsafeFreezeSmallArrayOp "unsafeFreezeSmallArray#" GenPrimOp
-   SmallMutableArray# s v -> State# s -> (# State# s, SmallArray# v #)
+   SmallMutableArray# s a_levpoly -> State# s -> (# State# s, SmallArray# a_levpoly #)
    {Make a mutable array immutable, without copying.}
    with
-   has_side_effects = True
+   effect = ReadWriteEffect
+   -- see Note [primOpEffect of unsafe freezes and thaws]
 
 primop  UnsafeThawSmallArrayOp  "unsafeThawSmallArray#" GenPrimOp
-   SmallArray# v -> State# s -> (# State# s, SmallMutableArray# s v #)
+   SmallArray# a_levpoly -> State# s -> (# State# s, SmallMutableArray# s a_levpoly #)
    {Make an immutable array mutable, without copying.}
    with
    out_of_line = True
-   has_side_effects = True
+   effect = ReadWriteEffect
+   -- see Note [primOpEffect of unsafe freezes and thaws]
 
 -- The code_size is only correct for the case when the copy family of
 -- primops aren't inlined. It would be nice to keep track of both.
 
 primop  CopySmallArrayOp "copySmallArray#" GenPrimOp
-  SmallArray# v -> Int# -> SmallMutableArray# s v -> Int# -> Int# -> State# s -> State# s
+  SmallArray# a_levpoly -> Int# -> SmallMutableArray# s a_levpoly -> Int# -> Int# -> State# s -> State# s
   {Given a source array, an offset into the source array, a
    destination array, an offset into the destination array, and a
    number of elements to copy, copy the elements from the source array
@@ -1584,12 +1764,12 @@ primop  CopySmallArrayOp "copySmallArray#" GenPrimOp
    be the same array in different states, but this is not checked
    either.}
   with
-  out_of_line      = True
-  has_side_effects = True
-  can_fail         = True
+  out_of_line = True
+  effect = ReadWriteEffect
+  can_fail_warning = YesWarnCanFail
 
 primop  CopySmallMutableArrayOp "copySmallMutableArray#" GenPrimOp
-  SmallMutableArray# s v -> Int# -> SmallMutableArray# s v -> Int# -> Int# -> State# s -> State# s
+  SmallMutableArray# s a_levpoly -> Int# -> SmallMutableArray# s a_levpoly -> Int# -> Int# -> State# s -> State# s
   {Given a source array, an offset into the source array, a
    destination array, an offset into the destination array, and a
    number of elements to copy, copy the elements from the source array
@@ -1599,62 +1779,62 @@ primop  CopySmallMutableArrayOp "copySmallMutableArray#" GenPrimOp
    The regions are allowed to overlap, although this is only possible when the same
    array is provided as both the source and the destination. }
   with
-  out_of_line      = True
-  has_side_effects = True
-  can_fail         = True
+  out_of_line = True
+  effect = ReadWriteEffect
+  can_fail_warning = YesWarnCanFail
 
 primop  CloneSmallArrayOp "cloneSmallArray#" GenPrimOp
-  SmallArray# v -> Int# -> Int# -> SmallArray# v
+  SmallArray# a_levpoly -> Int# -> Int# -> SmallArray# a_levpoly
   {Given a source array, an offset into the source array, and a number
    of elements to copy, create a new array with the elements from the
    source array. The provided array must fully contain the specified
    range, but this is not checked.}
   with
   out_of_line      = True
-  has_side_effects = True
-  can_fail         = True
+  effect = ReadWriteEffect -- assumed too expensive to duplicate?
+  can_fail_warning = YesWarnCanFail
 
 primop  CloneSmallMutableArrayOp "cloneSmallMutableArray#" GenPrimOp
-  SmallMutableArray# s v -> Int# -> Int# -> State# s -> (# State# s, SmallMutableArray# s v #)
+  SmallMutableArray# s a_levpoly -> Int# -> Int# -> State# s -> (# State# s, SmallMutableArray# s a_levpoly #)
   {Given a source array, an offset into the source array, and a number
    of elements to copy, create a new array with the elements from the
    source array. The provided array must fully contain the specified
    range, but this is not checked.}
   with
   out_of_line      = True
-  has_side_effects = True
-  can_fail         = True
+  effect = ReadWriteEffect
+  can_fail_warning = YesWarnCanFail
 
 primop  FreezeSmallArrayOp "freezeSmallArray#" GenPrimOp
-  SmallMutableArray# s v -> Int# -> Int# -> State# s -> (# State# s, SmallArray# v #)
+  SmallMutableArray# s a_levpoly -> Int# -> Int# -> State# s -> (# State# s, SmallArray# a_levpoly #)
   {Given a source array, an offset into the source array, and a number
    of elements to copy, create a new array with the elements from the
    source array. The provided array must fully contain the specified
    range, but this is not checked.}
   with
   out_of_line      = True
-  has_side_effects = True
-  can_fail         = True
+  effect = ReadWriteEffect
+  can_fail_warning = YesWarnCanFail
 
 primop  ThawSmallArrayOp "thawSmallArray#" GenPrimOp
-  SmallArray# v -> Int# -> Int# -> State# s -> (# State# s, SmallMutableArray# s v #)
+  SmallArray# a_levpoly -> Int# -> Int# -> State# s -> (# State# s, SmallMutableArray# s a_levpoly #)
   {Given a source array, an offset into the source array, and a number
    of elements to copy, create a new array with the elements from the
    source array. The provided array must fully contain the specified
    range, but this is not checked.}
   with
   out_of_line      = True
-  has_side_effects = True
-  can_fail         = True
+  effect = ReadWriteEffect
+  can_fail_warning = YesWarnCanFail
 
 primop CasSmallArrayOp  "casSmallArray#" GenPrimOp
-   SmallMutableArray# s v -> Int# -> v -> v -> State# s -> (# State# s, Int#, v #)
+   SmallMutableArray# s a_levpoly -> Int# -> a_levpoly -> a_levpoly -> State# s -> (# State# s, Int#, a_levpoly #)
    {Unsafe, machine-level atomic compare and swap on an element within an array.
     See the documentation of 'casArray#'.}
    with
    out_of_line = True
-   has_side_effects = True
-   can_fail = True -- Might index out of bounds
+   effect = ReadWriteEffect -- Might index out of bounds
+   can_fail_warning = YesWarnCanFail
 
 ------------------------------------------------------------------------
 section "Byte Arrays"
@@ -1720,20 +1900,22 @@ primop  NewByteArrayOp_Char "newByteArray#" GenPrimOp
     the specified state thread. The size of the memory underlying the
     array will be rounded up to the platform's word size.}
    with out_of_line = True
-        has_side_effects = True
+        effect = ReadWriteEffect
 
 primop  NewPinnedByteArrayOp_Char "newPinnedByteArray#" GenPrimOp
    Int# -> State# s -> (# State# s, MutableByteArray# s #)
    {Like 'newByteArray#' but GC guarantees not to move it.}
    with out_of_line = True
-        has_side_effects = True
+        effect = ReadWriteEffect
 
 primop  NewAlignedPinnedByteArrayOp_Char "newAlignedPinnedByteArray#" GenPrimOp
    Int# -> Int# -> State# s -> (# State# s, MutableByteArray# s #)
    {Like 'newPinnedByteArray#' but allow specifying an arbitrary
     alignment, which must be a power of two.}
    with out_of_line = True
-        has_side_effects = True
+        effect = ReadWriteEffect
+        can_fail_warning = YesWarnCanFail
+        -- can fail warning for the "power of two" requirement
 
 primop  MutableByteArrayIsPinnedOp "isMutableByteArrayPinned#" GenPrimOp
    MutableByteArray# s -> Int#
@@ -1758,13 +1940,21 @@ primop  ShrinkMutableByteArrayOp_Char "shrinkMutableByteArray#" GenPrimOp
    MutableByteArray# s -> Int# -> State# s -> State# s
    {Shrink mutable byte array to new specified size (in bytes), in
     the specified state thread. The new size argument must be less than or
-    equal to the current size as reported by 'getSizeofMutableByteArray#'.}
+    equal to the current size as reported by 'getSizeofMutableByteArray#'.
+
+    Assuming the non-profiling RTS, this primitive compiles to an O(1)
+    operation in C--, modifying the array in-place. Backends bypassing C--
+    representation (such as JavaScript) might behave differently.
+
+    @since 0.4.0.0}
    with out_of_line = True
-        has_side_effects = True
+        effect = ReadWriteEffect
+        can_fail_warning = YesWarnCanFail
+        -- can fail for the "newSize <= oldSize" requirement
 
 primop  ResizeMutableByteArrayOp_Char "resizeMutableByteArray#" GenPrimOp
    MutableByteArray# s -> Int# -> State# s -> (# State# s,MutableByteArray# s #)
-   {Resize (unpinned) mutable byte array to new specified size (in bytes).
+   {Resize mutable byte array to new specified size (in bytes), shrinking or growing it.
     The returned 'MutableByteArray#' is either the original
     'MutableByteArray#' resized in-place or, if not possible, a newly
     allocated (unpinned) 'MutableByteArray#' (with the original content
@@ -1774,15 +1964,29 @@ primop  ResizeMutableByteArrayOp_Char "resizeMutableByteArray#" GenPrimOp
     not be accessed anymore after a 'resizeMutableByteArray#' has been
     performed.  Moreover, no reference to the old one should be kept in order
     to allow garbage collection of the original 'MutableByteArray#' in
-    case a new 'MutableByteArray#' had to be allocated.}
+    case a new 'MutableByteArray#' had to be allocated.
+
+    @since 0.4.0.0}
    with out_of_line = True
-        has_side_effects = True
+        effect = ReadWriteEffect
 
 primop  UnsafeFreezeByteArrayOp "unsafeFreezeByteArray#" GenPrimOp
    MutableByteArray# s -> State# s -> (# State# s, ByteArray# #)
    {Make a mutable byte array immutable, without copying.}
    with
-   has_side_effects = True
+   code_size = 0
+   effect = NoEffect
+   -- see Note [primOpEffect of unsafe freezes and thaws]
+
+primop  UnsafeThawByteArrayOp "unsafeThawByteArray#" GenPrimOp
+   ByteArray# -> State# s -> (# State# s, MutableByteArray# s #)
+   {Make an immutable byte array mutable, without copying.
+
+    @since 0.12.0.0}
+   with
+   code_size = 0
+   effect = NoEffect
+   -- see Note [primOpEffect of unsafe freezes and thaws]
 
 primop  SizeofByteArrayOp "sizeofByteArray#" GenPrimOp
    ByteArray# -> Int#
@@ -1790,16 +1994,24 @@ primop  SizeofByteArrayOp "sizeofByteArray#" GenPrimOp
 
 primop  SizeofMutableByteArrayOp "sizeofMutableByteArray#" GenPrimOp
    MutableByteArray# s -> Int#
-   {Return the size of the array in bytes. Note that this is deprecated as it is
-   unsafe in the presence of shrink and resize operations on the same mutable byte
+   {Return the size of the array in bytes. __Deprecated__, it is
+   unsafe in the presence of 'shrinkMutableByteArray#' and 'resizeMutableByteArray#'
+   operations on the same mutable byte
    array.}
    with deprecated_msg = { Use 'getSizeofMutableByteArray#' instead }
 
 primop  GetSizeofMutableByteArrayOp "getSizeofMutableByteArray#" GenPrimOp
    MutableByteArray# s -> State# s -> (# State# s, Int# #)
-   {Return the number of elements in the array.}
+   {Return the number of elements in the array, correctly accounting for
+   the effect of 'shrinkMutableByteArray#' and 'resizeMutableByteArray#'.
 
-#include "bytearray-ops.txt.pp"
+   @since 0.5.0.0}
+
+
+bytearray_access_ops
+-- This generates a whole bunch of primops;
+-- see utils/genprimopcode/AccessOps.hs
+
 
 primop  CompareByteArraysOp "compareByteArrays#" GenPrimOp
    ByteArray# -> Int# -> ByteArray# -> Int# -> Int# -> Int#
@@ -1811,34 +2023,57 @@ primop  CompareByteArraysOp "compareByteArrays#" GenPrimOp
     specified ranges, but this is not checked.  Returns an 'Int#'
     less than, equal to, or greater than zero if the range is found,
     respectively, to be byte-wise lexicographically less than, to
-    match, or be greater than the second range.}
+    match, or be greater than the second range.
+
+    @since 0.5.2.0}
    with
-   can_fail = True
+   effect = CanFail
 
 primop  CopyByteArrayOp "copyByteArray#" GenPrimOp
   ByteArray# -> Int# -> MutableByteArray# s -> Int# -> Int# -> State# s -> State# s
-  {@'copyByteArray#' src src_ofs dst dst_ofs n@ copies the range
-   starting at offset @src_ofs@ of length @n@ from the
-   'ByteArray#' @src@ to the 'MutableByteArray#' @dst@
-   starting at offset @dst_ofs@.  Both arrays must fully contain
-   the specified ranges, but this is not checked.  The two arrays must
-   not be the same array in different states, but this is not checked
-   either.}
+  { @'copyByteArray#' src src_ofs dst dst_ofs len@ copies the range
+    starting at offset @src_ofs@ of length @len@ from the
+    'ByteArray#' @src@ to the 'MutableByteArray#' @dst@
+    starting at offset @dst_ofs@.  Both arrays must fully contain
+    the specified ranges, but this is not checked.  The two arrays must
+    not be the same array in different states, but this is not checked
+    either.
+  }
   with
-  has_side_effects = True
+  effect = ReadWriteEffect
+  can_fail_warning = YesWarnCanFail
   code_size = { primOpCodeSizeForeignCall + 4}
-  can_fail = True
 
 primop  CopyMutableByteArrayOp "copyMutableByteArray#" GenPrimOp
   MutableByteArray# s -> Int# -> MutableByteArray# s -> Int# -> Int# -> State# s -> State# s
-  {Copy a range of the first MutableByteArray\# to the specified region in the second MutableByteArray\#.
-   Both arrays must fully contain the specified ranges, but this is not checked. The regions are
-   allowed to overlap, although this is only possible when the same array is provided
-   as both the source and the destination.}
+  { @'copyMutableByteArray#' src src_ofs dst dst_ofs len@ copies the
+    range starting at offset @src_ofs@ of length @len@ from the
+    'MutableByteArray#' @src@ to the 'MutableByteArray#' @dst@
+    starting at offset @dst_ofs@.  Both arrays must fully contain the
+    specified ranges, but this is not checked.  The regions are
+    allowed to overlap, although this is only possible when the same
+    array is provided as both the source and the destination.
+  }
   with
-  has_side_effects = True
+  effect = ReadWriteEffect
+  can_fail_warning = YesWarnCanFail
   code_size = { primOpCodeSizeForeignCall + 4 }
-  can_fail = True
+
+primop  CopyMutableByteArrayNonOverlappingOp "copyMutableByteArrayNonOverlapping#" GenPrimOp
+  MutableByteArray# s -> Int# -> MutableByteArray# s -> Int# -> Int# -> State# s -> State# s
+  { @'copyMutableByteArrayNonOverlapping#' src src_ofs dst dst_ofs len@
+    copies the range starting at offset @src_ofs@ of length @len@ from
+    the 'MutableByteArray#' @src@ to the 'MutableByteArray#' @dst@
+    starting at offset @dst_ofs@.  Both arrays must fully contain the
+    specified ranges, but this is not checked.  The regions are /not/
+    allowed to overlap, but this is also not checked.
+
+    @since 0.11.0
+  }
+  with
+  effect = ReadWriteEffect
+  can_fail_warning = YesWarnCanFail
+  code_size = { primOpCodeSizeForeignCall + 4 }
 
 primop  CopyByteArrayToAddrOp "copyByteArrayToAddr#" GenPrimOp
   ByteArray# -> Int# -> Addr# -> Int# -> State# s -> State# s
@@ -1848,9 +2083,9 @@ primop  CopyByteArrayToAddrOp "copyByteArrayToAddr#" GenPrimOp
    ByteArray\# (e.g. if the ByteArray\# were pinned), but this is not checked
    either.}
   with
-  has_side_effects = True
-  code_size = { primOpCodeSizeForeignCall + 4}
-  can_fail = True
+  effect = ReadWriteEffect
+  can_fail_warning = YesWarnCanFail
+  code_size = { primOpCodeSizeForeignCall + 4 }
 
 primop  CopyMutableByteArrayToAddrOp "copyMutableByteArrayToAddr#" GenPrimOp
   MutableByteArray# s -> Int# -> Addr# -> Int# -> State# s -> State# s
@@ -1860,9 +2095,9 @@ primop  CopyMutableByteArrayToAddrOp "copyMutableByteArrayToAddr#" GenPrimOp
    point into the MutableByteArray\# (e.g. if the MutableByteArray\# were
    pinned), but this is not checked either.}
   with
-  has_side_effects = True
-  code_size = { primOpCodeSizeForeignCall + 4}
-  can_fail = True
+  effect = ReadWriteEffect
+  can_fail_warning = YesWarnCanFail
+  code_size = { primOpCodeSizeForeignCall + 4 }
 
 primop  CopyAddrToByteArrayOp "copyAddrToByteArray#" GenPrimOp
   Addr# -> MutableByteArray# s -> Int# -> Int# -> State# s -> State# s
@@ -1872,18 +2107,64 @@ primop  CopyAddrToByteArrayOp "copyAddrToByteArray#" GenPrimOp
    point into the MutableByteArray\# (e.g. if the MutableByteArray\# were pinned),
    but this is not checked either.}
   with
-  has_side_effects = True
-  code_size = { primOpCodeSizeForeignCall + 4}
-  can_fail = True
+  effect = ReadWriteEffect
+  can_fail_warning = YesWarnCanFail
+  code_size = { primOpCodeSizeForeignCall + 4 }
+
+primop  CopyAddrToAddrOp "copyAddrToAddr#" GenPrimOp
+  Addr# -> Addr# -> Int# -> State# RealWorld -> State# RealWorld
+  { @'copyAddrToAddr#' src dest len@ copies @len@ bytes
+    from @src@ to @dest@.  These two memory ranges are allowed to overlap.
+
+    Analogous to the standard C function @memmove@, but with a different
+    argument order.
+
+    @since 0.11.0
+  }
+  with
+  effect = ReadWriteEffect
+  can_fail_warning = YesWarnCanFail
+  code_size = { primOpCodeSizeForeignCall }
+
+primop  CopyAddrToAddrNonOverlappingOp "copyAddrToAddrNonOverlapping#" GenPrimOp
+  Addr# -> Addr# -> Int# -> State# RealWorld -> State# RealWorld
+  { @'copyAddrToAddrNonOverlapping#' src dest len@ copies @len@ bytes
+    from @src@ to @dest@.  As the name suggests, these two memory ranges
+    /must not overlap/, although this pre-condition is not checked.
+
+    Analogous to the standard C function @memcpy@, but with a different
+    argument order.
+
+    @since 0.11.0
+  }
+  with
+  effect = ReadWriteEffect
+  can_fail_warning = YesWarnCanFail
+  code_size = { primOpCodeSizeForeignCall }
 
 primop  SetByteArrayOp "setByteArray#" GenPrimOp
   MutableByteArray# s -> Int# -> Int# -> Int# -> State# s -> State# s
   {@'setByteArray#' ba off len c@ sets the byte range @[off, off+len)@ of
    the 'MutableByteArray#' to the byte @c@.}
   with
-  has_side_effects = True
+  effect = ReadWriteEffect
+  can_fail_warning = YesWarnCanFail
   code_size = { primOpCodeSizeForeignCall + 4 }
-  can_fail = True
+
+primop  SetAddrRangeOp "setAddrRange#" GenPrimOp
+  Addr# -> Int# -> Int# -> State# RealWorld -> State# RealWorld
+  { @'setAddrRange#' dest len c@ sets all of the bytes in
+    @[dest, dest+len)@ to the value @c@.
+
+    Analogous to the standard C function @memset@, but with a different
+    argument order.
+
+    @since 0.11.0
+  }
+  with
+  effect = ReadWriteEffect
+  can_fail_warning = YesWarnCanFail
+  code_size = { primOpCodeSizeForeignCall }
 
 -- Atomic operations
 
@@ -1891,15 +2172,17 @@ primop  AtomicReadByteArrayOp_Int "atomicReadIntArray#" GenPrimOp
    MutableByteArray# s -> Int# -> State# s -> (# State# s, Int# #)
    {Given an array and an offset in machine words, read an element. The
     index is assumed to be in bounds. Implies a full memory barrier.}
-   with has_side_effects = True
-        can_fail = True
+   with
+   effect = ReadWriteEffect
+   can_fail_warning = YesWarnCanFail
 
 primop  AtomicWriteByteArrayOp_Int "atomicWriteIntArray#" GenPrimOp
    MutableByteArray# s -> Int# -> Int# -> State# s -> State# s
    {Given an array and an offset in machine words, write an element. The
     index is assumed to be in bounds. Implies a full memory barrier.}
-   with has_side_effects = True
-        can_fail = True
+   with
+   effect = ReadWriteEffect
+   can_fail_warning = YesWarnCanFail
 
 primop CasByteArrayOp_Int "casIntArray#" GenPrimOp
    MutableByteArray# s -> Int# -> Int# -> Int# -> State# s -> (# State# s, Int# #)
@@ -1908,8 +2191,9 @@ primop CasByteArrayOp_Int "casIntArray#" GenPrimOp
     value if the current value matches the provided old value. Returns
     the value of the element before the operation. Implies a full memory
     barrier.}
-   with has_side_effects = True
-        can_fail = True
+   with
+   effect = ReadWriteEffect
+   can_fail_warning = YesWarnCanFail
 
 primop CasByteArrayOp_Int8 "casInt8Array#" GenPrimOp
    MutableByteArray# s -> Int# -> Int8# -> Int8# -> State# s -> (# State# s, Int8# #)
@@ -1918,8 +2202,9 @@ primop CasByteArrayOp_Int8 "casInt8Array#" GenPrimOp
     value if the current value matches the provided old value. Returns
     the value of the element before the operation. Implies a full memory
     barrier.}
-   with has_side_effects = True
-        can_fail = True
+   with
+   effect = ReadWriteEffect
+   can_fail_warning = YesWarnCanFail
 
 primop CasByteArrayOp_Int16 "casInt16Array#" GenPrimOp
    MutableByteArray# s -> Int# -> Int16# -> Int16# -> State# s -> (# State# s, Int16# #)
@@ -1928,8 +2213,9 @@ primop CasByteArrayOp_Int16 "casInt16Array#" GenPrimOp
     value if the current value matches the provided old value. Returns
     the value of the element before the operation. Implies a full memory
     barrier.}
-   with has_side_effects = True
-        can_fail = True
+   with
+   effect = ReadWriteEffect
+   can_fail_warning = YesWarnCanFail
 
 primop CasByteArrayOp_Int32 "casInt32Array#" GenPrimOp
    MutableByteArray# s -> Int# -> Int32# -> Int32# -> State# s -> (# State# s, Int32# #)
@@ -1938,8 +2224,9 @@ primop CasByteArrayOp_Int32 "casInt32Array#" GenPrimOp
     value if the current value matches the provided old value. Returns
     the value of the element before the operation. Implies a full memory
     barrier.}
-   with has_side_effects = True
-        can_fail = True
+   with
+   effect = ReadWriteEffect
+   can_fail_warning = YesWarnCanFail
 
 primop CasByteArrayOp_Int64 "casInt64Array#" GenPrimOp
    MutableByteArray# s -> Int# -> Int64# -> Int64# -> State# s -> (# State# s, Int64# #)
@@ -1948,56 +2235,63 @@ primop CasByteArrayOp_Int64 "casInt64Array#" GenPrimOp
     value if the current value matches the provided old value. Returns
     the value of the element before the operation. Implies a full memory
     barrier.}
-   with has_side_effects = True
-        can_fail = True
+   with
+   effect = ReadWriteEffect
+   can_fail_warning = YesWarnCanFail
 
 primop FetchAddByteArrayOp_Int "fetchAddIntArray#" GenPrimOp
    MutableByteArray# s -> Int# -> Int# -> State# s -> (# State# s, Int# #)
    {Given an array, and offset in machine words, and a value to add,
     atomically add the value to the element. Returns the value of the
     element before the operation. Implies a full memory barrier.}
-   with has_side_effects = True
-        can_fail = True
+   with
+   effect = ReadWriteEffect
+   can_fail_warning = YesWarnCanFail
 
 primop FetchSubByteArrayOp_Int "fetchSubIntArray#" GenPrimOp
    MutableByteArray# s -> Int# -> Int# -> State# s -> (# State# s, Int# #)
    {Given an array, and offset in machine words, and a value to subtract,
     atomically subtract the value from the element. Returns the value of
     the element before the operation. Implies a full memory barrier.}
-   with has_side_effects = True
-        can_fail = True
+   with
+   effect = ReadWriteEffect
+   can_fail_warning = YesWarnCanFail
 
 primop FetchAndByteArrayOp_Int "fetchAndIntArray#" GenPrimOp
    MutableByteArray# s -> Int# -> Int# -> State# s -> (# State# s, Int# #)
    {Given an array, and offset in machine words, and a value to AND,
     atomically AND the value into the element. Returns the value of the
     element before the operation. Implies a full memory barrier.}
-   with has_side_effects = True
-        can_fail = True
+   with
+   effect = ReadWriteEffect
+   can_fail_warning = YesWarnCanFail
 
 primop FetchNandByteArrayOp_Int "fetchNandIntArray#" GenPrimOp
    MutableByteArray# s -> Int# -> Int# -> State# s -> (# State# s, Int# #)
    {Given an array, and offset in machine words, and a value to NAND,
     atomically NAND the value into the element. Returns the value of the
     element before the operation. Implies a full memory barrier.}
-   with has_side_effects = True
-        can_fail = True
+   with
+   effect = ReadWriteEffect
+   can_fail_warning = YesWarnCanFail
 
 primop FetchOrByteArrayOp_Int "fetchOrIntArray#" GenPrimOp
    MutableByteArray# s -> Int# -> Int# -> State# s -> (# State# s, Int# #)
    {Given an array, and offset in machine words, and a value to OR,
     atomically OR the value into the element. Returns the value of the
     element before the operation. Implies a full memory barrier.}
-   with has_side_effects = True
-        can_fail = True
+   with
+   effect = ReadWriteEffect
+   can_fail_warning = YesWarnCanFail
 
 primop FetchXorByteArrayOp_Int "fetchXorIntArray#" GenPrimOp
    MutableByteArray# s -> Int# -> Int# -> State# s -> (# State# s, Int# #)
    {Given an array, and offset in machine words, and a value to XOR,
     atomically XOR the value into the element. Returns the value of the
     element before the operation. Implies a full memory barrier.}
-   with has_side_effects = True
-        can_fail = True
+   with
+   effect = ReadWriteEffect
+   can_fail_warning = YesWarnCanFail
 
 ------------------------------------------------------------------------
 section "Addr#"
@@ -2033,247 +2327,27 @@ primop   AddrNeOp  "neAddr#"   Compare   Addr# -> Addr# -> Int#
 primop   AddrLtOp  "ltAddr#"   Compare   Addr# -> Addr# -> Int#
 primop   AddrLeOp  "leAddr#"   Compare   Addr# -> Addr# -> Int#
 
-primop IndexOffAddrOp_Char "indexCharOffAddr#" GenPrimOp
-   Addr# -> Int# -> Char#
-   {Reads 8-bit character; offset in bytes.}
-   with can_fail = True
 
-primop IndexOffAddrOp_WideChar "indexWideCharOffAddr#" GenPrimOp
-   Addr# -> Int# -> Char#
-   {Reads 31-bit character; offset in 4-byte words.}
-   with can_fail = True
+addr_access_ops
+-- This generates a whole bunch of primops;
+-- see utils/genprimopcode/AccessOps.hs
 
-primop IndexOffAddrOp_Int "indexIntOffAddr#" GenPrimOp
-   Addr# -> Int# -> Int#
-   with can_fail = True
-
-primop IndexOffAddrOp_Word "indexWordOffAddr#" GenPrimOp
-   Addr# -> Int# -> Word#
-   with can_fail = True
-
-primop IndexOffAddrOp_Addr "indexAddrOffAddr#" GenPrimOp
-   Addr# -> Int# -> Addr#
-   with can_fail = True
-
-primop IndexOffAddrOp_Float "indexFloatOffAddr#" GenPrimOp
-   Addr# -> Int# -> Float#
-   with can_fail = True
-
-primop IndexOffAddrOp_Double "indexDoubleOffAddr#" GenPrimOp
-   Addr# -> Int# -> Double#
-   with can_fail = True
-
-primop IndexOffAddrOp_StablePtr "indexStablePtrOffAddr#" GenPrimOp
-   Addr# -> Int# -> StablePtr# a
-   with can_fail = True
-
-primop IndexOffAddrOp_Int8 "indexInt8OffAddr#" GenPrimOp
-   Addr# -> Int# -> Int8#
-   with can_fail = True
-
-primop IndexOffAddrOp_Int16 "indexInt16OffAddr#" GenPrimOp
-   Addr# -> Int# -> Int16#
-   with can_fail = True
-
-primop IndexOffAddrOp_Int32 "indexInt32OffAddr#" GenPrimOp
-   Addr# -> Int# -> Int32#
-   with can_fail = True
-
-primop IndexOffAddrOp_Int64 "indexInt64OffAddr#" GenPrimOp
-   Addr# -> Int# -> Int64#
-   with can_fail = True
-
-primop IndexOffAddrOp_Word8 "indexWord8OffAddr#" GenPrimOp
-   Addr# -> Int# -> Word8#
-   with can_fail = True
-
-primop IndexOffAddrOp_Word16 "indexWord16OffAddr#" GenPrimOp
-   Addr# -> Int# -> Word16#
-   with can_fail = True
-
-primop IndexOffAddrOp_Word32 "indexWord32OffAddr#" GenPrimOp
-   Addr# -> Int# -> Word32#
-   with can_fail = True
-
-primop IndexOffAddrOp_Word64 "indexWord64OffAddr#" GenPrimOp
-   Addr# -> Int# -> Word64#
-   with can_fail = True
-
-primop ReadOffAddrOp_Char "readCharOffAddr#" GenPrimOp
-   Addr# -> Int# -> State# s -> (# State# s, Char# #)
-   {Reads 8-bit character; offset in bytes.}
-   with has_side_effects = True
-        can_fail         = True
-
-primop ReadOffAddrOp_WideChar "readWideCharOffAddr#" GenPrimOp
-   Addr# -> Int# -> State# s -> (# State# s, Char# #)
-   {Reads 31-bit character; offset in 4-byte words.}
-   with has_side_effects = True
-        can_fail         = True
-
-primop ReadOffAddrOp_Int "readIntOffAddr#" GenPrimOp
-   Addr# -> Int# -> State# s -> (# State# s, Int# #)
-   with has_side_effects = True
-        can_fail         = True
-
-primop ReadOffAddrOp_Word "readWordOffAddr#" GenPrimOp
-   Addr# -> Int# -> State# s -> (# State# s, Word# #)
-   with has_side_effects = True
-        can_fail         = True
-
-primop ReadOffAddrOp_Addr "readAddrOffAddr#" GenPrimOp
-   Addr# -> Int# -> State# s -> (# State# s, Addr# #)
-   with has_side_effects = True
-        can_fail         = True
-
-primop ReadOffAddrOp_Float "readFloatOffAddr#" GenPrimOp
-   Addr# -> Int# -> State# s -> (# State# s, Float# #)
-   with has_side_effects = True
-        can_fail         = True
-
-primop ReadOffAddrOp_Double "readDoubleOffAddr#" GenPrimOp
-   Addr# -> Int# -> State# s -> (# State# s, Double# #)
-   with has_side_effects = True
-        can_fail         = True
-
-primop ReadOffAddrOp_StablePtr "readStablePtrOffAddr#" GenPrimOp
-   Addr# -> Int# -> State# s -> (# State# s, StablePtr# a #)
-   with has_side_effects = True
-        can_fail         = True
-
-primop ReadOffAddrOp_Int8 "readInt8OffAddr#" GenPrimOp
-   Addr# -> Int# -> State# s -> (# State# s, Int8# #)
-   with has_side_effects = True
-        can_fail         = True
-
-primop ReadOffAddrOp_Int16 "readInt16OffAddr#" GenPrimOp
-   Addr# -> Int# -> State# s -> (# State# s, Int16# #)
-   with has_side_effects = True
-        can_fail         = True
-
-primop ReadOffAddrOp_Int32 "readInt32OffAddr#" GenPrimOp
-   Addr# -> Int# -> State# s -> (# State# s, Int32# #)
-   with has_side_effects = True
-        can_fail         = True
-
-primop ReadOffAddrOp_Int64 "readInt64OffAddr#" GenPrimOp
-   Addr# -> Int# -> State# s -> (# State# s, Int64# #)
-   with has_side_effects = True
-        can_fail         = True
-
-primop ReadOffAddrOp_Word8 "readWord8OffAddr#" GenPrimOp
-   Addr# -> Int# -> State# s -> (# State# s, Word8# #)
-   with has_side_effects = True
-        can_fail         = True
-
-primop ReadOffAddrOp_Word16 "readWord16OffAddr#" GenPrimOp
-   Addr# -> Int# -> State# s -> (# State# s, Word16# #)
-   with has_side_effects = True
-        can_fail         = True
-
-primop ReadOffAddrOp_Word32 "readWord32OffAddr#" GenPrimOp
-   Addr# -> Int# -> State# s -> (# State# s, Word32# #)
-   with has_side_effects = True
-        can_fail         = True
-
-primop ReadOffAddrOp_Word64 "readWord64OffAddr#" GenPrimOp
-   Addr# -> Int# -> State# s -> (# State# s, Word64# #)
-   with has_side_effects = True
-        can_fail         = True
-
-primop  WriteOffAddrOp_Char "writeCharOffAddr#" GenPrimOp
-   Addr# -> Int# -> Char# -> State# s -> State# s
-   with has_side_effects = True
-        can_fail         = True
-
-primop  WriteOffAddrOp_WideChar "writeWideCharOffAddr#" GenPrimOp
-   Addr# -> Int# -> Char# -> State# s -> State# s
-   with has_side_effects = True
-        can_fail         = True
-
-primop  WriteOffAddrOp_Int "writeIntOffAddr#" GenPrimOp
-   Addr# -> Int# -> Int# -> State# s -> State# s
-   with has_side_effects = True
-        can_fail         = True
-
-primop  WriteOffAddrOp_Word "writeWordOffAddr#" GenPrimOp
-   Addr# -> Int# -> Word# -> State# s -> State# s
-   with has_side_effects = True
-        can_fail         = True
-
-primop  WriteOffAddrOp_Addr "writeAddrOffAddr#" GenPrimOp
-   Addr# -> Int# -> Addr# -> State# s -> State# s
-   with has_side_effects = True
-        can_fail         = True
-
-primop  WriteOffAddrOp_Float "writeFloatOffAddr#" GenPrimOp
-   Addr# -> Int# -> Float# -> State# s -> State# s
-   with has_side_effects = True
-        can_fail         = True
-
-primop  WriteOffAddrOp_Double "writeDoubleOffAddr#" GenPrimOp
-   Addr# -> Int# -> Double# -> State# s -> State# s
-   with has_side_effects = True
-        can_fail         = True
-
-primop  WriteOffAddrOp_StablePtr "writeStablePtrOffAddr#" GenPrimOp
-   Addr# -> Int# -> StablePtr# a -> State# s -> State# s
-   with has_side_effects = True
-        can_fail         = True
-
-primop  WriteOffAddrOp_Int8 "writeInt8OffAddr#" GenPrimOp
-   Addr# -> Int# -> Int8# -> State# s -> State# s
-   with has_side_effects = True
-        can_fail         = True
-
-primop  WriteOffAddrOp_Int16 "writeInt16OffAddr#" GenPrimOp
-   Addr# -> Int# -> Int16# -> State# s -> State# s
-   with has_side_effects = True
-        can_fail         = True
-
-primop  WriteOffAddrOp_Int32 "writeInt32OffAddr#" GenPrimOp
-   Addr# -> Int# -> Int32# -> State# s -> State# s
-   with has_side_effects = True
-        can_fail         = True
-
-primop  WriteOffAddrOp_Int64 "writeInt64OffAddr#" GenPrimOp
-   Addr# -> Int# -> Int64# -> State# s -> State# s
-   with has_side_effects = True
-        can_fail         = True
-
-primop  WriteOffAddrOp_Word8 "writeWord8OffAddr#" GenPrimOp
-   Addr# -> Int# -> Word8# -> State# s -> State# s
-   with has_side_effects = True
-        can_fail         = True
-
-primop  WriteOffAddrOp_Word16 "writeWord16OffAddr#" GenPrimOp
-   Addr# -> Int# -> Word16# -> State# s -> State# s
-   with has_side_effects = True
-        can_fail         = True
-
-primop  WriteOffAddrOp_Word32 "writeWord32OffAddr#" GenPrimOp
-   Addr# -> Int# -> Word32# -> State# s -> State# s
-   with has_side_effects = True
-        can_fail         = True
-
-primop  WriteOffAddrOp_Word64 "writeWord64OffAddr#" GenPrimOp
-   Addr# -> Int# -> Word64# -> State# s -> State# s
-   with has_side_effects = True
-        can_fail         = True
 
 primop  InterlockedExchange_Addr "atomicExchangeAddrAddr#" GenPrimOp
    Addr# -> Addr# -> State# s -> (# State# s, Addr# #)
    {The atomic exchange operation. Atomically exchanges the value at the first address
     with the Addr# given as second argument. Implies a read barrier.}
-   with has_side_effects = True
-        can_fail         = True
+   with
+   effect = ReadWriteEffect
+   can_fail_warning = YesWarnCanFail
 
 primop  InterlockedExchange_Word "atomicExchangeWordAddr#" GenPrimOp
    Addr# -> Word# -> State# s -> (# State# s, Word# #)
    {The atomic exchange operation. Atomically exchanges the value at the address
     with the given value. Returns the old value. Implies a read barrier.}
-   with has_side_effects = True
-        can_fail         = True
+   with
+   effect = ReadWriteEffect
+   can_fail_warning = YesWarnCanFail
 
 primop  CasAddrOp_Addr "atomicCasAddrAddr#" GenPrimOp
    Addr# -> Addr# -> Addr# -> State# s -> (# State# s, Addr# #)
@@ -2286,8 +2360,9 @@ primop  CasAddrOp_Addr "atomicCasAddrAddr#" GenPrimOp
      most architectures).
 
      Implies a full memory barrier.}
-   with has_side_effects = True
-        can_fail         = True
+   with
+   effect = ReadWriteEffect
+   can_fail_warning = YesWarnCanFail
 
 primop  CasAddrOp_Word "atomicCasWordAddr#" GenPrimOp
    Addr# -> Word# -> Word# -> State# s -> (# State# s, Word# #)
@@ -2300,8 +2375,9 @@ primop  CasAddrOp_Word "atomicCasWordAddr#" GenPrimOp
      most architectures).
 
      Implies a full memory barrier.}
-   with has_side_effects = True
-        can_fail         = True
+   with
+   effect = ReadWriteEffect
+   can_fail_warning = YesWarnCanFail
 
 primop  CasAddrOp_Word8 "atomicCasWord8Addr#" GenPrimOp
    Addr# -> Word8# -> Word8# -> State# s -> (# State# s, Word8# #)
@@ -2314,8 +2390,9 @@ primop  CasAddrOp_Word8 "atomicCasWord8Addr#" GenPrimOp
      most architectures).
 
      Implies a full memory barrier.}
-   with has_side_effects = True
-        can_fail         = True
+   with
+   effect = ReadWriteEffect
+   can_fail_warning = YesWarnCanFail
 
 primop  CasAddrOp_Word16 "atomicCasWord16Addr#" GenPrimOp
    Addr# -> Word16# -> Word16# -> State# s -> (# State# s, Word16# #)
@@ -2328,8 +2405,9 @@ primop  CasAddrOp_Word16 "atomicCasWord16Addr#" GenPrimOp
      most architectures).
 
      Implies a full memory barrier.}
-   with has_side_effects = True
-        can_fail         = True
+   with
+   effect = ReadWriteEffect
+   can_fail_warning = YesWarnCanFail
 
 primop  CasAddrOp_Word32 "atomicCasWord32Addr#" GenPrimOp
    Addr# -> Word32# -> Word32# -> State# s -> (# State# s, Word32# #)
@@ -2342,8 +2420,9 @@ primop  CasAddrOp_Word32 "atomicCasWord32Addr#" GenPrimOp
      most architectures).
 
      Implies a full memory barrier.}
-   with has_side_effects = True
-        can_fail         = True
+   with
+   effect = ReadWriteEffect
+   can_fail_warning = YesWarnCanFail
 
 primop  CasAddrOp_Word64 "atomicCasWord64Addr#" GenPrimOp
    Addr# -> Word64# -> Word64# -> State# s -> (# State# s, Word64# #)
@@ -2356,68 +2435,77 @@ primop  CasAddrOp_Word64 "atomicCasWord64Addr#" GenPrimOp
      most architectures).
 
      Implies a full memory barrier.}
-   with has_side_effects = True
-        can_fail         = True
+   with
+   effect = ReadWriteEffect
+   can_fail_warning = YesWarnCanFail
 
 primop FetchAddAddrOp_Word "fetchAddWordAddr#" GenPrimOp
    Addr# -> Word# -> State# s -> (# State# s, Word# #)
    {Given an address, and a value to add,
     atomically add the value to the element. Returns the value of the
     element before the operation. Implies a full memory barrier.}
-   with has_side_effects = True
-        can_fail = True
+   with
+   effect = ReadWriteEffect
+   can_fail_warning = YesWarnCanFail
 
 primop FetchSubAddrOp_Word "fetchSubWordAddr#" GenPrimOp
    Addr# -> Word# -> State# s -> (# State# s, Word# #)
    {Given an address, and a value to subtract,
     atomically subtract the value from the element. Returns the value of
     the element before the operation. Implies a full memory barrier.}
-   with has_side_effects = True
-        can_fail = True
+   with
+   effect = ReadWriteEffect
+   can_fail_warning = YesWarnCanFail
 
 primop FetchAndAddrOp_Word "fetchAndWordAddr#" GenPrimOp
    Addr# -> Word# -> State# s -> (# State# s, Word# #)
    {Given an address, and a value to AND,
     atomically AND the value into the element. Returns the value of the
     element before the operation. Implies a full memory barrier.}
-   with has_side_effects = True
-        can_fail = True
+   with
+   effect = ReadWriteEffect
+   can_fail_warning = YesWarnCanFail
 
 primop FetchNandAddrOp_Word "fetchNandWordAddr#" GenPrimOp
    Addr# -> Word# -> State# s -> (# State# s, Word# #)
    {Given an address, and a value to NAND,
     atomically NAND the value into the element. Returns the value of the
     element before the operation. Implies a full memory barrier.}
-   with has_side_effects = True
-        can_fail = True
+   with
+   effect = ReadWriteEffect
+   can_fail_warning = YesWarnCanFail
 
 primop FetchOrAddrOp_Word "fetchOrWordAddr#" GenPrimOp
    Addr# -> Word# -> State# s -> (# State# s, Word# #)
    {Given an address, and a value to OR,
     atomically OR the value into the element. Returns the value of the
     element before the operation. Implies a full memory barrier.}
-   with has_side_effects = True
-        can_fail = True
+   with
+   effect = ReadWriteEffect
+   can_fail_warning = YesWarnCanFail
 
 primop FetchXorAddrOp_Word "fetchXorWordAddr#" GenPrimOp
    Addr# -> Word# -> State# s -> (# State# s, Word# #)
    {Given an address, and a value to XOR,
     atomically XOR the value into the element. Returns the value of the
     element before the operation. Implies a full memory barrier.}
-   with has_side_effects = True
-        can_fail = True
+   with
+   effect = ReadWriteEffect
+   can_fail_warning = YesWarnCanFail
 
 primop  AtomicReadAddrOp_Word "atomicReadWordAddr#" GenPrimOp
    Addr# -> State# s -> (# State# s, Word# #)
    {Given an address, read a machine word.  Implies a full memory barrier.}
-   with has_side_effects = True
-        can_fail = True
+   with
+   effect = ReadWriteEffect
+   can_fail_warning = YesWarnCanFail
 
 primop  AtomicWriteAddrOp_Word "atomicWriteWordAddr#" GenPrimOp
    Addr# -> Word# -> State# s -> State# s
    {Given an address, write a machine word. Implies a full memory barrier.}
-   with has_side_effects = True
-        can_fail = True
+   with
+   effect = ReadWriteEffect
+   can_fail_warning = YesWarnCanFail
 
 
 ------------------------------------------------------------------------
@@ -2429,40 +2517,46 @@ primtype MutVar# s a
         {A 'MutVar#' behaves like a single-element mutable array.}
 
 primop  NewMutVarOp "newMutVar#" GenPrimOp
-   v -> State# s -> (# State# s, MutVar# s v #)
+   a_levpoly -> State# s -> (# State# s, MutVar# s a_levpoly #)
    {Create 'MutVar#' with specified initial value in specified state thread.}
    with
    out_of_line = True
-   has_side_effects = True
+   effect = ReadWriteEffect
 
 -- Note [Why MutVar# ops can't fail]
 -- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 --
--- We don't label readMutVar# or writeMutVar# as can_fail.
+-- We don't label readMutVar# or writeMutVar# as CanFail.
 -- This may seem a bit peculiar, because they surely *could*
 -- fail spectacularly if passed a pointer to unallocated memory.
 -- But MutVar#s are always correct by construction; we never
 -- test if a pointer is valid before using it with these operations.
 -- So we never have to worry about floating the pointer reference
--- outside a validity test. At the moment, has_side_effects blocks
+-- outside a validity test. At the moment, ReadWriteEffect blocks
 -- up the relevant optimizations anyway, but we hope to draw finer
 -- distinctions soon, which should improve matters for readMutVar#
 -- at least.
 
 primop  ReadMutVarOp "readMutVar#" GenPrimOp
-   MutVar# s v -> State# s -> (# State# s, v #)
+   MutVar# s a_levpoly -> State# s -> (# State# s, a_levpoly #)
    {Read contents of 'MutVar#'. Result is not yet evaluated.}
    with
    -- See Note [Why MutVar# ops can't fail]
-   has_side_effects = True
+   effect = ReadWriteEffect
 
 primop  WriteMutVarOp "writeMutVar#"  GenPrimOp
-   MutVar# s v -> v -> State# s -> State# s
+   MutVar# s a_levpoly -> a_levpoly -> State# s -> State# s
    {Write contents of 'MutVar#'.}
    with
    -- See Note [Why MutVar# ops can't fail]
-   has_side_effects = True
+   effect = ReadWriteEffect
    code_size = { primOpCodeSizeForeignCall } -- for the write barrier
+
+primop  AtomicSwapMutVarOp "atomicSwapMutVar#" GenPrimOp
+   MutVar# s a_levpoly -> a_levpoly -> State# s -> (# State# s, a_levpoly #)
+   {Atomically exchange the value of a 'MutVar#'.}
+   with
+   effect = ReadWriteEffect
 
 -- Note [Why not an unboxed tuple in atomicModifyMutVar2#?]
 -- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -2479,15 +2573,27 @@ primop  WriteMutVarOp "writeMutVar#"  GenPrimOp
 primop  AtomicModifyMutVar2Op "atomicModifyMutVar2#" GenPrimOp
    MutVar# s a -> (a -> c) -> State# s -> (# State# s, a, c #)
    { Modify the contents of a 'MutVar#', returning the previous
-     contents and the result of applying the given function to the
-     previous contents. Note that this isn't strictly
-     speaking the correct type for this function; it should really be
-     @'MutVar#' s a -> (a -> (a,b)) -> 'State#' s -> (# 'State#' s, a, (a, b) #)@,
-     but we don't know about pairs here. }
+     contents @x :: a@ and the result of applying the given function to the
+     previous contents @f x :: c@.
+
+     The @data@ type @c@ (not a @newtype@!) must be a record whose first field
+     is of lifted type @a :: Type@ and is not unpacked. For example, product
+     types @c ~ Solo a@ or @c ~ (a, b)@ work well. If the record type is both
+     monomorphic and strict in its first field, it's recommended to mark the
+     latter @{-# NOUNPACK #-}@ explicitly.
+
+     Under the hood 'atomicModifyMutVar2#' atomically replaces a pointer to an
+     old @x :: a@ with a pointer to a selector thunk @fst r@, where
+     @fst@ is a selector for the first field of the record and @r@ is a
+     function application thunk @r = f x@.
+
+     @atomicModifyIORef2Native@ from @atomic-modify-general@ package makes an
+     effort to reflect restrictions on @c@ faithfully, providing a
+     well-typed high-level wrapper.}
    with
    out_of_line = True
-   has_side_effects = True
-   can_fail         = True
+   effect = ReadWriteEffect
+   strictness  = { \ _arity -> mkClosedDmdSig [ topDmd, lazyApply1Dmd, topDmd ] topDiv }
 
 primop  AtomicModifyMutVar_Op "atomicModifyMutVar_#" GenPrimOp
    MutVar# s a -> (a -> a) -> State# s -> (# State# s, a, a #)
@@ -2496,11 +2602,11 @@ primop  AtomicModifyMutVar_Op "atomicModifyMutVar_#" GenPrimOp
      previous contents. }
    with
    out_of_line = True
-   has_side_effects = True
-   can_fail         = True
+   effect = ReadWriteEffect
+   strictness  = { \ _arity -> mkClosedDmdSig [ topDmd, lazyApply1Dmd, topDmd ] topDiv }
 
 primop  CasMutVarOp "casMutVar#" GenPrimOp
-  MutVar# s v -> v -> v -> State# s -> (# State# s, Int#, v #)
+  MutVar# s a_levpoly -> a_levpoly -> a_levpoly -> State# s -> (# State# s, Int#, a_levpoly #)
    { Compare-and-swap: perform a pointer equality test between
      the first value passed to this function and the value
      stored inside the 'MutVar#'. If the pointers are equal,
@@ -2518,30 +2624,57 @@ primop  CasMutVarOp "casMutVar#" GenPrimOp
    }
    with
    out_of_line = True
-   has_side_effects = True
+   effect = ReadWriteEffect
 
 ------------------------------------------------------------------------
 section "Exceptions"
 ------------------------------------------------------------------------
 
--- Note [Strictness for mask/unmask/catch]
--- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+-- Note [Strict IO wrappers]
+-- ~~~~~~~~~~~~~~~~~~~~~~~~~
 -- Consider this example, which comes from GHC.IO.Handle.Internals:
---    wantReadableHandle3 f ma b st
+--    wantReadableHandle3 f mv b st
 --      = case ... of
---          DEFAULT -> case ma of MVar a -> ...
---          0#      -> maskAsyncExceptions# (\st -> case ma of MVar a -> ...)
+--          DEFAULT -> case mv of MVar a -> ...
+--          0#      -> maskAsyncExceptions# (\st -> case mv of MVar a -> ...)
 -- The outer case just decides whether to mask exceptions, but we don't want
--- thereby to hide the strictness in 'ma'!  Hence the use of strictOnceApply1Dmd
--- in mask and unmask. But catch really is lazy in its first argument, see
--- #11555. So for IO actions 'ma' we often use a wrapper around it that is
--- head-strict in 'ma': GHC.IO.catchException.
+-- thereby to hide the strictness in `mv`!  Hence the use of strictOnceApply1Dmd
+-- in mask#, unmask# and atomically# (where we use strictManyApply1Dmd to respect
+-- that it potentially calls its action multiple times).
+--
+-- Note [Strictness for catch-style primops]
+-- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+-- The catch#-style primops always call their action, just like outlined
+-- in Note [Strict IO wrappers].
+-- However, it is important that we give their first arg lazyApply1Dmd and not
+-- strictOnceApply1Dmd, like for mask#. Here is why. Consider a call
+--
+--   catch# act handler s
+--
+-- If `act = raiseIO# ...`, using strictOnceApply1Dmd for `act` would mean that
+-- the call forwards the dead-end flag from `act` (see Note [Dead ends] and
+-- Note [Precise exceptions and strictness analysis]).
+-- This would cause dead code elimination to discard the continuation of the
+-- catch# call, among other things. This first came up in #11555.
+--
+-- Hence catch# uses lazyApply1Dmd in order /not/ to forward the dead-end flag
+-- from `act`. (This is a bit brutal, but the language of strictness types is
+-- not expressive enough to give it a more precise semantics that is still
+-- sound.)
+-- For perf reasons we often (but not always) choose to use a wrapper around
+-- catch# that is head-strict in `act`: GHC.IO.catchException.
+--
+-- A similar caveat applies to prompt#, which can be seen as a
+-- generalisation of catch# as explained in GHC.Prim#continuations#.
+-- The reason is that even if `act` appears dead-ending (e.g., looping)
+-- `prompt# tag ma s` might return alright due to a (higher-order) use of
+-- `control0#` in `act`. This came up in #25439.
 
 primop  CatchOp "catch#" GenPrimOp
-          (State# RealWorld -> (# State# RealWorld, o #) )
-       -> (w -> State# RealWorld -> (# State# RealWorld, o #) )
+          (State# RealWorld -> (# State# RealWorld, a_reppoly #) )
+       -> (b_levpoly -> State# RealWorld -> (# State# RealWorld, a_reppoly #) )
        -> State# RealWorld
-       -> (# State# RealWorld, o #)
+       -> (# State# RealWorld, a_reppoly #)
    { @'catch#' k handler s@ evaluates @k s@, invoking @handler@ on any exceptions
      thrown.
 
@@ -2552,63 +2685,64 @@ primop  CatchOp "catch#" GenPrimOp
    strictness  = { \ _arity -> mkClosedDmdSig [ lazyApply1Dmd
                                                  , lazyApply2Dmd
                                                  , topDmd] topDiv }
-                 -- See Note [Strictness for mask/unmask/catch]
+                 -- See Note [Strictness for catch-style primops]
    out_of_line = True
-   has_side_effects = True
+   effect = ReadWriteEffect
+   -- Either inner computation might potentially raise an unchecked exception,
+   -- but it doesn't seem worth putting a WARNING in the haddocks over
 
 primop  RaiseOp "raise#" GenPrimOp
-   v -> p
-      -- NB: "v" is the same as "a" except levity-polymorphic,
-      -- and "p" is the same as "b" except representation-polymorphic
-      -- See Note [Levity and representation polymorphic primops]
+   a_levpoly -> b_reppoly
    with
    -- In contrast to 'raiseIO#', which throws a *precise* exception,
    -- exceptions thrown by 'raise#' are considered *imprecise*.
    -- See Note [Precise vs imprecise exceptions] in GHC.Types.Demand.
    -- Hence, it has 'botDiv', not 'exnDiv'.
-   -- For the same reasons, 'raise#' is marked as "can_fail" (which 'raiseIO#'
-   -- is not), but not as "has_side_effects" (which 'raiseIO#' is).
-   -- See Note [PrimOp can_fail and has_side_effects] in "GHC.Builtin.PrimOps".
    strictness  = { \ _arity -> mkClosedDmdSig [topDmd] botDiv }
    out_of_line = True
-   can_fail = True
+   effect = ThrowsException
+   work_free = True
 
 primop  RaiseUnderflowOp "raiseUnderflow#" GenPrimOp
-   (# #) -> p
+   (# #) -> b_reppoly
    with
    strictness  = { \ _arity -> mkClosedDmdSig [topDmd] botDiv }
    out_of_line = True
-   can_fail = True
+   effect = ThrowsException
    code_size = { primOpCodeSizeForeignCall }
+   work_free = True
 
 primop  RaiseOverflowOp "raiseOverflow#" GenPrimOp
-   (# #) -> p
+   (# #) -> b_reppoly
    with
    strictness  = { \ _arity -> mkClosedDmdSig [topDmd] botDiv }
    out_of_line = True
-   can_fail = True
+   effect = ThrowsException
    code_size = { primOpCodeSizeForeignCall }
+   work_free = True
 
 primop  RaiseDivZeroOp "raiseDivZero#" GenPrimOp
-   (# #) -> p
+   (# #) -> b_reppoly
    with
    strictness  = { \ _arity -> mkClosedDmdSig [topDmd] botDiv }
    out_of_line = True
-   can_fail = True
+   effect = ThrowsException
    code_size = { primOpCodeSizeForeignCall }
+   work_free = True
 
 primop  RaiseIOOp "raiseIO#" GenPrimOp
-   v -> State# RealWorld -> (# State# RealWorld, p #)
+   a_levpoly -> State# RealWorld -> (# State# RealWorld, b_reppoly #)
    with
    -- See Note [Precise exceptions and strictness analysis] in "GHC.Types.Demand"
    -- for why this is the *only* primop that has 'exnDiv'
    strictness  = { \ _arity -> mkClosedDmdSig [topDmd, topDmd] exnDiv }
    out_of_line = True
-   has_side_effects = True
+   effect = ThrowsException
+   work_free = True
 
 primop  MaskAsyncExceptionsOp "maskAsyncExceptions#" GenPrimOp
-        (State# RealWorld -> (# State# RealWorld, o #))
-     -> (State# RealWorld -> (# State# RealWorld, o #))
+        (State# RealWorld -> (# State# RealWorld, a_reppoly #))
+     -> (State# RealWorld -> (# State# RealWorld, a_reppoly #))
    { @'maskAsyncExceptions#' k s@ evaluates @k s@ such that asynchronous
      exceptions are deferred until after evaluation has finished.
 
@@ -2617,13 +2751,13 @@ primop  MaskAsyncExceptionsOp "maskAsyncExceptions#" GenPrimOp
      in continuation-style primops\" for details. }
    with
    strictness  = { \ _arity -> mkClosedDmdSig [strictOnceApply1Dmd,topDmd] topDiv }
-                 -- See Note [Strictness for mask/unmask/catch]
+                 -- See Note [Strict IO wrappers]
    out_of_line = True
-   has_side_effects = True
+   effect = ReadWriteEffect
 
 primop  MaskUninterruptibleOp "maskUninterruptible#" GenPrimOp
-        (State# RealWorld -> (# State# RealWorld, o #))
-     -> (State# RealWorld -> (# State# RealWorld, o #))
+        (State# RealWorld -> (# State# RealWorld, a_reppoly #))
+     -> (State# RealWorld -> (# State# RealWorld, a_reppoly #))
    { @'maskUninterruptible#' k s@ evaluates @k s@ such that asynchronous
      exceptions are deferred until after evaluation has finished.
 
@@ -2632,12 +2766,13 @@ primop  MaskUninterruptibleOp "maskUninterruptible#" GenPrimOp
      in continuation-style primops\" for details. }
    with
    strictness  = { \ _arity -> mkClosedDmdSig [strictOnceApply1Dmd,topDmd] topDiv }
+                 -- See Note [Strict IO wrappers]
    out_of_line = True
-   has_side_effects = True
+   effect = ReadWriteEffect
 
 primop  UnmaskAsyncExceptionsOp "unmaskAsyncExceptions#" GenPrimOp
-        (State# RealWorld -> (# State# RealWorld, o #))
-     -> (State# RealWorld -> (# State# RealWorld, o #))
+        (State# RealWorld -> (# State# RealWorld, a_reppoly #))
+     -> (State# RealWorld -> (# State# RealWorld, a_reppoly #))
    { @'unmaskAsyncUninterruptible#' k s@ evaluates @k s@ such that asynchronous
      exceptions are unmasked.
 
@@ -2646,15 +2781,15 @@ primop  UnmaskAsyncExceptionsOp "unmaskAsyncExceptions#" GenPrimOp
      in continuation-style primops\" for details. }
    with
    strictness  = { \ _arity -> mkClosedDmdSig [strictOnceApply1Dmd,topDmd] topDiv }
-                 -- See Note [Strictness for mask/unmask/catch]
+                 -- See Note [Strict IO wrappers]
    out_of_line = True
-   has_side_effects = True
+   effect = ReadWriteEffect
 
 primop  MaskStatus "getMaskingState#" GenPrimOp
         State# RealWorld -> (# State# RealWorld, Int# #)
    with
    out_of_line = True
-   has_side_effects = True
+   effect = ReadWriteEffect
 
 ------------------------------------------------------------------------
 section "Continuations"
@@ -2791,9 +2926,9 @@ section "Continuations"
     'control0#' will fail by raising an exception. However, such violations
     are only detected on a best-effort basis, as the bookkeeping necessary for
     detecting /all/ illegal uses of 'control0#' would have significant overhead.
-    Therefore, although the operations are “safe” from the runtime’s point of
+    Therefore, although the operations are "safe" from the runtime's point of
     view (e.g. they will not compromise memory safety or clobber internal runtime
-    state), it is still ultimately the programmer’s responsibility to ensure
+    state), it is still ultimately the programmer's responsibility to ensure
     these invariants hold to guarantee predictable program behavior.
 
     In a similar vein, since each captured continuation includes the full local
@@ -2805,13 +2940,13 @@ section "Continuations"
     finish reading it when it is resumed; further attempts to resume from the
     same place would then fail because the file handle was already closed.
 
-    In other words, although the RTS ensures that a computation’s control state
+    In other words, although the RTS ensures that a computation's control state
     and local variables are properly restored for each distinct resumption of
     a continuation, it makes no attempt to duplicate any local state the
     computation may have been using (and could not possibly do so in general).
     Furthermore, it provides no mechanism for an arbitrary computation to
     protect itself against unwanted reentrancy (i.e. there is no analogue to
-    Scheme’s @dynamic-wind@). For those reasons, manipulating the continuation
+    Scheme's @dynamic-wind@). For those reasons, manipulating the continuation
     is only safe if the caller can be certain that doing so will not violate any
     expectations or invariants of the enclosing computation. }
 ------------------------------------------------------------------------
@@ -2824,7 +2959,7 @@ primop  NewPromptTagOp "newPromptTag#" GenPrimOp
    { See "GHC.Prim#continuations". }
    with
    out_of_line = True
-   has_side_effects = True
+   effect = ReadWriteEffect
 
 primop  PromptOp "prompt#" GenPrimOp
         PromptTag# a
@@ -2832,21 +2967,23 @@ primop  PromptOp "prompt#" GenPrimOp
      -> State# RealWorld -> (# State# RealWorld, a #)
    { See "GHC.Prim#continuations". }
    with
-   strictness = { \ _arity -> mkClosedDmdSig [topDmd, strictOnceApply1Dmd, topDmd] topDiv }
+   strictness = { \ _arity -> mkClosedDmdSig [topDmd, lazyApply1Dmd, topDmd] topDiv }
+                 -- See Note [Strictness for catch-style primops]
    out_of_line = True
-   has_side_effects = True
+   effect = ReadWriteEffect
 
 primop  Control0Op "control0#" GenPrimOp
         PromptTag# a
-     -> (((State# RealWorld -> (# State# RealWorld, p #))
+     -> (((State# RealWorld -> (# State# RealWorld, b_reppoly #))
           -> State# RealWorld -> (# State# RealWorld, a #))
          -> State# RealWorld -> (# State# RealWorld, a #))
-     -> State# RealWorld -> (# State# RealWorld, p #)
+     -> State# RealWorld -> (# State# RealWorld, b_reppoly #)
    { See "GHC.Prim#continuations". }
    with
    strictness = { \ _arity -> mkClosedDmdSig [topDmd, lazyApply2Dmd, topDmd] topDiv }
    out_of_line = True
-   has_side_effects = True
+   effect = ReadWriteEffect
+   can_fail_warning = YesWarnCanFail
 
 ------------------------------------------------------------------------
 section "STM-accessible Mutable Variables"
@@ -2855,13 +2992,13 @@ section "STM-accessible Mutable Variables"
 primtype TVar# s a
 
 primop  AtomicallyOp "atomically#" GenPrimOp
-      (State# RealWorld -> (# State# RealWorld, v #) )
-   -> State# RealWorld -> (# State# RealWorld, v #)
+      (State# RealWorld -> (# State# RealWorld, a_levpoly #) )
+   -> State# RealWorld -> (# State# RealWorld, a_levpoly #)
    with
    strictness  = { \ _arity -> mkClosedDmdSig [strictManyApply1Dmd,topDmd] topDiv }
-                 -- See Note [Strictness for mask/unmask/catch]
+                 -- See Note [Strict IO wrappers]
    out_of_line = True
-   has_side_effects = True
+   effect = ReadWriteEffect
 
 -- NB: retry#'s strictness information specifies it to diverge.
 -- This lets the compiler perform some extra simplifications, since retry#
@@ -2874,71 +3011,71 @@ primop  AtomicallyOp "atomically#" GenPrimOp
 --   retry# s1
 -- where 'e' would be unreachable anyway.  See #8091.
 primop  RetryOp "retry#" GenPrimOp
-   State# RealWorld -> (# State# RealWorld, v #)
+   State# RealWorld -> (# State# RealWorld, a_levpoly #)
    with
    strictness  = { \ _arity -> mkClosedDmdSig [topDmd] botDiv }
    out_of_line = True
-   has_side_effects = True
+   effect = ReadWriteEffect
 
 primop  CatchRetryOp "catchRetry#" GenPrimOp
-      (State# RealWorld -> (# State# RealWorld, v #) )
-   -> (State# RealWorld -> (# State# RealWorld, v #) )
-   -> (State# RealWorld -> (# State# RealWorld, v #) )
+      (State# RealWorld -> (# State# RealWorld, a_levpoly #) )
+   -> (State# RealWorld -> (# State# RealWorld, a_levpoly #) )
+   -> (State# RealWorld -> (# State# RealWorld, a_levpoly #) )
    with
    strictness  = { \ _arity -> mkClosedDmdSig [ lazyApply1Dmd
                                                  , lazyApply1Dmd
                                                  , topDmd ] topDiv }
-                 -- See Note [Strictness for mask/unmask/catch]
+                 -- See Note [Strictness for catch-style primops]
    out_of_line = True
-   has_side_effects = True
+   effect = ReadWriteEffect
 
 primop  CatchSTMOp "catchSTM#" GenPrimOp
-      (State# RealWorld -> (# State# RealWorld, v #) )
-   -> (b -> State# RealWorld -> (# State# RealWorld, v #) )
-   -> (State# RealWorld -> (# State# RealWorld, v #) )
+      (State# RealWorld -> (# State# RealWorld, a_levpoly #) )
+   -> (b -> State# RealWorld -> (# State# RealWorld, a_levpoly #) )
+   -> (State# RealWorld -> (# State# RealWorld, a_levpoly #) )
    with
    strictness  = { \ _arity -> mkClosedDmdSig [ lazyApply1Dmd
                                                  , lazyApply2Dmd
                                                  , topDmd ] topDiv }
-                 -- See Note [Strictness for mask/unmask/catch]
+                 -- See Note [Strictness for catch-style primops]
    out_of_line = True
-   has_side_effects = True
+   effect = ReadWriteEffect
 
 primop  NewTVarOp "newTVar#" GenPrimOp
-       v
-    -> State# s -> (# State# s, TVar# s v #)
+       a_levpoly
+    -> State# s -> (# State# s, TVar# s a_levpoly #)
    {Create a new 'TVar#' holding a specified initial value.}
    with
    out_of_line  = True
-   has_side_effects = True
+   effect = ReadWriteEffect
 
 primop  ReadTVarOp "readTVar#" GenPrimOp
-       TVar# s v
-    -> State# s -> (# State# s, v #)
+       TVar# s a_levpoly
+    -> State# s -> (# State# s, a_levpoly #)
    {Read contents of 'TVar#' inside an STM transaction,
     i.e. within a call to 'atomically#'.
     Does not force evaluation of the result.}
    with
    out_of_line  = True
-   has_side_effects = True
+   effect = ReadWriteEffect
 
 primop ReadTVarIOOp "readTVarIO#" GenPrimOp
-       TVar# s v
-    -> State# s -> (# State# s, v #)
+       TVar# s a_levpoly
+    -> State# s -> (# State# s, a_levpoly #)
    {Read contents of 'TVar#' outside an STM transaction.
    Does not force evaluation of the result.}
    with
    out_of_line      = True
-   has_side_effects = True
+   effect = ReadWriteEffect
 
 primop  WriteTVarOp "writeTVar#" GenPrimOp
-       TVar# s v
-    -> v
+       TVar# s a_levpoly
+    -> a_levpoly
     -> State# s -> State# s
    {Write contents of 'TVar#'.}
    with
    out_of_line      = True
-   has_side_effects = True
+   effect = ReadWriteEffect
 
 
 ------------------------------------------------------------------------
@@ -2952,67 +3089,67 @@ primtype MVar# s a
         represented by @('MutVar#' (Maybe a))@.) }
 
 primop  NewMVarOp "newMVar#"  GenPrimOp
-   State# s -> (# State# s, MVar# s v #)
+   State# s -> (# State# s, MVar# s a_levpoly #)
    {Create new 'MVar#'; initially empty.}
    with
    out_of_line = True
-   has_side_effects = True
+   effect = ReadWriteEffect
 
 primop  TakeMVarOp "takeMVar#" GenPrimOp
-   MVar# s v -> State# s -> (# State# s, v #)
+   MVar# s a_levpoly -> State# s -> (# State# s, a_levpoly #)
    {If 'MVar#' is empty, block until it becomes full.
    Then remove and return its contents, and set it empty.}
    with
    out_of_line      = True
-   has_side_effects = True
+   effect = ReadWriteEffect
 
 primop  TryTakeMVarOp "tryTakeMVar#" GenPrimOp
-   MVar# s v -> State# s -> (# State# s, Int#, v #)
+   MVar# s a_levpoly -> State# s -> (# State# s, Int#, a_levpoly #)
    {If 'MVar#' is empty, immediately return with integer 0 and value undefined.
    Otherwise, return with integer 1 and contents of 'MVar#', and set 'MVar#' empty.}
    with
    out_of_line      = True
-   has_side_effects = True
+   effect = ReadWriteEffect
 
 primop  PutMVarOp "putMVar#" GenPrimOp
-   MVar# s v -> v -> State# s -> State# s
+   MVar# s a_levpoly -> a_levpoly -> State# s -> State# s
    {If 'MVar#' is full, block until it becomes empty.
    Then store value arg as its new contents.}
    with
    out_of_line      = True
-   has_side_effects = True
+   effect = ReadWriteEffect
 
 primop  TryPutMVarOp "tryPutMVar#" GenPrimOp
-   MVar# s v -> v -> State# s -> (# State# s, Int# #)
+   MVar# s a_levpoly -> a_levpoly -> State# s -> (# State# s, Int# #)
    {If 'MVar#' is full, immediately return with integer 0.
     Otherwise, store value arg as 'MVar#''s new contents, and return with integer 1.}
    with
    out_of_line      = True
-   has_side_effects = True
+   effect = ReadWriteEffect
 
 primop  ReadMVarOp "readMVar#" GenPrimOp
-   MVar# s v -> State# s -> (# State# s, v #)
+   MVar# s a_levpoly -> State# s -> (# State# s, a_levpoly #)
    {If 'MVar#' is empty, block until it becomes full.
    Then read its contents without modifying the MVar, without possibility
    of intervention from other threads.}
    with
    out_of_line      = True
-   has_side_effects = True
+   effect = ReadWriteEffect
 
 primop  TryReadMVarOp "tryReadMVar#" GenPrimOp
-   MVar# s v -> State# s -> (# State# s, Int#, v #)
+   MVar# s a_levpoly -> State# s -> (# State# s, Int#, a_levpoly #)
    {If 'MVar#' is empty, immediately return with integer 0 and value undefined.
    Otherwise, return with integer 1 and contents of 'MVar#'.}
    with
    out_of_line      = True
-   has_side_effects = True
+   effect = ReadWriteEffect
 
 primop  IsEmptyMVarOp "isEmptyMVar#" GenPrimOp
-   MVar# s v -> State# s -> (# State# s, Int# #)
+   MVar# s a_levpoly -> State# s -> (# State# s, Int# #)
    {Return 1 if 'MVar#' is empty; 0 otherwise.}
    with
    out_of_line = True
-   has_side_effects = True
+   effect = ReadWriteEffect
 
 
 ------------------------------------------------------------------------
@@ -3026,31 +3163,31 @@ primtype IOPort# s a
         deadlock breaking code that forcibly releases the lock. }
 
 primop  NewIOPortOp "newIOPort#"  GenPrimOp
-   State# s -> (# State# s, IOPort# s v #)
+   State# s -> (# State# s, IOPort# s a_levpoly #)
    {Create new 'IOPort#'; initially empty.}
    with
    out_of_line = True
-   has_side_effects = True
+   effect = ReadWriteEffect
 
 primop  ReadIOPortOp "readIOPort#" GenPrimOp
-   IOPort# s v -> State# s -> (# State# s, v #)
+   IOPort# s a_levpoly -> State# s -> (# State# s, a_levpoly #)
    {If 'IOPort#' is empty, block until it becomes full.
    Then remove and return its contents, and set it empty.
    Throws an 'IOPortException' if another thread is already
    waiting to read this 'IOPort#'.}
    with
    out_of_line      = True
-   has_side_effects = True
+   effect = ReadWriteEffect
 
 primop  WriteIOPortOp "writeIOPort#" GenPrimOp
-   IOPort# s v -> v -> State# s -> (# State# s, Int# #)
+   IOPort# s a_levpoly -> a_levpoly -> State# s -> (# State# s, Int# #)
    {If 'IOPort#' is full, immediately return with integer 0,
     throwing an 'IOPortException'.
     Otherwise, store value arg as 'IOPort#''s new contents,
     and return with integer 1. }
    with
    out_of_line      = True
-   has_side_effects = True
+   effect = ReadWriteEffect
 
 ------------------------------------------------------------------------
 section "Delay/wait operations"
@@ -3060,21 +3197,21 @@ primop  DelayOp "delay#" GenPrimOp
    Int# -> State# s -> State# s
    {Sleep specified number of microseconds.}
    with
-   has_side_effects = True
+   effect = ReadWriteEffect
    out_of_line      = True
 
 primop  WaitReadOp "waitRead#" GenPrimOp
    Int# -> State# s -> State# s
    {Block until input is available on specified file descriptor.}
    with
-   has_side_effects = True
+   effect = ReadWriteEffect
    out_of_line      = True
 
 primop  WaitWriteOp "waitWrite#" GenPrimOp
    Int# -> State# s -> State# s
    {Block until output is possible on specified file descriptor.}
    with
-   has_side_effects = True
+   effect = ReadWriteEffect
    out_of_line      = True
 
 ------------------------------------------------------------------------
@@ -3099,19 +3236,19 @@ primtype ThreadId#
         other operations can be omitted.)}
 
 primop  ForkOp "fork#" GenPrimOp
-   (State# RealWorld -> (# State# RealWorld, o #))
+   (State# RealWorld -> (# State# RealWorld, a_reppoly #))
    -> State# RealWorld -> (# State# RealWorld, ThreadId# #)
    with
-   has_side_effects = True
+   effect = ReadWriteEffect
    out_of_line      = True
    strictness  = { \ _arity -> mkClosedDmdSig [ lazyApply1Dmd
                                               , topDmd ] topDiv }
 
 primop  ForkOnOp "forkOn#" GenPrimOp
-   Int# -> (State# RealWorld -> (# State# RealWorld, o #))
+   Int# -> (State# RealWorld -> (# State# RealWorld, a_reppoly #))
    -> State# RealWorld -> (# State# RealWorld, ThreadId# #)
    with
-   has_side_effects = True
+   effect = ReadWriteEffect
    out_of_line      = True
    strictness  = { \ _arity -> mkClosedDmdSig [ topDmd
                                               , lazyApply1Dmd
@@ -3120,39 +3257,39 @@ primop  ForkOnOp "forkOn#" GenPrimOp
 primop  KillThreadOp "killThread#"  GenPrimOp
    ThreadId# -> a -> State# RealWorld -> State# RealWorld
    with
-   has_side_effects = True
+   effect = ReadWriteEffect
    out_of_line      = True
 
 primop  YieldOp "yield#" GenPrimOp
    State# RealWorld -> State# RealWorld
    with
-   has_side_effects = True
+   effect = ReadWriteEffect
    out_of_line      = True
 
 primop  MyThreadIdOp "myThreadId#" GenPrimOp
    State# RealWorld -> (# State# RealWorld, ThreadId# #)
    with
-   has_side_effects = True
+   effect = ReadWriteEffect
 
 primop LabelThreadOp "labelThread#" GenPrimOp
    ThreadId# -> ByteArray# -> State# RealWorld -> State# RealWorld
    {Set the label of the given thread. The @ByteArray#@ should contain
     a UTF-8-encoded string.}
    with
-   has_side_effects = True
+   effect = ReadWriteEffect
    out_of_line      = True
 
 primop  IsCurrentThreadBoundOp "isCurrentThreadBound#" GenPrimOp
    State# RealWorld -> (# State# RealWorld, Int# #)
    with
    out_of_line = True
-   has_side_effects = True
+   effect = ReadWriteEffect
 
 primop  NoDuplicateOp "noDuplicate#" GenPrimOp
    State# s -> State# s
    with
    out_of_line = True
-   has_side_effects = True
+   effect = ReadWriteEffect
 
 primop GetThreadLabelOp "threadLabel#" GenPrimOp
    ThreadId# -> State# RealWorld -> (# State# RealWorld, Int#, ByteArray# #)
@@ -3177,7 +3314,7 @@ primop  ThreadStatusOp "threadStatus#" GenPrimOp
     @since 0.9}
    with
    out_of_line = True
-   has_side_effects = True
+   effect = ReadWriteEffect
 
 primop ListThreadsOp "listThreads#" GenPrimOp
    State# RealWorld -> (# State# RealWorld, Array# ThreadId# #)
@@ -3188,7 +3325,7 @@ primop ListThreadsOp "listThreads#" GenPrimOp
      @since 0.10}
    with
    out_of_line = True
-   has_side_effects = True
+   effect = ReadWriteEffect
 
 ------------------------------------------------------------------------
 section "Weak pointers"
@@ -3196,29 +3333,26 @@ section "Weak pointers"
 
 primtype Weak# b
 
--- N.B. "v" and "w" denote levity-polymorphic type variables.
--- See Note [Levity and representation polymorphic primops]
-
 primop  MkWeakOp "mkWeak#" GenPrimOp
-   v -> w -> (State# RealWorld -> (# State# RealWorld, c #))
-     -> State# RealWorld -> (# State# RealWorld, Weak# w #)
+   a_levpoly -> b_levpoly -> (State# RealWorld -> (# State# RealWorld, c #))
+     -> State# RealWorld -> (# State# RealWorld, Weak# b_levpoly #)
    { @'mkWeak#' k v finalizer s@ creates a weak reference to value @k@,
      with an associated reference to some value @v@. If @k@ is still
      alive then @v@ can be retrieved using 'deRefWeak#'. Note that
      the type of @k@ must be represented by a pointer (i.e. of kind
      @'TYPE' ''LiftedRep' or @'TYPE' ''UnliftedRep'@). }
    with
-   has_side_effects = True
+   effect = ReadWriteEffect
    out_of_line      = True
 
 primop  MkWeakNoFinalizerOp "mkWeakNoFinalizer#" GenPrimOp
-   v -> w -> State# RealWorld -> (# State# RealWorld, Weak# w #)
+   a_levpoly -> b_levpoly -> State# RealWorld -> (# State# RealWorld, Weak# b_levpoly #)
    with
-   has_side_effects = True
+   effect = ReadWriteEffect
    out_of_line      = True
 
 primop  AddCFinalizerToWeakOp "addCFinalizerToWeak#" GenPrimOp
-   Addr# -> Addr# -> Int# -> Addr# -> Weak# w
+   Addr# -> Addr# -> Int# -> Addr# -> Weak# b_levpoly
           -> State# RealWorld -> (# State# RealWorld, Int# #)
    { @'addCFinalizerToWeak#' fptr ptr flag eptr w@ attaches a C
      function pointer @fptr@ to a weak pointer @w@ as a finalizer. If
@@ -3227,17 +3361,17 @@ primop  AddCFinalizerToWeakOp "addCFinalizerToWeak#" GenPrimOp
      @eptr@ and @ptr@. 'addCFinalizerToWeak#' returns
      1 on success, or 0 if @w@ is already dead. }
    with
-   has_side_effects = True
+   effect = ReadWriteEffect
    out_of_line      = True
 
 primop  DeRefWeakOp "deRefWeak#" GenPrimOp
-   Weak# v -> State# RealWorld -> (# State# RealWorld, Int#, v #)
+   Weak# a_levpoly -> State# RealWorld -> (# State# RealWorld, Int#, a_levpoly #)
    with
-   has_side_effects = True
+   effect = ReadWriteEffect
    out_of_line      = True
 
 primop  FinalizeWeakOp "finalizeWeak#" GenPrimOp
-   Weak# v -> State# RealWorld -> (# State# RealWorld, Int#,
+   Weak# a_levpoly -> State# RealWorld -> (# State# RealWorld, Int#,
               (State# RealWorld -> (# State# RealWorld, b #) ) #)
    { Finalize a weak pointer. The return value is an unboxed tuple
      containing the new state of the world and an "unboxed Maybe",
@@ -3245,14 +3379,30 @@ primop  FinalizeWeakOp "finalizeWeak#" GenPrimOp
      action. An 'Int#' of @1@ indicates that the finalizer is valid. The
      return value @b@ from the finalizer should be ignored. }
    with
-   has_side_effects = True
+   effect = ReadWriteEffect
    out_of_line      = True
 
 primop TouchOp "touch#" GenPrimOp
-   v -> State# RealWorld -> State# RealWorld
+   a_levpoly -> State# s -> State# s
    with
-   code_size = { 0 }
-   has_side_effects = True
+   code_size = 0
+   effect = ReadWriteEffect -- see Note [touch# has ReadWriteEffect]
+   work_free = False
+
+
+-- Note [touch# has ReadWriteEffect]
+-- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+-- Although touch# emits no code, it is marked as ReadWriteEffect to
+-- prevent it from being defeated by the optimizer:
+--  * Discarding a touch# call would defeat its whole purpose.
+--  * Strictly floating a touch# call out would shorten the lifetime
+--    of the touched object, again defeating its purpose.
+--  * Duplicating a touch# call might unpredictably extend the lifetime
+--    of the touched object.  Although this would not defeat the purpose
+--    of touch#, it seems undesirable.
+--
+-- In practice, this designation probably doesn't matter in most cases,
+-- as touch# is usually tightly coupled with a "real" read or write effect.
 
 ------------------------------------------------------------------------
 section "Stable pointers and names"
@@ -3263,30 +3413,30 @@ primtype StablePtr# a
 primtype StableName# a
 
 primop  MakeStablePtrOp "makeStablePtr#" GenPrimOp
-   v -> State# RealWorld -> (# State# RealWorld, StablePtr# v #)
+   a_levpoly -> State# RealWorld -> (# State# RealWorld, StablePtr# a_levpoly #)
    with
-   has_side_effects = True
+   effect = ReadWriteEffect
    out_of_line      = True
 
 primop  DeRefStablePtrOp "deRefStablePtr#" GenPrimOp
-   StablePtr# v -> State# RealWorld -> (# State# RealWorld, v #)
+   StablePtr# a_levpoly -> State# RealWorld -> (# State# RealWorld, a_levpoly #)
    with
-   has_side_effects = True
+   effect = ReadWriteEffect
    out_of_line      = True
 
 primop  EqStablePtrOp "eqStablePtr#" GenPrimOp
-   StablePtr# v -> StablePtr# v -> Int#
+   StablePtr# a_levpoly -> StablePtr# a_levpoly -> Int#
    with
-   has_side_effects = True
+   effect = ReadWriteEffect
 
 primop  MakeStableNameOp "makeStableName#" GenPrimOp
-   v -> State# RealWorld -> (# State# RealWorld, StableName# v #)
+   a_levpoly -> State# RealWorld -> (# State# RealWorld, StableName# a_levpoly #)
    with
-   has_side_effects = True
+   effect = ReadWriteEffect
    out_of_line      = True
 
 primop  StableNameToIntOp "stableNameToInt#" GenPrimOp
-   StableName# v -> Int#
+   StableName# a_levpoly -> Int#
 
 ------------------------------------------------------------------------
 section "Compact normal form"
@@ -3314,7 +3464,7 @@ primop  CompactNewOp "compactNew#" GenPrimOp
      The capacity is rounded up to a multiple of the allocator block size
      and is capped to one mega block. }
    with
-   has_side_effects = True
+   effect = ReadWriteEffect
    out_of_line      = True
 
 primop  CompactResizeOp "compactResize#" GenPrimOp
@@ -3324,7 +3474,7 @@ primop  CompactResizeOp "compactResize#" GenPrimOp
      determines the capacity of each compact block in the CNF. It
      does not retroactively affect existing compact blocks in the CNF. }
    with
-   has_side_effects = True
+   effect = ReadWriteEffect
    out_of_line      = True
 
 primop  CompactContainsOp "compactContains#" GenPrimOp
@@ -3366,7 +3516,7 @@ primop  CompactAllocateBlockOp "compactAllocateBlock#" GenPrimOp
      so that the address does not escape or memory will be leaked.
    }
    with
-   has_side_effects = True
+   effect = ReadWriteEffect
    out_of_line      = True
 
 primop  CompactFixupPointersOp "compactFixupPointers#" GenPrimOp
@@ -3379,7 +3529,7 @@ primop  CompactFixupPointersOp "compactFixupPointers#" GenPrimOp
      a serialized CNF. It returns the new CNF and the new adjusted
      root address. }
    with
-   has_side_effects = True
+   effect = ReadWriteEffect
    out_of_line      = True
 
 primop CompactAdd "compactAdd#" GenPrimOp
@@ -3392,7 +3542,7 @@ primop CompactAdd "compactAdd#" GenPrimOp
      enforce any mutual exclusion; the caller is expected to
      arrange this. }
    with
-   has_side_effects = True
+   effect = ReadWriteEffect
    out_of_line      = True
 
 primop CompactAddWithSharing "compactAddWithSharing#" GenPrimOp
@@ -3400,7 +3550,7 @@ primop CompactAddWithSharing "compactAddWithSharing#" GenPrimOp
    { Like 'compactAdd#', but retains sharing and cycles
    during compaction. }
    with
-   has_side_effects = True
+   effect = ReadWriteEffect
    out_of_line      = True
 
 primop CompactSize "compactSize#" GenPrimOp
@@ -3408,7 +3558,7 @@ primop CompactSize "compactSize#" GenPrimOp
    { Return the total capacity (in bytes) of all the compact blocks
      in the CNF. }
    with
-   has_side_effects = True
+   effect = ReadWriteEffect
    out_of_line      = True
 
 ------------------------------------------------------------------------
@@ -3416,13 +3566,12 @@ section "Unsafe pointer equality"
 --  (#1 Bad Guy: Alastair Reid :)
 ------------------------------------------------------------------------
 
--- `v` and `w` are levity-polymorphic type variables with independent levities.
--- See Note [Levity and representation polymorphic primops]
 primop  ReallyUnsafePtrEqualityOp "reallyUnsafePtrEquality#" GenPrimOp
-   v -> w -> Int#
+   a_levpoly -> b_levpoly -> Int#
    { Returns @1#@ if the given pointers are equal and @0#@ otherwise. }
    with
-   can_fail   = True -- See Note [reallyUnsafePtrEquality# can_fail]
+   effect = CanFail -- See Note [reallyUnsafePtrEquality# CanFail]
+   can_fail_warning = DoNotWarnCanFail
 
 -- Note [Pointer comparison operations]
 -- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -3432,7 +3581,7 @@ primop  ReallyUnsafePtrEqualityOp "reallyUnsafePtrEquality#" GenPrimOp
 -- (PE1) It is levity-polymorphic. It works for TYPE (BoxedRep Lifted) and
 --       TYPE (BoxedRep Unlifted). But not TYPE IntRep, for example.
 --       This levity-polymorphism comes from the use of the type variables
---       "v" and "w". See Note [Levity and representation polymorphic primops]
+--       "a_levpoly" and "b_levpoly". See Note [Levity and representation polymorphic primops]
 --
 -- (PE2) It is hetero-typed; you can compare pointers of different types.
 --       This is used in various packages such as containers & unordered-containers.
@@ -3454,7 +3603,7 @@ primop  ReallyUnsafePtrEqualityOp "reallyUnsafePtrEquality#" GenPrimOp
 --
 -- (PE5) reallyUnsafePtrEquality# can't fail, but it is marked as such
 --       to prevent it from floating out.
---       See Note [reallyUnsafePtrEquality# can_fail]
+--       See Note [reallyUnsafePtrEquality# CanFail]
 --
 -- The library GHC.Prim.PtrEq (and GHC.Exts) provides
 --
@@ -3489,10 +3638,10 @@ primop  ReallyUnsafePtrEqualityOp "reallyUnsafePtrEquality#" GenPrimOp
 --
 -- These operations are all specialisations of unsafePtrEquality#.
 
--- Note [reallyUnsafePtrEquality# can_fail]
--- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+-- Note [reallyUnsafePtrEquality# CanFail]
+-- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 -- reallyUnsafePtrEquality# can't actually fail, per se, but we mark it
--- can_fail anyway. Until 5a9a1738023a, GHC considered primops okay for
+-- CanFail anyway. Until 5a9a1738023a, GHC considered primops okay for
 -- speculation only when their arguments were known to be forced. This was
 -- unnecessarily conservative, but it prevented reallyUnsafePtrEquality# from
 -- floating out of places where its arguments were known to be forced.
@@ -3527,30 +3676,33 @@ primop  ParOp "par#" GenPrimOp
    with
       -- Note that Par is lazy to avoid that the sparked thing
       -- gets evaluated strictly, which it should *not* be
-   has_side_effects = True
+   effect = ReadWriteEffect
    code_size = { primOpCodeSizeForeignCall }
    deprecated_msg = { Use 'spark#' instead }
 
 primop SparkOp "spark#" GenPrimOp
    a -> State# s -> (# State# s, a #)
-   with has_side_effects = True
+   with effect = ReadWriteEffect
    code_size = { primOpCodeSizeForeignCall }
 
+-- See Note [seq# magic] in GHC.Core.Opt.ConstantFold
 primop SeqOp "seq#" GenPrimOp
    a -> State# s -> (# State# s, a #)
-   -- See Note [seq# magic] in GHC.Core.Op.ConstantFold
+   with
+   effect = ThrowsException
+   work_free = True -- seq# does work iff its lifted arg does work
 
 primop GetSparkOp "getSpark#" GenPrimOp
    State# s -> (# State# s, Int#, a #)
    with
-   has_side_effects = True
+   effect = ReadWriteEffect
    out_of_line = True
 
 primop NumSparks "numSparks#" GenPrimOp
    State# s -> (# State# s, Int# #)
    { Returns the number of sparks in the local spark pool. }
    with
-   has_side_effects = True
+   effect = ReadWriteEffect
    out_of_line = True
 
 
@@ -3561,11 +3713,8 @@ section "Controlling object lifetime"
 ------------------------------------------------------------------------
 
 -- See Note [keepAlive# magic] in GHC.CoreToStg.Prep.
--- NB: "v" is the same as "a" except levity-polymorphic,
--- and "p" is the same as "b" except representation-polymorphic.
--- See Note [Levity and representation polymorphic primops]
 primop KeepAliveOp "keepAlive#" GenPrimOp
-   v -> State# RealWorld -> (State# RealWorld -> p) -> p
+   a_levpoly -> State# s -> (State# s -> b_reppoly) -> b_reppoly
    { @'keepAlive#' x s k@ keeps the value @x@ alive during the execution
      of the computation @k@.
 
@@ -3575,6 +3724,9 @@ primop KeepAliveOp "keepAlive#" GenPrimOp
    with
    out_of_line = True
    strictness = { \ _arity -> mkClosedDmdSig [topDmd, topDmd, strictOnceApply1Dmd] topDiv }
+                 -- See Note [Strict IO wrappers]
+   effect = ReadWriteEffect
+   -- The invoked computation may have side effects
 
 
 ------------------------------------------------------------------------
@@ -3583,16 +3735,50 @@ section "Tag to enum stuff"
         and small integers.}
 ------------------------------------------------------------------------
 
-primop  DataToTagOp "dataToTag#" GenPrimOp
-   a -> Int#  -- Zero-indexed; the first constructor has tag zero
-   { Evaluates the argument and returns the tag of the result.
-     Tags are Zero-indexed; the first constructor has tag zero. }
+primop  DataToTagSmallOp "dataToTagSmall#" GenPrimOp
+   a_levpoly -> Int#
+   { Used internally to implement @dataToTag#@: Use that function instead!
+     This one normally offers /no advantage/ and comes with no stability
+     guarantees: it may change its type, its name, or its behavior
+     with /no warning/ between compiler releases.
+
+     It is expected that this function will be un-exposed in a future
+     release of ghc.
+
+     For more details, look at @Note [DataToTag overview]@
+     in GHC.Tc.Instance.Class in the source code for
+     /the specific compiler version you are using./
+   }
    with
+   deprecated_msg = { Use dataToTag# from \"GHC.Magic\" instead. }
    strictness = { \ _arity -> mkClosedDmdSig [evalDmd] topDiv }
-   -- See Note [dataToTag# magic] in GHC.Core.Opt.ConstantFold
+   effect = ThrowsException
+   cheap = True
+
+primop  DataToTagLargeOp "dataToTagLarge#" GenPrimOp
+   a_levpoly -> Int#
+   { Used internally to implement @dataToTag#@: Use that function instead!
+     This one offers /no advantage/ and comes with no stability
+     guarantees: it may change its type, its name, or its behavior
+     with /no warning/ between compiler releases.
+
+     It is expected that this function will be un-exposed in a future
+     release of ghc.
+
+     For more details, look at @Note [DataToTag overview]@
+     in GHC.Tc.Instance.Class in the source code for
+     /the specific compiler version you are using./
+   }
+   with
+   deprecated_msg = { Use dataToTag# from \"GHC.Magic\" instead. }
+   strictness = { \ _arity -> mkClosedDmdSig [evalDmd] topDiv }
+   effect = ThrowsException
+   cheap = True
 
 primop  TagToEnumOp "tagToEnum#" GenPrimOp
    Int# -> a
+   with
+   effect = CanFail
 
 ------------------------------------------------------------------------
 section "Bytecode operations"
@@ -3607,7 +3793,7 @@ primtype BCO
    { Primitive bytecode type. }
 
 primop   AddrToAnyOp "addrToAny#" GenPrimOp
-   Addr# -> (# v #)
+   Addr# -> (# a_levpoly #)
    { Convert an 'Addr#' to a followable Any type. }
    with
    code_size = 0
@@ -3641,7 +3827,7 @@ primop  NewBCOOp "newBCO#" GenPrimOp
      encoded in @instrs@, and a static reference table usage bitmap given by
      @bitmap@. }
    with
-   has_side_effects = True
+   effect = ReadWriteEffect
    out_of_line      = True
 
 primop  UnpackClosureOp "unpackClosure#" GenPrimOp
@@ -3693,10 +3879,9 @@ primop  ClearCCSOp "clearCCS#" GenPrimOp
 section "Info Table Origin"
 ------------------------------------------------------------------------
 primop WhereFromOp "whereFrom#" GenPrimOp
-   a -> State# s -> (# State# s, Addr# #)
-   { Returns the @InfoProvEnt @ for the info table of the given object
-     (value is @NULL@ if the table does not exist or there is no information
-     about the closure).}
+   a -> Addr# -> State# s -> (# State# s, Int# #)
+   { Fills the given buffer with the @InfoProvEnt@ for the info table of the
+     given object. Returns @1#@ on success and @0#@ otherwise.}
    with
    out_of_line = True
 
@@ -3743,7 +3928,7 @@ pseudoop "proxy#"
    representation. }
 
 pseudoop   "seq"
-   a -> b -> b
+   a -> b_reppoly -> b_reppoly
    { The value of @'seq' a b@ is bottom if @a@ is bottom, and
      otherwise equal to @b@. In other words, it evaluates the first
      argument @a@ to weak head normal form (WHNF). 'seq' is usually
@@ -3760,50 +3945,6 @@ pseudoop   "seq"
          -- This fixity is only the one picked up by Haddock. If you
          -- change this, do update 'ghcPrimIface' in 'GHC.Iface.Load'.
 
-pseudoop   "unsafeCoerce#"
-   a -> b
-   { The function 'unsafeCoerce#' allows you to side-step the typechecker entirely. That
-        is, it allows you to coerce any type into any other type. If you use this function,
-        you had better get it right, otherwise segmentation faults await. It is generally
-        used when you want to write a program that you know is well-typed, but where Haskell's
-        type system is not expressive enough to prove that it is well typed.
-
-        The following uses of 'unsafeCoerce#' are supposed to work (i.e. not lead to
-        spurious compile-time or run-time crashes):
-
-         * Casting any lifted type to 'Any'
-
-         * Casting 'Any' back to the real type
-
-         * Casting an unboxed type to another unboxed type of the same size.
-           (Casting between floating-point and integral types does not work.
-           See the "GHC.Float" module for functions to do work.)
-
-         * Casting between two types that have the same runtime representation.  One case is when
-           the two types differ only in "phantom" type parameters, for example
-           @'Ptr' 'Int'@ to @'Ptr' 'Float'@, or @['Int']@ to @['Float']@ when the list is
-           known to be empty.  Also, a @newtype@ of a type @T@ has the same representation
-           at runtime as @T@.
-
-        Other uses of 'unsafeCoerce#' are undefined.  In particular, you should not use
-        'unsafeCoerce#' to cast a T to an algebraic data type D, unless T is also
-        an algebraic data type.  For example, do not cast @'Int'->'Int'@ to 'Bool', even if
-        you later cast that 'Bool' back to @'Int'->'Int'@ before applying it.  The reasons
-        have to do with GHC's internal representation details (for the cognoscenti, data values
-        can be entered but function closures cannot).  If you want a safe type to cast things
-        to, use 'Any', which is not an algebraic data type.
-
-        }
-   with can_fail = True
-
--- NB. It is tempting to think that casting a value to a type that it doesn't have is safe
--- as long as you don't "do anything" with the value in its cast form, such as seq on it.  This
--- isn't the case: the compiler can insert seqs itself, and if these happen at the wrong type,
--- Bad Things Might Happen.  See bug #1616: in this case we cast a function of type (a,b) -> (a,b)
--- to () -> () and back again.  The strictness analyser saw that the function was strict, but
--- the wrapper had type () -> (), and hence the wrapper de-constructed the (), the worker re-constructed
--- a new (), with the result that the code ended up with "case () of (a,b) -> ...".
-
 primop  TraceEventOp "traceEvent#" GenPrimOp
    Addr# -> State# s -> State# s
    { Emits an event via the RTS tracing framework.  The contents
@@ -3811,7 +3952,7 @@ primop  TraceEventOp "traceEvent#" GenPrimOp
      argument.  The event will be emitted either to the @.eventlog@ file,
      or to stderr, depending on the runtime RTS flags. }
    with
-   has_side_effects = True
+   effect = ReadWriteEffect
    out_of_line      = True
 
 primop  TraceEventBinaryOp "traceBinaryEvent#" GenPrimOp
@@ -3821,7 +3962,7 @@ primop  TraceEventBinaryOp "traceBinaryEvent#" GenPrimOp
      the given length passed as the second argument. The event will be
      emitted to the @.eventlog@ file. }
    with
-   has_side_effects = True
+   effect = ReadWriteEffect
    out_of_line      = True
 
 primop  TraceMarkerOp "traceMarker#" GenPrimOp
@@ -3831,14 +3972,14 @@ primop  TraceMarkerOp "traceMarker#" GenPrimOp
      argument.  The event will be emitted either to the @.eventlog@ file,
      or to stderr, depending on the runtime RTS flags. }
    with
-   has_side_effects = True
+   effect = ReadWriteEffect
    out_of_line      = True
 
 primop  SetThreadAllocationCounter "setThreadAllocationCounter#" GenPrimOp
    Int64# -> State# RealWorld -> State# RealWorld
    { Sets the allocation counter for the current thread to the given value. }
    with
-   has_side_effects = True
+   effect = ReadWriteEffect
    out_of_line      = True
 
 primtype StackSnapshot#
@@ -3942,7 +4083,7 @@ primop VecUnpackOp "unpack#" GenPrimOp
 primop VecInsertOp "insert#" GenPrimOp
    VECTOR -> SCALAR -> Int# -> VECTOR
    { Insert a scalar at the given position in a vector. }
-   with can_fail = True
+   with effect = CanFail
         llvm_only = True
         vector = ALL_VECTOR_TYPES
 
@@ -3969,21 +4110,21 @@ primop VecMulOp "times#" GenPrimOp
 primop VecDivOp "divide#" GenPrimOp
    VECTOR -> VECTOR -> VECTOR
    { Divide two vectors element-wise. }
-   with can_fail = True
+   with effect = CanFail
         llvm_only = True
         vector = FLOAT_VECTOR_TYPES
 
 primop VecQuotOp "quot#" GenPrimOp
    VECTOR -> VECTOR -> VECTOR
    { Rounds towards zero element-wise. }
-   with can_fail = True
+   with effect = CanFail
         llvm_only = True
         vector = INT_VECTOR_TYPES
 
 primop VecRemOp "rem#" GenPrimOp
    VECTOR -> VECTOR -> VECTOR
    { Satisfies @('quot#' x y) 'times#' y 'plus#' ('rem#' x y) == x@. }
-   with can_fail = True
+   with effect = CanFail
         llvm_only = True
         vector = INT_VECTOR_TYPES
 
@@ -3996,46 +4137,46 @@ primop VecNegOp "negate#" GenPrimOp
 primop VecIndexByteArrayOp "indexArray#" GenPrimOp
    ByteArray# -> Int# -> VECTOR
    { Read a vector from specified index of immutable array. }
-   with can_fail = True
+   with effect = CanFail
         llvm_only = True
         vector = ALL_VECTOR_TYPES
 
 primop VecReadByteArrayOp "readArray#" GenPrimOp
    MutableByteArray# s -> Int# -> State# s -> (# State# s, VECTOR #)
    { Read a vector from specified index of mutable array. }
-   with has_side_effects = True
-        can_fail = True
+   with effect = ReadWriteEffect
+        can_fail_warning = YesWarnCanFail
         llvm_only = True
         vector = ALL_VECTOR_TYPES
 
 primop VecWriteByteArrayOp "writeArray#" GenPrimOp
    MutableByteArray# s -> Int# -> VECTOR -> State# s -> State# s
    { Write a vector to specified index of mutable array. }
-   with has_side_effects = True
-        can_fail = True
+   with effect = ReadWriteEffect
+        can_fail_warning = YesWarnCanFail
         llvm_only = True
         vector = ALL_VECTOR_TYPES
 
 primop VecIndexOffAddrOp "indexOffAddr#" GenPrimOp
    Addr# -> Int# -> VECTOR
    { Reads vector; offset in bytes. }
-   with can_fail = True
+   with effect = CanFail
         llvm_only = True
         vector = ALL_VECTOR_TYPES
 
 primop VecReadOffAddrOp "readOffAddr#" GenPrimOp
    Addr# -> Int# -> State# s -> (# State# s, VECTOR #)
    { Reads vector; offset in bytes. }
-   with has_side_effects = True
-        can_fail = True
+   with effect = ReadWriteEffect
+        can_fail_warning = YesWarnCanFail
         llvm_only = True
         vector = ALL_VECTOR_TYPES
 
 primop VecWriteOffAddrOp "writeOffAddr#" GenPrimOp
    Addr# -> Int# -> VECTOR -> State# s -> State# s
    { Write vector; offset in bytes. }
-   with has_side_effects = True
-        can_fail = True
+   with effect = ReadWriteEffect
+        can_fail_warning = YesWarnCanFail
         llvm_only = True
         vector = ALL_VECTOR_TYPES
 
@@ -4043,46 +4184,46 @@ primop VecWriteOffAddrOp "writeOffAddr#" GenPrimOp
 primop VecIndexScalarByteArrayOp "indexArrayAs#" GenPrimOp
    ByteArray# -> Int# -> VECTOR
    { Read a vector from specified index of immutable array of scalars; offset is in scalar elements. }
-   with can_fail = True
+   with effect = CanFail
         llvm_only = True
         vector = ALL_VECTOR_TYPES
 
 primop VecReadScalarByteArrayOp "readArrayAs#" GenPrimOp
    MutableByteArray# s -> Int# -> State# s -> (# State# s, VECTOR #)
    { Read a vector from specified index of mutable array of scalars; offset is in scalar elements. }
-   with has_side_effects = True
-        can_fail = True
+   with effect = ReadWriteEffect
+        can_fail_warning = YesWarnCanFail
         llvm_only = True
         vector = ALL_VECTOR_TYPES
 
 primop VecWriteScalarByteArrayOp "writeArrayAs#" GenPrimOp
    MutableByteArray# s -> Int# -> VECTOR -> State# s -> State# s
    { Write a vector to specified index of mutable array of scalars; offset is in scalar elements. }
-   with has_side_effects = True
-        can_fail = True
+   with effect = ReadWriteEffect
+        can_fail_warning = YesWarnCanFail
         llvm_only = True
         vector = ALL_VECTOR_TYPES
 
 primop VecIndexScalarOffAddrOp "indexOffAddrAs#" GenPrimOp
    Addr# -> Int# -> VECTOR
    { Reads vector; offset in scalar elements. }
-   with can_fail = True
+   with effect = CanFail
         llvm_only = True
         vector = ALL_VECTOR_TYPES
 
 primop VecReadScalarOffAddrOp "readOffAddrAs#" GenPrimOp
    Addr# -> Int# -> State# s -> (# State# s, VECTOR #)
    { Reads vector; offset in scalar elements. }
-   with has_side_effects = True
-        can_fail = True
+   with effect = ReadWriteEffect
+        can_fail_warning = YesWarnCanFail
         llvm_only = True
         vector = ALL_VECTOR_TYPES
 
 primop VecWriteScalarOffAddrOp "writeOffAddrAs#" GenPrimOp
    Addr# -> Int# -> VECTOR -> State# s -> State# s
    { Write vector; offset in scalar elements. }
-   with has_side_effects = True
-        can_fail = True
+   with effect = ReadWriteEffect
+        can_fail_warning = YesWarnCanFail
         llvm_only = True
         vector = ALL_VECTOR_TYPES
 
@@ -4131,7 +4272,7 @@ section "Prefetch"
   It is important to note that while the prefetch operations will never change the
   answer to a pure computation, They CAN change the memory locations resident
   in a CPU cache and that may change the performance and timing characteristics
-  of an application. The prefetch operations are marked has_side_effects=True
+  of an application. The prefetch operations are marked as ReadWriteEffect
   to reflect that these operations have side effects with respect to the runtime
   performance characteristics of the resulting code. Additionally, if the prefetchValue
   operations did not have this attribute, GHC does a float out transformation that
@@ -4148,70 +4289,70 @@ section "Prefetch"
 ---
 primop PrefetchByteArrayOp3 "prefetchByteArray3#" GenPrimOp
   ByteArray# -> Int# ->  State# s -> State# s
-  with has_side_effects =  True
+  with effect = ReadWriteEffect
 
 primop PrefetchMutableByteArrayOp3 "prefetchMutableByteArray3#" GenPrimOp
   MutableByteArray# s -> Int# -> State# s -> State# s
-  with has_side_effects =  True
+  with effect = ReadWriteEffect
 
 primop PrefetchAddrOp3 "prefetchAddr3#" GenPrimOp
   Addr# -> Int# -> State# s -> State# s
-  with has_side_effects =  True
+  with effect = ReadWriteEffect
 
 primop PrefetchValueOp3 "prefetchValue3#" GenPrimOp
    a -> State# s -> State# s
-   with has_side_effects =  True
+   with effect = ReadWriteEffect
 ----
 
 primop PrefetchByteArrayOp2 "prefetchByteArray2#" GenPrimOp
   ByteArray# -> Int# ->  State# s -> State# s
-  with has_side_effects =  True
+  with effect = ReadWriteEffect
 
 primop PrefetchMutableByteArrayOp2 "prefetchMutableByteArray2#" GenPrimOp
   MutableByteArray# s -> Int# -> State# s -> State# s
-  with has_side_effects =  True
+  with effect = ReadWriteEffect
 
 primop PrefetchAddrOp2 "prefetchAddr2#" GenPrimOp
   Addr# -> Int# ->  State# s -> State# s
-  with has_side_effects =  True
+  with effect = ReadWriteEffect
 
 primop PrefetchValueOp2 "prefetchValue2#" GenPrimOp
    a ->  State# s -> State# s
-   with has_side_effects =  True
+   with effect = ReadWriteEffect
 ----
 
 primop PrefetchByteArrayOp1 "prefetchByteArray1#" GenPrimOp
    ByteArray# -> Int# -> State# s -> State# s
-   with has_side_effects =  True
+   with effect = ReadWriteEffect
 
 primop PrefetchMutableByteArrayOp1 "prefetchMutableByteArray1#" GenPrimOp
   MutableByteArray# s -> Int# -> State# s -> State# s
-  with has_side_effects =  True
+  with effect = ReadWriteEffect
 
 primop PrefetchAddrOp1 "prefetchAddr1#" GenPrimOp
   Addr# -> Int# -> State# s -> State# s
-  with has_side_effects =  True
+  with effect = ReadWriteEffect
 
 primop PrefetchValueOp1 "prefetchValue1#" GenPrimOp
    a -> State# s -> State# s
-   with has_side_effects =  True
+   with effect = ReadWriteEffect
 ----
 
 primop PrefetchByteArrayOp0 "prefetchByteArray0#" GenPrimOp
   ByteArray# -> Int# ->  State# s -> State# s
-  with has_side_effects =  True
+  with effect = ReadWriteEffect
 
 primop PrefetchMutableByteArrayOp0 "prefetchMutableByteArray0#" GenPrimOp
   MutableByteArray# s -> Int# -> State# s -> State# s
-  with has_side_effects =  True
+  with effect = ReadWriteEffect
 
 primop PrefetchAddrOp0 "prefetchAddr0#" GenPrimOp
   Addr# -> Int# -> State# s -> State# s
-  with has_side_effects =  True
+  with effect = ReadWriteEffect
 
 primop PrefetchValueOp0 "prefetchValue0#" GenPrimOp
    a -> State# s -> State# s
-   with has_side_effects =  True
+   with effect = ReadWriteEffect
 
 
 -- Note [RuntimeRep polymorphism in continuation-style primops]

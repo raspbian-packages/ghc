@@ -166,6 +166,7 @@ void initRtsFlagsDefaults(void)
     RtsFlags.GcFlags.oldGenFactor       = 2;
     RtsFlags.GcFlags.returnDecayFactor  = 4;
     RtsFlags.GcFlags.useNonmoving       = false;
+    RtsFlags.GcFlags.nonmovingDenseAllocatorCount = 16;
     RtsFlags.GcFlags.generations        = 2;
     RtsFlags.GcFlags.squeezeUpdFrames   = true;
     RtsFlags.GcFlags.compact            = false;
@@ -184,6 +185,9 @@ void initRtsFlagsDefaults(void)
     RtsFlags.GcFlags.numaMask           = 1;
     RtsFlags.GcFlags.ringBell           = false;
     RtsFlags.GcFlags.longGCSync         = 0; /* detection turned off */
+
+    // 1 TBytes
+    RtsFlags.GcFlags.addressSpaceSize   = (StgWord64)1 << 40;
 
     RtsFlags.DebugFlags.scheduler       = false;
     RtsFlags.DebugFlags.interpreter     = false;
@@ -215,6 +219,8 @@ void initRtsFlagsDefaults(void)
     RtsFlags.ProfFlags.doHeapProfile      = false;
     RtsFlags.ProfFlags.heapProfileInterval = USToTime(100000); // 100ms
     RtsFlags.ProfFlags.startHeapProfileAtStartup = true;
+    RtsFlags.ProfFlags.startTimeProfileAtStartup = true;
+    RtsFlags.ProfFlags.incrementUserEra = false;
 
 #if defined(PROFILING)
     RtsFlags.ProfFlags.showCCSOnException = false;
@@ -227,6 +233,7 @@ void initRtsFlagsDefaults(void)
     RtsFlags.ProfFlags.ccsSelector        = NULL;
     RtsFlags.ProfFlags.retainerSelector   = NULL;
     RtsFlags.ProfFlags.bioSelector        = NULL;
+    RtsFlags.ProfFlags.eraSelector        = 0;
 #endif
 
 #if defined(TRACING)
@@ -293,6 +300,7 @@ void initRtsFlagsDefaults(void)
     RtsFlags.TickyFlags.showTickyStats   = false;
     RtsFlags.TickyFlags.tickyFile        = NULL;
 #endif
+    RtsFlags.HpcFlags.writeTixFile       = true;
 }
 
 static const char *
@@ -381,6 +389,7 @@ usage_text[] = {
 "                 d = closure description",
 "                 y = type description",
 "                 i = info table",
+"                 e = era",
 "                 r = retainer",
 "                 b = biography (LAG,DRAG,VOID,USE)",
 "  A subset of closures may be selected thusly:",
@@ -391,6 +400,7 @@ usage_text[] = {
 "    -hy<typ>...  closures with specified type descriptions",
 "    -hr<cc>...   closures with specified retainers",
 "    -hb<bio>...  closures with specified biographies (lag,drag,void,use)",
+"    -he<era>...  closures with specified era",
 "",
 "  -R<size>       Set the maximum retainer set size (default: 8)",
 "",
@@ -398,6 +408,8 @@ usage_text[] = {
 "                 (default: 25)",
 "",
 "  -xt            Include threads (TSOs) in a heap profile",
+"",
+"  --automatic-era-increment Increment the era on each major garbage collection",
 "",
 "  -xc      Show current cost centre stack on raising an exception",
 #else /* PROFILING */
@@ -543,10 +555,19 @@ usage_text[] = {
 "  -xq        The allocation limit given to a thread after it receives",
 "             an AllocationLimitExceeded exception. (default: 100k)",
 "",
+#if defined(USE_LARGE_ADDRESS_SPACE)
+"  -xr        The size of virtual memory address space reserved by the",
+"             two step allocator (default: 1T)",
+"",
+#endif
 "  -Mgrace=<n>",
 "             The amount of allocation after the program receives a",
 "             HeapOverflow exception before the exception is thrown again, if",
 "             the program is still exceeding the heap limit.",
+"",
+"  --write-tix-file=<yes|no>",
+"             Whether to write <program>.tix at the end of execution.",
+"             (default: yes)",
 "",
 "RTS options may also be specified using the GHCRTS environment variable.",
 "",
@@ -1028,6 +1049,27 @@ error = true;
                       OPTION_SAFE;
                       RtsFlags.GcFlags.useNonmoving = true;
                   }
+                  else if (!strncmp("nonmoving-dense-allocator-count=",
+                               &rts_argv[arg][2], 32)) {
+                      OPTION_SAFE;
+                      int32_t threshold = strtol(rts_argv[arg]+34, (char **) NULL, 10);
+                      if (threshold < 1 || threshold > (uint16_t)-1) {
+                        errorBelch("bad value for --nonmoving-dense-allocator-count");
+                        error = true;
+                      } else {
+                        RtsFlags.GcFlags.nonmovingDenseAllocatorCount = threshold;
+                      }
+                  }
+                  else if (strequal("write-tix-file=yes",
+                              &rts_argv[arg][2])) {
+                       OPTION_UNSAFE;
+                       RtsFlags.HpcFlags.writeTixFile = true;
+                  }
+                  else if (strequal("write-tix-file=no",
+                              &rts_argv[arg][2])) {
+                       OPTION_UNSAFE;
+                       RtsFlags.HpcFlags.writeTixFile = false;
+                  }
 #if defined(THREADED_RTS)
 #if defined(mingw32_HOST_OS)
                   else if (!strncmp("io-manager-threads",
@@ -1125,6 +1167,19 @@ error = true;
                                &rts_argv[arg][2])) {
                       OPTION_SAFE;
                       RtsFlags.ProfFlags.startHeapProfileAtStartup = false;
+                      break;
+                  }
+                  else if (strequal("no-automatic-time-samples",
+                               &rts_argv[arg][2])) {
+                      OPTION_SAFE;
+                      RtsFlags.ProfFlags.startTimeProfileAtStartup = false;
+                      break;
+                  }
+
+                  else if (strequal("automatic-era-increment",
+                               &rts_argv[arg][2])) {
+                      OPTION_SAFE;
+                      RtsFlags.ProfFlags.incrementUserEra = true;
                       break;
                   }
                   else {
@@ -1773,6 +1828,12 @@ error = true;
                           / BLOCK_SIZE;
                   break;
 
+                case 'r':
+                    OPTION_UNSAFE;
+                    RtsFlags.GcFlags.addressSpaceSize
+                      = decodeSize(rts_argv[arg], 3, MBLOCK_SIZE, HS_WORD64_MAX);
+                    break;
+
                   default:
                     OPTION_SAFE;
                     errorBelch("unknown RTS option: %s",rts_argv[arg]);
@@ -1890,6 +1951,9 @@ static void normaliseRtsOpts (void)
     if (RtsFlags.GcFlags.maxHeapSize != 0 &&
         RtsFlags.GcFlags.heapSizeSuggestion >
         RtsFlags.GcFlags.maxHeapSize) {
+        errorBelch("Maximum heap size (-M) is smaller than suggested heap size (-H)\n"
+                   "Setting maximum heap size to suggested heap size ( %" FMT_Word64 " )",
+                   (StgWord64) RtsFlags.GcFlags.maxHeapSize * (StgWord64) BLOCK_SIZE);
         RtsFlags.GcFlags.maxHeapSize = RtsFlags.GcFlags.heapSizeSuggestion;
     }
 
@@ -1939,11 +2003,6 @@ static void normaliseRtsOpts (void)
              "when linked against the profiled RTS.");
     }
 #endif
-
-    if (RtsFlags.ProfFlags.doHeapProfile != NO_HEAP_PROFILING &&
-            RtsFlags.GcFlags.useNonmoving) {
-        barf("The non-moving collector doesn't support profiling");
-    }
 
     if (RtsFlags.GcFlags.compact && RtsFlags.GcFlags.useNonmoving) {
         errorBelch("The non-moving collector cannot be used in conjunction with\n"
@@ -2076,7 +2135,9 @@ decodeSize(const char *flag, uint32_t offset, StgWord64 min, StgWord64 max)
         m = atof(s);
         c = s[strlen(s)-1];
 
-        if (c == 'g' || c == 'G')
+        if (c == 't' || c == 'T')
+            m *= (StgWord64)1024*1024*1024*1024;
+        else if (c == 'g' || c == 'G')
             m *= 1024*1024*1024;
         else if (c == 'm' || c == 'M')
             m *= 1024*1024;
@@ -2201,13 +2262,14 @@ static void read_debug_flags(const char* arg)
     }
     // -Dx also turns on -v.  Use -l to direct trace
     // events to the .eventlog file instead.
-    RtsFlags.TraceFlags.tracing = TRACE_STDERR;
+    if (RtsFlags.TraceFlags.tracing == TRACE_NONE) {
+        RtsFlags.TraceFlags.tracing = TRACE_STDERR;
+    }
 
-   // sanity implies zero_on_gc
-   if(RtsFlags.DebugFlags.sanity){
-        RtsFlags.DebugFlags.zero_on_gc = true;
-   }
-
+    // sanity implies zero_on_gc
+    if(RtsFlags.DebugFlags.sanity){
+         RtsFlags.DebugFlags.zero_on_gc = true;
+    }
 }
 #endif
 
@@ -2235,6 +2297,7 @@ static bool read_heap_profiling_flag(const char *arg)
     case 'r':
     case 'B':
     case 'b':
+    case 'e':
     case 'T':
         if (arg[2] != '\0' && arg[3] != '\0') {
             {
@@ -2280,6 +2343,10 @@ static bool read_heap_profiling_flag(const char *arg)
                 case 'b': // biography select
                     RtsFlags.ProfFlags.bioSelector = selector;
                     break;
+                case 'E':
+                case 'e': // era select
+                    RtsFlags.ProfFlags.eraSelector = strtoul(selector, (char **) NULL, 10);
+                    break;
                 default:
                     stgFree(selector);
                 }
@@ -2324,6 +2391,9 @@ static bool read_heap_profiling_flag(const char *arg)
             break;
         case 'T':
             RtsFlags.ProfFlags.doHeapProfile = HEAP_BY_CLOSURE_TYPE;
+            break;
+        case 'e':
+            RtsFlags.ProfFlags.doHeapProfile = HEAP_BY_ERA;
             break;
         }
         break;
@@ -2663,3 +2733,26 @@ bool is_io_mng_native_p (void)
   return false;
 #endif
 }
+
+
+#if defined(PROFILING)
+bool
+doingLDVProfiling( void )
+{
+    return (RtsFlags.ProfFlags.doHeapProfile == HEAP_BY_LDV
+            || RtsFlags.ProfFlags.bioSelector != NULL);
+}
+
+bool
+doingRetainerProfiling( void )
+{
+    return (RtsFlags.ProfFlags.doHeapProfile == HEAP_BY_RETAINER
+            || RtsFlags.ProfFlags.retainerSelector != NULL);
+}
+bool
+doingErasProfiling( void )
+{
+    return (RtsFlags.ProfFlags.doHeapProfile == HEAP_BY_ERA
+            || RtsFlags.ProfFlags.eraSelector != 0);
+}
+#endif /* PROFILING */

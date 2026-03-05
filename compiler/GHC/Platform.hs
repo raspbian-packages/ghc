@@ -29,6 +29,7 @@ module GHC.Platform
    , platformInIntRange
    , platformInWordRange
    , platformCConvNeedsExtension
+   , platformHasRTSLinker
    , PlatformMisc(..)
    , SseVersion (..)
    , BmiVersion (..)
@@ -78,7 +79,7 @@ data Platform = Platform
    , platformTablesNextToCode         :: !Bool
       -- ^ Determines whether we will be compiling info tables that reside just
       --   before the entry code, or with an indirection to the entry code. See
-      --   TABLES_NEXT_TO_CODE in rts/include/rts/storage/InfoTables.h.
+      --   TABLES_NEXT_TO_CODE in @rts/include/rts/storage/InfoTables.h@.
    , platformHasLibm                  :: !Bool
       -- ^ Some platforms require that we explicitly link against @libm@ if any
       -- math-y things are used (which we assume to include all programs). See
@@ -179,45 +180,12 @@ platformOS :: Platform -> OS
 platformOS platform = case platformArchOS platform of
    ArchOS _ os -> os
 
-isARM :: Arch -> Bool
-isARM (ArchARM {}) = True
-isARM ArchAArch64  = True
-isARM _ = False
-
 -- | This predicate tells us whether the platform is 32-bit.
 target32Bit :: Platform -> Bool
 target32Bit p =
     case platformWordSize p of
       PW4 -> True
       PW8 -> False
-
--- | This predicate tells us whether the OS supports ELF-like shared libraries.
-osElfTarget :: OS -> Bool
-osElfTarget OSLinux     = True
-osElfTarget OSFreeBSD   = True
-osElfTarget OSDragonFly = True
-osElfTarget OSOpenBSD   = True
-osElfTarget OSNetBSD    = True
-osElfTarget OSSolaris2  = True
-osElfTarget OSDarwin    = False
-osElfTarget OSMinGW32   = False
-osElfTarget OSKFreeBSD  = True
-osElfTarget OSHaiku     = True
-osElfTarget OSQNXNTO    = False
-osElfTarget OSAIX       = False
-osElfTarget OSHurd      = True
-osElfTarget OSWasi      = False
-osElfTarget OSGhcjs     = False
-osElfTarget OSUnknown   = False
- -- Defaulting to False is safe; it means don't rely on any
- -- ELF-specific functionality.  It is important to have a default for
- -- portability, otherwise we have to answer this question for every
- -- new platform we compile on (even unreg).
-
--- | This predicate tells us whether the OS support Mach-O shared libraries.
-osMachOTarget :: OS -> Bool
-osMachOTarget OSDarwin = True
-osMachOTarget _ = False
 
 osUsesFrameworks :: OS -> Bool
 osUsesFrameworks OSDarwin = True
@@ -271,6 +239,23 @@ platformCConvNeedsExtension platform = case platformArch platform of
       -- https://developer.apple.com/documentation/xcode/writing-arm64-code-for-apple-platforms
     | OSDarwin <- platformOS platform -> True
   _            -> False
+
+-- | Does this platform have an RTS linker?
+platformHasRTSLinker :: Platform -> Bool
+-- Note that we've inlined this logic in hadrian's
+-- Settings.Builders.RunTest.inTreeCompilerArgs.
+-- If you change this, be sure to change it too
+platformHasRTSLinker p = case archOS_arch (platformArchOS p) of
+  ArchPPC           -> False -- powerpc
+  ArchPPC_64 ELF_V1 -> False -- powerpc64
+  ArchPPC_64 ELF_V2 -> False -- powerpc64le
+  ArchS390X         -> False
+  ArchRISCV64       -> False
+  ArchLoongArch64   -> False
+  ArchJavaScript    -> False
+  ArchWasm32        -> False
+  _                 -> True
+
 
 
 --------------------------------------------------

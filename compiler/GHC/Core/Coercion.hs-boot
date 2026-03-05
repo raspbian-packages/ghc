@@ -16,10 +16,10 @@ import GHC.Utils.Misc
 mkReflCo :: Role -> Type -> Coercion
 mkTyConAppCo :: HasDebugCallStack => Role -> TyCon -> [Coercion] -> Coercion
 mkAppCo :: Coercion -> Coercion -> Coercion
-mkForAllCo :: TyCoVar -> Coercion -> Coercion -> Coercion
-mkFunCo1 :: HasDebugCallStack => Role -> FunTyFlag -> CoercionN -> Coercion -> Coercion -> Coercion
-mkNakedFunCo1 :: Role -> FunTyFlag -> CoercionN -> Coercion -> Coercion -> Coercion
-mkFunCo2 :: HasDebugCallStack => Role -> FunTyFlag -> FunTyFlag -> CoercionN -> Coercion -> Coercion -> Coercion
+mkForAllCo :: HasDebugCallStack => TyCoVar -> ForAllTyFlag -> ForAllTyFlag -> Coercion -> Coercion -> Coercion
+mkFunCo      :: Role -> FunTyFlag -> CoercionN -> Coercion -> Coercion -> Coercion
+mkNakedFunCo :: Role -> FunTyFlag -> CoercionN -> Coercion -> Coercion -> Coercion
+mkFunCo2     :: Role -> FunTyFlag -> FunTyFlag -> CoercionN -> Coercion -> Coercion -> Coercion
 mkCoVarCo :: CoVar -> Coercion
 mkAxiomInstCo :: CoAxiom Branched -> BranchIndex -> [Coercion] -> Coercion
 mkPhantomCo :: Coercion -> Type -> Type -> Coercion
@@ -36,6 +36,8 @@ mkSubCo :: HasDebugCallStack => Coercion -> Coercion
 mkProofIrrelCo :: Role -> Coercion -> Coercion -> Coercion -> Coercion
 mkAxiomRuleCo :: CoAxiomRule -> [Coercion] -> Coercion
 
+funRole :: Role -> FunSel -> Role
+
 isGReflCo :: Coercion -> Bool
 isReflCo :: Coercion -> Bool
 isReflexiveCo :: Coercion -> Bool
@@ -45,8 +47,6 @@ coVarRole :: CoVar -> Role
 
 mkCoercionType :: Role -> Type -> Type -> Type
 
-data LiftingContext
-liftCoSubst :: HasDebugCallStack => Role -> LiftingContext -> Type -> Coercion
 seqCo :: Coercion -> ()
 
 coercionKind :: Coercion -> Pair Type

@@ -11,7 +11,7 @@ module GHC.Core.Utils (
         -- * Constructing expressions
         mkCast, mkCastMCo, mkPiMCo,
         mkTick, mkTicks, mkTickNoHNF, tickHNFArgs,
-        bindNonRec, needsCaseBinding,
+        bindNonRec, needsCaseBinding, needsCaseBindingL,
         mkAltExpr, mkDefaultCase, mkSingleAltCase,
 
         -- * Taking expressions apart
@@ -21,12 +21,13 @@ module GHC.Core.Utils (
         scaleAltsBy,
 
         -- * Properties of expressions
-        exprType, coreAltType, coreAltsType, mkLamType, mkLamTypes,
+        exprType, coreAltType, coreAltsType,
+        mkLamType, mkLamTypes,
         mkFunctionType,
         exprIsTrivial, getIdFromTrivialExpr, getIdFromTrivialExpr_maybe,
         trivial_expr_fold,
         exprIsDupable, exprIsCheap, exprIsExpandable, exprIsCheapX, CheapAppFun,
-        exprIsHNF, exprOkForSpeculation, exprOkForSideEffects, exprOkForSpecEval,
+        exprIsHNF, exprOkForSpeculation, exprOkToDiscard, exprOkForSpecEval,
         exprIsWorkFree, exprIsConLike,
         isCheapApp, isExpandableApp, isSaturatedConApp,
         exprIsTickedString, exprIsTickedString_maybe,
@@ -59,7 +60,7 @@ module GHC.Core.Utils (
         mkStrictFieldSeqs, shouldStrictifyIdForCbv, shouldUseCbvForId,
 
         -- * unsafeEqualityProof
-        isUnsafeEqualityProof,
+        isUnsafeEqualityCase,
 
         -- * Dumping stuff
         dumpIdInfoOfProgram
@@ -79,7 +80,7 @@ import GHC.Core.Reduction
 import GHC.Core.TyCon
 import GHC.Core.Multiplicity
 
-import GHC.Builtin.Names ( makeStaticName, unsafeEqualityProofIdKey )
+import GHC.Builtin.Names ( makeStaticName, unsafeEqualityProofIdKey, unsafeReflDataConKey )
 import GHC.Builtin.PrimOps
 
 import GHC.Types.Var
@@ -91,8 +92,7 @@ import GHC.Types.Literal
 import GHC.Types.Tickish
 import GHC.Types.Id
 import GHC.Types.Id.Info
-import GHC.Types.Basic( Arity, Levity(..)
-                       )
+import GHC.Types.Basic( Arity )
 import GHC.Types.Unique
 import GHC.Types.Unique.Set
 import GHC.Types.Demand
@@ -105,7 +105,6 @@ import GHC.Data.OrdList
 import GHC.Utils.Constants (debugIsOn)
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
-import GHC.Utils.Panic.Plain
 import GHC.Utils.Misc
 
 import Data.ByteString     ( ByteString )
@@ -141,8 +140,7 @@ exprType (Lam binder expr)   = mkLamType binder (exprType expr)
 exprType e@(App _ _)
   = case collectArgs e of
         (fun, args) -> applyTypeToArgs (pprCoreExpr e) (exprType fun) args
-
-exprType other = pprPanic "exprType" (pprCoreExpr other)
+exprType (Type ty) = pprPanic "exprType" (ppr ty)
 
 coreAltType :: CoreAlt -> Type
 -- ^ Returns the type of the alternatives right hand side
@@ -163,17 +161,20 @@ mkLamType  :: HasDebugCallStack => Var -> Type -> Type
 -- ^ Makes a @(->)@ type or an implicit forall type, depending
 -- on whether it is given a type variable or a term variable.
 -- This is used, for example, when producing the type of a lambda.
--- Always uses Inferred binders.
+--
 mkLamTypes :: [Var] -> Type -> Type
 -- ^ 'mkLamType' for multiple type or value arguments
 
 mkLamType v body_ty
    | isTyVar v
-   = mkForAllTy (Bndr v Inferred) body_ty
+   = mkForAllTy (Bndr v coreTyLamForAllTyFlag) body_ty
+     -- coreTyLamForAllTyFlag: see Note [Required foralls in Core]
+     --                        in GHC.Core.TyCo.Rep
 
    | isCoVar v
    , v `elemVarSet` tyCoVarsOfType body_ty
-   = mkForAllTy (Bndr v Required) body_ty
+     -- See Note [Unused coercion variable in ForAllTy] in GHC.Core.TyCo.Rep
+   = mkForAllTy (Bndr v coreTyLamForAllTyFlag) body_ty
 
    | otherwise
    = mkFunctionType (varMult v) (varType v) body_ty
@@ -512,14 +513,21 @@ bindNonRec bndr rhs body
     case_bind = mkDefaultCase rhs bndr body
     let_bind  = Let (NonRec bndr rhs) body
 
--- | Tests whether we have to use a @case@ rather than @let@ binding for this
--- expression as per the invariants of 'CoreExpr': see "GHC.Core#let_can_float_invariant"
-needsCaseBinding :: Type -> CoreExpr -> Bool
-needsCaseBinding ty rhs
-  = mightBeUnliftedType ty && not (exprOkForSpeculation rhs)
-        -- Make a case expression instead of a let
-        -- These can arise either from the desugarer,
-        -- or from beta reductions: (\x.e) (x +# y)
+-- | `needsCaseBinding` tests whether we have to use a @case@ rather than @let@
+-- binding for this expression as per the invariants of 'CoreExpr': see
+-- "GHC.Core#let_can_float_invariant"
+-- (needsCaseBinding ty rhs) requires that `ty` has a well-defined levity, else
+-- `typeLevity ty` will fail; but that should be the case because
+-- `needsCaseBinding` is only called once typechecking is complete
+needsCaseBinding :: HasDebugCallStack => Type -> CoreExpr -> Bool
+needsCaseBinding ty rhs = needsCaseBindingL (typeLevity ty) rhs
+
+needsCaseBindingL :: Levity -> CoreExpr -> Bool
+-- True <=> make a case expression instead of a let
+-- These can arise either from the desugarer,
+-- or from beta reductions: (\x.e) (x +# y)
+needsCaseBindingL Lifted   _rhs = False
+needsCaseBindingL Unlifted rhs = not (exprOkForSpeculation rhs)
 
 mkAltExpr :: AltCon     -- ^ Case alternative constructor
           -> [CoreBndr] -- ^ Things bound by the pattern match
@@ -847,7 +855,8 @@ There are two exceptions where we avoid refining a DEFAULT case:
            __DEFAULT -> ()
 
   Namely, we do _not_ want to match on `A`, as it doesn't exist at the value
-  level!
+  level! See wrinkle (W2b) in Note [Type data declarations] in GHC.Rename.Module
+
 
 Note [Combine identical alternatives]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1065,6 +1074,9 @@ trivial_expr_fold :: (Id -> r) -> (Literal -> r) -> r -> r -> CoreExpr -> r
 -- * `case e of {}` an empty case
 trivial_expr_fold k_id k_lit k_triv k_not_triv = go
   where
+    -- If you change this function, be sure to change SetLevels.notWorthFloating
+    -- as well!
+    -- (Or yet better: Come up with a way to share code with this function.)
     go (Var v)                            = k_id v  -- See Note [Variables are trivial]
     go (Lit l)    | litIsTrivial l        = k_lit l
     go (Type _)                           = k_triv
@@ -1073,7 +1085,11 @@ trivial_expr_fold k_id k_lit k_triv k_not_triv = go
     go (Lam b e)  | not (isRuntimeVar b)  = go e
     go (Tick t e) | not (tickishIsCode t) = go e              -- See Note [Tick trivial]
     go (Cast e _)                         = go e
-    go (Case e _ _ [])                    = go e              -- See Note [Empty case is trivial]
+    go (Case e b _ as)
+      | null as
+      = go e     -- See Note [Empty case is trivial]
+      | Just rhs <- isUnsafeEqualityCase e b as
+      = go rhs   -- See (U2) of Note [Implementing unsafeCoerce] in base:Unsafe.Coerce
     go _                                  = k_not_triv
 
 exprIsTrivial :: CoreExpr -> Bool
@@ -1384,6 +1400,7 @@ isWorkFreeApp fn n_val_args
   | otherwise
   = case idDetails fn of
       DataConWorkId {} -> True
+      PrimOpId op _    -> primOpIsWorkFree op
       _                -> False
 
 isCheapApp :: CheapAppFun
@@ -1491,34 +1508,45 @@ it's applied only to dictionaries.
 -}
 
 -----------------------------
--- | 'exprOkForSpeculation' returns True of an expression that is:
+-- | To a first approximation, 'exprOkForSpeculation' returns True of
+-- an expression that is:
 --
 --  * Safe to evaluate even if normal order eval might not
---    evaluate the expression at all, or
+--    evaluate the expression at all, and
 --
 --  * Safe /not/ to evaluate even if normal order would do so
 --
--- It is usually called on arguments of unlifted type, but not always
--- In particular, Simplify.rebuildCase calls it on lifted types
--- when a 'case' is a plain 'seq'. See the example in
--- Note [exprOkForSpeculation: case expressions] below
+-- More specifically, this means that:
+--  * A: Evaluation of the expression reaches weak-head-normal-form,
+--  * B: soon,
+--  * C: without causing a write side effect (e.g. writing a mutable variable).
 --
--- Precisely, it returns @True@ iff:
---  a) The expression guarantees to terminate,
---  b) soon,
---  c) without causing a write side effect (e.g. writing a mutable variable)
---  d) without throwing a Haskell exception
---  e) without risking an unchecked runtime exception (array out of bounds,
---     divide by zero)
+-- In particular, an expression that may
+--  * throw a synchronous Haskell exception, or
+--  * risk an unchecked runtime exception (e.g. array
+--    out of bounds, divide by zero)
+-- is /not/ considered OK-for-speculation, as these violate condition A.
 --
--- For @exprOkForSideEffects@ the list is the same, but omitting (e).
+-- For 'exprOkToDiscard', condition A is weakened to allow expressions
+-- that might risk an unchecked runtime exception but must otherwise
+-- reach weak-head-normal-form.
+-- (Note that 'exprOkForSpeculation' implies 'exprOkToDiscard')
 --
--- Note that
---    exprIsHNF            implies exprOkForSpeculation
---    exprOkForSpeculation implies exprOkForSideEffects
+-- But in fact both functions are a bit more conservative than the above,
+-- in at least the following ways:
 --
--- See Note [PrimOp can_fail and has_side_effects] in "GHC.Builtin.PrimOps"
--- and Note [Transformations affected by can_fail and has_side_effects]
+--  * W1: We do not take advantage of already-evaluated lifted variables.
+--        As a result, 'exprIsHNF' DOES NOT imply 'exprOkForSpeculation';
+--        if @y@ is a case-binder of lifted type, then @exprIsHNF y@ is
+--        'True', while @exprOkForSpeculation y@ is 'False'.
+--        See Note [exprOkForSpeculation and evaluated variables] for why.
+--  * W2: Read-effects on mutable variables are currently also included.
+--        See Note [Classifying primop effects] "GHC.Builtin.PrimOps".
+--  * W3: Currently, 'exprOkForSpeculation' always returns 'False' for
+--        let-expressions.  Lets can be stacked deeply, so we just give up.
+--        In any case, the argument of 'exprOkForSpeculation' is usually in
+--        a strict context, so any lets will have been floated away.
+--
 --
 -- As an example of the considerations in this test, consider:
 --
@@ -1532,12 +1560,24 @@ it's applied only to dictionaries.
 -- >    in E
 -- > }
 --
--- We can only do this if the @y + 1@ is ok for speculation: it has no
+-- We can only do this if the @y# +# 1#@ is ok for speculation: it has no
 -- side effects, and can't diverge or raise an exception.
+--
+--
+-- See also Note [Classifying primop effects] in "GHC.Builtin.PrimOps"
+-- and Note [Transformations affected by primop effects].
+--
+-- 'exprOkForSpeculation' is used to define Core's let-can-float
+-- invariant.  (See Note [Core let-can-float invariant] in
+-- "GHC.Core".)  It is therefore frequently called on arguments of
+-- unlifted type, especially via 'needsCaseBinding'.  But it is
+-- sometimes called on expressions of lifted type as well.  For
+-- example, see Note [Speculative evaluation] in "GHC.CoreToStg.Prep".
 
-exprOkForSpeculation, exprOkForSideEffects :: CoreExpr -> Bool
+
+exprOkForSpeculation, exprOkToDiscard :: CoreExpr -> Bool
 exprOkForSpeculation = expr_ok fun_always_ok primOpOkForSpeculation
-exprOkForSideEffects = expr_ok fun_always_ok primOpOkForSideEffects
+exprOkToDiscard      = expr_ok fun_always_ok primOpOkToDiscard
 
 fun_always_ok :: Id -> Bool
 fun_always_ok _ = True
@@ -1567,10 +1607,7 @@ expr_ok fun_ok primop_ok (Tick tickish e)
    | otherwise             = expr_ok fun_ok primop_ok e
 
 expr_ok _ _ (Let {}) = False
-  -- Lets can be stacked deeply, so just give up.
-  -- In any case, the argument of exprOkForSpeculation is
-  -- usually in a strict context, so any lets will have been
-  -- floated away.
+-- See W3 in the Haddock comment for exprOkForSpeculation
 
 expr_ok fun_ok primop_ok (Case scrut bndr _ alts)
   =  -- See Note [exprOkForSpeculation: case expressions]
@@ -1602,21 +1639,38 @@ app_ok :: (Id -> Bool) -> (PrimOp -> Bool) -> Id -> [CoreExpr] -> Bool
 app_ok fun_ok primop_ok fun args
   | not (fun_ok fun)
   = False -- This code path is only taken for Note [Speculative evaluation]
+
+  | idArity fun > n_val_args
+  -- Partial application: just check passing the arguments is OK
+  = args_ok
+
   | otherwise
   = case idDetails fun of
-      DFunId new_type ->  not new_type
+      DFunId new_type -> not new_type
          -- DFuns terminate, unless the dict is implemented
          -- with a newtype in which case they may not
 
-      DataConWorkId {} -> True
+      DataConWorkId {} -> args_ok
                 -- The strictness of the constructor has already
                 -- been expressed by its "wrapper", so we don't need
                 -- to take the arguments into account
+                   -- Well, we thought so.  But it's definitely wrong!
+                   -- See #20749 and Note [How untagged pointers can
+                   -- end up in strict fields] in GHC.Stg.InferTags
+
+      ClassOpId _ is_terminating_result
+        | is_terminating_result -- See Note [exprOkForSpeculation and type classes]
+        -> assertPpr (n_val_args == 1) (ppr fun $$ ppr args) $
+           True
+           -- assert: terminating result type => can't be applied;
+           -- c.f the _other case below
 
       PrimOpId op _
         | primOpIsDiv op
-        , [arg1, Lit lit] <- args
-        -> not (isZeroLit lit) && expr_ok fun_ok primop_ok arg1
+        , Lit divisor <- last args
+            -- there can be 2 args (most div primops) or 3 args
+            -- (WordQuotRem2Op), hence the use of last/init
+        -> not (isZeroLit divisor) && all (expr_ok fun_ok primop_ok) (init args)
               -- Special case for dividing operations that fail
               -- In general they are NOT ok-for-speculation
               -- (which primop_ok will catch), but they ARE OK
@@ -1624,32 +1678,21 @@ app_ok fun_ok primop_ok fun args
               -- Often there is a literal divisor, and this
               -- can get rid of a thunk in an inner loop
 
-        | SeqOp <- op  -- See Note [exprOkForSpeculation and SeqOp/DataToTagOp]
-        -> False       --     for the special cases for SeqOp and DataToTagOp
-        | DataToTagOp <- op
-        -> False
-        | KeepAliveOp <- op
-        -> False
+        | otherwise -> primop_ok op && args_ok
 
-        | otherwise
-        -> primop_ok op  -- Check the primop itself
-        && and (zipWith arg_ok arg_tys args)  -- Check the arguments
-
-      _  -- Unlifted types
-         -- c.f. the Var case of exprIsHNF
-         | Just Unlifted <- typeLevity_maybe (idType fun)
+      _other  -- Unlifted and terminating types;
+              -- Also c.f. the Var case of exprIsHNF
+         |  isTerminatingType fun_ty  -- See Note [exprOkForSpeculation and type classes]
+         || definitelyUnliftedType fun_ty
          -> assertPpr (n_val_args == 0) (ppr fun $$ ppr args)
-            True  -- Our only unlifted types are Int# etc, so will have
-                  -- no value args.  The assert is just to check this.
-                  -- If we added unlifted function types this would change,
-                  -- and we'd need to actually test n_val_args == 0.
-
-         -- Partial applications
-         | idArity fun > n_val_args ->
-           and (zipWith arg_ok arg_tys args)  -- Check the arguments
+            True  -- Both terminating types (e.g. Eq a), and unlifted types (e.g. Int#)
+                  -- are non-functions and so will have no value args.  The assert is
+                  -- just to check this.
+                  -- (If we added unlifted function types this would change,
+                  -- and we'd need to actually test n_val_args == 0.)
 
          -- Functions that terminate fast without raising exceptions etc
-         -- See Note [Discarding unnecessary unsafeEqualityProofs]
+         -- See (U12) of Note [Implementing unsafeCoerce]
          | fun `hasKey` unsafeEqualityProofIdKey -> True
 
          | otherwise -> False
@@ -1657,15 +1700,18 @@ app_ok fun_ok primop_ok fun args
              --     for evaluated-ness of the fun;
              --     see Note [exprOkForSpeculation and evaluated variables]
   where
+    fun_ty       = idType fun
     n_val_args   = valArgCount args
-    (arg_tys, _) = splitPiTys (idType fun)
+    (arg_tys, _) = splitPiTys fun_ty
 
-    -- Used for arguments to primops and to partial applications
+    -- Even if a function call itself is OK, any unlifted
+    -- args are still evaluated eagerly and must be checked
+    args_ok = and (zipWith arg_ok arg_tys args)
     arg_ok :: PiTyVarBinder -> CoreExpr -> Bool
     arg_ok (Named _) _ = True   -- A type argument
     arg_ok (Anon ty _) arg      -- A term argument
-       | Just Lifted <- typeLevity_maybe (scaledThing ty)
-       = True -- See Note [Primops with lifted arguments]
+       | definitelyLiftedType (scaledThing ty)
+       = True -- lifted args are not evaluated eagerly
        | otherwise
        = expr_ok fun_ok primop_ok arg
 
@@ -1674,7 +1720,7 @@ altsAreExhaustive :: [Alt b] -> Bool
 -- True  <=> the case alternatives are definitely exhaustive
 -- False <=> they may or may not be
 altsAreExhaustive []
-  = False    -- Should not happen
+  = True    -- The scrutinee never returns; see Note [Empty case alternatives] in GHC.Core
 altsAreExhaustive (Alt con1 _ _ : alts)
   = case con1 of
       DEFAULT   -> True
@@ -1694,8 +1740,36 @@ etaExpansionTick id t
   = hasNoBinding id &&
     ( tickishFloatable t || isProfTick t )
 
-{- Note [exprOkForSpeculation: case expressions]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+{- Note [exprOkForSpeculation and type classes]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Consider (#22745, #15205)
+
+  \(d :: C a b). case eq_sel (sc_sel d) of
+                   (co :: t1 ~# t2) [Dead] ->  blah
+
+We know that
+* eq_sel's argument (sc_sel d) has dictionary type, so it definitely terminates
+  (again Note [NON-BOTTOM-DICTS invariant] in GHC.Core)
+* eq_sel is simply a superclass selector, and hence is fast
+* The field that eq_sel picks is of unlifted type, and hence can't be bottom
+  (remember the dictionary argument itself is non-bottom)
+
+So we can treat (eq_sel (sc_sel d)) as ok-for-speculation.  We must check
+
+a) That the function is a class-op, with IdDetails of ClassOpId
+
+b) That the result type of the class-op is terminating or unlifted.  E.g. for
+     class C a => D a where ...
+     class C a where { op :: a -> a }
+   Since C is represented by a newtype, (sc_sel (d :: D a)) might
+   not be terminating.
+
+Rather than repeatedly test if the result of the class-op is a
+terminating/unlifted type, we cache it as a field of ClassOpId. See
+GHC.Types.Id.Make.mkDictSelId for where this field is initialised.
+
+Note [exprOkForSpeculation: case expressions]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 exprOkForSpeculation accepts very special case expressions.
 Reason: (a ==# b) is ok-for-speculation, but the litEq rules
 in GHC.Core.Opt.ConstantFold convert it (a ==# 3#) to
@@ -1784,77 +1858,36 @@ points do the job nicely.
 ------- End of historical note ------------
 
 
-Note [Primops with lifted arguments]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Is this ok-for-speculation (see #13027)?
-   reallyUnsafePtrEquality# a b
-Well, yes.  The primop accepts lifted arguments and does not
-evaluate them.  Indeed, in general primops are, well, primitive
-and do not perform evaluation.
-
-Bottom line:
-  * In exprOkForSpeculation we simply ignore all lifted arguments.
-  * In the rare case of primops that /do/ evaluate their arguments,
-    (namely DataToTagOp and SeqOp) return False; see
-    Note [exprOkForSpeculation and evaluated variables]
-
-Note [exprOkForSpeculation and SeqOp/DataToTagOp]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Most primops with lifted arguments don't evaluate them
-(see Note [Primops with lifted arguments]), so we can ignore
-that argument entirely when doing exprOkForSpeculation.
-
-But DataToTagOp and SeqOp are exceptions to that rule.
-For reasons described in Note [exprOkForSpeculation and
-evaluated variables], we simply return False for them.
-
-Not doing this made #5129 go bad.
-Lots of discussion in #15696.
-
 Note [exprOkForSpeculation and evaluated variables]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Recall that
-  seq#       :: forall a s. a -> State# s -> (# State# s, a #)
-  dataToTag# :: forall a.   a -> Int#
-must always evaluate their first argument.
-
-Now consider these examples:
+Consider these examples:
  * case x of y { DEFAULT -> ....y.... }
    Should 'y' (alone) be considered ok-for-speculation?
 
- * case x of y { DEFAULT -> ....let z = dataToTag# y... }
-   Should (dataToTag# y) be considered ok-for-spec?
+ * case x of y { DEFAULT -> ....let z = dataToTagLarge# y... }
+   Should (dataToTagLarge# y) be considered ok-for-spec? Recall that
+     dataToTagLarge# :: forall a. a -> Int#
+   must always evaluate its argument. (See also Note [DataToTag overview].)
 
 You could argue 'yes', because in the case alternative we know that
 'y' is evaluated.  But the binder-swap transformation, which is
 extremely useful for float-out, changes these expressions to
    case x of y { DEFAULT -> ....x.... }
-   case x of y { DEFAULT -> ....let z = dataToTag# x... }
+   case x of y { DEFAULT -> ....let z = dataToTagLarge# x... }
 
 And now the expression does not obey the let-can-float invariant!  Yikes!
-Moreover we really might float (dataToTag# x) outside the case,
+Moreover we really might float (dataToTagLarge# x) outside the case,
 and then it really, really doesn't obey the let-can-float invariant.
 
 The solution is simple: exprOkForSpeculation does not try to take
 advantage of the evaluated-ness of (lifted) variables.  And it returns
-False (always) for DataToTagOp and SeqOp.
+False (always) for primops that perform evaluation.  We achieve the latter
+by marking the relevant primops as "ThrowsException" or
+"ReadWriteEffect"; see also Note [Classifying primop effects] in
+GHC.Builtin.PrimOps.
 
 Note that exprIsHNF /can/ and does take advantage of evaluated-ness;
 it doesn't have the trickiness of the let-can-float invariant to worry about.
-
-Note [Discarding unnecessary unsafeEqualityProofs]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-In #20143 we found
-   case unsafeEqualityProof @t1 @t2 of UnsafeRefl cv[dead] -> blah
-where 'blah' didn't mention 'cv'.  We'd like to discard this
-redundant use of unsafeEqualityProof, via GHC.Core.Opt.Simplify.rebuildCase.
-To do this we need to know
-  (a) that cv is unused (done by OccAnal), and
-  (b) that unsafeEqualityProof terminates rapidly without side effects.
-
-At the moment we check that explicitly here in exprOkForSideEffects,
-but one might imagine a more systematic check in future.
-
 
 ************************************************************************
 *                                                                      *
@@ -1867,15 +1900,15 @@ but one might imagine a more systematic check in future.
 -- ~~~~~~~~~~~~~~~~
 -- | exprIsHNF returns true for expressions that are certainly /already/
 -- evaluated to /head/ normal form.  This is used to decide whether it's ok
--- to change:
+-- to perform case-to-let for lifted expressions, which changes:
 --
--- > case x of _ -> e
+-- > case x of x' { _ -> e }
 --
 --    into:
 --
--- > e
+-- > let x' = x in e
 --
--- and to decide whether it's safe to discard a 'seq'.
+-- and in so doing makes the binding lazy.
 --
 -- So, it does /not/ treat variables as evaluated, unless they say they are.
 -- However, it /does/ treat partial applications and constructor applications
@@ -1920,7 +1953,8 @@ exprIsHNFlike is_con is_con_unf = is_hnf_like
         -- We don't look through loop breakers here, which is a bit conservative
         -- but otherwise I worry that if an Id's unfolding is just itself,
         -- we could get an infinite loop
-      || ( typeLevity_maybe (idType v) == Just Unlifted )
+
+      || definitelyUnliftedType (idType v)
         -- Unlifted binders are always evaluated (#20140)
 
     is_hnf_like (Lit l)          = not (isLitRubbish l)
@@ -1938,6 +1972,9 @@ exprIsHNFlike is_con is_con_unf = is_hnf_like
       | isValArg a               = app_is_value e 1
       | otherwise                = is_hnf_like e
     is_hnf_like (Let _ e)        = is_hnf_like e  -- Lazy let(rec)s don't affect us
+    is_hnf_like (Case e b _ as)
+      | Just rhs <- isUnsafeEqualityCase e b as
+      = is_hnf_like rhs
     is_hnf_like _                = False
 
     -- 'n' is the number of value args to which the expression is applied
@@ -2091,9 +2128,8 @@ dataConInstPat fss uniqs mult con inst_tys
     arg_ids = zipWith4 mk_id_var id_uniqs id_fss arg_tys arg_strs
     mk_id_var uniq fs (Scaled m ty) str
       = setCaseBndrEvald str $  -- See Note [Mark evaluated arguments]
-        mkLocalIdOrCoVar name (mult `mkMultMul` m) (Type.substTy full_subst ty)
-      where
-        name = mkInternalName uniq (mkVarOccFS fs) noSrcSpan
+        mkUserLocalOrCoVar (mkVarOccFS fs) uniq
+                           (mult `mkMultMul` m) (Type.substTy full_subst ty) noSrcSpan
 
 {-
 Note [Mark evaluated arguments]
@@ -2146,10 +2182,11 @@ cheapEqExpr' ignoreTick e1 e2
 
 -- Used by diffBinds, which is itself only used in GHC.Core.Lint.lintAnnots
 eqTickish :: RnEnv2 -> CoreTickish -> CoreTickish -> Bool
-eqTickish env (Breakpoint lext lid lids) (Breakpoint rext rid rids)
+eqTickish env (Breakpoint lext lid lids lmod) (Breakpoint rext rid rids rmod)
       = lid == rid &&
         map (rnOccL env) lids == map (rnOccR env) rids &&
-        lext == rext
+        lext == rext &&
+        lmod == rmod
 eqTickish _ l r = l == r
 
 -- | Finds differences between core bindings, see @diffExpr@.
@@ -2633,7 +2670,7 @@ shouldUseCbvForId = wantCbvForId True
 
 -- When we strictify we want to skip strict args otherwise the logic is the same
 -- as for shouldUseCbvForId so we common up the logic here.
--- Basically returns true if it would be benefitial for runtime to pass this argument
+-- Basically returns true if it would be beneficial for runtime to pass this argument
 -- as CBV independent of weither or not it's correct. E.g. it might return true for lazy args
 -- we are not allowed to force.
 wantCbvForId :: Bool -> Var -> Bool
@@ -2668,11 +2705,20 @@ wantCbvForId cbv_for_strict v
 *                                                                      *
 ********************************************************************* -}
 
-isUnsafeEqualityProof :: CoreExpr -> Bool
+isUnsafeEqualityCase :: CoreExpr -> Id -> [CoreAlt] -> Maybe CoreExpr
 -- See (U3) and (U4) in
 -- Note [Implementing unsafeCoerce] in base:Unsafe.Coerce
-isUnsafeEqualityProof e
-  | Var v `App` Type _ `App` Type _ `App` Type _ <- e
-  = v `hasKey` unsafeEqualityProofIdKey
+isUnsafeEqualityCase scrut bndr alts
+  | [Alt ac _ rhs] <- alts
+  , DataAlt dc <- ac
+  , dc `hasKey` unsafeReflDataConKey
+  , isDeadBinder bndr
+      -- We can only discard the case if the case-binder is dead
+      -- It usually is, but see #18227
+  , Var v `App` _ `App` _ `App` _ <- scrut
+  , v `hasKey` unsafeEqualityProofIdKey
+      -- Check that the scrutinee really is unsafeEqualityProof
+      -- and not, say, error
+  = Just rhs
   | otherwise
-  = False
+  = Nothing

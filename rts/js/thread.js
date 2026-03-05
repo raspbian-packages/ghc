@@ -70,7 +70,7 @@ var h$blocked = new h$Set();
 function h$Thread() {
     this.tid = ++h$threadIdN;
     this.status = THREAD_RUNNING;
-    this.stack = [h$done, 0, h$baseZCGHCziConcziSynczireportError, h$catch_e];
+    this.stack = [h$done, 0, h$ghczminternalZCGHCziInternalziConcziSynczireportError, h$catch_e];
 #ifdef GHCJS_DEBUG_STACK
     this.stack = new Proxy(this.stack, {
      set(obj,prop,value) {
@@ -138,6 +138,7 @@ function h$getThreadLabel(t) {
 
 function h$listThreads() {
   var r = h$newArray(0,null);
+  var t;
 
   if (h$currentThread) r.push(h$currentThread);
 
@@ -176,6 +177,32 @@ function h$forkThread(a, inherit) {
 function h$threadStatus(t) {
   // status, capability, locked
   RETURN_UBX_TUP3(t.status, 0, 1);
+}
+
+// Required by Google Closure Compiler static code analysis
+var h$fds = {};
+
+// Copied from GHCJS because it is required by Google Closure Compiler
+// static code analysis
+function h$fdReady(fd, write, msecs, isSock) {
+  var f = h$fds[fd];
+  if(write) {
+    if(f.writeReady) {
+      return 1;
+    } else if(msecs === 0) {
+      return 0;
+    } else {
+      throw "h$fdReady: blocking not implemented";
+    }
+  } else {
+    if(f.readReady) {
+      return 1;
+    } else if(msecs === 0) {
+      return 0;
+    } else {
+      throw "h$fdReady: blocking not implemented";
+    }
+  }
 }
 
 function h$waitRead(fd) {
@@ -797,7 +824,7 @@ function h$runThreadSliceCatch(c) {
     h$currentThread is the thread to run
     h$stack         is the stack of this thread
     h$sp            is the stack pointer
-  
+
     any global variables needed to pass arguments have been set
     the caller has to update the thread state object
  */
@@ -877,7 +904,7 @@ function h$handleBlockedSyncThread(c) {
       TRACE_SCHEDULER("blocking synchronous thread: exception")
       h$sp += 2;
       h$currentThread.sp = h$sp;
-      h$stack[h$sp-1] = h$baseZCGHCziJSziPrimziInternalziwouldBlock;
+      h$stack[h$sp-1] = h$ghczminternalZCGHCziInternalziJSziPrimziInternalziwouldBlock;
       h$stack[h$sp]   = h$raiseAsync_frame;
       h$forceWakeupThread(h$currentThread);
       c = h$raiseAsync_frame;
@@ -897,7 +924,7 @@ function h$run(a) {
 
 /** @constructor */
 function h$WouldBlock() {
-  
+
 }
 
 h$WouldBlock.prototype.toString = function() {
@@ -949,7 +976,7 @@ function h$setCurrentThreadResultValue(v) {
 function h$runSyncReturn(a, cont) {
   var t = new h$Thread();
   TRACE_SCHEDULER("h$runSyncReturn created thread: " + h$threadString(t))
-  var aa = MK_AP1(h$baseZCGHCziJSziPrimziInternalzisetCurrentThreadResultValue, a);
+  var aa = MK_AP1(h$ghczminternalZCGHCziInternalziJSziPrimziInternalzisetCurrentThreadResultValue, a);
   h$runSyncAction(t, aa, cont);
   if(t.status === THREAD_FINISHED) {
     if(t.resultIsException) {
@@ -967,7 +994,7 @@ function h$runSyncReturn(a, cont) {
 /*
    run a Haskell IO action synchronously, ignoring the result
    or any exception in the Haskell code
-     
+
      - a:    the IO action
      - cont: continue async if blocked
 
@@ -992,7 +1019,7 @@ function h$runSync(a, cont) {
 function h$runSyncAction(t, a, cont) {
   h$runInitStatic();
   var c = h$return;
-  t.stack[2] = h$baseZCGHCziJSziPrimziInternalzisetCurrentThreadResultException;
+  t.stack[2] = h$ghczminternalZCGHCziInternalziJSziPrimziInternalzisetCurrentThreadResultException;
   t.stack[4] = h$ap_1_0;
   t.stack[5] = a;
   t.stack[6] = h$return;
@@ -1146,7 +1173,7 @@ function h$main(a) {
     t.stack[0] = h$doneMain_e;
 #ifndef GHCJS_BROWSER
   if(!h$isBrowser() && !h$isGHCJSi()) {
-    t.stack[2] = h$baseZCGHCziTopHandlerzitopHandler;
+    t.stack[2] = h$ghczminternalZCGHCziInternalziTopHandlerzitopHandler;
   }
 #endif
   t.stack[4] = h$ap_1_0;
@@ -1391,7 +1418,7 @@ function h$blockOnBlackhole(c) {
   TRACE_SCHEDULER("blackhole, blocking: " + h$collectProps(c))
   if(BLACKHOLE_TID(c) === h$currentThread) {
     TRACE_SCHEDULER("NonTermination")
-    return h$throw(h$baseZCControlziExceptionziBasezinonTermination, true);
+    return h$throw(h$ghczminternalZCGHCziInternalziControlziExceptionziBasezinonTermination, true);
   }
   TRACE_SCHEDULER("blackhole, blocking thread: " + h$threadString(h$currentThread))
   if(BLACKHOLE_QUEUE(c) === null) {
@@ -1459,5 +1486,3 @@ function h$makeMVarListener(mv, stopProp, stopImmProp, preventDefault) {
 function h$rs() {
   return h$stack[h$sp];
 }
-
-const rts_isThreaded = 0;

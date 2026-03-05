@@ -1,6 +1,6 @@
 cabal-version:  >=1.10
 name:           stm
-version:        2.5.1.0
+version:        2.5.3.1
 -- don't forget to update changelog.md file!
 
 license:        BSD3
@@ -11,7 +11,7 @@ bug-reports:    https://github.com/haskell/stm/issues
 synopsis:       Software Transactional Memory
 category:       Concurrency
 build-type:     Simple
-tested-with:    GHC==8.10.*, GHC==8.8.*, GHC==8.6.*, GHC==8.4.*, GHC==8.2.*, GHC==8.0.*, GHC==7.10.*, GHC==7.8.*, GHC==7.6.*, GHC==7.4.*, GHC==7.2.*
+tested-with:    GHC==9.6.2, GHC==9.4.7, GHC==9.2.8, GHC==9.0.2, GHC==8.10.7, GHC==8.8.4, GHC==8.6.5, GHC==8.4.4, GHC==8.2.2, GHC==8.0.2, GHC==7.10.3, GHC==7.8.4, GHC==7.6.3, GHC==7.4.2, GHC==7.2.2
 description:
     Software Transactional Memory, or STM, is an abstraction for
     concurrent communication. The main benefits of STM are
@@ -53,7 +53,7 @@ library
         build-depends: semigroups >=0.18.6 && <0.21
 
     build-depends:
-        base  >= 4.4 && < 4.19,
+        base  >= 4.4 && < 4.21,
         array >= 0.3 && < 0.6
 
     exposed-modules:

@@ -27,7 +27,7 @@ import GHC.Cmm.Lint         ( cmmLint )
 import GHC.Cmm
 import GHC.Cmm.CLabel
 
-import GHC.Driver.Session
+import GHC.Driver.DynFlags
 import GHC.Driver.Config.Finder    ( initFinderOpts   )
 import GHC.Driver.Config.CmmToAsm  ( initNCGConfig    )
 import GHC.Driver.Config.CmmToLlvm ( initLlvmCgConfig )
@@ -105,7 +105,7 @@ codeOutput logger tmpfs llvm_config dflags unit_state this_mod filenm location g
                   (const ()) $ do
                 { case cmmLint (targetPlatform dflags) cmm of
                         Just err -> do { logMsg logger
-                                                   MCDump
+                                                   MCInfo -- See Note [MCInfo for Lint] in "GHC.Core.Lint"
                                                    noSrcSpan
                                                    $ withPprStyle defaultDumpStyle err
                                        ; ghcExit logger 1

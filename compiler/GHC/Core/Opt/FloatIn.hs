@@ -28,8 +28,8 @@ import GHC.Core.Utils
 import GHC.Core.FVs
 import GHC.Core.Type
 
-import GHC.Types.Basic      ( RecFlag(..), isRec, Levity(Unlifted) )
-import GHC.Types.Id         ( idType, isJoinId, isJoinId_maybe )
+import GHC.Types.Basic      ( RecFlag(..), isRec )
+import GHC.Types.Id         ( idType, isJoinId, idJoinPointHood )
 import GHC.Types.Tickish
 import GHC.Types.Var
 import GHC.Types.Var.Set
@@ -234,6 +234,29 @@ Every jump must be exact, so the jump to j must have three arguments. Hence
 we're careful not to float into the target of a jump (though we can float into
 the arguments just fine).
 
+Floating in can /enhance/ join points.  Consider this (#3458)
+    f2 x = let g :: Int -> Int
+               g y = if y==0 then y+x else g (y-1)
+           in case g x of
+                0 -> True
+                _ -> False
+
+Here `g` is not a join point. But if we float inwards it becomes one!  We
+float in; the occurrence analyser identifies `g` as a join point; the Simplifier
+retains that property, so we get
+    f2 x = case (joinrec
+                    g y = if y==0 then y+x else g (y-1)
+                 in jump g x) of
+              0 -> True
+              _ -> False
+
+Now that outer case gets pushed into the RHS of the joinrec, giving
+    f2 x = joinrec g y = if y==0
+                         then case y+x of { 0 -> True; _ -> False }
+                         else jump g (y-1)
+           in jump g x
+Nice!
+
 Note [Floating in past a lambda group]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 * We must be careful about floating inside a value lambda.
@@ -306,7 +329,7 @@ It is obviously bogus for FloatIn to transform to
        (y:ys) -> ...(let x = y+1 in x)...
        [] -> blah
 because the y is captured.  This doesn't happen much, because shadowing is
-rare, but it did happen in #22662.
+rare (see Note [Shadowing in Core]), but it did happen in #22662.
 
 One solution would be to clone as we go.  But a simpler one is this:
 
@@ -322,7 +345,7 @@ the "used-here" set:
 
 * In fiExpr (AnnCase ...). Remember to include the case_bndr in the
   binders.  Again, no need to delete the alt binders from the rhs
-  free vars, beause any bindings mentioning them will be dropped
+  free vars, because any bindings mentioning them will be dropped
   here unconditionally.
 -}
 
@@ -423,6 +446,30 @@ motivating example was #5658: in particular, this change allows
 array indexing operations, which have a single DEFAULT alternative
 without any binders, to be floated inward.
 
+In particular, we want to be able to transform
+
+  case indexIntArray# arr i of vi {
+    __DEFAULT -> case <# j n of _ {
+      __DEFAULT -> False
+      1# -> case indexIntArray# arr j of vj {
+        __DEFAULT -> ... vi ... vj ...
+      }
+    }
+  }
+
+by floating in `indexIntArray# arr i` to produce
+
+  case <# j n of _ {
+    __DEFAULT -> False
+    1# -> case indexIntArray# arr i of vi {
+      __DEFAULT -> case indexIntArray# arr j of vj {
+        __DEFAULT -> ... vi ... vj ...
+      }
+    }
+  }
+
+...which skips the `indexIntArray# arr i` call entirely in the out-of-bounds branch.
+
 SIMD primops for unpacking SIMD vectors into an unboxed tuple of unboxed
 scalars also need to be floated inward, but unpacks have a single non-DEFAULT
 alternative that binds the elements of the tuple. We now therefore also support
@@ -431,12 +478,11 @@ floating in cases with a single alternative that may bind values.
 But there are wrinkles
 
 * Which unlifted cases do we float?
-  See Note [PrimOp can_fail and has_side_effects] in GHC.Builtin.PrimOps which
-  explains:
-   - We can float in can_fail primops (which concerns imprecise exceptions),
-     but we can't float them out.
-   - But we can float a has_side_effects primop, but NOT inside a lambda,
-     so for now we don't float them at all. Hence exprOkForSideEffects.
+  See Note [Transformations affected by primop effects] in GHC.Builtin.PrimOps
+  which explains:
+   - We can float in or discard CanFail primops, but we can't float them out.
+   - We don't want to discard a synchronous exception or side effect
+     so we don't float those at all. Hence exprOkToDiscard.
    - Throwing precise exceptions is a special case of the previous point: We
      may /never/ float in a call to (something that ultimately calls)
      'raiseIO#'.
@@ -448,7 +494,7 @@ But there are wrinkles
   ===>
     f (case a /# b of r -> F# r)
   because that creates a new thunk that wasn't there before.  And
-  because it can't be floated out (can_fail), the thunk will stay
+  because it can't be floated out (CanFail), the thunk will stay
   there.  Disaster!  (This happened in nofib 'simple' and 'scs'.)
 
   Solution: only float cases into the branches of other cases, and
@@ -477,7 +523,7 @@ bindings are:
 fiExpr platform to_drop (_, AnnCase scrut case_bndr _ [AnnAlt con alt_bndrs rhs])
   | isUnliftedType (idType case_bndr)
      -- binders have a fixed RuntimeRep so it's OK to call isUnliftedType
-  , exprOkForSideEffects (deAnnotate scrut)
+  , exprOkToDiscard (deAnnotate scrut)
       -- See Note [Floating primops]
   = wrapFloats shared_binds $
     fiExpr platform (case_float : rhs_binds) rhs
@@ -599,7 +645,7 @@ fiBind platform to_drop (AnnRec bindings) body_fvs
 ------------------
 fiRhs :: Platform -> RevFloatInBinds -> CoreBndr -> CoreExprWithFVs -> CoreExpr
 fiRhs platform to_drop bndr rhs
-  | Just join_arity <- isJoinId_maybe bndr
+  | JoinPoint join_arity <- idJoinPointHood bndr
   , let (bndrs, body) = collectNAnnBndrs join_arity rhs
   = mkLams bndrs (fiExpr platform to_drop body)
   | otherwise
@@ -618,7 +664,7 @@ noFloatIntoRhs is_rec bndr rhs
   | isJoinId bndr
   = isRec is_rec -- Joins are one-shot iff non-recursive
 
-  | Just Unlifted <- typeLevity_maybe (idType bndr)
+  | definitelyUnliftedType (idType bndr)
   = True  -- Preserve let-can-float invariant, see Note [noFloatInto considerations]
 
   | otherwise

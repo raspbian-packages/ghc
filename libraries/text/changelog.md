@@ -1,3 +1,78 @@
+### 2.1.3 - 2025-08-01
+
+* [Fix CRLF handling in IO functions](https://github.com/haskell/text/pull/649)
+
+* [Change `utf8LengthByLeader` to a branching implementation](https://github.com/haskell/text/pull/635)
+
+* [Define `stimes 0` for lazy text](https://github.com/haskell/text/pull/641)
+
+* [Add implementation of `sconcat` and `stimes` for strict `Text`](https://github.com/haskell/text/pull/580) and [Fix `stimes` for strict text when size wraps around `Int`](https://github.com/haskell/text/pull/639)
+
+* [Allow list fusion for `unpack` over both strict and lazy `Text`](https://github.com/haskell/text/pull/629)
+
+### 2.1.2
+
+* [Update case mappings for Unicode 16.0](https://github.com/haskell/text/pull/618)
+
+* [Add type synonym for lazy builders. Deprecated `StrictBuilder` for `StrictTextBuilder`](https://github.com/haskell/text/pull/581)
+
+* [Add `initsNE` and `tailsNE`](https://github.com/haskell/text/pull/558)
+
+* [Add `foldlM'`](https://github.com/haskell/text/pull/543)
+
+* [Add `Data.Text.Foreign.peekCString`](https://github.com/haskell/text/pull/599)
+
+* [Add `Data.Text.show` and `Data.Text.Lazy.show`](https://github.com/haskell/text/pull/608)
+
+* [Add pattern synonyms `Empty`, `(:<)`, and `(:>)`](https://github.com/haskell/text/pull/619)
+
+* [Improve precision of `Data.Text.Read.rational`](https://github.com/haskell/text/pull/565)
+
+* [`Data.Text.IO.Utf8`: use `B.putStrLn` instead of `B.putStr t >> B.putStr "\n"`](https://github.com/haskell/text/pull/579)
+
+* [`Data.Text.IO` and `Data.Text.Lazy.IO`: Make `putStrLn` more atomic with line or block buffering](https://github.com/haskell/text/pull/600)
+
+* [Integrate UTF-8 `hPutStr` to standard `hPutStr`](https://github.com/haskell/text/pull/589)
+
+* [Serialise `Text` without going through `ByteString`](https://github.com/haskell/text/pull/617)
+
+* [Make `splitAt` strict in its first argument, even if input is empty](https://github.com/haskell/text/pull/575)
+
+* [Improve lazy performance of `Data.Text.Lazy.inits`](https://github.com/haskell/text/pull/572)
+
+* [Implement `Data.Text.unpack` and `Data.Text.toTitle` directly, without streaming](https://github.com/haskell/text/pull/611)
+
+* [Make `fromString` `INLINEABLE` instead of `INLINE`](https://github.com/haskell/text/pull/571) to reduce the size of generated code.
+
+### 2.1.1
+
+* Add pure Haskell implementations as an alternative to C-based ones,
+  suitable for JavaScript backend.
+
+* [Add type synonyms for lazy and strict text flavours](https://github.com/haskell/text/pull/547)
+
+* [Share empty `Text` values](https://github.com/haskell/text/pull/493)
+
+* [Fix bug in `isValidUtf8ByteArray`](https://github.com/haskell/text/pull/553)
+
+* [Optimize the implementation of `Data.Text.concat`](https://github.com/haskell/text/pull/551)
+
+* [Fix `filter/filter` rules for `Text` and lazy `Text`](https://github.com/haskell/text/pull/560)
+
+### 2.1
+
+* [Switch `Data.Text.Array` to `Data.Array.Byte`](https://github.com/haskell/text/pull/474)
+
+* [Add `Text.IO.Utf8` module](https://github.com/haskell/text/pull/503)
+
+* [Expose UTF-8 validation functions from internal module](https://github.com/haskell/text/pull/483)
+
+* [Fix handling of incomplete input in stream decoders](https://github.com/haskell/text/pull/527)
+
+* [Fix handling of invalid bytes in stream decoders](https://github.com/haskell/text/pull/528)
+
+* [Make Lift Text work under RebindableSyntax](https://github.com/haskell/text/pull/534)
+
 ### 2.0.2
 
 * [Add decoding functions in `Data.Text.Encoding` that allow

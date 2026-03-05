@@ -216,7 +216,7 @@ ioManagerDie (void)
 void
 ioManagerStartCap (Capability **cap)
 {
-    rts_evalIO(cap,&base_GHCziConcziIO_ensureIOManagerIsRunning_closure,NULL);
+    rts_evalIO(cap,&ghczminternal_GHCziInternalziConcziIO_ensureIOManagerIsRunning_closure,NULL);
 }
 
 void
@@ -368,8 +368,10 @@ int
 stg_sig_install(int sig, int spi, void *mask)
 {
     sigset_t signals, osignals;
-    struct sigaction action;
     StgInt previous_spi;
+
+    struct sigaction action;
+    memset(&action, 0, sizeof(struct sigaction));
 
     ACQUIRE_LOCK(&sig_mutex);
 
@@ -485,7 +487,7 @@ startSignalHandlers(Capability *cap)
                        RtsFlags.GcFlags.initialStkSize,
                        rts_apply(cap,
                                  rts_apply(cap,
-                                           &base_GHCziConcziSignal_runHandlersPtr_closure,
+                                           &ghczminternal_GHCziInternalziConcziSignal_runHandlersPtr_closure,
                                            rts_mkPtr(cap, info)),
                                  rts_mkInt(cap, info->si_signo)));
     scheduleThread(cap, t);
@@ -522,7 +524,9 @@ shutdown_handler(int sig STG_UNUSED)
     // extreme prejudice.  So the first ^C tries to exit the program
     // cleanly, and the second one just kills it.
     if (getSchedState() >= SCHED_INTERRUPTING) {
-        stg_exit(EXIT_INTERRUPTED);
+        // N.B. we cannot use stg_exit() here as it calls exit() which is not
+        // signal-safe. See #23417.
+        _exit(EXIT_INTERRUPTED);
     } else {
         interruptStgRts();
     }
@@ -617,6 +621,7 @@ static void
 set_sigtstp_action (bool handle)
 {
     struct sigaction sa;
+    memset(&sa, 0, sizeof(struct sigaction));
     if (handle) {
         sa.sa_handler = sigtstp_handler;
     } else {
@@ -633,7 +638,8 @@ set_sigtstp_action (bool handle)
 void
 install_vtalrm_handler(int sig, TickProc handle_tick)
 {
-    struct sigaction action = {};
+    struct sigaction action;
+    memset(&action, 0, sizeof(struct sigaction));
 
     action.sa_handler = handle_tick;
 
@@ -675,8 +681,11 @@ install_vtalrm_handler(int sig, TickProc handle_tick)
 void
 initDefaultHandlers(void)
 {
-    struct sigaction action = {};
-    struct sigaction oact = {};
+    // N.B. We can't use initializers here as CentOS's ancient toolchain throws
+    // spurious warnings. See #23577.
+    struct sigaction action, oact;
+    memset(&oact, 0, sizeof(struct sigaction));
+    memset(&action, 0, sizeof(struct sigaction));
 
     // install the SIGINT handler
     action.sa_handler = shutdown_handler;

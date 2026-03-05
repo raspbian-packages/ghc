@@ -4,7 +4,7 @@ module GHC.Driver.Config.CmmToLlvm
 where
 
 import GHC.Prelude
-import GHC.Driver.Session
+import GHC.Driver.DynFlags
 import GHC.Driver.LlvmConfigCache
 import GHC.Platform
 import GHC.CmmToLlvm.Config
@@ -23,6 +23,7 @@ initLlvmCgConfig logger config_cache dflags = do
     , llvmCgContext              = initSDocContext dflags PprCode
     , llvmCgFillUndefWithGarbage = gopt Opt_LlvmFillUndefWithGarbage dflags
     , llvmCgSplitSection         = gopt Opt_SplitSections dflags
+    , llvmCgAvxEnabled           = isAvxEnabled dflags
     , llvmCgBmiVersion           = case platformArch (targetPlatform dflags) of
                                       ArchX86_64 -> bmiVersion dflags
                                       ArchX86    -> bmiVersion dflags

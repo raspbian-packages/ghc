@@ -288,7 +288,7 @@ exprs_fvs :: [CoreExpr] -> FV
 exprs_fvs exprs = mapUnionFV expr_fvs exprs
 
 tickish_fvs :: CoreTickish -> FV
-tickish_fvs (Breakpoint _ _ ids) = FV.mkFVs ids
+tickish_fvs (Breakpoint _ _ ids _) = FV.mkFVs ids
 tickish_fvs _ = emptyFV
 
 {-
@@ -386,8 +386,9 @@ orphNamesOfCo (Refl ty)             = orphNamesOfType ty
 orphNamesOfCo (GRefl _ ty mco)      = orphNamesOfType ty `unionNameSet` orphNamesOfMCo mco
 orphNamesOfCo (TyConAppCo _ tc cos) = unitNameSet (getName tc) `unionNameSet` orphNamesOfCos cos
 orphNamesOfCo (AppCo co1 co2)       = orphNamesOfCo co1 `unionNameSet` orphNamesOfCo co2
-orphNamesOfCo (ForAllCo _ kind_co co)     = orphNamesOfCo kind_co
-                                            `unionNameSet` orphNamesOfCo co
+orphNamesOfCo (ForAllCo { fco_kind = kind_co, fco_body = co })
+                                    = orphNamesOfCo kind_co
+                                      `unionNameSet` orphNamesOfCo co
 orphNamesOfCo (FunCo { fco_mult = co_mult, fco_arg = co1, fco_res = co2 })
                                     = orphNamesOfCo co_mult
                                       `unionNameSet` orphNamesOfCo co1
@@ -410,7 +411,6 @@ orphNamesOfProv :: UnivCoProvenance -> NameSet
 orphNamesOfProv (PhantomProv co)    = orphNamesOfCo co
 orphNamesOfProv (ProofIrrelProv co) = orphNamesOfCo co
 orphNamesOfProv (PluginProv _)      = emptyNameSet
-orphNamesOfProv (CorePrepProv _)    = emptyNameSet
 
 orphNamesOfCos :: [Coercion] -> NameSet
 orphNamesOfCos = orphNamesOfThings orphNamesOfCo
@@ -793,9 +793,8 @@ freeVars = go
         , AnnTick tickish expr2 )
       where
         expr2 = go expr
-        tickishFVs (Breakpoint _ _ ids) = mkDVarSet ids
-        tickishFVs _                    = emptyDVarSet
+        tickishFVs (Breakpoint _ _ ids _) = mkDVarSet ids
+        tickishFVs _                      = emptyDVarSet
 
     go (Type ty)     = (tyCoVarsOfTypeDSet ty, AnnType ty)
     go (Coercion co) = (tyCoVarsOfCoDSet co, AnnCoercion co)
-

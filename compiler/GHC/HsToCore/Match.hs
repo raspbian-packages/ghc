@@ -1,4 +1,5 @@
 
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE MonadComprehensions #-}
 {-# LANGUAGE OverloadedLists #-}
 {-# LANGUAGE PatternSynonyms #-}
@@ -28,14 +29,20 @@ import Language.Haskell.Syntax.Basic (Boxity(..))
 
 import {-#SOURCE#-} GHC.HsToCore.Expr (dsExpr)
 
-import GHC.Types.Basic ( Origin(..), isGenerated )
+import GHC.Types.Basic ( Origin(..), requiresPMC )
+
 import GHC.Types.SourceText
-import GHC.Driver.Session
+    ( FractionalLit,
+      IntegralLit(il_value),
+      negateFractionalLit,
+      integralFractionalLit )
+import GHC.Driver.DynFlags
 import GHC.Hs
 import GHC.Hs.Syn.Type
 import GHC.Tc.Types.Evidence
 import GHC.Tc.Utils.Monad
 import GHC.HsToCore.Pmc
+import GHC.HsToCore.Pmc.Utils
 import GHC.HsToCore.Pmc.Types ( Nablas )
 import GHC.HsToCore.Monad
 import GHC.HsToCore.Binds
@@ -67,12 +74,11 @@ import GHC.Utils.Misc
 import GHC.Types.Name
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
-import GHC.Utils.Panic.Plain
 import GHC.Data.FastString
 import GHC.Types.Unique
 import GHC.Types.Unique.DFM
 
-import Control.Monad ( zipWithM, unless, when )
+import Control.Monad ( zipWithM, unless )
 import Data.List.NonEmpty (NonEmpty(..))
 import qualified Data.List.NonEmpty as NEL
 import qualified Data.Map as Map
@@ -192,13 +198,9 @@ match :: [MatchId]        -- ^ Variables rep\'ing the exprs we\'re matching with
 
 match [] ty eqns
   = assertPpr (not (null eqns)) (ppr ty) $
-    return (foldr1 combineMatchResults match_results)
-  where
-    match_results = [ assert (null (eqn_pats eqn)) $
-                      eqn_rhs eqn
-                    | eqn <- eqns ]
+    combineEqnRhss (NEL.fromList eqns)
 
-match (v:vs) ty eqns    -- Eqns *can* be empty
+match (v:vs) ty eqns    -- Eqns can be empty, but each equation is nonempty
   = assertPpr (all (isInternalName . idName) vars) (ppr vars) $
     do  { dflags <- getDynFlags
         ; let platform = targetPlatform dflags
@@ -221,12 +223,11 @@ match (v:vs) ty eqns    -- Eqns *can* be empty
     dropGroup :: Functor f => f (PatGroup,EquationInfo) -> f EquationInfo
     dropGroup = fmap snd
 
-    match_groups :: [NonEmpty (PatGroup,EquationInfo)] -> DsM (NonEmpty (MatchResult CoreExpr))
-    -- Result list of [MatchResult CoreExpr] is always non-empty
+    match_groups :: [NonEmpty (PatGroup,EquationInfoNE)] -> DsM (NonEmpty (MatchResult CoreExpr))
     match_groups [] = matchEmpty v ty
     match_groups (g:gs) = mapM match_group $ g :| gs
 
-    match_group :: NonEmpty (PatGroup,EquationInfo) -> DsM (MatchResult CoreExpr)
+    match_group :: NonEmpty (PatGroup,EquationInfoNE) -> DsM (MatchResult CoreExpr)
     match_group eqns@((group,_) :| _)
         = case group of
             PgCon {}  -> matchConFamily  vars ty (ne $ subGroupUniq [(c,e) | (PgCon c, e) <- eqns'])
@@ -266,32 +267,32 @@ matchEmpty var res_ty
     mk_seq fail = return $ mkWildCase (Var var) (idScaledType var) res_ty
                                       [Alt DEFAULT [] fail]
 
-matchVariables :: NonEmpty MatchId -> Type -> NonEmpty EquationInfo -> DsM (MatchResult CoreExpr)
+matchVariables :: NonEmpty MatchId -> Type -> NonEmpty EquationInfoNE -> DsM (MatchResult CoreExpr)
 -- Real true variables, just like in matchVar, SLPJ p 94
 -- No binding to do: they'll all be wildcards by now (done in tidy)
 matchVariables (_ :| vars) ty eqns = match vars ty $ NEL.toList $ shiftEqns eqns
 
-matchBangs :: NonEmpty MatchId -> Type -> NonEmpty EquationInfo -> DsM (MatchResult CoreExpr)
+matchBangs :: NonEmpty MatchId -> Type -> NonEmpty EquationInfoNE -> DsM (MatchResult CoreExpr)
 matchBangs (var :| vars) ty eqns
   = do  { match_result <- match (var:vars) ty $ NEL.toList $
             decomposeFirstPat getBangPat <$> eqns
         ; return (mkEvalMatchResult var ty match_result) }
 
-matchCoercion :: NonEmpty MatchId -> Type -> NonEmpty EquationInfo -> DsM (MatchResult CoreExpr)
+matchCoercion :: NonEmpty MatchId -> Type -> NonEmpty EquationInfoNE -> DsM (MatchResult CoreExpr)
 -- Apply the coercion to the match variable and then match that
-matchCoercion (var :| vars) ty (eqns@(eqn1 :| _))
+matchCoercion (var :| vars) ty eqns@(eqn1 :| _)
   = do  { let XPat (CoPat co pat _) = firstPat eqn1
         ; let pat_ty' = hsPatType pat
         ; var' <- newUniqueId var (idMult var) pat_ty'
         ; match_result <- match (var':vars) ty $ NEL.toList $
             decomposeFirstPat getCoPat <$> eqns
-        ; core_wrap <- dsHsWrapper co
-        ; let bind = NonRec var' (core_wrap (Var var))
-        ; return (mkCoLetMatchResult bind match_result) }
+        ; dsHsWrapper co $ \core_wrap -> do
+        { let bind = NonRec var' (core_wrap (Var var))
+        ; return (mkCoLetMatchResult bind match_result) } }
 
-matchView :: NonEmpty MatchId -> Type -> NonEmpty EquationInfo -> DsM (MatchResult CoreExpr)
+matchView :: NonEmpty MatchId -> Type -> NonEmpty EquationInfoNE -> DsM (MatchResult CoreExpr)
 -- Apply the view function to the match variable and then match that
-matchView (var :| vars) ty (eqns@(eqn1 :| _))
+matchView (var :| vars) ty eqns@(eqn1 :| _)
   = do  { -- we could pass in the expr from the PgView,
          -- but this needs to extract the pat anyway
          -- to figure out the type of the fresh variable
@@ -308,10 +309,9 @@ matchView (var :| vars) ty (eqns@(eqn1 :| _))
                     match_result) }
 
 -- decompose the first pattern and leave the rest alone
-decomposeFirstPat :: (Pat GhcTc -> Pat GhcTc) -> EquationInfo -> EquationInfo
-decomposeFirstPat extractpat (eqn@(EqnInfo { eqn_pats = pat : pats }))
-        = eqn { eqn_pats = extractpat pat : pats}
-decomposeFirstPat _ _ = panic "decomposeFirstPat"
+decomposeFirstPat :: (Pat GhcTc -> Pat GhcTc) -> EquationInfoNE -> EquationInfoNE
+decomposeFirstPat extract eqn@(EqnMatch { eqn_pat = pat }) = eqn{eqn_pat = fmap extract pat}
+decomposeFirstPat _ (EqnDone {}) = panic "decomposeFirstPat"
 
 getCoPat, getBangPat, getViewPat :: Pat GhcTc -> Pat GhcTc
 getCoPat (XPat (CoPat _ pat _)) = pat
@@ -404,15 +404,14 @@ tidyEqnInfo :: Id -> EquationInfo
         -- POST CONDITION: head pattern in the EqnInfo is
         --      one of these for which patGroup is defined.
 
-tidyEqnInfo _ (EqnInfo { eqn_pats = [] })
-  = panic "tidyEqnInfo"
+tidyEqnInfo _ eqn@(EqnDone {}) = return (idDsWrapper, eqn)
 
-tidyEqnInfo v eqn@(EqnInfo { eqn_pats = pat : pats, eqn_orig = orig })
-  = do { (wrap, pat') <- tidy1 v orig pat
-       ; return (wrap, eqn { eqn_pats = pat' : pats }) }
+tidyEqnInfo v eqn@(EqnMatch { eqn_pat = (L loc pat) }) = do
+  (wrap, pat') <- tidy1 v (not . isGoodSrcSpan . locA $ loc) pat
+  return (wrap, eqn{eqn_pat = L loc pat' })
 
 tidy1 :: Id                  -- The Id being scrutinised
-      -> Origin              -- Was this a pattern the user wrote?
+      -> Bool                -- `True` if the pattern was generated, `False` if it was user-written
       -> Pat GhcTc           -- The pattern against which it is to be matched
       -> DsM (DsWrapper,     -- Extra bindings to do before the match
               Pat GhcTc)     -- Equivalent pattern
@@ -423,10 +422,10 @@ tidy1 :: Id                  -- The Id being scrutinised
 -- It eliminates many pattern forms (as-patterns, variable patterns,
 -- list patterns, etc) and returns any created bindings in the wrapper.
 
-tidy1 v o (ParPat _ _ pat _)  = tidy1 v o (unLoc pat)
-tidy1 v o (SigPat _ pat _)    = tidy1 v o (unLoc pat)
+tidy1 v g (ParPat _ pat)      = tidy1 v g (unLoc pat)
+tidy1 v g (SigPat _ pat _)    = tidy1 v g (unLoc pat)
 tidy1 _ _ (WildPat ty)        = return (idDsWrapper, WildPat ty)
-tidy1 v o (BangPat _ (L l p)) = tidy_bang_pat v o l p
+tidy1 v g (BangPat _ (L l p)) = tidy_bang_pat v g l p
 
         -- case v of { x -> mr[] }
         -- = case v of { _ -> let x=v in mr[] }
@@ -435,8 +434,8 @@ tidy1 v _ (VarPat _ (L _ var))
 
         -- case v of { x@p -> mr[] }
         -- = case v of { p -> let x=v in mr[] }
-tidy1 v o (AsPat _ (L _ var) _ pat)
-  = do  { (wrap, pat') <- tidy1 v o (unLoc pat)
+tidy1 v g (AsPat _ (L _ var) pat)
+  = do  { (wrap, pat') <- tidy1 v g (unLoc pat)
         ; return (wrapBind var v . wrap, pat') }
 
 {- now, here we handle lazy patterns:
@@ -454,13 +453,13 @@ tidy1 v _ (LazyPat _ pat)
     -- This is a convenient place to check for unlifted types under a lazy pattern.
     -- Doing this check during type-checking is unsatisfactory because we may
     -- not fully know the zonked types yet. We sure do here.
-  = do  { let unlifted_bndrs = filter (isUnliftedType . idType) (collectPatBinders CollNoDictBinders pat)
+  = putSrcSpanDs (getLocA pat) $
+    do  { let unlifted_bndrs = filter (isUnliftedType . idType) (collectPatBinders CollNoDictBinders pat)
             -- NB: the binders can't be representation-polymorphic, so we're OK to call isUnliftedType
         ; unless (null unlifted_bndrs) $
-          putSrcSpanDs (getLocA pat) $
           diagnosticDs (DsLazyPatCantBindVarsOfUnliftedType unlifted_bndrs)
 
-        ; (_,sel_prs) <- mkSelectorBinds [] pat (Var v)
+        ; (_,sel_prs) <- mkSelectorBinds [] pat LazyPatCtx (Var v)
         ; let sel_binds =  [NonRec b rhs | (b,rhs) <- sel_prs]
         ; return (mkCoreLets sel_binds, WildPat (idType v)) }
 
@@ -488,22 +487,22 @@ tidy1 _ _ (SumPat tys pat alt arity)
                  -- See Note [Unboxed tuple RuntimeRep vars] in TyCon
 
 -- LitPats: we *might* be able to replace these w/ a simpler form
-tidy1 _ o (LitPat _ lit)
-  = do { unless (isGenerated o) $
+tidy1 _ g (LitPat _ lit)
+  = do { unless g $
            warnAboutOverflowedLit lit
        ; return (idDsWrapper, tidyLitPat lit) }
 
 -- NPats: we *might* be able to replace these w/ a simpler form
-tidy1 _ o (NPat ty (L _ lit@OverLit { ol_val = v }) mb_neg eq)
-  = do { unless (isGenerated o) $
+tidy1 _ g (NPat ty (L _ lit@OverLit { ol_val = v }) mb_neg eq)
+  = do { unless g $
            let lit' | Just _ <- mb_neg = lit{ ol_val = negateOverLitVal v }
                     | otherwise = lit
            in warnAboutOverflowedOverLit lit'
        ; return (idDsWrapper, tidyNPat lit mb_neg eq ty) }
 
 -- NPlusKPat: we may want to warn about the literals
-tidy1 _ o n@(NPlusKPat _ _ (L _ lit1) lit2 _ _)
-  = do { unless (isGenerated o) $ do
+tidy1 _ g n@(NPlusKPat _ _ (L _ lit1) lit2 _ _)
+  = do { unless g $ do
            warnAboutOverflowedOverLit lit1
            warnAboutOverflowedOverLit lit2
        ; return (idDsWrapper, n) }
@@ -513,28 +512,28 @@ tidy1 _ _ non_interesting_pat
   = return (idDsWrapper, non_interesting_pat)
 
 --------------------
-tidy_bang_pat :: Id -> Origin -> SrcSpanAnnA -> Pat GhcTc
+tidy_bang_pat :: Id -> Bool -> SrcSpanAnnA -> Pat GhcTc
               -> DsM (DsWrapper, Pat GhcTc)
 
 -- Discard par/sig under a bang
-tidy_bang_pat v o _ (ParPat _ _ (L l p) _) = tidy_bang_pat v o l p
-tidy_bang_pat v o _ (SigPat _ (L l p) _) = tidy_bang_pat v o l p
+tidy_bang_pat v g _ (ParPat _ (L l p))   = tidy_bang_pat v g l p
+tidy_bang_pat v g _ (SigPat _ (L l p) _) = tidy_bang_pat v g l p
 
 -- Push the bang-pattern inwards, in the hope that
 -- it may disappear next time
-tidy_bang_pat v o l (AsPat x v' at p)
-  = tidy1 v o (AsPat x v' at (L l (BangPat noExtField p)))
-tidy_bang_pat v o l (XPat (CoPat w p t))
-  = tidy1 v o (XPat $ CoPat w (BangPat noExtField (L l p)) t)
+tidy_bang_pat v g l (AsPat x v' p)
+  = tidy1 v g (AsPat x v' (L l (BangPat noExtField p)))
+tidy_bang_pat v g l (XPat (CoPat w p t))
+  = tidy1 v g (XPat $ CoPat w (BangPat noExtField (L l p)) t)
 
 -- Discard bang around strict pattern
-tidy_bang_pat v o _ p@(LitPat {})    = tidy1 v o p
-tidy_bang_pat v o _ p@(ListPat {})   = tidy1 v o p
-tidy_bang_pat v o _ p@(TuplePat {})  = tidy1 v o p
-tidy_bang_pat v o _ p@(SumPat {})    = tidy1 v o p
+tidy_bang_pat v g _ p@(LitPat {})    = tidy1 v g p
+tidy_bang_pat v g _ p@(ListPat {})   = tidy1 v g p
+tidy_bang_pat v g _ p@(TuplePat {})  = tidy1 v g p
+tidy_bang_pat v g _ p@(SumPat {})    = tidy1 v g p
 
 -- Data/newtype constructors
-tidy_bang_pat v o l p@(ConPat { pat_con = L _ (RealDataCon dc)
+tidy_bang_pat v g l p@(ConPat { pat_con = L _ (RealDataCon dc)
                               , pat_args = args
                               , pat_con_ext = ConPatTc
                                 { cpt_arg_tys = arg_tys
@@ -543,8 +542,8 @@ tidy_bang_pat v o l p@(ConPat { pat_con = L _ (RealDataCon dc)
   -- Newtypes: push bang inwards (#9844)
   =
     if isNewTyCon (dataConTyCon dc)
-      then tidy1 v o (p { pat_args = push_bang_into_newtype_arg l (scaledThing ty) args })
-      else tidy1 v o p  -- Data types: discard the bang
+      then tidy1 v g (p { pat_args = push_bang_into_newtype_arg l (scaledThing ty) args })
+      else tidy1 v g p  -- Data types: discard the bang
     where
       (ty:_) = dataConInstArgTys dc arg_tys
 
@@ -736,7 +735,7 @@ Call @match@ with all of this information!
 --                         p2 q2 -> ...
 
 matchWrapper
-  :: HsMatchContext GhcRn              -- ^ For shadowing warning messages
+  :: HsMatchContextRn                  -- ^ For shadowing warning messages
   -> Maybe [LHsExpr GhcTc]             -- ^ Scrutinee(s)
                                        -- see Note [matchWrapper scrutinees]
   -> MatchGroup GhcTc (LHsExpr GhcTc)  -- ^ Matches being desugared
@@ -771,7 +770,6 @@ matchWrapper ctxt scrs (MG { mg_alts = L _ matches
                            })
   = do  { dflags <- getDynFlags
         ; locn   <- getSrcSpanDs
-
         ; new_vars    <- case matches of
                            []    -> newSysLocalsDs arg_tys
                            (m:_) ->
@@ -783,12 +781,19 @@ matchWrapper ctxt scrs (MG { mg_alts = L _ matches
         -- Pattern match check warnings for /this match-group/.
         -- @rhss_nablas@ is a flat list of covered Nablas for each RHS.
         -- Each Match will split off one Nablas for its RHSs from this.
+        ; tracePm "matchWrapper"
+          (vcat [ ppr ctxt
+                , text "scrs" <+> ppr scrs
+                , text "matches group" <+> ppr matches
+                , text "matchPmChecked" <+> ppr (isMatchContextPmChecked dflags origin ctxt)])
         ; matches_nablas <-
             if isMatchContextPmChecked dflags origin ctxt
+               -- See Note [Expanding HsDo with XXExprGhcRn] Part 1. Wrinkle 1 for
+               -- pmc for pattern synonyms
 
             -- See Note [Long-distance information] in GHC.HsToCore.Pmc
             then addHsScrutTmCs (concat scrs) new_vars $
-                 pmcMatches (DsMatchContext ctxt locn) new_vars matches
+                 pmcMatches origin (DsMatchContext ctxt locn) new_vars matches
 
             -- When we're not doing PM checks on the match group,
             -- we still need to propagate long-distance information.
@@ -798,7 +803,7 @@ matchWrapper ctxt scrs (MG { mg_alts = L _ matches
 
         ; eqns_info   <- zipWithM mk_eqn_info matches matches_nablas
 
-        ; result_expr <- discard_warnings_if_generated origin $
+        ; result_expr <- discard_warnings_if_skip_pmc origin $
                          matchEquations ctxt new_vars eqns_info rhs_ty
 
         ; return (new_vars, result_expr) }
@@ -807,21 +812,19 @@ matchWrapper ctxt scrs (MG { mg_alts = L _ matches
     mk_eqn_info :: LMatch GhcTc (LHsExpr GhcTc) -> (Nablas, NonEmpty Nablas) -> DsM EquationInfo
     mk_eqn_info (L _ (Match { m_pats = pats, m_grhss = grhss })) (pat_nablas, rhss_nablas)
       = do { dflags <- getDynFlags
-           ; let upats = map (unLoc . decideBangHood dflags) pats
+           ; let upats = map (decideBangHood dflags) pats
            -- pat_nablas is the covered set *after* matching the pattern, but
            -- before any of the GRHSs. We extend the environment with pat_nablas
            -- (via updPmNablas) so that the where-clause of 'grhss' can profit
            -- from that knowledge (#18533)
            ; match_result <- updPmNablas pat_nablas $
                              dsGRHSs ctxt grhss rhs_ty rhss_nablas
-           ; return EqnInfo { eqn_pats = upats
-                            , eqn_orig = FromSource
-                            , eqn_rhs  = match_result } }
+           ; return $ mkEqnInfo upats match_result }
 
-    discard_warnings_if_generated orig =
-      if isGenerated orig
-      then discardWarningsDs
-      else id
+    discard_warnings_if_skip_pmc orig =
+      if requiresPMC orig
+      then id
+      else discardWarningsDs
 
     initNablasMatches :: Nablas -> [LMatch GhcTc b] -> [(Nablas, NonEmpty Nablas)]
     initNablasMatches ldi_nablas ms
@@ -880,7 +883,7 @@ the expression (in this case, it will end up recursively calling 'matchWrapper'
 on the user-written case statement).
 -}
 
-matchEquations  :: HsMatchContext GhcRn
+matchEquations  :: HsMatchContextRn
                 -> [MatchId] -> [EquationInfo] -> Type
                 -> DsM CoreExpr
 matchEquations ctxt vars eqns_info rhs_ty
@@ -894,7 +897,8 @@ matchEquations ctxt vars eqns_info rhs_ty
 -- situation where we want to match a single expression against a single
 -- pattern. It returns an expression.
 matchSimply :: CoreExpr                 -- ^ Scrutinee
-            -> HsMatchContext GhcRn     -- ^ Match kind
+            -> HsMatchContextRn         -- ^ Match kind
+            -> Mult                     -- ^ Scaling factor of the case expression
             -> LPat GhcTc               -- ^ Pattern it should match
             -> CoreExpr                 -- ^ Return this if it matches
             -> CoreExpr                 -- ^ Return this if it doesn't
@@ -908,15 +912,15 @@ matchSimply :: CoreExpr                 -- ^ Scrutinee
 --     match is awkward
 --   * And we still export 'matchSinglePatVar', so not much is gained if we
 --     don't also implement it in terms of 'matchWrapper'
-matchSimply scrut hs_ctx pat result_expr fail_expr = do
+matchSimply scrut hs_ctx mult pat result_expr fail_expr = do
     let
       match_result = cantFailMatchResult result_expr
       rhs_ty       = exprType fail_expr
         -- Use exprType of fail_expr, because won't refine in the case of failure!
-    match_result' <- matchSinglePat scrut hs_ctx pat rhs_ty match_result
+    match_result' <- matchSinglePat scrut hs_ctx pat mult rhs_ty match_result
     extractMatchResult match_result' fail_expr
 
-matchSinglePat :: CoreExpr -> HsMatchContext GhcRn -> LPat GhcTc
+matchSinglePat :: CoreExpr -> HsMatchContextRn -> LPat GhcTc -> Mult
                -> Type -> MatchResult CoreExpr -> DsM (MatchResult CoreExpr)
 -- matchSinglePat ensures that the scrutinee is a variable
 -- and then calls matchSinglePatVar
@@ -925,39 +929,47 @@ matchSinglePat :: CoreExpr -> HsMatchContext GhcRn -> LPat GhcTc
 -- Used for things like [ e | pat <- stuff ], where
 -- incomplete patterns are just fine
 
-matchSinglePat (Var var) ctx pat ty match_result
+matchSinglePat (Var var) ctx pat _ ty match_result
   | not (isExternalName (idName var))
   = matchSinglePatVar var Nothing ctx pat ty match_result
 
-matchSinglePat scrut hs_ctx pat ty match_result
-  = do { var           <- selectSimpleMatchVarL ManyTy pat
-                            -- matchSinglePat is only used in matchSimply, which
-                            -- is used in list comprehension, arrow notation,
-                            -- and to create field selectors. All of which only
-                            -- bind unrestricted variables, hence the 'Many'
-                            -- above.
+matchSinglePat scrut hs_ctx pat mult ty match_result
+  = do { var           <- selectSimpleMatchVarL mult pat
        ; match_result' <- matchSinglePatVar var (Just scrut) hs_ctx pat ty match_result
        ; return $ bindNonRec var scrut <$> match_result'
        }
 
 matchSinglePatVar :: Id   -- See Note [Match Ids]
                   -> Maybe CoreExpr -- ^ The scrutinee the match id is bound to
-                  -> HsMatchContext GhcRn -> LPat GhcTc
+                  -> HsMatchContextRn -> LPat GhcTc
                   -> Type -> MatchResult CoreExpr -> DsM (MatchResult CoreExpr)
 matchSinglePatVar var mb_scrut ctx pat ty match_result
   = assertPpr (isInternalName (idName var)) (ppr var) $
     do { dflags <- getDynFlags
        ; locn   <- getSrcSpanDs
-       -- Pattern match check warnings
-       ; when (isMatchContextPmChecked dflags FromSource ctx) $
-           addCoreScrutTmCs (maybeToList mb_scrut) [var] $
-           pmcPatBind (DsMatchContext ctx locn) var (unLoc pat)
+       -- Pattern match check warnings.
+       -- See Note [Long-distance information in matchWrapper] and
+       -- Note [Long-distance information in do notation] in GHC.HsToCore.Expr.
+       ; ldi_nablas <-
+         if  isMatchContextPmChecked_SinglePat dflags FromSource ctx pat
+         then addCoreScrutTmCs (maybeToList mb_scrut) [var] $
+              pmcPatBind (DsMatchContext ctx locn) var (unLoc pat)
+         else getLdiNablas
 
-       ; let eqn_info = EqnInfo { eqn_pats = [unLoc (decideBangHood dflags pat)]
-                                , eqn_orig = FromSource
-                                , eqn_rhs  = match_result }
+       ; let eqn_info = EqnMatch { eqn_pat = decideBangHood dflags pat
+                                 , eqn_rest =
+          EqnDone $ updPmNablasMatchResult ldi_nablas match_result }
+               -- See Note [Long-distance information in do notation]
+               -- in GHC.HsToCore.Expr.
+
        ; match [var] ty [eqn_info] }
 
+updPmNablasMatchResult :: Nablas -> MatchResult r -> MatchResult r
+updPmNablasMatchResult nablas = \case
+  MR_Infallible body_fn -> MR_Infallible $
+    updPmNablas nablas body_fn
+  MR_Fallible body_fn -> MR_Fallible $ \fail ->
+    updPmNablas nablas $ body_fn fail
 
 {-
 ************************************************************************
@@ -984,6 +996,13 @@ data PatGroup
                         -- the LHsExpr is the expression e
            Type         -- the Type is the type of p (equivalently, the result type of e)
 
+instance Show PatGroup where
+  show PgAny = "PgAny"
+  show (PgCon _) = "PgCon"
+  show (PgLit _) = "PgLit"
+  show (PgView _ _) = "PgView"
+  show _ = "PgOther"
+
 {- Note [Don't use Literal for PgN]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Previously we had, as PatGroup constructors
@@ -1004,7 +1023,7 @@ the PgN constructor as a FractionalLit if numeric, and add a PgOverStr construct
 for overloaded strings.
 -}
 
-groupEquations :: Platform -> [EquationInfo] -> [NonEmpty (PatGroup, EquationInfo)]
+groupEquations :: Platform -> [EquationInfoNE] -> [NonEmpty (PatGroup, EquationInfoNE)]
 -- If the result is of form [g1, g2, g3],
 -- (a) all the (pg,eq) pairs in g1 have the same pg
 -- (b) none of the gi are empty
@@ -1124,14 +1143,16 @@ viewLExprEq (e1,_) (e2,_) = lexp e1 e2
     exp :: HsExpr GhcTc -> HsExpr GhcTc -> Bool
     -- real comparison is on HsExpr's
     -- strip parens
-    exp (HsPar _ _ (L _ e) _) e' = exp e e'
-    exp e (HsPar _ _ (L _ e') _) = exp e e'
+    exp (HsPar _ (L _ e)) e' = exp e e'
+    exp e (HsPar _ (L _ e')) = exp e e'
     -- because the expressions do not necessarily have the same type,
     -- we have to compare the wrappers
     exp (XExpr (WrapExpr (HsWrap h e))) (XExpr (WrapExpr (HsWrap  h' e'))) =
       wrap h h' && exp e e'
-    exp (XExpr (ExpansionExpr (HsExpanded _ b))) (XExpr (ExpansionExpr (HsExpanded _ b'))) =
-      exp b b'
+    exp (XExpr (ExpandedThingTc o x)) (XExpr (ExpandedThingTc o' x'))
+      | isHsThingRnExpr o
+      , isHsThingRnExpr o'
+      = exp x x'
     exp (HsVar _ i) (HsVar _ i') =  i == i'
     exp (XExpr (ConLikeTc c _ _)) (XExpr (ConLikeTc c' _ _)) = c == c'
     -- the instance for IPName derives using the id, so this works if the
@@ -1148,8 +1169,8 @@ viewLExprEq (e1,_) (e2,_) = lexp e1 e2
     exp (HsApp _ e1 e2) (HsApp _ e1' e2') = lexp e1 e1' && lexp e2 e2'
     -- the fixities have been straightened out by now, so it's safe
     -- to ignore them?
-    exp (OpApp _ l o ri) (OpApp _ l' o' ri') =
-        lexp l l' && lexp o o' && lexp ri ri'
+    exp (OpApp _ l g ri) (OpApp _ l' o' ri') =
+        lexp l l' && lexp g o' && lexp ri ri'
     exp (NegApp _ e n) (NegApp _ e' n') = lexp e e' && syn_exp n n'
     exp (SectionL _ e1 e2) (SectionL _ e1' e2') =
         lexp e1 e1' && lexp e2 e2'
@@ -1250,6 +1271,7 @@ patGroup _ (NPlusKPat _ _ (L _ (OverLit {ol_val=oval})) _ _ _) =
    _ -> pprPanic "patGroup NPlusKPat" (ppr oval)
 patGroup _ (ViewPat _ expr p)           = PgView expr (hsPatType (unLoc p))
 patGroup platform (LitPat _ lit)        = PgLit (hsLitKey platform lit)
+patGroup _ EmbTyPat{} = PgAny
 patGroup platform (XPat ext) = case ext of
   CoPat _ p _      -> PgCo (hsPatType p) -- Type of innelexp pattern
   ExpansionPat _ p -> patGroup platform p

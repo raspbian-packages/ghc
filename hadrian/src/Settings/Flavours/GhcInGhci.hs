@@ -11,13 +11,13 @@ import {-# SOURCE #-} Settings.Default
 ghcInGhciFlavour :: Flavour
 ghcInGhciFlavour = defaultFlavour
     { name        = "ghc-in-ghci"
-    , args        = defaultBuilderArgs <> ghciArgs <> defaultPackageArgs
+    , extraArgs        = ghciArgs
     -- We can't build DLLs on Windows (yet). Actually we should only
     -- include the dynamic way when we have a dynamic host GHC, but just
     -- checking for Windows seems simpler for now.
     , libraryWays = pure (Set.fromList [vanilla]) <> pure (Set.fromList [ dynamic | not windowsHost ])
     , rtsWays     = pure (Set.fromList [vanilla]) <> (targetSupportsThreadedRts ? pure (Set.fromList [threaded])) <> pure (Set.fromList [ dynamic | not windowsHost ])
-    , dynamicGhcPrograms = return False }
+    }
 
 ghciArgs :: Args
 ghciArgs = sourceArgs SourceArgs

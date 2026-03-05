@@ -1,6 +1,6 @@
-#!/usr/bin/env bash
+#!/usr/bin/bash
 
-set -e
+set -Eeuo pipefail
 
 # This is a script for preparing and uploading a release of GHC.
 #
@@ -19,7 +19,7 @@ set -e
 #                                    tarballs
 #
 #   upload.sh prepare_docs           (deprecated) prepare the documentation directory
-#                                    (this should be unecessary as the script which
+#                                    (this should be unnecessary as the script which
 #                                     fetches artifacts should create this folder from
 #                                     the doc-tarball job)
 #
@@ -30,23 +30,17 @@ set -e
 #
 # Prerequisites: moreutils
 
-if [ -z "$SIGNING_KEY" ]; then
-    SIGNING_KEY="=Benjamin Gamari <ben@well-typed.com>"
-fi
+: ${SIGNING_KEY:="=Benjamin Gamari <ben@well-typed.com>"}
 
 
 # Infer release name from directory name
-if [ -z "$rel_name" ]; then
-    rel_name="$(basename $(pwd))"
-fi
+: ${rel_name:=$(basename $(pwd))}
 
 # Infer version from tarball names
-if [ -z "$ver" ]; then
-    ver="$(ls ghc-*.tar.* | sed -ne 's/ghc-\([0-9]\+\.[0-9]\+\.[0-9]\+\(\.[0-9]\+\)\?\).\+/\1/p' | head -n1)"
-    if [ -z "$ver" ]; then echo "Failed to infer \$ver"; exit 1; fi
-fi
+: ${ver:=$(ls ghc-*.tar.* | sed -ne 's/ghc-\([0-9]\+\.[0-9]\+\.[0-9]\+\(\.[0-9]\+\)\?\).\+/\1/p' | head -n1)}
+if [ -z "$ver" ]; then echo "Failed to infer \$ver"; exit 1; fi
 
-host="gitlab-storage.haskell.org"
+host="gitlab.haskell.org:2222"
 
 usage() {
     echo "Usage: [rel_name=<name>] ver=7.10.3-rc2 $0 <action>"
@@ -82,7 +76,9 @@ fi
 function hash_files() {
     echo $(find -maxdepth 1 \
          -iname '*.xz' \
+      -o -iname '*.gz' \
       -o -iname '*.lz' \
+      -o -iname '*.gz' \
       -o -iname '*.bz2' \
       -o -iname '*.zip' \
     )
@@ -141,6 +137,7 @@ function upload() {
 }
 
 function purge_all() {
+    local dir="$(echo $rel_name | sed s/-release//)"
     # Purge CDN cache
     curl -X PURGE http://downloads.haskell.org/ghc/
     curl -X PURGE http://downloads.haskell.org/~ghc/
@@ -149,76 +146,46 @@ function purge_all() {
     curl -X PURGE http://downloads.haskell.org/~ghc/$dir
     curl -X PURGE http://downloads.haskell.org/~ghc/$dir/
     for i in *; do
-        purge_file $i
+        purge_file "$i"
     done
 }
 
 function purge_file() {
-    curl -X PURGE http://downloads.haskell.org/~ghc/$rel_name/$i
-    curl -X PURGE http://downloads.haskell.org/~ghc/$rel_name/$i/
-    curl -X PURGE http://downloads.haskell.org/~ghc/$rel_name/$i/docs/
-    curl -X PURGE http://downloads.haskell.org/ghc/$rel_name/$i
-    curl -X PURGE http://downloads.haskell.org/ghc/$rel_name/$i/
-    curl -X PURGE http://downloads.haskell.org/ghc/$rel_name/$i/docs/
+    dirs=(
+        "~ghc/$rel_name"
+        "ghc/$rel_name"
+        "~ghc/$ver"
+        "ghc/$ver"
+    )
+
+    for dir in ${dirs[@]}; do
+        curl -X PURGE http://downloads.haskell.org/$dir/$1
+        curl -X PURGE http://downloads.haskell.org/$dir/$1/
+        curl -X PURGE http://downloads.haskell.org/$dir/$1/docs/
+    done
 }
 
 function prepare_docs() {
     echo "THIS COMMAND IS DEPRECATED, THE DOCS FOLDER SHOULD BE PREPARED BY THE FETCH SCRIPT"
-    local tmp
-    rm -Rf docs
-    if [ -z "$GHC_TREE" ]; then
-        tmp="$(mktemp -d)"
-        tar -xf "ghc-$ver-src.tar.xz" -C "$tmp"
-        GHC_TREE="$tmp/ghc-$ver"
-    fi
-    mkdocs="$GHC_TREE/distrib/mkDocs/mkDocs"
-    if [ ! -e "$mkdocs" ]; then
-        echo "Couldn't find GHC mkDocs at $mkdocs."
-        echo "Perhaps you need to override GHC_TREE?"
-        rm -Rf "$tmp"
-        exit 1
-    fi
-    windows_bindist="$(ls ghc-$ver-x86_64-unknown-mingw32.tar.xz | head -n1)"
-    linux_bindist="$(ls ghc-$ver-x86_64-deb9-linux.tar.xz | head -n1)"
-    echo "Windows bindist: $windows_bindist"
-    echo "Linux bindist: $linux_bindist"
-    $ENTER_FHS_ENV $mkdocs $linux_bindist $windows_bindist
-    if [ -d "$tmp" ]; then rm -Rf "$tmp"; fi
-
-    mkdir -p docs/html
-    tar -Jxf "$linux_bindist"
-    cp -R "ghc-$ver/docs/users_guide/build-html/users_guide docs/html/users_guide"
-    #cp -R ghc-$ver/utils/haddock/doc/haddock docs/html/haddock
-    rm -R "ghc-$ver"
-
-    tar -Jxf docs/libraries.html.tar.xz -C docs/html
-    mv docs/index.html docs/html
 }
 
 function recompress() {
-    combine <(basename -s .xz *.xz) not <(basename -s .lz *.lz) | \
-        parallel 'echo "Recompressing {}.xz to {}.lz"; unxz -c {}.xz | lzip - -o {}.lz'
+    set -Eeuo pipefail
+    needed=()
 
-    for darwin_bindist in $(ls ghc-*-darwin.tar.xz); do
-        local dest="$(basename $darwin_bindist .xz).bz2"
-        if [[ ! -f "$dest" ]]; then
-            echo "Recompressing Darwin bindist to bzip2..."
-            unxz -c "$darwin_bindist" | bzip2 > "$dest"
-        fi
+    for i in ghc-*.tar.xz; do
+        needed+=( "$(basename $i .xz).gz" )
     done
 
-    for windows_bindist in $(ls ghc-*-mingw32*.tar.xz); do
-      local tmp="$(mktemp -d tmp.XXX)"
-      local dest="$(realpath $(basename $windows_bindist .tar.xz).zip)"
-      echo $dest
-      if [[ ! -f "$dest" ]]; then
-          echo "Recompressing Windows bindist to zip..."
-          tar -C "$tmp" -xf "$windows_bindist"
-          ls $tmp
-          (cd "$tmp"; zip -9 -r "$dest" *)
-      fi
-      rm -R "$tmp"
+    for i in ghc-*-darwin.tar.xz; do
+        needed+=( "$(basename $i .xz).bz2" )
     done
+
+    for i in ghc-*-mingw32.tar.xz; do
+        needed+=( "$(basename $i .tar.xz).zip" )
+    done
+
+    recompress-all -j10 ${needed[@]}
 }
 
 function upload_docs() {

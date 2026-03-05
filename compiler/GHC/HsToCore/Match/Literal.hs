@@ -36,7 +36,7 @@ import GHC.HsToCore.Utils
 
 import GHC.Hs
 
-import GHC.Tc.Utils.Zonk ( shortCutLit )
+import GHC.Tc.Utils.TcMType ( shortCutLit )
 import GHC.Tc.Utils.TcType
 
 import GHC.Core
@@ -58,12 +58,12 @@ import GHC.Builtin.Types.Prim
 import GHC.Types.Id
 import GHC.Types.SourceText
 
-import GHC.Driver.Session
+import GHC.Driver.DynFlags
 
 import GHC.Utils.Outputable as Outputable
 import GHC.Utils.Misc
 import GHC.Utils.Panic
-import GHC.Utils.Panic.Plain
+import GHC.Utils.Unique (sameUnique)
 
 import GHC.Data.FastString
 
@@ -106,7 +106,13 @@ dsLit l = do
     HsCharPrim   _ c -> return (Lit (LitChar c))
     HsIntPrim    _ i -> return (Lit (mkLitIntWrap platform i))
     HsWordPrim   _ w -> return (Lit (mkLitWordWrap platform w))
+    HsInt8Prim   _ i -> return (Lit (mkLitInt8Wrap i))
+    HsInt16Prim  _ i -> return (Lit (mkLitInt16Wrap i))
+    HsInt32Prim  _ i -> return (Lit (mkLitInt32Wrap i))
     HsInt64Prim  _ i -> return (Lit (mkLitInt64Wrap i))
+    HsWord8Prim  _ w -> return (Lit (mkLitWord8Wrap w))
+    HsWord16Prim _ w -> return (Lit (mkLitWord16Wrap w))
+    HsWord32Prim _ w -> return (Lit (mkLitWord32Wrap w))
     HsWord64Prim _ w -> return (Lit (mkLitWord64Wrap w))
 
     -- This can be slow for very large literals. See Note [FractionalLit representation]
@@ -313,29 +319,29 @@ warnAboutOverflowedLiterals dflags lit
  , Just (i, tc) <- lit
  = if
     -- These only show up via the 'HsOverLit' route
-    | tc == intTyConName        -> check i tc minInt         maxInt
-    | tc == wordTyConName       -> check i tc minWord        maxWord
-    | tc == int8TyConName       -> check i tc (min' @Int8)   (max' @Int8)
-    | tc == int16TyConName      -> check i tc (min' @Int16)  (max' @Int16)
-    | tc == int32TyConName      -> check i tc (min' @Int32)  (max' @Int32)
-    | tc == int64TyConName      -> check i tc (min' @Int64)  (max' @Int64)
-    | tc == word8TyConName      -> check i tc (min' @Word8)  (max' @Word8)
-    | tc == word16TyConName     -> check i tc (min' @Word16) (max' @Word16)
-    | tc == word32TyConName     -> check i tc (min' @Word32) (max' @Word32)
-    | tc == word64TyConName     -> check i tc (min' @Word64) (max' @Word64)
-    | tc == naturalTyConName    -> checkPositive i tc
+    | sameUnique tc intTyConName        -> check i tc minInt         maxInt
+    | sameUnique tc wordTyConName       -> check i tc minWord        maxWord
+    | sameUnique tc int8TyConName       -> check i tc (min' @Int8)   (max' @Int8)
+    | sameUnique tc int16TyConName      -> check i tc (min' @Int16)  (max' @Int16)
+    | sameUnique tc int32TyConName      -> check i tc (min' @Int32)  (max' @Int32)
+    | sameUnique tc int64TyConName      -> check i tc (min' @Int64)  (max' @Int64)
+    | sameUnique tc word8TyConName      -> check i tc (min' @Word8)  (max' @Word8)
+    | sameUnique tc word16TyConName     -> check i tc (min' @Word16) (max' @Word16)
+    | sameUnique tc word32TyConName     -> check i tc (min' @Word32) (max' @Word32)
+    | sameUnique tc word64TyConName     -> check i tc (min' @Word64) (max' @Word64)
+    | sameUnique tc naturalTyConName    -> checkPositive i tc
 
     -- These only show up via the 'HsLit' route
-    | tc == intPrimTyConName    -> check i tc minInt         maxInt
-    | tc == wordPrimTyConName   -> check i tc minWord        maxWord
-    | tc == int8PrimTyConName   -> check i tc (min' @Int8)   (max' @Int8)
-    | tc == int16PrimTyConName  -> check i tc (min' @Int16)  (max' @Int16)
-    | tc == int32PrimTyConName  -> check i tc (min' @Int32)  (max' @Int32)
-    | tc == int64PrimTyConName  -> check i tc (min' @Int64)  (max' @Int64)
-    | tc == word8PrimTyConName  -> check i tc (min' @Word8)  (max' @Word8)
-    | tc == word16PrimTyConName -> check i tc (min' @Word16) (max' @Word16)
-    | tc == word32PrimTyConName -> check i tc (min' @Word32) (max' @Word32)
-    | tc == word64PrimTyConName -> check i tc (min' @Word64) (max' @Word64)
+    | sameUnique tc intPrimTyConName    -> check i tc minInt         maxInt
+    | sameUnique tc wordPrimTyConName   -> check i tc minWord        maxWord
+    | sameUnique tc int8PrimTyConName   -> check i tc (min' @Int8)   (max' @Int8)
+    | sameUnique tc int16PrimTyConName  -> check i tc (min' @Int16)  (max' @Int16)
+    | sameUnique tc int32PrimTyConName  -> check i tc (min' @Int32)  (max' @Int32)
+    | sameUnique tc int64PrimTyConName  -> check i tc (min' @Int64)  (max' @Int64)
+    | sameUnique tc word8PrimTyConName  -> check i tc (min' @Word8)  (max' @Word8)
+    | sameUnique tc word16PrimTyConName -> check i tc (min' @Word16) (max' @Word16)
+    | sameUnique tc word32PrimTyConName -> check i tc (min' @Word32) (max' @Word32)
+    | sameUnique tc word64PrimTyConName -> check i tc (min' @Word64) (max' @Word64)
 
     | otherwise -> return ()
 
@@ -392,22 +398,22 @@ warnAboutEmptyEnumerations fam_envs dflags fromExpr mThnExpr toExpr
 
       platform <- targetPlatform <$> getDynFlags
          -- Be careful to use target Int/Word sizes! cf #17336
-      if | tc == intTyConName     -> case platformWordSize platform of
-                                      PW4 -> check @Int32
-                                      PW8 -> check @Int64
-         | tc == wordTyConName    -> case platformWordSize platform of
-                                      PW4 -> check @Word32
-                                      PW8 -> check @Word64
-         | tc == int8TyConName    -> check @Int8
-         | tc == int16TyConName   -> check @Int16
-         | tc == int32TyConName   -> check @Int32
-         | tc == int64TyConName   -> check @Int64
-         | tc == word8TyConName   -> check @Word8
-         | tc == word16TyConName  -> check @Word16
-         | tc == word32TyConName  -> check @Word32
-         | tc == word64TyConName  -> check @Word64
-         | tc == integerTyConName -> check @Integer
-         | tc == naturalTyConName -> check @Integer
+      if | sameUnique tc intTyConName     -> case platformWordSize platform of
+                                               PW4 -> check @Int32
+                                               PW8 -> check @Int64
+         | sameUnique tc wordTyConName    -> case platformWordSize platform of
+                                               PW4 -> check @Word32
+                                               PW8 -> check @Word64
+         | sameUnique tc int8TyConName    -> check @Int8
+         | sameUnique tc int16TyConName   -> check @Int16
+         | sameUnique tc int32TyConName   -> check @Int32
+         | sameUnique tc int64TyConName   -> check @Int64
+         | sameUnique tc word8TyConName   -> check @Word8
+         | sameUnique tc word16TyConName  -> check @Word16
+         | sameUnique tc word32TyConName  -> check @Word32
+         | sameUnique tc word64TyConName  -> check @Word64
+         | sameUnique tc integerTyConName -> check @Integer
+         | sameUnique tc naturalTyConName -> check @Integer
             -- We use 'Integer' because otherwise a negative 'Natural' literal
             -- could cause a compile time crash (instead of a runtime one).
             -- See the T10930b test case for an example of where this matters.
@@ -431,7 +437,7 @@ getLHsIntegralLit :: LHsExpr GhcTc -> Maybe (Integer, Type)
 -- ^ See if the expression is an 'Integral' literal.
 getLHsIntegralLit (L _ e) = go e
   where
-    go (HsPar _ _ e _)        = getLHsIntegralLit e
+    go (HsPar _ e)            = getLHsIntegralLit e
     go (HsOverLit _ over_lit) = getIntegralLit over_lit
     go (HsLit _ lit)          = getSimpleIntegralLit lit
 
@@ -455,14 +461,27 @@ getSimpleIntegralLit :: HsLit GhcTc -> Maybe (Integer, Type)
 getSimpleIntegralLit (HsInt _ IL{ il_value = i }) = Just (i, intTy)
 getSimpleIntegralLit (HsIntPrim _ i)    = Just (i, intPrimTy)
 getSimpleIntegralLit (HsWordPrim _ i)   = Just (i, wordPrimTy)
+getSimpleIntegralLit (HsInt8Prim _ i)   = Just (i, int8PrimTy)
+getSimpleIntegralLit (HsInt16Prim _ i)  = Just (i, int16PrimTy)
+getSimpleIntegralLit (HsInt32Prim _ i)  = Just (i, int32PrimTy)
 getSimpleIntegralLit (HsInt64Prim _ i)  = Just (i, int64PrimTy)
+getSimpleIntegralLit (HsWord8Prim _ i)  = Just (i, word8PrimTy)
+getSimpleIntegralLit (HsWord16Prim _ i) = Just (i, word16PrimTy)
+getSimpleIntegralLit (HsWord32Prim _ i) = Just (i, word32PrimTy)
 getSimpleIntegralLit (HsWord64Prim _ i) = Just (i, word64PrimTy)
 getSimpleIntegralLit (HsInteger _ i ty) = Just (i, ty)
-getSimpleIntegralLit _ = Nothing
+
+getSimpleIntegralLit HsChar{}           = Nothing
+getSimpleIntegralLit HsCharPrim{}       = Nothing
+getSimpleIntegralLit HsString{}         = Nothing
+getSimpleIntegralLit HsStringPrim{}     = Nothing
+getSimpleIntegralLit HsRat{}            = Nothing
+getSimpleIntegralLit HsFloatPrim{}      = Nothing
+getSimpleIntegralLit HsDoublePrim{}     = Nothing
 
 -- | Extract the Char if the expression is a Char literal.
 getLHsCharLit :: LHsExpr GhcTc -> Maybe Char
-getLHsCharLit (L _ (HsPar _ _ e _))        = getLHsCharLit e
+getLHsCharLit (L _ (HsPar _ e))            = getLHsCharLit e
 getLHsCharLit (L _ (HsLit _ (HsChar _ c))) = Just c
 getLHsCharLit (L _ (XExpr (HsTick _ e)))         = getLHsCharLit e
 getLHsCharLit (L _ (XExpr (HsBinTick _ _ e)))    = getLHsCharLit e
@@ -587,7 +606,7 @@ tidyNPat over_lit mb_neg eq outer_ty
 
 matchLiterals :: NonEmpty Id
               -> Type -- ^ Type of the whole case expression
-              -> NonEmpty (NonEmpty EquationInfo) -- ^ All PgLits
+              -> NonEmpty (NonEmpty EquationInfoNE) -- ^ All PgLits
               -> DsM (MatchResult CoreExpr)
 
 matchLiterals (var :| vars) ty sub_groups
@@ -605,11 +624,11 @@ matchLiterals (var :| vars) ty sub_groups
             return (mkCoPrimCaseMatchResult var ty $ NEL.toList alts)
         }
   where
-    match_group :: NonEmpty EquationInfo -> DsM (Literal, MatchResult CoreExpr)
-    match_group eqns@(firstEqn :| _)
+    match_group :: NonEmpty EquationInfoNE -> DsM (Literal, MatchResult CoreExpr)
+    match_group eqns
         = do { dflags <- getDynFlags
              ; let platform = targetPlatform dflags
-             ; let LitPat _ hs_lit = firstPat firstEqn
+             ; let EqnMatch { eqn_pat = L _ (LitPat _ hs_lit) } = NEL.head eqns
              ; match_result <- match vars ty (NEL.toList $ shiftEqns eqns)
              ; return (hsLitKey platform hs_lit, match_result) }
 
@@ -638,7 +657,13 @@ hsLitKey :: Platform -> HsLit GhcTc -> Literal
 -- HsLit does not.
 hsLitKey platform (HsIntPrim    _ i)  = mkLitIntWrap  platform i
 hsLitKey platform (HsWordPrim   _ w)  = mkLitWordWrap platform w
+hsLitKey _        (HsInt8Prim   _ i)  = mkLitInt8Wrap   i
+hsLitKey _        (HsInt16Prim  _ i)  = mkLitInt16Wrap  i
+hsLitKey _        (HsInt32Prim  _ i)  = mkLitInt32Wrap  i
 hsLitKey _        (HsInt64Prim  _ i)  = mkLitInt64Wrap  i
+hsLitKey _        (HsWord8Prim  _ w)  = mkLitWord8Wrap  w
+hsLitKey _        (HsWord16Prim _ w)  = mkLitWord16Wrap w
+hsLitKey _        (HsWord32Prim _ w)  = mkLitWord32Wrap w
 hsLitKey _        (HsWord64Prim _ w)  = mkLitWord64Wrap w
 hsLitKey _        (HsCharPrim   _ c)  = mkLitChar            c
 -- This following two can be slow. See Note [FractionalLit representation]
@@ -656,7 +681,7 @@ hsLitKey _        l                   = pprPanic "hsLitKey" (ppr l)
 ************************************************************************
 -}
 
-matchNPats :: NonEmpty Id -> Type -> NonEmpty EquationInfo -> DsM (MatchResult CoreExpr)
+matchNPats :: NonEmpty Id -> Type -> NonEmpty EquationInfoNE -> DsM (MatchResult CoreExpr)
 matchNPats (var :| vars) ty (eqn1 :| eqns)    -- All for the same literal
   = do  { let NPat _ (L _ lit) mb_neg eq_chk = firstPat eqn1
         ; lit_expr <- dsOverLit lit
@@ -685,7 +710,7 @@ We generate:
 \end{verbatim}
 -}
 
-matchNPlusKPats :: NonEmpty Id -> Type -> NonEmpty EquationInfo -> DsM (MatchResult CoreExpr)
+matchNPlusKPats :: NonEmpty Id -> Type -> NonEmpty EquationInfoNE -> DsM (MatchResult CoreExpr)
 -- All NPlusKPats, for the *same* literal k
 matchNPlusKPats (var :| vars) ty (eqn1 :| eqns)
   = do  { let NPlusKPat _ (L _ n1) (L _ lit1) lit2 ge minus
@@ -701,7 +726,7 @@ matchNPlusKPats (var :| vars) ty (eqn1 :| eqns)
                    fmap (foldr1 (.) wraps)                      $
                    match_result) }
   where
-    shift n1 eqn@(EqnInfo { eqn_pats = NPlusKPat _ (L _ n) _ _ _ _ : pats })
-        = (wrapBind n n1, eqn { eqn_pats = pats })
+    shift n1 (EqnMatch { eqn_pat = L _ (NPlusKPat _ (L _ n) _ _ _ _), eqn_rest = rest })
+        = (wrapBind n n1, rest)
         -- The wrapBind is a no-op for the first equation
     shift _ e = pprPanic "matchNPlusKPats/shift" (ppr e)

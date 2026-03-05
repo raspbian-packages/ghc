@@ -1,6 +1,6 @@
-{-# LANGUAGE BangPatterns #-}
-{-# OPTIONS_HADDOCK prune #-}
 {-# LANGUAGE Trustworthy #-}
+
+{-# OPTIONS_HADDOCK prune #-}
 
 -- |
 -- Module      : Data.ByteString.Lazy.Char8
@@ -179,8 +179,28 @@ module Data.ByteString.Lazy.Char8 (
         copy,
 
         -- * Reading from ByteStrings
+        -- | Note that a lazy 'ByteString' may hold an unbounded stream of
+        -- @\'0\'@ digits, in which case the functions below may never return.
+        -- If that's a concern, you can use 'take' to first truncate the input
+        -- to an acceptable length.  Non-termination is also possible when
+        -- reading arbitrary precision numbers via 'readInteger' or
+        -- 'readNatural', if the input is an unbounded stream of arbitrary
+        -- decimal digits.
+        --
         readInt,
+        readInt64,
+        readInt32,
+        readInt16,
+        readInt8,
+
+        readWord,
+        readWord64,
+        readWord32,
+        readWord16,
+        readWord8,
+
         readInteger,
+        readNatural,
 
         -- * I\/O with 'ByteString's
         -- | ByteString I/O uses binary mode, without any character decoding
@@ -228,8 +248,10 @@ import qualified Data.ByteString as B
 import qualified Data.ByteString.Unsafe as B
 import Data.List.NonEmpty (NonEmpty(..))
 import Data.ByteString.Lazy.Internal
+import Data.ByteString.Lazy.ReadInt
+import Data.ByteString.Lazy.ReadNat
 
-import Data.ByteString.Internal (w2c, c2w, isSpaceWord8)
+import Data.ByteString.Internal (c2w,w2c,isSpaceWord8)
 
 import Data.Int (Int64)
 import qualified Data.List as List
@@ -899,96 +921,6 @@ words = List.filter (not . L.null) . L.splitWith isSpaceWord8
 unwords :: [ByteString] -> ByteString
 unwords = intercalate (singleton ' ')
 {-# INLINE unwords #-}
-
--- | readInt reads an Int from the beginning of the ByteString.  If
--- there is no integer at the beginning of the string, it returns
--- Nothing, otherwise it just returns the int read, and the rest of the
--- string.
---
--- Note: This function will overflow the Int for large integers.
-
-readInt :: ByteString -> Maybe (Int, ByteString)
-{-# INLINE readInt #-}
-readInt Empty        = Nothing
-readInt (Chunk x xs) = case w2c (B.unsafeHead x) of
-    '-' -> loop True  0 0 (B.unsafeTail x) xs
-    '+' -> loop False 0 0 (B.unsafeTail x) xs
-    _   -> loop False 0 0 x xs
-
-    where loop :: Bool -> Int -> Int
-                -> S.ByteString -> ByteString -> Maybe (Int, ByteString)
-          loop neg !i !n !c cs
-              | B.null c = case cs of
-                             Empty          -> end  neg i n c  cs
-                             (Chunk c' cs') -> loop neg i n c' cs'
-              | otherwise =
-                  case B.unsafeHead c of
-                    w | w >= 0x30
-                     && w <= 0x39 -> loop neg (i+1)
-                                          (n * 10 + (fromIntegral w - 0x30))
-                                          (B.unsafeTail c) cs
-                      | otherwise -> end neg i n c cs
-
-          {-# INLINE end #-}
-          end _   0 _ _  _ = Nothing
-          end neg _ n c cs = e
-                where n' = if neg then negate n else n
-                      c' = chunk c cs
-                      e  = n' `seq` c' `seq` Just (n',c')
-         --                  in n' `seq` c' `seq` JustS n' c'
-
--- | readInteger reads an Integer from the beginning of the ByteString.  If
--- there is no integer at the beginning of the string, it returns Nothing,
--- otherwise it just returns the int read, and the rest of the string.
-readInteger :: ByteString -> Maybe (Integer, ByteString)
-readInteger Empty = Nothing
-readInteger (Chunk c0 cs0) =
-        case w2c (B.unsafeHead c0) of
-            '-' -> first (B.unsafeTail c0) cs0 >>= \(n, cs') -> return (-n, cs')
-            '+' -> first (B.unsafeTail c0) cs0
-            _   -> first c0 cs0
-
-    where first c cs
-              | B.null c = case cs of
-                  Empty          -> Nothing
-                  (Chunk c' cs') -> first' c' cs'
-              | otherwise = first' c cs
-
-          first' c cs = case B.unsafeHead c of
-              w | w >= 0x30 && w <= 0x39 -> Just $
-                  loop 1 (fromIntegral w - 0x30) [] (B.unsafeTail c) cs
-                | otherwise              -> Nothing
-
-          loop :: Int -> Int -> [Integer]
-               -> S.ByteString -> ByteString -> (Integer, ByteString)
-          loop !d !acc ns !c cs
-              | B.null c = case cs of
-                             Empty          -> combine d acc ns c cs
-                             (Chunk c' cs') -> loop d acc ns c' cs'
-              | otherwise =
-                  case B.unsafeHead c of
-                   w | w >= 0x30 && w <= 0x39 ->
-                       if d < 9 then loop (d+1)
-                                          (10*acc + (fromIntegral w - 0x30))
-                                          ns (B.unsafeTail c) cs
-                                else loop 1 (fromIntegral w - 0x30)
-                                          (fromIntegral acc : ns)
-                                          (B.unsafeTail c) cs
-                     | otherwise -> combine d acc ns c cs
-
-          combine _ acc [] c cs = end (fromIntegral acc) c cs
-          combine d acc ns c cs =
-              end (10^d * combine1 1000000000 ns + fromIntegral acc) c cs
-
-          combine1 _ [n] = n
-          combine1 b ns  = combine1 (b*b) $ combine2 b ns
-
-          combine2 b (n:m:ns) = let !t = n+m*b in t : combine2 b ns
-          combine2 _ ns       = ns
-
-          end n c cs = let !c' = chunk c cs
-                        in (n, c')
-
 
 -- | Write a ByteString to a handle, appending a newline byte.
 --

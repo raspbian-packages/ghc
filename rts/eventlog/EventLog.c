@@ -769,8 +769,10 @@ void postCapsetVecEvent (EventTypeNum tag,
         // 1 + strlen to account for the trailing \0, used as separator
         int increment = 1 + strlen(argv[i]);
         if (size + increment > EVENT_PAYLOAD_SIZE_MAX) {
-            errorBelch("Event size exceeds EVENT_PAYLOAD_SIZE_MAX, record only "
-                       "%d out of %d args", i, argc);
+            errorBelch("Event size exceeds EVENT_PAYLOAD_SIZE_MAX, record only %"
+                       FMT_Word " out of %" FMT_Word " args",
+                       (StgWord) i,
+                       (StgWord) argc);
             argc = i;
             break;
         } else {
@@ -1140,15 +1142,24 @@ void postConcMarkEnd(StgWord32 marked_obj_count)
     RELEASE_LOCK(&eventBufMutex);
 }
 
-void postNonmovingHeapCensus(int log_blk_size,
+void postNonmovingHeapCensus(uint16_t blk_size,
                              const struct NonmovingAllocCensus *census)
 {
     ACQUIRE_LOCK(&eventBufMutex);
     postEventHeader(&eventBuf, EVENT_NONMOVING_HEAP_CENSUS);
-    postWord8(&eventBuf, log_blk_size);
+    postWord16(&eventBuf, blk_size);
     postWord32(&eventBuf, census->n_active_segs);
     postWord32(&eventBuf, census->n_filled_segs);
     postWord32(&eventBuf, census->n_live_blocks);
+    RELEASE_LOCK(&eventBufMutex);
+}
+
+void postNonmovingPrunedSegments(uint32_t pruned_segments, uint32_t free_segments)
+{
+    ACQUIRE_LOCK(&eventBufMutex);
+    postEventHeader(&eventBuf, EVENT_NONMOVING_PRUNED_SEGMENTS);
+    postWord32(&eventBuf, pruned_segments);
+    postWord32(&eventBuf, free_segments);
     RELEASE_LOCK(&eventBufMutex);
 }
 
@@ -1201,6 +1212,8 @@ static HeapProfBreakdown getHeapProfBreakdown(void)
         return HEAP_PROF_BREAKDOWN_CLOSURE_TYPE;
     case HEAP_BY_INFO_TABLE:
         return HEAP_PROF_BREAKDOWN_INFO_TABLE;
+    case HEAP_BY_ERA:
+        return HEAP_PROF_BREAKDOWN_ERA;
     default:
         barf("getHeapProfBreakdown: unknown heap profiling mode");
     }
@@ -1437,11 +1450,14 @@ void postTickyCounterSamples(StgEntCounter *counters)
 #endif /* TICKY_TICKY */
 void postIPE(const InfoProvEnt *ipe)
 {
+    char closure_desc_buf[CLOSURE_DESC_BUFFER_SIZE] = {};
+    formatClosureDescIpe(ipe, closure_desc_buf);
+
     // See Note [Maximum event length].
     const StgWord MAX_IPE_STRING_LEN = 65535;
     ACQUIRE_LOCK(&eventBufMutex);
     StgWord table_name_len = MIN(strlen(ipe->prov.table_name), MAX_IPE_STRING_LEN);
-    StgWord closure_desc_len = MIN(strlen(ipe->prov.closure_desc), MAX_IPE_STRING_LEN);
+    StgWord closure_desc_len = MIN(strlen(closure_desc_buf), MAX_IPE_STRING_LEN);
     StgWord ty_desc_len = MIN(strlen(ipe->prov.ty_desc), MAX_IPE_STRING_LEN);
     StgWord label_len = MIN(strlen(ipe->prov.label), MAX_IPE_STRING_LEN);
     StgWord module_len = MIN(strlen(ipe->prov.module), MAX_IPE_STRING_LEN);
@@ -1458,7 +1474,7 @@ void postIPE(const InfoProvEnt *ipe)
     postPayloadSize(&eventBuf, len);
     postWord64(&eventBuf, (StgWord) INFO_PTR_TO_STRUCT(ipe->info));
     postStringLen(&eventBuf, ipe->prov.table_name, table_name_len);
-    postStringLen(&eventBuf, ipe->prov.closure_desc, closure_desc_len);
+    postStringLen(&eventBuf, closure_desc_buf, closure_desc_len);
     postStringLen(&eventBuf, ipe->prov.ty_desc, ty_desc_len);
     postStringLen(&eventBuf, ipe->prov.label, label_len);
     postStringLen(&eventBuf, ipe->prov.module, module_len);

@@ -7,7 +7,7 @@ module GHC.Tc.Types.Evidence (
 
   -- * HsWrapper
   HsWrapper(..),
-  (<.>), mkWpTyApps, mkWpEvApps, mkWpEvVarApps, mkWpTyLams,
+  (<.>), mkWpTyApps, mkWpEvApps, mkWpEvVarApps, mkWpTyLams, mkWpForAllCast,
   mkWpEvLams, mkWpLet, mkWpFun, mkWpCastN, mkWpCastR, mkWpEta,
   collectHsWrapBinders,
   idHsWrapper, isIdHsWrapper,
@@ -22,7 +22,7 @@ module GHC.Tc.Types.Evidence (
   isEmptyEvBindMap,
   evBindMapToVarSet,
   varSetMinusEvBindMap,
-  EvBind(..), emptyTcEvBinds, isEmptyTcEvBinds, mkGivenEvBind, mkWantedEvBind,
+  EvBindInfo(..), EvBind(..), emptyTcEvBinds, isEmptyTcEvBinds, mkGivenEvBind, mkWantedEvBind,
   evBindVar, isCoEvBindsVar,
 
   -- * EvTerm (already a CoreExpr)
@@ -70,6 +70,7 @@ import GHC.Types.Basic
 import GHC.Core
 import GHC.Core.Class (Class, classSCSelId )
 import GHC.Core.FVs   ( exprSomeFreeVars )
+import GHC.Core.InstEnv ( Canonical )
 
 import GHC.Utils.Misc
 import GHC.Utils.Panic
@@ -229,7 +230,7 @@ mkWpEta xs wrap = foldr eta_one wrap xs
 
 mk_wp_fun_co :: Mult -> TcCoercionR -> TcCoercionR -> TcCoercionR
 mk_wp_fun_co mult arg_co res_co
-  = mkNakedFunCo1 Representational FTF_T_T (multToCo mult) arg_co res_co
+  = mkNakedFunCo Representational FTF_T_T (multToCo mult) arg_co res_co
     -- FTF_T_T: WpFun is always (->)
 
 mkWpCastR :: TcCoercionR -> HsWrapper
@@ -256,6 +257,21 @@ mkWpEvVarApps vs = mk_co_app_fn WpEvApp (map (EvExpr . evId) vs)
 
 mkWpTyLams :: [TyVar] -> HsWrapper
 mkWpTyLams ids = mk_co_lam_fn WpTyLam ids
+
+-- mkWpForAllCast [tv{vis}] constructs a cast
+--   forall tv. res  ~R#   forall tv{vis} res`.
+-- See Note [Required foralls in Core] in GHC.Core.TyCo.Rep
+--
+-- It's a no-op if all binders are invisible;
+-- but in that case we refrain from calling it.
+mkWpForAllCast :: [ForAllTyBinder] -> Type -> HsWrapper
+mkWpForAllCast bndrs res_ty
+  = mkWpCastR (go bndrs)
+  where
+    go []                 = mkRepReflCo res_ty
+    go (Bndr tv vis : bs) = mkForAllCo tv coreTyLamForAllTyFlag vis kind_co (go bs)
+      where
+        kind_co = mkNomReflCo (varType tv)
 
 mkWpEvLams :: [Var] -> HsWrapper
 mkWpEvLams ids = mk_co_lam_fn WpEvLam ids
@@ -447,24 +463,29 @@ varSetMinusEvBindMap vs (EvBindMap dve) = vs `uniqSetMinusUDFM` dve
 instance Outputable EvBindMap where
   ppr (EvBindMap m) = ppr m
 
+data EvBindInfo
+  = EvBindGiven { -- See Note [Tracking redundant constraints] in GHC.Tc.Solver
+    }
+  | EvBindWanted { ebi_canonical :: Canonical -- See Note [Desugaring non-canonical evidence]
+    }
+
 -----------------
 -- All evidence is bound by EvBinds; no side effects
 data EvBind
-  = EvBind { eb_lhs      :: EvVar
-           , eb_rhs      :: EvTerm
-           , eb_is_given :: Bool  -- True <=> given
-                 -- See Note [Tracking redundant constraints] in GHC.Tc.Solver
+  = EvBind { eb_lhs  :: EvVar
+           , eb_rhs  :: EvTerm
+           , eb_info :: EvBindInfo
     }
 
 evBindVar :: EvBind -> EvVar
 evBindVar = eb_lhs
 
-mkWantedEvBind :: EvVar -> EvTerm -> EvBind
-mkWantedEvBind ev tm = EvBind { eb_is_given = False, eb_lhs = ev, eb_rhs = tm }
+mkWantedEvBind :: EvVar -> Canonical -> EvTerm -> EvBind
+mkWantedEvBind ev c tm = EvBind { eb_info = EvBindWanted c, eb_lhs = ev, eb_rhs = tm }
 
 -- EvTypeable are never given, so we can work with EvExpr here instead of EvTerm
 mkGivenEvBind :: EvVar -> EvTerm -> EvBind
-mkGivenEvBind ev tm = EvBind { eb_is_given = True, eb_lhs = ev, eb_rhs = tm }
+mkGivenEvBind ev tm = EvBind { eb_info = EvBindGiven, eb_lhs = ev, eb_rhs = tm }
 
 
 -- An EvTerm is, conceptually, a CoreExpr that implements the constraint.
@@ -655,7 +676,7 @@ important) are solved in three steps:
 
 1. Explicit, user-written occurrences of `?stk :: CallStack`
    which have IPOccOrigin, are solved directly from the given IP,
-   just like a regular IP; see GHC.Tc.Solver.Interact.interactDict.
+   just like a regular IP; see GHC.Tc.Solver.Dict.tryInertDicts.
 
    For example, the occurrence of `?stk` in
 
@@ -685,7 +706,7 @@ important) are solved in three steps:
         [W] d1 : IP "stk" CallStack
      with CtOrigin = OccurrenceOf "foo"
 
-   * We /solve/ this constraint, in GHC.Tc.Solver.Canonical.canClassNC
+   * We /solve/ this constraint, in GHC.Tc.Solver.Dict.canDictNC
      by emitting a NEW Wanted
         [W] d2 :: IP "stk" CallStack
      with CtOrigin = IPOccOrigin
@@ -771,7 +792,7 @@ Important Details:
 
 - When we emit a new wanted CallStack from rule (2) we set its origin to
   `IPOccOrigin ip_name` instead of the original `OccurrenceOf func`
-  (see GHC.Tc.Solver.Interact.interactDict).
+  (see GHC.Tc.Solver.Dict.tryInertDicts).
 
   This is a bit shady, but is how we ensure that the new wanted is
   solved like a regular IP.
@@ -845,8 +866,7 @@ findNeededEvVars ev_binds seeds
    add :: Var -> VarSet -> VarSet
    add v needs
      | Just ev_bind <- lookupEvBind ev_binds v
-     , EvBind { eb_is_given = is_given, eb_rhs = rhs } <- ev_bind
-     , is_given
+     , EvBind { eb_info = EvBindGiven, eb_rhs = rhs } <- ev_bind
      = evVarsOfTerm rhs `unionVarSet` needs
      | otherwise
      = needs
@@ -940,12 +960,14 @@ instance Uniquable EvBindsVar where
   getUnique = ebv_uniq
 
 instance Outputable EvBind where
-  ppr (EvBind { eb_lhs = v, eb_rhs = e, eb_is_given = is_given })
+  ppr (EvBind { eb_lhs = v, eb_rhs = e, eb_info = info })
      = sep [ pp_gw <+> ppr v
            , nest 2 $ equals <+> ppr e ]
+      -- We cheat a bit and pretend EqVars are CoVars for the purposes of pretty printing
      where
-       pp_gw = brackets (if is_given then char 'G' else char 'W')
-   -- We cheat a bit and pretend EqVars are CoVars for the purposes of pretty printing
+       pp_gw = brackets $ case info of
+           EvBindGiven{}  -> char 'G'
+           EvBindWanted{} -> char 'W'
 
 instance Outputable EvTerm where
   ppr (EvExpr e)         = ppr e

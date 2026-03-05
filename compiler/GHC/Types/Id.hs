@@ -54,7 +54,7 @@ module GHC.Types.Id (
         setIdExported, setIdNotExported,
         globaliseId, localiseId,
         setIdInfo, lazySetIdInfo, modifyIdInfo, maybeModifyIdInfo,
-        zapLamIdInfo, zapIdDemandInfo, zapIdUsageInfo, zapIdUsageEnvInfo,
+        zapLamIdInfo, floatifyIdDemandInfo, zapIdUsageInfo, zapIdUsageEnvInfo,
         zapIdUsedOnceInfo, zapIdTailCallInfo,
         zapFragileIdInfo, zapIdDmdSig, zapStableUnfolding,
         transferPolyIdInfo, scaleIdBy, scaleVarBy,
@@ -78,7 +78,8 @@ module GHC.Types.Id (
         hasNoBinding,
 
         -- ** Join variables
-        JoinId, isJoinId, isJoinId_maybe, idJoinArity,
+        JoinId, JoinPointHood,
+        isJoinId, idJoinPointHood, idJoinArity,
         asJoinId, asJoinId_maybe, zapJoinId,
 
         -- ** Inline pragma stuff
@@ -165,7 +166,6 @@ import GHC.Core.Multiplicity
 import GHC.Utils.Misc
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
-import GHC.Utils.Panic.Plain
 import GHC.Stg.InferTags.TagSig
 
 -- infixl so you can say (id `set` a `set` b)
@@ -296,26 +296,28 @@ mkGlobalId :: IdDetails -> Name -> Type -> IdInfo -> Id
 mkGlobalId = Var.mkGlobalVar
 
 -- | Make a global 'Id' without any extra information at all
-mkVanillaGlobal :: Name -> Type -> Id
+mkVanillaGlobal :: HasDebugCallStack => Name -> Type -> Id
 mkVanillaGlobal name ty = mkVanillaGlobalWithInfo name ty vanillaIdInfo
 
 -- | Make a global 'Id' with no global information but some generic 'IdInfo'
-mkVanillaGlobalWithInfo :: Name -> Type -> IdInfo -> Id
-mkVanillaGlobalWithInfo = mkGlobalId VanillaId
-
+mkVanillaGlobalWithInfo :: HasDebugCallStack => Name -> Type -> IdInfo -> Id
+mkVanillaGlobalWithInfo nm =
+  assertPpr (not $ isFieldNameSpace $ nameNameSpace nm)
+    (text "mkVanillaGlobalWithInfo called on record field:" <+> ppr nm) $
+    mkGlobalId VanillaId nm
 
 -- | For an explanation of global vs. local 'Id's, see "GHC.Types.Var#globalvslocal"
 mkLocalId :: HasDebugCallStack => Name -> Mult -> Type -> Id
 mkLocalId name w ty = mkLocalIdWithInfo name w (assert (not (isCoVarType ty)) ty) vanillaIdInfo
 
 -- | Make a local CoVar
-mkLocalCoVar :: Name -> Type -> CoVar
+mkLocalCoVar :: HasDebugCallStack => Name -> Type -> CoVar
 mkLocalCoVar name ty
   = assert (isCoVarType ty) $
     Var.mkLocalVar CoVarId name ManyTy ty vanillaIdInfo
 
 -- | Like 'mkLocalId', but checks the type to see if it should make a covar
-mkLocalIdOrCoVar :: Name -> Mult -> Type -> Id
+mkLocalIdOrCoVar :: HasDebugCallStack => Name -> Mult -> Type -> Id
 mkLocalIdOrCoVar name w ty
   -- We should assert (eqType w Many) in the isCoVarType case.
   -- However, currently this assertion does not hold.
@@ -339,7 +341,10 @@ mkExportedLocalId details name ty = Var.mkExportedLocalVar details name ty vanil
         -- Note [Free type variables]
 
 mkExportedVanillaId :: Name -> Type -> Id
-mkExportedVanillaId name ty = Var.mkExportedLocalVar VanillaId name ty vanillaIdInfo
+mkExportedVanillaId name ty =
+  assertPpr (not $ isFieldNameSpace $ nameNameSpace name)
+    (text "mkExportedVanillaId called on record field:" <+> ppr name) $
+    Var.mkExportedLocalVar VanillaId name ty vanillaIdInfo
         -- Note [Free type variables]
 
 
@@ -480,23 +485,23 @@ isRecordSelector id = case Var.idDetails id of
 
 isDataConRecordSelector id = case Var.idDetails id of
                         RecSelId {sel_tycon = RecSelData _} -> True
-                        _               -> False
+                        _                                   -> False
 
 isPatSynRecordSelector id = case Var.idDetails id of
                         RecSelId {sel_tycon = RecSelPatSyn _} -> True
-                        _               -> False
+                        _                                     -> False
 
 isNaughtyRecordSelector id = case Var.idDetails id of
                         RecSelId { sel_naughty = n } -> n
-                        _                               -> False
+                        _                            -> False
 
 isClassOpId id = case Var.idDetails id of
-                        ClassOpId _   -> True
-                        _other        -> False
+                        ClassOpId {} -> True
+                        _other       -> False
 
 isClassOpId_maybe id = case Var.idDetails id of
-                        ClassOpId cls -> Just cls
-                        _other        -> Nothing
+                        ClassOpId cls _ -> Just cls
+                        _other          -> Nothing
 
 isPrimOpId id = case Var.idDetails id of
                         PrimOpId {} -> True
@@ -527,8 +532,8 @@ isDataConWorkId_maybe id = case Var.idDetails id of
                         _                 -> Nothing
 
 isDataConWrapId id = case Var.idDetails id of
-                       DataConWrapId _ -> True
-                       _               -> False
+                        DataConWrapId _ -> True
+                        _               -> False
 
 isDataConWrapId_maybe id = case Var.idDetails id of
                         DataConWrapId con -> Just con
@@ -560,13 +565,12 @@ isJoinId id
   | otherwise = False
 
 -- | Doesn't return strictness marks
-isJoinId_maybe :: Var -> Maybe JoinArity
-isJoinId_maybe id
- | isId id  = assertPpr (isId id) (ppr id) $
-              case Var.idDetails id of
-                JoinId arity _marks -> Just arity
-                _            -> Nothing
- | otherwise = Nothing
+idJoinPointHood :: Var -> JoinPointHood
+idJoinPointHood id
+ | isId id  = case Var.idDetails id of
+                JoinId arity _marks -> JoinPoint arity
+                _                   -> NotJoinPoint
+ | otherwise = NotJoinPoint
 
 idDataCon :: Id -> DataCon
 -- ^ Get from either the worker or the wrapper 'Id' to the 'DataCon'. Currently used only in the desugarer.
@@ -639,7 +643,9 @@ isDeadBinder bndr | isId bndr = isDeadOcc (idOccInfo bndr)
 -}
 
 idJoinArity :: JoinId -> JoinArity
-idJoinArity id = isJoinId_maybe id `orElse` pprPanic "idJoinArity" (ppr id)
+idJoinArity id = case idJoinPointHood id of
+                   JoinPoint ar -> ar
+                   NotJoinPoint -> pprPanic "idJoinArity" (ppr id)
 
 asJoinId :: Id -> JoinArity -> JoinId
 asJoinId id arity = warnPprTrace (not (isLocalId id))
@@ -671,9 +677,9 @@ zapJoinId jid | isJoinId jid = zapIdTailCallInfo (newIdDetails `seq` jid `setIdD
                   _                     -> panic "zapJoinId: newIdDetails can only be used if Id was a join Id."
 
 
-asJoinId_maybe :: Id -> Maybe JoinArity -> Id
-asJoinId_maybe id (Just arity) = asJoinId id arity
-asJoinId_maybe id Nothing      = zapJoinId id
+asJoinId_maybe :: Id -> JoinPointHood -> Id
+asJoinId_maybe id (JoinPoint arity) = asJoinId id arity
+asJoinId_maybe id NotJoinPoint      = zapJoinId id
 
 {-
 ************************************************************************
@@ -834,15 +840,15 @@ asNonWorkerLikeId :: Id -> Id
 asNonWorkerLikeId id =
   let details = case idDetails id of
         WorkerLikeId{}      -> Just $ VanillaId
-        JoinId arity Just{}   -> Just $ JoinId arity Nothing
-        _                     -> Nothing
+        JoinId arity Just{} -> Just $ JoinId arity Nothing
+        _                   -> Nothing
   in maybeModifyIdDetails details id
 
 -- | Turn this id into a WorkerLikeId if possible.
 asWorkerLikeId :: Id -> Id
 asWorkerLikeId id =
   let details = case idDetails id of
-        WorkerLikeId{}      -> Nothing
+        WorkerLikeId{}        -> Nothing
         JoinId _arity Just{}  -> Nothing
         JoinId arity Nothing  -> Just (JoinId arity (Just []))
         VanillaId             -> Just $ WorkerLikeId []
@@ -957,12 +963,11 @@ setIdOneShotInfo id one_shot = modifyIdInfo (`setOneShotInfo` one_shot) id
 updOneShotInfo :: Id -> OneShotInfo -> Id
 -- Combine the info in the Id with new info
 updOneShotInfo id one_shot
-  | do_upd    = setIdOneShotInfo id one_shot
-  | otherwise = id
-  where
-    do_upd = case (idOneShotInfo id, one_shot) of
-                (NoOneShotInfo, _) -> True
-                (OneShotLam,    _) -> False
+  | OneShotLam <- one_shot
+  , NoOneShotInfo <- idOneShotInfo id
+  = setIdOneShotInfo id OneShotLam
+  | otherwise
+  = id
 
 -- The OneShotLambda functions simply fiddle with the IdInfo flag
 -- But watch out: this may change the type of something else
@@ -979,8 +984,9 @@ zapLamIdInfo = zapInfo zapLamInfo
 zapFragileIdInfo :: Id -> Id
 zapFragileIdInfo = zapInfo zapFragileInfo
 
-zapIdDemandInfo :: Id -> Id
-zapIdDemandInfo = zapInfo zapDemandInfo
+floatifyIdDemandInfo :: Id -> Id
+-- See Note [Floatifying demand info when floating] in GHC.Core.Opt.SetLevels
+floatifyIdDemandInfo = zapInfo floatifyDemandInfo
 
 zapIdUsageInfo :: Id -> Id
 zapIdUsageInfo = zapInfo zapUsageInfo

@@ -1,5 +1,6 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE MonadComprehensions #-}
 {-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE DataKinds #-}
@@ -20,67 +21,92 @@ module GHC.Tc.Errors.Ppr
   , pprHsDocContext
   , inHsDocContext
   , TcRnMessageOpts(..)
+  , pprTyThingUsedWrong
+  , pprUntouchableVariable
+
+  --
+  , mismatchMsg_ExpectedActuals
+
+  -- | Useful when overriding message printing.
+  , messageWithInfoDiagnosticMessage
+  , messageWithHsDocContext
   )
   where
 
 import GHC.Prelude
 
+import qualified Language.Haskell.TH as TH
+
 import GHC.Builtin.Names
-import GHC.Builtin.Types ( boxedRepDataConTyCon, tYPETyCon )
+import GHC.Builtin.Types ( boxedRepDataConTyCon, tYPETyCon, filterCTuple, pretendNameIsInScope )
+
+import GHC.Types.Name.Reader
+import GHC.Unit.Module.ModIface
+import GHC.Unit.Module.Warnings
 
 import GHC.Core.Coercion
 import GHC.Core.Unify     ( tcMatchTys )
 import GHC.Core.TyCon
 import GHC.Core.Class
 import GHC.Core.DataCon
-import GHC.Core.Coercion.Axiom (coAxiomTyCon, coAxiomSingleBranch)
+import GHC.Core.Coercion.Axiom (CoAxBranch, coAxiomTyCon, coAxiomSingleBranch)
 import GHC.Core.ConLike
-import GHC.Core.FamInstEnv ( famInstAxiom )
+import GHC.Core.FamInstEnv ( FamInst(..), famInstAxiom, pprFamInst )
 import GHC.Core.InstEnv
 import GHC.Core.TyCo.Rep (Type(..))
-import GHC.Core.TyCo.Ppr (pprWithExplicitKindsWhen,
-                          pprSourceTyCon, pprTyVars, pprWithTYPE)
+import GHC.Core.TyCo.Ppr (pprWithInvisibleBitsWhen, pprSourceTyCon,
+                          pprTyVars, pprWithTYPE, pprTyVar, pprTidiedType, pprForAll)
 import GHC.Core.PatSyn ( patSynName, pprPatSynType )
 import GHC.Core.Predicate
 import GHC.Core.Type
+import GHC.Core.FVs( orphNamesOfTypes )
+import GHC.CoreToIface
 
 import GHC.Driver.Flags
 import GHC.Driver.Backend
 import GHC.Hs
 
 import GHC.Tc.Errors.Types
+import GHC.Tc.Types.BasicTypes
 import GHC.Tc.Types.Constraint
-import {-# SOURCE #-} GHC.Tc.Types( getLclEnvLoc, lclEnvInGeneratedCode )
-import GHC.Tc.Types.Origin
+import GHC.Tc.Types.Origin hiding ( Position(..) )
 import GHC.Tc.Types.Rank (Rank(..))
+import GHC.Tc.Types.TH
 import GHC.Tc.Utils.TcType
 
 import GHC.Types.Error
-import GHC.Types.FieldLabel (flIsOverloaded)
-import GHC.Types.Hint (UntickedPromotedThing(..), pprUntickedConstructor, isBareSymbol)
+import GHC.Types.Hint
 import GHC.Types.Hint.Ppr () -- Outputable GhcHint
 import GHC.Types.Basic
-import GHC.Types.Error.Codes ( constructorCode )
+import GHC.Types.Error.Codes
 import GHC.Types.Id
+import GHC.Types.Id.Info ( RecSelParent(..) )
 import GHC.Types.Name
-import GHC.Types.Name.Reader ( GreName(..), pprNameProvenance
-                             , RdrName, rdrNameOcc, greMangledName )
+import GHC.Types.Name.Env
 import GHC.Types.Name.Set
+import GHC.Types.SourceFile
 import GHC.Types.SrcLoc
 import GHC.Types.TyThing
+import GHC.Types.TyThing.Ppr ( pprTyThingInContext )
 import GHC.Types.Unique.Set ( nonDetEltsUniqSet )
 import GHC.Types.Var
 import GHC.Types.Var.Set
 import GHC.Types.Var.Env
+import GHC.Types.Fixity (defaultFixity)
 
-import GHC.Unit.State (pprWithUnitState, UnitState)
+import GHC.Iface.Errors.Types
+import GHC.Iface.Errors.Ppr
+import GHC.Iface.Syntax
+
+import GHC.Unit.State
 import GHC.Unit.Module
-import GHC.Unit.Module.Warnings  ( pprWarningTxtForMsg )
 
 import GHC.Data.Bag
 import GHC.Data.FastString
 import GHC.Data.List.SetOps ( nubOrdBy )
 import GHC.Data.Maybe
+import GHC.Data.Pair
+import GHC.Settings.Constants (mAX_TUPLE_SIZE, mAX_CTUPLE_SIZE)
 import GHC.Utils.Misc
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
@@ -91,27 +117,26 @@ import GHC.Data.BooleanFormula (pprBooleanFormulaNice)
 
 import Data.List.NonEmpty (NonEmpty(..))
 import qualified Data.List.NonEmpty as NE
+import Data.Foldable ( fold )
 import Data.Function (on)
 import Data.List ( groupBy, sortBy, tails
                  , partition, unfoldr )
 import Data.Ord ( comparing )
 import Data.Bifunctor
-import GHC.Types.Name.Env
-import qualified Language.Haskell.TH as TH
 
-data TcRnMessageOpts = TcRnMessageOpts { tcOptsShowContext :: !Bool -- ^ Whether we show the error context or not
-                                       }
 
 defaultTcRnMessageOpts :: TcRnMessageOpts
-defaultTcRnMessageOpts = TcRnMessageOpts { tcOptsShowContext = True }
+defaultTcRnMessageOpts = TcRnMessageOpts { tcOptsShowContext = True
+                                         , tcOptsIfaceOpts = defaultDiagnosticOpts @IfaceMessage }
 
+instance HasDefaultDiagnosticOpts TcRnMessageOpts where
+  defaultOpts = defaultTcRnMessageOpts
 
 instance Diagnostic TcRnMessage where
   type DiagnosticOpts TcRnMessage = TcRnMessageOpts
-  defaultDiagnosticOpts = defaultTcRnMessageOpts
   diagnosticMessage opts = \case
-    TcRnUnknownMessage (UnknownDiagnostic @e m)
-      -> diagnosticMessage (defaultDiagnosticOpts @e) m
+    TcRnUnknownMessage (UnknownDiagnostic f m)
+      -> diagnosticMessage (f opts) m
     TcRnMessageWithInfo unit_state msg_with_info
       -> case msg_with_info of
            TcRnMessageDetailed err_info msg
@@ -119,14 +144,15 @@ instance Diagnostic TcRnMessage where
                   (tcOptsShowContext opts)
                   (diagnosticMessage opts msg)
     TcRnWithHsDocContext ctxt msg
-      -> if tcOptsShowContext opts
-         then main_msg `unionDecoratedSDoc` ctxt_msg
-         else main_msg
-      where
-        main_msg = diagnosticMessage opts msg
-        ctxt_msg = mkSimpleDecorated (inHsDocContext ctxt)
-    TcRnSolverReport msg _ _
+      -> messageWithHsDocContext opts ctxt (diagnosticMessage opts msg)
+    TcRnSolverReport msg _
       -> mkSimpleDecorated $ pprSolverReportWithCtxt msg
+    TcRnSolverDepthError ty depth -> mkSimpleDecorated msg
+      where
+        msg =
+          vcat [ text "Reduction stack overflow; size =" <+> ppr depth
+               , hang (text "When simplifying the following type:")
+                    2 (ppr ty) ]
     TcRnRedundantConstraints redundants (info, show_info)
       -> mkSimpleDecorated $
          text "Redundant constraint" <> plural redundants <> colon
@@ -137,6 +163,10 @@ instance Diagnostic TcRnMessage where
          hang (text "Inaccessible code in")
            2 (ppr (ic_info implic))
          $$ pprSolverReportWithCtxt contra
+    TcRnInaccessibleCoAxBranch fam_tc cur_branch
+      -> mkSimpleDecorated $
+          text "Type family instance equation is overlapped:" $$
+          nest 2 (pprCoAxBranchUser fam_tc cur_branch)
     TcRnTypeDoesNotHaveFixedRuntimeRep ty prov (ErrInfo extra supplementary)
       -> mkDecorated [pprTypeDoesNotHaveFixedRuntimeRep ty prov, extra, supplementary]
     TcRnImplicitLift id_or_name ErrInfo{..}
@@ -146,10 +176,13 @@ instance Diagnostic TcRnMessage where
            ) : [errInfoContext, errInfoSupplementary]
     TcRnUnusedPatternBinds bind
       -> mkDecorated [hang (text "This pattern-binding binds no variables:") 2 (ppr bind)]
-    TcRnDodgyImports name
-      -> mkDecorated [dodgy_msg (text "import") name (dodgy_msg_insert name :: IE GhcPs)]
-    TcRnDodgyExports name
-      -> mkDecorated [dodgy_msg (text "export") name (dodgy_msg_insert name :: IE GhcRn)]
+    TcRnDodgyImports (DodgyImportsEmptyParent gre)
+      -> mkDecorated [dodgy_msg (text "import") gre (dodgy_msg_insert gre)]
+    TcRnDodgyImports (DodgyImportsHiding reason)
+      -> mkSimpleDecorated $
+         pprImportLookup reason
+    TcRnDodgyExports gre
+      -> mkDecorated [dodgy_msg (text "export") gre (dodgy_msg_insert gre)]
     TcRnMissingImportList ie
       -> mkDecorated [ text "The import item" <+> quotes (ppr ie) <+>
                        text "does not have an explicit import list"
@@ -174,6 +207,11 @@ instance Diagnostic TcRnMessage where
             sep [text "This binding for" <+> quotes (ppr occ)
              <+> text "shadows the existing binding" <> plural shadowed_locs,
                    nest 2 (vcat shadowed_locs)]
+    TcRnInvalidWarningCategory cat
+      -> mkSimpleDecorated $
+           vcat [text "Warning category" <+> quotes (ppr cat) <+> text "is not valid",
+                 text "(user-defined category names must begin with" <+> quotes (text "x-"),
+                 text "and contain only letters, numbers, apostrophes and dashes)" ]
     TcRnDuplicateWarningDecls d rdr_name
       -> mkSimpleDecorated $
            vcat [text "Multiple warning declarations for" <+> quotes (ppr rdr_name),
@@ -239,19 +277,29 @@ instance Diagnostic TcRnMessage where
         sole_msg =
           vcat [ text "except as the sole constraint"
                , nest 2 (text "e.g., deriving instance _ => Eq (Foo a)") ]
+    TcRnIllegalNamedWildcardInTypeArgument rdr
+      -> mkSimpleDecorated $
+           hang (text "Illegal named wildcard in a required type argument:")
+                2 (quotes (ppr rdr))
+    TcRnIllegalImplicitTyVarInTypeArgument rdr
+      -> mkSimpleDecorated $
+            hang (text "Illegal implicitly quantified type variable in a required type argument:")
+                2 (quotes (ppr rdr))
     TcRnDuplicateFieldName fld_part dups
       -> mkSimpleDecorated $
-           hsep [text "duplicate field name",
-                 quotes (ppr (NE.head dups)),
-                 text "in record", pprRecordFieldPart fld_part]
+           hsep [ text "Duplicate field name"
+                , quotes (ppr (rdrNameOcc $ NE.head dups))
+                , text "in record", pprRecordFieldPart fld_part ]
     TcRnIllegalViewPattern pat
       -> mkSimpleDecorated $ vcat [text "Illegal view pattern: " <+> ppr pat]
     TcRnCharLiteralOutOfRange c
       -> mkSimpleDecorated $ text "character literal out of range: '\\" <> char c  <> char '\''
     TcRnIllegalWildcardsInConstructor con
       -> mkSimpleDecorated $
-           vcat [ text "Illegal `..' notation for constructor" <+> quotes (ppr con)
-                , nest 2 (text "The constructor has no labelled fields") ]
+           vcat [ text "Illegal `{..}' notation for constructor" <+> quotes (ppr con)
+                , nest 2 (text "Record wildcards may not be used for constructors with unlabelled fields.")
+                , nest 2 (text "Possible fix: Remove the `{..}' and add a match for each field of the constructor.")
+                ]
     TcRnIgnoringAnnotations anns
       -> mkSimpleDecorated $
            text "Ignoring ANN annotation" <> plural anns <> comma
@@ -283,16 +331,31 @@ instance Diagnostic TcRnMessage where
     TcRnArrowIfThenElsePredDependsOnResultTy
       -> mkSimpleDecorated $
            text "Predicate type of `ifThenElse' depends on result type"
-    TcRnIllegalHsBootFileDecl
+    TcRnIllegalHsBootOrSigDecl boot_or_sig decls
       -> mkSimpleDecorated $
-           text "Illegal declarations in an hs-boot file"
+           text "Illegal" <+> what <+> text "in" <+> whr <> dot
+        where
+          what = case decls of
+            BootBindsPs      {} -> text "binding"
+            BootBindsRn      {} -> text "binding"
+            BootInstanceSigs {} -> text "instance body"
+            BootFamInst      {} -> text "family instance"
+            BootSpliceDecls  {} -> text "splice"
+            BootForeignDecls {} -> text "foreign declaration"
+            BootDefaultDecls {} -> text "default declaration"
+            BootRuleDecls    {} -> text "RULE pragma"
+          whr = case boot_or_sig of
+            HsBoot -> text "an hs-boot file"
+            Hsig   -> text "a backpack signature file"
+    TcRnBootMismatch boot_or_sig err ->
+      mkSimpleDecorated $ pprBootMismatch boot_or_sig err
     TcRnRecursivePatternSynonym binds
       -> mkSimpleDecorated $
             hang (text "Recursive pattern synonym definition with following bindings:")
                2 (vcat $ map pprLBind . bagToList $ binds)
           where
             pprLoc loc = parens (text "defined at" <+> ppr loc)
-            pprLBind :: CollectPass GhcRn => GenLocated (SrcSpanAnn' a) (HsBindLR GhcRn idR) -> SDoc
+            pprLBind :: CollectPass GhcRn => GenLocated (EpAnn a) (HsBindLR GhcRn idR) -> SDoc
             pprLBind (L loc bind) = pprWithCommas ppr (collectHsBindBinders CollNoDictBinders bind)
                                         <+> pprLoc (locA loc)
     TcRnPartialTypeSigTyVarMismatch n1 n2 fn_name hs_ty
@@ -312,7 +375,7 @@ instance Diagnostic TcRnMessage where
               = sep [ quotes (ppr n), text "should really be", quotes (ppr rhs_ty) ]
               | otherwise
               = empty
-    TcRnMissingSignature what _ _ ->
+    TcRnMissingSignature what _ ->
       mkSimpleDecorated $
       case what of
         MissingPatSynSig p ->
@@ -340,13 +403,6 @@ instance Diagnostic TcRnMessage where
               2 (ppr sig)
     TcRnTupleConstraintInst _
       -> mkSimpleDecorated $ text "You can't specify an instance for a tuple constraint"
-    TcRnAbstractClassInst clas
-      -> mkSimpleDecorated $
-           text "Cannot define instance for abstract class" <+>
-           quotes (ppr (className clas))
-    TcRnNoClassInstHead tau
-      -> mkSimpleDecorated $
-           hang (text "Instance head is not headed by a class:") 2 (pprType tau)
     TcRnUserTypeError ty
       -> mkSimpleDecorated (pprUserTypeErrorTy ty)
     TcRnConstraintInKind ty
@@ -369,12 +425,32 @@ instance Diagnostic TcRnMessage where
                 2 (text "type:" <+> quotes (ppr ty))
            , hang (text "where the body of the forall has this kind:")
                 2 (quotes (pprKind kind)) ]
-    TcRnVDQInTermType mb_ty
+    TcRnSimplifiableConstraint pred what
       -> mkSimpleDecorated $ vcat
-           [ case mb_ty of
+           [ hang (text "The constraint" <+> quotes (pprType pred) <+> text "matches")
+                2 (ppr what)
+           , hang (text "This makes type inference for inner bindings fragile;")
+                2 (text "either use MonoLocalBinds, or simplify it using the instance") ]
+    TcRnArityMismatch thing thing_arity nb_args
+      -> mkSimpleDecorated $
+           hsep [ text "The" <+> what, quotes (ppr $ getName thing), text "should have"
+                , n_arguments <> comma, text "but has been given"
+                , if nb_args == 0 then text "none" else int nb_args
+                ]
+          where
+            what = case thing of
+              ATyCon tc -> ppr (tyConFlavour tc)
+              _         -> text (tyThingCategory thing)
+            n_arguments | thing_arity == 0 = text "no arguments"
+                        | thing_arity == 1 = text "1 argument"
+                        | True          = hsep [int thing_arity, text "arguments"]
+    TcRnIllegalInstance reason ->
+      mkSimpleDecorated $ pprIllegalInstance reason
+    TcRnVDQInTermType mb_ty
+      -> mkSimpleDecorated $
+             case mb_ty of
                Nothing -> main_msg
                Just ty -> hang (main_msg <> char ':') 2 (pprType ty)
-           , text "(GHC does not yet support this)" ]
       where
         main_msg =
           text "Illegal visible, dependent quantification" <+>
@@ -396,18 +472,10 @@ instance Diagnostic TcRnMessage where
     TcRnIllegalConstraintSynonymOfKind kind
       -> mkSimpleDecorated $
            text "Illegal constraint synonym of kind:" <+> quotes (pprKind kind)
-    TcRnIllegalClassInst tcf
-      -> mkSimpleDecorated $
-           vcat [ text "Illegal instance for a" <+> ppr tcf
-                , text "A class instance must be for a class" ]
     TcRnOversaturatedVisibleKindArg ty
       -> mkSimpleDecorated $
            text "Illegal oversaturated visible kind argument:" <+>
            quotes (char '@' <> pprParendType ty)
-    TcRnBadAssociatedType clas tc
-      -> mkSimpleDecorated $
-           hsep [ text "Class", quotes (ppr clas)
-                , text "does not have an associated type", quotes (ppr tc) ]
     TcRnForAllRankErr rank ty
       -> let herald = case tcSplitForAllTyVars ty of
                ([], _) -> text "Illegal qualified type:"
@@ -422,11 +490,14 @@ instance Diagnostic TcRnMessage where
               sep [ text "The Monomorphism Restriction applies to the binding"
                   <> plural bindings
                   , text "for" <+> pp_bndrs ]
-    TcRnOrphanInstance inst
+    TcRnOrphanInstance (Left cls_inst)
       -> mkSimpleDecorated $
-           hsep [ text "Orphan instance:"
-                , pprInstanceHdr inst
-                ]
+           hang (text "Orphan class instance:")
+              2 (pprInstanceHdr cls_inst)
+    TcRnOrphanInstance (Right fam_inst)
+      -> mkSimpleDecorated $
+           hang (text "Orphan family instance:")
+              2 (pprFamInst fam_inst)
     TcRnFunDepConflict unit_state sorted
       -> let herald = text "Functional dependencies conflict between instance declarations:"
          in mkSimpleDecorated $
@@ -465,7 +536,7 @@ instance Diagnostic TcRnMessage where
                                 , text "cannot be inferred from the right-hand side." ]
                      in (injectivityErrorHerald $$ body $$ text "In the type family equation:", show_kinds)
 
-         in mkSimpleDecorated $ pprWithExplicitKindsWhen show_kinds $
+         in mkSimpleDecorated $ pprWithInvisibleBitsWhen show_kinds $
               hang herald
                 2 (vcat (map (pprCoAxBranchUser fam_tc) (eqn1 : rest_eqns)))
     TcRnBangOnUnliftedType ty
@@ -521,9 +592,9 @@ instance Diagnostic TcRnMessage where
        $ formatExportItemError
            (ppr export_item)
            "attempts to export constructors or class methods that are not visible here"
-    TcRnDuplicateExport child ie1 ie2
+    TcRnDuplicateExport gre ie1 ie2
       -> mkSimpleDecorated $
-           hsep [ quotes (ppr child)
+           hsep [ quotes (ppr $ greName gre)
                 , text "is exported by", quotes (ppr ie1)
                 , text "and",            quotes (ppr ie2) ]
     TcRnExportedParentChildMismatch parent_name ty_thing child parent_names
@@ -543,33 +614,60 @@ instance Diagnostic TcRnMessage where
           | isRecordSelector i = "record selector"
         pp_category i = tyThingCategory i
         what_is = pp_category ty_thing
-        thing = ppr child
+        thing = ppr $ nameOccName child
         parents = map ppr parent_names
-    TcRnConflictingExports occ child1 gre1 ie1 child2 gre2 ie2
+    TcRnConflictingExports occ child_gre1 ie1 child_gre2 ie2
       -> mkSimpleDecorated $
            vcat [ text "Conflicting exports for" <+> quotes (ppr occ) <> colon
-                , ppr_export child1 gre1 ie1
-                , ppr_export child2 gre2 ie2
+                , ppr_export child_gre1 ie1
+                , ppr_export child_gre2 ie2
                 ]
       where
-        ppr_export child gre ie = nest 3 (hang (quotes (ppr ie) <+> text "exports" <+>
-                                                quotes (ppr_name child))
-                                            2 (pprNameProvenance gre))
-
-        -- DuplicateRecordFields means that nameOccName might be a
-        -- mangled $sel-prefixed thing, in which case show the correct OccName
-        -- alone (but otherwise show the Name so it will have a module
-        -- qualifier)
-        ppr_name (FieldGreName fl) | flIsOverloaded fl = ppr fl
-                                   | otherwise         = ppr (flSelector fl)
-        ppr_name (NormalGreName name) = ppr name
-    TcRnAmbiguousField rupd parent_type
+        ppr_export gre ie =
+          nest 3 $
+            hang (quotes (ppr ie) <+> text "exports" <+> quotes (ppr $ greName gre))
+               2 (pprNameProvenance gre)
+    TcRnDuplicateFieldExport (gre, ie1) gres_ies ->
+      mkSimpleDecorated $
+           vcat ( hsep [ text "Duplicate record field"
+                       , quotes (ppr $ greOccName gre)
+                       , text "in export list" <> colon ]
+                : map ppr_export ((gre,ie1) : NE.toList gres_ies)
+                )
+      where
+        ppr_export (gre,ie) =
+          nest 3 $
+            hang (sep [ quotes (ppr ie) <+> text "exports the field" <+> quotes (ppr $ greName gre)
+                       , text "belonging to the constructor" <> plural fld_cons <+> pprQuotedList fld_cons ])
+               2 (pprNameProvenance gre)
+          where
+            fld_cons :: [ConLikeName]
+            fld_cons = nonDetEltsUniqSet $ recFieldCons $ fieldGREInfo gre
+    TcRnAmbiguousFieldInUpdate (gre1, gre2, gres)
       -> mkSimpleDecorated $
-          vcat [ text "The record update" <+> ppr rupd
-                   <+> text "with type" <+> ppr parent_type
-                   <+> text "is ambiguous."
-               , text "This will not be supported by -XDuplicateRecordFields in future releases of GHC."
+          vcat [ text "Ambiguous record field" <+> fld <> dot
+               , hang (text "It could refer to any of the following:")
+                  2 $ vcat (map pprSugg (gre1 : gre2 : gres))
                ]
+        where
+          fld = quotes $ ppr (occNameFS $ greOccName gre1)
+          pprSugg gre = vcat [ bullet <+> pprGRE gre <> comma
+                             , nest 2 (pprNameProvenance gre) ]
+          pprGRE gre = case greInfo gre of
+            IAmRecField {}
+              -> let parent = par_is $ greParent gre
+                 in text "record field" <+> fld <+> text "of" <+> quotes (ppr parent)
+            _ -> text "variable" <+> fld
+    TcRnAmbiguousRecordUpdate _rupd tc
+      -> mkSimpleDecorated $
+          vcat [ text "Ambiguous record update with parent" <+> what <> dot
+               , hsep [ text "This type-directed disambiguation mechanism"
+                      , text "will not be supported by -XDuplicateRecordFields in future releases of GHC." ]
+               , text "Consider disambiguating using module qualification instead."
+               ]
+        where
+          what :: SDoc
+          what = text "type constructor" <+> quotes (ppr $ RecSelData tc)
     TcRnMissingFields con fields
       -> mkSimpleDecorated $ vcat [header, nest 2 rest]
          where
@@ -583,21 +681,6 @@ instance Diagnostic TcRnMessage where
            hang (text "Record update for insufficiently polymorphic field"
                    <> plural prs <> colon)
               2 (vcat [ ppr f <+> dcolon <+> ppr ty | (f,ty) <- prs ])
-    TcRnNoConstructorHasAllFields conflictingFields
-      -> mkSimpleDecorated $
-           hang (text "No constructor has all these fields:")
-              2 (pprQuotedList conflictingFields)
-    TcRnMixedSelectors data_name data_sels pat_name pat_syn_sels
-      -> mkSimpleDecorated $
-           text "Cannot use a mixture of pattern synonym and record selectors" $$
-           text "Record selectors defined by"
-             <+> quotes (ppr data_name)
-             <> colon
-             <+> pprWithCommas ppr data_sels $$
-           text "Pattern synonym selectors defined by"
-             <+> quotes (ppr pat_name)
-             <> colon
-             <+> pprWithCommas ppr pat_syn_sels
     TcRnMissingStrictFields con fields
       -> mkSimpleDecorated $ vcat [header, nest 2 rest]
          where
@@ -608,14 +691,51 @@ instance Diagnostic TcRnMessage where
            header = text "Constructor" <+> quotes (ppr con) <+>
                     text "does not have the required strict field(s)" <>
                     if null fields then empty else colon
-    TcRnNoPossibleParentForFields rbinds
-      -> mkSimpleDecorated $
-           hang (text "No type has all these fields:")
-              2 (pprQuotedList fields)
-         where fields = map (hfbLHS . unLoc) rbinds
-    TcRnBadOverloadedRecordUpdate _rbinds
-      -> mkSimpleDecorated $
-           text "Record update is ambiguous, and requires a type signature"
+    TcRnBadRecordUpdate upd_flds reason
+      -> case reason of
+          NoConstructorHasAllFields { conflictingFields = conflicts }
+            | [fld] <- conflicts
+            -> mkSimpleDecorated $
+                vcat [ header
+                     , text "No constructor in scope has the field" <+> quotes (ppr fld) ]
+            | otherwise
+            ->
+              mkSimpleDecorated $
+                vcat [ header
+                     , hang (text "No constructor in scope has all of the following fields:")
+                        2 (pprQuotedList conflicts) ]
+            where
+              header :: SDoc
+              header = text "Invalid record update."
+          MultiplePossibleParents (par1, par2, pars) ->
+            mkSimpleDecorated $
+              vcat [ hang (text "Ambiguous record update with field" <> plural upd_flds)
+                       2 ppr_flds
+                   , hang (thisOrThese upd_flds <+> text "field" <> plural upd_flds <+> what_parent)
+                       2 (quotedListWithAnd (map ppr (par1:par2:pars))) ]
+            where
+              ppr_flds, what_parent, which :: SDoc
+              ppr_flds = quotedListWithAnd $ map ppr upd_flds
+              what_parent = case par1 of
+                RecSelData   {} -> text "appear" <> singular upd_flds
+                                <+> text "in" <+> which <+> text "datatypes"
+                RecSelPatSyn {} -> isOrAre upd_flds <+> text "associated with"
+                                <+> which <+> text "pattern synonyms"
+              which = case pars of
+                [] -> text "both"
+                _  -> text "all of the"
+          InvalidTyConParent tc pars ->
+            mkSimpleDecorated $
+              vcat [ hang (text "No data constructor of" <+> what $$ text "has all of the fields:")
+                      2 (pprQuotedList upd_flds)
+                   , pat_syn_msg ]
+            where
+              what = text "type constructor" <+> quotes (ppr (RecSelData tc))
+              pat_syn_msg
+                | any (\case { RecSelPatSyn {} -> True; _ -> False}) pars
+                = text "NB: type-directed disambiguation is not supported for pattern synonym record fields."
+                | otherwise
+                = empty
     TcRnStaticFormNotClosed name reason
       -> mkSimpleDecorated $
            quotes (ppr name)
@@ -658,6 +778,10 @@ instance Diagnostic TcRnMessage where
     TcRnCannotDeriveInstance cls cls_tys mb_strat newtype_deriving reason
       -> mkSimpleDecorated $
            derivErrDiagnosticMessage cls cls_tys mb_strat newtype_deriving True reason
+    TcRnLookupInstance cls tys reason
+      -> mkSimpleDecorated $
+          text "Couldn't match instance:" <+>
+           lookupInstanceErrDiagnosticMessage cls tys reason
     TcRnLazyGADTPattern
       -> mkSimpleDecorated $
            hang (text "An existential or GADT data constructor cannot be used")
@@ -665,23 +789,6 @@ instance Diagnostic TcRnMessage where
     TcRnArrowProcGADTPattern
       -> mkSimpleDecorated $
            text "Proc patterns cannot use existential or GADT data constructors"
-
-    TcRnSpecialClassInst cls because_safeHaskell
-      -> mkSimpleDecorated $
-            text "Class" <+> quotes (ppr $ className cls)
-                   <+> text "does not support user-specified instances"
-                   <> safeHaskell_msg
-          where
-            safeHaskell_msg
-              | because_safeHaskell
-              = text " when Safe Haskell is enabled."
-              | otherwise
-              = dot
-    TcRnForallIdentifier rdr_name
-      -> mkSimpleDecorated $
-            fsep [ text "The use of" <+> quotes (ppr rdr_name)
-                                     <+> text "as an identifier",
-                   text "will become an error in a future GHC release." ]
     TcRnTypeEqualityOutOfScope
       -> mkDecorated
            [ text "The" <+> quotes (text "~") <+> text "operator is out of scope." $$
@@ -707,23 +814,22 @@ instance Diagnostic TcRnMessage where
             fsep [ text "Pattern matching on GADTs without MonoLocalBinds"
                  , text "is fragile." ]
     TcRnIncorrectNameSpace name _
-      -> mkSimpleDecorated $ msg
+      -> mkSimpleDecorated $
+           text "The" <+> what <+> text "does not live in" <+> other_ns
         where
-          msg
-            -- We are in a type-level namespace,
-            -- and the name is incorrectly at the term-level.
-            | isValNameSpace ns
-            = text "The" <+> what <+> text "does not live in the type-level namespace"
-
-            -- We are in a term-level namespace,
-            -- and the name is incorrectly at the type-level.
-            | otherwise
-            = text "Illegal term-level use of the" <+> what
+          -- the other (opposite) namespace
+          other_ns | isValNameSpace ns = text "the type-level namespace"
+                   | otherwise         = text "the term-level namespace"
           ns = nameNameSpace name
           what = pprNameSpace ns <+> quotes (ppr name)
     TcRnNotInScope err name imp_errs _
       -> mkSimpleDecorated $
            pprScopeError name err $$ vcat (map ppr imp_errs)
+    TcRnTermNameInType name _
+      -> mkSimpleDecorated $
+           quotes (ppr name) <+>
+             (text "is a term-level binding") $+$
+             (text " and can not be used at the type level.")
     TcRnUntickedPromotedThing thing
       -> mkSimpleDecorated $
          text "Unticked promoted" <+> what
@@ -802,9 +908,9 @@ instance Diagnostic TcRnMessage where
                in case why of
                 NotADataType ->
                   quotes (ppr ty) <+> text "is not a data type"
-                NewtypeDataConNotInScope Nothing ->
+                NewtypeDataConNotInScope _ [] ->
                   hang innerMsg 2 $ text "because its data constructor is not in scope"
-                NewtypeDataConNotInScope (Just tc) ->
+                NewtypeDataConNotInScope tc _ ->
                   hang innerMsg 2 $
                     text "because the data constructor for"
                     <+> quotes (ppr tc) <+> text "is not in scope"
@@ -838,9 +944,6 @@ instance Diagnostic TcRnMessage where
     TcRnExpectedValueId thing
       -> mkSimpleDecorated $
            ppr thing <+> text "used where a value identifier was expected"
-    TcRnNotARecordSelector field
-      -> mkSimpleDecorated $
-           hsep [quotes (ppr field), text "is not a record selector"]
     TcRnRecSelectorEscapedTyVar lbl
       -> mkSimpleDecorated $
            text "Cannot use record selector" <+> quotes (ppr lbl) <+>
@@ -849,9 +952,6 @@ instance Diagnostic TcRnMessage where
       -> mkSimpleDecorated $
            text "non-bidirectional pattern synonym"
            <+> quotes (ppr name) <+> text "used in an expression"
-    TcRnSplicePolymorphicLocalVar ident
-      -> mkSimpleDecorated $
-           text "Can't splice the polymorphic local variable" <+> quotes (ppr ident)
     TcRnIllegalDerivingItem hs_ty
       -> mkSimpleDecorated $
            text "Illegal deriving item" <+> quotes (ppr hs_ty)
@@ -864,12 +964,10 @@ instance Diagnostic TcRnMessage where
                  HsSrcBang _ _ _                   -> "strictness"
             in text "Unexpected" <+> text err <+> text "annotation:" <+> ppr ty $$
                text err <+> text "annotation cannot appear nested inside a type"
-    TcRnIllegalRecordSyntax ty
+    TcRnIllegalRecordSyntax either_ty_ty
       -> mkSimpleDecorated $
-           text "Record syntax is illegal here:" <+> ppr ty
-    TcRnUnexpectedTypeSplice ty
-      -> mkSimpleDecorated $
-           text "Unexpected type splice:" <+> ppr ty
+           text "Record syntax is illegal here:" <+> either ppr ppr either_ty_ty
+
     TcRnInvalidVisibleKindArgument arg ty
       -> mkSimpleDecorated $
            text "Cannot apply function of kind" <+> quotes (ppr ty)
@@ -925,17 +1023,22 @@ instance Diagnostic TcRnMessage where
                         2 (parens reason))
         where
           reason = case err of
-                     ConstrainedDataConPE pred
+                     ConstrainedDataConPE theta
                                     -> text "it has an unpromotable context"
-                                       <+> quotes (ppr pred)
+                                       <+> quotes (pprTheta theta)
+
                      FamDataConPE   -> text "it comes from a data family instance"
-                     NoDataKindsDC  -> text "perhaps you intended to use DataKinds"
                      PatSynPE       -> text "pattern synonyms cannot be promoted"
                      RecDataConPE   -> same_rec_group_msg
                      ClassPE        -> same_rec_group_msg
                      TyConPE        -> same_rec_group_msg
                      TermVariablePE -> text "term variables cannot be promoted"
+                     TypeVariablePE -> text "type variables bound in a kind signature cannot be used in the type"
           same_rec_group_msg = text "it is defined and used in the same recursive group"
+    TcRnIllegalTermLevelUse name err
+      -> mkSimpleDecorated $
+           text "Illegal term-level use of the" <+>
+             text (teCategory err) <+> quotes (ppr name)
     TcRnMatchesHaveDiffNumArgs argsContext (MatchArgMatches match1 bad_matches)
       -> mkSimpleDecorated $
            (vcat [ pprMatchContextNouns argsContext <+>
@@ -974,24 +1077,64 @@ instance Diagnostic TcRnMessage where
       -> mkSimpleDecorated $
          text "You cannot SPECIALISE" <+> quotes (ppr name)
            <+> text "because its definition is not visible in this module"
-    TcRnNameByTemplateHaskellQuote name -> mkSimpleDecorated $
-      text "Cannot redefine a Name retrieved by a Template Haskell quote:" <+> ppr name
-    TcRnIllegalBindingOfBuiltIn name -> mkSimpleDecorated $
-       text "Illegal binding of built-in syntax:" <+> ppr name
-    TcRnPragmaWarning {pragma_warning_occ, pragma_warning_msg, pragma_warning_import_mod, pragma_warning_defined_mod}
+    TcRnPragmaWarning
+      { pragma_warning_info = PragmaWarningInstance{pwarn_dfunid, pwarn_ctorig}
+      , pragma_warning_msg }
+      -> mkSimpleDecorated $
+        sep [ hang (text "In the use of")
+                 2 (pprDFunId pwarn_dfunid)
+            , ppr pwarn_ctorig
+            , pprWarningTxtForMsg pragma_warning_msg
+         ]
+    TcRnPragmaWarning {pragma_warning_info, pragma_warning_msg}
       -> mkSimpleDecorated $
         sep [ sep [ text "In the use of"
-                <+> pprNonVarNameSpace (occNameSpace pragma_warning_occ)
-                <+> quotes (ppr pragma_warning_occ)
-                , parens impMsg <> colon ]
+                <+> pprNonVarNameSpace (occNameSpace occ_name)
+                <+> quotes (ppr occ_name)
+                , parens imp_msg <> colon ]
           , pprWarningTxtForMsg pragma_warning_msg ]
           where
-            impMsg  = text "imported from" <+> ppr pragma_warning_import_mod <> extra
-            extra | pragma_warning_import_mod == pragma_warning_defined_mod = empty
-                  | otherwise = text ", but defined in" <+> ppr pragma_warning_defined_mod
+            occ_name = pwarn_occname pragma_warning_info
+            imp_mod = pwarn_impmod pragma_warning_info
+            imp_msg  = text "imported from" <+> ppr imp_mod <> extra
+            extra | PragmaWarningName {pwarn_declmod = decl_mod} <- pragma_warning_info
+                  , imp_mod /= decl_mod = text ", but defined in" <+> ppr decl_mod
+                  | otherwise = empty
+    TcRnDifferentExportWarnings name locs
+      -> mkSimpleDecorated $ vcat [quotes (ppr name) <+> text "exported with different error messages",
+                                   text "at" <+> vcat (map ppr $ sortBy leftmost_smallest $ NE.toList locs)]
+    TcRnIncompleteExportWarnings name locs
+      -> mkSimpleDecorated $ vcat [quotes (ppr name) <+> text "will not have its export warned about",
+                                   text "missing export warning at" <+> vcat (map ppr $ sortBy leftmost_smallest $ NE.toList locs)]
     TcRnIllegalHsigDefaultMethods name meths
       -> mkSimpleDecorated $
         text "Illegal default method" <> plural (NE.toList meths) <+> text "in class definition of" <+> ppr name <+> text "in hsig file"
+    TcRnHsigFixityMismatch real_thing real_fixity sig_fixity
+      ->
+      let ppr_fix f = ppr f <+> if f == defaultFixity then parens (text "default") else empty
+      in mkSimpleDecorated $
+        vcat [ppr real_thing <+> text "has conflicting fixities in the module",
+              text "and its hsig file",
+              text "Main module:" <+> ppr_fix real_fixity,
+              text "Hsig file:" <+> ppr_fix sig_fixity]
+    TcRnHsigShapeMismatch (HsigShapeSortMismatch info1 info2)
+      -> mkSimpleDecorated $
+            text "While merging export lists, could not combine"
+            <+> ppr info1 <+> text "with" <+> ppr info2
+            <+> parens (text "one is a type, the other is a plain identifier")
+    TcRnHsigShapeMismatch (HsigShapeNotUnifiable name1 name2 notHere)
+      ->
+      let extra = if notHere
+                  then text "Neither name variable originates from the current signature."
+                  else empty
+      in mkSimpleDecorated $
+        text "While merging export lists, could not unify"
+        <+> ppr name1 <+> text "with" <+> ppr name2 $$ extra
+    TcRnHsigMissingModuleExport occ unit_state impl_mod
+      -> mkSimpleDecorated $
+            quotes (ppr occ)
+        <+> text "is exported by the hsig file, but not exported by the implementing module"
+        <+> quotes (pprWithUnitState unit_state $ ppr impl_mod)
     TcRnBadGenericMethod clas op
       -> mkSimpleDecorated $
         hsep [text "Class", quotes (ppr clas),
@@ -1014,11 +1157,6 @@ instance Diagnostic TcRnMessage where
       -> mkSimpleDecorated $
         hsep [text "Class", quotes (ppr badMethodErrClassName),
           text "does not have a method", quotes (ppr badMethodErrMethodName)]
-    TcRnNoExplicitAssocTypeOrDefaultDeclaration name
-      -> mkSimpleDecorated $
-        text "No explicit" <+> text "associated type"
-          <+> text "or default declaration for"
-          <+> quotes (ppr name)
     TcRnIllegalTypeData
       -> mkSimpleDecorated $
         text "Illegal type-level data declaration"
@@ -1044,7 +1182,7 @@ instance Diagnostic TcRnMessage where
                 ppr con <+> dcolon <+> ppr (dataConDisplayType True con))
               IsGADT ->
                 (text "A newtype must not be a GADT",
-                ppr con <+> dcolon <+> pprWithExplicitKindsWhen sneaky_eq_spec
+                ppr con <+> dcolon <+> pprWithInvisibleBitsWhen sneaky_eq_spec
                                        (ppr $ dataConDisplayType show_linear_types con))
               HasConstructorContext ->
                 (text "A newtype constructor must not have a context in its type",
@@ -1058,109 +1196,6 @@ instance Diagnostic TcRnMessage where
           -- Is the data con a "covert" GADT?  See Note [isCovertGadtDataCon]
           -- in GHC.Core.DataCon
           sneaky_eq_spec = isCovertGadtDataCon con
-
-    TcRnTypedTHWithPolyType ty
-      -> mkSimpleDecorated $
-        vcat [ text "Illegal polytype:" <+> ppr ty
-             , text "The type of a Typed Template Haskell expression must" <+>
-               text "not have any quantification." ]
-    TcRnSpliceThrewException phase _exn exn_msg expr show_code
-      -> mkSimpleDecorated $
-           vcat [ text "Exception when trying to" <+> text phaseStr <+> text "compile-time code:"
-                , nest 2 (text exn_msg)
-                , if show_code then text "Code:" <+> ppr expr else empty]
-         where phaseStr =
-                 case phase of
-                   SplicePhase_Run -> "run"
-                   SplicePhase_CompileAndLink -> "compile and link"
-    TcRnInvalidTopDecl _decl
-      -> mkSimpleDecorated $
-         text "Only function, value, annotation, and foreign import declarations may be added with addTopDecls"
-    TcRnNonExactName name
-      -> mkSimpleDecorated $
-         hang (text "The binder" <+> quotes (ppr name) <+> text "is not a NameU.")
-            2 (text "Probable cause: you used mkName instead of newName to generate a binding.")
-    TcRnAddInvalidCorePlugin plugin
-      -> mkSimpleDecorated $
-         hang
-           (text "addCorePlugin: invalid plugin module "
-              <+> text (show plugin)
-           )
-           2
-           (text "Plugins in the current package can't be specified.")
-    TcRnAddDocToNonLocalDefn doc_loc
-      -> mkSimpleDecorated $
-         text "Can't add documentation to" <+> ppr_loc doc_loc <+>
-         text "as it isn't inside the current module"
-      where
-        ppr_loc (TH.DeclDoc n) = text $ TH.pprint n
-        ppr_loc (TH.ArgDoc n _) = text $ TH.pprint n
-        ppr_loc (TH.InstDoc t) = text $ TH.pprint t
-        ppr_loc TH.ModuleDoc = text "the module header"
-
-    TcRnFailedToLookupThInstName th_type reason
-      -> mkSimpleDecorated $
-         case reason of
-           NoMatchesFound ->
-             text "Couldn't find any instances of"
-               <+> text (TH.pprint th_type)
-               <+> text "to add documentation to"
-           CouldNotDetermineInstance ->
-             text "Couldn't work out what instance"
-               <+> text (TH.pprint th_type)
-               <+> text "is supposed to be"
-    TcRnCannotReifyInstance ty
-      -> mkSimpleDecorated $
-         hang (text "reifyInstances:" <+> quotes (ppr ty))
-            2 (text "is not a class constraint or type family application")
-    TcRnCannotReifyOutOfScopeThing th_name
-      -> mkSimpleDecorated $
-         quotes (text (TH.pprint th_name)) <+>
-                 text "is not in scope at a reify"
-               -- Ugh! Rather an indirect way to display the name
-    TcRnCannotReifyThingNotInTypeEnv name
-      -> mkSimpleDecorated $
-         quotes (ppr name) <+> text "is not in the type environment at a reify"
-    TcRnNoRolesAssociatedWithThing thing
-      -> mkSimpleDecorated $
-         text "No roles associated with" <+> (ppr thing)
-    TcRnCannotRepresentType sort ty
-      -> mkSimpleDecorated $
-         hsep [text "Can't represent" <+> sort_doc <+>
-               text "in Template Haskell:",
-                 nest 2 (ppr ty)]
-       where
-         sort_doc = text $
-           case sort of
-             LinearInvisibleArgument -> "linear invisible argument"
-             CoercionsInTypes -> "coercions in types"
-    TcRnRunSpliceFailure mCallingFnName (ConversionFail what reason)
-      -> mkSimpleDecorated
-           . addCallingFn
-           . addSpliceInfo
-           $ pprConversionFailReason reason
-      where
-        addCallingFn rest =
-          case mCallingFnName of
-            Nothing -> rest
-            Just callingFn ->
-              hang (text ("Error in a declaration passed to " ++ callingFn ++ ":"))
-                 2 rest
-        addSpliceInfo = case what of
-          ConvDec d -> addSliceInfo' "declaration" d
-          ConvExp e -> addSliceInfo' "expression" e
-          ConvPat p -> addSliceInfo' "pattern" p
-          ConvType t -> addSliceInfo' "type" t
-        addSliceInfo' what item reasonErr = reasonErr $$ descr
-          where
-                -- Show the item in pretty syntax normally,
-                -- but with all its constructors if you say -dppr-debug
-            descr = hang (text "When splicing a TH" <+> text what <> colon)
-                       2 (getPprDebug $ \case
-                           True  -> text (show item)
-                           False -> text (TH.pprint item))
-    TcRnReportCustomQuasiError _ msg -> mkSimpleDecorated $ text msg
-    TcRnInterfaceLookupError _ sdoc -> mkSimpleDecorated sdoc
     TcRnUnsatisfiedMinimalDef mindef
       -> mkSimpleDecorated $
         vcat [text "No explicit implementation for"
@@ -1172,33 +1207,12 @@ instance Diagnostic TcRnMessage where
                   2 (hang (pprPrefixName name)
                         2 (dcolon <+> ppr hs_ty))
              ]
-    TcRnBadBootFamInstDecl {}
-      -> mkSimpleDecorated $
-        text "Illegal family instance in hs-boot file"
-    TcRnIllegalFamilyInstance tycon
-      -> mkSimpleDecorated $
-        vcat [ text "Illegal family instance for" <+> quotes (ppr tycon)
-             , nest 2 $ parens (ppr tycon <+> text "is not an indexed type family")]
-    TcRnMissingClassAssoc name
-      -> mkSimpleDecorated $
-        text "Associated type" <+> quotes (ppr name) <+>
-        text "must be inside a class instance"
-    TcRnBadFamInstDecl tc_name
-      -> mkSimpleDecorated $
-        text "Illegal family instance for" <+> quotes (ppr tc_name)
-    TcRnNotOpenFamily tc
-      -> mkSimpleDecorated $
-        text "Illegal instance for closed family" <+> quotes (ppr tc)
     TcRnNoRebindableSyntaxRecordDot -> mkSimpleDecorated $
       text "RebindableSyntax is required if OverloadedRecordUpdate is enabled."
     TcRnNoFieldPunsRecordDot -> mkSimpleDecorated $
       text "For this to work enable NamedFieldPuns"
     TcRnIllegalStaticExpression e -> mkSimpleDecorated $
         text "Illegal static expression:" <+> ppr e
-    TcRnIllegalStaticFormInSplice e -> mkSimpleDecorated $
-      sep [ text "static forms cannot be used in splices:"
-          , nest 2 $ ppr e
-          ]
     TcRnListComprehensionDuplicateBinding n -> mkSimpleDecorated $
         (text "Duplicate binding in parallel list comprehension for:"
           <+> quotes (ppr n))
@@ -1231,25 +1245,702 @@ instance Diagnostic TcRnMessage where
     TcRnSectionWithoutParentheses expr -> mkSimpleDecorated $
       hang (text "A section must be enclosed in parentheses")
          2 (text "thus:" <+> (parens (ppr expr)))
+    TcRnMissingRoleAnnotation name roles -> mkSimpleDecorated $
+      hang (text "Missing role annotation" <> colon)
+         2 (text "type role" <+> ppr name <+> hsep (map ppr roles))
 
-    TcRnLoopySuperclassSolve wtd_loc wtd_pty ->
-      mkSimpleDecorated $ vcat [ header, warning, user_manual ]
-      where
-        header, warning, user_manual :: SDoc
-        header
-          = vcat [ text "I am solving the constraint" <+> quotes (ppr wtd_pty) <> comma
-                 , nest 2 $ pprCtOrigin (ctLocOrigin wtd_loc) <> comma
-                 , text "in a way that might turn out to loop at runtime." ]
-        warning
-          = vcat [ text "Starting from GHC 9.10, this warning will turn into an error." ]
-        user_manual =
-          vcat [ text "See the user manual, § Undecidable instances and loopy superclasses." ]
-    TcRnCannotDefaultConcrete frr
+    TcRnIllformedTypePattern p
       -> mkSimpleDecorated $
-         ppr (frr_context frr) $$
-         text "cannot be assigned a fixed runtime representation," <+>
-         text "not even by defaulting."
+          hang (text "Ill-formed type pattern:") 2 (ppr p)
+    TcRnIllegalTypePattern
+      -> mkSimpleDecorated $
+          text "Illegal type pattern." $$
+          text "A type pattern must be checked against a visible forall."
+    TcRnIllformedTypeArgument e
+      -> mkSimpleDecorated $
+          hang (text "Ill-formed type argument:") 2 (ppr e)
+    TcRnIllegalTypeExpr
+      -> mkSimpleDecorated $
+          text "Illegal type expression." $$
+          text "A type expression must be used to instantiate a visible forall."
 
+    TcRnCapturedTermName tv_name shadowed_term_names
+      -> mkSimpleDecorated $
+        text "The type variable" <+> quotes (ppr tv_name) <+>
+          text "is implicitly quantified," $+$
+          text "even though another variable of the same name is in scope:" $+$
+          nest 2 var_names $+$
+          text "This is not compatible with the RequiredTypeArguments extension."
+        where
+          var_names = case shadowed_term_names of
+              Left gbl_names -> vcat (map (\name -> quotes (ppr $ greName name) <+> pprNameProvenance name) gbl_names)
+              Right lcl_name -> quotes (ppr lcl_name) <+> text "defined at"
+                <+> ppr (nameSrcLoc lcl_name)
+    TcRnBindingOfExistingName name -> mkSimpleDecorated $
+      text "Illegal binding of an existing name:" <+> ppr (filterCTuple name)
+    TcRnMultipleFixityDecls loc rdr_name -> mkSimpleDecorated $
+      vcat [text "Multiple fixity declarations for" <+> quotes (ppr rdr_name),
+            text "also at " <+> ppr loc]
+    TcRnIllegalPatternSynonymDecl -> mkSimpleDecorated $
+      text "Illegal pattern synonym declaration"
+    TcRnIllegalClassBinding dsort bind -> mkSimpleDecorated $
+      vcat [ what <+> text "not allowed in" <+> decl_sort
+              , nest 2 (ppr bind) ]
+      where
+        decl_sort = case dsort of
+          ClassDeclSort -> text "class declaration:"
+          InstanceDeclSort -> text "instance declaration:"
+        what = case bind of
+                  PatBind {}    -> text "Pattern bindings (except simple variables)"
+                  PatSynBind {} -> text "Pattern synonyms"
+                                   -- Associated pattern synonyms are not implemented yet
+                  _ -> pprPanic "rnMethodBind" (ppr bind)
+    TcRnOrphanCompletePragma -> mkSimpleDecorated $
+      text "Orphan COMPLETE pragmas not supported" $$
+      text "A COMPLETE pragma must mention at least one data constructor" $$
+      text "or pattern synonym defined in the same module."
+    TcRnEmptyCase ctxt reason -> mkSimpleDecorated $
+      case reason of
+        EmptyCaseWithoutFlag ->
+          text "Empty list of alternatives in" <+> pp_ctxt
+        EmptyCaseDisallowedCtxt ->
+          text "Empty list of alternatives is not allowed in" <+> pp_ctxt
+        EmptyCaseForall tvb ->
+          vcat [ text "Empty list of alternatives in" <+> pp_ctxt
+               , hang (text "checked against a forall-type:")
+                      2 (pprForAll [tvb] <+> text "...")
+               ]
+        where
+          pp_ctxt = case ctxt of
+            CaseAlt                                -> text "case expression"
+            LamAlt LamCase                         -> text "\\case expression"
+            LamAlt LamCases                        -> text "\\cases expression"
+            ArrowMatchCtxt (ArrowLamAlt LamSingle) -> text "kappa abstraction"
+            ArrowMatchCtxt (ArrowLamAlt LamCase)   -> text "\\case command"
+            ArrowMatchCtxt (ArrowLamAlt LamCases)  -> text "\\cases command"
+            ArrowMatchCtxt ArrowCaseAlt            -> text "case command"
+            ctxt                                   -> text "(unexpected)" <+> pprMatchContextNoun ctxt
+    TcRnNonStdGuards (NonStandardGuards guards) -> mkSimpleDecorated $
+      text "accepting non-standard pattern guards" $$
+      nest 4 (interpp'SP guards)
+    TcRnDuplicateSigDecl pairs@((L _ name, sig) :| _) -> mkSimpleDecorated $
+      vcat [ text "Duplicate" <+> what_it_is
+            <> text "s for" <+> quotes (ppr name)
+          , text "at" <+> vcat (map ppr $ sortBy leftmost_smallest
+                                        $ map (getLocA . fst)
+                                        $ NE.toList pairs)
+          ]
+      where
+        what_it_is = hsSigDoc sig
+    TcRnMisplacedSigDecl sig -> mkSimpleDecorated $
+      sep [text "Misplaced" <+> hsSigDoc sig <> colon, ppr sig]
+    TcRnUnexpectedDefaultSig sig -> mkSimpleDecorated $
+      hang (text "Unexpected default signature:")
+         2 (ppr sig)
+    TcRnDuplicateMinimalSig sig1 sig2 otherSigs -> mkSimpleDecorated $
+      vcat [ text "Multiple minimal complete definitions"
+           , text "at" <+> vcat (map ppr $ sortBy leftmost_smallest $ map getLocA sigs)
+           , text "Combine alternative minimal complete definitions with `|'" ]
+      where
+        sigs = sig1 : sig2 : otherSigs
+    TcRnUnexpectedStandaloneDerivingDecl -> mkSimpleDecorated $
+      text "Illegal standalone deriving declaration"
+    TcRnUnusedVariableInRuleDecl name var -> mkSimpleDecorated $
+      sep [text "Rule" <+> doubleQuotes (ftext name) <> colon,
+          text "Forall'd variable" <+> quotes (ppr var) <+>
+                  text "does not appear on left hand side"]
+    TcRnUnexpectedStandaloneKindSig -> mkSimpleDecorated $
+      text "Illegal standalone kind signature"
+    TcRnIllegalRuleLhs errReason name lhs bad_e -> mkSimpleDecorated $
+      sep [text "Rule" <+> pprRuleName name <> colon,
+           nest 2 (vcat [err,
+                         text "in left-hand side:" <+> ppr lhs])]
+      $$
+      text "LHS must be of form (f e1 .. en) where f is not forall'd"
+      where
+        err = case errReason of
+          UnboundVariable uv nis -> pprScopeError uv nis
+          IllegalExpression -> text "Illegal expression:" <+> ppr bad_e
+    TcRnDuplicateRoleAnnot list -> mkSimpleDecorated $
+      hang (text "Duplicate role annotations for" <+>
+            quotes (ppr $ roleAnnotDeclName first_decl) <> colon)
+        2 (vcat $ map pp_role_annot $ NE.toList sorted_list)
+      where
+        sorted_list = NE.sortBy cmp_loc list
+        ((L _ first_decl) :| _) = sorted_list
+
+        pp_role_annot (L loc decl) = hang (ppr decl)
+                                        4 (text "-- written at" <+> ppr (locA loc))
+
+        cmp_loc = leftmost_smallest `on` getLocA
+    TcRnDuplicateKindSig list -> mkSimpleDecorated $
+      hang (text "Duplicate standalone kind signatures for" <+>
+            quotes (ppr $ standaloneKindSigName first_decl) <> colon)
+        2 (vcat $ map pp_kisig $ NE.toList sorted_list)
+      where
+        sorted_list = NE.sortBy cmp_loc list
+        ((L _ first_decl) :| _) = sorted_list
+
+        pp_kisig (L loc decl) =
+          hang (ppr decl) 4 (text "-- written at" <+> ppr (locA loc))
+
+        cmp_loc = leftmost_smallest `on` getLocA
+    TcRnIllegalDerivStrategy ds -> mkSimpleDecorated $
+      text "Illegal deriving strategy" <> colon <+> derivStrategyName ds
+    TcRnIllegalMultipleDerivClauses -> mkSimpleDecorated $
+      text "Illegal use of multiple, consecutive deriving clauses"
+    TcRnNoDerivStratSpecified{} -> mkSimpleDecorated $ text
+      "No deriving strategy specified. Did you want stock, newtype, or anyclass?"
+    TcRnStupidThetaInGadt{} -> mkSimpleDecorated $
+      vcat [text "No context is allowed on a GADT-style data declaration",
+            text "(You can put a context on each constructor, though.)"]
+    TcRnShadowedTyVarNameInFamResult resName -> mkSimpleDecorated $
+       hsep [ text "Type variable", quotes (ppr resName) <> comma
+            , text "naming a type family result,"
+            ] $$
+      text "shadows an already bound type variable"
+    TcRnIncorrectTyVarOnLhsOfInjCond resName injFrom -> mkSimpleDecorated $
+        vcat [ text $ "Incorrect type variable on the LHS of "
+                   ++ "injectivity condition"
+      , nest 5
+      ( vcat [ text "Expected :" <+> ppr resName
+             , text "Actual   :" <+> ppr injFrom ])]
+    TcRnUnknownTyVarsOnRhsOfInjCond errorVars -> mkSimpleDecorated $
+      hsep [ text "Unknown type variable" <> plural errorVars
+           , text "on the RHS of injectivity condition:"
+           , interpp'SP errorVars ]
+    TcRnBadlyStaged reason bind_lvl use_lvl
+      -> mkSimpleDecorated $
+         text "Stage error:" <+> pprStageCheckReason reason <+>
+         hsep [text "is bound at stage" <+> ppr bind_lvl,
+               text "but used at stage" <+> ppr use_lvl]
+    TcRnBadlyStagedType name bind_lvl use_lvl
+      -> mkSimpleDecorated $
+         text "Badly staged type:" <+> ppr name <+>
+         hsep [text "is bound at stage" <+> ppr bind_lvl,
+               text "but used at stage" <+> ppr use_lvl]
+    TcRnStageRestriction reason
+      -> mkSimpleDecorated $
+         sep [ text "GHC stage restriction:"
+             , nest 2 (vcat [ pprStageCheckReason reason <+>
+                              text "is used in a top-level splice, quasi-quote, or annotation,"
+                            , text "and must be imported, not defined locally"])]
+    TcRnTyThingUsedWrong sort thing name
+      -> mkSimpleDecorated $
+         pprTyThingUsedWrong sort thing name
+    TcRnCannotDefaultKindVar var knd ->
+      mkSimpleDecorated $
+      (vcat [ text "Cannot default kind variable" <+> quotes (ppr var)
+            , text "of kind:" <+> ppr knd
+            , text "Perhaps enable PolyKinds or add a kind signature" ])
+    TcRnUninferrableTyVar tidied_tvs context ->
+      mkSimpleDecorated $
+      pprWithInvisibleBitsWhen True $
+      vcat [ text "Uninferrable type variable"
+              <> plural tidied_tvs
+              <+> pprWithCommas pprTyVar tidied_tvs
+              <+> text "in"
+            , pprUninferrableTyVarCtx context ]
+    TcRnSkolemEscape escapees tv orig_ty ->
+      mkSimpleDecorated $
+      pprWithInvisibleBitsWhen True $
+      vcat [ sep [ text "Cannot generalise type; skolem" <> plural escapees
+                , quotes $ pprTyVars escapees
+                , text "would escape" <+> itsOrTheir escapees <+> text "scope"
+                ]
+          , sep [ text "if I tried to quantify"
+                , pprTyVar tv
+                , text "in this type:"
+                ]
+          , nest 2 (pprTidiedType orig_ty)
+          , text "(Indeed, I sometimes struggle even printing this correctly,"
+          , text " due to its ill-scoped nature.)"
+          ]
+    TcRnPatSynEscapedCoercion arg bad_co_ne -> mkSimpleDecorated $
+      vcat [ text "Iceland Jack!  Iceland Jack! Stop torturing me!"
+           , hang (text "Pattern-bound variable")
+                2 (ppr arg <+> dcolon <+> ppr (idType arg))
+           , nest 2 $
+             hang (text "has a type that mentions pattern-bound coercion"
+                   <> plural bad_co_list <> colon)
+                2 (pprWithCommas ppr bad_co_list)
+           , text "Hint: use -fprint-explicit-coercions to see the coercions"
+           , text "Probable fix: add a pattern signature" ]
+      where
+        bad_co_list = NE.toList bad_co_ne
+    TcRnPatSynExistentialInResult name pat_ty bad_tvs -> mkSimpleDecorated $
+      hang (sep [ text "The result type of the signature for" <+> quotes (ppr name) <> comma
+                , text "namely" <+> quotes (ppr pat_ty) ])
+        2 (text "mentions existential type variable" <> plural bad_tvs
+           <+> pprQuotedList bad_tvs)
+    TcRnPatSynArityMismatch name decl_arity missing -> mkSimpleDecorated $
+      hang (text "Pattern synonym" <+> quotes (ppr name) <+> text "has"
+            <+> speakNOf decl_arity (text "argument"))
+         2 (text "but its type signature has" <+> int missing <+> text "fewer arrows")
+    TcRnPatSynInvalidRhs ps_name lpat _ reason -> mkSimpleDecorated $
+      vcat [ hang (text "Invalid right-hand side of bidirectional pattern synonym"
+                   <+> quotes (ppr ps_name) <> colon)
+                2 (pprPatSynInvalidRhsReason reason)
+           , text "RHS pattern:" <+> ppr lpat ]
+    TcRnTyFamDepsDisabled -> mkSimpleDecorated $
+      text "Illegal injectivity annotation"
+    TcRnAbstractClosedTyFamDecl -> mkSimpleDecorated $
+      text "You may define an abstract closed type family" $$
+      text "only in a .hs-boot file"
+    TcRnPartialFieldSelector fld -> mkSimpleDecorated $
+      sep [text "Use of partial record field selector" <> colon,
+           nest 2 $ quotes (ppr (occName fld))]
+    TcRnHasFieldResolvedIncomplete name -> mkSimpleDecorated $
+      text "The invocation of `getField` on the record field" <+> quotes (ppr name)
+      <+> text "may produce an error since it is not defined for all data constructors"
+    TcRnBadFieldAnnotation n con reason -> mkSimpleDecorated $
+      hang (pprBadFieldAnnotationReason reason)
+         2 (text "on the" <+> speakNth n
+            <+> text "argument of" <+> quotes (ppr con))
+    TcRnSuperclassCycle (MkSuperclassCycle cls definite details) ->
+      let herald | definite  = text "Superclass cycle for"
+                 | otherwise = text "Potential superclass cycle for"
+      in mkSimpleDecorated $
+       vcat [ herald <+> quotes (ppr cls), nest 2 (vcat (pprSuperclassCycleDetail <$> details))]
+    TcRnDefaultSigMismatch sel_id dm_ty -> mkSimpleDecorated $
+      hang (text "The default type signature for"
+            <+> ppr sel_id <> colon)
+         2 (ppr dm_ty)
+      $$ (text "does not match its corresponding"
+          <+> text "non-default type signature")
+    TcRnTyFamsDisabled reason -> mkSimpleDecorated $
+      text "Illegal family" <+> text sort <+> text "for" <+> quotes name
+      where
+        (sort, name) = case reason of
+          TyFamsDisabledFamily n -> ("declaration", ppr n)
+          TyFamsDisabledInstance n -> ("instance", ppr n)
+    TcRnBadTyConTelescope tc -> mkSimpleDecorated $
+      vcat [ hang (text "The kind of" <+> quotes (ppr tc) <+> text "is ill-scoped")
+                2 pp_tc_kind
+           , extra
+           , hang (text "Perhaps try this order instead:")
+                2 (pprTyVars sorted_tvs) ]
+      where
+        pp_tc_kind = text "Inferred kind:" <+> ppr tc <+> dcolon <+> ppr_untidy (tyConKind tc)
+        ppr_untidy ty = pprIfaceType (toIfaceType ty)
+          -- We need ppr_untidy here because pprType will tidy the type, which
+          -- will turn the bogus kind we are trying to report
+          --     T :: forall (a::k) k (b::k) -> blah
+          -- into a misleadingly sanitised version
+          --     T :: forall (a::k) k1 (b::k1) -> blah
+
+        tcbs = tyConBinders tc
+        tvs  = binderVars tcbs
+        sorted_tvs = scopedSort tvs
+
+        inferred_tvs  = [ binderVar tcb
+                        | tcb <- tcbs, Inferred == tyConBinderForAllTyFlag tcb ]
+        specified_tvs = [ binderVar tcb
+                        | tcb <- tcbs, Specified == tyConBinderForAllTyFlag tcb ]
+
+        extra
+          | null inferred_tvs && null specified_tvs
+          = empty
+          | null inferred_tvs
+          = hang (text "NB: Specified variables")
+               2 (sep [pp_spec, text "always come first"])
+          | null specified_tvs
+          = hang (text "NB: Inferred variables")
+               2 (sep [pp_inf, text "always come first"])
+          | otherwise
+          = hang (text "NB: Inferred variables")
+               2 (vcat [ sep [ pp_inf, text "always come first"]
+                       , sep [text "then Specified variables", pp_spec]])
+
+        pp_inf  = parens (text "namely:" <+> pprTyVars inferred_tvs)
+        pp_spec = parens (text "namely:" <+> pprTyVars specified_tvs)
+    TcRnTyFamResultDisabled tc_name tvb -> mkSimpleDecorated $
+      text "Illegal result type variable" <+> ppr tvb <+> text "for" <+> quotes (ppr tc_name)
+    TcRnRoleValidationFailed role reason -> mkSimpleDecorated $
+      vcat [text "Internal error in role inference:",
+            pprRoleValidationFailedReason role reason,
+            text "Please report this as a GHC bug:  https://www.haskell.org/ghc/reportabug"]
+    TcRnCommonFieldResultTypeMismatch con1 con2 field_name -> mkSimpleDecorated $
+      vcat [sep [text "Constructors" <+> ppr con1 <+> text "and" <+> ppr con2,
+                 text "have a common field" <+> quotes (ppr field_name) <> comma],
+            nest 2 $ text "but have different result types"]
+    TcRnCommonFieldTypeMismatch con1 con2 field_name -> mkSimpleDecorated $
+      sep [text "Constructors" <+> ppr con1 <+> text "and" <+> ppr con2,
+           text "give different types for field", quotes (ppr field_name)]
+    TcRnClassExtensionDisabled cls reason -> mkSimpleDecorated $
+      pprDisabledClassExtension cls reason
+    TcRnDataConParentTypeMismatch data_con res_ty_tmpl -> mkSimpleDecorated $
+      hang (text "Data constructor" <+> quotes (ppr data_con) <+>
+            text "returns type" <+> quotes (ppr actual_res_ty))
+         2 (text "instead of an instance of its parent type" <+> quotes (ppr res_ty_tmpl))
+      where
+        actual_res_ty = dataConOrigResTy data_con
+    TcRnGADTsDisabled tc_name -> mkSimpleDecorated $
+      text "Illegal generalised algebraic data declaration for" <+> quotes (ppr tc_name)
+    TcRnExistentialQuantificationDisabled con -> mkSimpleDecorated $
+      sdocOption sdocLinearTypes (\show_linear_types ->
+        hang (text "Data constructor" <+> quotes (ppr con) <+>
+              text "has existential type variables, a context, or a specialised result type")
+           2 (ppr con <+> dcolon <+> ppr (dataConDisplayType show_linear_types con)))
+    TcRnGADTDataContext tc_name -> mkSimpleDecorated $
+      text "A data type declared in GADT style cannot have a context:" <+> quotes (ppr tc_name)
+    TcRnMultipleConForNewtype tycon n -> mkSimpleDecorated $
+      sep [text "A newtype must have exactly one constructor,",
+           nest 2 $ text "but" <+> quotes (ppr tycon) <+> text "has" <+> speakN n]
+    TcRnKindSignaturesDisabled thing -> mkSimpleDecorated $
+      text "Illegal kind signature" <+> quotes (either ppr with_sig thing)
+      where
+        with_sig (tc_name, ksig) = ppr tc_name <+> dcolon <+> ppr ksig
+    TcRnEmptyDataDeclsDisabled tycon -> mkSimpleDecorated $
+      quotes (ppr tycon) <+> text "has no constructors"
+    TcRnRoleMismatch var annot inferred -> mkSimpleDecorated $
+      hang (text "Role mismatch on variable" <+> ppr var <> colon)
+         2 (sep [ text "Annotation says", ppr annot
+                , text "but role", ppr inferred
+                , text "is required" ])
+    TcRnRoleCountMismatch tyvars d@(L _ (RoleAnnotDecl _ _ annots)) -> mkSimpleDecorated $
+      hang (text "Wrong number of roles listed in role annotation;" $$
+            text "Expected" <+> (ppr tyvars) <> comma <+>
+            text "got" <+> (ppr $ length annots) <> colon)
+         2 (ppr d)
+    TcRnIllegalRoleAnnotation (RoleAnnotDecl _ tycon _) -> mkSimpleDecorated $
+      (text "Illegal role annotation for" <+> ppr tycon <> char ';' $$
+       text "they are allowed only for datatypes and classes.")
+    TcRnRoleAnnotationsDisabled  tc -> mkSimpleDecorated $
+      text "Illegal role annotation for" <+> ppr tc
+    TcRnIncoherentRoles _ -> mkSimpleDecorated $
+      (text "Roles other than" <+> quotes (text "nominal") <+>
+      text "for class parameters can lead to incoherence.")
+    TcRnUnexpectedKindVar tv_name
+      -> mkSimpleDecorated $ text "Unexpected kind variable" <+> quotes (ppr tv_name)
+
+    TcRnNegativeNumTypeLiteral tyLit
+      -> mkSimpleDecorated $ text "Illegal literal in type (type literals must not be negative):" <+> ppr tyLit
+
+    TcRnIllegalKind ty_thing _
+      -> mkSimpleDecorated $ text "Illegal kind:" <+> (ppr ty_thing)
+
+    TcRnPrecedenceParsingError op1 op2
+      -> mkSimpleDecorated $
+           hang (text "Precedence parsing error")
+           4 (hsep [text "cannot mix", ppr_opfix op1, text "and",
+           ppr_opfix op2,
+           text "in the same infix expression"])
+
+    TcRnSectionPrecedenceError op arg_op section
+      -> mkSimpleDecorated $
+           vcat [text "The operator" <+> ppr_opfix op <+> text "of a section",
+             nest 4 (sep [text "must have lower precedence than that of the operand,",
+                          nest 2 (text "namely" <+> ppr_opfix arg_op)]),
+             nest 4 (text "in the section:" <+> quotes (ppr section))]
+
+    TcRnUnexpectedPatSigType ty
+      -> mkSimpleDecorated $
+           hang (text "Illegal type signature:" <+> quotes (ppr ty))
+              2 (text "Type signatures are only allowed in patterns with ScopedTypeVariables")
+
+    TcRnIllegalKindSignature ty
+      -> mkSimpleDecorated $ text "Illegal kind signature:" <+> quotes (ppr ty)
+
+    TcRnUnusedQuantifiedTypeVar doc tyVar
+      -> mkSimpleDecorated $
+           vcat [ text "Unused quantified type variable" <+> quotes (ppr tyVar)
+                , inHsDocContext doc ]
+
+    TcRnDataKindsError typeOrKind thing
+      -- See Note [Checking for DataKinds] (Wrinkle: Migration story for
+      -- DataKinds typechecker errors) in GHC.Tc.Validity for why we give
+      -- different diagnostic messages below.
+      -> case thing of
+           Left renamer_thing ->
+             mkSimpleDecorated $
+               text "Illegal" <+> ppr_level <> colon <+> quotes (ppr renamer_thing)
+           Right typechecker_thing ->
+             mkSimpleDecorated $ vcat
+               [ text "An occurrence of" <+> quotes (ppr typechecker_thing) <+>
+                 text "in a" <+> ppr_level <+> text "requires DataKinds."
+               , text "Future versions of GHC will turn this warning into an error."
+               ]
+      where
+        ppr_level = text $ levelString typeOrKind
+
+    TcRnTypeSynonymCycle decl_or_tcs
+      -> mkSimpleDecorated $
+           sep [ text "Cycle in type synonym declarations:"
+               , nest 2 (vcat (map ppr_decl decl_or_tcs)) ]
+      where
+        ppr_decl = \case
+          Right (L loc decl) -> ppr (locA loc) <> colon <+> ppr decl
+          Left tc ->
+            let n = tyConName tc
+            in ppr (getSrcSpan n) <> colon <+> ppr (tyConName tc)
+                   <+> text "from external module"
+    TcRnZonkerMessage err
+      -> mkSimpleDecorated $ pprZonkerMessage err
+    TcRnInterfaceError reason
+      -> diagnosticMessage (tcOptsIfaceOpts opts) reason
+    TcRnSelfImport imp_mod_name
+      -> mkSimpleDecorated $
+         text "A module cannot import itself:" <+> ppr imp_mod_name
+    TcRnNoExplicitImportList mod
+      -> mkSimpleDecorated $
+         text "The module" <+> quotes (ppr mod) <+> text "does not have an explicit import list"
+    TcRnSafeImportsDisabled _
+      -> mkSimpleDecorated $
+         text "safe import can't be used as Safe Haskell isn't on!"
+    TcRnDeprecatedModule mod txt
+      -> mkSimpleDecorated $
+         sep [ text "Module" <+> quotes (ppr mod) <> text extra <> colon,
+               nest 2 (vcat (map (ppr . hsDocString . unLoc) msg)) ]
+         where
+          (extra, msg) = case txt of
+            WarningTxt _ _ msg -> ("", msg)
+            DeprecatedTxt _ msg -> (" is deprecated", msg)
+    TcRnCompatUnqualifiedImport decl
+      -> mkSimpleDecorated $
+         vcat
+         [ text "To ensure compatibility with future core libraries changes"
+         , text "imports to" <+> ppr (ideclName decl) <+> text "should be"
+         , text "either qualified or have an explicit import list."
+         ]
+    TcRnRedundantSourceImport mod_name
+      -> mkSimpleDecorated $
+         text "Unnecessary {-# SOURCE #-} in the import of module" <+> quotes (ppr mod_name)
+    TcRnImportLookup reason
+      -> mkSimpleDecorated $
+         pprImportLookup reason
+    TcRnUnusedImport decl reason
+      -> mkSimpleDecorated $
+         pprUnusedImport decl reason
+    TcRnDuplicateDecls name sorted_names
+      -> mkSimpleDecorated $
+         vcat [text "Multiple declarations of" <+>
+               quotes (ppr name),
+                -- NB. print the OccName, not the Name, because the
+                -- latter might not be in scope in the RdrEnv and so will
+                -- be printed qualified.
+               text "Declared at:" <+>
+               vcat (NE.toList $ ppr . nameSrcLoc <$> sorted_names)]
+    TcRnPackageImportsDisabled
+      -> mkSimpleDecorated $
+         text "Package-qualified imports are not enabled"
+    TcRnIllegalDataCon name
+      -> mkSimpleDecorated $
+         hsep [text "Illegal data constructor name", quotes (ppr name)]
+    TcRnNestedForallsContexts entity
+      -> mkSimpleDecorated $
+         what <+> text "cannot contain nested"
+         <+> quotes forAllLit <> text "s or contexts"
+         where
+           what = case entity of
+             NFC_Specialize -> text "SPECIALISE instance type"
+             NFC_ViaType -> quotes (text "via") <+> text "type"
+             NFC_GadtConSig -> text "GADT constructor type signature"
+             NFC_InstanceHead -> text "Instance head"
+             NFC_StandaloneDerivedInstanceHead -> text "Standalone-derived instance head"
+             NFC_DerivedClassType -> text "Derived class type"
+    TcRnRedundantRecordWildcard
+      -> mkSimpleDecorated $
+         text "Record wildcard does not bind any new variables"
+    TcRnUnusedRecordWildcard _
+      -> mkSimpleDecorated $
+         text "No variables bound in the record wildcard match are used"
+    TcRnUnusedName name reason
+      -> mkSimpleDecorated $
+         pprUnusedName name reason
+    TcRnQualifiedBinder rdr_name
+      -> mkSimpleDecorated $
+         text "Qualified name in binding position:" <+> ppr rdr_name
+    TcRnTypeApplicationsDisabled ty_app
+      -> mkSimpleDecorated $
+         text "Illegal visible" <+> what <+> text "application" <+> ctx <> colon
+           <+> ppr arg
+         where
+           arg = case ty_app of
+            TypeApplication ty _ -> char '@' <> ppr ty
+            TypeApplicationInPattern ty_app -> ppr ty_app
+           what = case ty_app of
+             TypeApplication _ ty_or_ki ->
+              case ty_or_ki of
+                TypeLevel -> text "type"
+                KindLevel -> text "kind"
+             TypeApplicationInPattern _ -> text "type"
+           ctx = case ty_app of
+            TypeApplicationInPattern _ -> text "in a pattern"
+            _                          -> empty
+    TcRnInvalidRecordField con field
+      -> mkSimpleDecorated $
+         hsep [text "Constructor" <+> quotes (ppr con),
+               text "does not have field", quotes (ppr field)]
+    TcRnTupleTooLarge tup_size
+      -> mkSimpleDecorated $
+         sep [text "A" <+> int tup_size <> text "-tuple is too large for GHC",
+              nest 2 (parens (text "max size is" <+> int mAX_TUPLE_SIZE)),
+              nest 2 (text "Workaround: use nested tuples or define a data type")]
+    TcRnCTupleTooLarge tup_size
+      -> mkSimpleDecorated $
+         hang (text "Constraint tuple arity too large:" <+> int tup_size
+               <+> parens (text "max arity =" <+> int mAX_CTUPLE_SIZE))
+            2 (text "Instead, use a nested tuple")
+    TcRnIllegalInferredTyVars _
+      -> mkSimpleDecorated $
+         text "Inferred type variables are not allowed"
+    TcRnAmbiguousName gre_env name gres
+      -> mkSimpleDecorated $
+         vcat [ text "Ambiguous occurrence" <+> quotes (ppr name) <> dot
+              , text "It could refer to"
+              , nest 3 (vcat msgs) ]
+         where
+           np1 NE.:| nps = gres
+           msgs = punctuateFinal comma dot $
+                    text "either" <+> ppr_gre np1
+                 : [text "    or" <+> ppr_gre np | np <- nps]
+
+           ppr_gre gre = pprAmbiguousGreName gre_env gre
+
+    TcRnBindingNameConflict name locs
+      -> mkSimpleDecorated $
+         vcat [text "Conflicting definitions for" <+> quotes (ppr name),
+               locations]
+         where
+           locations =
+             text "Bound at:"
+             <+> vcat (map ppr (sortBy leftmost_smallest (NE.toList locs)))
+    TcRnNonCanonicalDefinition reason inst_ty
+      -> mkSimpleDecorated $
+         pprNonCanonicalDefinition inst_ty reason
+    TcRnDefaultedExceptionContext ct_loc ->
+      mkSimpleDecorated $ vcat [ header, warning, proposal ]
+      where
+        header, warning, proposal :: SDoc
+        header
+          = vcat [ text "Solving for an implicit ExceptionContext constraint"
+                 , nest 2 $ pprCtOrigin (ctLocOrigin ct_loc) <> text "." ]
+        warning
+          = vcat [ text "Future versions of GHC will turn this warning into an error." ]
+        proposal
+          = vcat [ text "See GHC Proposal #330." ]
+    TcRnImplicitImportOfPrelude
+      -> mkSimpleDecorated $
+         text "Module" <+> quotes (text "Prelude") <+> text "implicitly imported."
+    TcRnMissingMain explicit_export_list main_mod main_occ
+      -> mkSimpleDecorated $
+         text "The" <+> ppMainFn main_occ
+        <+> text "is not" <+> defOrExp <+> text "module"
+        <+> quotes (ppr main_mod)
+      where
+        defOrExp :: SDoc
+        defOrExp | explicit_export_list = text "exported by"
+                 | otherwise            = text "defined in"
+    TcRnGhciUnliftedBind id
+      -> mkSimpleDecorated $
+         sep [ text "GHCi can't bind a variable of unlifted type:"
+             , nest 2 (pprPrefixOcc id <+> dcolon <+> ppr (idType id)) ]
+    TcRnGhciMonadLookupFail ty lookups
+      -> mkSimpleDecorated $
+         hang (text "Can't find type" <+> pp_ty <> dot $$ ambig_msg)
+           2 (text "When checking that" <+> pp_ty <>
+              text "is a monad that can execute GHCi statements.")
+      where
+        pp_ty = quotes (text ty)
+        ambig_msg = case lookups of
+          Just (_:_:_) -> text "The type is ambiguous."
+          _            -> empty
+    TcRnIllegalQuasiQuotes -> mkSimpleDecorated $
+      text "Quasi-quotes are not permitted without QuasiQuotes"
+    TcRnTHError err -> pprTHError err
+    TcRnPatersonCondFailure reason ctxt lhs rhs ->
+      mkSimpleDecorated $ pprPatersonCondFailure reason ctxt lhs rhs
+    TcRnIllegalInvisTyVarBndr bndr ->
+      mkSimpleDecorated $
+        hang (text "Illegal invisible type variable binder:")
+           2 (ppr bndr)
+
+    TcRnInvalidInvisTyVarBndr name hs_bndr ->
+      mkSimpleDecorated $
+        vcat [ hang (text "Invalid invisible type variable binder:")
+                  2 (ppr hs_bndr)
+             , text "There is no matching forall-bound variable"
+             , text "in the standalone kind signature for" <+> quotes (ppr name) <> dot
+             , text "NB." <+> vcat [
+                text "Only" <+> quotes (text "forall a.") <+> text "-quantification matches invisible binders,",
+                text "whereas" <+> quotes (text "forall {a}.") <+> text "and" <+> quotes (text "forall a ->") <+> text "do not."
+             ]]
+
+    TcRnDeprecatedInvisTyArgInConPat ->
+      mkSimpleDecorated $
+        cat [ text "Type applications in constructor patterns will require"
+            , text "the TypeAbstractions extension starting from GHC 9.14." ]
+
+    TcRnInvisBndrWithoutSig _ hs_bndr ->
+      mkSimpleDecorated $
+        vcat [ hang (text "Invalid invisible type variable binder:")
+                  2 (ppr hs_bndr)
+             , text "Either a standalone kind signature (SAKS)"
+             , text "or a complete user-supplied kind (CUSK, legacy feature)"
+             , text "is required to use invisible binders." ]
+
+    TcRnImplicitRhsQuantification kv -> mkSimpleDecorated $
+      vcat [ text "The variable" <+> quotes (ppr kv) <+> text "occurs free on the RHS of the type declaration"
+           , text "In the future GHC will no longer implicitly quantify over such variables"
+           ]
+
+    TcRnInvalidDefaultedTyVar wanteds proposal bad_tvs ->
+      mkSimpleDecorated $
+      pprWithInvisibleBitsWhen True $
+      vcat [ text "Invalid defaulting proposal."
+           , hang (text "The following type variable" <> plural (NE.toList bad_tvs) <+> text "cannot be defaulted, as" <+> why <> colon)
+                2 (pprQuotedList (NE.toList bad_tvs))
+           , hang (text "Defaulting proposal:")
+                2 (ppr proposal)
+           , hang (text "Wanted constraints:")
+                2 (pprQuotedList (map ctPred wanteds))
+           ]
+        where
+          why
+            | _ :| [] <- bad_tvs
+            = text "it is not an unfilled metavariable"
+            | otherwise
+            = text "they are not unfilled metavariables"
+
+    TcRnNamespacedWarningPragmaWithoutFlag warning@(Warning (kw, _) _ txt) -> mkSimpleDecorated $
+      vcat [ text "Illegal use of the" <+> quotes (ppr kw) <+> text "keyword:"
+           , nest 2 (ppr warning)
+           , text "in a" <+> pragma_type <+> text "pragma"
+           ]
+      where
+        pragma_type = case txt of
+          WarningTxt{} -> text "WARNING"
+          DeprecatedTxt{} -> text "DEPRECATED"
+
+    TcRnIllegalInvisibleTypePattern tp -> mkSimpleDecorated $
+      text "Illegal invisible type pattern:" <+> ppr tp
+
+    TcRnInvisPatWithNoForAll tp -> mkSimpleDecorated $
+      text "Invisible type pattern" <+> ppr tp <+> text "has no associated forall"
+
+    TcRnNamespacedFixitySigWithoutFlag sig@(FixitySig kw _ _) -> mkSimpleDecorated $
+      vcat [ text "Illegal use of the" <+> quotes (ppr kw) <+> text "keyword:"
+           , nest 2 (ppr sig)
+           , text "in a fixity signature"
+           ]
+
+    TcRnOutOfArityTyVar ts_name tv_name -> mkDecorated
+      [ vcat [ text "The arity of" <+> quotes (ppr ts_name) <+> text "is insufficiently high to accommodate"
+             , text "an implicit binding for the" <+> quotes (ppr tv_name) <+> text "type variable." ]
+      , suggestion ]
+      where
+        suggestion =
+          text "Use" <+> quotes at_bndr     <+> text "on the LHS" <+>
+          text "or"  <+> quotes forall_bndr <+> text "on the RHS" <+>
+          text "to bring it into scope."
+        at_bndr     = char '@' <> ppr tv_name
+        forall_bndr = text "forall" <+> ppr tv_name <> text "."
+
+    TcRnMisplacedInvisPat tp -> mkSimpleDecorated $
+      text "Invisible type pattern" <+> ppr tp <+> text "is not allowed here"
+
+  diagnosticReason :: TcRnMessage -> DiagnosticReason
   diagnosticReason = \case
     TcRnUnknownMessage m
       -> diagnosticReason m
@@ -1258,11 +1949,15 @@ instance Diagnostic TcRnMessage where
            TcRnMessageDetailed _ m -> diagnosticReason m
     TcRnWithHsDocContext _ msg
       -> diagnosticReason msg
-    TcRnSolverReport _ reason _
+    TcRnSolverReport _ reason
       -> reason -- Error, or a Warning if we are deferring type errors
+    TcRnSolverDepthError {}
+      -> ErrorWithoutFlag
     TcRnRedundantConstraints {}
       -> WarningWithFlag Opt_WarnRedundantConstraints
     TcRnInaccessibleCode {}
+      -> WarningWithFlag Opt_WarnInaccessibleCode
+    TcRnInaccessibleCoAxBranch {}
       -> WarningWithFlag Opt_WarnInaccessibleCode
     TcRnTypeDoesNotHaveFixedRuntimeRep{}
       -> ErrorWithoutFlag
@@ -1286,6 +1981,8 @@ instance Diagnostic TcRnMessage where
       -> ErrorWithoutFlag
     TcRnShadowedName{}
       -> WarningWithFlag Opt_WarnNameShadowing
+    TcRnInvalidWarningCategory{}
+      -> ErrorWithoutFlag
     TcRnDuplicateWarningDecls{}
       -> ErrorWithoutFlag
     TcRnSimplifierTooManyIterations{}
@@ -1301,6 +1998,10 @@ instance Diagnostic TcRnMessage where
     TcRnIllegalWildcardsInRecord{}
       -> ErrorWithoutFlag
     TcRnIllegalWildcardInType{}
+      -> ErrorWithoutFlag
+    TcRnIllegalNamedWildcardInTypeArgument{}
+      -> ErrorWithoutFlag
+    TcRnIllegalImplicitTyVarInTypeArgument{}
       -> ErrorWithoutFlag
     TcRnDuplicateFieldName{}
       -> ErrorWithoutFlag
@@ -1326,7 +2027,9 @@ instance Diagnostic TcRnMessage where
       -> ErrorWithoutFlag
     TcRnArrowIfThenElsePredDependsOnResultTy
       -> ErrorWithoutFlag
-    TcRnIllegalHsBootFileDecl
+    TcRnIllegalHsBootOrSigDecl {}
+      -> ErrorWithoutFlag
+    TcRnBootMismatch {}
       -> ErrorWithoutFlag
     TcRnRecursivePatternSynonym{}
       -> ErrorWithoutFlag
@@ -1334,17 +2037,13 @@ instance Diagnostic TcRnMessage where
       -> ErrorWithoutFlag
     TcRnPartialTypeSigBadQuantifier{}
       -> ErrorWithoutFlag
-    TcRnMissingSignature what exported overridden
-      -> WarningWithFlag $ missingSignatureWarningFlag what exported overridden
+    TcRnMissingSignature what exported
+      -> WarningWithFlags $ missingSignatureWarningFlags what exported
     TcRnPolymorphicBinderMissingSig{}
       -> WarningWithFlag Opt_WarnMissingLocalSignatures
     TcRnOverloadedSig{}
       -> ErrorWithoutFlag
     TcRnTupleConstraintInst{}
-      -> ErrorWithoutFlag
-    TcRnAbstractClassInst{}
-      -> ErrorWithoutFlag
-    TcRnNoClassInstHead{}
       -> ErrorWithoutFlag
     TcRnUserTypeError{}
       -> ErrorWithoutFlag
@@ -1356,6 +2055,12 @@ instance Diagnostic TcRnMessage where
       -> ErrorWithoutFlag
     TcRnForAllEscapeError{}
       -> ErrorWithoutFlag
+    TcRnSimplifiableConstraint{}
+      -> WarningWithFlag Opt_WarnSimplifiableClassConstraints
+    TcRnArityMismatch{}
+      -> ErrorWithoutFlag
+    TcRnIllegalInstance rea
+      -> illegalInstanceReason rea
     TcRnVDQInTermType{}
       -> ErrorWithoutFlag
     TcRnBadQuantPredHead{}
@@ -1368,11 +2073,7 @@ instance Diagnostic TcRnMessage where
       -> ErrorWithoutFlag
     TcRnIllegalConstraintSynonymOfKind{}
       -> ErrorWithoutFlag
-    TcRnIllegalClassInst{}
-      -> ErrorWithoutFlag
     TcRnOversaturatedVisibleKindArg{}
-      -> ErrorWithoutFlag
-    TcRnBadAssociatedType{}
       -> ErrorWithoutFlag
     TcRnForAllRankErr{}
       -> ErrorWithoutFlag
@@ -1416,21 +2117,21 @@ instance Diagnostic TcRnMessage where
       -> ErrorWithoutFlag
     TcRnConflictingExports{}
       -> ErrorWithoutFlag
-    TcRnAmbiguousField{}
+    TcRnDuplicateFieldExport {}
+      -> ErrorWithoutFlag
+    TcRnAmbiguousFieldInUpdate {}
+      -> ErrorWithoutFlag
+    TcRnAmbiguousRecordUpdate{}
       -> WarningWithFlag Opt_WarnAmbiguousFields
     TcRnMissingFields{}
       -> WarningWithFlag Opt_WarnMissingFields
     TcRnFieldUpdateInvalidType{}
       -> ErrorWithoutFlag
-    TcRnNoConstructorHasAllFields{}
-      -> ErrorWithoutFlag
-    TcRnMixedSelectors{}
-      -> ErrorWithoutFlag
     TcRnMissingStrictFields{}
       -> ErrorWithoutFlag
-    TcRnNoPossibleParentForFields{}
+    TcRnBadRecordUpdate{}
       -> ErrorWithoutFlag
-    TcRnBadOverloadedRecordUpdate{}
+    TcRnIllegalStaticExpression {}
       -> ErrorWithoutFlag
     TcRnStaticFormNotClosed{}
       -> ErrorWithoutFlag
@@ -1471,14 +2172,12 @@ instance Diagnostic TcRnMessage where
            DerivErrBadConstructor{}                -> ErrorWithoutFlag
            DerivErrGenerics{}                      -> ErrorWithoutFlag
            DerivErrEnumOrProduct{}                 -> ErrorWithoutFlag
+    TcRnLookupInstance _ _ _
+      -> ErrorWithoutFlag
     TcRnLazyGADTPattern
       -> ErrorWithoutFlag
     TcRnArrowProcGADTPattern
       -> ErrorWithoutFlag
-    TcRnSpecialClassInst {}
-      -> ErrorWithoutFlag
-    TcRnForallIdentifier {}
-      -> WarningWithFlag Opt_WarnForallIdentifier
     TcRnTypeEqualityOutOfScope
       -> WarningWithFlag Opt_WarnTypeEqualityOutOfScope
     TcRnTypeEqualityRequiresOperators
@@ -1492,6 +2191,8 @@ instance Diagnostic TcRnMessage where
     TcRnIncorrectNameSpace {}
       -> ErrorWithoutFlag
     TcRnNotInScope {}
+      -> ErrorWithoutFlag
+    TcRnTermNameInType {}
       -> ErrorWithoutFlag
     TcRnUntickedPromotedThing {}
       -> WarningWithFlag Opt_WarnUntickedPromotedConstructors
@@ -1519,21 +2220,15 @@ instance Diagnostic TcRnMessage where
       -> ErrorWithoutFlag
     TcRnExpectedValueId{}
       -> ErrorWithoutFlag
-    TcRnNotARecordSelector{}
-      -> ErrorWithoutFlag
     TcRnRecSelectorEscapedTyVar{}
       -> ErrorWithoutFlag
     TcRnPatSynNotBidirectional{}
-      -> ErrorWithoutFlag
-    TcRnSplicePolymorphicLocalVar{}
       -> ErrorWithoutFlag
     TcRnIllegalDerivingItem{}
       -> ErrorWithoutFlag
     TcRnUnexpectedAnnotation{}
       -> ErrorWithoutFlag
     TcRnIllegalRecordSyntax{}
-      -> ErrorWithoutFlag
-    TcRnUnexpectedTypeSplice{}
       -> ErrorWithoutFlag
     TcRnInvalidVisibleKindArgument{}
       -> ErrorWithoutFlag
@@ -1548,6 +2243,8 @@ instance Diagnostic TcRnMessage where
     TcRnClassKindNotConstraint{}
       -> ErrorWithoutFlag
     TcRnUnpromotableThing{}
+      -> ErrorWithoutFlag
+    TcRnIllegalTermLevelUse{}
       -> ErrorWithoutFlag
     TcRnMatchesHaveDiffNumArgs{}
       -> ErrorWithoutFlag
@@ -1565,13 +2262,19 @@ instance Diagnostic TcRnMessage where
       -> WarningWithoutFlag
     TcRnSpecialiseNotVisible{}
       -> WarningWithoutFlag
-    TcRnNameByTemplateHaskellQuote{}
+    TcRnPragmaWarning{pragma_warning_msg}
+      -> WarningWithCategory (warningTxtCategory pragma_warning_msg)
+    TcRnDifferentExportWarnings _ _
       -> ErrorWithoutFlag
-    TcRnIllegalBindingOfBuiltIn{}
-      -> ErrorWithoutFlag
-    TcRnPragmaWarning{}
-      -> WarningWithFlag Opt_WarnWarningsDeprecations
+    TcRnIncompleteExportWarnings _ _
+      -> WarningWithFlag Opt_WarnIncompleteExportWarnings
     TcRnIllegalHsigDefaultMethods{}
+      -> ErrorWithoutFlag
+    TcRnHsigFixityMismatch{}
+      -> ErrorWithoutFlag
+    TcRnHsigShapeMismatch{}
+      -> ErrorWithoutFlag
+    TcRnHsigMissingModuleExport{}
       -> ErrorWithoutFlag
     TcRnBadGenericMethod{}
       -> ErrorWithoutFlag
@@ -1583,65 +2286,23 @@ instance Diagnostic TcRnMessage where
       -> WarningWithoutFlag
     TcRnBadMethodErr{}
       -> ErrorWithoutFlag
-    TcRnNoExplicitAssocTypeOrDefaultDeclaration{}
-      -> WarningWithFlag (Opt_WarnMissingMethods)
     TcRnIllegalTypeData
       -> ErrorWithoutFlag
+    TcRnIllegalQuasiQuotes{}
+      -> ErrorWithoutFlag
+    TcRnTHError err
+      -> thErrorReason err
     TcRnTypeDataForbids{}
       -> ErrorWithoutFlag
     TcRnIllegalNewtype{}
-      -> ErrorWithoutFlag
-    TcRnTypedTHWithPolyType{}
-      -> ErrorWithoutFlag
-    TcRnSpliceThrewException{}
-      -> ErrorWithoutFlag
-    TcRnInvalidTopDecl{}
-      -> ErrorWithoutFlag
-    TcRnNonExactName{}
-      -> ErrorWithoutFlag
-    TcRnAddInvalidCorePlugin{}
-      -> ErrorWithoutFlag
-    TcRnAddDocToNonLocalDefn{}
-      -> ErrorWithoutFlag
-    TcRnFailedToLookupThInstName{}
-      -> ErrorWithoutFlag
-    TcRnCannotReifyInstance{}
-      -> ErrorWithoutFlag
-    TcRnCannotReifyOutOfScopeThing{}
-      -> ErrorWithoutFlag
-    TcRnCannotReifyThingNotInTypeEnv{}
-      -> ErrorWithoutFlag
-    TcRnNoRolesAssociatedWithThing{}
-      -> ErrorWithoutFlag
-    TcRnCannotRepresentType{}
-      -> ErrorWithoutFlag
-    TcRnRunSpliceFailure{}
-      -> ErrorWithoutFlag
-    TcRnReportCustomQuasiError isError _
-      -> if isError then ErrorWithoutFlag else WarningWithoutFlag
-    TcRnInterfaceLookupError{}
       -> ErrorWithoutFlag
     TcRnUnsatisfiedMinimalDef{}
       -> WarningWithFlag (Opt_WarnMissingMethods)
     TcRnMisplacedInstSig{}
       -> ErrorWithoutFlag
-    TcRnBadBootFamInstDecl{}
-      -> ErrorWithoutFlag
-    TcRnIllegalFamilyInstance{}
-      -> ErrorWithoutFlag
-    TcRnMissingClassAssoc{}
-      -> ErrorWithoutFlag
-    TcRnBadFamInstDecl{}
-      -> ErrorWithoutFlag
-    TcRnNotOpenFamily{}
-      -> ErrorWithoutFlag
     TcRnNoRebindableSyntaxRecordDot{}
       -> ErrorWithoutFlag
     TcRnNoFieldPunsRecordDot{}
-      -> ErrorWithoutFlag
-    TcRnIllegalStaticExpression{}
-      -> ErrorWithoutFlag
-    TcRnIllegalStaticFormInSplice{}
       -> ErrorWithoutFlag
     TcRnListComprehensionDuplicateBinding{}
       -> ErrorWithoutFlag
@@ -1657,9 +2318,265 @@ instance Diagnostic TcRnMessage where
       -> ErrorWithoutFlag
     TcRnIllegalTupleSection{}
       -> ErrorWithoutFlag
-    TcRnLoopySuperclassSolve{}
-      -> WarningWithFlag Opt_WarnLoopySuperclassSolve
-    TcRnCannotDefaultConcrete{}
+    TcRnCapturedTermName{}
+      -> WarningWithFlag Opt_WarnTermVariableCapture
+    TcRnBindingOfExistingName{}
+      -> ErrorWithoutFlag
+    TcRnMultipleFixityDecls{}
+      -> ErrorWithoutFlag
+    TcRnIllegalPatternSynonymDecl{}
+      -> ErrorWithoutFlag
+    TcRnIllegalClassBinding{}
+      -> ErrorWithoutFlag
+    TcRnOrphanCompletePragma{}
+      -> ErrorWithoutFlag
+    TcRnEmptyCase{}
+      -> ErrorWithoutFlag
+    TcRnNonStdGuards{}
+      -> WarningWithoutFlag
+    TcRnDuplicateSigDecl{}
+      -> ErrorWithoutFlag
+    TcRnMisplacedSigDecl{}
+      -> ErrorWithoutFlag
+    TcRnUnexpectedDefaultSig{}
+      -> ErrorWithoutFlag
+    TcRnDuplicateMinimalSig{}
+      -> ErrorWithoutFlag
+    TcRnUnexpectedStandaloneDerivingDecl{}
+      -> ErrorWithoutFlag
+    TcRnUnusedVariableInRuleDecl{}
+      -> ErrorWithoutFlag
+    TcRnUnexpectedStandaloneKindSig{}
+      -> ErrorWithoutFlag
+    TcRnIllegalRuleLhs{}
+      -> ErrorWithoutFlag
+    TcRnDuplicateRoleAnnot{}
+      -> ErrorWithoutFlag
+    TcRnDuplicateKindSig{}
+      -> ErrorWithoutFlag
+    TcRnIllegalDerivStrategy{}
+      -> ErrorWithoutFlag
+    TcRnIllegalMultipleDerivClauses{}
+      -> ErrorWithoutFlag
+    TcRnNoDerivStratSpecified{}
+      -> WarningWithFlag Opt_WarnMissingDerivingStrategies
+    TcRnStupidThetaInGadt{}
+      -> ErrorWithoutFlag
+    TcRnShadowedTyVarNameInFamResult{}
+      -> ErrorWithoutFlag
+    TcRnIncorrectTyVarOnLhsOfInjCond{}
+      -> ErrorWithoutFlag
+    TcRnUnknownTyVarsOnRhsOfInjCond{}
+      -> ErrorWithoutFlag
+    TcRnBadlyStaged{}
+      -> ErrorWithoutFlag
+    TcRnBadlyStagedType{}
+      -> WarningWithFlag Opt_WarnBadlyStagedTypes
+    TcRnStageRestriction{}
+      -> ErrorWithoutFlag
+    TcRnTyThingUsedWrong{}
+      -> ErrorWithoutFlag
+    TcRnCannotDefaultKindVar{}
+      -> ErrorWithoutFlag
+    TcRnUninferrableTyVar{}
+      -> ErrorWithoutFlag
+    TcRnSkolemEscape{}
+      -> ErrorWithoutFlag
+    TcRnPatSynEscapedCoercion{}
+      -> ErrorWithoutFlag
+    TcRnPatSynExistentialInResult{}
+      -> ErrorWithoutFlag
+    TcRnPatSynArityMismatch{}
+      -> ErrorWithoutFlag
+    TcRnPatSynInvalidRhs{}
+      -> ErrorWithoutFlag
+    TcRnTyFamDepsDisabled{}
+      -> ErrorWithoutFlag
+    TcRnAbstractClosedTyFamDecl{}
+      -> ErrorWithoutFlag
+    TcRnPartialFieldSelector{}
+      -> WarningWithFlag Opt_WarnPartialFields
+    TcRnHasFieldResolvedIncomplete{}
+      -> WarningWithFlag Opt_WarnIncompleteRecordSelectors
+    TcRnBadFieldAnnotation _ _ LazyFieldsDisabled
+      -> ErrorWithoutFlag
+    TcRnBadFieldAnnotation{}
+      -> WarningWithoutFlag
+    TcRnSuperclassCycle{}
+      -> ErrorWithoutFlag
+    TcRnDefaultSigMismatch{}
+      -> ErrorWithoutFlag
+    TcRnTyFamsDisabled{}
+      -> ErrorWithoutFlag
+    TcRnBadTyConTelescope {}
+      -> ErrorWithoutFlag
+    TcRnTyFamResultDisabled{}
+      -> ErrorWithoutFlag
+    TcRnRoleValidationFailed{}
+      -> ErrorWithoutFlag
+    TcRnCommonFieldResultTypeMismatch{}
+      -> ErrorWithoutFlag
+    TcRnCommonFieldTypeMismatch{}
+      -> ErrorWithoutFlag
+    TcRnClassExtensionDisabled{}
+      -> ErrorWithoutFlag
+    TcRnDataConParentTypeMismatch{}
+      -> ErrorWithoutFlag
+    TcRnGADTsDisabled{}
+      -> ErrorWithoutFlag
+    TcRnExistentialQuantificationDisabled{}
+      -> ErrorWithoutFlag
+    TcRnGADTDataContext{}
+      -> ErrorWithoutFlag
+    TcRnMultipleConForNewtype{}
+      -> ErrorWithoutFlag
+    TcRnKindSignaturesDisabled{}
+      -> ErrorWithoutFlag
+    TcRnEmptyDataDeclsDisabled{}
+      -> ErrorWithoutFlag
+    TcRnRoleMismatch{}
+      -> ErrorWithoutFlag
+    TcRnRoleCountMismatch{}
+      -> ErrorWithoutFlag
+    TcRnIllegalRoleAnnotation{}
+      -> ErrorWithoutFlag
+    TcRnRoleAnnotationsDisabled{}
+      -> ErrorWithoutFlag
+    TcRnIncoherentRoles{}
+      -> ErrorWithoutFlag
+    TcRnUnexpectedKindVar{}
+      -> ErrorWithoutFlag
+    TcRnNegativeNumTypeLiteral{}
+      -> ErrorWithoutFlag
+    TcRnIllegalKind{}
+      -> ErrorWithoutFlag
+    TcRnPrecedenceParsingError{}
+      -> ErrorWithoutFlag
+    TcRnSectionPrecedenceError{}
+      -> ErrorWithoutFlag
+    TcRnUnexpectedPatSigType{}
+      -> ErrorWithoutFlag
+    TcRnIllegalKindSignature{}
+      -> ErrorWithoutFlag
+    TcRnUnusedQuantifiedTypeVar{}
+      -> WarningWithFlag Opt_WarnUnusedForalls
+    TcRnDataKindsError _ thing
+      -- DataKinds errors can arise from either the renamer (Left) or the
+      -- typechecker (Right). The latter category of DataKinds errors are a
+      -- fairly recent addition to GHC (introduced in GHC 9.10), and in order
+      -- to prevent these new errors from breaking users' code, we temporarily
+      -- downgrade these errors to warnings. See Note [Checking for DataKinds]
+      -- (Wrinkle: Migration story for DataKinds typechecker errors)
+      -- in GHC.Tc.Validity.
+      -> case thing of
+           Left  _ -> ErrorWithoutFlag
+           Right _ -> WarningWithFlag Opt_WarnDataKindsTC
+    TcRnTypeSynonymCycle{}
+      -> ErrorWithoutFlag
+    TcRnZonkerMessage msg
+      -> zonkerMessageReason msg
+    TcRnInterfaceError err
+      -> interfaceErrorReason err
+    TcRnSelfImport{}
+      -> ErrorWithoutFlag
+    TcRnNoExplicitImportList{}
+      -> WarningWithFlag Opt_WarnMissingImportList
+    TcRnSafeImportsDisabled{}
+      -> ErrorWithoutFlag
+    TcRnDeprecatedModule _ txt
+      -> WarningWithCategory (warningTxtCategory txt)
+    TcRnCompatUnqualifiedImport{}
+      -> WarningWithFlag Opt_WarnCompatUnqualifiedImports
+    TcRnRedundantSourceImport{}
+      -> WarningWithoutFlag
+    TcRnImportLookup{}
+      -> ErrorWithoutFlag
+    TcRnUnusedImport{}
+      -> WarningWithFlag Opt_WarnUnusedImports
+    TcRnDuplicateDecls{}
+      -> ErrorWithoutFlag
+    TcRnPackageImportsDisabled
+      -> ErrorWithoutFlag
+    TcRnIllegalDataCon{}
+      -> ErrorWithoutFlag
+    TcRnNestedForallsContexts{}
+      -> ErrorWithoutFlag
+    TcRnRedundantRecordWildcard
+      -> WarningWithFlag Opt_WarnRedundantRecordWildcards
+    TcRnUnusedRecordWildcard{}
+      -> WarningWithFlag Opt_WarnUnusedRecordWildcards
+    TcRnUnusedName _ prov
+      -> WarningWithFlag $ case prov of
+        UnusedNameTopDecl -> Opt_WarnUnusedTopBinds
+        UnusedNameImported _ -> Opt_WarnUnusedTopBinds
+        UnusedNameTypePattern -> Opt_WarnUnusedTypePatterns
+        UnusedNameMatch -> Opt_WarnUnusedMatches
+        UnusedNameLocalBind -> Opt_WarnUnusedLocalBinds
+    TcRnQualifiedBinder{}
+      -> ErrorWithoutFlag
+    TcRnTypeApplicationsDisabled{}
+      -> ErrorWithoutFlag
+    TcRnInvalidRecordField{}
+      -> ErrorWithoutFlag
+    TcRnTupleTooLarge{}
+      -> ErrorWithoutFlag
+    TcRnCTupleTooLarge{}
+      -> ErrorWithoutFlag
+    TcRnIllegalInferredTyVars{}
+      -> ErrorWithoutFlag
+    TcRnAmbiguousName{}
+      -> ErrorWithoutFlag
+    TcRnBindingNameConflict{}
+      -> ErrorWithoutFlag
+    TcRnNonCanonicalDefinition (NonCanonicalMonoid _) _
+      -> WarningWithFlag Opt_WarnNonCanonicalMonoidInstances
+    TcRnNonCanonicalDefinition (NonCanonicalMonad _) _
+      -> WarningWithFlag Opt_WarnNonCanonicalMonadInstances
+    TcRnDefaultedExceptionContext{}
+      -> WarningWithFlag Opt_WarnDefaultedExceptionContext
+    TcRnImplicitImportOfPrelude {}
+      -> WarningWithFlag Opt_WarnImplicitPrelude
+    TcRnMissingMain {}
+      -> ErrorWithoutFlag
+    TcRnGhciUnliftedBind {}
+      -> ErrorWithoutFlag
+    TcRnGhciMonadLookupFail {}
+      -> ErrorWithoutFlag
+    TcRnMissingRoleAnnotation{}
+      -> WarningWithFlag Opt_WarnMissingRoleAnnotations
+    TcRnIllegalInvisTyVarBndr{}
+      -> ErrorWithoutFlag
+    TcRnDeprecatedInvisTyArgInConPat {}
+      -> WarningWithFlag Opt_WarnDeprecatedTypeAbstractions
+    TcRnInvalidInvisTyVarBndr{}
+      -> ErrorWithoutFlag
+    TcRnInvisBndrWithoutSig{}
+      -> ErrorWithoutFlag
+    TcRnImplicitRhsQuantification{}
+      -> WarningWithFlag Opt_WarnImplicitRhsQuantification
+    TcRnPatersonCondFailure{}
+      -> ErrorWithoutFlag
+    TcRnIllformedTypePattern{}
+      -> ErrorWithoutFlag
+    TcRnIllegalTypePattern{}
+      -> ErrorWithoutFlag
+    TcRnIllformedTypeArgument{}
+      -> ErrorWithoutFlag
+    TcRnIllegalTypeExpr{}
+      -> ErrorWithoutFlag
+    TcRnInvalidDefaultedTyVar{}
+      -> ErrorWithoutFlag
+    TcRnNamespacedWarningPragmaWithoutFlag{}
+      -> ErrorWithoutFlag
+    TcRnIllegalInvisibleTypePattern{}
+      -> ErrorWithoutFlag
+    TcRnInvisPatWithNoForAll{}
+      -> ErrorWithoutFlag
+    TcRnNamespacedFixitySigWithoutFlag{}
+      -> ErrorWithoutFlag
+    TcRnOutOfArityTyVar{}
+      -> ErrorWithoutFlag
+    TcRnMisplacedInvisPat{}
       -> ErrorWithoutFlag
 
   diagnosticHints = \case
@@ -1670,11 +2587,15 @@ instance Diagnostic TcRnMessage where
            TcRnMessageDetailed _ m -> diagnosticHints m
     TcRnWithHsDocContext _ msg
       -> diagnosticHints msg
-    TcRnSolverReport _ _ hints
-      -> hints
+    TcRnSolverReport (SolverReportWithCtxt ctxt msg) _
+      -> tcSolverReportMsgHints ctxt msg
+    TcRnSolverDepthError {}
+      -> [SuggestIncreaseReductionDepth]
     TcRnRedundantConstraints{}
       -> noHints
     TcRnInaccessibleCode{}
+      -> noHints
+    TcRnInaccessibleCoAxBranch{}
       -> noHints
     TcRnTypeDoesNotHaveFixedRuntimeRep{}
       -> noHints
@@ -1698,6 +2619,8 @@ instance Diagnostic TcRnMessage where
       -> [SuggestAddToHSigExportList name Nothing]
     TcRnShadowedName{}
       -> noHints
+    TcRnInvalidWarningCategory{}
+      -> noHints
     TcRnDuplicateWarningDecls{}
       -> noHints
     TcRnSimplifierTooManyIterations{}
@@ -1714,6 +2637,10 @@ instance Diagnostic TcRnMessage where
       -> [suggestExtension LangExt.RecordWildCards]
     TcRnIllegalWildcardInType{}
       -> noHints
+    TcRnIllegalNamedWildcardInTypeArgument{}
+      -> [SuggestAnonymousWildcard]
+    TcRnIllegalImplicitTyVarInTypeArgument tv
+      -> [SuggestExplicitQuantification tv]
     TcRnDuplicateFieldName{}
       -> noHints
     TcRnIllegalViewPattern{}
@@ -1738,8 +2665,18 @@ instance Diagnostic TcRnMessage where
       -> noHints
     TcRnArrowIfThenElsePredDependsOnResultTy
       -> noHints
-    TcRnIllegalHsBootFileDecl
+    TcRnIllegalHsBootOrSigDecl {}
       -> noHints
+    TcRnBootMismatch boot_or_sig err
+      | Hsig <- boot_or_sig
+      , BootMismatch _ _ (BootMismatchedTyCons _boot_tc real_tc tc_errs) <- err
+      , any is_synAbsData_etaReduce (NE.toList tc_errs)
+      -> [SuggestEtaReduceAbsDataTySyn real_tc]
+      | otherwise
+      -> noHints
+      where
+        is_synAbsData_etaReduce (SynAbstractData SynAbsDataTySynNotNullary) = True
+        is_synAbsData_etaReduce _ = False
     TcRnRecursivePatternSynonym{}
       -> noHints
     TcRnPartialTypeSigTyVarMismatch{}
@@ -1754,10 +2691,6 @@ instance Diagnostic TcRnMessage where
       -> noHints
     TcRnTupleConstraintInst{}
       -> noHints
-    TcRnAbstractClassInst{}
-      -> noHints
-    TcRnNoClassInstHead{}
-      -> noHints
     TcRnUserTypeError{}
       -> noHints
     TcRnConstraintInKind{}
@@ -1768,8 +2701,9 @@ instance Diagnostic TcRnMessage where
       -> noHints
     TcRnForAllEscapeError{}
       -> noHints
-    TcRnVDQInTermType{}
-      -> noHints
+    TcRnVDQInTermType mb_ty
+      | isJust mb_ty -> [suggestExtension LangExt.RequiredTypeArguments]
+      | otherwise    -> []
     TcRnBadQuantPredHead{}
       -> noHints
     TcRnIllegalTupleConstraint{}
@@ -1780,11 +2714,7 @@ instance Diagnostic TcRnMessage where
       -> noHints
     TcRnIllegalConstraintSynonymOfKind{}
       -> [suggestExtension LangExt.ConstraintKinds]
-    TcRnIllegalClassInst{}
-      -> noHints
     TcRnOversaturatedVisibleKindArg{}
-      -> noHints
-    TcRnBadAssociatedType{}
       -> noHints
     TcRnForAllRankErr rank _
       -> case rank of
@@ -1794,12 +2724,22 @@ instance Diagnostic TcRnMessage where
            MonoTypeSynArg     -> [suggestExtension LangExt.LiberalTypeSynonyms]
            MonoTypeConstraint -> [suggestExtension LangExt.QuantifiedConstraints]
            _                  -> noHints
+    TcRnSimplifiableConstraint{}
+      -> noHints
+    TcRnArityMismatch{}
+      -> noHints
+    TcRnIllegalInstance rea
+      -> illegalInstanceHints rea
     TcRnMonomorphicBindings bindings
       -> case bindings of
           []     -> noHints
           (x:xs) -> [SuggestAddTypeSignatures $ NamedBindings (x NE.:| xs)]
-    TcRnOrphanInstance{}
-      -> [SuggestFixOrphanInstance]
+    TcRnOrphanInstance clsOrFamInst
+      -> [SuggestFixOrphanInst { isFamilyInstance = isFam }]
+        where
+          isFam = case clsOrFamInst :: Either ClsInst FamInst of
+            Left  _clsInst -> Nothing
+            Right famInst  -> Just $ fi_flavor famInst
     TcRnFunDepConflict{}
       -> noHints
     TcRnDupInstanceDecls{}
@@ -1844,22 +2784,22 @@ instance Diagnostic TcRnMessage where
       -> noHints
     TcRnConflictingExports{}
       -> noHints
-    TcRnAmbiguousField{}
+    TcRnDuplicateFieldExport {}
+      -> [suggestExtension LangExt.DuplicateRecordFields]
+    TcRnAmbiguousFieldInUpdate {}
+      -> [suggestExtension LangExt.DisambiguateRecordFields]
+    TcRnAmbiguousRecordUpdate{}
       -> noHints
     TcRnMissingFields{}
       -> noHints
     TcRnFieldUpdateInvalidType{}
       -> noHints
-    TcRnNoConstructorHasAllFields{}
-      -> noHints
-    TcRnMixedSelectors{}
-      -> noHints
     TcRnMissingStrictFields{}
       -> noHints
-    TcRnNoPossibleParentForFields{}
+    TcRnBadRecordUpdate{}
       -> noHints
-    TcRnBadOverloadedRecordUpdate{}
-      -> noHints
+    TcRnIllegalStaticExpression {}
+      -> [suggestExtension LangExt.StaticPointers]
     TcRnStaticFormNotClosed{}
       -> noHints
     TcRnUselessTypeable
@@ -1877,14 +2817,12 @@ instance Diagnostic TcRnMessage where
              -> noHints
     TcRnCannotDeriveInstance cls _ _ newtype_deriving rea
       -> deriveInstanceErrReasonHints cls newtype_deriving rea
+    TcRnLookupInstance _ _ _
+      -> noHints
     TcRnLazyGADTPattern
       -> noHints
     TcRnArrowProcGADTPattern
       -> noHints
-    TcRnSpecialClassInst {}
-      -> noHints
-    TcRnForallIdentifier {}
-      -> [SuggestRenameForall]
     TcRnTypeEqualityOutOfScope
       -> noHints
     TcRnTypeEqualityRequiresOperators
@@ -1902,6 +2840,8 @@ instance Diagnostic TcRnMessage where
       -> noHints
     TcRnNotInScope err _ _ hints
       -> scopeErrorHints err ++ hints
+    TcRnTermNameInType _ hints
+      -> hints
     TcRnUntickedPromotedThing thing
       -> [SuggestAddTick thing]
     TcRnIllegalBuiltinSyntax {}
@@ -1923,28 +2863,27 @@ instance Diagnostic TcRnMessage where
     TcRnIllegalForeignType _ reason
       -> case reason of
            TypeCannotBeMarshaled _ why
-             | NewtypeDataConNotInScope{} <- why -> [SuggestImportingDataCon]
-             | UnliftedFFITypesNeeded <- why -> [suggestExtension LangExt.UnliftedFFITypes]
+             | NewtypeDataConNotInScope tc _ <- why
+             -> let tc_nm = tyConName tc
+                    dc = dataConName $ head $ tyConDataCons tc
+                in [ ImportSuggestion (occName dc)
+                   $ ImportDataCon Nothing (nameOccName tc_nm) ]
+             | UnliftedFFITypesNeeded <- why
+             -> [suggestExtension LangExt.UnliftedFFITypes]
            _ -> noHints
     TcRnInvalidCIdentifier{}
       -> noHints
     TcRnExpectedValueId{}
       -> noHints
-    TcRnNotARecordSelector{}
-      -> noHints
     TcRnRecSelectorEscapedTyVar{}
       -> [SuggestPatternMatchingSyntax]
     TcRnPatSynNotBidirectional{}
-      -> noHints
-    TcRnSplicePolymorphicLocalVar{}
       -> noHints
     TcRnIllegalDerivingItem{}
       -> noHints
     TcRnUnexpectedAnnotation{}
       -> noHints
     TcRnIllegalRecordSyntax{}
-      -> noHints
-    TcRnUnexpectedTypeSplice{}
       -> noHints
     TcRnInvalidVisibleKindArgument{}
       -> noHints
@@ -1963,6 +2902,8 @@ instance Diagnostic TcRnMessage where
       -> noHints
     TcRnUnpromotableThing{}
       -> noHints
+    TcRnIllegalTermLevelUse{}
+      -> noHints
     TcRnMatchesHaveDiffNumArgs{}
       -> noHints
     TcRnCannotBindScopedTyVarInPatSig{}
@@ -1979,13 +2920,23 @@ instance Diagnostic TcRnMessage where
       -> noHints
     TcRnSpecialiseNotVisible name
       -> [SuggestSpecialiseVisibilityHints name]
-    TcRnNameByTemplateHaskellQuote{}
-      -> noHints
-    TcRnIllegalBindingOfBuiltIn{}
-      -> noHints
     TcRnPragmaWarning{}
       -> noHints
+    TcRnDifferentExportWarnings _ _
+      -> noHints
+    TcRnIncompleteExportWarnings _ _
+      -> noHints
     TcRnIllegalHsigDefaultMethods{}
+      -> noHints
+    TcRnIllegalQuasiQuotes{}
+      -> [suggestExtension LangExt.QuasiQuotes]
+    TcRnTHError err
+      -> thErrorHints err
+    TcRnHsigFixityMismatch{}
+      -> noHints
+    TcRnHsigShapeMismatch{}
+      -> noHints
+    TcRnHsigMissingModuleExport{}
       -> noHints
     TcRnBadGenericMethod{}
       -> noHints
@@ -1997,65 +2948,19 @@ instance Diagnostic TcRnMessage where
       -> noHints
     TcRnBadMethodErr{}
       -> noHints
-    TcRnNoExplicitAssocTypeOrDefaultDeclaration{}
-      -> noHints
     TcRnIllegalTypeData
       -> [suggestExtension LangExt.TypeData]
     TcRnTypeDataForbids{}
       -> noHints
     TcRnIllegalNewtype{}
       -> noHints
-    TcRnTypedTHWithPolyType{}
-      -> noHints
-    TcRnSpliceThrewException{}
-      -> noHints
-    TcRnInvalidTopDecl{}
-      -> noHints
-    TcRnNonExactName{}
-      -> noHints
-    TcRnAddInvalidCorePlugin{}
-      -> noHints
-    TcRnAddDocToNonLocalDefn{}
-      -> noHints
-    TcRnFailedToLookupThInstName{}
-      -> noHints
-    TcRnCannotReifyInstance{}
-      -> noHints
-    TcRnCannotReifyOutOfScopeThing{}
-      -> noHints
-    TcRnCannotReifyThingNotInTypeEnv{}
-      -> noHints
-    TcRnNoRolesAssociatedWithThing{}
-      -> noHints
-    TcRnCannotRepresentType{}
-      -> noHints
-    TcRnRunSpliceFailure{}
-      -> noHints
-    TcRnReportCustomQuasiError{}
-      -> noHints
-    TcRnInterfaceLookupError{}
-      -> noHints
     TcRnUnsatisfiedMinimalDef{}
       -> noHints
     TcRnMisplacedInstSig{}
       -> [suggestExtension LangExt.InstanceSigs]
-    TcRnBadBootFamInstDecl{}
-      -> noHints
-    TcRnIllegalFamilyInstance{}
-      -> noHints
-    TcRnMissingClassAssoc{}
-      -> noHints
-    TcRnBadFamInstDecl{}
-      -> [suggestExtension LangExt.TypeFamilies]
-    TcRnNotOpenFamily{}
-      -> noHints
     TcRnNoRebindableSyntaxRecordDot{}
       -> noHints
     TcRnNoFieldPunsRecordDot{}
-      -> noHints
-    TcRnIllegalStaticExpression{}
-      -> [suggestExtension LangExt.StaticPointers]
-    TcRnIllegalStaticFormInSplice{}
       -> noHints
     TcRnListComprehensionDuplicateBinding{}
       -> noHints
@@ -2074,15 +2979,278 @@ instance Diagnostic TcRnMessage where
       -> noHints
     TcRnIllegalTupleSection{}
       -> [suggestExtension LangExt.TupleSections]
-    TcRnLoopySuperclassSolve wtd_loc wtd_pty
-      -> [LoopySuperclassSolveHint wtd_pty cls_or_qc]
-      where
-        cls_or_qc :: ClsInstOrQC
-        cls_or_qc = case ctLocOrigin wtd_loc of
-          ScOrigin c_or_q _ -> c_or_q
-          _                 -> IsClsInst -- shouldn't happen
-    TcRnCannotDefaultConcrete{}
-      -> [SuggestAddTypeSignatures UnnamedBinding]
+    TcRnCapturedTermName{}
+      -> [SuggestRenameTypeVariable]
+    TcRnBindingOfExistingName{}
+      -> noHints
+    TcRnMultipleFixityDecls{}
+      -> noHints
+    TcRnIllegalPatternSynonymDecl{}
+      -> [suggestExtension LangExt.PatternSynonyms]
+    TcRnIllegalClassBinding{}
+      -> noHints
+    TcRnOrphanCompletePragma{}
+      -> noHints
+    TcRnEmptyCase _ reason ->
+      case reason of
+        EmptyCaseWithoutFlag{}    -> [suggestExtension LangExt.EmptyCase]
+        EmptyCaseDisallowedCtxt{} -> noHints
+        EmptyCaseForall{}         -> noHints
+    TcRnNonStdGuards{}
+      -> [suggestExtension LangExt.PatternGuards]
+    TcRnDuplicateSigDecl{}
+      -> noHints
+    TcRnMisplacedSigDecl{}
+      -> noHints
+    TcRnUnexpectedDefaultSig{}
+      -> [suggestExtension LangExt.DefaultSignatures]
+    TcRnDuplicateMinimalSig{}
+      -> noHints
+    TcRnUnexpectedStandaloneDerivingDecl{}
+      -> [suggestExtension LangExt.StandaloneDeriving]
+    TcRnUnusedVariableInRuleDecl{}
+      -> noHints
+    TcRnUnexpectedStandaloneKindSig{}
+      -> [suggestExtension LangExt.StandaloneKindSignatures]
+    TcRnIllegalRuleLhs{}
+      -> noHints
+    TcRnDuplicateRoleAnnot{}
+      -> noHints
+    TcRnDuplicateKindSig{}
+      -> noHints
+    TcRnIllegalDerivStrategy ds -> case ds of
+      ViaStrategy{} -> [suggestExtension LangExt.DerivingVia]
+      _ -> [suggestExtension LangExt.DerivingStrategies]
+    TcRnIllegalMultipleDerivClauses{}
+      -> [suggestExtension LangExt.DerivingStrategies]
+    TcRnNoDerivStratSpecified isDSEnabled -> if isDSEnabled
+      then noHints
+      else [suggestExtension LangExt.DerivingStrategies]
+    TcRnStupidThetaInGadt{}
+      -> noHints
+    TcRnShadowedTyVarNameInFamResult{}
+      -> noHints
+    TcRnIncorrectTyVarOnLhsOfInjCond{}
+      -> noHints
+    TcRnUnknownTyVarsOnRhsOfInjCond{}
+      -> noHints
+    TcRnBadlyStaged{}
+      -> noHints
+    TcRnBadlyStagedType{}
+      -> noHints
+    TcRnStageRestriction{}
+      -> noHints
+    TcRnTyThingUsedWrong{}
+      -> noHints
+    TcRnCannotDefaultKindVar{}
+      -> noHints
+    TcRnUninferrableTyVar{}
+      -> noHints
+    TcRnSkolemEscape{}
+      -> noHints
+    TcRnPatSynEscapedCoercion{}
+      -> noHints
+    TcRnPatSynExistentialInResult{}
+      -> noHints
+    TcRnPatSynArityMismatch{}
+      -> noHints
+    TcRnPatSynInvalidRhs name pat args (PatSynNotInvertible _)
+      -> [SuggestExplicitBidiPatSyn name pat args]
+    TcRnPatSynInvalidRhs{}
+      -> noHints
+    TcRnTyFamDepsDisabled{}
+      -> [suggestExtension LangExt.TypeFamilyDependencies]
+    TcRnAbstractClosedTyFamDecl{}
+      -> noHints
+    TcRnPartialFieldSelector{}
+      -> noHints
+    TcRnHasFieldResolvedIncomplete{}
+      -> noHints
+    TcRnBadFieldAnnotation _ _ LazyFieldsDisabled
+      -> [suggestExtension LangExt.StrictData]
+    TcRnBadFieldAnnotation{}
+      -> noHints
+    TcRnSuperclassCycle{}
+      -> [suggestExtension LangExt.UndecidableSuperClasses]
+    TcRnDefaultSigMismatch{}
+      -> noHints
+    TcRnTyFamsDisabled{}
+      -> [suggestExtension LangExt.TypeFamilies]
+    TcRnBadTyConTelescope{}
+      -> noHints
+    TcRnTyFamResultDisabled{}
+      -> [suggestExtension LangExt.TypeFamilyDependencies]
+    TcRnRoleValidationFailed{}
+      -> noHints
+    TcRnCommonFieldResultTypeMismatch{}
+      -> noHints
+    TcRnCommonFieldTypeMismatch{}
+      -> noHints
+    TcRnClassExtensionDisabled _ MultiParamDisabled{}
+      -> [suggestExtension LangExt.MultiParamTypeClasses]
+    TcRnClassExtensionDisabled _ FunDepsDisabled{}
+      -> [suggestExtension LangExt.FunctionalDependencies]
+    TcRnClassExtensionDisabled _ ConstrainedClassMethodsDisabled{}
+      -> [suggestExtension LangExt.ConstrainedClassMethods]
+    TcRnDataConParentTypeMismatch{}
+      -> noHints
+    TcRnGADTsDisabled{}
+      -> [suggestExtension LangExt.GADTs]
+    TcRnExistentialQuantificationDisabled{}
+      -> [suggestAnyExtension [LangExt.ExistentialQuantification, LangExt.GADTs]]
+    TcRnGADTDataContext{}
+      -> noHints
+    TcRnMultipleConForNewtype{}
+      -> noHints
+    TcRnKindSignaturesDisabled{}
+      -> [suggestExtension LangExt.KindSignatures]
+    TcRnEmptyDataDeclsDisabled{}
+      -> [suggestExtension LangExt.EmptyDataDecls]
+    TcRnRoleMismatch{}
+      -> noHints
+    TcRnRoleCountMismatch{}
+      -> noHints
+    TcRnIllegalRoleAnnotation{}
+      -> noHints
+    TcRnRoleAnnotationsDisabled{}
+      -> [suggestExtension LangExt.RoleAnnotations]
+    TcRnIncoherentRoles{}
+      -> [suggestExtension LangExt.IncoherentInstances]
+    TcRnUnexpectedKindVar{}
+      -> [suggestExtension LangExt.PolyKinds]
+    TcRnNegativeNumTypeLiteral{}
+      -> noHints
+    TcRnIllegalKind _ suggest_polyKinds
+      -> if suggest_polyKinds
+         then [suggestExtension LangExt.PolyKinds]
+         else noHints
+    TcRnPrecedenceParsingError{}
+      -> noHints
+    TcRnSectionPrecedenceError{}
+      -> noHints
+    TcRnUnexpectedPatSigType{}
+      -> [suggestExtension LangExt.ScopedTypeVariables]
+    TcRnIllegalKindSignature{}
+      -> [suggestExtension LangExt.KindSignatures]
+    TcRnUnusedQuantifiedTypeVar{}
+      -> noHints
+    TcRnDataKindsError{}
+      -> [suggestExtension LangExt.DataKinds]
+    TcRnTypeSynonymCycle{}
+      -> noHints
+    TcRnZonkerMessage msg
+      -> zonkerMessageHints msg
+    TcRnInterfaceError reason
+      -> interfaceErrorHints reason
+    TcRnSelfImport{}
+      -> noHints
+    TcRnNoExplicitImportList{}
+      -> noHints
+    TcRnSafeImportsDisabled{}
+      -> [SuggestSafeHaskell]
+    TcRnDeprecatedModule{}
+      -> noHints
+    TcRnCompatUnqualifiedImport{}
+      -> noHints
+    TcRnRedundantSourceImport{}
+      -> noHints
+    TcRnImportLookup (ImportLookupBad k _ is ie patsyns_enabled) ->
+      let mod_name = moduleName $ is_mod is
+          occ = rdrNameOcc $ ieName ie
+      in case k of
+        BadImportAvailVar          -> [ImportSuggestion occ $ CouldRemoveTypeKeyword mod_name]
+        BadImportNotExported suggs -> suggs
+        BadImportAvailTyCon ex_ns  ->
+          [useExtensionInOrderTo empty LangExt.ExplicitNamespaces | not ex_ns]
+          ++ [ImportSuggestion occ $ CouldAddTypeKeyword mod_name]
+        BadImportAvailDataCon par  -> [ImportSuggestion occ $ ImportDataCon (Just (mod_name, patsyns_enabled)) par]
+        BadImportNotExportedSubordinates{} -> noHints
+    TcRnImportLookup{}
+      -> noHints
+    TcRnUnusedImport{}
+      -> noHints
+    TcRnDuplicateDecls{}
+      -> noHints
+    TcRnPackageImportsDisabled
+      -> [suggestExtension LangExt.PackageImports]
+    TcRnIllegalDataCon{}
+      -> noHints
+    TcRnNestedForallsContexts{}
+      -> noHints
+    TcRnRedundantRecordWildcard
+      -> [SuggestRemoveRecordWildcard]
+    TcRnUnusedRecordWildcard{}
+      -> [SuggestRemoveRecordWildcard]
+    TcRnUnusedName{}
+      -> noHints
+    TcRnQualifiedBinder{}
+      -> noHints
+    TcRnTypeApplicationsDisabled ty_app
+      -> case ty_app of
+          TypeApplication {}
+            -> [suggestExtension LangExt.TypeApplications]
+          TypeApplicationInPattern {}
+            -> [suggestExtension LangExt.TypeAbstractions]
+    TcRnInvalidRecordField{}
+      -> noHints
+    TcRnTupleTooLarge{}
+      -> noHints
+    TcRnCTupleTooLarge{}
+      -> noHints
+    TcRnIllegalInferredTyVars{}
+      -> noHints
+    TcRnAmbiguousName{}
+      -> noHints
+    TcRnBindingNameConflict{}
+      -> noHints
+    TcRnNonCanonicalDefinition reason _
+      -> suggestNonCanonicalDefinition reason
+    TcRnDefaultedExceptionContext _
+      -> noHints
+    TcRnImplicitImportOfPrelude {}
+      -> noHints
+    TcRnMissingMain {}
+      -> noHints
+    TcRnGhciUnliftedBind {}
+      -> noHints
+    TcRnGhciMonadLookupFail {}
+      -> noHints
+    TcRnMissingRoleAnnotation{}
+      -> noHints
+    TcRnIllegalInvisTyVarBndr{}
+      -> [suggestExtension LangExt.TypeAbstractions]
+    TcRnDeprecatedInvisTyArgInConPat{}
+      -> [suggestExtension LangExt.TypeAbstractions]
+    TcRnInvalidInvisTyVarBndr{}
+      -> noHints
+    TcRnInvisBndrWithoutSig name _
+      -> [SuggestAddStandaloneKindSignature name]
+    TcRnImplicitRhsQuantification kv
+      -> [SuggestBindTyVarOnLhs (unLoc kv)]
+    TcRnPatersonCondFailure{}
+      -> [suggestExtension LangExt.UndecidableInstances]
+    TcRnIllformedTypePattern{}
+      -> noHints
+    TcRnIllegalTypePattern{}
+      -> noHints
+    TcRnIllformedTypeArgument{}
+      -> noHints
+    TcRnIllegalTypeExpr{}
+      -> noHints
+    TcRnInvalidDefaultedTyVar{}
+      -> noHints
+    TcRnNamespacedWarningPragmaWithoutFlag{}
+      -> [suggestExtension LangExt.ExplicitNamespaces]
+    TcRnIllegalInvisibleTypePattern{}
+      -> [suggestExtension LangExt.TypeAbstractions]
+    TcRnInvisPatWithNoForAll{}
+      -> noHints
+    TcRnNamespacedFixitySigWithoutFlag{}
+      -> [suggestExtension LangExt.ExplicitNamespaces]
+    TcRnOutOfArityTyVar{}
+      -> noHints
+    TcRnMisplacedInvisPat{}
+      -> noHints
 
   diagnosticCode = constructorCode
 
@@ -2188,19 +3356,35 @@ messageWithInfoDiagnosticMessage unit_state ErrInfo{..} show_ctxt important =
       in (mapDecoratedSDoc (pprWithUnitState unit_state) important) `unionDecoratedSDoc`
          mkDecorated err_info'
 
-dodgy_msg :: (Outputable a, Outputable b) => SDoc -> a -> b -> SDoc
-dodgy_msg kind tc ie
-  = sep [ text "The" <+> kind <+> text "item"
-                     <+> quotes (ppr ie)
-                <+> text "suggests that",
-          quotes (ppr tc) <+> text "has (in-scope) constructors or class methods,",
-          text "but it has none" ]
+messageWithHsDocContext :: TcRnMessageOpts -> HsDocContext -> DecoratedSDoc -> DecoratedSDoc
+messageWithHsDocContext opts ctxt main_msg = do
+      if tcOptsShowContext opts
+         then main_msg `unionDecoratedSDoc` ctxt_msg
+         else main_msg
+      where
+        ctxt_msg = mkSimpleDecorated (inHsDocContext ctxt)
 
-dodgy_msg_insert :: forall p . (Anno (IdP (GhcPass p)) ~ SrcSpanAnnN) => IdP (GhcPass p) -> IE (GhcPass p)
-dodgy_msg_insert tc = IEThingAll noAnn ii
+dodgy_msg :: Outputable ie => SDoc -> GlobalRdrElt -> ie -> SDoc
+dodgy_msg kind tc ie
+  = vcat [ text "The" <+> kind <+> text "item" <+> quotes (ppr ie) <+> text "suggests that"
+         , quotes (ppr $ greName tc) <+> text "has" <+> sep rest ]
   where
-    ii :: LIEWrappedName (GhcPass p)
-    ii = noLocA (IEName noExtField $ noLocA tc)
+    rest :: [SDoc]
+    rest =
+      case greInfo tc of
+        IAmTyCon ClassFlavour
+          -> [ text "(in-scope) class methods or associated types" <> comma
+             , text "but it has none" ]
+        IAmTyCon _
+          -> [ text "(in-scope) constructors or record fields" <> comma
+             , text "but it has none" ]
+        _ -> [ text "children" <> comma
+             , text "but it is not a type constructor or a class" ]
+
+dodgy_msg_insert :: GlobalRdrElt -> IE GhcRn
+dodgy_msg_insert tc_gre = IEThingAll (Nothing, noAnn) ii Nothing
+  where
+    ii = noLocA (IEName noExtField $ noLocA $ greName tc_gre)
 
 pprTypeDoesNotHaveFixedRuntimeRep :: Type -> FixedRuntimeRepProvenance -> SDoc
 pprTypeDoesNotHaveFixedRuntimeRep ty prov =
@@ -2221,12 +3405,20 @@ pprField (f,ty) = ppr f <+> dcolon <+> ppr ty
 
 pprRecordFieldPart :: RecordFieldPart -> SDoc
 pprRecordFieldPart = \case
+  RecordFieldDecl {}       -> text "declaration"
   RecordFieldConstructor{} -> text "construction"
   RecordFieldPattern{}     -> text "pattern"
   RecordFieldUpdate        -> text "update"
 
+ppr_opfix :: (OpName, Fixity) -> SDoc
+ppr_opfix (op, fixity) = pp_op <+> brackets (ppr fixity)
+   where
+     pp_op | NegateOp <- op = text "prefix `-'"
+           | otherwise      = quotes (ppr op)
+
 pprBindings :: [Name] -> SDoc
 pprBindings = pprWithCommas (quotes . ppr)
+
 
 injectivityErrorHerald :: SDoc
 injectivityErrorHerald =
@@ -2238,22 +3430,19 @@ formatExportItemError exportedThing reason =
        , quotes exportedThing
        , text reason ]
 
--- | What warning flag is associated with the given missing signature?
-missingSignatureWarningFlag :: MissingSignature -> Exported -> Bool -> WarningFlag
-missingSignatureWarningFlag (MissingTopLevelBindingSig {}) exported overridden
-  | IsExported <- exported
-  , not overridden
-  = Opt_WarnMissingExportedSignatures
-  | otherwise
-  = Opt_WarnMissingSignatures
-missingSignatureWarningFlag (MissingPatSynSig {}) exported overridden
-  | IsExported <- exported
-  , not overridden
-  = Opt_WarnMissingExportedPatternSynonymSignatures
-  | otherwise
-  = Opt_WarnMissingPatternSynonymSignatures
-missingSignatureWarningFlag (MissingTyConKindSig {}) _ _
-  = Opt_WarnMissingKindSignatures
+-- | What warning flags are associated with the given missing signature?
+missingSignatureWarningFlags :: MissingSignature -> Exported -> NonEmpty WarningFlag
+missingSignatureWarningFlags (MissingTopLevelBindingSig {}) exported
+  -- We prefer "bigger" warnings first: #14794
+  --
+  -- See Note [Warnings controlled by multiple flags]
+  = Opt_WarnMissingSignatures :|
+    [ Opt_WarnMissingExportedSignatures | IsExported == exported ]
+missingSignatureWarningFlags (MissingPatSynSig {}) exported
+  = Opt_WarnMissingPatternSynonymSignatures :|
+    [ Opt_WarnMissingExportedPatternSynonymSignatures | IsExported  == exported ]
+missingSignatureWarningFlags (MissingTyConKindSig ty_con _) _
+  = Opt_WarnMissingKindSignatures :| [Opt_WarnMissingPolyKindSignatures | isForAllTy_invis_ty (tyConKind ty_con) ]
 
 useDerivingStrategies :: GhcHint
 useDerivingStrategies =
@@ -2462,6 +3651,18 @@ derivErrDiagnosticMessage cls cls_tys mb_strat newtype_deriving pprHerald = \cas
        in cannotMakeDerivedInstanceHerald cls cls_tys mb_strat newtype_deriving pprHerald
           (ppr1 $$ text "  or" $$ ppr2)
 
+lookupInstanceErrDiagnosticMessage :: Class
+                                   -> [Type]
+                                   -> LookupInstanceErrReason
+                                   -> SDoc
+lookupInstanceErrDiagnosticMessage cls tys = \case
+  LookupInstErrNotExact
+    -> text "Not an exact match (i.e., some variables get instantiated)"
+  LookupInstErrFlexiVar
+    -> text "flexible type variable:" <+> (ppr $ mkTyConApp (classTyCon cls) tys)
+  LookupInstErrNotFound
+    -> text "instance not found" <+> (ppr $ mkTyConApp (classTyCon cls) tys)
+
 {- *********************************************************************
 *                                                                      *
               Outputable SolverReportErrCtxt (for debugging)
@@ -2509,6 +3710,8 @@ pprTcSolverReportMsg _ (BadTelescope telescope skols) =
     sorted_tvs = scopedSort skols
 pprTcSolverReportMsg _ (UserTypeError ty) =
   pprUserTypeErrorTy ty
+pprTcSolverReportMsg _ (UnsatisfiableError ty) =
+  pprUserTypeErrorTy ty
 pprTcSolverReportMsg ctxt (ReportHoleError hole err) =
   pprHoleError ctxt hole err
 pprTcSolverReportMsg ctxt
@@ -2523,10 +3726,10 @@ pprTcSolverReportMsg ctxt
      , mismatchTyVarInfo     = tv_info
      , mismatchAmbiguityInfo = ambig_infos
      , mismatchCoercibleInfo = coercible_info })
-  = hang (pprMismatchMsg ctxt mismatch_msg)
-     2 (vcat ( maybe empty (pprTyVarInfo ctxt) tv_info
-             : maybe empty pprCoercibleMsg coercible_info
-             : map pprAmbiguityInfo ambig_infos ))
+  = vcat ([ pprMismatchMsg ctxt mismatch_msg
+          , maybe empty (pprTyVarInfo ctxt) tv_info
+          , maybe empty pprCoercibleMsg coercible_info ]
+          ++ (map pprAmbiguityInfo ambig_infos))
 pprTcSolverReportMsg _ (FixedRuntimeRepError frr_origs) =
   vcat (map make_msg frr_origs)
   where
@@ -2575,7 +3778,7 @@ pprTcSolverReportMsg _ (FixedRuntimeRepError frr_origs) =
         CastTy inner_ty _
           -- A confusing cast is one that is responsible
           -- for a representation-polymorphism error.
-          -> isConcrete (typeKind inner_ty)
+          -> isConcreteType (typeKind inner_ty)
         _ -> False
 
     type_printout :: Type -> SDoc
@@ -2592,7 +3795,7 @@ pprTcSolverReportMsg _ (FixedRuntimeRepError frr_origs) =
     unsolved_concrete_eq_explanation tv not_conc =
           text "Cannot unify" <+> quotes (ppr not_conc)
       <+> text "with the type variable" <+> quotes (ppr tv)
-      $$  text "because it is not a concrete" <+> what <> dot
+      $$  text "because the former is not a concrete" <+> what <> dot
       where
         ki = tyVarKind tv
         what :: SDoc
@@ -2603,13 +3806,6 @@ pprTcSolverReportMsg _ (FixedRuntimeRepError frr_origs) =
           = quotes (text "Levity")
           | otherwise
           = text "type"
-pprTcSolverReportMsg _ (UntouchableVariable tv implic)
-  | Implic { ic_given = given, ic_info = skol_info } <- implic
-  = sep [ quotes (ppr tv) <+> text "is untouchable"
-        , nest 2 $ text "inside the constraints:" <+> pprEvVarTheta given
-        , nest 2 $ text "bound by" <+> ppr skol_info
-        , nest 2 $ text "at" <+>
-          ppr (getLclEnvLoc (ic_env implic)) ]
 pprTcSolverReportMsg _ (BlockedEquality item) =
   vcat [ hang (text "Cannot use equality for substitution:")
            2 (ppr (errorItemPred item))
@@ -2801,7 +3997,7 @@ pprTcSolverReportMsg (CEC {cec_encl = implics}) (OverlappingInstances item match
              _  -> Just $ hang (pprTheta ev_vars_matching)
                             2 (sep [ text "bound by" <+> ppr skol_info
                                    , text "at" <+>
-                                     ppr (getLclEnvLoc (ic_env implic)) ])
+                                     ppr (getCtLocEnvLoc (ic_env implic)) ])
         where ev_vars_matching = [ pred
                                  | ev_var <- evvars
                                  , let pred = evVarPred ev_var
@@ -2857,7 +4053,7 @@ pprCannotUnifyVariableReason _ (SkolemEscape item implic esc_skols) =
          <+> text "bound by"
        , nest 2 $ ppr (ic_info implic)
        , nest 2 $ text "at" <+>
-         ppr (getLclEnvLoc (ic_env implic)) ] ]
+         ppr (getCtLocEnvLoc (ic_env implic)) ] ]
   where
     what = text $ levelString $
            ctLocTypeOrKind_maybe (errorItemCtLoc item) `orElse` TypeLevel
@@ -2880,6 +4076,13 @@ pprCannotUnifyVariableReason ctxt (DifferentTyVars tv_info)
 pprCannotUnifyVariableReason ctxt (RepresentationalEq tv_info mb_coercible_msg)
   = pprTyVarInfo ctxt tv_info
   $$ maybe empty pprCoercibleMsg mb_coercible_msg
+
+pprUntouchableVariable :: TcTyVar -> Implication -> SDoc
+pprUntouchableVariable tv (Implic { ic_given = given, ic_info = skol_info, ic_env = env })
+  = sep [ quotes (ppr tv) <+> text "is untouchable"
+        , nest 2 $ text "inside the constraints:" <+> pprEvVarTheta given
+        , nest 2 $ text "bound by" <+> ppr skol_info
+        , nest 2 $ text "at" <+> ppr (getCtLocEnvLoc env) ]
 
 pprMismatchMsg :: SolverReportErrCtxt -> MismatchMsg -> SDoc
 pprMismatchMsg ctxt
@@ -2954,17 +4157,18 @@ pprMismatchMsg _
               | otherwise       = text "kind" <+> quotes (ppr exp)
 
 pprMismatchMsg ctxt
-  (TypeEqMismatch { teq_mismatch_ppr_explicit_kinds = ppr_explicit_kinds
-                  , teq_mismatch_item     = item
+  (TypeEqMismatch { teq_mismatch_item     = item
                   , teq_mismatch_ty1      = ty1   -- These types are the actual types
                   , teq_mismatch_ty2      = ty2   --   that don't match; may be swapped
                   , teq_mismatch_expected = exp   -- These are the context of
                   , teq_mismatch_actual   = act   --   the mis-match
                   , teq_mismatch_what     = mb_thing
                   , teq_mb_same_occ       = mb_same_occ })
-  = addArising ct_loc $ pprWithExplicitKindsWhen ppr_explicit_kinds msg
-  $$ maybe empty pprSameOccInfo mb_same_occ
+  = addArising ct_loc $
+    pprWithInvisibleBitsWhen ppr_invis_bits msg
+    $$ maybe empty pprSameOccInfo mb_same_occ
   where
+
     msg | Just (torc, rep) <- sORTKind_maybe exp
         = msg_for_exp_sort torc rep
 
@@ -3027,6 +4231,7 @@ pprMismatchMsg ctxt
     ct_loc = errorItemCtLoc item
     orig   = errorItemOrigin item
     level  = ctLocTypeOrKind_maybe ct_loc `orElse` TypeLevel
+    ppr_invis_bits = shouldPprWithInvisibleBits ty1 ty2 orig
 
     num_args_msg = case level of
       KindLevel
@@ -3118,6 +4323,60 @@ pprMismatchMsg ctxt (CouldNotDeduce useful_givens (item :| others) mb_extra)
         _        -> pprTheta wanteds
 
 
+-- | Whether to print explicit kinds (with @-fprint-explicit-kinds@)
+-- in an 'SDoc' when a type mismatch occurs to due invisible parts of the types.
+-- See Note [Showing invisible bits of types in error messages]
+--
+-- This function first checks to see if the 'CtOrigin' argument is a
+-- 'TypeEqOrigin'. If so, it first checks whether the equality is a visible
+-- equality; if it's not, definitely print the kinds. Even if the equality is
+-- a visible equality, check the expected/actual types to see if the types
+-- have equal visible components. If the 'CtOrigin' is
+-- not a 'TypeEqOrigin', fall back on the actual mismatched types themselves.
+shouldPprWithInvisibleBits :: Type -> Type -> CtOrigin -> Bool
+shouldPprWithInvisibleBits _ty1 _ty2 (TypeEqOrigin { uo_actual = act
+                                                   , uo_expected = exp
+                                                   , uo_visible = vis })
+  | not vis   = True                  -- See tests T15870, T16204c
+  | otherwise = mayLookIdentical act exp   -- See tests T9171, T9144.
+shouldPprWithInvisibleBits ty1 ty2 _ct
+  = mayLookIdentical ty1 ty2
+
+{- Note [Showing invisible bits of types in error messages]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+It can be terribly confusing to get an error message like (#9171)
+
+    Couldn't match expected type ‘GetParam Base (GetParam Base Int)’
+                with actual type ‘GetParam Base (GetParam Base Int)’
+
+The reason may be that the kinds don't match up.  Typically you'll get
+more useful information, but not when it's as a result of ambiguity.
+
+To mitigate this, when we find a type or kind mis-match:
+
+* See if normally-visible parts of the type would make the two types
+  look different.  This check is made by
+  `GHC.Core.TyCo.Compare.mayLookIdentical`
+
+* If not, display the types with their normally-visible parts made visible,
+  by setting flags in the `SDocContext":
+  Specifically:
+    - Display kind arguments: sdocPrintExplicitKinds
+    - Don't default away runtime-reps: sdocPrintExplicitRuntimeReps,
+           which controls `GHC.Iface.Type.hideNonStandardTypes`
+  (NB: foralls are always printed by pprType, it turns out.)
+
+As a result the above error message would instead be displayed as:
+
+    Couldn't match expected type
+                  ‘GetParam @* @k2 @* Base (GetParam @* @* @k2 Base Int)’
+                with actual type
+                  ‘GetParam @* @k20 @* Base (GetParam @* @* @k20 Base Int)’
+
+Which makes it clearer that the culprit is the mismatch between `k2` and `k20`.
+
+Another example of what goes wrong without this: #24553.
+-}
 
 {- *********************************************************************
 *                                                                      *
@@ -3363,8 +4622,10 @@ pprWhenMatching ctxt (WhenMatching cty1 cty2 sub_o mb_sub_t_or_k) =
         Right msg  -> pprMismatchMsg ctxt msg
 
 pprTyVarInfo :: SolverReportErrCtxt -> TyVarInfo -> SDoc
-pprTyVarInfo ctxt (TyVarInfo { thisTyVar = tv1, otherTy = mb_tv2 }) =
-  mk_msg tv1 $$ case mb_tv2 of { Nothing -> empty; Just tv2 -> mk_msg tv2 }
+pprTyVarInfo ctxt (TyVarInfo { thisTyVar = tv1, otherTy = mb_tv2, thisTyVarIsUntouchable = mb_implic })
+  = vcat [ mk_msg tv1
+         , maybe empty (pprUntouchableVariable tv1) mb_implic
+         , case mb_tv2 of { Nothing -> empty; Just tv2 -> mk_msg tv2 } ]
   where
     mk_msg tv = case tcTyVarDetails tv of
       SkolemTv sk_info _ _ -> pprSkols ctxt [(getSkolemInfo sk_info, [tv])]
@@ -3424,7 +4685,7 @@ pprSameOccInfo (SameOcc same_pkg n1 n2) =
 **********************************************************************-}
 
 pprHoleError :: SolverReportErrCtxt -> Hole -> HoleError -> SDoc
-pprHoleError _ (Hole { hole_ty, hole_occ = rdr }) (OutOfScopeHole imp_errs)
+pprHoleError _ (Hole { hole_ty, hole_occ = rdr }) (OutOfScopeHole imp_errs _hints)
   = out_of_scope_msg $$ vcat (map ppr imp_errs)
   where
     herald | isDataOcc (rdrNameOcc rdr) = text "Data constructor not in scope:"
@@ -3449,7 +4710,7 @@ pprHoleError ctxt (Hole { hole_ty, hole_occ}) (HoleError sort other_tvs hole_sko
           2 (text "standing for" <+> quotes pp_hole_type_with_kind)
       ConstraintHole ->
         hang (text "Found extra-constraints wildcard standing for")
-          2 (quotes $ pprType hole_ty)  -- always kind constraint
+          2 (quotes $ pprType hole_ty)  -- always kind Constraint
 
     hole_kind = typeKind hole_ty
 
@@ -3501,9 +4762,12 @@ pp_rdr_with_type occ hole_ty = hang (pprPrefixOcc occ) 2 (dcolon <+> pprType hol
 pprScopeError :: RdrName -> NotInScopeError -> SDoc
 pprScopeError rdr_name scope_err =
   case scope_err of
-    NotInScope {} ->
+    NotInScope ->
       hang (text "Not in scope:")
         2 (what <+> quotes (ppr rdr_name))
+    NotARecordField ->
+      hang (text "Not in scope:")
+        2 (text "record field" <+> quotes (ppr rdr_name))
     NoExactName name ->
       text "The Name" <+> quotes (ppr name) <+> text "is not in scope."
     SameName gres ->
@@ -3511,7 +4775,8 @@ pprScopeError rdr_name scope_err =
       $ hang (text "Same Name in multiple name-spaces:")
            2 (vcat (map pp_one sorted_names))
       where
-        sorted_names = sortBy (leftmost_smallest `on` nameSrcSpan) (map greMangledName gres)
+        sorted_names = sortBy (leftmost_smallest `on` nameSrcSpan)
+                     $ map greName gres
         pp_one name
           = hang (pprNameSpace (occNameSpace (getOccName name))
                   <+> quotes (ppr name) <> comma)
@@ -3525,6 +4790,10 @@ pprScopeError rdr_name scope_err =
         2 (what <+> quotes (ppr rdr_name) <+> text "in this module")
     UnknownSubordinate doc ->
       quotes (ppr rdr_name) <+> text "is not a (visible)" <+> doc
+    NotInScopeTc env ->
+      vcat[text "GHC internal error:" <+> quotes (ppr rdr_name) <+>
+      text "is not in scope during type checking, but it passed the renamer",
+      text "tcl_env of environment:" <+> ppr env]
   where
     what = pprNonVarNameSpace (occNameSpace (rdrNameOcc rdr_name))
 
@@ -3532,11 +4801,135 @@ scopeErrorHints :: NotInScopeError -> [GhcHint]
 scopeErrorHints scope_err =
   case scope_err of
     NotInScope             -> noHints
+    NotARecordField        -> noHints
     NoExactName {}         -> [SuggestDumpSlices]
     SameName {}            -> [SuggestDumpSlices]
     MissingBinding _ hints -> hints
     NoTopLevelBinding      -> noHints
     UnknownSubordinate {}  -> noHints
+    NotInScopeTc _         -> noHints
+
+tcSolverReportMsgHints :: SolverReportErrCtxt -> TcSolverReportMsg -> [GhcHint]
+tcSolverReportMsgHints ctxt = \case
+  BadTelescope {}
+    -> noHints
+  UserTypeError {}
+    -> noHints
+  UnsatisfiableError {}
+    -> noHints
+  ReportHoleError hole err
+    -> holeErrorHints hole err
+  CannotUnifyVariable mismatch_msg rea
+    -> mismatchMsgHints ctxt mismatch_msg ++ cannotUnifyVariableHints rea
+  Mismatch { mismatchMsg = mismatch_msg }
+    -> mismatchMsgHints ctxt mismatch_msg
+  FixedRuntimeRepError {}
+    -> noHints
+  BlockedEquality {}
+    -> noHints
+  ExpectingMoreArguments {}
+    -> noHints
+  UnboundImplicitParams {}
+    -> noHints
+  AmbiguityPreventsSolvingCt {}
+    -> noHints
+  CannotResolveInstance {}
+    -> noHints
+  OverlappingInstances {}
+    -> noHints
+  UnsafeOverlap {}
+   -> noHints
+
+mismatchMsgHints :: SolverReportErrCtxt -> MismatchMsg -> [GhcHint]
+mismatchMsgHints ctxt msg =
+  maybeToList [ hint | (exp,act) <- mismatchMsg_ExpectedActuals msg
+                     , hint <- suggestAddSig ctxt exp act ]
+
+mismatchMsg_ExpectedActuals :: MismatchMsg -> Maybe (Type, Type)
+mismatchMsg_ExpectedActuals = \case
+  BasicMismatch { mismatch_ty1 = exp, mismatch_ty2 = act } ->
+    Just (exp, act)
+  KindMismatch { kmismatch_expected = exp, kmismatch_actual = act } ->
+    Just (exp, act)
+  TypeEqMismatch { teq_mismatch_expected = exp, teq_mismatch_actual = act } ->
+    Just (exp,act)
+  CouldNotDeduce { cnd_extra = cnd_extra }
+    | Just (CND_Extra _ exp act) <- cnd_extra
+    -> Just (exp, act)
+    | otherwise
+    -> Nothing
+
+holeErrorHints :: Hole -> HoleError -> [GhcHint]
+holeErrorHints _hole = \case
+  OutOfScopeHole _ hints
+    -> hints
+  HoleError {}
+    -> noHints
+
+cannotUnifyVariableHints :: CannotUnifyVariableReason -> [GhcHint]
+cannotUnifyVariableHints = \case
+  CannotUnifyWithPolytype {}
+    -> noHints
+  OccursCheck {}
+    -> noHints
+  SkolemEscape {}
+    -> noHints
+  DifferentTyVars {}
+    -> noHints
+  RepresentationalEq {}
+    -> noHints
+
+suggestAddSig :: SolverReportErrCtxt -> TcType -> TcType -> Maybe GhcHint
+-- See Note [Suggest adding a type signature]
+suggestAddSig ctxt ty1 _ty2
+  | bndr : bndrs <- inferred_bndrs
+  = Just $ SuggestAddTypeSignatures $ NamedBindings (bndr :| bndrs)
+  | otherwise
+  = Nothing
+  where
+    inferred_bndrs =
+      case getTyVar_maybe ty1 of
+        Just tv | isSkolemTyVar tv -> find (cec_encl ctxt) False tv
+        _                          -> []
+
+    -- 'find' returns the binders of an InferSkol for 'tv',
+    -- provided there is an intervening implication with
+    -- ic_given_eqs /= NoGivenEqs (i.e. a GADT match)
+    find [] _ _ = []
+    find (implic:implics) seen_eqs tv
+       | tv `elem` ic_skols implic
+       , InferSkol prs <- ic_info implic
+       , seen_eqs
+       = map fst prs
+       | otherwise
+       = find implics (seen_eqs || ic_given_eqs implic /= NoGivenEqs) tv
+
+{- Note [Suggest adding a type signature]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The OutsideIn algorithm rejects GADT programs that don't have a principal
+type, and indeed some that do.  Example:
+   data T a where
+     MkT :: Int -> T Int
+
+   f (MkT n) = n
+
+Does this have type f :: T a -> a, or f :: T a -> Int?
+The error that shows up tends to be an attempt to unify an
+untouchable type variable.  So suggestAddSig sees if the offending
+type variable is bound by an *inferred* signature, and suggests
+adding a declared signature instead.
+
+More specifically, we suggest adding a type sig if we have p ~ ty, and
+p is a skolem bound by an InferSkol.  Those skolems were created from
+unification variables in simplifyInfer.  Why didn't we unify?  It must
+have been because of an intervening GADT or existential, making it
+untouchable. Either way, a type signature would help.  For GADTs, it
+might make it typeable; for existentials the attempt to write a
+signature will fail -- or at least will produce a better error message
+next time
+
+This initially came up in #8968, concerning pattern synonyms.
+-}
 
 {- *********************************************************************
 *                                                                      *
@@ -3636,7 +5029,7 @@ pp_givens givens
              -- See Note [Suppress redundant givens during error reporting]
              -- for why we use mkMinimalBySCs above.
                 2 (sep [ text "bound by" <+> ppr skol_info
-                       , text "at" <+> ppr (getLclEnvLoc (ic_env implic)) ])
+                       , text "at" <+> ppr (getCtLocEnvLoc (ic_env implic)) ])
 
 {- *********************************************************************
 *                                                                      *
@@ -3657,7 +5050,7 @@ pprArising ct_loc
   | otherwise         = pprCtOrigin orig
   where
     orig = ctLocOrigin ct_loc
-    in_generated_code = lclEnvInGeneratedCode (ctLocEnv ct_loc)
+    in_generated_code = ctLocEnvInGeneratedCode (ctLocEnv ct_loc)
     suppress_origin
       | isGivenOrigin orig = True
       | otherwise          = case orig of
@@ -3692,7 +5085,7 @@ pprWithArising (ct:cts)
 {- Note ["Arising from" messages in generated code]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Consider code generated when we desugar code before typechecking;
-see Note [Rebindable syntax and HsExpansion].
+see Note [Rebindable syntax and XXExprGhcRn].
 
 In this code, constraints may be generated, but we don't want to
 say "arising from a call of foo" if 'foo' doesn't appear in the
@@ -3735,9 +5128,9 @@ tidySigSkol env cx ty tv_prs
       where
         (env', tv') = tidy_tv_bndr env tv
 
-    tidy_ty env ty@(FunTy af w arg res) -- Look under  c => t
-      | isInvisibleFunArg af
-      = ty { ft_mult = tidy_ty env w
+    tidy_ty env ty@(FunTy { ft_mult = w, ft_arg = arg, ft_res = res })
+      = -- Look under  c => t and t1 -> t2
+        ty { ft_mult = tidy_ty env w
            , ft_arg  = tidyType env arg
            , ft_res  = tidy_ty env res }
 
@@ -3974,7 +5367,7 @@ expandSynonymsToMatch ty1 ty2 = (ty1_ret, ty2_ret)
     --   ...
     --   type T0  = Int
     --
-    -- `tyExpansions T10` returns [T9, T8, T7, ... Int]
+    -- `tyExpansions T10` returns [T9, T8, T7, ..., Int]
     --
     -- This only expands the top layer, so if you have:
     --
@@ -4102,9 +5495,9 @@ pprConversionFailReason = \case
   InvalidCCallImpent from ->
     text (show from) <+> text "is not a valid ccall impent"
   RecGadtNoCons ->
-    text "RecGadtC must have at least one constructor name"
+    quotes (text "RecGadtC") <+> text "must have at least one constructor name"
   GadtNoCons ->
-    text "GadtC must have at least one constructor name"
+    quotes (text "GadtC") <+> text "must have at least one constructor name"
   InvalidTypeInstanceHeader tys ->
     text "Invalid type instance header:"
     <+> text (show tys)
@@ -4121,3 +5514,1384 @@ pprConversionFailReason = \case
     text "Function binding for"
     <+> quotes (text (TH.pprint nm))
     <+> text "has no equations"
+
+pprTyThingUsedWrong :: WrongThingSort -> TcTyThing -> Name -> SDoc
+pprTyThingUsedWrong sort thing name =
+  pprTcTyThingCategory thing <+> quotes (ppr name) <+>
+  text "used as a" <+> pprWrongThingSort sort
+
+pprWrongThingSort :: WrongThingSort -> SDoc
+pprWrongThingSort =
+  text . \case
+    WrongThingType -> "type"
+    WrongThingDataCon -> "data constructor"
+    WrongThingPatSyn -> "pattern synonym"
+    WrongThingConLike -> "constructor-like thing"
+    WrongThingClass -> "class"
+    WrongThingTyCon -> "type constructor"
+    WrongThingAxiom -> "axiom"
+
+pprStageCheckReason :: StageCheckReason -> SDoc
+pprStageCheckReason = \case
+  StageCheckInstance _ t ->
+    text "instance for" <+> quotes (ppr t)
+  StageCheckSplice t ->
+    quotes (ppr t)
+
+pprUninferrableTyVarCtx :: UninferrableTyVarCtx -> SDoc
+pprUninferrableTyVarCtx = \case
+  UninfTyCtx_ClassContext theta ->
+    sep [ text "the class context:", pprTheta theta ]
+  UninfTyCtx_DataContext theta ->
+    sep [ text "the datatype context:", pprTheta theta ]
+  UninfTyCtx_ProvidedContext theta ->
+    sep [ text "the provided context:" , pprTheta theta ]
+  UninfTyCtx_TyFamRhs rhs_ty ->
+    sep [ text "the type family equation right-hand side:" , ppr rhs_ty ]
+  UninfTyCtx_TySynRhs rhs_ty ->
+    sep [ text "the type synonym right-hand side:" , ppr rhs_ty ]
+  UninfTyCtx_Sig exp_kind full_hs_ty ->
+    hang (text "the kind" <+> ppr exp_kind) 2
+         (text "of the type signature:" <+> ppr full_hs_ty)
+
+pprPatSynInvalidRhsReason :: PatSynInvalidRhsReason -> SDoc
+pprPatSynInvalidRhsReason = \case
+  PatSynNotInvertible p ->
+    text "Pattern" <+> quotes (ppr p) <+> text "is not invertible"
+  PatSynUnboundVar var ->
+    quotes (ppr var) <+> text "is not bound by the LHS of the pattern synonym"
+
+pprBadFieldAnnotationReason :: BadFieldAnnotationReason -> SDoc
+pprBadFieldAnnotationReason = \case
+  LazyFieldsDisabled ->
+    text "Lazy field annotations (~) are disabled"
+  UnpackWithoutStrictness ->
+    text "UNPACK pragma lacks '!'"
+  BackpackUnpackAbstractType ->
+    text "Ignoring unusable UNPACK pragma"
+
+pprSuperclassCycleDetail :: SuperclassCycleDetail -> SDoc
+pprSuperclassCycleDetail = \case
+  SCD_HeadTyVar pred ->
+    hang (text "one of whose superclass constraints is headed by a type variable:")
+       2 (quotes (ppr pred))
+  SCD_HeadTyFam pred ->
+    hang (text "one of whose superclass constraints is headed by a type family:")
+       2 (quotes (ppr pred))
+  SCD_Superclass cls ->
+    text "one of whose superclasses is" <+> quotes (ppr cls)
+
+pprRoleValidationFailedReason :: Role -> RoleValidationFailedReason -> SDoc
+pprRoleValidationFailedReason role = \case
+  TyVarRoleMismatch tv role' ->
+    text "type variable" <+> quotes (ppr tv) <+>
+    text "cannot have role" <+> ppr role <+>
+    text "because it was assigned role" <+> ppr role'
+  TyVarMissingInEnv tv ->
+    text "type variable" <+> quotes (ppr tv) <+> text "missing in environment"
+  BadCoercionRole co ->
+    text "coercion" <+> ppr co <+> text "has bad role" <+> ppr role
+
+pprDisabledClassExtension :: Class -> DisabledClassExtension -> SDoc
+pprDisabledClassExtension cls = \case
+  MultiParamDisabled n ->
+    text howMany <+> text "parameters for class" <+> quotes (ppr cls)
+    where
+      howMany | n == 0 = "No"
+              | otherwise = "Too many"
+  FunDepsDisabled ->
+    text "Fundeps in class" <+> quotes (ppr cls)
+  ConstrainedClassMethodsDisabled sel_id pred ->
+    vcat [ hang (text "Constraint" <+> quotes (ppr pred)
+                 <+> text "in the type of" <+> quotes (ppr sel_id))
+              2 (text "constrains only the class type variables")]
+
+pprImportLookup :: ImportLookupReason -> SDoc
+pprImportLookup = \case
+  ImportLookupBad k iface decl_spec ie _ps ->
+    let
+      pprImpDeclSpec :: ModIface -> ImpDeclSpec -> SDoc
+      pprImpDeclSpec iface decl_spec =
+        quotes (ppr (moduleName $ is_mod decl_spec)) <+> case mi_boot iface of
+            IsBoot  -> text "(hi-boot interface)"
+            NotBoot -> empty
+      withContext msgs =
+        hang (text "In the import of" <+> pprImpDeclSpec iface decl_spec <> colon)
+          2 (vcat msgs)
+    in case k of
+      BadImportNotExported _ ->
+        vcat
+          [ text "Module" <+> pprImpDeclSpec iface decl_spec <+>
+            text "does not export" <+> quotes (ppr ie) <> dot
+          ]
+      BadImportAvailVar ->
+        withContext
+          [ text "an item called"
+              <+> quotes val <+> text "is exported, but it is not a type."
+          ]
+        where
+          val_occ = rdrNameOcc $ ieName ie
+          val = parenSymOcc val_occ (ppr val_occ)
+      BadImportAvailTyCon {} ->
+        withContext
+          [ text "an item called"
+            <+> quotes tycon <+> text "is exported, but it is a type."
+          ]
+        where
+          tycon_occ = rdrNameOcc $ ieName ie
+          tycon = parenSymOcc tycon_occ (ppr tycon_occ)
+      BadImportNotExportedSubordinates ns ->
+        withContext
+          [ text "an item called" <+> quotes sub <+> text "is exported, but it does not export any children"
+          , text "(constructors, class methods or field names) called"
+          <+> pprWithCommas (quotes . ppr) ns <> dot
+          ]
+          where
+            sub_occ = rdrNameOcc $ ieName ie
+            sub = parenSymOcc sub_occ (ppr sub_occ)
+      BadImportAvailDataCon dataType_occ ->
+        withContext
+          [ text "an item called" <+> quotes datacon
+          , text "is exported, but it is a data constructor of"
+          , quotes dataType <> dot
+          ]
+          where
+            datacon_occ = rdrNameOcc $ ieName ie
+            datacon = parenSymOcc datacon_occ (ppr datacon_occ)
+            dataType = parenSymOcc dataType_occ (ppr dataType_occ)
+  ImportLookupQualified rdr ->
+    hang (text "Illegal qualified name in import item:")
+       2 (ppr rdr)
+  ImportLookupIllegal ->
+    text "Illegal import item"
+  ImportLookupAmbiguous rdr gres ->
+    hang (text "Ambiguous name" <+> quotes (ppr rdr) <+> text "in import item. It could refer to:")
+       2 (vcat (map (ppr . greOccName) gres))
+
+pprUnusedImport :: ImportDecl GhcRn -> UnusedImportReason -> SDoc
+pprUnusedImport decl = \case
+  UnusedImportNone ->
+    vcat [ pp_herald <+> quotes pp_mod <+> text "is redundant"
+         , nest 2 (text "except perhaps to import instances from"
+                   <+> quotes pp_mod)
+         , text "To import instances alone, use:"
+           <+> text "import" <+> pp_mod <> parens empty ]
+  UnusedImportSome sort_unused ->
+    sep [ pp_herald <+> quotes (pprWithCommas pp_unused sort_unused)
+        , text "from module" <+> quotes pp_mod <+> text "is redundant"]
+  where
+    pp_mod = ppr (unLoc (ideclName decl))
+    pp_herald = text "The" <+> pp_qual <+> text "import of"
+    pp_qual
+      | isImportDeclQualified (ideclQualified decl) = text "qualified"
+      | otherwise                                   = empty
+    pp_unused = \case
+      UnusedImportNameRegular n ->
+        pprNameUnqualified n
+      UnusedImportNameRecField par fld_occ ->
+        case par of
+          ParentIs p -> pprNameUnqualified p <> parens (ppr fld_occ)
+          NoParent   -> ppr fld_occ
+
+pprUnusedName :: OccName -> UnusedNameProv -> SDoc
+pprUnusedName name reason =
+  sep [ msg <> colon
+      , nest 2 $ pprNonVarNameSpace (occNameSpace name)
+                 <+> quotes (ppr name)]
+  where
+    msg = case reason of
+      UnusedNameTopDecl ->
+        defined
+      UnusedNameImported mod ->
+        text "Imported from" <+> quotes (ppr mod) <+> text "but not used"
+      UnusedNameTypePattern ->
+        defined <+> text "on the right hand side"
+      UnusedNameMatch ->
+        defined
+      UnusedNameLocalBind ->
+        defined
+    defined = text "Defined but not used"
+
+-- When printing the name, take care to qualify it in the same
+-- way as the provenance reported by pprNameProvenance, namely
+-- the head of 'gre_imp'.  Otherwise we get confusing reports like
+--   Ambiguous occurrence ‘null’
+--   It could refer to either ‘T15487a.null’,
+--                            imported from ‘Prelude’ at T15487.hs:1:8-13
+--                     or ...
+-- See #15487
+pprAmbiguousGreName :: GlobalRdrEnv -> GlobalRdrElt -> SDoc
+pprAmbiguousGreName gre_env gre
+  | IAmRecField fld_info <- greInfo gre
+  = sep [ text "the field" <+> quotes (ppr occ) <+> parent_info fld_info <> comma
+        , pprNameProvenance gre ]
+  | otherwise
+  = sep [ quotes (pp_qual <> dot <> ppr occ) <> comma
+        , pprNameProvenance gre ]
+
+  where
+    occ = greOccName gre
+    parent_info fld_info =
+      case first_con of
+        PatSynName  ps -> text "of pattern synonym" <+> quotes (ppr ps)
+        DataConName {} ->
+          case greParent gre of
+            ParentIs par
+              -- For a data family, only reporting the family TyCon can be
+              -- unhelpful (see T23301). So we give a bit of additional
+              -- info in that case.
+              | Just par_gre <- lookupGRE_Name gre_env par
+              , IAmTyCon tc_flav <- greInfo par_gre
+              , OpenFamilyFlavour IAmData _ <- tc_flav
+              -> vcat [ ppr_cons
+                      , text "in a data family instance of" <+> quotes (ppr par) ]
+              | otherwise
+              -> text "of record" <+> quotes (ppr par)
+            NoParent -> ppr_cons
+      where
+        cons :: [ConLikeName]
+        cons = nonDetEltsUniqSet $ recFieldCons fld_info
+        first_con :: ConLikeName
+        first_con = head cons
+        ppr_cons :: SDoc
+        ppr_cons = hsep [ text "belonging to data constructor"
+                        , quotes (ppr $ nameOccName $ conLikeName_Name first_con)
+                        , if length cons > 1 then parens (text "among others") else empty
+                        ]
+    pp_qual
+        | gre_lcl gre
+        = ppr (nameModule $ greName gre)
+        | Just imp  <- headMaybe $ gre_imp gre
+            -- This 'imp' is the one that
+            -- pprNameProvenance chooses
+        , ImpDeclSpec { is_as = mod } <- is_decl imp
+        = ppr mod
+        | otherwise
+        = pprPanic "addNameClassErrRn" (ppr gre)
+          -- Invariant: either 'lcl' is True or 'iss' is non-empty
+
+pprNonCanonicalDefinition :: LHsSigType GhcRn
+                          -> NonCanonicalDefinition
+                          -> SDoc
+pprNonCanonicalDefinition inst_ty = \case
+  NonCanonicalMonoid sub -> case sub of
+    NonCanonical_Sappend ->
+      msg1 "(<>)" "mappend"
+    NonCanonical_Mappend ->
+      msg2 "mappend" "(<>)"
+  NonCanonicalMonad sub -> case sub of
+    NonCanonical_Pure ->
+      msg1 "pure" "return"
+    NonCanonical_ThenA ->
+      msg1 "(*>)" "(>>)"
+    NonCanonical_Return ->
+      msg2 "return" "pure"
+    NonCanonical_ThenM ->
+      msg2 "(>>)" "(*>)"
+  where
+    msg1 :: String -> String -> SDoc
+    msg1 lhs rhs =
+      vcat [ text "Noncanonical" <+>
+            quotes (text (lhs ++ " = " ++ rhs)) <+>
+            text "definition detected"
+          , inst
+          ]
+
+    msg2 :: String -> String -> SDoc
+    msg2 lhs rhs =
+      vcat [ text "Noncanonical" <+>
+            quotes (text lhs) <+>
+            text "definition detected"
+          , inst
+          , quotes (text lhs) <+>
+            text "will eventually be removed in favour of" <+>
+            quotes (text rhs)
+          ]
+
+    inst = instDeclCtxt1 inst_ty
+
+    -- stolen from GHC.Tc.TyCl.Instance
+    instDeclCtxt1 :: LHsSigType GhcRn -> SDoc
+    instDeclCtxt1 hs_inst_ty
+      = inst_decl_ctxt (ppr (getLHsInstDeclHead hs_inst_ty))
+
+    inst_decl_ctxt :: SDoc -> SDoc
+    inst_decl_ctxt doc = hang (text "in the instance declaration for")
+                         2 (quotes doc <> text ".")
+
+suggestNonCanonicalDefinition :: NonCanonicalDefinition -> [GhcHint]
+suggestNonCanonicalDefinition reason =
+  [action doc]
+  where
+    action = case reason of
+      NonCanonicalMonoid sub -> case sub of
+        NonCanonical_Sappend -> move sappendName mappendName
+        NonCanonical_Mappend -> remove mappendName sappendName
+      NonCanonicalMonad sub -> case sub of
+        NonCanonical_Pure -> move pureAName returnMName
+        NonCanonical_ThenA -> move thenAName thenMName
+        NonCanonical_Return -> remove returnMName pureAName
+        NonCanonical_ThenM -> remove thenMName thenAName
+
+    move = SuggestMoveNonCanonicalDefinition
+    remove = SuggestRemoveNonCanonicalDefinition
+
+    doc = case reason of
+      NonCanonicalMonoid _ -> doc_monoid
+      NonCanonicalMonad _ -> doc_monad
+
+    doc_monoid =
+      "https://gitlab.haskell.org/ghc/ghc/-/wikis/proposal/semigroup-monoid"
+    doc_monad =
+      "https://gitlab.haskell.org/ghc/ghc/-/wikis/proposal/monad-of-no-return"
+
+--------------------------------------------------------------------------------
+-- hs-boot mismatch errors
+
+pprBootMismatch :: HsBootOrSig -> BootMismatch -> SDoc
+pprBootMismatch boot_or_sig = \case
+  MissingBootThing nm err ->
+    let def_or_exp = case err of
+          MissingBootDefinition -> text "defined in"
+          MissingBootExport     -> text "exported by"
+    in quotes (ppr nm) <+> text "is exported by the"
+       <+> ppr_boot_or_sig <> comma
+       <+> text "but not"
+       <+> def_or_exp <+> text "the implementing module."
+  MissingBootInstance boot_dfun ->
+    hang (text "instance" <+> ppr (idType boot_dfun))
+       2 (text "is defined in the" <+> ppr ppr_boot_or_sig <> comma <+>
+          text "but not in the implementing module.")
+  BadReexportedBootThing name name' ->
+    withUserStyle alwaysQualify AllTheWay $ vcat
+        [ text "The" <+> ppr_boot_or_sig
+           <+> text "(re)exports" <+> quotes (ppr name)
+        , text "but the implementing module exports a different identifier" <+> quotes (ppr name')
+        ]
+  BootMismatch boot_thing real_thing err ->
+    vcat
+      [ ppr real_thing <+>
+        text "has conflicting definitions in the module"
+      , text "and its" <+> ppr_boot_or_sig <> dot,
+                    text "Main module:" <+> real_doc
+      , (case boot_or_sig of
+          HsBoot -> text "  Boot file:"
+          Hsig   -> text "  Hsig file:") <+> boot_doc
+      , pprBootMismatchWhat boot_or_sig err
+      ]
+      where
+        to_doc
+          = pprTyThingInContext $
+            showToHeader
+              { ss_forall =
+                  case boot_or_sig of
+                    HsBoot -> ShowForAllMust
+                    Hsig   -> ShowForAllWhen }
+
+        real_doc = to_doc real_thing
+        boot_doc = to_doc boot_thing
+
+  where
+    ppr_boot_or_sig = case boot_or_sig of
+      HsBoot -> text "hs-boot file"
+      Hsig   -> text "hsig file"
+
+
+pprBootMismatchWhat :: HsBootOrSig -> BootMismatchWhat -> SDoc
+pprBootMismatchWhat boot_or_sig = \case
+  BootMismatchedIdTypes {} ->
+    text "The two types are different."
+  BootMismatchedTyCons tc1 tc2 errs ->
+    vcat $ map (pprBootTyConMismatch boot_or_sig tc1 tc2) (NE.toList errs)
+
+pprBootTyConMismatch :: HsBootOrSig -> TyCon -> TyCon
+                     -> BootTyConMismatch -> SDoc
+pprBootTyConMismatch boot_or_sig tc1 tc2 = \case
+  TyConKindMismatch ->
+    text "The types have different kinds."
+  TyConRoleMismatch sub_type ->
+    if sub_type
+    then
+      text "The roles are not compatible:" $$
+      text "Main module:" <+> ppr (tyConRoles tc1) $$
+      text "  Hsig file:" <+> ppr (tyConRoles tc2)
+    else
+      text "The roles do not match." $$
+      if boot_or_sig == HsBoot
+      then text "NB: roles on abstract types default to" <+>
+           quotes (text "representational") <+> text "in hs-boot files."
+      else empty
+  TyConSynonymMismatch {} -> empty -- nothing interesting to say
+  TyConFlavourMismatch fam_flav1 fam_flav2 ->
+    whenPprDebug $
+      text "Family flavours" <+> ppr fam_flav1 <+> text "and" <+> ppr fam_flav2 <+>
+      text "do not match"
+  TyConAxiomMismatch ax_errs ->
+    pprBootListMismatches (text "Type family equations do not match:")
+      pprTyConAxiomMismatch ax_errs
+  TyConInjectivityMismatch {} ->
+    text "Injectivity annotations do not match"
+  TyConMismatchedClasses _ _ err ->
+    pprBootClassMismatch boot_or_sig err
+  TyConMismatchedData _rhs1 _rhs2 err ->
+    pprBootDataMismatch err
+  SynAbstractData err ->
+    pprSynAbstractDataError err
+  TyConsVeryDifferent ->
+    empty -- should be obvious to the user what the problem is
+
+pprSynAbstractDataError :: SynAbstractDataError -> SDoc
+pprSynAbstractDataError = \case
+  SynAbsDataTySynNotNullary ->
+    text "Illegal parameterized type synonym in implementation of abstract data."
+  SynAbstractDataInvalidRHS bad_sub_tys ->
+    let msgs = mapMaybe pprInvalidAbstractSubTy (NE.toList bad_sub_tys)
+    in  case msgs of
+      []     -> herald <> dot
+      msg:[] -> hang (herald <> colon)
+                   2 msg
+      _      -> hang (herald <> colon)
+                   2 (vcat $ map (<+> bullet) msgs)
+
+  where
+    herald = text "Illegal implementation of abstract data"
+    pprInvalidAbstractSubTy = \case
+      TyConApp tc _
+        -> assertPpr (isTypeFamilyTyCon tc) (ppr tc) $
+           Just $ text "Invalid type family" <+> quotes (ppr tc) <> dot
+      ty@(ForAllTy {})
+        -> Just $ text "Invalid polymorphic type" <> colon <+> ppr ty <> dot
+      ty@(FunTy af _ _ _)
+        | not (af == FTF_T_T)
+        -> Just $ text "Invalid qualified type" <> colon <+> ppr ty <> dot
+      _ -> Nothing
+
+pprTyConAxiomMismatch :: BootListMismatch CoAxBranch BootAxiomBranchMismatch -> SDoc
+pprTyConAxiomMismatch = \case
+  MismatchedLength ->
+    text "The number of equations differs."
+  MismatchedThing i br1 br2 err ->
+    hang (text "The" <+> speakNth (i+1) <+> text "equations do not match.")
+       2 (pprCoAxBranchMismatch br1 br2 err)
+
+pprCoAxBranchMismatch :: CoAxBranch -> CoAxBranch -> BootAxiomBranchMismatch -> SDoc
+pprCoAxBranchMismatch _br1 _br2 err =
+  text "The" <+> what <+> text "don't match."
+  where
+    what = case err of
+      MismatchedAxiomBinders -> text "variables bound in the equation"
+      MismatchedAxiomLHS     -> text "equation left-hand sides"
+      MismatchedAxiomRHS     -> text "equation right-hand sides"
+
+pprBootListMismatches :: SDoc -- ^ herald
+                      -> (BootListMismatch item err -> SDoc)
+                      -> BootListMismatches item err -> SDoc
+pprBootListMismatches herald ppr_one errs =
+  hang herald 2 msgs
+  where
+    msgs = case errs of
+      err :| [] -> ppr_one err
+      _         -> vcat $ map ((bullet <+>) . ppr_one) $ NE.toList errs
+
+pprBootClassMismatch :: HsBootOrSig -> BootClassMismatch -> SDoc
+pprBootClassMismatch boot_or_sig = \case
+  MismatchedMethods errs ->
+    pprBootListMismatches (text "The class methods do not match:")
+      pprBootClassMethodListMismatch errs
+  MismatchedATs at_errs ->
+    pprBootListMismatches (text "The associated types do not match:")
+      (pprATMismatch boot_or_sig) at_errs
+  MismatchedFunDeps ->
+    text "The functional dependencies do not match."
+  MismatchedSuperclasses ->
+    text "The superclass constraints do not match."
+  MismatchedMinimalPragmas ->
+    text "The MINIMAL pragmas are not compatible."
+
+pprATMismatch :: HsBootOrSig -> BootListMismatch ClassATItem BootATMismatch -> SDoc
+pprATMismatch boot_or_sig = \case
+  MismatchedLength ->
+    text "The number of associated type defaults differs."
+  MismatchedThing i at1 at2 err ->
+    pprATMismatchErr boot_or_sig i at1 at2 err
+
+pprATMismatchErr :: HsBootOrSig -> Int -> ClassATItem -> ClassATItem -> BootATMismatch -> SDoc
+pprATMismatchErr boot_or_sig i (ATI tc1 _) (ATI tc2 _) = \case
+  MismatchedTyConAT err ->
+    hang (text "The associated types differ:")
+       2 $ pprBootTyConMismatch boot_or_sig tc1 tc2 err
+  MismatchedATDefaultType ->
+    text "The types of the" <+> speakNth (i+1) <+>
+    text "associated type default differ."
+
+pprBootClassMethodListMismatch :: BootListMismatch ClassOpItem BootMethodMismatch -> SDoc
+pprBootClassMethodListMismatch = \case
+  MismatchedLength ->
+    text "The number of class methods differs."
+  MismatchedThing _ op1 op2 err ->
+    pprBootClassMethodMismatch op1 op2 err
+
+pprBootClassMethodMismatch :: ClassOpItem -> ClassOpItem -> BootMethodMismatch -> SDoc
+pprBootClassMethodMismatch (op1, _) (op2, _) = \case
+  MismatchedMethodNames ->
+    text "The method names" <+> quotes pname1 <+> text "and"
+                            <+> quotes pname2 <+> text "differ."
+  MismatchedMethodTypes {} ->
+    text "The types of" <+> pname1 <+> text "are different."
+  MismatchedDefaultMethods subtype_check ->
+    if subtype_check
+    then
+      text "The default methods associated with" <+> pname1 <+>
+      text "are not compatible."
+    else
+      text "The default methods associated with" <+> pname1 <+>
+      text "are different."
+  where
+    nm1 = idName op1
+    nm2 = idName op2
+    pname1 = quotes (ppr nm1)
+    pname2 = quotes (ppr nm2)
+
+pprBootDataMismatch :: BootDataMismatch -> SDoc
+pprBootDataMismatch = \case
+  MismatchedNewtypeVsData ->
+    text "Cannot match a" <+> quotes (text "data") <+>
+    text "definition with a" <+> quotes (text "newtype") <+>
+    text "definition."
+  MismatchedConstructors dc_errs ->
+    pprBootListMismatches (text "The constructors do not match:")
+      pprBootDataConMismatch dc_errs
+  MismatchedDatatypeContexts {} ->
+    text "The datatype contexts do not match."
+
+pprBootDataConMismatch :: BootListMismatch DataCon BootDataConMismatch
+                       -> SDoc
+pprBootDataConMismatch = \case
+  MismatchedLength ->
+    text "The number of constructors differs."
+  MismatchedThing _ dc1 dc2 err ->
+    pprBootDataConMismatchErr dc1 dc2 err
+
+pprBootDataConMismatchErr :: DataCon -> DataCon -> BootDataConMismatch -> SDoc
+pprBootDataConMismatchErr dc1 dc2 = \case
+  MismatchedDataConNames ->
+    text "The names" <+> pname1 <+> text "and" <+> pname2 <+> text "differ."
+  MismatchedDataConFixities ->
+    text "The fixities of" <+> pname1 <+> text "differ."
+  MismatchedDataConBangs ->
+    text "The strictness annotations for" <+> pname1 <+> text "differ."
+  MismatchedDataConFieldLabels ->
+    text "The record label lists for" <+> pname1 <+> text "differ."
+  MismatchedDataConTypes ->
+    text "The types for" <+> pname1 <+> text "differ."
+  where
+     name1 = dataConName dc1
+     name2 = dataConName dc2
+     pname1 = quotes (ppr name1)
+     pname2 = quotes (ppr name2)
+
+--------------------------------------------------------------------------------
+-- Illegal instance errors
+
+pprIllegalInstance :: IllegalInstanceReason -> SDoc
+pprIllegalInstance = \case
+  IllegalClassInstance head_ty reason ->
+    pprIllegalClassInstanceReason head_ty reason
+  IllegalFamilyInstance reason ->
+    pprIllegalFamilyInstance reason
+  IllegalFamilyApplicationInInstance inst_ty invis_arg tf_tc tf_args ->
+    pprWithInvisibleBitsWhen invis_arg $
+      hang (text "Illegal type synonym family application"
+              <+> quotes (ppr tf_ty) <+> text "in instance" <> colon)
+         2 (ppr inst_ty)
+      where
+        tf_ty = mkTyConApp tf_tc tf_args
+
+pprIllegalClassInstanceReason :: TypedThing -> IllegalClassInstanceReason -> SDoc
+pprIllegalClassInstanceReason head_ty = \case
+  IllegalInstanceHead reason ->
+    pprIllegalInstanceHeadReason head_ty reason
+  IllegalHasFieldInstance has_field_err ->
+    with_illegal_instance_header head_ty $
+      pprIllegalHasFieldInstance has_field_err
+  IllegalSpecialClassInstance cls because_safeHaskell ->
+    text "Class" <+> quotes (ppr $ className cls)
+    <+> text "does not support user-specified instances"
+    <> safeHaskell_msg
+      where
+        safeHaskell_msg
+          | because_safeHaskell
+          = text " when Safe Haskell is enabled."
+          | otherwise
+          = dot
+  IllegalInstanceFailsCoverageCondition cls coverage_failure ->
+    with_illegal_instance_header head_ty $
+      pprNotCovered cls coverage_failure
+
+pprIllegalInstanceHeadReason :: TypedThing
+                             -> IllegalInstanceHeadReason -> SDoc
+pprIllegalInstanceHeadReason head_ty = \case
+  InstHeadTySynArgs -> with_illegal_instance_header head_ty $
+    text "All instance types must be of the form (T t1 ... tn)" $$
+    text "where T is not a synonym."
+  InstHeadNonTyVarArgs -> with_illegal_instance_header head_ty $ vcat [
+    text "All instance types must be of the form (T a1 ... an)",
+    text "where a1 ... an are *distinct type variables*,",
+    text "and each type variable appears at most once in the instance head."]
+  InstHeadMultiParam -> with_illegal_instance_header head_ty $ parens $
+    text "Only one type can be given in an instance head."
+  InstHeadAbstractClass clas ->
+    text "Cannot define instance for abstract class" <+>
+    quotes (ppr (className clas))
+  InstHeadNonClass bad_head ->
+    vcat [ text "Illegal" <+> what_illegal <> dot
+         , text "Instance heads must be of the form"
+         , nest 2 $ text "C ty_1 ... ty_n"
+         , text "where" <+> quotes (char 'C') <+> text "is a class."
+         ]
+    where
+      what_illegal = case bad_head of
+        Just tc ->
+          text "instance for" <+> ppr (tyConFlavour tc) <+> quotes (ppr $ tyConName tc)
+        Nothing ->
+          text "head of an instance declaration:" <+> quotes (ppr head_ty)
+
+with_illegal_instance_header :: TypedThing -> SDoc -> SDoc
+with_illegal_instance_header head_ty msg =
+  hang (hang (text "Illegal instance declaration for")
+           2 (quotes (ppr head_ty)) <> colon)
+      2 msg
+
+pprIllegalHasFieldInstance :: IllegalHasFieldInstance -> SDoc
+pprIllegalHasFieldInstance = \case
+  IllegalHasFieldInstanceNotATyCon
+    -> text "Record data type must be specified."
+  IllegalHasFieldInstanceFamilyTyCon
+    -> text "Record data type may not be a data family."
+  IllegalHasFieldInstanceTyConHasField tc lbl
+    -> quotes (ppr tc) <+> text "already has a field" <+> quotes (ppr lbl) <> dot
+  IllegalHasFieldInstanceTyConHasFields tc lbl
+    -> sep [ ppr_tc <+> text "has fields, and the type" <+> quotes (ppr lbl)
+           , text "could unify with one of the field labels of" <+> ppr_tc <> dot ]
+    where ppr_tc = quotes (ppr tc)
+
+pprNotCovered :: Class -> CoverageProblem -> SDoc
+pprNotCovered clas
+  CoverageProblem
+  { not_covered_fundep        = fd
+  , not_covered_fundep_inst   = (ls, rs)
+  , not_covered_invis_vis_tvs = undetermined_tvs
+  , not_covered_liberal       = which_cc_failed
+  } =
+  pprWithInvisibleBitsWhen (isEmptyVarSet $ pSnd undetermined_tvs) $
+    vcat [ sep [ text "The"
+                  <+> ppWhen liberal (text "liberal")
+                  <+> text "coverage condition fails in class"
+                  <+> quotes (ppr clas)
+                , nest 2 $ text "for functional dependency:"
+                  <+> quotes (pprFunDep fd) ]
+          , sep [ text "Reason: lhs type" <> plural ls <+> pprQuotedList ls
+                , nest 2 $
+                  (if isSingleton ls
+                  then text "does not"
+                  else text "do not jointly")
+                  <+> text "determine rhs type" <> plural rs
+                  <+> pprQuotedList rs ]
+          , text "Un-determined variable" <> pluralVarSet undet_set <> colon
+                  <+> pprVarSet undet_set (pprWithCommas ppr)
+          ]
+  where
+    liberal = case which_cc_failed of
+                   FailedLICC   -> True
+                   FailedICC {} -> False
+    undet_set = fold undetermined_tvs
+
+illegalInstanceHints :: IllegalInstanceReason -> [GhcHint]
+illegalInstanceHints = \case
+  IllegalClassInstance _ reason ->
+    illegalClassInstanceHints reason
+  IllegalFamilyInstance reason ->
+    illegalFamilyInstanceHints reason
+  IllegalFamilyApplicationInInstance {} ->
+    noHints
+
+illegalInstanceReason :: IllegalInstanceReason -> DiagnosticReason
+illegalInstanceReason = \case
+  IllegalClassInstance _ reason ->
+    illegalClassInstanceReason reason
+  IllegalFamilyInstance reason ->
+    illegalFamilyInstanceReason reason
+  IllegalFamilyApplicationInInstance {} ->
+    ErrorWithoutFlag
+
+illegalClassInstanceHints :: IllegalClassInstanceReason -> [GhcHint]
+illegalClassInstanceHints = \case
+  IllegalInstanceHead reason ->
+    illegalInstanceHeadHints reason
+  IllegalHasFieldInstance has_field_err ->
+    illegalHasFieldInstanceHints has_field_err
+  IllegalSpecialClassInstance {} -> noHints
+  IllegalInstanceFailsCoverageCondition _ coverage_failure ->
+    failedCoverageConditionHints coverage_failure
+
+
+illegalClassInstanceReason :: IllegalClassInstanceReason -> DiagnosticReason
+illegalClassInstanceReason = \case
+  IllegalInstanceHead reason ->
+    illegalInstanceHeadReason reason
+  IllegalHasFieldInstance has_field_err ->
+    illegalHasFieldInstanceReason has_field_err
+  IllegalSpecialClassInstance {} -> ErrorWithoutFlag
+  IllegalInstanceFailsCoverageCondition _ coverage_failure ->
+    failedCoverageConditionReason coverage_failure
+
+illegalInstanceHeadHints :: IllegalInstanceHeadReason -> [GhcHint]
+illegalInstanceHeadHints = \case
+  InstHeadTySynArgs ->
+    [suggestExtension LangExt.TypeSynonymInstances]
+  InstHeadNonTyVarArgs ->
+    [suggestExtension LangExt.FlexibleInstances]
+  InstHeadMultiParam ->
+    [suggestExtension LangExt.MultiParamTypeClasses]
+  InstHeadAbstractClass {} ->
+    noHints
+  InstHeadNonClass {} ->
+    noHints
+
+illegalInstanceHeadReason :: IllegalInstanceHeadReason -> DiagnosticReason
+illegalInstanceHeadReason = \case
+  -- These are serious
+  InstHeadAbstractClass {} ->
+    ErrorWithoutFlag
+  InstHeadNonClass {} ->
+    ErrorWithoutFlag
+
+  -- These are less serious (enable an extension)
+  InstHeadTySynArgs ->
+    ErrorWithoutFlag
+  InstHeadNonTyVarArgs ->
+    ErrorWithoutFlag
+  InstHeadMultiParam ->
+    ErrorWithoutFlag
+
+illegalHasFieldInstanceHints :: IllegalHasFieldInstance -> [GhcHint]
+illegalHasFieldInstanceHints = \case
+  IllegalHasFieldInstanceNotATyCon
+    -> noHints
+  IllegalHasFieldInstanceFamilyTyCon
+    -> noHints
+  IllegalHasFieldInstanceTyConHasField {}
+    -> noHints
+  IllegalHasFieldInstanceTyConHasFields {}
+    -> noHints
+
+illegalHasFieldInstanceReason :: IllegalHasFieldInstance -> DiagnosticReason
+illegalHasFieldInstanceReason = \case
+  IllegalHasFieldInstanceNotATyCon
+    -> ErrorWithoutFlag
+  IllegalHasFieldInstanceFamilyTyCon
+    -> ErrorWithoutFlag
+  IllegalHasFieldInstanceTyConHasField {}
+    -> ErrorWithoutFlag
+  IllegalHasFieldInstanceTyConHasFields {}
+    -> ErrorWithoutFlag
+
+failedCoverageConditionHints :: CoverageProblem -> [GhcHint]
+failedCoverageConditionHints (CoverageProblem { not_covered_liberal = failed_cc })
+  = case failed_cc of
+      FailedLICC -> noHints
+      FailedICC { alsoFailedLICC = failed_licc } ->
+        -- Turning on UndecidableInstances makes the check liberal,
+        -- so if the liberal check passes, suggest enabling UndecidableInstances.
+        if failed_licc
+        then noHints
+        else [suggestExtension LangExt.UndecidableInstances]
+
+failedCoverageConditionReason :: CoverageProblem -> DiagnosticReason
+failedCoverageConditionReason _ = ErrorWithoutFlag
+
+pprIllegalFamilyInstance :: IllegalFamilyInstanceReason -> SDoc
+pprIllegalFamilyInstance = \case
+  InvalidAssoc reason -> pprInvalidAssoc reason
+  NotAFamilyTyCon ty_or_data tc ->
+    vcat [ text "Illegal family instance for" <+> quotes (ppr tc)
+         , nest 2 $ parens (quotes (ppr tc) <+> text "is not a" <+> what) ]
+    where
+      what = ppr ty_or_data <+> text "family"
+  NotAnOpenFamilyTyCon tc ->
+    text "Illegal instance for closed family" <+> quotes (ppr tc)
+  FamilyCategoryMismatch tc ->
+    text "Wrong category of family instance; declaration was for a" <+> what <> dot
+    where
+      what = case tyConFlavour tc of
+        OpenFamilyFlavour IAmData _ -> text "data family"
+        _                           -> text "type family"
+  FamilyArityMismatch _ max_args ->
+    text "Number of parameters must match family declaration; expected"
+    <+> ppr max_args <> dot
+  TyFamNameMismatch fam_tc_name eqn_tc_name ->
+    hang (text "Mismatched type name in type family instance.")
+       2 (vcat [ text "Expected:" <+> ppr fam_tc_name
+               , text "  Actual:" <+> ppr eqn_tc_name ])
+  FamInstRHSOutOfScopeTyVars mb_dodgy (NE.toList -> tvs) ->
+    hang (text "Out of scope type variable" <> plural tvs
+         <+> pprWithCommas (quotes . ppr) tvs
+         <+> text "in the RHS of a family instance.")
+       2 (text "All such variables must be bound on the LHS.")
+    $$ mk_extra
+    where
+    -- mk_extra: #7536: give a decent error message for
+    --         type T a = Int
+    --         type instance F (T a) = a
+    mk_extra = case mb_dodgy of
+      Nothing -> empty
+      Just (fam_tc, pats, dodgy_tvs) ->
+        ppWhen (any (`elemVarSetByKey` dodgy_tvs) (fmap nameUnique tvs)) $
+          hang (text "The real LHS (expanding synonyms) is:")
+             2 (pprTypeApp fam_tc (map expandTypeSynonyms pats))
+  FamInstLHSUnusedBoundTyVars (NE.toList -> bad_qtvs) ->
+    vcat [ not_bound_msg, not_used_msg, dodgy_msg ]
+    where
+
+      -- Filter to only keep user-written variables,
+      -- unless none were user-written in which case we report all of them
+      -- (as we need to report an error).
+      filter_user tvs
+        = map ifiqtv
+        $ case filter ifiqtv_user_written tvs of { [] -> tvs ; qvs -> qvs }
+
+      (not_bound, not_used, dodgy)
+        = case foldr acc_tv ([], [], []) bad_qtvs of
+            (nb, nu, d) -> (filter_user nb, filter_user nu, filter_user d)
+
+      acc_tv tv (nb, nu, d) = case ifiqtv_reason tv of
+        InvalidFamInstQTvNotUsedInRHS   -> (nb, tv : nu, d)
+        InvalidFamInstQTvNotBoundInPats -> (tv : nb, nu, d)
+        InvalidFamInstQTvDodgy          -> (nb, nu, tv : d)
+
+      -- Error message for type variables not bound in LHS patterns.
+      not_bound_msg
+        | null not_bound
+        = empty
+        | otherwise
+        = vcat [ text "The type variable" <> plural not_bound <+> pprQuotedList not_bound
+            <+> isOrAre not_bound <+> text "bound by a forall,"
+              , text "but" <+> doOrDoes not_bound <+> text "not appear in any of the LHS patterns of the family instance." ]
+
+      -- Error message for type variables bound by a forall but not used
+      -- in the RHS.
+      not_used_msg =
+        if null not_used
+        then empty
+        else text "The type variable" <> plural not_used <+> pprQuotedList not_used
+             <+> isOrAre not_used <+> text "bound by a forall," $$
+             text "but" <+> itOrThey not_used <+>
+             isOrAre not_used <> text "n't used in the family instance."
+
+      -- Error message for dodgy type variables.
+      -- See Note [Dodgy binding sites in type family instances] in GHC.Tc.Validity.
+      dodgy_msg
+        | null dodgy
+        = empty
+        | otherwise
+        = hang (text "Dodgy type variable" <> plural dodgy <+> pprQuotedList dodgy
+               <+> text "in the LHS of a family instance:")
+             2 (text "the type variable" <> plural dodgy <+> pprQuotedList dodgy
+                <+> text "syntactically appear" <> singular dodgy <+> text "in LHS patterns,"
+               $$ text "but" <+> itOrThey dodgy <+> doOrDoes dodgy <> text "n't appear in an injective position.")
+
+
+illegalFamilyInstanceHints :: IllegalFamilyInstanceReason -> [GhcHint]
+illegalFamilyInstanceHints = \case
+  InvalidAssoc rea -> invalidAssocHints rea
+  NotAFamilyTyCon {} -> noHints
+  NotAnOpenFamilyTyCon {} -> noHints
+  FamilyCategoryMismatch {} -> noHints
+  FamilyArityMismatch {} -> noHints
+  TyFamNameMismatch {} -> noHints
+  FamInstRHSOutOfScopeTyVars {} -> noHints
+  FamInstLHSUnusedBoundTyVars {} -> noHints
+
+illegalFamilyInstanceReason :: IllegalFamilyInstanceReason -> DiagnosticReason
+illegalFamilyInstanceReason = \case
+  InvalidAssoc rea -> invalidAssocReason rea
+  NotAFamilyTyCon {} -> ErrorWithoutFlag
+  NotAnOpenFamilyTyCon {} -> ErrorWithoutFlag
+  FamilyCategoryMismatch {} -> ErrorWithoutFlag
+  FamilyArityMismatch {} -> ErrorWithoutFlag
+  TyFamNameMismatch {} -> ErrorWithoutFlag
+  FamInstRHSOutOfScopeTyVars {} -> ErrorWithoutFlag
+  FamInstLHSUnusedBoundTyVars {} -> ErrorWithoutFlag
+
+pprInvalidAssoc :: InvalidAssoc -> SDoc
+pprInvalidAssoc = \case
+  InvalidAssocInstance rea -> pprInvalidAssocInstance rea
+  InvalidAssocDefault  rea -> pprInvalidAssocDefault  rea
+
+pprInvalidAssocInstance :: InvalidAssocInstance -> SDoc
+pprInvalidAssocInstance = \case
+  AssocInstanceMissing name ->
+    text "No explicit" <+> text "associated type"
+    <+> text "or default declaration for"
+    <+> quotes (ppr name)
+  AssocInstanceNotInAClass fam_tc ->
+    text "Associated type" <+> quotes (ppr fam_tc) <+>
+    text "must be inside a class instance"
+  AssocNotInThisClass cls fam_tc ->
+    hsep [ text "Class", quotes (ppr cls)
+         , text "does not have an associated type", quotes (ppr fam_tc) ]
+  AssocNoClassTyVar cls fam_tc ->
+    sep [ text "The associated type" <+> quotes (ppr fam_tc <+> hsep (map ppr (tyConTyVars fam_tc)))
+        , text "mentions none of the type or kind variables of the class" <+>
+                quotes (ppr cls <+> hsep (map ppr (classTyVars cls)))]
+  AssocTyVarsDontMatch vis fam_tc exp_tys act_tys ->
+    pprWithInvisibleBitsWhen (isInvisibleForAllTyFlag vis) $
+    vcat [ text "Type indexes must match class instance head"
+         , text "Expected:" <+> pp exp_tys
+         , text "  Actual:" <+> pp act_tys ]
+    where
+      pp tys = pprIfaceTypeApp topPrec (toIfaceTyCon fam_tc) $
+               toIfaceTcArgs fam_tc tys
+
+pprInvalidAssocDefault :: InvalidAssocDefault -> SDoc
+pprInvalidAssocDefault = \case
+  AssocDefaultNotAssoc cls tc ->
+    hsep [ text "Class", quotes (ppr cls)
+         , text "does not have an associated type", quotes (ppr tc) ]
+  AssocMultipleDefaults name ->
+      text "More than one default declaration for" <+> quotes (ppr name)
+  AssocDefaultBadArgs fam_tc pat_tys bad_arg ->
+    let (pat_vis, main_msg) = case bad_arg of
+          AssocDefaultNonTyVarArg (pat_ty, pat_vis) ->
+            (pat_vis,
+             text "Illegal argument" <+> quotes (ppr pat_ty) <+> text "in:")
+          AssocDefaultDuplicateTyVars dups ->
+            let (pat_tv, pat_vis) = NE.head dups
+            in (pat_vis,
+                text "Illegal duplicate variable" <+> quotes (ppr pat_tv) <+> text "in:")
+    in pprWithInvisibleBitsWhen (isInvisibleForAllTyFlag pat_vis) $
+         hang main_msg
+            2 (vcat [ppr_eqn, suggestion])
+    where
+      ppr_eqn :: SDoc
+      ppr_eqn =
+        quotes (text "type" <+> ppr (mkTyConApp fam_tc pat_tys)
+                <+> equals <+> text "...")
+
+      suggestion :: SDoc
+      suggestion = text "The arguments to" <+> quotes (ppr fam_tc)
+               <+> text "must all be distinct type variables."
+
+invalidAssocHints :: InvalidAssoc -> [GhcHint]
+invalidAssocHints = \case
+  InvalidAssocInstance rea -> invalidAssocInstanceHints rea
+  InvalidAssocDefault  rea -> invalidAssocDefaultHints  rea
+
+invalidAssocInstanceHints :: InvalidAssocInstance -> [GhcHint]
+invalidAssocInstanceHints = \case
+  AssocInstanceMissing {} -> noHints
+  AssocInstanceNotInAClass {} -> noHints
+  AssocNotInThisClass {} -> noHints
+  AssocNoClassTyVar {} -> noHints
+  AssocTyVarsDontMatch {} -> noHints
+
+invalidAssocDefaultHints :: InvalidAssocDefault -> [GhcHint]
+invalidAssocDefaultHints = \case
+  AssocDefaultNotAssoc {} -> noHints
+  AssocMultipleDefaults {} -> noHints
+  AssocDefaultBadArgs _ _ bad ->
+    assocDefaultBadArgHints bad
+
+assocDefaultBadArgHints :: AssocDefaultBadArgs -> [GhcHint]
+assocDefaultBadArgHints = \case
+  AssocDefaultNonTyVarArg {} -> noHints
+  AssocDefaultDuplicateTyVars {} -> noHints
+
+invalidAssocReason :: InvalidAssoc -> DiagnosticReason
+invalidAssocReason = \case
+  InvalidAssocInstance rea -> invalidAssocInstanceReason rea
+  InvalidAssocDefault  rea -> invalidAssocDefaultReason  rea
+
+invalidAssocInstanceReason :: InvalidAssocInstance -> DiagnosticReason
+invalidAssocInstanceReason = \case
+  AssocInstanceMissing {} -> WarningWithFlag (Opt_WarnMissingMethods)
+  AssocInstanceNotInAClass {} -> ErrorWithoutFlag
+  AssocNotInThisClass {} -> ErrorWithoutFlag
+  AssocNoClassTyVar {} -> ErrorWithoutFlag
+  AssocTyVarsDontMatch {} -> ErrorWithoutFlag
+
+invalidAssocDefaultReason :: InvalidAssocDefault -> DiagnosticReason
+invalidAssocDefaultReason = \case
+  AssocDefaultNotAssoc {} -> ErrorWithoutFlag
+  AssocMultipleDefaults {} -> ErrorWithoutFlag
+  AssocDefaultBadArgs _ _ rea ->
+    assocDefaultBadArgReason rea
+
+assocDefaultBadArgReason :: AssocDefaultBadArgs -> DiagnosticReason
+assocDefaultBadArgReason = \case
+  AssocDefaultNonTyVarArg {} -> ErrorWithoutFlag
+  AssocDefaultDuplicateTyVars {} -> ErrorWithoutFlag
+
+--------------------------------------------------------------------------------
+-- Template Haskell quotes and splices
+
+pprTHError :: THError -> DecoratedSDoc
+pprTHError = \case
+  THSyntaxError err -> pprTHSyntaxError err
+  THNameError   err -> pprTHNameError   err
+  THReifyError  err -> pprTHReifyError  err
+  TypedTHError  err -> pprTypedTHError  err
+  THSpliceFailed rea -> pprSpliceFailReason rea
+  AddTopDeclsError err -> pprAddTopDeclsError err
+
+  IllegalStaticFormInSplice e ->
+    mkSimpleDecorated $
+      sep [ text "static forms cannot be used in splices:"
+          , nest 2 $ ppr e
+          ]
+
+  FailedToLookupThInstName th_type reason ->
+    mkSimpleDecorated $
+    case reason of
+      NoMatchesFound ->
+        text "Couldn't find any instances of"
+          <+> text (TH.pprint th_type)
+          <+> text "to add documentation to"
+      CouldNotDetermineInstance ->
+        text "Couldn't work out what instance"
+          <+> text (TH.pprint th_type)
+          <+> text "is supposed to be"
+
+  AddInvalidCorePlugin plugin ->
+    mkSimpleDecorated $
+      hang (text "addCorePlugin: invalid plugin module" <+> quotes (text plugin) )
+         2 (text "Plugins in the current package can't be specified.")
+
+  AddDocToNonLocalDefn doc_loc ->
+    mkSimpleDecorated $
+      text "Can't add documentation to" <+> ppr_loc doc_loc <> comma <+>
+      text "as it isn't inside the current module."
+      where
+        ppr_loc (TH.DeclDoc n) = text $ TH.pprint n
+        ppr_loc (TH.ArgDoc n _) = text $ TH.pprint n
+        ppr_loc (TH.InstDoc t) = text $ TH.pprint t
+        ppr_loc TH.ModuleDoc = text "the module header"
+
+  ReportCustomQuasiError _ msg -> mkSimpleDecorated $ text msg
+
+pprTHSyntaxError :: THSyntaxError -> DecoratedSDoc
+pprTHSyntaxError = mkSimpleDecorated . \case
+  IllegalTHQuotes expr ->
+    text "Syntax error on" <+> ppr expr
+      -- The error message context will say
+      -- "In the Template Haskell quotation", so no need to repeat that here.
+  BadImplicitSplice ->
+    sep [ text "Parse error: module header, import declaration"
+        , text "or top-level declaration expected." ]
+    -- The compiler should not mention TemplateHaskell, as the common case
+    -- is that this is a simple beginner error, for example:
+    --
+    -- module M where
+    --   f :: Int -> Int; f x = x
+    --   xyzzy
+    --   g y = f y + 1
+    --
+    -- It's unlikely that 'xyzzy' above was intended to be a Template Haskell
+    -- splice; instead it's probably something mistakenly left in the code.
+    -- See #12146 for discussion.
+
+  IllegalTHSplice ->
+    text "Unexpected top-level splice."
+  MismatchedSpliceType splice_type inner_splice_or_bracket ->
+    inner <+> text "may not appear in" <+> outer <> dot
+      where
+        (inner, outer) = case inner_splice_or_bracket of
+          IsSplice -> case splice_type of
+            Typed   -> (text "Typed splices"  , text "untyped brackets")
+            Untyped -> (text "Untyped splices", text "typed brackets")
+          IsBracket ->
+            case splice_type of
+            Typed   -> (text "Untyped brackets", text "typed splices")
+            Untyped -> (text "Typed brackets"  , text "untyped splices")
+  NestedTHBrackets ->
+    text "Template Haskell brackets cannot be nested" <+>
+    text "(without intervening splices)"
+
+pprTHNameError :: THNameError -> DecoratedSDoc
+pprTHNameError = \case
+  NonExactName name ->
+    mkSimpleDecorated $
+      hang (text "The binder" <+> quotes (ppr name) <+> text "is not a NameU.")
+         2 (text "Probable cause: you used mkName instead of newName to generate a binding.")
+  QuotedNameWrongStage quote ->
+    mkSimpleDecorated $
+      sep [ text "Stage error: the non-top-level quoted name" <+> ppr quote
+          , text "must be used at the same stage at which it is bound." ]
+
+pprTHReifyError :: THReifyError -> DecoratedSDoc
+pprTHReifyError = \case
+  CannotReifyInstance ty
+    -> mkSimpleDecorated $
+       hang (text "reifyInstances:" <+> quotes (ppr ty))
+          2 (text "is not a class constraint or type family application")
+  CannotReifyOutOfScopeThing th_name
+    -> mkSimpleDecorated $
+       quotes (text (TH.pprint th_name)) <+>
+               text "is not in scope at a reify"
+             -- Ugh! Rather an indirect way to display the name
+  CannotReifyThingNotInTypeEnv name
+    -> mkSimpleDecorated $
+       quotes (ppr name) <+> text "is not in the type environment at a reify"
+  NoRolesAssociatedWithThing thing
+    -> mkSimpleDecorated $
+       text "No roles associated with" <+> (ppr thing)
+  CannotRepresentType sort ty
+    -> mkSimpleDecorated $
+       hsep [text "Can't represent" <+> sort_doc <+>
+             text "in Template Haskell:",
+               nest 2 (ppr ty)]
+     where
+       sort_doc = text $
+         case sort of
+           LinearInvisibleArgument -> "linear invisible argument"
+           CoercionsInTypes -> "coercions in types"
+
+pprTypedTHError :: TypedTHError -> DecoratedSDoc
+pprTypedTHError = \case
+  SplicePolymorphicLocalVar ident
+    -> mkSimpleDecorated $
+         text "Can't splice the polymorphic local variable" <+> quotes (ppr ident)
+  TypedTHWithPolyType ty
+    -> mkSimpleDecorated $
+      vcat [ text "Illegal polytype:" <+> ppr ty
+           , text "The type of a Typed Template Haskell expression must" <+>
+             text "not have any quantification." ]
+
+pprSpliceFailReason :: SpliceFailReason -> DecoratedSDoc
+pprSpliceFailReason = \case
+  SpliceThrewException phase _exn exn_msg expr show_code ->
+    mkSimpleDecorated $
+      vcat [ text "Exception when trying to" <+> text phaseStr <+> text "compile-time code:"
+           , nest 2 (text exn_msg)
+           , if show_code then text "Code:" <+> ppr expr else empty]
+    where phaseStr =
+            case phase of
+              SplicePhase_Run -> "run"
+              SplicePhase_CompileAndLink -> "compile and link"
+  RunSpliceFailure err -> pprRunSpliceFailure Nothing err
+
+pprAddTopDeclsError :: AddTopDeclsError -> DecoratedSDoc
+pprAddTopDeclsError = \case
+  InvalidTopDecl _decl ->
+    mkSimpleDecorated $
+      sep [ text "Only function, value, annotation, and foreign import declarations"
+          , text "may be added with" <+> quotes (text "addTopDecls") <> dot ]
+  AddTopDeclsUnexpectedDeclarationSplice {} ->
+    mkSimpleDecorated $
+      text "Declaration splices are not permitted" <+>
+      text "inside top-level declarations added with" <+>
+      quotes (text "addTopDecls") <> dot
+  AddTopDeclsRunSpliceFailure err ->
+    pprRunSpliceFailure (Just "addTopDecls") err
+
+pprRunSpliceFailure :: Maybe String -> RunSpliceFailReason -> DecoratedSDoc
+pprRunSpliceFailure mb_calling_fn (ConversionFail what reason) =
+  mkSimpleDecorated . add_calling_fn . addSpliceInfo $
+    pprConversionFailReason reason
+  where
+    add_calling_fn rest =
+      case mb_calling_fn of
+        Just calling_fn ->
+          hang (text "Error in a declaration passed to" <+> quotes (text calling_fn) <> colon)
+             2 rest
+        Nothing -> rest
+    addSpliceInfo = case what of
+      ConvDec  d -> addSliceInfo' "declaration" d
+      ConvExp  e -> addSliceInfo' "expression" e
+      ConvPat  p -> addSliceInfo' "pattern" p
+      ConvType t -> addSliceInfo' "type" t
+    addSliceInfo' what item reasonErr = reasonErr $$ descr
+      where
+            -- Show the item in pretty syntax normally,
+            -- but with all its constructors if you say -dppr-debug
+        descr = hang (text "When splicing a TH" <+> text what <> colon)
+                   2 (getPprDebug $ \case
+                       True  -> text (show item)
+                       False -> text (TH.pprint item))
+
+thErrorReason :: THError -> DiagnosticReason
+thErrorReason = \case
+  THSyntaxError err -> thSyntaxErrorReason err
+  THNameError   err -> thNameErrorReason   err
+  THReifyError  err -> thReifyErrorReason  err
+  TypedTHError  err -> typedTHErrorReason  err
+  THSpliceFailed rea -> spliceFailedReason rea
+  AddTopDeclsError err -> addTopDeclsErrorReason err
+
+  IllegalStaticFormInSplice {} -> ErrorWithoutFlag
+  FailedToLookupThInstName {}  -> ErrorWithoutFlag
+  AddInvalidCorePlugin {}      -> ErrorWithoutFlag
+  AddDocToNonLocalDefn {}      -> ErrorWithoutFlag
+  ReportCustomQuasiError is_error _ ->
+    if is_error
+    then ErrorWithoutFlag
+    else WarningWithoutFlag
+
+thSyntaxErrorReason :: THSyntaxError -> DiagnosticReason
+thSyntaxErrorReason = \case
+  IllegalTHQuotes{}      -> ErrorWithoutFlag
+  BadImplicitSplice      -> ErrorWithoutFlag
+  IllegalTHSplice{}      -> ErrorWithoutFlag
+  NestedTHBrackets{}     -> ErrorWithoutFlag
+  MismatchedSpliceType{} -> ErrorWithoutFlag
+
+thNameErrorReason :: THNameError -> DiagnosticReason
+thNameErrorReason = \case
+  NonExactName {}         -> ErrorWithoutFlag
+  QuotedNameWrongStage {} -> ErrorWithoutFlag
+
+thReifyErrorReason :: THReifyError -> DiagnosticReason
+thReifyErrorReason = \case
+  CannotReifyInstance {}          -> ErrorWithoutFlag
+  CannotReifyOutOfScopeThing {}   -> ErrorWithoutFlag
+  CannotReifyThingNotInTypeEnv {} -> ErrorWithoutFlag
+  NoRolesAssociatedWithThing {}   -> ErrorWithoutFlag
+  CannotRepresentType {}          -> ErrorWithoutFlag
+
+typedTHErrorReason :: TypedTHError -> DiagnosticReason
+typedTHErrorReason = \case
+  SplicePolymorphicLocalVar {} -> ErrorWithoutFlag
+  TypedTHWithPolyType {}       -> ErrorWithoutFlag
+
+spliceFailedReason :: SpliceFailReason -> DiagnosticReason
+spliceFailedReason = \case
+  SpliceThrewException {} -> ErrorWithoutFlag
+  RunSpliceFailure {}     -> ErrorWithoutFlag
+
+addTopDeclsErrorReason :: AddTopDeclsError -> DiagnosticReason
+addTopDeclsErrorReason = \case
+  InvalidTopDecl {}
+    -> ErrorWithoutFlag
+  AddTopDeclsUnexpectedDeclarationSplice {}
+    -> ErrorWithoutFlag
+  AddTopDeclsRunSpliceFailure {}
+    -> ErrorWithoutFlag
+
+thErrorHints :: THError -> [GhcHint]
+thErrorHints = \case
+  THSyntaxError err -> thSyntaxErrorHints err
+  THNameError   err -> thNameErrorHints   err
+  THReifyError  err -> thReifyErrorHints  err
+  TypedTHError  err -> typedTHErrorHints  err
+  THSpliceFailed rea -> spliceFailedHints rea
+  AddTopDeclsError err -> addTopDeclsErrorHints err
+
+  IllegalStaticFormInSplice {} -> noHints
+  FailedToLookupThInstName {}  -> noHints
+  AddInvalidCorePlugin {}      -> noHints
+  AddDocToNonLocalDefn {}      -> noHints
+  ReportCustomQuasiError {}    -> noHints
+
+thSyntaxErrorHints :: THSyntaxError -> [GhcHint]
+thSyntaxErrorHints = \case
+  IllegalTHQuotes{}
+    -> [suggestAnyExtension [LangExt.TemplateHaskell, LangExt.TemplateHaskellQuotes]]
+  BadImplicitSplice {}
+    -> noHints -- NB: don't suggest TemplateHaskell
+               -- see comments on BadImplicitSplice in pprTHSyntaxError
+  IllegalTHSplice{}
+    -> [suggestExtension LangExt.TemplateHaskell]
+  NestedTHBrackets{}
+    -> noHints
+  MismatchedSpliceType{}
+    -> noHints
+
+thNameErrorHints :: THNameError -> [GhcHint]
+thNameErrorHints = \case
+  NonExactName {}         -> noHints
+  QuotedNameWrongStage {} -> noHints
+
+thReifyErrorHints :: THReifyError -> [GhcHint]
+thReifyErrorHints = \case
+  CannotReifyInstance {}          -> noHints
+  CannotReifyOutOfScopeThing {}   -> noHints
+  CannotReifyThingNotInTypeEnv {} -> noHints
+  NoRolesAssociatedWithThing {}   -> noHints
+  CannotRepresentType {}          -> noHints
+
+typedTHErrorHints :: TypedTHError -> [GhcHint]
+typedTHErrorHints = \case
+  SplicePolymorphicLocalVar {} -> noHints
+  TypedTHWithPolyType {}       -> noHints
+
+spliceFailedHints :: SpliceFailReason -> [GhcHint]
+spliceFailedHints = \case
+  SpliceThrewException {} -> noHints
+  RunSpliceFailure {}     -> noHints
+
+addTopDeclsErrorHints :: AddTopDeclsError -> [GhcHint]
+addTopDeclsErrorHints = \case
+  InvalidTopDecl {}
+    -> noHints
+  AddTopDeclsUnexpectedDeclarationSplice {}
+    -> noHints
+  AddTopDeclsRunSpliceFailure {}
+    -> noHints
+
+--------------------------------------------------------------------------------
+
+pprPatersonCondFailure ::
+  PatersonCondFailure -> PatersonCondFailureContext -> Type -> Type -> SDoc
+pprPatersonCondFailure (PCF_TyVar tvs) InInstanceDecl lhs rhs =
+  hang (occMsg tvs)
+    2 (sep [ text "in the constraint" <+> quotes (ppr lhs)
+         , text "than in the instance head" <+> quotes (ppr rhs) ])
+  where
+    occMsg tvs = text "Variable" <> plural tvs <+> quotes (pprWithCommas ppr tvs)
+                 <+> pp_occurs <+> text "more often"
+    pp_occurs | isSingleton tvs = text "occurs"
+              | otherwise       = text "occur"
+pprPatersonCondFailure (PCF_TyVar tvs) InTyFamEquation lhs rhs =
+  hang (occMsg tvs)
+    2 (sep [ text "in the type-family application" <+> quotes (ppr rhs)
+         , text "than in the LHS of the family instance" <+> quotes (ppr lhs) ])
+  where
+    occMsg tvs = text "Variable" <> plural tvs <+> quotes (pprWithCommas ppr tvs)
+                 <+> pp_occurs <+> text "more often"
+    pp_occurs | isSingleton tvs = text "occurs"
+              | otherwise       = text "occur"
+pprPatersonCondFailure PCF_Size InInstanceDecl lhs rhs =
+  hang (text "The constraint" <+> quotes (ppr lhs))
+    2 (sep [ text "is no smaller than", pp_rhs ])
+  where pp_rhs = text "the instance head" <+> quotes (ppr rhs)
+pprPatersonCondFailure PCF_Size InTyFamEquation lhs rhs =
+  hang (text "The type-family application" <+> quotes (ppr rhs))
+    2 (sep [ text "is no smaller than", pp_lhs ])
+  where pp_lhs = text "the LHS of the family instance" <+> quotes (ppr lhs)
+pprPatersonCondFailure  (PCF_TyFam tc) InInstanceDecl lhs _rhs =
+  hang (text "Illegal use of type family" <+> quotes (ppr tc))
+    2 (text "in the constraint" <+> quotes (ppr lhs))
+pprPatersonCondFailure  (PCF_TyFam tc) InTyFamEquation _lhs rhs =
+  hang (text "Illegal nested use of type family" <+> quotes (ppr tc))
+    2 (text "in the arguments of the type-family application" <+> quotes (ppr rhs))
+
+
+
+--------------------------------------------------------------------------------
+
+pprZonkerMessage :: ZonkerMessage -> SDoc
+pprZonkerMessage = \case
+  ZonkerCannotDefaultConcrete frr ->
+    ppr (frr_context frr) $$
+    text "cannot be assigned a fixed runtime representation," <+>
+    text "not even by defaulting."
+
+zonkerMessageHints :: ZonkerMessage -> [GhcHint]
+zonkerMessageHints = \case
+  ZonkerCannotDefaultConcrete {} -> [SuggestAddTypeSignatures UnnamedBinding]
+
+zonkerMessageReason :: ZonkerMessage -> DiagnosticReason
+zonkerMessageReason = \case
+  ZonkerCannotDefaultConcrete {} -> ErrorWithoutFlag
+
+--------------------------------------------------------------------------------

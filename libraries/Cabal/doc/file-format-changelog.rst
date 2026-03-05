@@ -19,6 +19,13 @@ relative to the respective preceding *published* version.
     versions of the ``Cabal`` library denote unreleased development
     branches which have no stability guarantee.
 
+``cabal-version: 3.12``
+-----------------------
+
+* License fields use identifiers from SPDX License List version
+  ``3.23 2024-02-08``.
+
+
 ``cabal-version: 3.8``
 ----------------------
 
@@ -72,8 +79,8 @@ relative to the respective preceding *published* version.
 
 * Dependencies to sublibraries must be specified explicitly,
   even for current package.
-  For example: ``build-depends: mypackage:internal-lib``
-  This way you can have an internal library with the same
+  For example: ``build-depends: mypackage:my-sublib``
+  This way you can have a sublibrary with the same
   name as some external dependency.
 
 * Remove ``-any`` and ``-none`` syntax for version ranges
@@ -218,7 +225,7 @@ relative to the respective preceding *published* version.
 
 * Add support for new :pkg-section:`foreign-library` stanza.
 
-* Add support for :ref:`internal library stanzas <sublibs>`.
+* Add support for :ref:`sublibrary stanzas <sublibs>`.
 
 * New CPP Macro ``CURRENT_PACKAGE_VERSION``.
 

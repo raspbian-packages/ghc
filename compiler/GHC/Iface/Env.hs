@@ -24,7 +24,7 @@ module GHC.Iface.Env (
 import GHC.Prelude
 
 import GHC.Driver.Env
-import GHC.Driver.Session
+import GHC.Driver.DynFlags
 
 import GHC.Tc.Utils.Monad
 import GHC.Core.Type
@@ -193,9 +193,12 @@ setNameModule (Just m) n =
 tcIfaceLclId :: FastString -> IfL Id
 tcIfaceLclId occ
   = do  { lcl <- getLclEnv
-        ; case (lookupFsEnv (if_id_env lcl) occ) of
+        ; case lookupFsEnv (if_id_env lcl) occ of
             Just ty_var -> return ty_var
-            Nothing     -> failIfM (text "Iface id out of scope: " <+> ppr occ)
+            Nothing     -> failIfM $
+              vcat
+                [ text "Iface id out of scope: " <+> ppr occ
+                , text "env:" <+> ppr (if_id_env lcl) ]
         }
 
 extendIfaceIdEnv :: [Id] -> IfL a -> IfL a
@@ -209,7 +212,7 @@ extendIfaceIdEnv ids
 tcIfaceTyVar :: FastString -> IfL TyVar
 tcIfaceTyVar occ
   = do  { lcl <- getLclEnv
-        ; case (lookupFsEnv (if_tv_env lcl) occ) of
+        ; case lookupFsEnv (if_tv_env lcl) occ of
             Just ty_var -> return ty_var
             Nothing     -> failIfM (text "Iface type variable out of scope: " <+> ppr occ)
         }
@@ -262,14 +265,14 @@ newIfaceName occ
 
 newIfaceNames :: [OccName] -> IfL [Name]
 newIfaceNames occs
-  = do  { uniqs <- newUniqueSupply
+  = do  { uniqs <- getUniquesM
         ; return [ mkInternalName uniq occ noSrcSpan
-                 | (occ,uniq) <- occs `zip` uniqsFromSupply uniqs] }
+                 | (occ,uniq) <- occs `zip` uniqs] }
 
 trace_if :: Logger -> SDoc -> IO ()
-{-# INLINE trace_if #-}
+{-# INLINE trace_if #-} -- see Note [INLINE conditional tracing utilities]
 trace_if logger doc = when (logHasDumpFlag logger Opt_D_dump_if_trace) $ putMsg logger doc
 
 trace_hi_diffs :: Logger -> SDoc -> IO ()
-{-# INLINE trace_hi_diffs #-}
+{-# INLINE trace_hi_diffs #-} -- see Note [INLINE conditional tracing utilities]
 trace_hi_diffs logger doc = when (logHasDumpFlag logger Opt_D_dump_hi_diffs) $ putMsg logger doc

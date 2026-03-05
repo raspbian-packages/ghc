@@ -23,8 +23,10 @@ def job_triple(job_name):
         'release-x86_64-linux-ubuntu18_04-release': 'x86_64-ubuntu18_04-linux',
         'release-x86_64-linux-fedora33-release+debug_info': 'x86_64-fedora33-linux-dwarf',
         'release-x86_64-linux-fedora33-release': 'x86_64-fedora33-linux',
+        'release-x86_64-linux-fedora38-release': 'x86_64-fedora38-linux',
         'release-x86_64-linux-fedora27-release': 'x86_64-fedora27-linux',
         'release-x86_64-linux-deb11-release': 'x86_64-deb11-linux',
+        'release-x86_64-linux-deb12-release': 'x86_64-deb12-linux',
         'release-x86_64-linux-deb10-release+debug_info': 'x86_64-deb10-linux-dwarf',
         'release-x86_64-linux-deb10-release': 'x86_64-deb10-linux',
         'release-x86_64-linux-deb9-release': 'x86_64-deb9-linux',
@@ -32,10 +34,14 @@ def job_triple(job_name):
         'release-x86_64-linux-alpine3_12-release+fully_static': 'x86_64-alpine3_12-linux-static',
         'release-x86_64-linux-alpine3_12-release': 'x86_64-alpine3_12-linux',
         'release-x86_64-linux-alpine3_12-int_native-release+fully_static': 'x86_64-alpine3_12-linux-static-int_native',
+        'release-x86_64-linux-alpine3_18-release': 'x86_64-alpine3_18-linux',
         'release-x86_64-darwin-release': 'x86_64-apple-darwin',
         'release-i386-linux-deb9-release': 'i386-deb9-linux',
+        'release-i386-linux-deb10-release': 'i386-deb10-linux',
         'release-armv7-linux-deb10-release': 'armv7-deb10-linux',
         'release-aarch64-linux-deb10-release': 'aarch64-deb10-linux',
+        'release-aarch64-linux-deb11-release': 'aarch64-deb11-linux',
+        'release-aarch64-linux-alpine3_18-release+no_split_sections': 'aarch64-alpine3_18-linux',
         'release-aarch64-darwin-release': 'aarch64-apple-darwin',
 
         'source-tarball': 'src',
@@ -125,6 +131,9 @@ def fetch_artifacts(release: str, pipeline_id: int,
                     logging.info(f'extracted docs {f} to {dest}')
                 index_path = destdir / 'index.html'
                 index_path.replace(dest / 'index.html')
+                pdfs = list(destdir.glob('*.pdf'))
+                for f in pdfs:
+                  f.replace(dest / f.name)
             elif job.name == 'hackage-doc-tarball':
                 dest = dest_dir / 'hackage_docs'
                 logging.info(f'moved hackage_docs to {dest}')

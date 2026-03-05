@@ -50,7 +50,7 @@ import GHC.Cmm.Utils
 
 import GHC.JS.Ppr
 
-import GHC.Driver.Session
+import GHC.Driver.DynFlags
 import GHC.Driver.Config
 
 import GHC.Builtin.Types
@@ -58,7 +58,6 @@ import GHC.Builtin.Types.Prim
 import GHC.Builtin.Names
 
 import GHC.Data.FastString
-import GHC.Data.Pair
 import GHC.Data.Maybe
 
 import GHC.Utils.Outputable
@@ -83,7 +82,7 @@ dsJsFExport
 
 dsJsFExport fn_id co ext_name cconv isDyn = do
     let
-       ty                              = pSnd $ coercionKind co
+       ty                              = coercionRKind co
        (_tvs,sans_foralls)             = tcSplitForAllTyVars ty
        (fe_arg_tys', orig_res_ty)      = tcSplitFunTys sans_foralls
        -- We must use tcSplits here, because we want to see
@@ -156,16 +155,19 @@ mkFExportJSBits platform c_nm maybe_target arg_htys res_hty is_IO_res_ty _cconv
 
   header_bits = maybe mempty idTag maybe_target
   idTag i = let (tag, u) = unpkUnique (getUnique i)
-            in  CHeader (char tag <> int u)
+            in  CHeader (char tag <> word64 u)
+
+  normal_args = map (\(nm,_ty,_,_) -> nm) arg_info
+  all_args
+    | isNothing maybe_target = text "stableptr_offset" : normal_args
+    | otherwise              = normal_args
 
   fun_args
     | null arg_info = empty -- text "void"
-    | otherwise         = hsep $ punctuate comma
-                               $ map (\(nm,_ty,_,_) -> nm) arg_info
+    | otherwise     = hsep $ punctuate comma all_args
 
   fun_proto
-      = text "async" <+>
-        text "function" <+>
+      = text "function" <+>
         (if isNothing maybe_target
          then text "h$" <> ftext c_nm
          else ftext c_nm) <>
@@ -177,19 +179,19 @@ mkFExportJSBits platform c_nm maybe_target arg_htys res_hty is_IO_res_ty _cconv
             text "h$foreignExport" <>
                         parens (
                           ftext c_nm <> comma <>
-                          strlit (unitIdString (moduleUnitId m)) <> comma <>
-                          strlit (moduleNameString (moduleName m)) <> comma <>
-                          strlit (unpackFS c_nm) <> comma <>
-                          strlit type_string
+                          strlit (unitIdFS (moduleUnitId m)) <> comma <>
+                          strlit (moduleNameFS (moduleName m)) <> comma <>
+                          strlit c_nm <> comma <>
+                          strlit (mkFastString type_string)
                         ) <> semi
           _ -> empty
 
-  strlit xs = docToSDoc (pprStringLit (mkFastString xs))
+  strlit xs = pprStringLit xs
 
   -- the target which will form the root of what we ask rts_evalIO to run
   the_cfun
      = case maybe_target of
-          Nothing    -> text "h$deRefStablePtr(the_stableptr)"
+          Nothing    -> text "h$deRefStablePtr(stableptr_offset)"
           Just hs_fn -> idClosureText hs_fn
 
   -- the expression we give to rts_eval
@@ -211,8 +213,7 @@ mkFExportJSBits platform c_nm maybe_target arg_htys res_hty is_IO_res_ty _cconv
                $$ vcat
                  [ lbrace
                  ,   text "return"
-                     <+> text "await"
-                     <+> text "h$rts_eval"
+                     <+> text "h$rts_eval_sync"
                      <> parens ((if is_IO_res_ty
                                  then expr_to_run
                                  else text "h$rts_toIO" <> parens expr_to_run)
@@ -242,7 +243,7 @@ dsJsImport
   -> Maybe Header
   -> DsM ([Binding], CHeader, CStub)
 dsJsImport id co (CLabel cid) cconv _ _ = do
-   let ty = pFst $ coercionKind co
+   let ty = coercionLKind co
        fod = case tyConAppTyCon_maybe (dropForAlls ty) of
              Just tycon
               | tyConUnique tycon == funPtrTyConKey ->
@@ -272,7 +273,7 @@ dsJsFExportDynamic :: Id
                  -> DsM ([Binding], CHeader, CStub)
 dsJsFExportDynamic id co0 cconv = do
     let
-      ty                            = pFst (coercionKind co0)
+      ty                            = coercionLKind co0
       (tvs,sans_foralls)            = tcSplitForAllTyVars ty
       ([Scaled arg_mult arg_ty], fn_res_ty)  = tcSplitFunTys sans_foralls
       (io_tc, res_ty)               = expectJust "dsJsFExportDynamic: IO type expected"
@@ -342,7 +343,7 @@ dsJsCall :: Id -> Coercion -> ForeignCall -> Maybe Header
         -> DsM ([(Id, Expr TyVar)], CHeader, CStub)
 dsJsCall fn_id co (CCall (CCallSpec target cconv safety)) _mDeclHeader = do
     let
-        ty                   = pFst $ coercionKind co
+        ty                   = coercionLKind co
         (tv_bndrs, rho)      = tcSplitForAllTyVarBinders ty
         (arg_tys, io_res_ty) = tcSplitFunTys rho
 
@@ -382,16 +383,16 @@ dsJsCall fn_id co (CCall (CCallSpec target cconv safety)) _mDeclHeader = do
 
 
 mkHObj :: Type -> SDoc
-mkHObj t = text "h$rts_mk" <> text (showFFIType t)
+mkHObj t = text "h$rts_mk" <> showFFIType t
 
 unpackHObj :: Type -> SDoc
-unpackHObj t = text "h$rts_get" <> text (showFFIType t)
+unpackHObj t = text "h$rts_get" <> showFFIType t
 
 showStgType :: Type -> SDoc
-showStgType t = text "Hs" <> text (showFFIType t)
+showStgType t = text "Hs" <> showFFIType t
 
-showFFIType :: Type -> String
-showFFIType t = getOccString (getName (typeTyCon t))
+showFFIType :: Type -> SDoc
+showFFIType t = ftext (occNameFS (getOccName (typeTyCon t)))
 
 typeTyCon :: Type -> TyCon
 typeTyCon ty
@@ -471,10 +472,6 @@ unboxJsArg arg
     Just arg3_tycon                = maybe_arg3_tycon
 
 
-boxJsResult :: Type
-            -> DsM (Type, CoreExpr -> CoreExpr)
-boxJsResult result_ty
-  | isRuntimeRepKindedTy result_ty = panic "boxJsResult: runtime rep ty" -- fixme
 -- Takes the result of the user-level ccall:
 --      either (IO t),
 --      or maybe just t for an side-effect-free call
@@ -485,7 +482,7 @@ boxJsResult result_ty
 -- where t' is the unwrapped form of t.  If t is simply (), then
 -- the result type will be
 --      State# RealWorld -> (# State# RealWorld #)
-
+boxJsResult :: Type -> DsM (Type, CoreExpr -> CoreExpr)
 boxJsResult result_ty
   | Just (io_tycon, io_res_ty) <- tcSplitIOType_maybe result_ty
         -- isIOType_maybe handles the case where the type is a
@@ -585,7 +582,6 @@ jsResultWrapper
 -- E.g. foreign import foo :: Int -> IO T
 -- Then resultWrapper deals with marshalling the 'T' part
 jsResultWrapper result_ty
-  | isRuntimeRepKindedTy result_ty = return (Nothing, id) -- fixme this seems like a hack
   -- Base case 1a: unboxed tuples
   | Just (tc, args) <- splitTyConApp_maybe result_ty
   , isUnboxedTupleTyCon tc {- && False -} = do
@@ -639,7 +635,7 @@ jsResultWrapper result_ty
   | Just (tc,_) <- maybe_tc_app, tc `hasKey` boolTyConKey = do
 --    result_id <- newSysLocalDs boolTy
     ccall_uniq <- newUnique
-    let forceBool e = mkJsCall ccall_uniq "((x) => { return !(!x); })" [e] boolTy
+    let forceBool e = mkJsCall ccall_uniq (fsLit "((x) => { return !(!x); })") [e] boolTy
     return
      (Just intPrimTy, \e -> forceBool e)
 
@@ -674,10 +670,10 @@ jsResultWrapper result_ty
     maybe_tc_app = splitTyConApp_maybe result_ty
 
 -- low-level primitive JavaScript call:
-mkJsCall :: Unique -> String -> [CoreExpr] -> Type -> CoreExpr
+mkJsCall :: Unique -> FastString -> [CoreExpr] -> Type -> CoreExpr
 mkJsCall u tgt args t = mkFCall u ccall args t
   where
     ccall = CCall $ CCallSpec
-              (StaticTarget NoSourceText (mkFastString tgt) (Just primUnit) True)
+              (StaticTarget NoSourceText tgt (Just primUnit) True)
               JavaScriptCallConv
               PlayRisky

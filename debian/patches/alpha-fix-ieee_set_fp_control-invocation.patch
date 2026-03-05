@@ -21,11 +21,11 @@ rts/posix/Signals.c:709:5: error:
  rts/posix/Signals.c | 6 +++++-
  1 file changed, 5 insertions(+), 1 deletion(-)
 
-diff --git a/rts/posix/Signals.c b/rts/posix/Signals.c
-index b6bfe77f35..7c788b82b2 100644
+Index: b/rts/posix/Signals.c
+===================================================================
 --- a/rts/posix/Signals.c
 +++ b/rts/posix/Signals.c
-@@ -27,7 +27,7 @@
+@@ -21,7 +21,7 @@
  
  #if defined(alpha_HOST_ARCH)
  # if defined(linux_HOST_OS)
@@ -34,7 +34,7 @@ index b6bfe77f35..7c788b82b2 100644
  # else
  #  include <machine/fpu.h>
  # endif
-@@ -721,7 +721,11 @@ initDefaultHandlers(void)
+@@ -715,7 +715,11 @@ initDefaultHandlers(void)
  #endif
  
  #if defined(alpha_HOST_ARCH)
@@ -46,6 +46,3 @@ index b6bfe77f35..7c788b82b2 100644
  #endif
  
      // ignore SIGPIPE; see #1619
--- 
-2.39.5
-

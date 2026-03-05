@@ -16,6 +16,7 @@
 
 #include "rts/PosixSource.h"
 #include "Rts.h"
+#include "RtsFlags.h"
 
 #include "Evac.h"
 #include "Storage.h"
@@ -260,7 +261,9 @@ copy_tag(StgClosure **p, const StgInfoTable *info,
             // profiler when it encounters this closure in
             // processHeapClosureForDead.  So we reset the LDVW field
             // here.
-            LDVW(to) = 0;
+            if (doingLDVProfiling()){
+              LDVW(to) = 0;
+            }
 #endif
             return evacuate(p); // does the failed_to_evac stuff
         } else {
@@ -1109,6 +1112,8 @@ evacuate_BLACKHOLE(StgClosure **p)
         return;
     }
 
+    // Note [Black holes in large objects]
+    // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     // blackholes *can* be in a large object: when raiseAsync() creates an
     // AP_STACK the payload might be large enough to create a large object.
     // See #14497.
@@ -1213,9 +1218,13 @@ unchain_thunk_selectors(StgSelector *p, StgClosure *val)
             SET_INFO_RELEASE((StgClosure *)p, &stg_IND_info);
         }
 
+#if defined(PROFILING)
         // For the purposes of LDV profiling, we have created an
         // indirection.
-        LDV_RECORD_CREATE(p);
+        if (doingLDVProfiling()){
+          LDV_RECORD_CREATE(p);
+        }
+#endif
 
         p = prev;
     }
@@ -1394,8 +1403,7 @@ selector_loop:
                   // the same selector thunk.
                   SET_INFO((StgClosure*)p, (StgInfoTable *)info_ptr);
                   OVERWRITING_CLOSURE((StgClosure*)p);
-                  SET_INFO((StgClosure*)p, &stg_WHITEHOLE_info);
-                  write_barrier();
+                  SET_INFO_RELEASE((StgClosure*)p, &stg_WHITEHOLE_info);
 #if defined(PARALLEL_GC)
                   abort();  // LDV is incompatible with parallel GC
 #endif
@@ -1543,7 +1551,7 @@ selector_loop:
 bale_out:
     // We didn't manage to evaluate this thunk; restore the old info
     // pointer.  But don't forget: we still need to evacuate the thunk itself.
-    SET_INFO((StgClosure *)p, (const StgInfoTable *)info_ptr);
+    SET_INFO_RELAXED((StgClosure *)p, (const StgInfoTable *)info_ptr);
     // THREADED_RTS: we just unlocked the thunk, so another thread
     // might get in and update it.  copy() will lock it again and
     // check whether it was updated in the meantime.

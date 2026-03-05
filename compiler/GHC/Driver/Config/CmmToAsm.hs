@@ -5,7 +5,7 @@ where
 
 import GHC.Prelude
 
-import GHC.Driver.Session
+import GHC.Driver.DynFlags
 
 import GHC.Platform
 import GHC.Unit.Types (Module)
@@ -21,7 +21,8 @@ initNCGConfig dflags this_mod = NCGConfig
    , ncgAsmContext            = initSDocContext dflags PprCode
    , ncgProcAlignment         = cmmProcAlignment dflags
    , ncgExternalDynamicRefs   = gopt Opt_ExternalDynamicRefs dflags
-   , ncgPIC                   = positionIndependent dflags
+   -- no PIC on wasm32 for now
+   , ncgPIC                   = positionIndependent dflags && not (platformArch (targetPlatform dflags) == ArchWasm32)
    , ncgInlineThresholdMemcpy = fromIntegral $ maxInlineMemcpyInsns dflags
    , ncgInlineThresholdMemset = fromIntegral $ maxInlineMemsetInsns dflags
    , ncgSplitSections         = gopt Opt_SplitSections dflags
@@ -66,8 +67,8 @@ initNCGConfig dflags this_mod = NCGConfig
    , ncgDwarfSourceNotes    = osElfTarget (platformOS (targetPlatform dflags)) && debugLevel dflags > 2 -- We produce GHC-specific source-note DIEs only with -g3
    , ncgExposeInternalSymbols = gopt Opt_ExposeInternalSymbols dflags
    , ncgCmmStaticPred       = gopt Opt_CmmStaticPred dflags
-                              -- Disabled due to https://gitlab.haskell.org/ghc/ghc/-/issues/24507
-   , ncgEnableShortcutting  = False -- gopt Opt_AsmShortcutting dflags
+   , ncgEnableShortcutting  = gopt Opt_AsmShortcutting dflags
+   , ncgEnableInterModuleFarJumps = gopt Opt_InterModuleFarJumps dflags
    , ncgComputeUnwinding    = debugLevel dflags > 0
    , ncgEnableDeadCodeElimination = not (gopt Opt_InfoTableMap dflags)
                                      -- Disable when -finfo-table-map is on (#20428)

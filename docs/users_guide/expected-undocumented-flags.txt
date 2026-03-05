@@ -33,11 +33,17 @@
 -fbang-patterns
 -fbuilding-cabal-package
 -fconstraint-solver-iterations
+-fgivens-expansion-fuel
+-fwanteds-expansion-fuel
+-fqcs-expansion-fuel
 -fcontext-stack
 -fcross-module-specialize
 -fdiagnostics-color=always
 -fdiagnostics-color=auto
 -fdiagnostics-color=never
+-fprint-error-index-links=always
+-fprint-error-index-links=auto
+-fprint-error-index-links=never
 -fembed-manifest
 -fextended-default-rules
 -ffast-pap-calls

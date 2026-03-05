@@ -34,7 +34,7 @@ module GHC.Tc.Deriv.Generate (
         gen_Newtype_fam_insts,
         mkCoerceClassMethEqn,
         genAuxBinds,
-        ordOpTbl, boxConTbl, litConTbl,
+        ordOpTbl, boxConTbl,
         mkRdrFunBind, mkRdrFunBindEC, mkRdrFunBindSE, error_Expr,
 
         getPossibleDataCons,
@@ -44,53 +44,56 @@ module GHC.Tc.Deriv.Generate (
 
 import GHC.Prelude
 
-import GHC.Tc.Utils.Monad
-import GHC.Tc.TyCl.Class ( substATBndrs )
 import GHC.Hs
-import GHC.Types.FieldLabel
-import GHC.Types.Name.Reader
-import GHC.Types.Basic
-import GHC.Types.Fixity
-import GHC.Core.DataCon
-import GHC.Types.Name
-import GHC.Types.SourceText
 
-import GHC.Tc.Instance.Family
-import GHC.Core.FamInstEnv
-import GHC.Builtin.Names
-import GHC.Builtin.Names.TH
-import GHC.Types.Id.Make ( coerceId )
-import GHC.Builtin.PrimOps
-import GHC.Builtin.PrimOps.Ids (primOpId)
-import GHC.Types.SrcLoc
-import GHC.Core.TyCon
+import GHC.Tc.TyCl.Class ( substATBndrs )
+import GHC.Tc.Utils.Monad
+import GHC.Tc.Utils.Instantiate( newFamInst )
 import GHC.Tc.Utils.Env
 import GHC.Tc.Utils.TcType
-import GHC.Tc.Utils.Zonk
-import GHC.Tc.Validity ( checkValidCoAxBranch )
+import GHC.Tc.Zonk.Type
+import GHC.Tc.Validity
+
+import GHC.Core.DataCon
+import GHC.Core.FamInstEnv
+import GHC.Core.TyCon
 import GHC.Core.Coercion.Axiom ( coAxiomSingleBranch )
-import GHC.Builtin.Types.Prim
-import GHC.Builtin.Types
 import GHC.Core.Type
 import GHC.Core.Class
 
+import GHC.Types.Name.Reader
+import GHC.Types.Basic
+import GHC.Types.Fixity
+import GHC.Types.Name
+import GHC.Types.SourceText
+import GHC.Types.Id.Make ( coerceId )
+import GHC.Types.SrcLoc
 import GHC.Types.Unique.FM ( lookupUFM, listToUFM )
 import GHC.Types.Var.Env
-import GHC.Utils.Misc
 import GHC.Types.Var
+import GHC.Types.Var.Set
+
+import GHC.Builtin.Names
+import GHC.Builtin.Names.TH
+import GHC.Builtin.PrimOps
+import GHC.Builtin.PrimOps.Ids (primOpId)
+import GHC.Builtin.Types.Prim
+import GHC.Builtin.Types
+
+import GHC.Utils.Misc
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
-import GHC.Utils.Panic.Plain
 import GHC.Utils.Lexeme
+
 import GHC.Data.FastString
 import GHC.Data.Pair
 import GHC.Data.Bag
+import GHC.Data.Maybe ( expectJust )
+import GHC.Unit.Module
 
 import Language.Haskell.Syntax.Basic (FieldLabelString(..))
 
 import Data.List  ( find, partition, intersperse )
-import GHC.Data.Maybe ( expectJust )
-import GHC.Unit.Module
 
 -- | A declarative description of an auxiliary binding that should be
 -- generated. See @Note [Auxiliary binders]@ for a more detailed description
@@ -420,11 +423,12 @@ gen_Ord_binds loc dit@(DerivInstTys{ dit_rep_tc = tycon
       = emptyBag
 
     negate_expr = nlHsApp (nlHsVar not_RDR)
-    lE = mkSimpleGeneratedFunBind loc le_RDR [a_Pat, b_Pat] $
+    pats = [a_Pat, b_Pat]
+    lE = mkSimpleGeneratedFunBind loc le_RDR pats $
         negate_expr (nlHsApp (nlHsApp (nlHsVar lt_RDR) b_Expr) a_Expr)
-    gT = mkSimpleGeneratedFunBind loc gt_RDR [a_Pat, b_Pat] $
+    gT = mkSimpleGeneratedFunBind loc gt_RDR pats $
         nlHsApp (nlHsApp (nlHsVar lt_RDR) b_Expr) a_Expr
-    gE = mkSimpleGeneratedFunBind loc ge_RDR [a_Pat, b_Pat] $
+    gE = mkSimpleGeneratedFunBind loc ge_RDR pats $
         negate_expr (nlHsApp (nlHsApp (nlHsVar lt_RDR) a_Expr) b_Expr)
 
     get_tag con = dataConTag con - fIRST_TAG
@@ -512,7 +516,7 @@ gen_Ord_binds loc dit@(DerivInstTys{ dit_rep_tc = tycon
       where
         tag     = get_tag data_con
         tag_lit
-             = noLocA (HsLit noComments (HsIntPrim NoSourceText (toInteger tag)))
+             = noLocA (HsLit noExtField (HsIntPrim NoSourceText (toInteger tag)))
 
     mkInnerEqAlt :: OrdOp -> DataCon -> LMatch GhcPs (LHsExpr GhcPs)
     -- First argument 'a' known to be built with K
@@ -855,7 +859,7 @@ gen_Ix_binds loc (DerivInstTys{dit_rep_tc = tycon}) = do
 
     enum_index
       = mkSimpleGeneratedFunBind loc unsafeIndex_RDR
-                [noLocA (AsPat noAnn (noLocA c_RDR) noHsTok
+                [noLocA (AsPat noAnn (noLocA c_RDR)
                            (nlTuplePat [a_Pat, nlWildPat] Boxed)),
                                 d_Pat] (
            untag_Expr [(a_RDR, ah_RDR)] (
@@ -1279,8 +1283,7 @@ gen_Show_binds get_fixity loc dit@(DerivInstTys{ dit_rep_tc = tycon
              show_arg b arg_ty
                  | isUnliftedType arg_ty
                  -- See Note [Deriving and unboxed types] in GHC.Tc.Deriv.Infer
-                 = with_conv $
-                    nlHsApps compose_RDR
+                 = nlHsApps compose_RDR
                         [mk_shows_app boxed_arg, mk_showString_app postfixMod]
                  | otherwise
                  = mk_showsPrec_app arg_prec arg
@@ -1288,14 +1291,6 @@ gen_Show_binds get_fixity loc dit@(DerivInstTys{ dit_rep_tc = tycon
                  arg        = nlHsVar b
                  boxed_arg  = box "Show" arg arg_ty
                  postfixMod = assoc_ty_id "Show" postfixModTbl arg_ty
-                 with_conv expr
-                    | (Just conv) <- assoc_ty_id_maybe primConvTbl arg_ty =
-                        nested_compose_Expr
-                            [ mk_showString_app ("(" ++ conv ++ " ")
-                            , expr
-                            , mk_showString_app ")"
-                            ]
-                    | otherwise = expr
 
                 -- Fixity stuff
              is_infix = dataConIsInfix data_con
@@ -1511,25 +1506,24 @@ gfoldl_RDR, gunfold_RDR, toConstr_RDR, dataTypeOf_RDR, mkConstrTag_RDR,
     eqAddr_RDR  , ltAddr_RDR  , geAddr_RDR  , gtAddr_RDR  , leAddr_RDR  ,
     eqFloat_RDR , ltFloat_RDR , geFloat_RDR , gtFloat_RDR , leFloat_RDR ,
     eqDouble_RDR, ltDouble_RDR, geDouble_RDR, gtDouble_RDR, leDouble_RDR,
-    word8ToWord_RDR , int8ToInt_RDR ,
-    word16ToWord_RDR, int16ToInt_RDR,
-    word32ToWord_RDR, int32ToInt_RDR
+    int8DataCon_RDR, int16DataCon_RDR, int32DataCon_RDR, int64DataCon_RDR,
+    word8DataCon_RDR, word16DataCon_RDR, word32DataCon_RDR, word64DataCon_RDR
     :: RdrName
-gfoldl_RDR     = varQual_RDR  gENERICS (fsLit "gfoldl")
-gunfold_RDR    = varQual_RDR  gENERICS (fsLit "gunfold")
-toConstr_RDR   = varQual_RDR  gENERICS (fsLit "toConstr")
-dataTypeOf_RDR = varQual_RDR  gENERICS (fsLit "dataTypeOf")
-dataCast1_RDR  = varQual_RDR  gENERICS (fsLit "dataCast1")
-dataCast2_RDR  = varQual_RDR  gENERICS (fsLit "dataCast2")
-gcast1_RDR     = varQual_RDR  tYPEABLE (fsLit "gcast1")
-gcast2_RDR     = varQual_RDR  tYPEABLE (fsLit "gcast2")
-mkConstrTag_RDR = varQual_RDR gENERICS (fsLit "mkConstrTag")
-constr_RDR     = tcQual_RDR   gENERICS (fsLit "Constr")
-mkDataType_RDR = varQual_RDR  gENERICS (fsLit "mkDataType")
-dataType_RDR   = tcQual_RDR   gENERICS (fsLit "DataType")
-conIndex_RDR   = varQual_RDR  gENERICS (fsLit "constrIndex")
-prefix_RDR     = dataQual_RDR gENERICS (fsLit "Prefix")
-infix_RDR      = dataQual_RDR gENERICS (fsLit "Infix")
+gfoldl_RDR     = varQual_RDR  gHC_INTERNAL_DATA_DATA (fsLit "gfoldl")
+gunfold_RDR    = varQual_RDR  gHC_INTERNAL_DATA_DATA (fsLit "gunfold")
+toConstr_RDR   = varQual_RDR  gHC_INTERNAL_DATA_DATA (fsLit "toConstr")
+dataTypeOf_RDR = varQual_RDR  gHC_INTERNAL_DATA_DATA (fsLit "dataTypeOf")
+dataCast1_RDR  = varQual_RDR  gHC_INTERNAL_DATA_DATA (fsLit "dataCast1")
+dataCast2_RDR  = varQual_RDR  gHC_INTERNAL_DATA_DATA (fsLit "dataCast2")
+gcast1_RDR     = varQual_RDR  gHC_INTERNAL_TYPEABLE (fsLit "gcast1")
+gcast2_RDR     = varQual_RDR  gHC_INTERNAL_TYPEABLE (fsLit "gcast2")
+mkConstrTag_RDR = varQual_RDR gHC_INTERNAL_DATA_DATA (fsLit "mkConstrTag")
+constr_RDR     = tcQual_RDR   gHC_INTERNAL_DATA_DATA (fsLit "Constr")
+mkDataType_RDR = varQual_RDR  gHC_INTERNAL_DATA_DATA (fsLit "mkDataType")
+dataType_RDR   = tcQual_RDR   gHC_INTERNAL_DATA_DATA (fsLit "DataType")
+conIndex_RDR   = varQual_RDR  gHC_INTERNAL_DATA_DATA (fsLit "constrIndex")
+prefix_RDR     = dataQual_RDR gHC_INTERNAL_DATA_DATA (fsLit "Prefix")
+infix_RDR      = dataQual_RDR gHC_INTERNAL_DATA_DATA (fsLit "Infix")
 
 eqChar_RDR     = varQual_RDR  gHC_PRIM (fsLit "eqChar#")
 ltChar_RDR     = varQual_RDR  gHC_PRIM (fsLit "ltChar#")
@@ -1616,15 +1610,14 @@ leDouble_RDR   = varQual_RDR  gHC_PRIM (fsLit "<=##")
 gtDouble_RDR   = varQual_RDR  gHC_PRIM (fsLit ">##" )
 geDouble_RDR   = varQual_RDR  gHC_PRIM (fsLit ">=##")
 
-word8ToWord_RDR = varQual_RDR  gHC_PRIM (fsLit "word8ToWord#")
-int8ToInt_RDR   = varQual_RDR  gHC_PRIM (fsLit "int8ToInt#")
-
-word16ToWord_RDR = varQual_RDR  gHC_PRIM (fsLit "word16ToWord#")
-int16ToInt_RDR   = varQual_RDR  gHC_PRIM (fsLit "int16ToInt#")
-
-word32ToWord_RDR = varQual_RDR  gHC_PRIM (fsLit "word32ToWord#")
-int32ToInt_RDR   = varQual_RDR  gHC_PRIM (fsLit "int32ToInt#")
-
+int8DataCon_RDR   = dataQual_RDR gHC_INTERNAL_INT (fsLit "I8#")
+int16DataCon_RDR  = dataQual_RDR gHC_INTERNAL_INT (fsLit "I16#")
+int32DataCon_RDR  = dataQual_RDR gHC_INTERNAL_INT (fsLit "I32#")
+int64DataCon_RDR  = dataQual_RDR gHC_INTERNAL_INT (fsLit "I64#")
+word8DataCon_RDR  = dataQual_RDR gHC_INTERNAL_WORD (fsLit "W8#")
+word16DataCon_RDR = dataQual_RDR gHC_INTERNAL_WORD (fsLit "W16#")
+word32DataCon_RDR = dataQual_RDR gHC_INTERNAL_WORD (fsLit "W32#")
+word64DataCon_RDR = dataQual_RDR gHC_INTERNAL_WORD (fsLit "W64#")
 {-
 ************************************************************************
 *                                                                      *
@@ -1663,8 +1656,8 @@ gen_Lift_binds loc (DerivInstTys{ dit_rep_tc = tycon
     mk_untyped_bracket = HsUntypedBracket noAnn . ExpBr noExtField
     mk_typed_bracket = HsTypedBracket noAnn
 
-    mk_tsplice = HsTypedSplice (EpAnnNotUsed, noAnn)
-    mk_usplice = HsUntypedSplice EpAnnNotUsed . HsUntypedSpliceExpr noAnn
+    mk_tsplice = HsTypedSplice []
+    mk_usplice = HsUntypedSplice noExtField . HsUntypedSpliceExpr noAnn
     data_cons = getPossibleDataCons tycon tycon_args
 
     pats_etc mk_bracket mk_splice lift_name data_con
@@ -1807,7 +1800,7 @@ prove it *without computing any term evidence* (hence the <no-ev>). Alas, we
 *must* generate a term-level evidence binding in order to instantiate the
 quantified constraint! In response, GHC currently chooses not to use such
 a quantified constraint.
-See Note [Instances in no-evidence implications] in GHC.Tc.Solver.Interact.
+See Note [Instances in no-evidence implications] in GHC.Tc.Solver.Equality.
 
 But this isn't the death knell for combining QuantifiedConstraints with GND.
 On the contrary, if we generate GND bindings in a slightly different way, then
@@ -2093,6 +2086,7 @@ gen_Newtype_fam_insts loc' cls inst_tvs inst_tys rhs_ty
                                            rep_lhs_tys
         let axiom = mkSingleCoAxiom Nominal rep_tc_name rep_tvs' [] rep_cvs'
                                     fam_tc rep_lhs_tys rep_rhs_ty
+        checkFamPatBinders fam_tc (rep_tvs' ++ rep_cvs') emptyVarSet rep_lhs_tys rep_rhs_ty
         -- Check (c) from Note [GND and associated type families] in GHC.Tc.Deriv
         checkValidCoAxBranch fam_tc (coAxiomSingleBranch axiom)
         newFamInst SynFamilyInst axiom
@@ -2107,7 +2101,7 @@ gen_Newtype_fam_insts loc' cls inst_tvs inst_tys rhs_ty
         rep_cvs'    = scopedSort rep_cvs
 
 nlHsAppType :: LHsExpr GhcPs -> Type -> LHsExpr GhcPs
-nlHsAppType e s = noLocA (HsAppType noExtField e noHsTok hs_ty)
+nlHsAppType e s = noLocA (HsAppType noAnn e hs_ty)
   where
     hs_ty = mkHsWildCardBndrs $ parenthesizeHsType appPrec $ nlHsCoreTy s
 
@@ -2299,7 +2293,7 @@ mkFunBindSE arity loc fun pats_and_exprs
 mkRdrFunBind :: LocatedN RdrName -> [LMatch GhcPs (LHsExpr GhcPs)]
              -> LHsBind GhcPs
 mkRdrFunBind fun@(L loc _fun_rdr) matches
-  = L (na2la loc) (mkFunBind Generated fun matches)
+  = L (l2l loc) (mkFunBind (Generated OtherExpansion SkipPmc) fun matches)
 
 -- | Make a function binding. If no equations are given, produce a function
 -- with the given arity that uses an empty case expression for the last
@@ -2327,7 +2321,7 @@ mkRdrFunBindEC :: Arity
                -> [LMatch GhcPs (LHsExpr GhcPs)]
                -> LHsBind GhcPs
 mkRdrFunBindEC arity catch_all fun@(L loc _fun_rdr) matches
-  = L (na2la loc) (mkFunBind Generated fun matches')
+  = L (l2l loc) (mkFunBind (Generated OtherExpansion SkipPmc) fun matches')
  where
    -- Catch-all eqn looks like
    --     fmap _ z = case z of {}
@@ -2340,7 +2334,7 @@ mkRdrFunBindEC arity catch_all fun@(L loc _fun_rdr) matches
    -- See #4302
    matches' = if null matches
               then [mkMatch (mkPrefixFunRhs fun)
-                            (replicate (arity - 1) nlWildPat ++ [z_Pat])
+                            (replicate (arity - 1) (nlWildPat) ++ [z_Pat])
                             (catch_all $ nlHsCase z_Expr [])
                             emptyLocalBinds]
               else matches
@@ -2351,7 +2345,7 @@ mkRdrFunBindEC arity catch_all fun@(L loc _fun_rdr) matches
 mkRdrFunBindSE :: Arity -> LocatedN RdrName ->
                     [LMatch GhcPs (LHsExpr GhcPs)] -> LHsBind GhcPs
 mkRdrFunBindSE arity fun@(L loc fun_rdr) matches
-  = L (na2la loc) (mkFunBind Generated fun matches')
+  = L (l2l loc) (mkFunBind (Generated OtherExpansion SkipPmc) fun matches')
  where
    -- Catch-all eqn looks like
    --     compare _ _ = error "Void compare"
@@ -2371,7 +2365,7 @@ box ::         String           -- The class involved
             -> Type             -- The argument type
             -> LHsExpr GhcPs    -- Boxed version of the arg
 -- See Note [Deriving and unboxed types] in GHC.Tc.Deriv.Infer
-box cls_str arg arg_ty = assoc_ty_id cls_str boxConTbl arg_ty arg
+box cls_str arg arg_ty = nlHsApp (assoc_ty_id cls_str boxConTbl arg_ty) arg
 
 ---------------------
 primOrdOps :: String    -- The class involved
@@ -2411,38 +2405,28 @@ ordOpTbl
     ,(doublePrimTy, (ltDouble_RDR, leDouble_RDR
      , eqDouble_RDR, geDouble_RDR, gtDouble_RDR)) ]
 
--- A mapping from a primitive type to a function that constructs its boxed
--- version.
--- NOTE: Int8#/Word8# will become Int/Word.
-boxConTbl :: [(Type, LHsExpr GhcPs -> LHsExpr GhcPs)]
+-- A mapping from a primitive type to a DataCon of its boxed version.
+boxConTbl :: [(Type, LHsExpr GhcPs)]
 boxConTbl =
-    [ (charPrimTy  , nlHsApp (nlHsVar $ getRdrName charDataCon))
-    , (intPrimTy   , nlHsApp (nlHsVar $ getRdrName intDataCon))
-    , (wordPrimTy  , nlHsApp (nlHsVar $ getRdrName wordDataCon ))
-    , (floatPrimTy , nlHsApp (nlHsVar $ getRdrName floatDataCon ))
-    , (doublePrimTy, nlHsApp (nlHsVar $ getRdrName doubleDataCon))
-    , (int8PrimTy,
-        nlHsApp (nlHsVar $ getRdrName intDataCon)
-        . nlHsApp (nlHsVar int8ToInt_RDR))
-    , (word8PrimTy,
-        nlHsApp (nlHsVar $ getRdrName wordDataCon)
-        . nlHsApp (nlHsVar word8ToWord_RDR))
-    , (int16PrimTy,
-        nlHsApp (nlHsVar $ getRdrName intDataCon)
-        . nlHsApp (nlHsVar int16ToInt_RDR))
-    , (word16PrimTy,
-        nlHsApp (nlHsVar $ getRdrName wordDataCon)
-        . nlHsApp (nlHsVar word16ToWord_RDR))
-    , (int32PrimTy,
-        nlHsApp (nlHsVar $ getRdrName intDataCon)
-        . nlHsApp (nlHsVar int32ToInt_RDR))
-    , (word32PrimTy,
-        nlHsApp (nlHsVar $ getRdrName wordDataCon)
-        . nlHsApp (nlHsVar word32ToWord_RDR))
+    [ (charPrimTy  , nlHsVar $ getRdrName charDataCon)
+    , (intPrimTy   , nlHsVar $ getRdrName intDataCon)
+    , (wordPrimTy  , nlHsVar $ getRdrName wordDataCon)
+    , (floatPrimTy , nlHsVar $ getRdrName floatDataCon)
+    , (doublePrimTy, nlHsVar $ getRdrName doubleDataCon)
+    , (int8PrimTy,   nlHsVar int8DataCon_RDR)
+    , (word8PrimTy,  nlHsVar word8DataCon_RDR)
+    , (int16PrimTy,  nlHsVar int16DataCon_RDR)
+    , (word16PrimTy, nlHsVar word16DataCon_RDR)
+    , (int32PrimTy,  nlHsVar int32DataCon_RDR)
+    , (word32PrimTy, nlHsVar word32DataCon_RDR)
+    , (int64PrimTy,  nlHsVar int64DataCon_RDR)
+    , (word64PrimTy, nlHsVar word64DataCon_RDR)
     ]
 
 
 -- | A table of postfix modifiers for unboxed values.
+-- Following https://github.com/ghc-proposals/ghc-proposals/pull/596,
+-- we use the ExtendedLiterals syntax for sized literals.
 postfixModTbl :: [(Type, String)]
 postfixModTbl
   = [(charPrimTy  , "#" )
@@ -2450,42 +2434,14 @@ postfixModTbl
     ,(wordPrimTy  , "##")
     ,(floatPrimTy , "#" )
     ,(doublePrimTy, "##")
-    ,(int8PrimTy, "#")
-    ,(word8PrimTy, "##")
-    ,(int16PrimTy, "#")
-    ,(word16PrimTy, "##")
-    ,(int32PrimTy, "#")
-    ,(word32PrimTy, "##")
-    ]
-
-primConvTbl :: [(Type, String)]
-primConvTbl =
-    [ (int8PrimTy, "intToInt8#")
-    , (word8PrimTy, "wordToWord8#")
-    , (int16PrimTy, "intToInt16#")
-    , (word16PrimTy, "wordToWord16#")
-    , (int32PrimTy, "intToInt32#")
-    , (word32PrimTy, "wordToWord32#")
-    ]
-
-litConTbl :: [(Type, LHsExpr GhcPs -> LHsExpr GhcPs)]
-litConTbl
-  = [(charPrimTy  , nlHsApp (nlHsVar charPrimL_RDR))
-    ,(intPrimTy   , nlHsApp (nlHsVar intPrimL_RDR)
-                      . nlHsApp (nlHsVar toInteger_RDR))
-    ,(wordPrimTy  , nlHsApp (nlHsVar wordPrimL_RDR)
-                      . nlHsApp (nlHsVar toInteger_RDR))
-    ,(addrPrimTy  , nlHsApp (nlHsVar stringPrimL_RDR)
-                      . nlHsApp (nlHsApp
-                          (nlHsVar map_RDR)
-                          (compose_RDR `nlHsApps`
-                            [ nlHsVar fromIntegral_RDR
-                            , nlHsVar fromEnum_RDR
-                            ])))
-    ,(floatPrimTy , nlHsApp (nlHsVar floatPrimL_RDR)
-                      . nlHsApp (nlHsVar toRational_RDR))
-    ,(doublePrimTy, nlHsApp (nlHsVar doublePrimL_RDR)
-                      . nlHsApp (nlHsVar toRational_RDR))
+    ,(int8PrimTy  , "#Int8")
+    ,(word8PrimTy , "#Word8")
+    ,(int16PrimTy , "#Int16")
+    ,(word16PrimTy, "#Word16")
+    ,(int32PrimTy , "#Int32")
+    ,(word32PrimTy, "#Word32")
+    ,(int64PrimTy , "#Int64")
+    ,(word64PrimTy, "#Word64")
     ]
 
 -- | Lookup `Type` in an association list.
@@ -2780,19 +2736,19 @@ substDerivInstTys subst
     rep_tc_args' = substTys subst rep_tc_args
 
 -- | Zonk the 'TcTyVar's in a 'DerivInstTys' value to 'TyVar's.
--- See @Note [What is zonking?]@ in "GHC.Tc.Utils.TcMType".
+-- See @Note [What is zonking?]@ in "GHC.Tc.Zonk.Type".
 --
 -- This is only used in the final zonking step when inferring
 -- the context for a derived instance.
 -- See @Note [Overlap and deriving]@ in "GHC.Tc.Deriv.Infer".
-zonkDerivInstTys :: ZonkEnv -> DerivInstTys -> TcM DerivInstTys
-zonkDerivInstTys ze dit@(DerivInstTys { dit_cls_tys = cls_tys
-                                      , dit_tc_args = tc_args
-                                      , dit_rep_tc = rep_tc
-                                      , dit_rep_tc_args = rep_tc_args }) = do
-  cls_tys'     <- zonkTcTypesToTypesX ze cls_tys
-  tc_args'     <- zonkTcTypesToTypesX ze tc_args
-  rep_tc_args' <- zonkTcTypesToTypesX ze rep_tc_args
+zonkDerivInstTys :: DerivInstTys -> ZonkT TcM DerivInstTys
+zonkDerivInstTys dit@(DerivInstTys { dit_cls_tys = cls_tys
+                                   , dit_tc_args = tc_args
+                                   , dit_rep_tc = rep_tc
+                                   , dit_rep_tc_args = rep_tc_args }) = do
+  cls_tys'     <- zonkTcTypesToTypesX cls_tys
+  tc_args'     <- zonkTcTypesToTypesX tc_args
+  rep_tc_args' <- zonkTcTypesToTypesX rep_tc_args
   pure dit{ dit_cls_tys         = cls_tys'
           , dit_tc_args         = tc_args'
           , dit_rep_tc_args     = rep_tc_args'

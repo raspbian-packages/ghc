@@ -260,9 +260,9 @@ hyperlink (srcs, srcs') ident = case ident of
         Just SrcLocal -> Html.anchor content !
             [ Html.href $ hypSrcModuleNameUrl mdl name ]
         Just (SrcExternal path) ->
-          let hyperlinkUrl = makeHyperlinkUrl path </> hypSrcModuleNameUrl mdl name
+          let hyperlinkUrl = hypSrcModuleUrlToNameFormat $ makeHyperlinkUrl path
            in Html.anchor content !
-                [ Html.href $ spliceURL Nothing (Just mdl) (Just name) Nothing hyperlinkUrl ]
+                [ Html.href $ spliceURL (Just mdl) (Just name) Nothing hyperlinkUrl ]
         Nothing -> content
       where
         mdl = nameModule name
@@ -272,9 +272,9 @@ hyperlink (srcs, srcs') ident = case ident of
           Just SrcLocal -> Html.anchor content !
             [ Html.href $ hypSrcModuleUrl' moduleName ]
           Just (SrcExternal path) ->
-            let hyperlinkUrl = makeHyperlinkUrl path </> hypSrcModuleUrl' moduleName
+            let hyperlinkUrl = makeHyperlinkUrl path
              in Html.anchor content !
-                  [ Html.href $ spliceURL' Nothing (Just moduleName) Nothing Nothing hyperlinkUrl ]
+                  [ Html.href $ spliceURL' (Just moduleName) Nothing Nothing hyperlinkUrl ]
           Nothing -> content
 
 

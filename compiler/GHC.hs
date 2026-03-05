@@ -1,7 +1,7 @@
+{-# LANGUAGE MultiWayIf #-}
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE NondecreasingIndentation, ScopedTypeVariables #-}
 {-# LANGUAGE TupleSections, NamedFieldPuns #-}
-{-# LANGUAGE ViewPatterns #-}
 {-# LANGUAGE TypeFamilies #-}
 
 -- -----------------------------------------------------------------------------
@@ -157,14 +157,14 @@ module GHC (
         -- ** The debugger
         SingleStep(..),
         Resume(..),
-        History(historyBreakInfo, historyEnclosingDecls),
+        History(historyBreakpointId, historyEnclosingDecls),
         GHC.getHistorySpan, getHistoryModule,
         abandon, abandonAll,
         getResumeContext,
         GHC.obtainTermFromId, GHC.obtainTermFromVal, reconstructType,
         modInfoModBreaks,
         ModBreaks(..), BreakIndex,
-        BreakInfo(..),
+        BreakpointId(..), InternalBreakpointId(..),
         GHC.Runtime.Eval.back,
         GHC.Runtime.Eval.forward,
         GHC.Runtime.Eval.setupBreakpoint,
@@ -316,6 +316,7 @@ import GHC.Driver.Backend
 import GHC.Driver.Config.Finder (initFinderOpts)
 import GHC.Driver.Config.Parser (initParserOpts)
 import GHC.Driver.Config.Logger (initLogFlags)
+import GHC.Driver.Config.StgToJS (initStgToJSConfig)
 import GHC.Driver.Config.Diagnostic
 import GHC.Driver.Main
 import GHC.Driver.Make
@@ -336,13 +337,14 @@ import GHC.Parser.Lexer
 import GHC.Parser.Annotation
 import GHC.Parser.Utils
 
+import GHC.Iface.Env ( trace_if )
 import GHC.Iface.Load        ( loadSysInterface )
 import GHC.Hs
 import GHC.Builtin.Types.Prim ( alphaTyVars )
 import GHC.Data.StringBuffer
 import GHC.Data.FastString
 import qualified GHC.LanguageExtensions as LangExt
-import GHC.Rename.Names (renamePkgQual, renameRawPkgQual)
+import GHC.Rename.Names (renamePkgQual, renameRawPkgQual, gresFromAvails)
 
 import GHC.Tc.Utils.Monad    ( finalSafeMode, fixSafeInstances, initIfaceTcRn )
 import GHC.Tc.Types
@@ -353,11 +355,11 @@ import GHC.Tc.Instance.Family
 
 import GHC.Utils.TmpFs
 import GHC.Utils.Error
+import GHC.Utils.Exception
 import GHC.Utils.Monad
 import GHC.Utils.Misc
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
-import GHC.Utils.Panic.Plain
 import GHC.Utils.Logger
 import GHC.Utils.Fingerprint
 
@@ -370,6 +372,8 @@ import GHC.Core.DataCon
 import GHC.Core.FamInstEnv ( FamInst, famInstEnvElts, orphNamesOfFamInst )
 import GHC.Core.InstEnv
 import GHC.Core
+
+import GHC.Data.Maybe
 
 import GHC.Types.Id
 import GHC.Types.Name      hiding ( varName )
@@ -389,8 +393,9 @@ import GHC.Types.TyThing
 import GHC.Types.Name.Env
 import GHC.Types.Name.Ppr
 import GHC.Types.TypeEnv
-import GHC.Types.BreakInfo
+import GHC.Types.Breakpoint
 import GHC.Types.PkgQual
+import GHC.Types.Unique.FM
 
 import GHC.Unit
 import GHC.Unit.Env
@@ -403,29 +408,26 @@ import GHC.Unit.Module.ModSummary
 import GHC.Unit.Module.Graph
 import GHC.Unit.Home.ModInfo
 
+import Control.Applicative ((<|>))
+import Control.Concurrent
+import Control.Monad
+import Control.Monad.Catch as MC
 import Data.Foldable
-import qualified Data.Map.Strict as Map
-import Data.Set (Set)
-import qualified Data.Sequence as Seq
-import Data.Maybe
+import Data.IORef
+import Data.List (isPrefixOf)
 import Data.Typeable    ( Typeable )
 import Data.Word        ( Word8 )
-import Control.Monad
-import System.Exit      ( exitWith, ExitCode(..) )
-import GHC.Utils.Exception
-import Data.IORef
-import System.FilePath
-import Control.Concurrent
-import Control.Applicative ((<|>))
-import Control.Monad.Catch as MC
 
-import GHC.Data.Maybe
-import System.IO.Error  ( isDoesNotExistError )
-import System.Environment ( getEnv, getProgName )
-import System.Directory
-import Data.List (isPrefixOf)
+import qualified Data.Map.Strict as Map
+import Data.Set (Set)
 import qualified Data.Set as S
+import qualified Data.Sequence as Seq
 
+import System.Directory
+import System.Environment ( getEnv, getProgName )
+import System.Exit      ( exitWith, ExitCode(..) )
+import System.FilePath
+import System.IO.Error  ( isDoesNotExistError )
 
 -- %************************************************************************
 -- %*                                                                      *
@@ -558,13 +560,13 @@ withCleanupSession ghc = ghc `MC.finally` cleanup
 
 initGhcMonad :: GhcMonad m => Maybe FilePath -> m ()
 initGhcMonad mb_top_dir = setSession =<< liftIO ( do
+#if !defined(javascript_HOST_ARCH)
     -- The call to c_keepCAFsForGHCi must not be optimized away. Even in non-debug builds.
     -- So we can't use assertM here.
     -- See Note [keepCAFsForGHCi] in keepCAFsForGHCi.c for details about why.
--- #if MIN_VERSION_GLASGOW_HASKELL(9,7,0,0)
     !keep_cafs <- c_keepCAFsForGHCi
     massert keep_cafs
--- #endif
+#endif
     initHscEnv mb_top_dir
   )
 
@@ -673,10 +675,13 @@ setTopSessionDynFlags :: GhcMonad m => DynFlags -> m ()
 setTopSessionDynFlags dflags = do
   hsc_env <- getSession
   logger  <- getLogger
+  lookup_cache  <- liftIO $ newMVar emptyUFM
 
   -- Interpreter
-  interp <- if gopt Opt_ExternalInterpreter dflags
-    then do
+  interp <- if
+    -- external interpreter
+    | gopt Opt_ExternalInterpreter dflags
+    -> do
          let
            prog = pgm_i dflags ++ flavour
            profiled = ways dflags `hasWay` WayProf
@@ -698,14 +703,35 @@ setTopSessionDynFlags dflags = do
             , iservConfHook     = createIservProcessHook (hsc_hooks hsc_env)
             , iservConfTrace    = tr
             }
-         s <- liftIO $ newMVar IServPending
+         s <- liftIO $ newMVar InterpPending
          loader <- liftIO Loader.uninitializedLoader
-         return (Just (Interp (ExternalInterp conf (IServ s)) loader))
-    else
+         return (Just (Interp (ExternalInterp (ExtIServ (ExtInterpState conf s))) loader lookup_cache))
+
+    -- JavaScript interpreter
+    | ArchJavaScript <- platformArch (targetPlatform dflags)
+    -> do
+         s <- liftIO $ newMVar InterpPending
+         loader <- liftIO Loader.uninitializedLoader
+         let cfg = JSInterpConfig
+              { jsInterpNodeConfig  = defaultNodeJsSettings
+              , jsInterpScript      = topDir dflags </> "ghc-interp.js"
+              , jsInterpTmpFs       = hsc_tmpfs hsc_env
+              , jsInterpTmpDir      = tmpDir dflags
+              , jsInterpLogger      = hsc_logger hsc_env
+              , jsInterpCodegenCfg  = initStgToJSConfig dflags
+              , jsInterpUnitEnv     = hsc_unit_env hsc_env
+              , jsInterpFinderOpts  = initFinderOpts dflags
+              , jsInterpFinderCache = hsc_FC hsc_env
+              }
+         return (Just (Interp (ExternalInterp (ExtJS (ExtInterpState cfg s))) loader lookup_cache))
+
+    -- Internal interpreter
+    | otherwise
+    ->
 #if defined(HAVE_INTERNAL_INTERPRETER)
      do
       loader <- liftIO Loader.uninitializedLoader
-      return (Just (Interp InternalInterp loader))
+      return (Just (Interp InternalInterp loader lookup_cache))
 #else
       return Nothing
 #endif
@@ -837,7 +863,7 @@ parseDynamicFlags
     => Logger
     -> DynFlags
     -> [Located String]
-    -> m (DynFlags, [Located String], [Warn])
+    -> m (DynFlags, [Located String], Messages DriverMessage)
 parseDynamicFlags logger dflags cmdline = do
   (dflags1, leftovers, warns) <- parseDynamicFlagsCmdLine dflags cmdline
   -- flags that have just been read are used by the logger when loading package
@@ -939,7 +965,8 @@ checkNewDynFlags logger dflags = do
   let (dflags', warnings) = makeDynFlagsConsistent dflags
   let diag_opts = initDiagOpts dflags
       print_config = initPrintConfig dflags
-  liftIO $ handleFlagWarnings logger print_config diag_opts (map (Warn WarningWithoutFlag) warnings)
+  liftIO $ printOrThrowDiagnostics logger print_config diag_opts
+    $ fmap GhcDriverMessage $ warnsToMessages diag_opts warnings
   return dflags'
 
 checkNewInteractiveDynFlags :: MonadIO m => Logger -> DynFlags -> m DynFlags
@@ -1133,7 +1160,7 @@ instance DesugaredMod DesugaredModule where
 
 type ParsedSource      = Located (HsModule GhcPs)
 type RenamedSource     = (HsGroup GhcRn, [LImportDecl GhcRn], Maybe [(LIE GhcRn, Avails)],
-                          Maybe (LHsDoc GhcRn))
+                          Maybe (LHsDoc GhcRn), Maybe (XRec GhcRn ModuleName))
 type TypecheckedSource = LHsBinds GhcTc
 
 -- NOTE:
@@ -1199,6 +1226,9 @@ typecheckModule pmod = do
    details <- makeSimpleDetails lcl_logger tc_gbl_env
    safe    <- finalSafeMode lcl_dflags tc_gbl_env
 
+   let !rdr_env = forceGlobalRdrEnv $ tcg_rdr_env tc_gbl_env
+   -- See Note [Forcing GREInfo] in GHC.Types.GREInfo.
+
    return $
      TypecheckedModule {
        tm_internals_          = (tc_gbl_env, details),
@@ -1209,7 +1239,7 @@ typecheckModule pmod = do
          ModuleInfo {
            minf_type_env  = md_types details,
            minf_exports   = md_exports details,
-           minf_rdr_env   = Just (tcg_rdr_env tc_gbl_env),
+           minf_rdr_env   = Just rdr_env,
            minf_instances = fixSafeInstances safe $ instEnvElts $ md_insts details,
            minf_iface     = Nothing,
            minf_safe      = safe,
@@ -1302,8 +1332,7 @@ compileCore simplify fn = do
           else
              return $ Right mod_guts
 
-     Nothing -> panic "compileToCoreModule: target FilePath not found in\
-                           module dependency graph"
+     Nothing -> panic "compileToCoreModule: target FilePath not found in module dependency graph"
   where -- two versions, based on whether we simplify (thus run tidyProgram,
         -- which returns a (CgGuts, ModDetails) pair, or not (in which case
         -- we just have a ModGuts.
@@ -1363,7 +1392,7 @@ getNamePprCtx = withSession $ \hsc_env -> do
 data ModuleInfo = ModuleInfo {
         minf_type_env  :: TypeEnv,
         minf_exports   :: [AvailInfo],
-        minf_rdr_env   :: Maybe GlobalRdrEnv,   -- Nothing for a compiled/package mod
+        minf_rdr_env   :: Maybe IfGlobalRdrEnv, -- Nothing for a compiled/package mod
         minf_instances :: [ClsInst],
         minf_iface     :: Maybe ModIface,
         minf_safe      :: SafeHaskellMode,
@@ -1389,40 +1418,45 @@ getPackageModuleInfo hsc_env mdl
             pte    = eps_PTE eps
             tys    = [ ty | name <- concatMap availNames avails,
                             Just ty <- [lookupTypeEnv pte name] ]
-        --
+
+        let !rdr_env = availsToGlobalRdrEnv hsc_env mdl avails
+        -- See Note [Forcing GREInfo] in GHC.Types.GREInfo.
+
         return (Just (ModuleInfo {
                         minf_type_env  = mkTypeEnv tys,
                         minf_exports   = avails,
-                        minf_rdr_env   = Just $! availsToGlobalRdrEnv (moduleName mdl) avails,
+                        minf_rdr_env   = Just rdr_env,
                         minf_instances = error "getModuleInfo: instances for package module unimplemented",
                         minf_iface     = Just iface,
                         minf_safe      = getSafeMode $ mi_trust iface,
                         minf_modBreaks = emptyModBreaks
                 }))
 
-availsToGlobalRdrEnv :: ModuleName -> [AvailInfo] -> GlobalRdrEnv
-availsToGlobalRdrEnv mod_name avails
-  = mkGlobalRdrEnv (gresFromAvails (Just imp_spec) avails)
+availsToGlobalRdrEnv :: HasDebugCallStack => HscEnv -> Module -> [AvailInfo] -> IfGlobalRdrEnv
+availsToGlobalRdrEnv hsc_env mod avails
+  = forceGlobalRdrEnv rdr_env
+    -- See Note [Forcing GREInfo] in GHC.Types.GREInfo.
   where
+    rdr_env = mkGlobalRdrEnv (gresFromAvails hsc_env (Just imp_spec) avails)
       -- We're building a GlobalRdrEnv as if the user imported
       -- all the specified modules into the global interactive module
     imp_spec = ImpSpec { is_decl = decl, is_item = ImpAll}
-    decl = ImpDeclSpec { is_mod = mod_name, is_as = mod_name,
+    decl = ImpDeclSpec { is_mod = mod, is_as = moduleName mod,
                          is_qual = False,
                          is_dloc = srcLocSpan interactiveSrcLoc }
-
 
 getHomeModuleInfo :: HscEnv -> Module -> IO (Maybe ModuleInfo)
 getHomeModuleInfo hsc_env mdl =
   case lookupHugByModule mdl (hsc_HUG hsc_env) of
     Nothing  -> return Nothing
     Just hmi -> do
-      let details = hm_details hmi
-          iface   = hm_iface hmi
+      let details  = hm_details hmi
+          iface    = hm_iface hmi
       return (Just (ModuleInfo {
                         minf_type_env  = md_types details,
                         minf_exports   = md_exports details,
-                        minf_rdr_env   = mi_globals $! hm_iface hmi,
+                        minf_rdr_env   = mi_globals $ hm_iface hmi,
+                         -- NB: already forced. See Note [Forcing GREInfo] in GHC.Types.GREInfo.
                         minf_instances = instEnvElts $ md_insts details,
                         minf_iface     = Just iface,
                         minf_safe      = getSafeMode $ mi_trust iface
@@ -1435,13 +1469,15 @@ modInfoTyThings minf = typeEnvElts (minf_type_env minf)
 
 modInfoTopLevelScope :: ModuleInfo -> Maybe [Name]
 modInfoTopLevelScope minf
-  = fmap (map greMangledName . globalRdrEnvElts) (minf_rdr_env minf)
+  = fmap (map greName . globalRdrEnvElts) (minf_rdr_env minf)
+  -- NB: no need to force this again.
+  -- See Note [Forcing GREInfo] in GHC.Types.GREInfo.
 
 modInfoExports :: ModuleInfo -> [Name]
 modInfoExports minf = concatMap availNames $! minf_exports minf
 
 modInfoExportsWithSelectors :: ModuleInfo -> [Name]
-modInfoExportsWithSelectors minf = concatMap availNamesWithSelectors $! minf_exports minf
+modInfoExportsWithSelectors minf = concatMap availNames $! minf_exports minf
 
 -- | Returns the instances defined by the specified module.
 -- Warning: currently unimplemented for package modules.
@@ -1471,7 +1507,7 @@ modInfoLookupName minf name = withSession $ \hsc_env -> do
 modInfoIface :: ModuleInfo -> Maybe ModIface
 modInfoIface = minf_iface
 
-modInfoRdrEnv :: ModuleInfo -> Maybe GlobalRdrEnv
+modInfoRdrEnv :: ModuleInfo -> Maybe IfGlobalRdrEnv
 modInfoRdrEnv = minf_rdr_env
 
 -- | Retrieve module safe haskell mode
@@ -1668,6 +1704,7 @@ findModule mod_name maybe_pkg = do
 
 findQualifiedModule :: GhcMonad m => PkgQual -> ModuleName -> m Module
 findQualifiedModule pkgqual mod_name = withSession $ \hsc_env -> do
+  liftIO $ trace_if (hsc_logger hsc_env) (text "findQualifiedModule" <+> ppr mod_name <+> ppr pkgqual)
   let mhome_unit = hsc_home_unit_maybe hsc_env
   let dflags    = hsc_dflags hsc_env
   case pkgqual of
@@ -1730,7 +1767,8 @@ lookupQualifiedModule NoPkgQual mod_name = withSession $ \hsc_env -> do
 lookupQualifiedModule pkgqual mod_name = findQualifiedModule pkgqual mod_name
 
 lookupLoadedHomeModule :: GhcMonad m => UnitId -> ModuleName -> m (Maybe Module)
-lookupLoadedHomeModule uid mod_name = withSession $ \hsc_env ->
+lookupLoadedHomeModule uid mod_name = withSession $ \hsc_env -> do
+  liftIO $ trace_if (hsc_logger hsc_env) (text "lookupLoadedHomeModule" <+> ppr mod_name <+> ppr uid)
   case lookupHug  (hsc_HUG hsc_env) uid mod_name  of
     Just mod_info      -> return (Just (mi_module (hm_iface mod_info)))
     _not_a_home_module -> return Nothing
@@ -1957,7 +1995,8 @@ instance Exception GhcApiError
 mkApiErr :: DynFlags -> SDoc -> GhcApiError
 mkApiErr dflags msg = GhcApiError (showSDoc dflags msg)
 
---
+
+#if !defined(javascript_HOST_ARCH)
 foreign import ccall unsafe "keepCAFsForGHCi"
     c_keepCAFsForGHCi   :: IO Bool
-
+#endif

@@ -37,7 +37,6 @@ import Text.Parsec.Combinator as P
 import Text.Parsec.Char as P
 import Control.Monad.Except
 import UserSettings
-import Oracles.Flag
 
 
 flavourTransformers :: Map String (Flavour -> Flavour)
@@ -47,7 +46,8 @@ flavourTransformers = M.fromList
     , "ticky_ghc"        =: enableTickyGhc
     , "split_sections"   =: splitSections
     , "no_split_sections" =: noSplitSections
-    , "thread_sanitizer" =: enableThreadSanitizer
+    , "thread_sanitizer" =: enableThreadSanitizer False
+    , "thread_sanitizer_cmm" =: enableThreadSanitizer True
     , "llvm"             =: viaLlvmBackend
     , "profiled_ghc"     =: enableProfiledGhc
     , "no_dynamic_ghc"   =: disableDynamicGhcPrograms
@@ -59,8 +59,8 @@ flavourTransformers = M.fromList
     , "fully_static"     =: fullyStatic
     , "collect_timings"  =: collectTimings
     , "assertions"       =: enableAssertions
-    , "debug_ghc"        =: debugGhc Stage1
-    , "debug_stage1_ghc" =: debugGhc stage0InTree
+    , "debug_ghc"        =: debugGhc Stage2
+    , "debug_stage1_ghc" =: debugGhc Stage1
     , "lint"             =: enableLinting
     , "haddock"          =: enableHaddock
     , "hi_core"          =: enableHiCore
@@ -112,7 +112,7 @@ parseFlavour baseFlavours transformers str =
 
 -- | Add arguments to the 'args' of a 'Flavour'.
 addArgs :: Args -> Flavour -> Flavour
-addArgs args' fl = fl { args = args fl <> args' }
+addArgs args' fl = fl { extraArgs = extraArgs fl <> args' }
 
 -- | Turn on -Werror for packages built with the stage1 compiler.
 -- It mimics the CI settings so is useful to turn on when developing.
@@ -123,21 +123,37 @@ addArgs args' fl = fl { args = args fl <> args' }
 -- from warnings.
 werror :: Flavour -> Flavour
 werror =
-  addArgs
-    ( builder Ghc
+  addArgs $ mconcat
+    [ builder Ghc
         ? notStage0
         ? mconcat
           [ arg "-Werror"
             -- unix has many unused imports
           , package unix
               ? mconcat [arg "-Wwarn=unused-imports", arg "-Wwarn=unused-top-binds"]
+            -- semaphore-compat relies on sem_getvalue as provided by unix, which is
+            -- not implemented on Darwin and therefore throws a deprecation warning
+          , package semaphoreCompat
+              ? mconcat [arg "-Wwarn=deprecations"]
           ]
-    )
+    , builder Ghc
+        ? package rts
+        ? mconcat
+          [ arg "-optc-Werror"
+            -- clang complains about #pragma GCC pragmas
+          , arg "-optc-Wno-error=unknown-pragmas"
+            -- rejected inlinings are highly dependent upon toolchain and way
+          , arg "-optc-Wno-error=inline"
+          ]
+      -- N.B. We currently don't build the boot libraries' C sources with -Werror
+      -- as this tends to be a portability nightmare.
+    ]
 
 -- | Build C and Haskell objects with debugging information.
 enableDebugInfo :: Flavour -> Flavour
 enableDebugInfo = addArgs $ notStage0 ? mconcat
-    [ builder (Ghc CompileHs) ? arg "-g3"
+    [ builder (Ghc CompileHs) ? pure ["-g3"]
+    , builder (Ghc CompileCWithGhc) ? pure ["-optc-g3"]
     , builder (Cc CompileC) ? arg "-g3"
     , builder (Cabal Setup) ? arg "--disable-library-stripping"
     , builder (Cabal Setup) ? arg "--disable-executable-stripping"
@@ -145,11 +161,13 @@ enableDebugInfo = addArgs $ notStage0 ? mconcat
 
 -- | Enable the ticky-ticky profiler in stage2 GHC
 enableTickyGhc :: Flavour -> Flavour
-enableTickyGhc =
-    addArgs $ orM [stage1, cross] ? mconcat
+enableTickyGhc f =
+    (addArgs (orM [stage1, cross] ? mconcat
       [ builder (Ghc CompileHs) ? tickyArgs
       , builder (Ghc LinkHs) ? tickyArgs
-      ]
+      ]) f) { ghcThreaded = (< Stage2) }
+      -- Build single-threaded ghc because ticky profiling is racy with threaded
+      -- RTS and the C counters are disabled. (See #23439)
 
 tickyArgs :: Args
 tickyArgs = mconcat
@@ -201,32 +219,47 @@ noSplitSections f = f { ghcSplitSections = False }
 
 -- | Build GHC and libraries with ThreadSanitizer support. You likely want to
 -- configure with @--disable-large-address-space@ when using this.
-enableThreadSanitizer :: Flavour -> Flavour
-enableThreadSanitizer = addArgs $ notStage0 ? mconcat
-    [ builder (Ghc CompileHs) ? (arg "-optc-fsanitize=thread" <> arg "-fcmm-thread-sanitizer")
-    , builder (Ghc CompileCWithGhc) ? arg "-optc-fsanitize=thread"
+enableThreadSanitizer :: Bool -> Flavour -> Flavour
+enableThreadSanitizer instrumentCmm = addArgs $ notStage0 ? mconcat
+    [ instrumentCmm ? builder (Ghc CompileCWithGhc) ? arg "-optc-fsanitize=thread"
+
     , builder (Ghc LinkHs) ? (arg "-optc-fsanitize=thread" <> arg "-optl-fsanitize=thread")
     , builder Cc ? arg "-fsanitize=thread"
     , builder (Cabal Flags) ? arg "thread-sanitizer"
     , builder Testsuite ? arg "--config=have_thread_sanitizer=True"
+    , builder (Ghc CompileHs) ? mconcat
+        [ package pkg ? (arg "-optc-fsanitize=thread" <> arg "-fcmm-thread-sanitizer")
+        | pkg <- [base, ghcPrim, array, rts]
+        ]
     ]
 
 -- | Use the LLVM backend in stages 1 and later.
 viaLlvmBackend :: Flavour -> Flavour
 viaLlvmBackend = addArgs $ notStage0 ? builder Ghc ? arg "-fllvm"
 
--- | Build the GHC executable with profiling enabled in stages 1 and later. It
+-- | Build the GHC executable with profiling enabled in stages 2 and later. It
 -- is also recommended that you use this with @'dynamicGhcPrograms' = False@
 -- since GHC does not support loading of profiled libraries with the
 -- dynamically-linker.
 enableProfiledGhc :: Flavour -> Flavour
 enableProfiledGhc flavour =
-    enableLateCCS flavour { rtsWays = do
-                ws <- rtsWays flavour
-                pure $ (Set.map (\w -> if wayUnit Dynamic w then w else w <> profiling) ws) <> ws
-            , libraryWays = (Set.singleton profiling <>) <$> (libraryWays flavour)
-            , ghcProfiled = (>= Stage1)
-            }
+  enableLateCCS flavour
+    { rtsWays = do
+        ws <- rtsWays flavour
+        mconcat
+          [ pure ws
+          , buildingCompilerStage' (>= Stage2) ? pure (foldMap profiled_ways ws)
+          ]
+    , libraryWays = mconcat
+        [ libraryWays flavour
+        , buildingCompilerStage' (>= Stage2) ? pure (Set.singleton profiling)
+        ]
+    , ghcProfiled = (>= Stage2)
+    }
+    where
+      profiled_ways w
+        | wayUnit Dynamic w = Set.empty
+        | otherwise         = Set.singleton (w <> profiling)
 
 -- | Disable 'dynamicGhcPrograms'.
 disableDynamicGhcPrograms :: Flavour -> Flavour
@@ -342,11 +375,14 @@ collectTimings =
 
 -- | Build ghc with debug rts (i.e. -debug) in and after this stage
 debugGhc :: Stage -> Flavour -> Flavour
-debugGhc stage f = f
-  { ghcDebugged = (>= stage)
+debugGhc ghcStage f = f
+  { ghcDebugged = (>= ghcStage)
   , rtsWays = do
       ws <- rtsWays f
-      pure $ (Set.map (\w -> w <> debug) ws) <> ws
+      mconcat
+        [ pure ws
+        , buildingCompilerStage' (>= ghcStage) ? pure (Set.map (<> debug) ws)
+        ]
   }
 
 -- * CLI and <root>/hadrian.settings options
@@ -446,7 +482,7 @@ applySetting (KeyVal ks op v) = case runSettingsM ks builderPredicate of
   Left err -> throwError $
       "error while setting `" ++ intercalate "`." ks ++ ": " ++ err
   Right pred -> Right $ \flav -> flav
-    { args = update (args flav) pred }
+    { extraArgs = update (extraArgs flav) pred }
 
   where override arguments predicate = do
           holds <- predicate

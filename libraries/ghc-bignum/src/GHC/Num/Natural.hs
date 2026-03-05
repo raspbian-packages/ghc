@@ -8,7 +8,109 @@
 #include "MachDeps.h"
 #include "WordSize.h"
 
-module GHC.Num.Natural where
+module GHC.Num.Natural
+    ( Natural(..)
+    , naturalCheck#
+    , naturalCheck
+
+      -- * Useful constants
+    , naturalZero
+    , naturalOne
+
+      -- * Predicates
+    , naturalIsZero
+    , naturalIsOne
+    , naturalIsPowerOf2#
+
+      -- * Conversion with...
+      -- ** 'BigNat'
+    , naturalFromBigNat#
+    , naturalToBigNat#
+      -- ** 'Word'
+    , naturalFromWord#
+    , naturalFromWord2#
+    , naturalFromWord
+    , naturalToWord#
+    , naturalToWord
+    , naturalToWordClamp#
+    , naturalToWordClamp
+    , naturalToWordMaybe#
+      -- ** Limbs
+    , naturalFromWordList
+    , naturalToMutableByteArray#
+    , naturalFromByteArray#
+      -- ** Floating point
+    , naturalEncodeDouble#
+    , naturalEncodeFloat#
+      -- ** 'Addr#'
+    , naturalToAddr#
+    , naturalToAddr
+    , naturalFromAddr#
+    , naturalFromAddr
+
+      -- * Comparison
+    , naturalEq#
+    , naturalEq
+    , naturalNe#
+    , naturalNe
+    , naturalGe#
+    , naturalGe
+    , naturalLe#
+    , naturalLe
+    , naturalGt#
+    , naturalGt
+    , naturalLt#
+    , naturalLt
+    , naturalCompare
+
+      -- * Bit operations
+    , naturalPopCount#
+    , naturalPopCount
+    , naturalShiftR#
+    , naturalShiftR
+    , naturalShiftL#
+    , naturalShiftL
+    , naturalAnd
+    , naturalAndNot
+    , naturalOr
+    , naturalXor
+    , naturalTestBit#
+    , naturalTestBit
+    , naturalBit#
+    , naturalBit
+    , naturalSetBit#
+    , naturalSetBit
+    , naturalClearBit#
+    , naturalClearBit
+    , naturalComplementBit#
+    , naturalComplementBit
+
+      -- * Arithmetic
+    , naturalAdd
+    , naturalSub
+    , naturalSubThrow
+    , naturalSubUnsafe
+    , naturalMul
+    , naturalSqr
+    , naturalSignum
+    , naturalNegate
+    , naturalQuotRem#
+    , naturalQuotRem
+    , naturalQuot
+    , naturalRem
+    , naturalGcd
+    , naturalLcm
+    , naturalLog2#
+    , naturalLog2
+    , naturalLogBaseWord#
+    , naturalLogBaseWord
+    , naturalLogBase#
+    , naturalLogBase
+    , naturalPowMod
+
+      -- * Miscellaneous
+    , naturalSizeInBase#
+    ) where
 
 import GHC.Prim
 import GHC.Types
@@ -386,7 +488,7 @@ naturalAndNot :: Natural -> Natural -> Natural
 {-# NOINLINE naturalAndNot #-}
 naturalAndNot (NS n) (NS m) = NS (n `and#` not# m)
 naturalAndNot (NS n) (NB m) = NS (n `and#` not# (bigNatToWord# m))
-naturalAndNot (NB n) (NS m) = NS (bigNatToWord# n `and#` not# m)
+naturalAndNot (NB n) (NS m) = NB (bigNatAndNotWord# n m)
 naturalAndNot (NB n) (NB m) = naturalFromBigNat# (bigNatAndNot n m)
 
 naturalOr :: Natural -> Natural -> Natural

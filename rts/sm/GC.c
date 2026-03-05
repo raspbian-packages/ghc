@@ -341,8 +341,8 @@ GarbageCollect (struct GcConfig config,
   // attribute any costs to CCS_GC
 #if defined(PROFILING)
   for (n = 0; n < getNumCapabilities(); n++) {
-      save_CCS[n] = getCapability(n)->r.rCCCS;
-      getCapability(n)->r.rCCCS = CCS_GC;
+      save_CCS[n] = RELAXED_LOAD(&getCapability(n)->r.rCCCS);
+      RELAXED_STORE(&getCapability(n)->r.rCCCS, CCS_GC);
   }
 #endif
 
@@ -355,7 +355,7 @@ GarbageCollect (struct GcConfig config,
   deadlock_detect_gc = config.deadlock_detect;
 
 #if defined(THREADED_RTS)
-  if (major_gc && RtsFlags.GcFlags.useNonmoving && RELAXED_LOAD(&concurrent_coll_running)) {
+  if (major_gc && RtsFlags.GcFlags.useNonmoving && nonmovingConcurrentMarkIsRunning()) {
       /* If there is already a concurrent major collection running then
        * there is no benefit to starting another.
        * TODO: Catch heap-size runaway.
@@ -875,7 +875,9 @@ GarbageCollect (struct GcConfig config,
       ASSERT(oldest_gen->old_weak_ptr_list == NULL);
 
 #if defined(THREADED_RTS)
-      concurrent = !config.nonconcurrent;
+      // Concurrent collection is currently incompatible with heap profiling.
+      // See Note [Non-concurrent nonmoving collector heap census]
+      concurrent = !config.nonconcurrent && !RtsFlags.ProfFlags.doHeapProfile;
 #else
       // In the non-threaded runtime this is the only time we push to the
       // upd_rem_set
@@ -980,9 +982,9 @@ GarbageCollect (struct GcConfig config,
   // Post ticky counter sample.
   // We do this at the end of execution since tickers are registered in the
   // course of program execution.
-  if (performTickySample) {
+  if (RELAXED_LOAD(&performTickySample)) {
       emitTickyCounterSamples();
-      performTickySample = false;
+      RELAXED_STORE(&performTickySample, false);
   }
 #endif
 
@@ -997,14 +999,45 @@ GarbageCollect (struct GcConfig config,
   commitMBlockFreeing();
 
   if (major_gc) {
-      W_ need_prealloc, need_live, need, got;
+      W_ need_prealloc, need_copied_live, need_uncopied_live, need, got, extra_needed;
       uint32_t i;
 
-      need_live = 0;
+      need_copied_live = 0;
+      need_uncopied_live = 0;
       for (i = 0; i < RtsFlags.GcFlags.generations; i++) {
-          need_live += genLiveBlocks(&generations[i]);
+          need_copied_live += genLiveCopiedWords(&generations[i]);
+          need_uncopied_live += genLiveUncopiedWords(&generations[i]);
       }
-      need_live = stg_max(RtsFlags.GcFlags.minOldGenSize, need_live);
+
+      // Convert the live words into live blocks
+      // See Note [Statistics for retaining memory]
+      need_copied_live = BLOCK_ROUND_UP(need_copied_live) / BLOCK_SIZE_W;
+      need_uncopied_live = BLOCK_ROUND_UP(need_uncopied_live) / BLOCK_SIZE_W;
+
+      debugTrace(DEBUG_gc, "(before) copied_live: %d; uncopied_live: %d", need_copied_live, need_uncopied_live );
+
+
+      // minOldGenSize states that the size of the oldest generation must be at least
+      // as big as a certain value, so make sure to save enough memory for that.
+      extra_needed = 0;
+      if (RtsFlags.GcFlags.minOldGenSize >= need_copied_live + need_uncopied_live){
+        extra_needed = RtsFlags.GcFlags.minOldGenSize - (need_copied_live + need_uncopied_live);
+      }
+      debugTrace(DEBUG_gc, "(minOldGen: %d; extra_needed: %d", RtsFlags.GcFlags.minOldGenSize, extra_needed);
+
+      // If oldest gen is uncopying in some manner (compact or non-moving) then
+      // add the extra requested by minOldGenSize to uncopying portion of memory.
+      // Otherwise, the last generation is copying so add it to copying portion.
+      if (oldest_gen -> compact || RtsFlags.GcFlags.useNonmoving) {
+        need_uncopied_live += extra_needed;
+      }
+      else {
+        need_copied_live += extra_needed;
+      }
+
+      ASSERT(need_uncopied_live + need_copied_live >= RtsFlags.GcFlags.minOldGenSize );
+
+      debugTrace(DEBUG_gc, "(after) copied_live: %d; uncopied_live: %d", need_copied_live, need_uncopied_live );
 
       need_prealloc = 0;
       for (i = 0; i < n_nurseries; i++) {
@@ -1030,14 +1063,19 @@ GarbageCollect (struct GcConfig config,
 
       debugTrace(DEBUG_gc, "factors: %f %d %f", RtsFlags.GcFlags.oldGenFactor, consec_idle_gcs, scaled_factor  );
 
-      // Unavoidable need depends on GC strategy
+      // Unavoidable need for copying memory depends on GC strategy
       // * Copying need 2 * live
       // * Compacting need 1.x * live (we choose 1.2)
-      // * Nonmoving needs ~ 1.x * live
-      double unavoidable_need_factor = (oldest_gen->compact || RtsFlags.GcFlags.useNonmoving)
-                                          ? 1.2 : 2;
-      W_ scaled_needed = (scaled_factor + unavoidable_need_factor) * need_live;
-      debugTrace(DEBUG_gc, "factors_2: %f %d", unavoidable_need_factor, scaled_needed);
+      double unavoidable_copied_need_factor = (oldest_gen->compact)
+                                              ? 1.2 : 2;
+
+      // Unmoving blocks (compacted, pinned, nonmoving GC blocks) are not going
+      // to be copied so don't need to save 2* the memory for them.
+      double unavoidable_uncopied_need_factor = 1.2;
+
+      W_ scaled_needed = ((scaled_factor + unavoidable_copied_need_factor) * need_copied_live)
+                       + ((scaled_factor + unavoidable_uncopied_need_factor) * need_uncopied_live);
+      debugTrace(DEBUG_gc, "factors_2: %f %f", ((scaled_factor + unavoidable_copied_need_factor) * need_copied_live), ((scaled_factor + unavoidable_uncopied_need_factor) * need_uncopied_live));
       need = need_prealloc + scaled_needed;
 
       /* Also, if user set heap size, do not drop below it.
@@ -1282,7 +1320,7 @@ dec_running (void)
     ACQUIRE_LOCK(&gc_running_mutex);
 #endif
 
-    StgWord r = atomic_dec(&gc_running_threads);
+    StgWord r = atomic_dec(&gc_running_threads, 1);
 
 #if defined(THREADED_RTS)
     if (r == 0) {
@@ -1481,7 +1519,6 @@ waitForGcThreads (Capability *cap, bool idle_cap[])
             if (i == me || idle_cap[i]) { continue; }
             if (SEQ_CST_LOAD(&gc_threads[i]->wakeup) != GC_THREAD_STANDING_BY) {
                 prodCapability(getCapability(i), cap->running_task);
-                write_barrier();
                 interruptCapability(getCapability(i));
             }
         }
@@ -2393,4 +2430,40 @@ bool doIdleGCWork(Capability *cap STG_UNUSED, bool all)
  * of "idleness".
  *
 
+*/
+
+/* Note [Statistics for retaining memory]
+*  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+*
+* At the end of GC, we want to determine the size of the heap in order to
+* determine the amount of memory we wish to return to the OS, or if we want
+* to increase the heap size to the minimum.
+*
+* There's two promising candidates for this metric: live words, and live blocks.
+*
+* Measuring live blocks is promising because blocks are the smallest unit
+* that the storage manager can (de)allocate.
+* Most of the time live words and live blocks are very similar.
+*
+* But the two metrics can come apart when the heap is dominated
+* by small pinned objects, or when using the non-moving collector.
+*
+* In both cases, this happens because objects cannot be copied, so
+* block occupancy can fall as objects in a block become garbage.
+* In situations like this, using live blocks to determine memory
+* retention behaviour can lead to us being overly conservative.
+*
+* Instead we use live words rounded up to the block size to measure
+* heap size. This gives us a more accurate picture of the heap.
+*
+* This works particularly well with the nonmoving collector as we
+* can reuse the space taken up by dead heap objects. This choice is less good
+* for fragmentation caused by a few pinned objects retaining blocks.
+* In that case, the block can only be reused if it is deallocated in its entirety.
+* And therefore using live blocks would be more accurate in this case.
+* We assume that this is relatively rare and when it does happen,
+* this fragmentation is a problem that should be addressed in its own right.
+*
+* See: #23397
+*
 */

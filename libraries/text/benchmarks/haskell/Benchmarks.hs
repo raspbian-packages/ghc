@@ -10,6 +10,7 @@ import System.FilePath ((</>))
 import System.IO
 
 #ifdef mingw32_HOST_OS
+import System.IO.Temp (emptySystemTempFile)
 import System.Directory (removeFile)
 #endif
 
@@ -19,7 +20,9 @@ import qualified Benchmarks.DecodeUtf8 as DecodeUtf8
 import qualified Benchmarks.EncodeUtf8 as EncodeUtf8
 import qualified Benchmarks.Equality as Equality
 import qualified Benchmarks.FileRead as FileRead
+import qualified Benchmarks.FileWrite as FileWrite
 import qualified Benchmarks.FoldLines as FoldLines
+import qualified Benchmarks.Micro as Micro
 import qualified Benchmarks.Multilang as Multilang
 import qualified Benchmarks.Pure as Pure
 import qualified Benchmarks.ReadNumbers as ReadNumbers
@@ -38,11 +41,11 @@ import qualified Benchmarks.Programs.Throughput as Programs.Throughput
 mkSink :: IO (FilePath, Handle)
 mkSink = do
 #ifdef mingw32_HOST_OS
-    (sinkFn, sink) <- openTempFile "." "dev.null"
+    sinkFn <- emptySystemTempFile "dev.null"
 #else
     let sinkFn = "/dev/null"
-    sink <- openFile sinkFn  WriteMode
 #endif
+    sink <- openFile sinkFn WriteMode
     hSetEncoding sink utf8
     pure (sinkFn, sink)
 
@@ -58,9 +61,13 @@ main = do
     let tf = ("benchmarks/text-test-data" </>)
     -- Cannot use envWithCleanup, because there is no instance NFData Handle
     (sinkFn, sink) <- mkSink
+    (fileWriteBenchmarks, fileWriteCleanup) <- FileWrite.mkFileWriteBenchmarks $ do
+      (fp, h) <- mkSink
+      return (h, rmSink fp)
     defaultMain
         [ Builder.benchmark
         , Concat.benchmark
+        , Micro.benchmark
         , bgroup "DecodeUtf8"
             [ env (DecodeUtf8.initEnv (tf "libya-chinese.html")) (DecodeUtf8.benchmark "html")
             , env (DecodeUtf8.initEnv (tf "yiwiki.xml")) (DecodeUtf8.benchmark "xml")
@@ -75,6 +82,7 @@ main = do
             ]
         , env (Equality.initEnv (tf "japanese.txt")) Equality.benchmark
         , FileRead.benchmark (tf "russian.txt")
+        , fileWriteBenchmarks
         , FoldLines.benchmark (tf "russian.txt")
         , Multilang.benchmark
         , bgroup "Pure"
@@ -100,3 +108,4 @@ main = do
             ]
         ]
     rmSink sinkFn
+    fileWriteCleanup

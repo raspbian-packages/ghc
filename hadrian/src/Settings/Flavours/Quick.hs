@@ -15,7 +15,7 @@ import {-# SOURCE #-} Settings.Default
 quickFlavour :: Flavour
 quickFlavour = defaultFlavour
     { name        = "quick"
-    , args        = defaultBuilderArgs <> quickArgs <> defaultPackageArgs
+    , extraArgs        = quickArgs
     , libraryWays = Set.fromList <$>
                     mconcat
                     [ pure [vanilla]
@@ -42,5 +42,5 @@ quickArgs = sourceArgs SourceArgs
 quickDebugFlavour :: Flavour
 quickDebugFlavour = quickFlavour
     { name = "quick-debug"
-    , ghcDebugged = (>= Stage1)
+    , ghcDebugged = (>= Stage2)
     }

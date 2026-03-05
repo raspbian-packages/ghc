@@ -7,18 +7,18 @@
 -- Portability : tested on GHC only
 --
 
-{-# LANGUAGE BangPatterns        #-}
-{-# LANGUAGE PackageImports      #-}
-{-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE MagicHash           #-}
-
 module Main (main) where
 
 import           Data.Foldable                         (foldMap)
 import           Data.Monoid
+import           Data.Semigroup
 import           Data.String
 import           Test.Tasty.Bench
+
 import           Prelude                               hiding (words)
+import qualified Data.List                             as List
+import           Control.DeepSeq
+import           Control.Exception
 
 import qualified Data.ByteString                       as S
 import qualified Data.ByteString.Char8                 as S8
@@ -26,16 +26,17 @@ import qualified Data.ByteString.Lazy                  as L
 import qualified Data.ByteString.Lazy.Char8            as L8
 
 import           Data.ByteString.Builder
-import           Data.ByteString.Builder.Extra         (byteStringCopy,
-                                                        byteStringInsert,
-                                                        intHost)
-import           Data.ByteString.Builder.Internal      (ensureFree)
+import qualified Data.ByteString.Builder.Extra         as Extra
+import qualified Data.ByteString.Builder.Internal      as BI
 import           Data.ByteString.Builder.Prim          (BoundedPrim, FixedPrim,
                                                         (>$<))
 import qualified Data.ByteString.Builder.Prim          as P
 import qualified Data.ByteString.Builder.Prim.Internal as PI
 
 import           Foreign
+import           Foreign.ForeignPtr
+import qualified GHC.Exts as Exts
+import           GHC.Ptr (Ptr(..))
 
 import System.Random
 
@@ -43,6 +44,7 @@ import BenchBoundsCheckFusion
 import BenchCount
 import BenchCSV
 import BenchIndices
+import BenchReadInt
 import BenchShort
 
 ------------------------------------------------------------------------------
@@ -97,9 +99,12 @@ lazyByteStringData = case S.splitAt (nRepl `div` 2) byteStringData of
 
 {-# NOINLINE smallChunksData #-}
 smallChunksData :: L.ByteString
-smallChunksData
-  = L.fromChunks [S.take sz (S.drop n byteStringData)
-                 | let sz = 48, n <- [0, sz .. S.length byteStringData]]
+smallChunksData = L.fromChunks $ List.unfoldr step (byteStringData, 1)
+  where
+    step (!s, !i)
+      | S.null s = Nothing
+      | otherwise = case S.splitAt i s of
+          (!s1, !s2) -> Just (s1, (s2, i * 71 `mod` 97))
 
 {-# NOINLINE byteStringChunksData #-}
 byteStringChunksData :: [S.ByteString]
@@ -119,15 +124,45 @@ loremIpsum = S8.unlines $ map S8.pack
 -- benchmark wrappers
 ---------------------
 
-{-# INLINE benchB #-}
 benchB :: String -> a -> (a -> Builder) -> Benchmark
-benchB name x b =
-    bench (name ++" (" ++ show nRepl ++ ")") $
-        whnf (L.length . toLazyByteString . b) x
+{-# INLINE benchB #-}
+benchB name x b = benchB' (name ++" (" ++ show nRepl ++ ")") x b
 
-{-# INLINE benchB' #-}
 benchB' :: String -> a -> (a -> Builder) -> Benchmark
-benchB' name x b = bench name $ whnf (L.length . toLazyByteString . b) x
+{-# INLINE benchB' #-}
+benchB' name x mkB =
+  env (BI.newBuffer BI.defaultChunkSize) $ \buf ->
+    bench name $ whnfAppIO (runBuildStepOn buf . BI.runBuilder . mkB) x
+
+benchB'_ :: String -> Builder -> Benchmark
+{-# INLINE benchB'_ #-}
+benchB'_ name b =
+  env (BI.newBuffer BI.defaultChunkSize) $ \buf ->
+    bench name $ whnfIO (runBuildStepOn buf (BI.runBuilder b))
+
+-- | @runBuilderOn@ runs a @BuildStep@'s actions all on the same @Buffer@.
+-- It is used to avoid measuring driver allocation overhead.
+runBuildStepOn :: BI.Buffer -> BI.BuildStep () -> IO ()
+{-# NOINLINE runBuildStepOn #-}
+runBuildStepOn (BI.Buffer fp br@(BI.BufferRange op ope)) b = go b
+  where
+    !len = ope `minusPtr` op
+
+    go :: BI.BuildStep () -> IO ()
+    go bs = BI.fillWithBuildStep bs doneH fullH insertChunkH br
+
+    doneH :: Ptr Word8 -> () -> IO ()
+    doneH _ _ = touchForeignPtr fp
+    -- 'touchForeignPtr' is adequate because the given BuildStep
+    -- will always terminate. (We won't measure an infinite loop!)
+
+    fullH :: Ptr Word8 -> Int -> BI.BuildStep () -> IO ()
+    fullH _ minLen nextStep
+      | len < minLen = throwIO (ErrorCall "runBuilderOn: action expects too long of a BufferRange")
+      | otherwise    = go nextStep
+
+    insertChunkH :: Ptr Word8 -> S.ByteString -> BI.BuildStep () -> IO ()
+    insertChunkH _ _ nextStep = go nextStep
 
 {-# INLINE benchBInts #-}
 benchBInts :: String -> ([Int] -> Builder) -> Benchmark
@@ -245,18 +280,53 @@ largeTraversalInput = S.concat (replicate 10 byteStringData)
 smallTraversalInput :: S.ByteString
 smallTraversalInput = S8.pack "The quick brown fox"
 
+asciiBuf, utf8Buf, halfNullBuf, allNullBuf :: Ptr Word8
+asciiBuf = Ptr "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"#
+utf8Buf  = Ptr "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\xc0\x80xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"#
+halfNullBuf = Ptr "\xc0\x80xx\xc0\x80x\xc0\x80\xc0\x80x\xc0\x80\xc0\x80xx\xc0\x80\xc0\x80xxx\xc0\x80x\xc0\x80x\xc0\x80\xc0\x80\xc0\x80\xc0\x80\xc0\x80\xc0\x80xxx\xc0\x80x\xc0\x80xx\xc0\x80\xc0\x80xxxxxxxxxx\xc0\x80\xc0\x80\xc0\x80\xc0\x80\xc0\x80x\xc0\x80\xc0\x80x\xc0\x80\xc0\x80\xc0\x80\xc0\x80\xc0\x80xxx"#
+allNullBuf  = Ptr "\xc0\x80\xc0\x80\xc0\x80\xc0\x80\xc0\x80\xc0\x80\xc0\x80\xc0\x80\xc0\x80\xc0\x80\xc0\x80\xc0\x80\xc0\x80\xc0\x80\xc0\x80\xc0\x80\xc0\x80\xc0\x80\xc0\x80\xc0\x80\xc0\x80\xc0\x80\xc0\x80\xc0\x80\xc0\x80\xc0\x80\xc0\x80\xc0\x80\xc0\x80\xc0\x80\xc0\x80\xc0\x80\xc0\x80\xc0\x80\xc0\x80\xc0\x80\xc0\x80\xc0\x80\xc0\x80\xc0\x80\xc0\x80\xc0\x80\xc0\x80\xc0\x80\xc0\x80\xc0\x80\xc0\x80\xc0\x80\xc0\x80\xc0\x80\xc0\x80\xc0\x80\xc0\x80\xc0\x80\xc0\x80\xc0\x80\xc0\x80\xc0\x80\xc0\x80\xc0\x80\xc0\x80\xc0\x80\xc0\x80\xc0\x80"#
+
+asciiLit, utf8Lit :: Ptr Word8 -> Builder
+asciiLit (Ptr p#) = P.cstring p#
+utf8Lit (Ptr p#) = P.cstringUtf8 p#
+
+asciiStr, utf8Str :: String
+asciiStr = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+utf8Str  = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\0xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
 main :: IO ()
 main = do
   defaultMain
     [ bgroup "Data.ByteString.Builder"
       [ bgroup "Small payload"
-        [ benchB' "mempty"        ()  (const mempty)
-        , benchB' "ensureFree 8"  ()  (const (ensureFree 8))
-        , benchB' "intHost 1"     1   intHost
-        , benchB' "UTF-8 String (naive)" "hello world\0" fromString
-        , benchB' "UTF-8 String"  () $ \() -> P.cstringUtf8 "hello world\0"#
-        , benchB' "String (naive)" "hello world!" fromString
-        , benchB' "String"        () $ \() -> P.cstring "hello world!"#
+        [ benchB'_ "mempty" mempty
+        , bench "toLazyByteString mempty" $ nf toLazyByteString mempty
+        , benchB'_ "empty (10000 times)" $
+            stimes (10000 :: Int) (Exts.lazy BI.empty)
+        , benchB'_ "ensureFree 8" (BI.ensureFree 8)
+        , benchB'  "intHost 1" 1 Extra.intHost
+        , benchB'  "UTF-8 String (12B, naive)" "hello world\0" fromString
+        , benchB'_ "UTF-8 String (12B)" $ utf8Lit (Ptr "hello world\xc0\x80"#)
+        , benchB'  "UTF-8 String (64B, naive)" utf8Str fromString
+        , benchB'_ "UTF-8 String (64B, one null)" $ utf8Lit utf8Buf
+        , benchB'
+            "UTF-8 String (64B, one null, no shared work)"
+            utf8Buf
+            utf8Lit
+        , benchB'_ "UTF-8 String (64B, half nulls)" $ utf8Lit halfNullBuf
+        , benchB'_ "UTF-8 String (64B, all nulls)"  $ utf8Lit allNullBuf
+        , benchB'
+            "UTF-8 String (64B, all nulls, no shared work)"
+            allNullBuf
+            utf8Lit
+        , benchB'
+            "UTF-8 String (1 byte, no shared work)"
+            (Ptr "\xc0\x80"#)
+            utf8Lit
+        , benchB'  "ASCII String (12B, naive)" "hello world!" fromString
+        , benchB'_ "ASCII String (12B)" $ asciiLit (Ptr "hello wurld!"#)
+        , benchB'  "ASCII String (64B, naive)" asciiStr fromString
+        , benchB'_ "ASCII String (64B)" $ asciiLit asciiBuf
         ]
 
       , bgroup "Encoding wrappers"
@@ -273,11 +343,11 @@ main = do
         ]
       , bgroup "ByteString insertion" $
             [ benchB "foldMap byteStringInsert" byteStringChunksData
-                (foldMap byteStringInsert)
+                (foldMap Extra.byteStringInsert)
             , benchB "foldMap byteString" byteStringChunksData
                 (foldMap byteString)
             , benchB "foldMap byteStringCopy" byteStringChunksData
-                (foldMap byteStringCopy)
+                (foldMap Extra.byteStringCopy)
             ]
 
       , bgroup "Non-bounded encodings"
@@ -417,7 +487,25 @@ main = do
       [ bench "strict" $ nf S.tails byteStringData
       , bench "lazy"   $ nf L.tails lazyByteStringData
       ]
+    , bgroup "splitAtEnd (lazy)" $ let
+        testSAE op = \bs -> [op i bs | i <- [0,5..L.length bs]] `deepseq` ()
+        {-# INLINE testSAE #-}
+      in
+      [ bench "takeEnd" $
+          nf (testSAE L.takeEnd) lazyByteStringData
+      , bench "takeEnd (small chunks)" $
+          nf (testSAE L.takeEnd) smallChunksData
+      , bench "dropEnd" $
+          nf (testSAE L.dropEnd) lazyByteStringData
+      , bench "dropEnd (small chunks)" $
+          nf (testSAE L.dropEnd) smallChunksData
+      ]
     , bgroup "sort" $ map (\s -> bench (S8.unpack s) $ nf S.sort s) sortInputs
+    , bgroup "stimes" $ let  st = stimes :: Int -> S.ByteString -> S.ByteString
+     in
+      [ bench "strict (tiny)" $ whnf (st 4) (S8.pack "test")
+      , bench "strict (large)" $ whnf (st 50) byteStringData
+      ]
     , bgroup "words"
       [ bench "lorem ipsum" $ nf S8.words loremIpsum
       , bench "one huge word" $ nf S8.words byteStringData
@@ -490,5 +578,6 @@ main = do
     , benchCount
     , benchCSV
     , benchIndices
+    , benchReadInt
     , benchShort
     ]

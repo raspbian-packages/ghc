@@ -83,6 +83,10 @@
 	url = https://gitlab.haskell.org/ghc/packages/unix.git
 	ignore = untracked
 	branch = 2.7
+[submodule "libraries/semaphore-compat"]
+	path = libraries/semaphore-compat
+	url = https://gitlab.haskell.org/ghc/semaphore-compat.git
+	ignore = untracked
 [submodule "libraries/stm"]
 	path = libraries/stm
 	url = https://gitlab.haskell.org/ghc/packages/stm.git
@@ -110,3 +114,9 @@
 [submodule "libraries/exceptions"]
 	path = libraries/exceptions
 	url = https://gitlab.haskell.org/ghc/packages/exceptions.git
+[submodule "utils/hpc"]
+	path = utils/hpc
+	url = https://gitlab.haskell.org/hpc/hpc-bin.git
+[submodule "libraries/os-string"]
+	path = libraries/os-string
+	url = https://gitlab.haskell.org/ghc/packages/os-string

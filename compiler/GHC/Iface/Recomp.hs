@@ -24,7 +24,7 @@ import GHC.Data.FastString
 import GHC.Driver.Backend
 import GHC.Driver.Config.Finder
 import GHC.Driver.Env
-import GHC.Driver.Session
+import GHC.Driver.DynFlags
 import GHC.Driver.Ppr
 import GHC.Driver.Plugins
 
@@ -43,7 +43,6 @@ import GHC.Data.Maybe
 
 import GHC.Utils.Error
 import GHC.Utils.Panic
-import GHC.Utils.Panic.Plain
 import GHC.Utils.Outputable as Outputable
 import GHC.Utils.Misc as Utils
 import GHC.Utils.Binary
@@ -56,9 +55,9 @@ import GHC.Types.Annotations
 import GHC.Types.Name
 import GHC.Types.Name.Set
 import GHC.Types.SrcLoc
-import GHC.Types.Unique
 import GHC.Types.Unique.Set
 import GHC.Types.Fixity.Env
+import GHC.Types.Unique.Map
 import GHC.Unit.External
 import GHC.Unit.Finder
 import GHC.Unit.State
@@ -83,6 +82,7 @@ import GHC.List (uncons)
 import Data.Ord
 import Data.Containers.ListUtils
 import Data.Bifunctor
+import GHC.Iface.Errors.Ppr
 
 {-
   -----------------------------------------------
@@ -196,6 +196,7 @@ data RecompReason
   | MismatchedDynHiFile
   | ObjectsChanged
   | LibraryChanged
+  | THWithJS
   deriving (Eq)
 
 instance Outputable RecompReason where
@@ -228,6 +229,7 @@ instance Outputable RecompReason where
     MismatchedDynHiFile     -> text "Mismatched dynamic interface file"
     ObjectsChanged          -> text "Objects changed"
     LibraryChanged          -> text "Library changed"
+    THWithJS                -> text "JS backend always recompiles modules using Template Haskell for now (#23013)"
 
 recompileRequired :: RecompileRequired -> Bool
 recompileRequired UpToDate = False
@@ -292,8 +294,13 @@ check_old_iface hsc_env mod_summary maybe_iface
              read_result <- readIface read_dflags ncu (ms_mod mod_summary) iface_path
              case read_result of
                  Failed err -> do
-                     trace_if logger (text "FYI: cannot read old interface file:" $$ nest 4 err)
-                     trace_hi_diffs logger (text "Old interface file was invalid:" $$ nest 4 err)
+                     let msg = readInterfaceErrorDiagnostic err
+                     trace_if logger
+                       $ vcat [ text "FYI: cannot read old interface file:"
+                              , nest 4 msg ]
+                     trace_hi_diffs logger $
+                       vcat [ text "Old interface file was invalid:"
+                            , nest 4 msg ]
                      return Nothing
                  Succeeded iface -> do
                      trace_if logger (text "Read the interface file" <+> text iface_path)
@@ -559,8 +566,8 @@ checkMergedSignatures hsc_env mod_summary iface = do
     let logger     = hsc_logger hsc_env
     let unit_state = hsc_units hsc_env
     let old_merged = sort [ mod | UsageMergedRequirement{ usg_mod = mod } <- mi_usages iface ]
-        new_merged = case Map.lookup (ms_mod_name mod_summary)
-                                     (requirementContext unit_state) of
+        new_merged = case lookupUniqMap (requirementContext unit_state)
+                          (ms_mod_name mod_summary) of
                         Nothing -> []
                         Just r -> sort $ map (instModuleToModule unit_state) r
     if old_merged == new_merged
@@ -765,12 +772,12 @@ checkModUsage fc UsageFile{ usg_file_path = file,
                             usg_file_label = mlabel } =
   liftIO $
     handleIO handler $ do
-      new_hash <- lookupFileCache fc file
+      new_hash <- lookupFileCache fc $ unpackFS file
       if (old_hash /= new_hash)
          then return recomp
          else return UpToDate
  where
-   reason = FileChanged file
+   reason = FileChanged $ unpackFS file
    recomp  = needsRecompileBecause $ fromMaybe reason $ fmap CustomReason mlabel
    handler = if debugIsOn
       then \e -> pprTrace "UsageFile" (text (show e)) $ return recomp
@@ -956,7 +963,8 @@ addFingerprints hsc_env iface0
    eps <- hscEPS hsc_env
    let
        decls = mi_decls iface0
-       warn_fn = mkIfaceWarnCache (mi_warns iface0)
+       decl_warn_fn = mkIfaceDeclWarnCache (fromIfaceWarnings $ mi_warns iface0)
+       export_warn_fn = mkIfaceExportWarnCache (fromIfaceWarnings $ mi_warns iface0)
        fix_fn = mkIfaceFixCache (mi_fixities iface0)
 
         -- The ABI of a declaration represents everything that is made
@@ -979,8 +987,8 @@ addFingerprints hsc_env iface0
        -- This is computed by finding the free external names of each
        -- declaration, including IfaceDeclExtras (things that a
        -- declaration implicitly depends on).
-       edges :: [ Node Unique IfaceDeclABI ]
-       edges = [ DigraphNode abi (getUnique (getOccName decl)) out
+       edges :: [ Node OccName IfaceDeclABI ]
+       edges = [ DigraphNode abi (getOccName decl) out
                | decl <- decls
                , let abi = declABI decl
                , let out = localOccs $ freeNamesDeclABI abi
@@ -988,7 +996,7 @@ addFingerprints hsc_env iface0
 
        name_module n = assertPpr (isExternalName n) (ppr n) (nameModule n)
        localOccs =
-         map (getUnique . getParent . getOccName)
+         map (getParent . getOccName)
                         -- NB: names always use semantic module, so
                         -- filtering must be on the semantic module!
                         -- See Note [Identity versus semantic module]
@@ -1013,7 +1021,7 @@ addFingerprints hsc_env iface0
 
         -- Strongly-connected groups of declarations, in dependency order
        groups :: [SCC IfaceDeclABI]
-       groups = stronglyConnCompFromEdgedVerticesUniq edges
+       groups = stronglyConnCompFromEdgedVerticesOrd edges
 
        global_hash_fn = mkHashFun hsc_env eps
 
@@ -1205,7 +1213,11 @@ addFingerprints hsc_env iface0
 
        -- This key is safe because mi_extra_decls contains tidied things.
        getOcc (IfGblTopBndr b) = getOccName b
-       getOcc (IfLclTopBndr fs _ _ _) = mkVarOccFS fs
+       getOcc (IfLclTopBndr fs _ _ details) =
+        case details of
+          IfRecSelId { ifRecSelFirstCon = first_con }
+            -> mkRecFieldOccFS (getOccFS first_con) fs
+          _ -> mkVarOccFS fs
 
        binding_key (IfaceNonRec b _) = IfaceNonRec (getOcc b) ()
        binding_key (IfaceRec bs) = IfaceRec (map (\(b, _) -> (getOcc b, ())) bs)
@@ -1253,22 +1265,23 @@ addFingerprints hsc_env iface0
 
    let
     final_iface_exts = ModIfaceBackend
-      { mi_iface_hash  = iface_hash
-      , mi_mod_hash    = mod_hash
-      , mi_flag_hash   = flag_hash
-      , mi_opt_hash    = opt_hash
-      , mi_hpc_hash    = hpc_hash
-      , mi_plugin_hash = plugin_hash
-      , mi_orphan      = not (   all ifRuleAuto orph_rules
-                                   -- See Note [Orphans and auto-generated rules]
-                              && null orph_insts
-                              && null orph_fis)
-      , mi_finsts      = not (null (mi_fam_insts iface0))
-      , mi_exp_hash    = export_hash
-      , mi_orphan_hash = orphan_hash
-      , mi_warn_fn     = warn_fn
-      , mi_fix_fn      = fix_fn
-      , mi_hash_fn     = lookupOccEnv local_env
+      { mi_iface_hash     = iface_hash
+      , mi_mod_hash       = mod_hash
+      , mi_flag_hash      = flag_hash
+      , mi_opt_hash       = opt_hash
+      , mi_hpc_hash       = hpc_hash
+      , mi_plugin_hash    = plugin_hash
+      , mi_orphan         = not (   all ifRuleAuto orph_rules
+                                      -- See Note [Orphans and auto-generated rules]
+                                 && null orph_insts
+                                 && null orph_fis)
+      , mi_finsts         = not (null (mi_fam_insts iface0))
+      , mi_exp_hash       = export_hash
+      , mi_orphan_hash    = orphan_hash
+      , mi_decl_warn_fn   = decl_warn_fn
+      , mi_export_warn_fn = export_warn_fn
+      , mi_fix_fn         = fix_fn
+      , mi_hash_fn        = lookupOccEnv local_env
       }
     final_iface = iface0 { mi_decls = sorted_decls, mi_extra_decls = sorted_extra_decls, mi_final_exts = final_iface_exts }
    --
@@ -1283,7 +1296,7 @@ addFingerprints hsc_env iface0
     (non_orph_fis,   orph_fis)   = mkOrphMap ifFamInstOrph (mi_fam_insts iface0)
     ann_fn = mkIfaceAnnCache (mi_anns iface0)
     -- Do not allow filenames to affect the interface
-    usages = [ case u of UsageFile _ fp fl -> UsageFile "" fp fl; _ -> u | u <- mi_usages iface0 ]
+    usages = [ case u of UsageFile _ fp fl -> UsageFile (mkFastStringByteList []) fp fl; _ -> u | u <- mi_usages iface0 ]
 
 -- | Retrieve the orphan hashes 'mi_orphan_hash' for a list of modules
 -- (in particular, the orphan modules which are transitively imported by the
@@ -1321,7 +1334,7 @@ getOrphanHashes hsc_env mods = do
     dflags     = hsc_dflags hsc_env
     ctx        = initSDocContext dflags defaultUserStyle
     get_orph_hash mod = do
-          iface <- initIfaceLoad hsc_env . withException ctx
+          iface <- initIfaceLoad hsc_env . withIfaceErr ctx
                             $ loadInterface (text "getOrphanHashes") mod ImportBySystem
           return (mi_orphan_hash (mi_final_exts iface))
 
@@ -1616,7 +1629,7 @@ mkHashFun hsc_env eps name
                       -- requirements; we didn't do any /real/ typechecking
                       -- so there's no guarantee everything is loaded.
                       -- Kind of a heinous hack.
-                      initIfaceLoad hsc_env . withException ctx
+                      initIfaceLoad hsc_env . withIfaceErr ctx
                           $ withoutDynamicNow
                             -- If you try and load interfaces when dynamic-too
                             -- enabled then it attempts to load the dyn_hi and hi

@@ -9,6 +9,7 @@
 #include "rts/PosixSource.h"
 #define KEEP_LOCKCLOSURE
 #include "Rts.h"
+#include "RtsFlags.h"
 
 #include "sm/Storage.h"
 #include "RtsUtils.h"
@@ -512,7 +513,8 @@ run_thread:
 #endif
 
     if (ret == ThreadBlocked) {
-        if (t->why_blocked == BlockedOnBlackHole) {
+        uint16_t why_blocked = ACQUIRE_LOAD(&t->why_blocked);
+        if (why_blocked == BlockedOnBlackHole) {
             StgTSO *owner = blackHoleOwner(t->block_info.bh->bh);
             traceEventStopThread(cap, t, t->why_blocked + 6,
                                  owner != NULL ? owner->id : 0);
@@ -835,7 +837,7 @@ schedulePushWork(Capability *cap USED_IF_THREADS,
                 if (t->bound) {
                     t->bound->task->cap = free_caps[i];
                 }
-                t->cap = free_caps[i];
+                RELAXED_STORE(&t->cap, free_caps[i]);
                 n--; // we have one fewer threads now
                 i++; // move on to the next free_cap
                 if (i == n_free_caps) i = 0;
@@ -1385,7 +1387,7 @@ scheduleNeedHeapProfile( bool ready_to_gc )
 {
     // When we have +RTS -i0 and we're heap profiling, do a census at
     // every GC.  This lets us get repeatable runs for debugging.
-    if (performHeapProfile ||
+    if (RELAXED_LOAD(&performHeapProfile) ||
         (RtsFlags.ProfFlags.heapProfileInterval==0 &&
          RtsFlags.ProfFlags.doHeapProfile && ready_to_gc)) {
         return true;
@@ -1946,7 +1948,7 @@ delete_threads_and_gc:
 
     // The heap census itself is done during GarbageCollect().
     if (heap_census) {
-        performHeapProfile = false;
+        RELAXED_STORE(&performHeapProfile, false);
     }
 
 #if defined(THREADED_RTS)
@@ -2274,8 +2276,11 @@ setNumCapabilities (uint32_t new_n_capabilities USED_IF_THREADS)
     } else if (new_n_capabilities <= 0) {
         errorBelch("setNumCapabilities: Capability count must be positive");
         return;
+    } else if (new_n_capabilities > max_n_capabilities) {
+        // See Note [Capabilities array sizing] in rts/Capability.c.
+        errorBelch("setNumCapabilities: Attempt to increase capability count beyond maximum capability count %" PRIu32 "; clamping...\n", max_n_capabilities);
+        new_n_capabilities = max_n_capabilities;
     }
-
 
     debugTrace(DEBUG_sched, "changing the number of Capabilities from %d to %d",
                enabled_capabilities, new_n_capabilities);
@@ -2341,7 +2346,7 @@ setNumCapabilities (uint32_t new_n_capabilities USED_IF_THREADS)
             // must be done before calling moreCapabilities(), because that
             // will emit events about creating the new capabilities and adding
             // them to existing capsets.
-            tracingAddCapapilities(n_capabilities, new_n_capabilities);
+            tracingAddCapabilities(n_capabilities, new_n_capabilities);
 #endif
 
             // Resize the capabilities array
@@ -2358,7 +2363,8 @@ setNumCapabilities (uint32_t new_n_capabilities USED_IF_THREADS)
 
     // update n_capabilities before things start running
     if (new_n_capabilities > n_capabilities) {
-        RELAXED_STORE(&n_capabilities, enabled_capabilities = new_n_capabilities);
+        RELAXED_STORE(&n_capabilities, new_n_capabilities);
+        RELAXED_STORE(&enabled_capabilities, new_n_capabilities);
     }
 
     // We're done: release the original Capabilities
@@ -2494,7 +2500,7 @@ suspendThread (StgRegTable *reg, bool interruptible)
   traceEventStopThread(cap, tso, THREAD_SUSPENDED_FOREIGN_CALL, 0);
 
   // XXX this might not be necessary --SDM
-  tso->what_next = ThreadRunGHC;
+  RELAXED_STORE(&tso->what_next, ThreadRunGHC);
 
   threadPaused(cap,tso);
 
@@ -2785,7 +2791,6 @@ exitScheduler (bool wait_foreign USED_IF_THREADS)
     // If we haven't killed all the threads yet, do it now.
     if (getSchedState() < SCHED_SHUTTING_DOWN) {
         setSchedState(SCHED_INTERRUPTING);
-        nonmovingStop();
         Capability *cap = task->cap;
         waitForCapability(&cap,task);
         scheduleDoGC(&cap,task,true,false,false,true);

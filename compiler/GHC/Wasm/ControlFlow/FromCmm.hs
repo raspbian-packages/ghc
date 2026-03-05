@@ -15,16 +15,16 @@ import qualified Data.Tree as Tree
 
 import GHC.Cmm
 import GHC.Cmm.Dataflow.Block
-import GHC.Cmm.Dataflow.Collections
 import GHC.Cmm.Dominators
 import GHC.Cmm.Dataflow.Graph
 import GHC.Cmm.Dataflow.Label
+import GHC.Cmm.Reducibility
 import GHC.Cmm.Switch
 
 import GHC.CmmToAsm.Wasm.Types
 
 import GHC.Platform
-
+import GHC.Types.Unique.Supply
 import GHC.Utils.Misc
 import GHC.Utils.Panic
 import GHC.Utils.Outputable ( Outputable, text, (<+>), ppr
@@ -78,7 +78,7 @@ flowLeaving platform b =
               scrutinee = smartExtend platform $ smartPlus platform e offset
               range = inclusiveInterval (lo+toInteger offset) (hi+toInteger offset)
           in  Switch scrutinee range target_labels default_label
-      CmmCall { cml_cont = Nothing, cml_target = e } -> TailCall e
+      CmmCall { cml_target = e } -> TailCall e
       _ -> panic "flowLeaving: unreachable"
 
 ----------------------- Evaluation contexts ------------------------------
@@ -140,15 +140,19 @@ emptyPost _ = False
 structuredControl :: forall expr stmt m .
                      Applicative m
                   => Platform  -- ^ needed for offset calculation
+                  -> UniqSupply
                   -> (Label -> CmmExpr -> m expr) -- ^ translator for expressions
                   -> (Label -> CmmActions -> m stmt) -- ^ translator for straight-line code
                   -> CmmGraph -- ^ CFG to be translated
                   -> m (WasmControl stmt expr '[] '[ 'I32])
-structuredControl platform txExpr txBlock g =
+structuredControl platform us txExpr txBlock g' =
    doTree returns dominatorTree emptyContext
  where
+   g :: CmmGraph
+   g = gwd_graph gwd
+
    gwd :: GraphWithDominators CmmNode
-   gwd = graphWithDominators g
+   gwd = initUs_ us $ asReducible $ graphWithDominators g'
 
    dominatorTree :: Tree.Tree CmmBlock-- Dominator tree in which children are sorted
                                        -- with highest reverse-postorder number first
@@ -329,7 +333,7 @@ smartPlus platform e k =
     CmmMachOp (MO_Add width) [e, CmmLit (CmmInt (toInteger k) width)]
   where width = cmmExprWidth platform e
 
-addToList :: (IsMap map) => ([a] -> [a]) -> KeyOf map -> map [a] -> map [a]
+addToList :: ([a] -> [a]) -> Label -> LabelMap [a] -> LabelMap [a]
 addToList consx = mapAlter add
     where add Nothing = Just (consx [])
           add (Just xs) = Just (consx xs)

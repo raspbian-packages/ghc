@@ -15,7 +15,7 @@ module GHC.StgToByteCode ( UnlinkedBCO, byteCodeGen) where
 
 import GHC.Prelude
 
-import GHC.Driver.Session
+import GHC.Driver.DynFlags
 import GHC.Driver.Env
 
 import GHC.ByteCode.Instr
@@ -53,13 +53,13 @@ import GHC.Types.Var.Set
 import GHC.Builtin.Types.Prim
 import GHC.Core.TyCo.Ppr ( pprType )
 import GHC.Utils.Error
-import GHC.Types.Unique
 import GHC.Builtin.Uniques
 import GHC.Data.FastString
 import GHC.Utils.Panic
-import GHC.Utils.Panic.Plain
 import GHC.Utils.Exception (evaluate)
-import GHC.StgToCmm.Closure ( NonVoid(..), fromNonVoid, nonVoidIds, argPrimRep )
+import GHC.StgToCmm.Closure ( NonVoid(..), fromNonVoid, idPrimRepU,
+                              addIdReps, addArgReps,
+                              nonVoidIds, nonVoidStgArgs )
 import GHC.StgToCmm.Layout
 import GHC.Runtime.Heap.Layout hiding (WordOff, ByteOff, wordsToBytes)
 import GHC.Data.Bitmap
@@ -68,13 +68,14 @@ import GHC.Data.Maybe
 import GHC.Types.Name.Env (mkNameEnv)
 import GHC.Types.Tickish
 
-import Data.List ( genericReplicate, genericLength, intersperse
+import Data.List ( genericReplicate, intersperse
                  , partition, scanl', sortBy, zip4, zip6 )
 import Foreign hiding (shiftL, shiftR)
 import Control.Monad
 import Data.Char
 
 import GHC.Unit.Module
+import GHC.Unit.Home.ModInfo (lookupHpt)
 
 import Data.Array
 import Data.Coerce (coerce)
@@ -85,7 +86,6 @@ import qualified Data.Map as Map
 import qualified Data.IntMap as IntMap
 import qualified GHC.Data.FiniteMap as Map
 import Data.Ord
-import GHC.Stack.CCS
 import Data.Either ( partitionEithers )
 
 import GHC.Stg.Syntax
@@ -240,7 +240,7 @@ mkProtoBCO
    -> Either  [CgStgAlt] (CgStgRhs)
                 -- ^ original expression; for debugging only
    -> Int       -- ^ arity
-   -> Word16    -- ^ bitmap size
+   -> WordOff   -- ^ bitmap size
    -> [StgWord] -- ^ bitmap
    -> Bool      -- ^ True <=> is a return point, rather than a function
    -> [FFIInfo]
@@ -250,7 +250,7 @@ mkProtoBCO platform nm instrs_ordlist origin arity bitmap_size bitmap is_ret ffi
         protoBCOName = nm,
         protoBCOInstrs = maybe_with_stack_check,
         protoBCOBitmap = bitmap,
-        protoBCOBitmapSize = bitmap_size,
+        protoBCOBitmapSize = fromIntegral bitmap_size,
         protoBCOArity = arity,
         protoBCOExpr = origin,
         protoBCOFFIs = ffis
@@ -294,12 +294,7 @@ argBits :: Platform -> [ArgRep] -> [Bool]
 argBits _        [] = []
 argBits platform (rep : args)
   | isFollowableArg rep  = False : argBits platform args
-  | otherwise = take (argRepSizeW platform rep) (repeat True) ++ argBits platform args
-
-non_void :: [ArgRep] -> [ArgRep]
-non_void = filter nv
-  where nv V = False
-        nv _ = True
+  | otherwise = replicate (argRepSizeW platform rep) True ++ argBits platform args
 
 -- -----------------------------------------------------------------------------
 -- schemeTopBind
@@ -350,8 +345,8 @@ schemeR fvs (nm, rhs)
 -- underlying expression
 
 collect :: CgStgRhs -> ([Var], CgStgExpr)
-collect (StgRhsClosure _ _ _ args body) = (args, body)
-collect (StgRhsCon _cc dc cnum _ticks args) = ([], StgConApp dc cnum args [])
+collect (StgRhsClosure _ _ _ args body _) = (args, body)
+collect (StgRhsCon _cc dc cnum _ticks args _typ) = ([], StgConApp dc cnum args [])
 
 schemeR_wrk
     :: [Id]
@@ -377,35 +372,95 @@ schemeR_wrk fvs nm original_body (args, body)
          p_init    = Map.fromList (zip all_args (mkStackOffsets 0 szsb_args))
 
          -- make the arg bitmap
-         bits = argBits platform (reverse (map (bcIdArgRep platform) all_args))
-         bitmap_size = genericLength bits
+         bits = argBits platform (reverse (map (idArgRep platform) all_args))
+         bitmap_size = strictGenericLength bits
          bitmap = mkBitmap platform bits
      body_code <- schemeER_wrk sum_szsb_args p_init body
 
      emitBc (mkProtoBCO platform nm body_code (Right original_body)
                  arity bitmap_size bitmap False{-not alts-})
 
--- introduce break instructions for ticked expressions
+-- | Introduce break instructions for ticked expressions.
+-- If no breakpoint information is available, the instruction is omitted.
 schemeER_wrk :: StackDepth -> BCEnv -> CgStgExpr -> BcM BCInstrList
-schemeER_wrk d p (StgTick (Breakpoint tick_ty tick_no fvs) rhs)
-  = do  code <- schemeE d 0 p rhs
-        cc_arr <- getCCArray
-        this_mod <- moduleName <$> getCurrentModule
+schemeER_wrk d p (StgTick (Breakpoint tick_ty tick_no fvs tick_mod) rhs) = do
+  code <- schemeE d 0 p rhs
+  hsc_env <- getHscEnv
+  current_mod <- getCurrentModule
+  mb_current_mod_breaks <- getCurrentModBreaks
+  case mb_current_mod_breaks of
+    -- if we're not generating ModBreaks for this module for some reason, we
+    -- can't store breakpoint occurrence information.
+    Nothing -> pure code
+    Just current_mod_breaks -> case break_info hsc_env tick_mod current_mod mb_current_mod_breaks of
+      Nothing -> pure code
+      Just ModBreaks {modBreaks_flags = breaks, modBreaks_module = tick_mod_ptr, modBreaks_ccs = cc_arr} -> do
         platform <- profilePlatform <$> getProfile
         let idOffSets = getVarOffSets platform d p fvs
             ty_vars   = tyCoVarsOfTypesWellScoped (tick_ty:map idType fvs)
-        let breakInfo = dehydrateCgBreakInfo ty_vars idOffSets tick_ty
-        newBreakInfo tick_no breakInfo
-        hsc_env <- getHscEnv
+            toWord :: Maybe (Id, WordOff) -> Maybe (Id, Word)
+            toWord = fmap (\(i, wo) -> (i, fromIntegral wo))
+            breakInfo  = dehydrateCgBreakInfo ty_vars (map toWord idOffSets) tick_ty
+
+        let info_mod_ptr = modBreaks_module current_mod_breaks
+        infox <- newBreakInfo breakInfo
+
         let cc | Just interp <- hsc_interp hsc_env
-               , interpreterProfiled interp
-               = cc_arr ! tick_no
-               | otherwise = toRemotePtr nullPtr
-        let breakInstr = BRK_FUN (fromIntegral tick_no) (getUnique this_mod) cc
+              , interpreterProfiled interp
+              = cc_arr ! tick_no
+              | otherwise = toRemotePtr nullPtr
+
+        let -- cast that checks that round-tripping through Word16 doesn't change the value
+            toW16 x = let r = fromIntegral x :: Word16
+                      in if fromIntegral r == x
+                        then r
+                        else pprPanic "schemeER_wrk: breakpoint tick/info index too large!" (ppr x)
+            breakInstr = BRK_FUN breaks tick_mod_ptr (toW16 tick_no) info_mod_ptr (toW16 infox) cc
         return $ breakInstr `consOL` code
 schemeER_wrk d p rhs = schemeE d 0 p rhs
 
-getVarOffSets :: Platform -> StackDepth -> BCEnv -> [Id] -> [Maybe (Id, Word16)]
+-- | Determine the GHCi-allocated 'BreakArray' and module pointer for the module
+-- from which the breakpoint originates.
+-- These are stored in 'ModBreaks' as remote pointers in order to allow the BCOs
+-- to refer to pointers in GHCi's address space.
+-- They are initialized in 'GHC.HsToCore.Breakpoints.mkModBreaks', called by
+-- 'GHC.HsToCore.deSugar'.
+--
+-- Breakpoints might be disabled because we're in TH, because
+-- @-fno-break-points@ was specified, or because a module was reloaded without
+-- reinitializing 'ModBreaks'.
+--
+-- If the module stored in the breakpoint is the currently processed module, use
+-- the 'ModBreaks' from the state.
+-- If that is 'Nothing', consider breakpoints to be disabled and skip the
+-- instruction.
+--
+-- If the breakpoint is inlined from another module, look it up in the home
+-- package table.
+-- If the module doesn't exist there, or its module pointer is null (which means
+-- that the 'ModBreaks' value is uninitialized), skip the instruction.
+break_info ::
+  HscEnv ->
+  Module ->
+  Module ->
+  Maybe ModBreaks ->
+  Maybe ModBreaks
+break_info hsc_env mod current_mod current_mod_breaks
+  | mod == current_mod
+  = check_mod_ptr =<< current_mod_breaks
+  | Just hp <- lookupHpt (hsc_HPT hsc_env) (moduleName mod)
+  = check_mod_ptr (getModBreaks hp)
+  | otherwise
+  = Nothing
+  where
+    check_mod_ptr mb
+      | mod_ptr <- modBreaks_module mb
+      , fromRemotePtr mod_ptr /= nullPtr
+      = Just mb
+      | otherwise
+      = Nothing
+
+getVarOffSets :: Platform -> StackDepth -> BCEnv -> [Id] -> [Maybe (Id, WordOff)]
 getVarOffSets platform depth env = map getOffSet
   where
     getOffSet id = case lookupBCEnv_maybe id env of
@@ -418,22 +473,8 @@ getVarOffSets platform depth env = map getOffSet
             -- this "adjustment" is needed due to stack manipulation for
             -- BRK_FUN in Interpreter.c In any case, this is used only when
             -- we trigger a breakpoint.
-            let !var_depth_ws =
-                    trunc16W $ bytesToWords platform (depth - offset) + 2
+            let !var_depth_ws = bytesToWords platform (depth - offset) + 2
             in Just (id, var_depth_ws)
-
-truncIntegral16 :: Integral a => a -> Word16
-truncIntegral16 w
-    | w > fromIntegral (maxBound :: Word16)
-    = panic "stack depth overflow"
-    | otherwise
-    = fromIntegral w
-
-trunc16B :: ByteOff -> Word16
-trunc16B = truncIntegral16
-
-trunc16W :: WordOff -> Word16
-trunc16W = truncIntegral16
 
 fvsToEnv :: BCEnv -> CgStgRhs -> [Id]
 -- Takes the free variables of a right-hand side, and
@@ -460,9 +501,7 @@ returnUnliftedAtom
     -> StgArg
     -> BcM BCInstrList
 returnUnliftedAtom d s p e = do
-    let reps = case e of
-                 StgLitArg lit -> typePrimRepArgs (literalType lit)
-                 StgVarArg i   -> bcIdPrimReps i
+    let reps = stgArgRep e
     (push, szb) <- pushAtom d p e
     ret <- returnUnliftedReps d s szb reps
     return (push `appOL` ret)
@@ -477,9 +516,7 @@ returnUnliftedReps
 returnUnliftedReps d s szb reps = do
     profile <- getProfile
     let platform = profilePlatform profile
-        non_void VoidRep = False
-        non_void _ = True
-    ret <- case filter non_void reps of
+    ret <- case reps of
              -- use RETURN for nullary/unary representations
              []    -> return (unitOL $ RETURN V)
              [rep] -> return (unitOL $ RETURN (toArgRep platform rep))
@@ -491,7 +528,7 @@ returnUnliftedReps d s szb reps = do
                         PUSH_BCO tuple_bco `consOL`
                         unitOL RETURN_TUPLE
     return ( mkSlideB platform szb (d - s) -- clear to sequel
-             `appOL`  ret)                 -- go
+             `appOL` ret)                 -- go
 
 -- construct and return an unboxed tuple
 returnUnboxedTuple
@@ -503,7 +540,7 @@ returnUnboxedTuple
 returnUnboxedTuple d s p es = do
     profile <- getProfile
     let platform = profilePlatform profile
-        arg_ty e = primRepCmmType platform (atomPrimRep e)
+        arg_ty e = primRepCmmType platform (stgArgRepU e)
         (call_info, tuple_components) = layoutNativeCall profile
                                                          NativeTupleReturn
                                                          d
@@ -514,10 +551,14 @@ returnUnboxedTuple d s p es = do
                                          massert (off == dd + szb)
                                          go (dd + szb) (push:pushes) cs
     pushes <- go d [] tuple_components
+    let rep_to_maybe :: PrimOrVoidRep -> Maybe PrimRep
+        rep_to_maybe VoidRep = Nothing
+        rep_to_maybe (NVRep rep) = Just rep
+
     ret <- returnUnliftedReps d
                               s
                               (wordsToBytes platform $ nativeCallSize call_info)
-                              (map atomPrimRep es)
+                              (mapMaybe (rep_to_maybe . stgArgRep1) es)
     return (mconcat pushes `appOL` ret)
 
 -- Compile code to apply the given expression to the remaining args
@@ -534,7 +575,7 @@ schemeE d s p e@(StgOpApp {}) = schemeT d s p e
 schemeE d s p (StgLetNoEscape xlet bnd body)
    = schemeE d s p (StgLet xlet bnd body)
 schemeE d s p (StgLet _xlet
-                      (StgNonRec x (StgRhsCon _cc data_con _cnum _ticks args))
+                      (StgNonRec x (StgRhsCon _cc data_con _cnum _ticks args _typ))
                       body)
    = do -- Special case for a non-recursive let whose RHS is a
         -- saturated constructor application.
@@ -550,16 +591,16 @@ schemeE d s p (StgLet _ext binds body) = do
      platform <- targetPlatform <$> getDynFlags
      let (xs,rhss) = case binds of StgNonRec x rhs  -> ([x],[rhs])
                                    StgRec xs_n_rhss -> unzip xs_n_rhss
-         n_binds = genericLength xs
+         n_binds = strictGenericLength xs
 
          fvss  = map (fvsToEnv p') rhss
 
          -- Sizes of free vars
-         size_w = trunc16W . idSizeW platform
+         size_w = idSizeW platform
          sizes = map (\rhs_fvs -> sum (map size_w rhs_fvs)) fvss
 
          -- the arity of each rhs
-         arities = map (genericLength . fst . collect) rhss
+         arities = map (strictGenericLength . fst . collect) rhss
 
          -- This p', d' defn is safe because all the items being pushed
          -- are ptrs, so all have size 1 word.  d' and p' reflect the stack
@@ -574,13 +615,13 @@ schemeE d s p (StgLet _ext binds body) = do
          build_thunk
              :: StackDepth
              -> [Id]
-             -> Word16
+             -> WordOff
              -> ProtoBCO Name
-             -> Word16
-             -> Word16
+             -> WordOff
+             -> HalfWord
              -> BcM BCInstrList
          build_thunk _ [] size bco off arity
-            = return (PUSH_BCO bco `consOL` unitOL (mkap (off+size) size))
+            = return (PUSH_BCO bco `consOL` unitOL (mkap (off+size) (fromIntegral size)))
            where
                 mkap | arity == 0 = MKAP
                      | otherwise  = MKPAP
@@ -592,9 +633,9 @@ schemeE d s p (StgLet _ext binds body) = do
 
          alloc_code = toOL (zipWith mkAlloc sizes arities)
            where mkAlloc sz 0
-                    | is_tick     = ALLOC_AP_NOUPD sz
-                    | otherwise   = ALLOC_AP sz
-                 mkAlloc sz arity = ALLOC_PAP arity sz
+                    | is_tick     = ALLOC_AP_NOUPD (fromIntegral sz)
+                    | otherwise   = ALLOC_AP (fromIntegral sz)
+                 mkAlloc sz arity = ALLOC_PAP arity (fromIntegral sz)
 
          is_tick = case binds of
                      StgNonRec id _ -> occNameFS (getOccName id) == tickFS
@@ -605,7 +646,7 @@ schemeE d s p (StgLet _ext binds body) = do
                 build_thunk d' fvs size bco off arity
 
          compile_binds =
-            [ compile_bind d' fvs x rhs size arity (trunc16W n)
+            [ compile_bind d' fvs x rhs size arity n
             | (fvs, x, rhs, size, arity, n) <-
                 zip6 fvss xs rhss sizes arities [n_binds, n_binds-1 .. 1]
             ]
@@ -613,7 +654,7 @@ schemeE d s p (StgLet _ext binds body) = do
      thunk_codes <- sequence compile_binds
      return (alloc_code `appOL` concatOL thunk_codes `appOL` body_code)
 
-schemeE _d _s _p (StgTick (Breakpoint _ bp_id _) _rhs)
+schemeE _d _s _p (StgTick (Breakpoint _ bp_id _ _) _rhs)
    = panic ("schemeE: Breakpoint without let binding: " ++
             show bp_id ++
             " forgot to run bcPrep?")
@@ -718,11 +759,7 @@ mkConAppCode orig_d _ p con args = app_code
         let platform = profilePlatform profile
 
             non_voids =
-                [ NonVoid (prim_rep, arg)
-                | arg <- args
-                , let prim_rep = atomPrimRep arg
-                , not (isVoidRep prim_rep)
-                ]
+                addArgReps (nonVoidStgArgs args)
             (_, _, args_offsets) =
                 mkVirtHeapOffsetsWithPadding profile StdHeader non_voids
 
@@ -733,7 +770,7 @@ mkConAppCode orig_d _ p con args = app_code
                 more_push_code <- do_pushery (d + arg_bytes) args
                 return (push `appOL` more_push_code)
             do_pushery !d [] = do
-                let !n_arg_words = trunc16W $ bytesToWords platform (d - orig_d)
+                let !n_arg_words = bytesToWords platform (d - orig_d)
                 return (unitOL (PACK con n_arg_words))
 
         -- Push on the stack in the reverse order.
@@ -826,12 +863,12 @@ doCase d s p scrut bndr alts
         -- Are we dealing with an unboxed tuple with a tuple return frame?
         --
         -- 'Simple' tuples with at most one non-void component,
-        -- like (# Word# #) or (# Int#, State# RealWorld# #) do not have a
+        -- like (# Word# #) or (# Int#, State# RealWorld #) do not have a
         -- tuple return frame. This is because (# foo #) and (# foo, Void# #)
         -- have the same runtime rep. We have more efficient specialized
         -- return frames for the situations with one non-void element.
 
-        non_void_arg_reps = non_void (typeArgReps platform bndr_ty)
+        non_void_arg_reps = typeArgReps platform bndr_ty
         ubx_tuple_frame =
           (isUnboxedTupleType bndr_ty || isUnboxedSumType bndr_ty) &&
           length non_void_arg_reps > 1
@@ -864,7 +901,7 @@ doCase d s p scrut bndr alts
         (bndr_size, call_info, args_offsets)
            | ubx_tuple_frame =
                let bndr_ty = primRepCmmType platform
-                   bndr_reps = filter (not.isVoidRep) (bcIdPrimReps bndr)
+                   bndr_reps = typePrimRep (idType bndr)
                    (call_info, args_offsets) =
                        layoutNativeCall profile NativeTupleReturn 0 bndr_ty bndr_reps
                in ( wordsToBytes platform (nativeCallSize call_info)
@@ -904,7 +941,7 @@ doCase d s p scrut bndr alts
                 rhs_code <- schemeE d_alts s p_alts rhs
                 return (my_discr alt, rhs_code)
            | isUnboxedTupleType bndr_ty || isUnboxedSumType bndr_ty =
-             let bndr_ty = primRepCmmType platform . bcIdPrimRep
+             let bndr_ty = primRepCmmType platform . idPrimRepU
                  tuple_start = d_bndr
                  (call_info, args_offsets) =
                    layoutNativeCall profile
@@ -920,7 +957,7 @@ doCase d s p scrut bndr alts
                                 wordsToBytes platform (nativeCallSize call_info) +
                                 offset)
                         | (arg, offset) <- args_offsets
-                        , not (isVoidRep $ bcIdPrimRep arg)]
+                        , not (isZeroBitTy $ idType arg)]
                         p_alts
              in do
                rhs_code <- schemeE stack_bot s p' rhs
@@ -929,9 +966,7 @@ doCase d s p scrut bndr alts
            | otherwise =
              let (tot_wds, _ptrs_wds, args_offsets) =
                      mkVirtHeapOffsets profile NoHeader
-                         [ NonVoid (bcIdPrimRep id, id)
-                         | NonVoid id <- nonVoidIds real_bndrs
-                         ]
+                         (addIdReps (nonVoidIds real_bndrs))
                  size = WordOff tot_wds
 
                  stack_bot = d_alts + wordsToBytes platform size
@@ -946,7 +981,7 @@ doCase d s p scrut bndr alts
              massert isAlgCase
              rhs_code <- schemeE stack_bot s p' rhs
              return (my_discr alt,
-                     unitOL (UNPACK (trunc16W size)) `appOL` rhs_code)
+                     unitOL (UNPACK size) `appOL` rhs_code)
            where
              real_bndrs = filterOut isTyVar bndrs
 
@@ -1007,8 +1042,9 @@ doCase d s p scrut bndr alts
            | ubx_tuple_frame              = ([1], 2) -- call_info, tuple_BCO
            | otherwise                    = ([], 0)
 
-        bitmap_size = trunc16W $ fromIntegral extra_slots +
-                                 bytesToWords platform (d - s)
+        bitmap_size :: WordOff
+        bitmap_size = fromIntegral extra_slots +
+                      bytesToWords platform (d - s)
 
         bitmap_size' :: Int
         bitmap_size' = fromIntegral bitmap_size
@@ -1024,17 +1060,17 @@ doCase d s p scrut bndr alts
           rel_slots = IntSet.toAscList $ IntSet.fromList $ Map.elems $ Map.mapMaybeWithKey spread p
           spread id offset | isUnboxedTupleType (idType id) ||
                              isUnboxedSumType (idType id) = Nothing
-                           | isFollowableArg (bcIdArgRep platform id) = Just (fromIntegral rel_offset)
+                           | isFollowableArg (idArgRep platform id) = Just (fromIntegral rel_offset)
                            | otherwise                      = Nothing
-                where rel_offset = trunc16W $ bytesToWords platform (d - offset)
+                where rel_offset = bytesToWords platform (d - offset)
 
-        bitmap = intsToReverseBitmap platform bitmap_size'{-size-} pointers
+        bitmap = intsToReverseBitmap platform bitmap_size' pointers
 
      alt_stuff <- mapM codeAlt alts
      alt_final0 <- mkMultiBranch maybe_ncons alt_stuff
 
      let alt_final
-           | ubx_tuple_frame    = mkSlideW 0 2 `mappend` alt_final0
+           | ubx_tuple_frame    = SLIDE 0 2 `consOL` alt_final0
            | otherwise          = alt_final0
 
      let
@@ -1087,9 +1123,6 @@ layoutNativeCall profile call_type start_off arg_ty reps =
 
       reg_order :: GlobalReg -> (Int, GlobalReg)
       reg_order reg | Just n <- Map.lookup reg regs_order = (n, reg)
-      -- a VanillaReg goes to the same place regardless of whether it
-      -- contains a pointer
-      reg_order (VanillaReg n VNonGcPtr) = reg_order (VanillaReg n VGcPtr)
       -- if we don't have a position for a FloatReg then they must be passed
       -- in the equivalent DoubleReg
       reg_order (FloatReg n) = reg_order (DoubleReg n)
@@ -1307,11 +1340,11 @@ mkStackBitmap
   -- ^ The stack layout of the arguments, where each offset is relative to the
   -- /bottom/ of the stack space they occupy. Their offsets must be word-aligned,
   -- and the list must be sorted in order of ascending offset (i.e. bottom to top).
-  -> (Word16, [StgWord])
+  -> (WordOff, [StgWord])
 mkStackBitmap platform nptrs_prefix args_info args
   = (bitmap_size, bitmap)
   where
-    bitmap_size = trunc16W $ nptrs_prefix + arg_bottom
+    bitmap_size = nptrs_prefix + arg_bottom
     bitmap = intsToReverseBitmap platform (fromIntegral bitmap_size) ptr_offsets
 
     arg_bottom = nativeCallSize args_info
@@ -1352,16 +1385,16 @@ generatePrimCall d s p target _mb_unit _result_ty args
          non_void _       = True
 
          nv_args :: [StgArg]
-         nv_args = filter (non_void . argPrimRep) args
+         nv_args = filter (non_void . stgArgRep1) args
 
          (args_info, args_offsets) =
               layoutNativeCall profile
                                NativePrimCall
                                0
-                               (primRepCmmType platform . argPrimRep)
+                               (primRepCmmType platform . stgArgRepU)
                                nv_args
 
-         prim_args_offsets = mapFst argPrimRep args_offsets
+         prim_args_offsets = mapFst stgArgRepU args_offsets
          shifted_args_offsets = mapSnd (+ d) args_offsets
 
          push_target = PUSH_UBX (LitLabel target Nothing IsFunction) 1
@@ -1437,7 +1470,7 @@ generateCCall d0 s p (CCallSpec target cconv safety) result_ty args
          -- ArgRep of what was actually pushed.
 
          pargs
-             :: ByteOff -> [StgArg] -> BcM [(BCInstrList, PrimRep)]
+             :: ByteOff -> [StgArg] -> BcM [(BCInstrList, PrimOrVoidRep)]
          pargs _ [] = return []
          pargs d (aa@(StgVarArg a):az)
             | Just t      <- tyConAppTyCon_maybe (idType a)
@@ -1450,10 +1483,10 @@ generateCCall d0 s p (CCallSpec target cconv safety) result_ty args
                  -- The ptr points at the header.  Advance it over the
                  -- header and then pretend this is an Addr#.
                  let code = push_fo `snocOL` SWIZZLE 0 (fromIntegral hdr_sz)
-                 return ((code, AddrRep) : rest)
+                 return ((code, NVRep AddrRep) : rest)
          pargs d (aa:az) =  do (code_a, sz_a) <- pushAtom d p aa
                                rest <- pargs (d + sz_a) az
-                               return ((code_a, atomPrimRep aa) : rest)
+                               return ((code_a, stgArgRep1 aa) : rest)
 
      code_n_reps <- pargs d0 args_r_to_l
      let
@@ -1463,8 +1496,7 @@ generateCCall d0 s p (CCallSpec target cconv safety) result_ty args
          push_args    = concatOL pushs_arg
          !d_after_args = d0 + wordsToBytes platform a_reps_sizeW
          a_reps_pushed_RAW
-            | x:xs <- a_reps_pushed_r_to_l
-            , isVoidRep x
+            | VoidRep:xs <- a_reps_pushed_r_to_l
             = reverse xs
             | otherwise
             = panic "GHC.StgToByteCode.generateCCall: missing or invalid World token?"
@@ -1474,10 +1506,7 @@ generateCCall d0 s p (CCallSpec target cconv safety) result_ty args
          -- d_after_args is the stack depth once the args are on.
 
          -- Get the result rep.
-         (returns_void, r_rep)
-            = case maybe_getCCallReturnRep result_ty of
-                 Nothing -> (True,  VoidRep)
-                 Just rr -> (False, rr)
+         r_rep = maybe_getCCallReturnRep result_ty
          {-
          Because the Haskell stack grows down, the a_reps refer to
          lowest to highest addresses in that order.  The args for the call
@@ -1550,10 +1579,9 @@ generateCCall d0 s p (CCallSpec target cconv safety) result_ty args
          -- this is a V (tag).
          r_sizeW   = repSizeWords platform r_rep
          d_after_r = d_after_Addr + wordsToBytes platform r_sizeW
-         push_r =
-             if returns_void
-                then nilOL
-                else unitOL (PUSH_UBX (mkDummyLiteral platform r_rep) (trunc16W r_sizeW))
+         push_r = case r_rep of
+                    VoidRep -> nilOL
+                    NVRep r -> unitOL (PUSH_UBX (mkDummyLiteral platform r) r_sizeW)
 
          -- generate the marshalling code we're going to call
 
@@ -1561,7 +1589,7 @@ generateCCall d0 s p (CCallSpec target cconv safety) result_ty args
          -- instruction needs to describe the chunk of stack containing
          -- the ccall args to the GC, so it needs to know how large it
          -- is.  See comment in Interpreter.c with the CCALL instruction.
-         stk_offset   = trunc16W $ bytesToWords platform (d_after_r - s)
+         stk_offset   = bytesToWords platform (d_after_r - s)
 
          conv = case cconv of
            CCallConv -> FFICCall
@@ -1590,18 +1618,18 @@ generateCCall d0 s p (CCallSpec target cconv safety) result_ty args
 
          -- slide and return
          d_after_r_min_s = bytesToWords platform (d_after_r - s)
-         wrapup       = mkSlideW (trunc16W r_sizeW) (d_after_r_min_s - r_sizeW)
-                        `snocOL` RETURN (toArgRep platform r_rep)
+         wrapup       = mkSlideW r_sizeW (d_after_r_min_s - r_sizeW)
+                        `snocOL` RETURN (toArgRepOrV platform r_rep)
          --trace (show (arg1_offW, args_offW  ,  (map argRepSizeW a_reps) )) $
      return (
          push_args `appOL`
          push_Addr `appOL` push_r `appOL` do_call `appOL` wrapup
          )
 
-primRepToFFIType :: Platform -> PrimRep -> FFIType
-primRepToFFIType platform r
+primRepToFFIType :: Platform -> PrimOrVoidRep -> FFIType
+primRepToFFIType _ VoidRep = FFIVoid
+primRepToFFIType platform (NVRep r)
   = case r of
-     VoidRep     -> FFIVoid
      IntRep      -> signed_word
      WordRep     -> unsigned_word
      Int8Rep     -> FFISInt8
@@ -1615,8 +1643,7 @@ primRepToFFIType platform r
      AddrRep     -> FFIPointer
      FloatRep    -> FFIFloat
      DoubleRep   -> FFIDouble
-     LiftedRep   -> FFIPointer
-     UnliftedRep -> FFIPointer
+     BoxedRep _  -> FFIPointer
      _           -> pprPanic "primRepToFFIType" (ppr r)
   where
     (signed_word, unsigned_word) = case platformWordSize platform of
@@ -1641,16 +1668,15 @@ mkDummyLiteral platform pr
         AddrRep     -> LitNullAddr
         DoubleRep   -> LitDouble 0
         FloatRep    -> LitFloat 0
-        LiftedRep   -> LitNullAddr
-        UnliftedRep -> LitNullAddr
-        _         -> pprPanic "mkDummyLiteral" (ppr pr)
+        BoxedRep _  -> LitNullAddr
+        _           -> pprPanic "mkDummyLiteral" (ppr pr)
 
 
 -- Convert (eg)
 --     GHC.Prim.Char# -> GHC.Prim.State# GHC.Prim.RealWorld
 --                   -> (# GHC.Prim.State# GHC.Prim.RealWorld, GHC.Prim.Int# #)
 --
--- to  Just IntRep
+-- to  NVRep IntRep
 -- and check that an unboxed pair is returned wherein the first arg is V'd.
 --
 -- Alternatively, for call-targets returning nothing, convert
@@ -1658,31 +1684,30 @@ mkDummyLiteral platform pr
 --     GHC.Prim.Char# -> GHC.Prim.State# GHC.Prim.RealWorld
 --                   -> (# GHC.Prim.State# GHC.Prim.RealWorld #)
 --
--- to  Nothing
+-- to  VoidRep
 
-maybe_getCCallReturnRep :: Type -> Maybe PrimRep
+maybe_getCCallReturnRep :: Type -> PrimOrVoidRep
 maybe_getCCallReturnRep fn_ty
    = let
        (_a_tys, r_ty) = splitFunTys (dropForAlls fn_ty)
-       r_reps = typePrimRepArgs r_ty
-
-       blargh :: a -- Used at more than one type
-       blargh = pprPanic "maybe_getCCallReturn: can't handle:"
-                         (pprType fn_ty)
      in
-       case r_reps of
-         []            -> panic "empty typePrimRepArgs"
-         [VoidRep]     -> Nothing
-         [rep]         -> Just rep
+       case typePrimRep r_ty of
+         [] -> VoidRep
+         [rep] -> NVRep rep
 
                  -- if it was, it would be impossible to create a
                  -- valid return value placeholder on the stack
-         _             -> blargh
+         _ -> pprPanic "maybe_getCCallReturn: can't handle:"
+                         (pprType fn_ty)
 
-maybe_is_tagToEnum_call :: CgStgExpr -> Maybe (Id, [Name])
+maybe_is_tagToEnum_call :: CgStgExpr -> Maybe (StgArg, [Name])
 -- Detect and extract relevant info for the tagToEnum kludge.
-maybe_is_tagToEnum_call (StgOpApp (StgPrimOp TagToEnumOp) [StgVarArg v] t)
+maybe_is_tagToEnum_call (StgOpApp (StgPrimOp TagToEnumOp) args t)
+  | [v] <- args
   = Just (v, extract_constr_Names t)
+  | otherwise
+  = pprPanic "StgToByteCode: tagToEnum#"
+     $ text "Expected exactly one arg, but actual args are:" <+> ppr args
   where
     extract_constr_Names ty
            | rep_ty <- unwrapType ty
@@ -1729,14 +1754,14 @@ implement_tagToId
     :: StackDepth
     -> Sequel
     -> BCEnv
-    -> Id
+    -> StgArg
     -> [Name]
     -> BcM BCInstrList
 -- See Note [Implementing tagToEnum#]
 implement_tagToId d s p arg names
   = assert (notNull names) $
-    do (push_arg, arg_bytes) <- pushAtom d p (StgVarArg arg)
-       labels <- getLabelsBc (genericLength names)
+    do (push_arg, arg_bytes) <- pushAtom d p arg
+       labels <- getLabelsBc (strictGenericLength names)
        label_fail <- getLabelBc
        label_exit <- getLabelBc
        dflags <- getDynFlags
@@ -1795,8 +1820,9 @@ pushAtom d p (StgVarArg var)
    = do platform <- targetPlatform <$> getDynFlags
 
         let !szb = idSizeCon platform var
+            with_instr :: (ByteOff -> BCInstr) -> BcM (OrdList BCInstr, ByteOff)
             with_instr instr = do
-                let !off_b = trunc16B $ d - d_v
+                let !off_b = d - d_v
                 return (unitOL (instr off_b), wordSize platform)
 
         case szb of
@@ -1805,7 +1831,7 @@ pushAtom d p (StgVarArg var)
             4 -> with_instr PUSH32_W
             _ -> do
                 let !szw = bytesToWords platform szb
-                    !off_w = trunc16W $ bytesToWords platform (d - d_v) + szw - 1
+                    !off_w = bytesToWords platform (d - d_v) + szw - 1
                 return (toOL (genericReplicate szw (PUSH_L off_w)),
                               wordsToBytes platform szw)
         -- d - d_v           offset from TOS to the first slot of the object
@@ -1866,7 +1892,7 @@ pushLiteral padded lit =
                 1  -> PUSH_UBX8 lit
                 2  -> PUSH_UBX16 lit
                 4  -> PUSH_UBX32 lit
-                _  -> PUSH_UBX lit (trunc16W $ bytesToWords platform size_bytes)
+                _  -> PUSH_UBX lit (bytesToWords platform size_bytes)
 
      case lit of
         LitLabel {}     -> code AddrRep
@@ -1905,7 +1931,7 @@ pushConstrAtom d p va@(StgVarArg v)
         platform <- targetPlatform <$> getDynFlags
         let !szb = idSizeCon platform v
             done instr = do
-                let !off = trunc16B $ d - d_v
+                let !off = d - d_v
                 return (unitOL (instr off), szb)
         case szb of
             1 -> done PUSH8
@@ -1970,8 +1996,7 @@ mkMultiBranch maybe_ncons raw_ways = do
 
          mkTree vals range_lo range_hi
             = let n = length vals `div` 2
-                  vals_lo = take n vals
-                  vals_hi = drop n vals
+                  (vals_lo, vals_hi) = splitAt n vals
                   v_mid = fst (head vals_hi)
               in do
               label_geq <- getLabelBc
@@ -2108,7 +2133,7 @@ lookupBCEnv_maybe :: Id -> BCEnv -> Maybe ByteOff
 lookupBCEnv_maybe = Map.lookup
 
 idSizeW :: Platform -> Id -> WordOff
-idSizeW platform = WordOff . argRepSizeW platform . bcIdArgRep platform
+idSizeW platform = WordOff . argRepSizeW platform . idArgRep platform
 
 idSizeCon :: Platform -> Id -> ByteOff
 idSizeCon platform var
@@ -2117,25 +2142,11 @@ idSizeCon platform var
     isUnboxedSumType (idType var) =
     wordsToBytes platform .
     WordOff . sum . map (argRepSizeW platform . toArgRep platform) .
-    bcIdPrimReps $ var
-  | otherwise = ByteOff (primRepSizeB platform (bcIdPrimRep var))
+    typePrimRep . idType $ var
+  | otherwise = ByteOff (primRepSizeB platform (idPrimRepU var))
 
-bcIdArgRep :: Platform -> Id -> ArgRep
-bcIdArgRep platform = toArgRep platform . bcIdPrimRep
-
-bcIdPrimRep :: Id -> PrimRep
-bcIdPrimRep id
-  | [rep] <- typePrimRepArgs (idType id)
-  = rep
-  | otherwise
-  = pprPanic "bcIdPrimRep" (ppr id <+> dcolon <+> ppr (idType id))
-
-
-bcIdPrimReps :: Id -> [PrimRep]
-bcIdPrimReps id = typePrimRepArgs (idType id)
-
-repSizeWords :: Platform -> PrimRep -> WordOff
-repSizeWords platform rep = WordOff $ argRepSizeW platform (toArgRep platform rep)
+repSizeWords :: Platform -> PrimOrVoidRep -> WordOff
+repSizeWords platform rep = WordOff $ argRepSizeW platform (toArgRepOrV platform rep)
 
 isFollowableArg :: ArgRep -> Bool
 isFollowableArg P = True
@@ -2157,31 +2168,22 @@ unsupportedCConvException = throwGhcException (ProgramError
    "  Workaround: use -fobject-code, or compile this module to .o separately."))
 
 mkSlideB :: Platform -> ByteOff -> ByteOff -> OrdList BCInstr
-mkSlideB platform !nb !db = mkSlideW n d
+mkSlideB platform nb db = mkSlideW n d
   where
-    !n = trunc16W $ bytesToWords platform nb
+    !n = bytesToWords platform nb
     !d = bytesToWords platform db
 
-mkSlideW :: Word16 -> WordOff -> OrdList BCInstr
+mkSlideW :: WordOff -> WordOff -> OrdList BCInstr
 mkSlideW !n !ws
-    | ws > fromIntegral limit
-    -- If the amount to slide doesn't fit in a Word16, generate multiple slide
-    -- instructions
-    = SLIDE n limit `consOL` mkSlideW n (ws - fromIntegral limit)
     | ws == 0
     = nilOL
     | otherwise
     = unitOL (SLIDE n $ fromIntegral ws)
-  where
-    limit :: Word16
-    limit = maxBound
 
-atomPrimRep :: StgArg -> PrimRep
-atomPrimRep (StgVarArg v) = bcIdPrimRep v
-atomPrimRep (StgLitArg l) = typePrimRep1 (literalType l)
+
 
 atomRep :: Platform -> StgArg -> ArgRep
-atomRep platform e = toArgRep platform (atomPrimRep e)
+atomRep platform e = toArgRepOrV platform (stgArgRep1 e)
 
 -- | Let szsw be the sizes in bytes of some items pushed onto the stack, which
 -- has initial depth @original_depth@.  Return the values which the stack
@@ -2190,7 +2192,7 @@ mkStackOffsets :: ByteOff -> [ByteOff] -> [ByteOff]
 mkStackOffsets original_depth szsb = tail (scanl' (+) original_depth szsb)
 
 typeArgReps :: Platform -> Type -> [ArgRep]
-typeArgReps platform = map (toArgRep platform) . typePrimRepArgs
+typeArgReps platform = map (toArgRep platform) . typePrimRep
 
 -- -----------------------------------------------------------------------------
 -- The bytecode generator's monad
@@ -2203,7 +2205,12 @@ data BcM_State
         , ffis        :: [FFIInfo]       -- ffi info blocks, to free later
                                          -- Should be free()d when it is GCd
         , modBreaks   :: Maybe ModBreaks -- info about breakpoints
-        , breakInfo   :: IntMap CgBreakInfo
+
+        , breakInfo   :: IntMap CgBreakInfo -- ^ Info at breakpoint occurrence.
+                                            -- Indexed with breakpoint *info* index.
+                                            -- See Note [Breakpoint identifiers]
+                                            -- in GHC.Types.Breakpoint
+        , breakInfoIdx :: !Int              -- ^ Next index for breakInfo array
         }
 
 newtype BcM r = BcM (BcM_State -> IO (BcM_State, r)) deriving (Functor)
@@ -2217,7 +2224,7 @@ runBc :: HscEnv -> Module -> Maybe ModBreaks
       -> BcM r
       -> IO (BcM_State, r)
 runBc hsc_env this_mod modBreaks (BcM m)
-   = m (BcM_State hsc_env this_mod 0 [] modBreaks IntMap.empty)
+   = m (BcM_State hsc_env this_mod 0 [] modBreaks IntMap.empty 0)
 
 thenBc :: BcM a -> (a -> BcM b) -> BcM b
 thenBc (BcM expr) cont = BcM $ \st0 -> do
@@ -2273,18 +2280,20 @@ getLabelsBc n
   = BcM $ \st -> let ctr = nextlabel st
                  in return (st{nextlabel = ctr+n}, coerce [ctr .. ctr+n-1])
 
-getCCArray :: BcM (Array BreakIndex (RemotePtr CostCentre))
-getCCArray = BcM $ \st ->
-  let breaks = expectJust "GHC.StgToByteCode.getCCArray" $ modBreaks st in
-  return (st, modBreaks_ccs breaks)
-
-
-newBreakInfo :: BreakIndex -> CgBreakInfo -> BcM ()
-newBreakInfo ix info = BcM $ \st ->
-  return (st{breakInfo = IntMap.insert ix info (breakInfo st)}, ())
+newBreakInfo :: CgBreakInfo -> BcM Int
+newBreakInfo info = BcM $ \st ->
+  let ix = breakInfoIdx st
+      st' = st
+              { breakInfo = IntMap.insert ix info (breakInfo st)
+              , breakInfoIdx = ix + 1
+              }
+  in return (st', ix)
 
 getCurrentModule :: BcM Module
 getCurrentModule = BcM $ \st -> return (st, thisModule st)
+
+getCurrentModBreaks :: BcM (Maybe ModBreaks)
+getCurrentModBreaks = BcM $ \st -> return (st, modBreaks st)
 
 tickFS :: FastString
 tickFS = fsLit "ticked"

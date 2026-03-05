@@ -1,5 +1,10 @@
 {-# LANGUAGE TypeFamilies, UndecidableInstances #-}
 
+{-# OPTIONS_GHC -Wno-orphans #-}
+  -- Don't warn that `type instance DsForeignsHooks = ...`
+  -- is an orphan; see Note [The Decoupling Abstract Data Hack]
+  -- in GHC.Driver.Hooks
+
 -- | Various types used during desugaring.
 module GHC.HsToCore.Types (
         DsM, DsLclEnv(..), DsGblEnv(..),
@@ -9,6 +14,7 @@ module GHC.HsToCore.Types (
 import GHC.Prelude (Int)
 
 import Data.IORef
+import qualified Data.Set as S
 
 import GHC.Types.CostCentre.State
 import GHC.Types.Error
@@ -73,6 +79,9 @@ data DsLclEnv
   -- ^ See Note [Long-distance information] in "GHC.HsToCore.Pmc".
   -- The set of reaching values Nablas is augmented as we walk inwards, refined
   -- through each pattern match in turn
+  , dsl_unspecables :: S.Set EvVar
+  -- ^ See Note [Desugaring non-canonical evidence]: this field collects
+  -- all un-specialisable evidence variables in scope.
   }
 
 -- Inside [| |] brackets, the desugarer looks

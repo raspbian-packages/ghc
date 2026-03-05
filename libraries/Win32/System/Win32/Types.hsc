@@ -28,13 +28,14 @@ import Data.Maybe (fromMaybe)
 import Data.Typeable (cast)
 import Data.Word (Word8, Word16, Word32, Word64)
 import Foreign.C.Error (Errno(..), errnoToIOError)
-import Foreign.C.String (newCWString, withCWStringLen)
+import Foreign.C.String (newCWString, withCWStringLen, CWString)
 import Foreign.C.String (peekCWString, peekCWStringLen, withCWString)
 import Foreign.C.Types (CChar, CUChar, CWchar, CInt(..), CIntPtr(..), CUIntPtr)
 import Foreign.ForeignPtr (ForeignPtr, newForeignPtr, newForeignPtr_)
 import Foreign.Ptr (FunPtr, Ptr, nullPtr, ptrToIntPtr)
 import Foreign.StablePtr (StablePtr, freeStablePtr, newStablePtr)
 import Foreign (allocaArray)
+import GHC.IO.Exception
 import GHC.IO.FD (FD(..))
 import GHC.IO.Handle.FD (fdToHandle)
 import GHC.IO.Handle.Types (Handle(..), Handle__(..))
@@ -62,8 +63,6 @@ import Foreign.C.Types (CUIntPtr(..))
 import Foreign.Marshal.Utils (fromBool, with)
 import Foreign (peek)
 import Foreign.Ptr (ptrToWordPtr)
-import GHC.IO.Exception (ioException, IOException(..),
-                         IOErrorType(InappropriateType, ResourceBusy))
 import GHC.IO.SubSystem ((<!>))
 import GHC.IO.Handle.Windows
 import GHC.IO.IOMode
@@ -181,6 +180,7 @@ type MbLPCTSTR     = Maybe LPCTSTR
 ----------------------------------------------------------------
 
 withTString    :: String -> (LPTSTR -> IO a) -> IO a
+withFilePath   :: FilePath -> (LPTSTR -> IO a) -> IO a
 withTStringLen :: String -> ((LPTSTR, Int) -> IO a) -> IO a
 peekTString    :: LPCTSTR -> IO String
 peekTStringLen :: (LPCTSTR, Int) -> IO String
@@ -189,6 +189,7 @@ newTString     :: String -> IO LPCTSTR
 -- UTF-16 version:
 type TCHAR     = CWchar
 withTString    = withCWString
+withFilePath path = useAsCWStringSafe path
 withTStringLen = withCWStringLen
 peekTString    = peekCWString
 peekTStringLen = peekCWStringLen
@@ -202,6 +203,25 @@ peekTString    = peekCString
 peekTStringLen = peekCStringLen
 newTString     = newCString
 -}
+
+-- | Wrapper around 'useAsCString', checking the encoded 'FilePath' for internal NUL codepoints as these are
+-- disallowed in Windows filepaths. See https://gitlab.haskell.org/ghc/ghc/-/issues/13660
+useAsCWStringSafe :: FilePath -> (CWString -> IO a) -> IO a
+useAsCWStringSafe path f =
+    if '\NUL' `elem` path
+    then ioError err
+    else withCWString path f
+  where
+    err =
+        IOError
+          { ioe_handle = Nothing
+          , ioe_type = InvalidArgument
+          , ioe_location = "useAsCWStringSafe"
+          , ioe_description = "Windows filepaths must not contain internal NUL codepoints."
+          , ioe_errno = Nothing
+          , ioe_filename = Just path
+          }
+
 
 ----------------------------------------------------------------
 -- Handles
@@ -436,6 +456,8 @@ eRROR_MOD_NOT_FOUND = #const ERROR_MOD_NOT_FOUND
 eRROR_PROC_NOT_FOUND :: ErrCode
 eRROR_PROC_NOT_FOUND = #const ERROR_PROC_NOT_FOUND
 
+eERROR_ENVVAR_NOT_FOUND :: ErrCode
+eERROR_ENVVAR_NOT_FOUND = #const ERROR_ENVVAR_NOT_FOUND
 
 errorWin :: String -> IO a
 errorWin fn_name = do

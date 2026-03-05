@@ -10,7 +10,7 @@ module GHC.Core.Opt.Pipeline ( core2core, simplifyExpr ) where
 
 import GHC.Prelude
 
-import GHC.Driver.Session
+import GHC.Driver.DynFlags
 import GHC.Driver.Plugins ( withPlugins, installCoreToDos )
 import GHC.Driver.Env
 import GHC.Driver.Config.Core.Lint ( endPass )
@@ -43,7 +43,7 @@ import GHC.Core.Opt.CallArity    ( callArityAnalProgram )
 import GHC.Core.Opt.Exitify      ( exitifyProgram )
 import GHC.Core.Opt.WorkWrap     ( wwTopBinds )
 import GHC.Core.Opt.CallerCC     ( addCallerCostCentres )
-import GHC.Core.LateCC           (addLateCostCentresMG)
+import GHC.Core.LateCC.TopLevelBinds (topLevelBindsCCMG)
 import GHC.Core.Seq (seqBinds)
 import GHC.Core.FamInstEnv
 
@@ -77,9 +77,9 @@ core2core hsc_env guts@(ModGuts { mg_module  = mod
                                 , mg_loc     = loc
                                 , mg_rdr_env = rdr_env })
   = do { let builtin_passes = getCoreToDo dflags hpt_rule_base extra_vars
-             uniq_mask = 's'
+             uniq_tag = 's'
 
-       ; (guts2, stats) <- runCoreM hsc_env hpt_rule_base uniq_mask mod
+       ; (guts2, stats) <- runCoreM hsc_env hpt_rule_base uniq_tag mod
                                     name_ppr_ctx loc $
                            do { hsc_env' <- getHscEnv
                               ; all_passes <- withPlugins (hsc_plugins hsc_env')
@@ -309,7 +309,7 @@ getCoreToDo dflags hpt_rule_base extra_vars
            [ CoreLiberateCase, simplify "post-liberate-case" ],
            -- Run the simplifier after LiberateCase to vastly
            -- reduce the possibility of shadowing
-           -- Reason: see Note [Shadowing] in GHC.Core.Opt.SpecConstr
+           -- Reason: see Note [Shadowing in SpecConstr] in GHC.Core.Opt.SpecConstr
 
         runWhen spec_constr $ CoreDoPasses
            [ CoreDoSpecConstr, simplify "post-spec-constr"],
@@ -463,11 +463,16 @@ doCorePass pass guts = do
   let fam_envs = (p_fam_env, mg_fam_inst_env guts)
   let updateBinds  f = return $ guts { mg_binds = f (mg_binds guts) }
   let updateBindsM f = f (mg_binds guts) >>= \b' -> return $ guts { mg_binds = b' }
+  -- Important to force this now as name_ppr_ctx lives through an entire phase in
+  -- the optimiser and if it's not forced then the entire previous `ModGuts` will
+  -- be retained until the end of the phase. (See #24328 for more analysis)
+  let !rdr_env = mg_rdr_env guts
   let name_ppr_ctx =
         mkNamePprCtx
           (initPromotionTickContext dflags)
           (hsc_unit_env hsc_env)
-          (mg_rdr_env guts)
+          rdr_env
+
 
   case pass of
     CoreDoSimplify opts       -> {-# SCC "Simplify" #-}
@@ -515,7 +520,7 @@ doCorePass pass guts = do
                                  addCallerCostCentres guts
 
     CoreAddLateCcs            -> {-# SCC "AddLateCcs" #-}
-                                 addLateCostCentresMG guts
+                                 topLevelBindsCCMG guts
 
     CoreDoPrintCore           -> {-# SCC "PrintCore" #-}
                                  liftIO $ printCore logger (mg_binds guts) >> return guts
@@ -567,7 +572,7 @@ dmdAnal logger before_ww dflags fam_envs rules binds = do
                , dmd_max_worker_args = maxWorkerArgs dflags
                }
       binds_plus_dmds = dmdAnalProgram opts fam_envs rules binds
-  Logger.putDumpFileMaybe logger Opt_D_dump_str_signatures "Strictness signatures" FormatText $
+  Logger.putDumpFileMaybe logger Opt_D_dump_dmd_signatures "Demand signatures" FormatText $
     dumpIdInfoOfProgram (hasPprDebug dflags) (ppr . zapDmdEnvSig . dmdSigInfo) binds_plus_dmds
   -- See Note [Stamp out space leaks in demand analysis] in GHC.Core.Opt.DmdAnal
   seqBinds binds_plus_dmds `seq` return binds_plus_dmds

@@ -21,6 +21,12 @@ function h$logArith() { h$log.apply(h$log,arguments); }
 #define RETURN_W64(x) RETURN_UBX_TUP2(W64h(x), W64l(x))
 #define RETURN_W32(x) return Number(x)
 
+
+// N.B. 64-bit numbers are represented by two JS numbers,
+// each of which can represent a 32-bit integer precisely.
+// See Note [StgToJS design] in GHC.StgToJS for details on
+// number representation.
+
 function h$hs_quotWord64(h1,l1,h2,l2) {
   var a = W64(h1,l1);
   var b = W64(h2,l2);
@@ -38,35 +44,43 @@ function h$hs_remWord64(h1,l1,h2,l2) {
 }
 
 function h$hs_timesWord64(h1,l1,h2,l2) {
-  var a = W64(h1,l1);
-  var b = W64(h2,l2);
-  var r = BigInt.asUintN(64, a * b);
-  TRACE_ARITH("Word64: " + a + " * " + b + " ==> " + r)
-  RETURN_W64(r);
+  var rh = h$mul2Word32(l1,l2);
+  var rl = h$ret1;
+
+  rh += Math.imul(l1,h2)>>>0;
+  rh += Math.imul(l2,h1)>>>0;
+  rh >>>= 0;
+
+  TRACE_ARITH("Word64: " + (h1,l1) + " * " + (h2,l2) + " ==> " + (rh,rl))
+  RETURN_UBX_TUP2(rh,rl);
 }
 
 function h$hs_minusWord64(h1,l1,h2,l2) {
-  var a = (BigInt(h1) << BigInt(32)) | BigInt(l1>>>0);
-  var b = (BigInt(h2) << BigInt(32)) | BigInt(l2>>>0);
-  var r = BigInt.asUintN(64, a - b);
-  TRACE_ARITH("Word64: " + a + " - " + b + " ==> " + r)
-  RETURN_W64(r);
+  var l  = l1-l2;
+  var rl = l>>>0;
+  var rh = (h1-h2-(l!=rl?1:0))>>>0;
+  TRACE_ARITH("Word64: " + (h1,l1) + " - " + (h2,l2) + " ==> " + (rh,rl))
+  RETURN_UBX_TUP2(rh,rl);
 }
 
 function h$hs_plusWord64(h1,l1,h2,l2) {
-  var a = W64(h1,l1);
-  var b = W64(h2,l2);
-  var r = BigInt.asUintN(64, a + b);
-  TRACE_ARITH("Word64: " + a + " + " + b + " ==> " + r)
-  RETURN_W64(r);
+  var l  = l1+l2;
+  var rl = l>>>0;
+  var rh = (h1+h2+(l!=rl?1:0))>>>0;
+  TRACE_ARITH("Word64: " + (h1,l1) + " + " + (h2,l2) + " ==> " + (rh,rl))
+  RETURN_UBX_TUP2(rh,rl);
 }
 
 function h$hs_timesInt64(h1,l1,h2,l2) {
-  var a = I64(h1,l1);
-  var b = I64(h2,l2);
-  var r = BigInt.asIntN(64, a * b);
-  TRACE_ARITH("Int64: " + a + " * " + b + " ==> " + r)
-  RETURN_I64(r);
+  var rh = h$mul2Word32(l1,l2);
+  var rl = h$ret1;
+
+  rh += Math.imul(l1,h2)|0;
+  rh += Math.imul(l2,h1)|0;
+  rh |= 0;
+
+  TRACE_ARITH("Int64: " + (h1,l1) + " * " + (h2,l2) + " ==> " + (rh,rl))
+  RETURN_UBX_TUP2(rh,rl);
 }
 
 function h$hs_quotInt64(h1,l1,h2,l2) {
@@ -86,19 +100,19 @@ function h$hs_remInt64(h1,l1,h2,l2) {
 }
 
 function h$hs_plusInt64(h1,l1,h2,l2) {
-  var a = I64(h1,l1);
-  var b = I64(h2,l2);
-  var r = BigInt.asIntN(64, a + b);
-  TRACE_ARITH("Int64: " + a + " + " + b + " ==> " + r)
-  RETURN_I64(r);
+  var l  = l1+l2;
+  var rl = l>>>0;
+  var rh = (h1+h2+(l!=rl?1:0))|0;
+  TRACE_ARITH("Int64: " + (h1,l1) + " + " + (h2,l2) + " ==> " + (rh,rl))
+  RETURN_UBX_TUP2(rh,rl);
 }
 
 function h$hs_minusInt64(h1,l1,h2,l2) {
-  var a = I64(h1,l1);
-  var b = I64(h2,l2);
-  var r = BigInt.asIntN(64, a - b);
-  TRACE_ARITH("Int64: " + a + " - " + b + " ==> " + r)
-  RETURN_I64(r);
+  var l  = l1-l2;
+  var rl = l>>>0;
+  var rh = (h1-h2-(l!=rl?1:0))|0;
+  TRACE_ARITH("Int64: " + (h1,l1) + " - " + (h2,l2) + " ==> " + (rh,rl))
+  RETURN_UBX_TUP2(rh,rl);
 }
 
 function h$hs_uncheckedShiftLWord64(h,l,n) {
@@ -203,38 +217,73 @@ function h$hs_uncheckedShiftRLInt64(h,l,n) {
   RETURN_UBX_TUP2(rh,rl);
 }
 
-var h$mulInt32 = Math.imul;
-
 // Compute product of two Ints. Returns (nh,ch,cl)
 // where (ch,cl) are the two parts of the 64-bit result
 // and nh is 0 if ch can be safely dropped (i.e. it's a sign-extension of cl).
 function h$hs_timesInt2(l1,l2) {
-  var a = I32(l1);
-  var b = I32(l2);
-  var r = BigInt.asIntN(64, a * b);
-  TRACE_ARITH("Int32: " + a + " * " + b + " ==> " + r + " (Int64)")
+  var ah = l1 >> 16;
+  var al = l1 & 0xFFFF;
+  var bh = l2 >> 16;
+  var bl = l2 & 0xFFFF;
 
-  var rh = I64h(r);
-  var rl = I64l(r)|0;
-  var nh = ((rh === 0 && rl >= 0) || (rh === -1 && rl < 0)) ? 0 : 1;
-  RETURN_UBX_TUP3(nh, rh, rl);
+  var r0 = al * bl;
+  var r1 = r0 >>> 16;
+  r0 &= 0xFFFF;
+
+  r1 += al * bh;
+  var r2 = r1 >> 16;
+  r1 &= 0xFFFF;
+
+  r1 += ah * bl;
+  r2 += r1 >> 16;
+  r1 &= 0xFFFF;
+
+  r2 += ah * bh;
+  var r3 = (r2 >> 16) & 0xFFFF;
+  r2 &= 0xFFFF;
+
+  const rh = r3 << 16 | r2;
+  const rl = r1 << 16 | r0;
+
+  var s = rl >> 31;
+  if (rh === s) {
+    TRACE_ARITH("Int32: " + l1 + " * " + l2 + " ==> " + rl + " (Int64)")
+    RETURN_UBX_TUP3(0, s, rl);
+  }
+  else {
+    TRACE_ARITH("Int32: " + l1 + " * " + l2 + " ==> " + rh + " " + rl + " (Int64)")
+    RETURN_UBX_TUP3(1, rh, rl);
+  }
 }
 
-
-function h$mulWord32(l1,l2) {
-  var a = W32(l1);
-  var b = W32(l2);
-  var r = BigInt.asUintN(32, a * b);
-  TRACE_ARITH("Word32: " + a + " * " + b + " ==> " + r)
-  RETURN_W32(r);
-}
 
 function h$mul2Word32(l1,l2) {
-  var a = W32(l1);
-  var b = W32(l2);
-  var r = BigInt.asUintN(64, a * b);
-  TRACE_ARITH("Word32: " + a + " * " + b + " ==> " + r + " (Word64)")
-  RETURN_W64(r);
+  var ah = l1 >>> 16;
+  var al = l1 & 0xFFFF;
+  var bh = l2 >>> 16;
+  var bl = l2 & 0xFFFF;
+
+  var r0 = al * bl;
+  var r1 = r0 >>> 16;
+  r0 &= 0xFFFF;
+
+  r1 += al * bh;
+  var r2 = r1 >>> 16;
+  r1 &= 0xFFFF;
+
+  r1 += ah * bl;
+  r2 += r1 >>> 16;
+  r1 &= 0xFFFF;
+
+  r2 += ah * bh;
+  var r3 = (r2 >>> 16) & 0xFFFF;
+  r2 &= 0xFFFF;
+
+  const rh = (r3 << 16 | r2) >>> 0;
+  const rl = (r1 << 16 | r0) >>> 0;
+
+  TRACE_ARITH("Word32: " + l1 + " * " + l2 + " ==> " + rh + " " + rl + " (Word64)")
+  RETURN_UBX_TUP2(rh,rl);
 }
 
 function h$quotWord32(n,d) {
@@ -272,11 +321,11 @@ function h$quotRem2Word32(nh,nl,d) {
 }
 
 function h$wordAdd2(l1,l2) {
-  var a = W32(l1);
-  var b = W32(l2);
-  var r = BigInt.asUintN(64, a + b);
-  TRACE_ARITH("Word32: " + a + " + " + b + " ==> " + r + " (Word64)")
-  RETURN_W64(r);
+  var r = (l1 >>> 1) + (l2 >>> 1) + (1 & l1 & l2);
+  var h = r >>> 31;
+  var l = (l1 + l2) >>> 0;
+  TRACE_ARITH("Word32: " + a + " + " + b + " ==> " + h + " " + l + " (Word64)")
+  RETURN_UBX_TUP2(h,l);
 }
 
 function h$isDoubleNegativeZero(d) {
@@ -353,9 +402,9 @@ function h$decodeFloatInt(d) {
             h$convertFloat[0] = d*8388608; // put d in the normal range (~ shift left 23 bits)
             i = h$convertInt[0];
             s = (i&8388607) | 8388608;
-            e = ((i >> 23) & 0xff) - 173; // take into account normalization above (150+23)
-            TRACE_ARITH("decodeFloatInt s: " + (sgn * s) +  " e: " + e)
-            RETURN_UBX_TUP2(sgn*s, e)
+            exp = ((i >> 23) & 0xff) - 173; // take into account normalization above (150+23)
+            TRACE_ARITH("decodeFloatInt s: " + (sgn * s) +  " e: " + exp)
+            RETURN_UBX_TUP2(sgn*s, exp)
         }
     } else {
       TRACE_ARITH("decodeFloatInt s: " + (sgn * (s|8388608)) +  " e: " + (exp-150))
@@ -580,23 +629,23 @@ function h$__word_encodeFloat(j,e) {
   return Math.fround((j>>>0) * (2 ** (e|0)));
 }
 
-function h$stg_word32ToFloatzh(v) {
+function h$castWord32ToFloat(v) {
   h$convertWord[0] = v;
   return h$convertFloat[0];
 }
 
-function h$stg_floatToWord32zh(v) {
+function h$castFloatToWord32(v) {
   h$convertFloat[0] = v;
   return h$convertWord[0];
 }
 
-function h$stg_word64ToDoublezh(h,l) {
+function h$castWord64ToDouble(h,l) {
   h$convertWord[0] = l;
   h$convertWord[1] = h;
   return h$convertDouble[0];
 }
 
-function h$stg_doubleToWord64zh(v) {
+function h$castDoubleToWord64(v) {
   h$convertDouble[0] = v;
   var l = h$convertWord[0];
   var h = h$convertWord[1];

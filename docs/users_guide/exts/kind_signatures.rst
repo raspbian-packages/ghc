@@ -10,7 +10,7 @@ Explicitly-kinded quantification
     :implied by: :extension:`TypeFamilies`, :extension:`PolyKinds`
     :since: 6.8.1
 
-    :status: Included in :extension:`GHC2021`
+    :status: Included in :extension:`GHC2024`, :extension:`GHC2021`
 
     Allow explicit kind signatures on type variables.
 
@@ -36,6 +36,10 @@ This extension enables kind signatures in the following places:
 -  ``data`` declarations: ::
 
          data Set (cxt :: Type -> Type) a = Set [a]
+
+-  ``newtype`` declarations: ::
+
+         newtype Set (cxt :: Type -> Type) a = Set [a]
 
 -  ``type`` declarations: ::
 

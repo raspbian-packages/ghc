@@ -38,8 +38,8 @@ import GHC.Cmm.BlockId
 import GHC.Cmm.CLabel
 import GHC.Cmm hiding (pprBBlock, pprStatic)
 import GHC.Cmm.Dataflow.Block
-import GHC.Cmm.Dataflow.Collections
 import GHC.Cmm.Dataflow.Graph
+import GHC.Cmm.Dataflow.Label
 import GHC.Cmm.Utils
 import GHC.Cmm.Switch
 import GHC.Cmm.InitFini
@@ -261,6 +261,13 @@ pprStmt platform stmt =
     CmmUnsafeForeignCall (PrimTarget MO_Touch) _results _args -> empty
     CmmUnsafeForeignCall (PrimTarget (MO_Prefetch_Data _)) _results _args -> empty
 
+    CmmUnsafeForeignCall (PrimTarget MO_ReleaseFence) [] [] ->
+        text "__atomic_thread_fence(__ATOMIC_RELEASE);"
+    CmmUnsafeForeignCall (PrimTarget MO_AcquireFence) [] [] ->
+        text "__atomic_thread_fence(__ATOMIC_ACQUIRE);"
+    CmmUnsafeForeignCall (PrimTarget MO_SeqCstFence) [] [] ->
+        text "__atomic_thread_fence(__ATOMIC_SEQ_CST);"
+
     CmmUnsafeForeignCall target@(PrimTarget op) results args ->
         fn_call
       where
@@ -383,7 +390,7 @@ pprExpr platform e = case e of
 
     -- CmmRegOff is an alias of MO_Add
     CmmRegOff reg i    -> pprExpr platform $ CmmMachOp (MO_Add w) [CmmReg reg, CmmLit $ CmmInt (toInteger i) w]
-      where w = cmmRegWidth platform reg
+      where w = cmmRegWidth reg
 
     CmmMachOp mop args -> pprMachOpApp platform mop args
 
@@ -432,6 +439,9 @@ pprMachOpApp platform op args
   = text "mulIntMayOflo" <> parens (commafy (map (pprExpr platform) args))
   where isMulMayOfloOp (MO_S_MulMayOflo _) = True
         isMulMayOfloOp _ = False
+
+pprMachOpApp platform (MO_RelaxedRead w) [x]
+  = pprExpr platform (CmmLoad x (cmmBits w) NaturallyAligned)
 
 pprMachOpApp platform mop args
   | Just ty <- machOpNeedsCast platform mop (map (cmmExprType platform) args)
@@ -529,6 +539,11 @@ machOpNeedsCast platform mop args
 pprMachOpApp' :: Platform -> MachOp -> [CmmExpr] -> SDoc
 pprMachOpApp' platform mop args
  = case args of
+
+    -- ternary
+    args@[_,_,_] ->
+      pprMachOp_for_C platform mop <> parens (pprWithCommas pprArg args)
+
     -- dyadic
     [x,y] -> pprArg x <+> pprMachOp_for_C platform mop <+> pprArg y
 
@@ -711,12 +726,27 @@ pprMachOp_for_C platform mop = case mop of
         MO_U_Quot       _ -> char '/'
         MO_U_Rem        _ -> char '%'
 
-        -- & Floating-point operations
+        -- Floating-point operations
         MO_F_Add        _ -> char '+'
         MO_F_Sub        _ -> char '-'
         MO_F_Neg        _ -> char '-'
         MO_F_Mul        _ -> char '*'
         MO_F_Quot       _ -> char '/'
+
+        -- Floating-point fused multiply-add operations
+        MO_FMA FMAdd w ->
+          case w of
+            W32 -> text "fmaf"
+            W64 -> text "fma"
+            _   ->
+              pprTrace "offending mop:"
+                (text "FMAdd")
+                (panic $ "PprC.pprMachOp_for_C: FMAdd unsupported"
+                       ++ "at width " ++ show w)
+        MO_FMA var _width  ->
+          pprTrace "offending mop:"
+            (text $ "FMA " ++ show var)
+            (panic $ "PprC.pprMachOp_for_C: should have been handled earlier!")
 
         -- Signed comparisons
         MO_S_Ge         _ -> text ">="
@@ -769,6 +799,11 @@ pprMachOp_for_C platform mop = case mop of
 
         MO_SF_Conv _from to -> parens (machRep_F_CType to)
         MO_FS_Conv _from to -> parens (machRep_S_CType platform to)
+
+        MO_RelaxedRead _ -> pprTrace "offending mop:"
+                                (text "MO_RelaxedRead")
+                                (panic $ "PprC.pprMachOp_for_C: MO_S_MulMayOflo"
+                                      ++ " should have been handled earlier!")
 
         MO_S_MulMayOflo _ -> pprTrace "offending mop:"
                                 (text "MO_S_MulMayOflo")
@@ -924,8 +959,9 @@ pprCallishMachOp_for_C mop
         MO_F32_ExpM1    -> text "expm1f"
         MO_F32_Sqrt     -> text "sqrtf"
         MO_F32_Fabs     -> text "fabsf"
-        MO_ReadBarrier  -> text "load_load_barrier"
-        MO_WriteBarrier -> text "write_barrier"
+        MO_AcquireFence -> unsupported
+        MO_ReleaseFence -> unsupported
+        MO_SeqCstFence  -> unsupported
         MO_Memcpy _     -> text "__builtin_memcpy"
         MO_Memset _     -> text "__builtin_memset"
         MO_Memmove _    -> text "__builtin_memmove"
@@ -1044,9 +1080,11 @@ pprAssign platform r1 r2
   | isFixedPtrReg r1             = mkAssign (mkP_ <> pprExpr1 platform r2)
   | Just ty <- strangeRegType r1 = mkAssign (parens ty <> pprExpr1 platform r2)
   | otherwise                    = mkAssign (pprExpr platform r2)
-    where mkAssign x = if r1 == CmmGlobal BaseReg
-                       then text "ASSIGN_BaseReg" <> parens x <> semi
-                       else pprReg r1 <> text " = " <> x <> semi
+    where mkAssign x =
+            case r1 of
+              CmmGlobal (GlobalRegUse BaseReg _) ->
+                text "ASSIGN_BaseReg" <> parens x <> semi
+              _ -> pprReg r1 <> text " = " <> x <> semi
 
 -- ---------------------------------------------------------------------
 -- Registers
@@ -1061,17 +1099,16 @@ pprCastReg reg
 -- StgPtr.
 isFixedPtrReg :: CmmReg -> Bool
 isFixedPtrReg (CmmLocal _) = False
-isFixedPtrReg (CmmGlobal r) = isFixedPtrGlobalReg r
+isFixedPtrReg (CmmGlobal (GlobalRegUse r _)) = isFixedPtrGlobalReg r
 
 -- True if (pprAsPtrReg reg) will give an expression with type StgPtr
 -- JD: THIS IS HORRIBLE AND SHOULD BE RENAMED, AT THE VERY LEAST.
 -- THE GARBAGE WITH THE VNonGcPtr HELPS MATCH THE OLD CODE GENERATOR'S OUTPUT;
 -- I'M NOT SURE IF IT SHOULD REALLY STAY THAT WAY.
 isPtrReg :: CmmReg -> Bool
-isPtrReg (CmmLocal _)                         = False
-isPtrReg (CmmGlobal (VanillaReg _ VGcPtr))    = True  -- if we print via pprAsPtrReg
-isPtrReg (CmmGlobal (VanillaReg _ VNonGcPtr)) = False -- if we print via pprAsPtrReg
-isPtrReg (CmmGlobal reg)                      = isFixedPtrGlobalReg reg
+isPtrReg (CmmLocal _)                                 = False
+isPtrReg (CmmGlobal (GlobalRegUse (VanillaReg _) ty)) = isGcPtrType ty -- if we print via pprAsPtrReg
+isPtrReg (CmmGlobal (GlobalRegUse reg _))             = isFixedPtrGlobalReg reg
 
 -- True if this global reg has type StgPtr
 isFixedPtrGlobalReg :: GlobalReg -> Bool
@@ -1085,7 +1122,7 @@ isFixedPtrGlobalReg _     = False
 -- (machRepCType (cmmRegType reg)), so it has to be cast.
 isStrangeTypeReg :: CmmReg -> Bool
 isStrangeTypeReg (CmmLocal _)   = False
-isStrangeTypeReg (CmmGlobal g)  = isStrangeTypeGlobal g
+isStrangeTypeReg (CmmGlobal (GlobalRegUse g _)) = isStrangeTypeGlobal g
 
 isStrangeTypeGlobal :: GlobalReg -> Bool
 isStrangeTypeGlobal CCCS                = True
@@ -1095,10 +1132,10 @@ isStrangeTypeGlobal BaseReg             = True
 isStrangeTypeGlobal r                   = isFixedPtrGlobalReg r
 
 strangeRegType :: CmmReg -> Maybe SDoc
-strangeRegType (CmmGlobal CCCS) = Just (text "struct CostCentreStack_ *")
-strangeRegType (CmmGlobal CurrentTSO) = Just (text "struct StgTSO_ *")
-strangeRegType (CmmGlobal CurrentNursery) = Just (text "struct bdescr_ *")
-strangeRegType (CmmGlobal BaseReg) = Just (text "struct StgRegTable_ *")
+strangeRegType (CmmGlobal (GlobalRegUse CCCS _)) = Just (text "struct CostCentreStack_ *")
+strangeRegType (CmmGlobal (GlobalRegUse CurrentTSO _)) = Just (text "struct StgTSO_ *")
+strangeRegType (CmmGlobal (GlobalRegUse CurrentNursery _)) = Just (text "struct bdescr_ *")
+strangeRegType (CmmGlobal (GlobalRegUse BaseReg _)) = Just (text "struct StgRegTable_ *")
 strangeRegType _ = Nothing
 
 -- pprReg just prints the register name.
@@ -1106,16 +1143,16 @@ strangeRegType _ = Nothing
 pprReg :: CmmReg -> SDoc
 pprReg r = case r of
         CmmLocal  local  -> pprLocalReg local
-        CmmGlobal global -> pprGlobalReg global
+        CmmGlobal (GlobalRegUse global _ ) -> pprGlobalReg global
 
 pprAsPtrReg :: CmmReg -> SDoc
-pprAsPtrReg (CmmGlobal (VanillaReg n gcp))
-  = warnPprTrace (gcp /= VGcPtr) "pprAsPtrReg" (ppr n) $ char 'R' <> int n <> text ".p"
+pprAsPtrReg (CmmGlobal (GlobalRegUse (VanillaReg n) ty))
+  = warnPprTrace (not $ isGcPtrType ty) "pprAsPtrReg" (ppr n) $ char 'R' <> int n <> text ".p"
 pprAsPtrReg other_reg = pprReg other_reg
 
 pprGlobalReg :: GlobalReg -> SDoc
 pprGlobalReg gr = case gr of
-    VanillaReg n _ -> char 'R' <> int n  <> text ".w"
+    VanillaReg n   -> char 'R' <> int n  <> text ".w"
         -- pprGlobalReg prints a VanillaReg as a .w regardless
         -- Example:     R1.w = R1.w & (-0x8UL);
         --              JMP_(*R1.p);
@@ -1313,6 +1350,7 @@ cLoad platform expr rep
           bewareLoadStoreAlignment ArchMipsel   = True
           bewareLoadStoreAlignment (ArchARM {}) = True
           bewareLoadStoreAlignment ArchAArch64  = True
+          bewareLoadStoreAlignment ArchSPARC64  = True
           -- Pessimistically assume that they will also cause problems
           -- on unknown arches
           bewareLoadStoreAlignment ArchUnknown  = True
@@ -1492,12 +1530,15 @@ pprHexVal platform w rep = parens ctype <> rawlit
 pprCtorArray :: Platform -> InitOrFini -> [CLabel] -> SDoc
 pprCtorArray platform initOrFini lbls =
        decls
-    <> text "static __attribute__((" <> attribute <> text "))"
-    <> text "void _hs_" <> attribute <> text "()"
+    <> text "static __attribute__((" <> text attribute <> text "))"
+    <> text "void _hs_" <> text suffix <> text "()"
     <> braces body
   where
     body = vcat [ pprCLabel platform lbl <> text " ();" | lbl <- lbls ]
     decls = vcat [ text "void" <+> pprCLabel platform lbl <> text " (void);" | lbl <- lbls ]
-    attribute = case initOrFini of
-                  IsInitArray -> text "constructor"
-                  IsFiniArray -> text "destructor"
+    (attribute, suffix) = case initOrFini of
+                  IsInitArray
+                    -- See Note [JSFFI initialization] for details
+                    | ArchWasm32 <- platformArch platform -> ("constructor(101)", "constructor")
+                    | otherwise -> ("constructor", "constructor")
+                  IsFiniArray -> ("destructor", "destructor")

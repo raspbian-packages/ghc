@@ -18,15 +18,15 @@
    since we compile these things these days with cabal we can no longer
    specify optimization per file.  So we have to resort to pragmas.  */
 #if defined(__GNUC__) || defined(__GNUG__)
+#if !defined(__clang__)
 #if !defined(DEBUG)
 #pragma GCC push_options
 #pragma GCC optimize ("O3")
 #endif
 #endif
+#endif
 
-#define XXH_NAMESPACE __rts_
-#define XXH_STATIC_LINKING_ONLY   /* access advanced declarations */
-#define XXH_IMPLEMENTATION   /* access definitions */
+#define XXH_INLINE_ALL
 
 #include "xxhash.h"
 
@@ -94,13 +94,13 @@ hashWord(const HashTable *table, StgWord key)
 }
 
 int
-hashStr(const HashTable *table, StgWord w)
+hashBuffer(const HashTable *table, const void *buf, size_t len)
 {
-    const char *key = (char*) w;
-#if defined(x86_64_HOST_ARCH)
-    StgWord h = XXH3_64bits_withSeed (key, strlen(key), 1048583);
+    const char *key = (char*) buf;
+#if WORD_SIZE_IN_BITS == 64
+    StgWord h = XXH3_64bits_withSeed (key, len, 1048583);
 #else
-    StgWord h = XXH32 (key, strlen(key), 1048583);
+    StgWord h = XXH32 (key, len, 1048583);
 #endif
 
     /* Mod the size of the hash table (a power of 2) */
@@ -112,6 +112,13 @@ hashStr(const HashTable *table, StgWord w)
     }
 
     return bucket;
+}
+
+int
+hashStr(const HashTable *table, StgWord w)
+{
+    const char *key = (char*) w;
+    return hashBuffer(table, key, strlen(key));
 }
 
 STATIC_INLINE int
@@ -440,14 +447,15 @@ freeHashTable(HashTable *table, void (*freeDataFun)(void *) )
 
     /* Free table segments */
     while (segment >= 0) {
-        while (index >= 0) {
-            HashList *next;
-            for (HashList *hl = table->dir[segment][index]; hl != NULL; hl = next) {
-                next = hl->next;
-                if (freeDataFun != NULL)
+        if (freeDataFun) {
+            while (index >= 0) {
+                HashList *next;
+                for (HashList *hl = table->dir[segment][index]; hl != NULL; hl = next) {
+                    next = hl->next;
                     (*freeDataFun)((void *) hl->data);
+                }
+                index--;
             }
-            index--;
         }
         stgFree(table->dir[segment]);
         segment--;
@@ -565,7 +573,9 @@ int keyCountHashTable (HashTable *table)
 
 
 #if defined(__GNUC__) || defined(__GNUG__)
+#if !defined(__clang__)
 #if !defined(DEBUG)
 #pragma GCC pop_options
+#endif
 #endif
 #endif

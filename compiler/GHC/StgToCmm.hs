@@ -1,6 +1,5 @@
 
 {-# LANGUAGE DataKinds #-}
-{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE LambdaCase #-}
 
 -----------------------------------------------------------------------------
@@ -54,7 +53,6 @@ import GHC.Unit.Module
 
 import GHC.Utils.Error
 import GHC.Utils.Outputable
-import GHC.Utils.Panic.Plain
 import GHC.Utils.Logger
 
 import GHC.Utils.TmpFs
@@ -68,7 +66,7 @@ import GHC.Utils.Misc
 import System.IO.Unsafe
 import qualified Data.ByteString as BS
 import Data.IORef
-import GHC.Utils.Panic (assertPpr)
+import GHC.Utils.Panic
 
 codeGen :: Logger
         -> TmpFs
@@ -103,10 +101,6 @@ codeGen logger tmpfs cfg (InfoTableProvMap (UniqMap denv) _ _) data_tycons
                 yield cmm
                 return a
 
-               -- Note [codegen-split-init] the cmm_init block must come
-               -- FIRST.  This is because when -split-objs is on we need to
-               -- combine this block with its initialisation routines; see
-               -- Note [pipeline-split-init].
         ; cg (mkModuleInit cost_centre_info (stgToCmmThisModule cfg) hpc_info)
 
         ; mapM_ (cg . cgTopBinding logger tmpfs cfg) stg_binds
@@ -199,12 +193,12 @@ cgTopBinding logger tmpfs cfg = \case
 cgTopRhs :: StgToCmmConfig -> RecFlag -> Id -> CgStgRhs -> (CgIdInfo, FCode ())
         -- The Id is passed along for setting up a binding...
 
-cgTopRhs cfg _rec bndr (StgRhsCon _cc con mn _ts args)
+cgTopRhs cfg _rec bndr (StgRhsCon _cc con mn _ts args _typ)
   = cgTopRhsCon cfg bndr con mn (assertNonVoidStgArgs args)
       -- con args are always non-void,
       -- see Note [Post-unarisation invariants] in GHC.Stg.Unarise
 
-cgTopRhs cfg rec bndr (StgRhsClosure fvs cc upd_flag args body)
+cgTopRhs cfg rec bndr (StgRhsClosure fvs cc upd_flag args body _typ)
   = assertPpr (isEmptyDVarSet fvs) (text "fvs:" <> ppr fvs) $   -- There should be no free variables
     cgTopRhsClosure (stgToCmmPlatform cfg) rec bndr cc upd_flag args body
 
@@ -258,11 +252,11 @@ cgDataCon mn data_con
 
             -- We're generating info tables, so we don't know and care about
             -- what the actual arguments are. Using () here as the place holder.
-            arg_reps :: [NonVoid PrimRep]
-            arg_reps = [ NonVoid rep_ty
+            arg_reps :: [PrimRep]
+            arg_reps = [ rep_ty
                        | ty <- dataConRepArgTys data_con
                        , rep_ty <- typePrimRep (scaledThing ty)
-                       , not (isVoidRep rep_ty) ]
+                       ]
 
         ; emitClosureAndInfoTable platform dyn_info_tbl NativeDirectCall [] $
             -- NB: the closure pointer is assumed *untagged* on
@@ -272,9 +266,10 @@ cgDataCon mn data_con
             -- return it.
             -- NB 2: We don't set CC when entering data (WDP 94/06)
             do { tickyEnterDynCon
-               ; ldvEnter (CmmReg nodeReg)
+               ; let node = CmmReg $ nodeReg platform
+               ; ldvEnter node
                ; tickyReturnOldCon (length arg_reps)
-               ; void $ emitReturn [cmmOffsetB platform (CmmReg nodeReg) (tagForCon platform data_con)]
+               ; void $ emitReturn [cmmOffsetB platform node (tagForCon platform data_con)]
                }
                     -- The case continuation code expects a tagged pointer
         }

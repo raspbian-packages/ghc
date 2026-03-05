@@ -1,6 +1,8 @@
-{-# LANGUAGE CPP, MagicHash #-}
-{-# LANGUAGE Trustworthy #-}
+{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE CApiFFI #-}
+{-# LANGUAGE CPP #-}
+{-# LANGUAGE MagicHash #-}
+{-# LANGUAGE Trustworthy #-}
 {-# LANGUAGE ViewPatterns #-}
 
 {-# OPTIONS_GHC -fno-warn-orphans #-}
@@ -24,14 +26,14 @@ module Data.Text.Show
     ) where
 
 import Control.Monad.ST (ST, runST)
-import Data.Text.Internal (Text(..), empty_, safe, pack)
+import Data.Text.Internal (Text(..), empty, safe, pack)
 import Data.Text.Internal.Encoding.Utf8 (utf8Length)
-import Data.Text.Internal.Fusion (stream)
 import Data.Text.Internal.Unsafe.Char (unsafeWrite)
+import Data.Text.Unsafe (Iter(..), iterArray)
 import GHC.Exts (Ptr(..), Int(..), Addr#, indexWord8OffAddr#)
+import qualified GHC.Exts as Exts
 import GHC.Word (Word8(..))
 import qualified Data.Text.Array as A
-import qualified Data.Text.Internal.Fusion.Common as S
 #if !MIN_VERSION_ghc_prim(0,7,0)
 import Foreign.C.String (CString)
 import Foreign.C.Types (CSize(..))
@@ -52,8 +54,32 @@ unpack ::
   HasCallStack =>
 #endif
   Text -> String
-unpack = S.unstreamList . stream
-{-# INLINE [1] unpack #-}
+unpack t = foldrText (:) [] t
+{-# NOINLINE unpack #-}
+
+foldrText :: (Char -> b -> b) -> b -> Text -> b
+foldrText f z (Text arr off len) = go off
+  where
+    go !i
+      | i >= off + len = z
+      | otherwise = let !(Iter c l) = iterArray arr i in f c (go (i + l))
+{-# INLINE foldrText #-}
+
+foldrTextFB :: (Char -> b -> b) -> b -> Text -> b
+foldrTextFB = foldrText
+{-# INLINE [0] foldrTextFB #-}
+
+-- List fusion rules for `unpack`:
+-- * `unpack` rewrites to `build` up till (but not including) phase 1. `build`
+--   fuses if `foldr` is applied to it.
+-- * If it doesn't fuse: In phase 1, `build` inlines to give us
+--   `foldrTextFB (:) []` and we rewrite that back to `unpack`.
+-- * If it fuses: In phase 0, `foldrTextFB` inlines and `foldrText` inlines. GHC
+--   optimizes the fused code.
+{-# RULES
+"Text.unpack"     [~1] forall t. unpack t = Exts.build (\lcons lnil -> foldrTextFB lcons lnil t)
+"Text.unpackBack" [1]  foldrTextFB (:) [] = unpack
+  #-}
 
 -- | /O(n)/ Convert a null-terminated
 -- <https://en.wikipedia.org/wiki/UTF-8#Modified_UTF-8 modified UTF-8>
@@ -123,7 +149,7 @@ foreign import capi unsafe "string.h strlen" c_strlen :: CString -> CSize
     pack (GHC.unpackCStringUtf8# a) = unpackCString# a #-}
 
 {-# RULES "TEXT empty literal"
-    pack [] = empty_ #-}
+    pack [] = empty #-}
 
 {-# RULES "TEXT singleton literal" forall a.
     pack [a] = singleton a #-}

@@ -149,7 +149,7 @@ lintStgTopBindings platform logger diag_opts opts extra_vars this_mod unarised w
       Nothing  ->
         return ()
       Just msg -> do
-        logMsg logger Err.MCDump noSrcSpan
+        logMsg logger Err.MCInfo noSrcSpan   -- See Note [MCInfo for Lint] in "GHC.Core.Lint"
           $ withPprStyle defaultDumpStyle
           (vcat [ text "*** Stg Lint ErrMsgs: in" <+>
                         text whodunit <+> text "***",
@@ -178,7 +178,7 @@ lintStgTopBindings platform logger diag_opts opts extra_vars this_mod unarised w
 lintStgConArg :: StgArg -> LintM ()
 lintStgConArg arg = do
   unarised <- lf_unarised <$> getLintFlags
-  when unarised $ case typePrimRep_maybe (stgArgType arg) of
+  when unarised $ case stgArgRep_maybe arg of
     -- Note [Post-unarisation invariants], invariant 4
     Just [_] -> pure ()
     badRep   -> addErrL $
@@ -192,7 +192,7 @@ lintStgConArg arg = do
 lintStgFunArg :: StgArg -> LintM ()
 lintStgFunArg arg = do
   unarised <- lf_unarised <$> getLintFlags
-  when unarised $ case typePrimRep_maybe (stgArgType arg) of
+  when unarised $ case stgArgRep_maybe arg of
     -- Note [Post-unarisation invariants], invariant 3
     Just []  -> pure ()
     Just [_] -> pure ()
@@ -247,25 +247,25 @@ checkNoCurrentCCS rhs = do
    opts <- getStgPprOpts
    let rhs' = pprStgRhs opts rhs
    case rhs of
-      StgRhsClosure _ ccs _ _ _
+      StgRhsClosure _ ccs _ _ _ _
          | isCurrentCCS ccs
          -> addErrL (text "Top-level StgRhsClosure with CurrentCCS" $$ rhs')
-      StgRhsCon ccs _ _ _ _
+      StgRhsCon ccs _ _ _ _ _
          | isCurrentCCS ccs
          -> addErrL (text "Top-level StgRhsCon with CurrentCCS" $$ rhs')
       _ -> return ()
 
 lintStgRhs :: (OutputablePass a, BinderP a ~ Id) => GenStgRhs a -> LintM ()
 
-lintStgRhs (StgRhsClosure _ _ _ [] expr)
+lintStgRhs (StgRhsClosure _ _ _ [] expr _)
   = lintStgExpr expr
 
-lintStgRhs (StgRhsClosure _ _ _ binders expr)
+lintStgRhs (StgRhsClosure _ _ _ binders expr _)
   = addLoc (LambdaBodyOf binders) $
       addInScopeVars binders $
         lintStgExpr expr
 
-lintStgRhs rhs@(StgRhsCon _ con _ _ args) = do
+lintStgRhs rhs@(StgRhsCon _ con _ _ args _) = do
     opts <- getStgPprOpts
     when (isUnboxedTupleDataCon con || isUnboxedSumDataCon con) $ do
       addErrL (text "StgRhsCon is an unboxed tuple or sum application" $$
@@ -302,13 +302,13 @@ lintStgExpr (StgOpApp _ args _) =
 
 lintStgExpr (StgLet _ binds body) = do
     binders <- lintStgBinds NotTopLevel binds
-    addLoc (BodyOfLetRec binders) $
+    addLoc (BodyOfLet binders) $
       addInScopeVars binders $
         lintStgExpr body
 
 lintStgExpr (StgLetNoEscape _ binds body) = do
     binders <- lintStgBinds NotTopLevel binds
-    addLoc (BodyOfLetRec binders) $
+    addLoc (BodyOfLet binders) $
       addInScopeVars binders $
         lintStgExpr body
 
@@ -371,20 +371,14 @@ lintStgAppReps fun args = do
       -- and we abort kind checking.
       fun_arg_tys_reps, actual_arg_reps :: [Maybe [PrimRep]]
       fun_arg_tys_reps = map typePrimRep_maybe fun_arg_tys'
-      actual_arg_reps = map (typePrimRep_maybe . stgArgType) args
+      actual_arg_reps = map stgArgRep_maybe args
 
       match_args :: [Maybe [PrimRep]] -> [Maybe [PrimRep]] -> LintM ()
       match_args (Nothing:_) _   = return ()
       match_args (_) (Nothing:_) = return ()
       match_args (Just actual_rep:actual_reps_left) (Just expected_rep:expected_reps_left)
-        -- Common case, reps are exactly the same
+        -- Common case, reps are exactly the same (perhaps void)
         | actual_rep == expected_rep
-        = match_args actual_reps_left expected_reps_left
-
-        -- Check for void rep which can be either an empty list *or* [VoidRep]
-           -- No, typePrimRep_maybe will never return a result containing VoidRep.
-           -- We should refactor to make this obvious from the types.
-        | isVoidRep actual_rep && isVoidRep expected_rep
         = match_args actual_reps_left expected_reps_left
 
         -- Some reps are compatible *even* if they are not the same. E.g. IntRep and WordRep.
@@ -409,9 +403,6 @@ lintStgAppReps fun args = do
               -- text "expected reps:" <> ppr arg_ty_reps $$
               text "unarised?:" <> ppr (lf_unarised lf))
         where
-          isVoidRep [] = True
-          isVoidRep [VoidRep] = True
-          isVoidRep _ = False
           -- Try to strip one non-void arg rep from the current argument type returning
           -- the remaining list of arguments. We return Nothing for invalid input which
           -- will result in a lint failure in match_args.
@@ -438,7 +429,7 @@ lintAppCbvMarks e@(StgApp fun args) = do
         (text "marks" <> ppr marks $$
         text "args" <> ppr args $$
         text "arity" <> ppr (idArity fun) $$
-        text "join_arity" <> ppr (isJoinId_maybe fun))
+        text "join_arity" <> ppr (idJoinPointHood fun))
 lintAppCbvMarks _ = panic "impossible - lintAppCbvMarks"
 
 {-
@@ -469,7 +460,7 @@ data LintFlags = LintFlags { lf_unarised :: !Bool
 data LintLocInfo
   = RhsOf Id            -- The variable bound
   | LambdaBodyOf [Id]   -- The lambda-binder
-  | BodyOfLetRec [Id]   -- One of the binders
+  | BodyOfLet [Id]      -- The binders of the let
 
 dumpLoc :: LintLocInfo -> (SrcSpan, SDoc)
 dumpLoc (RhsOf v) =
@@ -477,8 +468,8 @@ dumpLoc (RhsOf v) =
 dumpLoc (LambdaBodyOf bs) =
   (srcLocSpan (getSrcLoc (head bs)), text " [in body of lambda with binders " <> pp_binders bs <> char ']' )
 
-dumpLoc (BodyOfLetRec bs) =
-  (srcLocSpan (getSrcLoc (head bs)), text " [in body of letrec with binders " <> pp_binders bs <> char ']' )
+dumpLoc (BodyOfLet bs) =
+  (srcLocSpan (getSrcLoc (head bs)), text " [in body of let with binders " <> pp_binders bs <> char ']' )
 
 
 pp_binders :: [Id] -> SDoc

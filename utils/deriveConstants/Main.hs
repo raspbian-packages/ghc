@@ -27,7 +27,6 @@ needing to run the program, by inspecting the object file using 'nm'.
 
 import Control.Monad (when, unless)
 import Data.Bits (shiftL)
-import Data.Char (toLower)
 import Data.List (elemIndex, stripPrefix, intercalate)
 import Data.Map (Map)
 import qualified Data.Map as Map
@@ -402,6 +401,7 @@ wanteds os = concat
           ,structField C    "Capability" "total_allocated"
           ,structField C    "Capability" "weak_ptr_list_hd"
           ,structField C    "Capability" "weak_ptr_list_tl"
+          ,structField C    "Capability" "n_run_queue"
 
           ,structField Both "bdescr" "start"
           ,structField Both "bdescr" "free"
@@ -438,6 +438,7 @@ wanteds os = concat
           ,structField  Both "StgEntCounter" "entry_count"
 
           ,closureSize  Both "StgUpdateFrame"
+          ,closureSize  Both "StgOrigThunkInfoFrame"
           ,closureSize  C    "StgCatchFrame"
           ,closureSize  C    "StgStopFrame"
           ,closureSize  C    "StgDeadThreadFrame"
@@ -468,6 +469,7 @@ wanteds os = concat
           ,closureField  C    "StgTSO"      "dirty"
           ,closureField  C    "StgTSO"      "bq"
           ,closureField  C    "StgTSO"      "label"
+          ,closureField  C    "StgTSO"      "bound"
           ,closureField  Both "StgTSO"      "alloc_limit"
           ,closureField_ Both "StgTSO_cccs" "StgTSO" "prof.cccs"
           ,closureField  Both "StgTSO"      "stackobj"
@@ -476,12 +478,19 @@ wanteds os = concat
           ,closureFieldOffset Both "StgStack" "stack"
           ,closureField       C    "StgStack" "stack_size"
           ,closureField       C    "StgStack" "dirty"
+          ,closureField       C    "StgStack" "marking"
 
           ,structSize C "StgTSOProfInfo"
 
           ,closureField Both "StgUpdateFrame" "updatee"
+          ,closureField Both "StgOrigThunkInfoFrame" "info_ptr"
 
           ,closureField C "StgCatchFrame" "handler"
+
+          ,structSize  C "StgRetFun"
+          ,fieldOffset C "StgRetFun" "size"
+          ,fieldOffset C "StgRetFun" "fun"
+          ,fieldOffset C "StgRetFun" "payload"
 
           ,closureSize       C "StgPAP"
           ,closureField      C "StgPAP" "n_args"

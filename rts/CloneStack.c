@@ -7,6 +7,7 @@
  *---------------------------------------------------------------------------*/
 
 #include "Rts.h"
+#include "RtsFlags.h"
 #include "rts/Messages.h"
 #include "Messages.h"
 #include "rts/Types.h"
@@ -23,6 +24,12 @@
 #endif
 
 #include <string.h>
+
+
+static StgWord getStackFrameCount(StgStack* stack);
+static StgWord getStackChunkClosureCount(StgStack* stack);
+static StgArrBytes* allocateByteArray(Capability *cap, StgWord bytes);
+static void copyPtrsToArray(StgArrBytes* arr, StgStack* stack);
 
 static StgStack* cloneStackChunk(Capability* capability, const StgStack* stack)
 {
@@ -74,9 +81,7 @@ void sendCloneStackMessage(StgTSO *tso, HsStablePtr mvar) {
   msg = (MessageCloneStack *)allocate(srcCapability, sizeofW(MessageCloneStack));
   msg->tso = tso;
   msg->result = (StgMVar*)deRefStablePtr(mvar);
-  SET_HDR(msg, &stg_MSG_CLONE_STACK_info, CCS_SYSTEM);
-  // Ensure that writes constructing Message are committed before sending.
-  write_barrier();
+  SET_HDR_RELEASE(msg, &stg_MSG_CLONE_STACK_info, CCS_SYSTEM);
 
   sendMessage(srcCapability, tso->cap, (Message *)msg);
 }
@@ -110,12 +115,12 @@ void sendCloneStackMessage(StgTSO *tso STG_UNUSED, HsStablePtr mvar STG_UNUSED) 
 // array is the count of stack frames.
 // Each InfoProvEnt* is looked up by lookupIPE(). If there's no IPE for a stack
 // frame it's represented by null.
-StgMutArrPtrs* decodeClonedStack(Capability *cap, StgStack* stack) {
+StgArrBytes* decodeClonedStack(Capability *cap, StgStack* stack) {
   StgWord closureCount = getStackFrameCount(stack);
 
-  StgMutArrPtrs* array = allocateMutableArray(closureCount);
+  StgArrBytes* array = allocateByteArray(cap, sizeof(StgInfoTable*) * closureCount);
 
-  copyPtrsToArray(cap, array, stack);
+  copyPtrsToArray(array, stack);
 
   return array;
 }
@@ -151,51 +156,33 @@ StgWord getStackChunkClosureCount(StgStack* stack) {
     return closureCount;
 }
 
-// Allocate and initialize memory for a MutableArray# (Haskell representation).
-StgMutArrPtrs* allocateMutableArray(StgWord closureCount) {
+// Allocate and initialize memory for a ByteArray# (Haskell representation).
+StgArrBytes* allocateByteArray(Capability *cap, StgWord bytes) {
   // Idea stolen from PrimOps.cmm:stg_newArrayzh()
-  StgWord size = closureCount + mutArrPtrsCardTableSize(closureCount);
-  StgWord words = sizeofW(StgMutArrPtrs) + size;
+  StgWord words = sizeofW(StgArrBytes) + bytes;
 
-  StgMutArrPtrs* array = (StgMutArrPtrs*) allocate(myTask()->cap, words);
+  StgArrBytes* array = (StgArrBytes*) allocate(cap, words);
 
-  SET_HDR(array, &stg_MUT_ARR_PTRS_DIRTY_info, CCS_SYSTEM);
-  array->ptrs  = closureCount;
-  array->size = size;
-
+  SET_HDR(array, &stg_ARR_WORDS_info, CCS_SYSTEM);
+  array->bytes  = bytes;
   return array;
 }
 
-
-void copyPtrsToArray(Capability *cap, StgMutArrPtrs* arr, StgStack* stack) {
+static void copyPtrsToArray(StgArrBytes* arr, StgStack* stack) {
   StgWord index = 0;
   StgStack *last_stack = stack;
+  const StgInfoTable **result = (const StgInfoTable **) arr->payload;
   while (true) {
     StgPtr sp = last_stack->sp;
     StgPtr spBottom = last_stack->stack + last_stack->stack_size;
     for (; sp < spBottom; sp += stack_frame_sizeW((StgClosure *)sp)) {
-      const StgInfoTable* infoTable = get_itbl((StgClosure *)sp);
-
-      // Add the IPE that was looked up by lookupIPE() to the MutableArray#.
-      // The "Info Table Provernance Entry Map" (IPE) idea is to use a pointer
-      // (address) to the info table to lookup entries, this is fulfilled in
-      // non-"Tables Next to Code" builds.
-      // When "Tables Next to Code" is used, the assembly label of the info table
-      // is between the info table and it's code. There's no other label in the
-      // assembly code which could be used instead, thus lookupIPE() is actually
-      // called with the code pointer of the info table.
-      // (As long as it's used consistently, this doesn't really matter - IPE uses
-      // the pointer only to connect an info table to it's provenance entry in the
-      // IPE map.)
-#if defined(TABLES_NEXT_TO_CODE)
-      InfoProvEnt* ipe = lookupIPE((StgInfoTable*) infoTable->code);
-#else
-      InfoProvEnt* ipe = lookupIPE(infoTable);
-#endif
-      arr->payload[index] = createPtrClosure(cap, ipe);
-
+      const StgInfoTable* infoTable = ((StgClosure *)sp)->header.info;
+      result[index] = infoTable;
       index++;
     }
+
+    // Ensure that we didn't overflow the result array
+    ASSERT(index-1 < arr->bytes / sizeof(StgInfoTable*));
 
     // check whether the stack ends in an underflow frame
     StgUnderflowFrame *frame = (StgUnderflowFrame *) (last_stack->stack
@@ -206,13 +193,4 @@ void copyPtrsToArray(Capability *cap, StgMutArrPtrs* arr, StgStack* stack) {
       break;
     }
   }
-}
-
-// Create a GHC.Ptr (Haskell constructor: `Ptr InfoProvEnt`) pointing to the
-// IPE.
-StgClosure* createPtrClosure(Capability *cap, InfoProvEnt* ipe) {
-  StgClosure *p = (StgClosure *) allocate(cap, CONSTR_sizeW(0,1));
-  SET_HDR(p, &base_GHCziPtr_Ptr_con_info, CCS_SYSTEM);
-  p->payload[0] = (StgClosure*) ipe;
-  return TAG_CLOSURE(1, p);
 }

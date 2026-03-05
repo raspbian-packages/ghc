@@ -1,7 +1,9 @@
-{-# LANGUAGE BangPatterns #-}
-{-# LANGUAGE MagicHash #-}
-{-# OPTIONS_HADDOCK prune #-}
 {-# LANGUAGE Trustworthy #-}
+
+{-# OPTIONS_HADDOCK prune #-}
+{-# OPTIONS_GHC -Wno-deprecations #-}
+  -- We use the deprecated Data.ByteString.{hGetLine,getLine} to
+  -- define the not-deprecated Char8 versions of the same functions.
 
 -- |
 -- Module      : Data.ByteString.Char8
@@ -187,7 +189,19 @@ module Data.ByteString.Char8 (
 
         -- * Reading from ByteStrings
         readInt,
+        readInt64,
+        readInt32,
+        readInt16,
+        readInt8,
+
+        readWord,
+        readWord64,
+        readWord32,
+        readWord16,
+        readWord8,
+
         readInteger,
+        readNatural,
 
         -- * Low level CString conversions
 
@@ -257,15 +271,17 @@ import Data.ByteString (null,length,tail,init,append
                        ,isInfixOf,stripPrefix,stripSuffix
                        ,breakSubstring,copy,group
 
-                       ,getLine, getContents, putStr, interact
+                       ,getContents, putStr, interact
                        ,readFile, writeFile, appendFile
                        ,hGetContents, hGet, hGetSome, hPut, hPutStr
-                       ,hGetLine, hGetNonBlocking, hPutNonBlocking
+                       ,hGetNonBlocking, hPutNonBlocking
                        ,packCString,packCStringLen
                        ,useAsCString,useAsCStringLen
                        )
 
 import Data.ByteString.Internal.Type
+import Data.ByteString.ReadInt
+import Data.ByteString.ReadNat
 
 import Data.Char    ( isSpace )
 -- See bytestring #70
@@ -845,14 +861,6 @@ unzip :: [(Char,Char)] -> (ByteString,ByteString)
 unzip ls = (pack (P.map fst ls), pack (P.map snd ls))
 {-# INLINE unzip #-}
 
--- | A variety of 'head' for non-empty ByteStrings. 'unsafeHead' omits
--- the check for the empty case, which is good for performance, but
--- there is an obligation on the programmer to provide a proof that the
--- ByteString is non-empty.
-unsafeHead :: ByteString -> Char
-unsafeHead  = w2c . B.unsafeHead
-{-# INLINE unsafeHead #-}
-
 -- ---------------------------------------------------------------------
 -- Things that depend on the encoding
 
@@ -988,84 +996,16 @@ unwords :: [ByteString] -> ByteString
 unwords = intercalate (singleton ' ')
 {-# INLINE unwords #-}
 
--- ---------------------------------------------------------------------
--- Reading from ByteStrings
-
--- | readInt reads an Int from the beginning of the ByteString.  If there is no
--- integer at the beginning of the string, it returns Nothing, otherwise
--- it just returns the int read, and the rest of the string.
---
--- Note: This function will overflow the Int for large integers.
-readInt :: ByteString -> Maybe (Int, ByteString)
-readInt as
-    | null as   = Nothing
-    | otherwise =
-        case unsafeHead as of
-            '-' -> loop True  0 0 (B.unsafeTail as)
-            '+' -> loop False 0 0 (B.unsafeTail as)
-            _   -> loop False 0 0 as
-
-    where loop :: Bool -> Int -> Int -> ByteString -> Maybe (Int, ByteString)
-          loop neg !i !n !ps
-              | null ps   = end neg i n ps
-              | otherwise =
-                  case B.unsafeHead ps of
-                    w | w >= 0x30
-                     && w <= 0x39 -> loop neg (i+1)
-                                          (n * 10 + (fromIntegral w - 0x30))
-                                          (B.unsafeTail ps)
-                      | otherwise -> end neg i n ps
-
-          end _    0 _ _  = Nothing
-          end True _ n ps = Just (negate n, ps)
-          end _    _ n ps = Just (n, ps)
-
--- | readInteger reads an Integer from the beginning of the ByteString.  If
--- there is no integer at the beginning of the string, it returns Nothing,
--- otherwise it just returns the int read, and the rest of the string.
-readInteger :: ByteString -> Maybe (Integer, ByteString)
-readInteger as
-    | null as   = Nothing
-    | otherwise =
-        case unsafeHead as of
-            '-' -> first (B.unsafeTail as) >>= \(n, bs) -> return (-n, bs)
-            '+' -> first (B.unsafeTail as)
-            _   -> first as
-
-    where first ps | null ps   = Nothing
-                   | otherwise =
-                       case B.unsafeHead ps of
-                        w | w >= 0x30 && w <= 0x39 -> Just $
-                            loop 1 (fromIntegral w - 0x30) [] (B.unsafeTail ps)
-                          | otherwise              -> Nothing
-
-          loop :: Int -> Int -> [Integer]
-               -> ByteString -> (Integer, ByteString)
-          loop !d !acc ns !ps
-              | null ps   = combine d acc ns empty
-              | otherwise =
-                  case B.unsafeHead ps of
-                   w | w >= 0x30 && w <= 0x39 ->
-                       if d == 9 then loop 1 (fromIntegral w - 0x30)
-                                           (toInteger acc : ns)
-                                           (B.unsafeTail ps)
-                                 else loop (d+1)
-                                           (10*acc + (fromIntegral w - 0x30))
-                                           ns (B.unsafeTail ps)
-                     | otherwise -> combine d acc ns ps
-
-          combine _ acc [] ps = (toInteger acc, ps)
-          combine d acc ns ps =
-              (10^d * combine1 1000000000 ns + toInteger acc, ps)
-
-          combine1 _ [n] = n
-          combine1 b ns  = combine1 (b*b) $ combine2 b ns
-
-          combine2 b (n:m:ns) = let !t = m*b + n in t : combine2 b ns
-          combine2 _ ns       = ns
-
 ------------------------------------------------------------------------
 -- For non-binary text processing:
+
+-- | Read a line from stdin.
+getLine :: IO ByteString
+getLine = B.getLine
+
+-- | Read a line from a handle
+hGetLine :: Handle -> IO ByteString
+hGetLine = B.hGetLine
 
 -- | Write a ByteString to a handle, appending a newline byte.
 --

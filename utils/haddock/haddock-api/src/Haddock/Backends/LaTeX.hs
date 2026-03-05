@@ -1,6 +1,7 @@
 {-# OPTIONS_GHC -fno-warn-name-shadowing #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE FlexibleInstances #-}
 
 -----------------------------------------------------------------------------
 -- |
@@ -27,7 +28,7 @@ import qualified GHC.Utils.Ppr as Pretty
 
 import GHC hiding (fromMaybeContext )
 import GHC.Types.Name.Occurrence
-import GHC.Types.Name        ( nameOccName )
+import GHC.Types.Name        ( nameOccName, getOccString, tidyNameOcc )
 import GHC.Types.Name.Reader ( rdrNameOcc )
 import GHC.Core.Type         ( Specificity(..) )
 import GHC.Data.FastString   ( unpackFS )
@@ -190,10 +191,15 @@ exportListItem
       )
     )
   = let (leader, names) = declNames decl
+        go (n,_)
+          | isDefaultMethodOcc (occName n) = Nothing
+          | otherwise = Just $ ppDocBinder n
+
     in sep (punctuate comma [ leader <+> ppDocBinder name | name <- names ]) <>
          case subdocs of
            [] -> empty
-           _  -> parens (sep (punctuate comma (map (ppDocBinder . fst) subdocs)))
+           _  -> parens (sep (punctuate comma (mapMaybe go subdocs)))
+
 exportListItem (ExportNoDecl y [])
   = ppDocBinder y
 exportListItem (ExportNoDecl y subs)
@@ -545,21 +551,21 @@ ppTypeSig nms ty unicode =
     <+> dcolon unicode
     <+> ppSigType unicode ty
 
-ppHsOuterTyVarBndrs :: HsOuterTyVarBndrs flag DocNameI -> Bool -> LaTeX
+ppHsOuterTyVarBndrs :: RenderableBndrFlag flag => HsOuterTyVarBndrs flag DocNameI -> Bool -> LaTeX
 ppHsOuterTyVarBndrs (HsOuterImplicit{}) _ = empty
 ppHsOuterTyVarBndrs (HsOuterExplicit{hso_bndrs = bndrs}) unicode =
-    hsep (forallSymbol unicode : ppTyVars bndrs) <> dot
+    hsep (forallSymbol unicode : ppTyVars unicode bndrs) <> dot
 
 ppHsForAllTelescope :: HsForAllTelescope DocNameI -> Bool -> LaTeX
 ppHsForAllTelescope tele unicode = case tele of
   HsForAllVis { hsf_vis_bndrs = bndrs } ->
-    hsep (forallSymbol unicode : ppTyVars bndrs) <> text "\\" <> arrow unicode
+    hsep (forallSymbol unicode : ppTyVars unicode bndrs) <> text "\\" <> arrow unicode
   HsForAllInvis { hsf_invis_bndrs = bndrs } ->
-    hsep (forallSymbol unicode : ppTyVars bndrs) <> dot
+    hsep (forallSymbol unicode : ppTyVars unicode bndrs) <> dot
 
 
-ppTyVars :: [LHsTyVarBndr flag DocNameI] -> [LaTeX]
-ppTyVars = map (ppSymName . getName . hsLTyVarNameI)
+ppTyVars :: RenderableBndrFlag flag => Bool -> [LHsTyVarBndr flag DocNameI] -> [LaTeX]
+ppTyVars unicode tvs = map (ppHsTyVarBndr unicode . unLoc) tvs
 
 
 tyvarNames :: LHsQTyVars DocNameI -> [Name]
@@ -669,11 +675,18 @@ ppClassDecl instances doc subdocs
             | L _ (ClassOpSig _ is_def lnames typ) <- lsigs
             , let doc | is_def = noDocForDecl
                       | otherwise = lookupAnySubdoc (head names) subdocs
-                  names = map unLoc lnames
+                  names = map (cleanName . unLoc) lnames
                   leader = if is_def then Just (keyword "default") else Nothing
             ]
             -- N.B. taking just the first name is ok. Signatures with multiple
             -- names are expanded so that each name gets its own signature.
+    -- Get rid of the ugly '$dm' prefix on default method names
+    cleanName n
+      | isDefaultMethodOcc (occName n)
+      , '$':'d':'m':occStr <- getOccString n
+      = setName (tidyNameOcc (getName n) (mkOccName varName occStr)) n
+      | otherwise = n
+
 
     instancesBit = ppDocInstances unicode instances
 
@@ -856,7 +869,7 @@ ppSideBySideConstr subdocs unicode leader (L _ con) =
           -- GADT record declarations
           RecConGADT _ _                  -> doConstrArgsWithDocs []
           -- GADT prefix data constructors
-          PrefixConGADT args | hasArgDocs -> doConstrArgsWithDocs (map hsScaledThing args)
+          PrefixConGADT _ args | hasArgDocs -> doConstrArgsWithDocs (map hsScaledThing args)
           _                               -> empty
 
         ConDeclH98{con_args = con_args'} -> case con_args' of
@@ -970,7 +983,7 @@ ppAppNameTypes :: DocName -> [HsType DocNameI] -> Bool -> LaTeX
 ppAppNameTypes n ts unicode = ppTypeApp n ts ppDocName (ppParendType unicode)
 
 ppAppNameTypeArgs :: DocName -> [LHsTypeArg DocNameI] -> Bool -> LaTeX
-ppAppNameTypeArgs n args@(HsValArg _:HsValArg _:_) unicode
+ppAppNameTypeArgs n args@(HsValArg _ _:HsValArg _ _:_) unicode
   = ppTypeApp n args ppDocName (ppLHsTypeArg unicode)
 ppAppNameTypeArgs n args unicode
   = ppDocName n <+> hsep (map (ppLHsTypeArg unicode) args)
@@ -1072,9 +1085,8 @@ ppSigType :: Bool -> HsSigType DocNameI -> LaTeX
 ppSigType unicode sig_ty = ppr_sig_ty (reparenSigType sig_ty) unicode
 
 ppLHsTypeArg :: Bool -> LHsTypeArg DocNameI -> LaTeX
-ppLHsTypeArg unicode (HsValArg ty) = ppLParendType unicode ty
-ppLHsTypeArg unicode (HsTypeArg _ ki) = atSign unicode <>
-                                       ppLParendType unicode ki
+ppLHsTypeArg unicode (HsValArg _ ty) = ppLParendType unicode ty
+ppLHsTypeArg unicode (HsTypeArg _ ki) = atSign <> ppLParendType unicode ki
 ppLHsTypeArg _ (HsArgPar _) = text ""
 
 class RenderableBndrFlag flag where
@@ -1083,15 +1095,26 @@ class RenderableBndrFlag flag where
 instance RenderableBndrFlag () where
   ppHsTyVarBndr _ (UserTyVar _ _ (L _ name)) = ppDocName name
   ppHsTyVarBndr unicode (KindedTyVar _ _ (L _ name) kind) =
-    parens (ppDocName name) <+> dcolon unicode <+> ppLKind unicode kind
+    parens (ppDocName name <+> dcolon unicode <+> ppLKind unicode kind)
 
 instance RenderableBndrFlag Specificity where
   ppHsTyVarBndr _ (UserTyVar _ SpecifiedSpec (L _ name)) = ppDocName name
   ppHsTyVarBndr _ (UserTyVar _ InferredSpec (L _ name)) = braces $ ppDocName name
   ppHsTyVarBndr unicode (KindedTyVar _ SpecifiedSpec (L _ name) kind) =
-    parens (ppDocName name) <+> dcolon unicode <+> ppLKind unicode kind
+    parens (ppDocName name <+> dcolon unicode <+> ppLKind unicode kind)
   ppHsTyVarBndr unicode (KindedTyVar _ InferredSpec (L _ name) kind) =
-    braces (ppDocName name) <+> dcolon unicode <+> ppLKind unicode kind
+    braces (ppDocName name <+> dcolon unicode <+> ppLKind unicode kind)
+
+instance RenderableBndrFlag (HsBndrVis DocNameI) where
+  ppHsTyVarBndr _ (UserTyVar _ bvis (L _ name)) =
+    ppHsBndrVis bvis $ ppDocName name
+  ppHsTyVarBndr unicode (KindedTyVar _ bvis (L _ name) kind) =
+    ppHsBndrVis bvis $
+    parens (ppDocName name <+> dcolon unicode <+> ppLKind unicode kind)
+
+ppHsBndrVis :: HsBndrVis DocNameI -> LaTeX -> LaTeX
+ppHsBndrVis (HsBndrRequired _) d = d
+ppHsBndrVis (HsBndrInvisible _) d = atSign <> d
 
 ppLKind :: Bool -> LHsKind DocNameI -> LaTeX
 ppLKind unicode y = ppKind unicode (unLoc y)
@@ -1124,7 +1147,7 @@ ppr_mono_ty (HsFunTy _ mult ty1 ty2)   u
    where arr = case mult of
                  HsLinearArrow _ -> lollipop u
                  HsUnrestrictedArrow _ -> arrow u
-                 HsExplicitMult _ m _ -> multAnnotation <> ppr_mono_lty m u <+> arrow u
+                 HsExplicitMult _ m -> multAnnotation <> ppr_mono_lty m u <+> arrow u
 
 ppr_mono_ty (HsBangTy _ b ty)     u = ppBang b <> ppLParendType u ty
 ppr_mono_ty (HsTyVar _ NotPromoted (L _ name)) _ = ppDocName name
@@ -1145,7 +1168,7 @@ ppr_mono_ty (HsAppTy _ fun_ty arg_ty) unicode
   = hsep [ppr_mono_lty fun_ty unicode, ppr_mono_lty arg_ty unicode]
 
 ppr_mono_ty (HsAppKindTy _ fun_ty arg_ki) unicode
-  = hsep [ppr_mono_lty fun_ty unicode, atSign unicode <> ppr_mono_lty arg_ki unicode]
+  = hsep [ppr_mono_lty fun_ty unicode, atSign <> ppr_mono_lty arg_ki unicode]
 
 ppr_mono_ty (HsOpTy _ prom ty1 op ty2) unicode
   = ppr_mono_lty ty1 unicode <+> ppr_op_prom <+> ppr_mono_lty ty2 unicode
@@ -1423,21 +1446,22 @@ quote :: LaTeX -> LaTeX
 quote doc = text "\\begin{quote}" $$ doc $$ text "\\end{quote}"
 
 
-dcolon, arrow, lollipop, darrow, forallSymbol, starSymbol, atSign :: Bool -> LaTeX
+dcolon, arrow, lollipop, darrow, forallSymbol, starSymbol :: Bool -> LaTeX
 dcolon unicode = text (if unicode then "∷" else "::")
 arrow  unicode = text (if unicode then "→" else "->")
 lollipop unicode = text (if unicode then "⊸" else "%1 ->")
 darrow unicode = text (if unicode then "⇒" else "=>")
 forallSymbol unicode = text (if unicode then "∀" else "forall")
 starSymbol unicode = text (if unicode then "★" else "*")
-atSign unicode = text (if unicode then "@" else "@")
+
+atSign :: LaTeX
+atSign = char '@'
 
 multAnnotation :: LaTeX
-multAnnotation = text "%"
+multAnnotation = char '%'
 
 dot :: LaTeX
 dot = char '.'
-
 
 parenList :: [LaTeX] -> LaTeX
 parenList = parens . hsep . punctuate comma

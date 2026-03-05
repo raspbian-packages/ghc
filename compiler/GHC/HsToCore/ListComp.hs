@@ -23,7 +23,7 @@ import GHC.Core.Make
 import GHC.HsToCore.Monad          -- the monadery used in the desugarer
 import GHC.HsToCore.Utils
 
-import GHC.Driver.Session
+import GHC.Driver.DynFlags
 import GHC.Core.Utils
 import GHC.Types.Id
 import GHC.Core.Type
@@ -33,7 +33,6 @@ import GHC.Builtin.Names
 import GHC.Types.SrcLoc
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
-import GHC.Utils.Panic.Plain
 import GHC.Tc.Utils.TcType
 import GHC.Data.List.SetOps( getNth )
 
@@ -285,7 +284,7 @@ deBindComp pat core_list1 quals core_list2 = do
         letrec_body = App (Var h) core_list1
 
     rest_expr <- deListComp quals core_fail
-    core_match <- matchSimply (Var u2) (StmtCtxt (HsDoStmt ListComp)) pat rest_expr core_fail
+    core_match <- matchSimply (Var u2) (StmtCtxt (HsDoStmt ListComp)) ManyTy pat rest_expr core_fail
 
     let
         rhs = Lam u1 $
@@ -373,7 +372,7 @@ dfBindComp c_id n_id (pat, core_list1) quals = do
     core_rest <- dfListComp c_id b quals
 
     -- build the pattern match
-    core_expr <- matchSimply (Var x) (StmtCtxt (HsDoStmt ListComp))
+    core_expr <- matchSimply (Var x) (StmtCtxt (HsDoStmt ListComp)) ManyTy
                 pat core_rest (Var b)
 
     -- now build the outermost foldr, and return
@@ -444,15 +443,13 @@ mkUnzipBind _ elt_tys
 
        ; unzip_fn <- newSysLocalDs ManyTy unzip_fn_ty
 
-       ; [us1, us2] <- sequence [newUniqueSupply, newUniqueSupply]
-
        ; let nil_tuple = mkBigCoreTup (map mkNilExpr elt_tys)
              concat_expressions = map mkConcatExpression (zip3 elt_tys (map Var xs) (map Var xss))
              tupled_concat_expression = mkBigCoreTup concat_expressions
 
-             folder_body_inner_case = mkBigTupleCase us1 xss tupled_concat_expression (Var axs)
-             folder_body_outer_case = mkBigTupleCase us2 xs folder_body_inner_case (Var ax)
-             folder_body = mkLams [ax, axs] folder_body_outer_case
+       ; folder_body_inner_case <- mkBigTupleCase xss tupled_concat_expression (Var axs)
+       ; folder_body_outer_case <- mkBigTupleCase xs folder_body_inner_case (Var ax)
+       ; let folder_body = mkLams [ax, axs] folder_body_outer_case
 
        ; unzip_body <- mkFoldrExpr elt_tuple_ty elt_list_tuple_ty folder_body nil_tuple (Var ys)
        ; return (Just (unzip_fn, mkLams [ys] unzip_body)) }
@@ -546,9 +543,8 @@ dsMcStmt (TransStmt { trS_stmts = stmts, trS_bndrs = bndrs
        ; body        <- dsMcStmts stmts_rest
        ; n_tup_var'  <- newSysLocalDs ManyTy n_tup_ty'
        ; tup_n_expr' <- mkMcUnzipM form fmap_op n_tup_var' from_bndr_tys
-       ; us          <- newUniqueSupply
        ; let rhs'  = mkApps usingExpr' usingArgs'
-             body' = mkBigTupleCase us to_bndrs body tup_n_expr'
+       ; body'       <- mkBigTupleCase to_bndrs body tup_n_expr'
 
        ; dsSyntaxExpr bind_op [rhs', Lam n_tup_var' body'] }
 
@@ -584,17 +580,17 @@ dsMcStmt (ParStmt bind_ty blocks mzip_op bind_op) stmts_rest
        = do { exp <- dsInnerMonadComp stmts bndrs return_op
             ; return (exp, mkBigCoreVarTupTy bndrs) }
 
-dsMcStmt stmt _ = pprPanic "dsMcStmt: unexpected stmt" (ppr stmt)
-
+dsMcStmt stmt@(ApplicativeStmt {}) _ = pprPanic "dsMcStmt: unexpected stmt" (ppr stmt)
+dsMcStmt stmt@(RecStmt {}) _ = pprPanic "dsMcStmt: unexpected stmt" (ppr stmt)
 
 matchTuple :: [Id] -> CoreExpr -> DsM CoreExpr
 -- (matchTuple [a,b,c] body)
 --       returns the Core term
 --  \x. case x of (a,b,c) -> body
 matchTuple ids body
-  = do { us <- newUniqueSupply
-       ; tup_id <- newSysLocalDs ManyTy (mkBigCoreVarTupTy ids)
-       ; return (Lam tup_id $ mkBigTupleCase us ids body (Var tup_id)) }
+  = do { tup_id <- newSysLocalDs ManyTy (mkBigCoreVarTupTy ids)
+       ; tup_case <- mkBigTupleCase ids body (Var tup_id)
+       ; return (Lam tup_id tup_case) }
 
 -- general `rhs' >>= \pat -> stmts` desugaring where `rhs'` is already a
 -- desugared `CoreExpr`
@@ -606,10 +602,12 @@ dsMcBindStmt :: LPat GhcTc
              -> [ExprLStmt GhcTc]
              -> DsM CoreExpr
 dsMcBindStmt pat rhs' bind_op fail_op res1_ty stmts
-  = do  { body     <- dsMcStmts stmts
-        ; var      <- selectSimpleMatchVarL ManyTy pat
+  = do  { var   <- selectSimpleMatchVarL ManyTy pat
         ; match <- matchSinglePatVar var Nothing (StmtCtxt (HsDoStmt (DoExpr Nothing))) pat
-                                  res1_ty (cantFailMatchResult body)
+                      res1_ty (MR_Infallible $ dsMcStmts stmts)
+            -- NB: dsMcStmts needs to happen inside matchSinglePatVar, and not
+            -- before it, so that long-distance information is properly threaded.
+            -- See Note [Long-distance information in do notation] in GHC.HsToCore.Expr.
         ; match_code <- dsHandleMonadicFailure MonadComp pat match fail_op
         ; dsSyntaxExpr bind_op [rhs', Lam var match_code] }
 

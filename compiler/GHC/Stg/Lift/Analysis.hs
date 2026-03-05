@@ -27,9 +27,13 @@ import GHC.Platform.Profile
 import GHC.Types.Basic
 import GHC.Types.Demand
 import GHC.Types.Id
+
 import GHC.Runtime.Heap.Layout ( WordOff )
+
 import GHC.Stg.Lift.Config
+import GHC.Stg.Lift.Types
 import GHC.Stg.Syntax
+
 import qualified GHC.StgToCmm.ArgRep  as StgToCmm.ArgRep
 import qualified GHC.StgToCmm.Closure as StgToCmm.Closure
 import qualified GHC.StgToCmm.Layout  as StgToCmm.Layout
@@ -109,80 +113,6 @@ import Data.Maybe ( mapMaybe )
 llTrace :: String -> SDoc -> a -> a
 llTrace _ _ c = c
 -- llTrace a b c = pprTrace a b c
-
-type instance BinderP      'LiftLams = BinderInfo
-type instance XRhsClosure  'LiftLams = DIdSet
-type instance XLet         'LiftLams = Skeleton
-type instance XLetNoEscape 'LiftLams = Skeleton
-
-
--- | Captures details of the syntax tree relevant to the cost model, such as
--- closures, multi-shot lambdas and case expressions.
-data Skeleton
-  = ClosureSk !Id !DIdSet {- ^ free vars -} !Skeleton
-  | RhsSk !Card {- ^ how often the RHS was entered -} !Skeleton
-  | AltSk !Skeleton !Skeleton
-  | BothSk !Skeleton !Skeleton
-  | NilSk
-
-bothSk :: Skeleton -> Skeleton -> Skeleton
-bothSk NilSk b = b
-bothSk a NilSk = a
-bothSk a b     = BothSk a b
-
-altSk :: Skeleton -> Skeleton -> Skeleton
-altSk NilSk b = b
-altSk a NilSk = a
-altSk a b     = AltSk a b
-
-rhsSk :: Card -> Skeleton -> Skeleton
-rhsSk _        NilSk = NilSk
-rhsSk body_dmd skel  = RhsSk body_dmd skel
-
--- | The type used in binder positions in 'GenStgExpr's.
-data BinderInfo
-  = BindsClosure !Id !Bool -- ^ Let(-no-escape)-bound thing with a flag
-                           --   indicating whether it occurs as an argument
-                           --   or in a nullary application
-                           --   (see "GHC.Stg.Lift.Analysis#arg_occs").
-  | BoringBinder !Id       -- ^ Every other kind of binder
-
--- | Gets the bound 'Id' out a 'BinderInfo'.
-binderInfoBndr :: BinderInfo -> Id
-binderInfoBndr (BoringBinder bndr)   = bndr
-binderInfoBndr (BindsClosure bndr _) = bndr
-
--- | Returns 'Nothing' for 'BoringBinder's and 'Just' the flag indicating
--- occurrences as argument or in a nullary applications otherwise.
-binderInfoOccursAsArg :: BinderInfo -> Maybe Bool
-binderInfoOccursAsArg BoringBinder{}     = Nothing
-binderInfoOccursAsArg (BindsClosure _ b) = Just b
-
-instance Outputable Skeleton where
-  ppr NilSk = text ""
-  ppr (AltSk l r) = vcat
-    [ text "{ " <+> ppr l
-    , text "ALT"
-    , text "  " <+> ppr r
-    , text "}"
-    ]
-  ppr (BothSk l r) = ppr l $$ ppr r
-  ppr (ClosureSk f fvs body) = ppr f <+> ppr fvs $$ nest 2 (ppr body)
-  ppr (RhsSk card body) = hcat
-    [ lambda
-    , ppr card
-    , dot
-    , ppr body
-    ]
-
-instance Outputable BinderInfo where
-  ppr = ppr . binderInfoBndr
-
-instance OutputableBndr BinderInfo where
-  pprBndr b = pprBndr b . binderInfoBndr
-  pprPrefixOcc = pprPrefixOcc . binderInfoBndr
-  pprInfixOcc = pprInfixOcc . binderInfoBndr
-  bndrIsJoin_maybe = bndrIsJoin_maybe . binderInfoBndr
 
 mkArgOccs :: [StgArg] -> IdSet
 mkArgOccs = mkVarSet . mapMaybe stg_arg_var
@@ -311,10 +241,10 @@ tagSkeletonBinding is_lne body_skel body_arg_occs (StgRec pairs)
         bndr' = BindsClosure bndr (bndr `elemVarSet` scope_occs)
 
 tagSkeletonRhs :: Id -> CgStgRhs -> (Skeleton, IdSet, LlStgRhs)
-tagSkeletonRhs _ (StgRhsCon ccs dc mn ts args)
-  = (NilSk, mkArgOccs args, StgRhsCon ccs dc mn ts args)
-tagSkeletonRhs bndr (StgRhsClosure fvs ccs upd bndrs body)
-  = (rhs_skel, body_arg_occs, StgRhsClosure fvs ccs upd bndrs' body')
+tagSkeletonRhs _ (StgRhsCon ccs dc mn ts args typ)
+  = (NilSk, mkArgOccs args, StgRhsCon ccs dc mn ts args typ)
+tagSkeletonRhs bndr (StgRhsClosure fvs ccs upd bndrs body typ)
+  = (rhs_skel, body_arg_occs, StgRhsClosure fvs ccs upd bndrs' body' typ)
   where
     bndrs' = map BoringBinder bndrs
     (body_skel, body_arg_occs, body') = tagSkeletonExpr body
@@ -400,7 +330,7 @@ goodToLift cfg top_lvl rec_flag expander pairs scope = decide
       -- We don't lift updatable thunks or constructors
       any_memoized = any is_memoized_rhs rhss
       is_memoized_rhs StgRhsCon{} = True
-      is_memoized_rhs (StgRhsClosure _ _ upd _ _) = isUpdatable upd
+      is_memoized_rhs (StgRhsClosure _ _ upd _ _ _) = isUpdatable upd
 
       -- Don't lift binders occurring as arguments. This would result in complex
       -- argument expressions which would have to be given a name, reintroducing
@@ -469,7 +399,7 @@ goodToLift cfg top_lvl rec_flag expander pairs scope = decide
 
 rhsLambdaBndrs :: LlStgRhs -> [Id]
 rhsLambdaBndrs StgRhsCon{} = []
-rhsLambdaBndrs (StgRhsClosure _ _ _ bndrs _) = map binderInfoBndr bndrs
+rhsLambdaBndrs (StgRhsClosure _ _ _ bndrs _ _) = map binderInfoBndr bndrs
 
 -- | The size in words of a function closure closing over the given 'Id's,
 -- including the header.
@@ -488,7 +418,7 @@ closureSize profile ids = words + pc_STD_HDR_SIZE (platformConstants (profilePla
 -- | The number of words a single 'Id' adds to a closure's size.
 -- Note that this can't handle unboxed tuples (which may still be present in
 -- let-no-escapes, even after Unarise), in which case
--- @'GHC.StgToCmm.Closure.idPrimRep'@ will crash.
+-- @'GHC.StgToCmm.ArgRep.idArgRep'@ will crash.
 idClosureFootprint:: Platform -> Id -> WordOff
 idClosureFootprint platform
   = StgToCmm.ArgRep.argRepSizeW platform
@@ -548,9 +478,9 @@ closureGrowth expander sizer group abs_ids = go
       -- cardinality. The @body_dmd@ part of 'RhsSk' is the result of
       -- 'rhsCard' and accurately captures the cardinality of the RHSs body
       -- relative to its defining context.
-      | isAbs n      = 0
-      | cg <= 0      = if isStrict n then cg else 0
-      | isUsedOnce n = cg
-      | otherwise    = infinity
+      | isAbs n        = 0
+      | cg <= 0        = if isStrict n then cg else 0
+      | isAtMostOnce n = cg
+      | otherwise      = infinity
       where
         cg = go body

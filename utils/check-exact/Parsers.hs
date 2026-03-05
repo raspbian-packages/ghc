@@ -276,16 +276,14 @@ fixModuleTrailingComments :: GHC.ParsedSource -> GHC.ParsedSource
 fixModuleTrailingComments (GHC.L l p) = GHC.L l p'
   where
     an' = case GHC.hsmodAnn $ GHC.hsmodExt p of
-      (GHC.EpAnn a an ocs) -> GHC.EpAnn a an (rebalance (GHC.am_decls an) ocs)
-      unused -> unused
+      (GHC.EpAnn a an ocs) -> GHC.EpAnn a an (rebalance ocs)
     p' = p { GHC.hsmodExt = (GHC.hsmodExt p){ GHC.hsmodAnn = an' } }
-    -- p'  = error $ "fixModuleTrailingComments: an'=" ++ showAst an'
 
-    rebalance :: GHC.AnnList -> GHC.EpAnnComments -> GHC.EpAnnComments
-    rebalance al cs = cs'
+    rebalance :: GHC.EpAnnComments -> GHC.EpAnnComments
+    rebalance cs = cs'
       where
-        cs' = case GHC.al_close al of
-          Just (GHC.AddEpAnn _ (GHC.EpaSpan ss _)) ->
+        cs' = case GHC.hsmodLayout $ GHC.hsmodExt p of
+          GHC.EpExplicitBraces _ (GHC.EpTok (GHC.EpaSpan (GHC.RealSrcSpan ss _))) ->
             let
               pc = GHC.priorComments cs
               fc = GHC.getFollowingComments cs

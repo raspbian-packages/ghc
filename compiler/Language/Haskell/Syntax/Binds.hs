@@ -1,4 +1,5 @@
 {-# LANGUAGE ConstraintKinds #-}
+{-# LANGUAGE DataKinds #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE ScopedTypeVariables #-}
@@ -162,6 +163,25 @@ other interesting cases. Namely,
     Just x = e
     (x) = e
     x :: Ty = e
+
+Note [Multiplicity annotations]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Multiplicity annotations are stored in the pat_mult field on PatBinds,
+represented by the HsMultAnn data type
+
+  HsNoMultAnn <=> no annotation in the source file
+  HsPct1Ann   <=> the %1 annotation
+  HsMultAnn   <=> the %t annotation, where `t` is some type
+
+In case of HsNoMultAnn the typechecker infers a multiplicity.
+
+We don't need to store a multiplicity on FunBinds:
+- let %1 x = … is parsed as a PatBind. So we don't need an annotation before
+  typechecking.
+- the multiplicity that the typechecker infers is stored in the binder's Var for
+  the desugarer to use. It's only relevant for strict FunBinds, see Wrinkle 1 in
+  Note [Desugar Strict binds] in GHC.HsToCore.Binds as, in Core, let expressions
+  don't have multiplicity annotations.
 -}
 
 -- | Haskell Binding with separate Left and Right id's
@@ -219,6 +239,8 @@ data HsBindLR idL idR
   | PatBind {
         pat_ext    :: XPatBind idL idR,
         pat_lhs    :: LPat idL,
+        pat_mult   :: HsMultAnn idL,
+        -- ^ See Note [Multiplicity annotations].
         pat_rhs    :: GRHSs idR (LHsExpr idR)
     }
 
@@ -263,6 +285,19 @@ data PatSynBind idL idR
      }
    | XPatSynBind !(XXPatSynBind idL idR)
 
+-- | Multiplicity annotations, on binders, are always resolved (to a unification
+-- variable if there is no annotation) during type-checking. The resolved
+-- multiplicity is stored in the extension fields.
+data HsMultAnn pass
+  = HsNoMultAnn !(XNoMultAnn pass)
+  | HsPct1Ann   !(XPct1Ann pass)
+  | HsMultAnn   !(XMultAnn pass) (LHsType (NoGhcTc pass))
+  | XMultAnn    !(XXMultAnn pass)
+
+type family XNoMultAnn p
+type family XPct1Ann   p
+type family XMultAnn   p
+type family XXMultAnn  p
 
 {-
 ************************************************************************
@@ -452,7 +487,7 @@ data Sig pass
        -- complete matchings which, for example, arise from pattern
        -- synonym definitions.
   | CompleteMatchSig (XCompleteMatchSig pass)
-                     (XRec pass [LIdP pass])
+                     [LIdP pass]
                      (Maybe (LIdP pass))
   | XSig !(XXSig pass)
 

@@ -12,7 +12,7 @@ import GHC.Prelude
 import qualified GHC.LanguageExtensions as LangExt
 
 import GHC.Driver.Env
-import GHC.Driver.Session
+import GHC.Driver.DynFlags
 import GHC.Driver.Config.Diagnostic
 
 import GHC.Core
@@ -77,17 +77,17 @@ initEndPassConfig dflags extra_vars name_ppr_ctx pass = EndPassConfig
 coreDumpFlag :: CoreToDo -> Maybe DumpFlag
 coreDumpFlag (CoreDoSimplify {})      = Just Opt_D_verbose_core2core
 coreDumpFlag (CoreDoPluginPass {})    = Just Opt_D_verbose_core2core
-coreDumpFlag CoreDoFloatInwards       = Just Opt_D_verbose_core2core
-coreDumpFlag (CoreDoFloatOutwards {}) = Just Opt_D_verbose_core2core
-coreDumpFlag CoreLiberateCase         = Just Opt_D_verbose_core2core
-coreDumpFlag CoreDoStaticArgs         = Just Opt_D_verbose_core2core
+coreDumpFlag CoreDoFloatInwards       = Just Opt_D_dump_float_in
+coreDumpFlag (CoreDoFloatOutwards {}) = Just Opt_D_dump_float_out
+coreDumpFlag CoreLiberateCase         = Just Opt_D_dump_liberate_case
+coreDumpFlag CoreDoStaticArgs         = Just Opt_D_dump_static_argument_transformation
 coreDumpFlag CoreDoCallArity          = Just Opt_D_dump_call_arity
 coreDumpFlag CoreDoExitify            = Just Opt_D_dump_exitify
-coreDumpFlag (CoreDoDemand {})        = Just Opt_D_dump_stranal
+coreDumpFlag (CoreDoDemand {})        = Just Opt_D_dump_dmdanal
 coreDumpFlag CoreDoCpr                = Just Opt_D_dump_cpranal
 coreDumpFlag CoreDoWorkerWrapper      = Just Opt_D_dump_worker_wrapper
 coreDumpFlag CoreDoSpecialising       = Just Opt_D_dump_spec
-coreDumpFlag CoreDoSpecConstr         = Just Opt_D_dump_spec
+coreDumpFlag CoreDoSpecConstr         = Just Opt_D_dump_spec_constr
 coreDumpFlag CoreCSE                  = Just Opt_D_dump_cse
 coreDumpFlag CoreDesugar              = Just Opt_D_dump_ds_preopt
 coreDumpFlag CoreDesugarOpt           = Just Opt_D_dump_ds
@@ -132,8 +132,7 @@ perPassFlags dflags pass
     -- we have eta-expanded data constructors with representation-polymorphic
     -- bindings; so we switch off the representation-polymorphism checks.
     -- The very simple optimiser will beta-reduce them away.
-    -- See Note [Checking for representation-polymorphic built-ins]
-    -- in GHC.HsToCore.Expr.
+    -- See Note [Representation-polymorphism checking built-ins] in GHC.Tc.Gen.Head.
     check_fixed_rep = case pass of
                         CoreDesugar -> False
                         _           -> True

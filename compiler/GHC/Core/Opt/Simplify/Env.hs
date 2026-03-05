@@ -84,7 +84,6 @@ import GHC.Platform ( Platform )
 import GHC.Utils.Monad
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
-import GHC.Utils.Panic.Plain
 import GHC.Utils.Misc
 
 import Data.List ( intersperse, mapAccumL )
@@ -377,7 +376,7 @@ type SimplIdSubst = IdEnv SimplSR -- IdId |--> OutExpr
 
 -- | A substitution result.
 data SimplSR
-  = DoneEx OutExpr (Maybe JoinArity)
+  = DoneEx OutExpr JoinPointHood
        -- If  x :-> DoneEx e ja   is in the SimplIdSubst
        -- then replace occurrences of x by e
        -- and  ja = Just a <=> x is a join-point of arity a
@@ -402,8 +401,8 @@ instance Outputable SimplSR where
   ppr (DoneEx e mj) = text "DoneEx" <> pp_mj <+> ppr e
     where
       pp_mj = case mj of
-                Nothing -> empty
-                Just n  -> parens (int n)
+                NotJoinPoint -> empty
+                JoinPoint n  -> parens (int n)
 
   ppr (ContEx _tv _cv _id e) = vcat [text "ContEx" <+> ppr e {-,
                                 ppr (filter_env tv), ppr (filter_env id) -}]
@@ -1238,9 +1237,8 @@ See also Note [Return type for join points] and Note [Join points and case-of-ca
 -}
 
 getSubst :: SimplEnv -> Subst
-getSubst (SimplEnv { seInScope = in_scope, seTvSubst = tv_env
-                      , seCvSubst = cv_env })
-  = mkSubst in_scope tv_env cv_env emptyIdSubstEnv
+getSubst (SimplEnv { seInScope = in_scope, seTvSubst = tv_env, seCvSubst = cv_env })
+  = mkTCvSubst in_scope tv_env cv_env
 
 substTy :: HasDebugCallStack => SimplEnv -> Type -> Type
 substTy env ty = Type.substTy (getSubst env) ty

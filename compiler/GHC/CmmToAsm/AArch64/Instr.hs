@@ -18,7 +18,6 @@ import GHC.Platform.Reg
 
 import GHC.Platform.Regs
 import GHC.Cmm.BlockId
-import GHC.Cmm.Dataflow.Collections
 import GHC.Cmm.Dataflow.Label
 import GHC.Cmm
 import GHC.Cmm.CLabel
@@ -32,9 +31,9 @@ import Data.Maybe (fromMaybe)
 
 import GHC.Stack
 
--- | TODO: verify this!
-stackFrameHeaderSize :: Platform -> Int
-stackFrameHeaderSize _ = 64
+-- | LR and FP (8 byte each) are the prologue of each stack frame
+stackFrameHeaderSize :: Int
+stackFrameHeaderSize = 2 * 8
 
 -- | All registers are 8 byte wide.
 spillSlotSize :: Int
@@ -49,14 +48,13 @@ stackAlign = 16
 maxSpillSlots :: NCGConfig -> Int
 maxSpillSlots config
 --  = 0 -- set to zero, to see when allocMoreStack has to fire.
-    = let platform = ncgPlatform config
-      in ((ncgSpillPreallocSize config - stackFrameHeaderSize platform)
+    = ((ncgSpillPreallocSize config - stackFrameHeaderSize)
          `div` spillSlotSize) - 1
 
 -- | Convert a spill slot number to a *byte* offset, with no sign.
 spillSlotToOffset :: NCGConfig -> Int -> Int
-spillSlotToOffset config slot
-   = stackFrameHeaderSize (ncgPlatform config) + spillSlotSize * slot
+spillSlotToOffset _ slot
+   = stackFrameHeaderSize + spillSlotSize * slot
 
 -- | Get the registers that are being used by this instruction.
 -- regUsage doesn't need to do any trickery for jumps and such.
@@ -80,13 +78,15 @@ regUsageOfInstr platform instr = case instr of
 
   -- 1. Arithmetic Instructions ------------------------------------------------
   ADD dst src1 src2        -> usage (regOp src1 ++ regOp src2, regOp dst)
-  CMN l r                  -> usage (regOp l ++ regOp r, [])
   CMP l r                  -> usage (regOp l ++ regOp r, [])
+  CMN l r                  -> usage (regOp l ++ regOp r, [])
   MSUB dst src1 src2 src3  -> usage (regOp src1 ++ regOp src2 ++ regOp src3, regOp dst)
   MUL dst src1 src2        -> usage (regOp src1 ++ regOp src2, regOp dst)
   NEG dst src              -> usage (regOp src, regOp dst)
   SMULH dst src1 src2      -> usage (regOp src1 ++ regOp src2, regOp dst)
   SMULL dst src1 src2      -> usage (regOp src1 ++ regOp src2, regOp dst)
+  UMULH dst src1 src2      -> usage (regOp src1 ++ regOp src2, regOp dst)
+  UMULL dst src1 src2      -> usage (regOp src1 ++ regOp src2, regOp dst)
   SDIV dst src1 src2       -> usage (regOp src1 ++ regOp src2, regOp dst)
   SUB dst src1 src2        -> usage (regOp src1 ++ regOp src2, regOp dst)
   UDIV dst src1 src2       -> usage (regOp src1 ++ regOp src2, regOp dst)
@@ -100,26 +100,27 @@ regUsageOfInstr platform instr = case instr of
   UXTB dst src             -> usage (regOp src, regOp dst)
   SXTH dst src             -> usage (regOp src, regOp dst)
   UXTH dst src             -> usage (regOp src, regOp dst)
+  CLZ  dst src             -> usage (regOp src, regOp dst)
+  RBIT dst src             -> usage (regOp src, regOp dst)
+  REV   dst src            -> usage (regOp src, regOp dst)
+  -- REV32 dst src            -> usage (regOp src, regOp dst)
+  REV16 dst src            -> usage (regOp src, regOp dst)
   -- 3. Logical and Move Instructions ------------------------------------------
   AND dst src1 src2        -> usage (regOp src1 ++ regOp src2, regOp dst)
   ASR dst src1 src2        -> usage (regOp src1 ++ regOp src2, regOp dst)
-  BIC dst src1 src2        -> usage (regOp src1 ++ regOp src2, regOp dst)
-  BICS dst src1 src2       -> usage (regOp src1 ++ regOp src2, regOp dst)
-  EON dst src1 src2        -> usage (regOp src1 ++ regOp src2, regOp dst)
   EOR dst src1 src2        -> usage (regOp src1 ++ regOp src2, regOp dst)
   LSL dst src1 src2        -> usage (regOp src1 ++ regOp src2, regOp dst)
   LSR dst src1 src2        -> usage (regOp src1 ++ regOp src2, regOp dst)
   MOV dst src              -> usage (regOp src, regOp dst)
   MOVK dst src             -> usage (regOp src, regOp dst)
+  MOVZ dst src             -> usage (regOp src, regOp dst)
   MVN dst src              -> usage (regOp src, regOp dst)
   ORR dst src1 src2        -> usage (regOp src1 ++ regOp src2, regOp dst)
-  ROR dst src1 src2        -> usage (regOp src1 ++ regOp src2, regOp dst)
-  TST src1 src2            -> usage (regOp src1 ++ regOp src2, [])
   -- 4. Branch Instructions ----------------------------------------------------
   J t                      -> usage (regTarget t, [])
   B t                      -> usage (regTarget t, [])
   BCOND _ t                -> usage (regTarget t, [])
-  BL t ps _rs              -> usage (regTarget t ++ ps, callerSavedRegisters)
+  BL t ps                  -> usage (regTarget t ++ ps, callerSavedRegisters)
 
   -- 5. Atomic Instructions ----------------------------------------------------
   -- 6. Conditional Instructions -----------------------------------------------
@@ -131,20 +132,21 @@ regUsageOfInstr platform instr = case instr of
   STLR _ src dst           -> usage (regOp src ++ regOp dst, [])
   LDR _ dst src            -> usage (regOp src, regOp dst)
   LDAR _ dst src           -> usage (regOp src, regOp dst)
-  -- TODO is this right? see STR, which I'm only partial about being right?
-  STP _ src1 src2 dst      -> usage (regOp src1 ++ regOp src2 ++ regOp dst, [])
-  LDP _ dst1 dst2 src      -> usage (regOp src, regOp dst1 ++ regOp dst2)
 
   -- 8. Synchronization Instructions -------------------------------------------
-  DMBSY                    -> usage ([], [])
+  DMBISH                   -> usage ([], [])
 
   -- 9. Floating Point Instructions --------------------------------------------
   FCVT dst src             -> usage (regOp src, regOp dst)
   SCVTF dst src            -> usage (regOp src, regOp dst)
   FCVTZS dst src           -> usage (regOp src, regOp dst)
   FABS dst src             -> usage (regOp src, regOp dst)
+  FSQRT dst src            -> usage (regOp src, regOp dst)
+  FMA _ dst src1 src2 src3 ->
+    usage (regOp src1 ++ regOp src2 ++ regOp src3, regOp dst)
 
-  _ -> panic $ "regUsageOfInstr: " ++ instrCon instr
+  LOCATION{} -> panic $ "regUsageOfInstr: " ++ instrCon instr
+  NEWBLOCK{} -> panic $ "regUsageOfInstr: " ++ instrCon instr
 
   where
         -- filtering the usage is necessary, otherwise the register
@@ -175,6 +177,8 @@ regUsageOfInstr platform instr = case instr of
         interesting _        (RegReal (RealRegSingle (-1))) = False
         interesting platform (RegReal (RealRegSingle i))    = freeReg platform i
 
+-- Note [AArch64 Register assignments]
+-- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 -- Save caller save registers
 -- This is x0-x18
 --
@@ -197,6 +201,8 @@ regUsageOfInstr platform instr = case instr of
 -- '---------------------------------------------------------------------------------------------------------------------------------------------------------------'
 -- IR: Indirect result location register, IP: Intra-procedure register, PL: Platform register, FP: Frame pointer, LR: Link register, SP: Stack pointer
 -- BR: Base, SL: SpLim
+--
+-- TODO: The zero register is currently mapped to -1 but should get it's own separate number.
 callerSavedRegisters :: [Reg]
 callerSavedRegisters
     = map regSingle [0..18]
@@ -216,13 +222,15 @@ patchRegsOfInstr instr env = case instr of
     DELTA{}             -> instr
     -- 1. Arithmetic Instructions ----------------------------------------------
     ADD o1 o2 o3   -> ADD (patchOp o1) (patchOp o2) (patchOp o3)
-    CMN o1 o2      -> CMN (patchOp o1) (patchOp o2)
     CMP o1 o2      -> CMP (patchOp o1) (patchOp o2)
+    CMN o1 o2      -> CMN (patchOp o1) (patchOp o2)
     MSUB o1 o2 o3 o4 -> MSUB (patchOp o1) (patchOp o2) (patchOp o3) (patchOp o4)
     MUL o1 o2 o3   -> MUL (patchOp o1) (patchOp o2) (patchOp o3)
     NEG o1 o2      -> NEG (patchOp o1) (patchOp o2)
     SMULH o1 o2 o3 -> SMULH (patchOp o1) (patchOp o2)  (patchOp o3)
     SMULL o1 o2 o3 -> SMULL (patchOp o1) (patchOp o2)  (patchOp o3)
+    UMULH o1 o2 o3 -> UMULH (patchOp o1) (patchOp o2)  (patchOp o3)
+    UMULL o1 o2 o3 -> UMULL (patchOp o1) (patchOp o2)  (patchOp o3)
     SDIV o1 o2 o3  -> SDIV (patchOp o1) (patchOp o2) (patchOp o3)
     SUB o1 o2 o3   -> SUB  (patchOp o1) (patchOp o2) (patchOp o3)
     UDIV o1 o2 o3  -> UDIV (patchOp o1) (patchOp o2) (patchOp o3)
@@ -236,28 +244,29 @@ patchRegsOfInstr instr env = case instr of
     UXTB o1 o2       -> UXTB (patchOp o1) (patchOp o2)
     SXTH o1 o2       -> SXTH (patchOp o1) (patchOp o2)
     UXTH o1 o2       -> UXTH (patchOp o1) (patchOp o2)
+    CLZ o1 o2        -> CLZ  (patchOp o1) (patchOp o2)
+    RBIT o1 o2       -> RBIT (patchOp o1) (patchOp o2)
+    REV   o1 o2      -> REV  (patchOp o1) (patchOp o2)
+    -- REV32 o1 o2      -> REV32 (patchOp o1) (patchOp o2)
+    REV16 o1 o2      -> REV16 (patchOp o1) (patchOp o2)
+
 
     -- 3. Logical and Move Instructions ----------------------------------------
     AND o1 o2 o3   -> AND  (patchOp o1) (patchOp o2) (patchOp o3)
-    ANDS o1 o2 o3  -> ANDS (patchOp o1) (patchOp o2) (patchOp o3)
     ASR o1 o2 o3   -> ASR  (patchOp o1) (patchOp o2) (patchOp o3)
-    BIC o1 o2 o3   -> BIC  (patchOp o1) (patchOp o2) (patchOp o3)
-    BICS o1 o2 o3  -> BICS (patchOp o1) (patchOp o2) (patchOp o3)
-    EON o1 o2 o3   -> EON  (patchOp o1) (patchOp o2) (patchOp o3)
     EOR o1 o2 o3   -> EOR  (patchOp o1) (patchOp o2) (patchOp o3)
     LSL o1 o2 o3   -> LSL  (patchOp o1) (patchOp o2) (patchOp o3)
     LSR o1 o2 o3   -> LSR  (patchOp o1) (patchOp o2) (patchOp o3)
     MOV o1 o2      -> MOV  (patchOp o1) (patchOp o2)
     MOVK o1 o2     -> MOVK (patchOp o1) (patchOp o2)
+    MOVZ o1 o2     -> MOVZ (patchOp o1) (patchOp o2)
     MVN o1 o2      -> MVN  (patchOp o1) (patchOp o2)
     ORR o1 o2 o3   -> ORR  (patchOp o1) (patchOp o2) (patchOp o3)
-    ROR o1 o2 o3   -> ROR  (patchOp o1) (patchOp o2) (patchOp o3)
-    TST o1 o2      -> TST  (patchOp o1) (patchOp o2)
 
     -- 4. Branch Instructions --------------------------------------------------
     J t            -> J (patchTarget t)
     B t            -> B (patchTarget t)
-    BL t rs ts     -> BL (patchTarget t) rs ts
+    BL t rs        -> BL (patchTarget t) rs
     BCOND c t      -> BCOND c (patchTarget t)
 
     -- 5. Atomic Instructions --------------------------------------------------
@@ -270,18 +279,21 @@ patchRegsOfInstr instr env = case instr of
     STLR f o1 o2   -> STLR f (patchOp o1) (patchOp o2)
     LDR f o1 o2    -> LDR f (patchOp o1) (patchOp o2)
     LDAR f o1 o2   -> LDAR f (patchOp o1) (patchOp o2)
-    STP f o1 o2 o3 -> STP f (patchOp o1) (patchOp o2) (patchOp o3)
-    LDP f o1 o2 o3 -> LDP f (patchOp o1) (patchOp o2) (patchOp o3)
 
     -- 8. Synchronization Instructions -----------------------------------------
-    DMBSY          -> DMBSY
+    DMBISH         -> DMBISH
 
     -- 9. Floating Point Instructions ------------------------------------------
     FCVT o1 o2     -> FCVT (patchOp o1) (patchOp o2)
     SCVTF o1 o2    -> SCVTF (patchOp o1) (patchOp o2)
     FCVTZS o1 o2   -> FCVTZS (patchOp o1) (patchOp o2)
     FABS o1 o2     -> FABS (patchOp o1) (patchOp o2)
-    _              -> panic $ "patchRegsOfInstr: " ++ instrCon instr
+    FSQRT o1 o2    -> FSQRT (patchOp o1) (patchOp o2)
+    FMA s o1 o2 o3 o4 ->
+      FMA s (patchOp o1) (patchOp o2) (patchOp o3) (patchOp o4)
+
+    NEWBLOCK{}     -> panic $ "patchRegsOfInstr: " ++ instrCon instr
+    LOCATION{}     -> panic $ "patchRegsOfInstr: " ++ instrCon instr
     where
         patchOp :: Operand -> Operand
         patchOp (OpReg w r) = OpReg w (env r)
@@ -320,7 +332,7 @@ jumpDestsOfInstr (CBZ _ t) = [ id | TBlock id <- [t]]
 jumpDestsOfInstr (CBNZ _ t) = [ id | TBlock id <- [t]]
 jumpDestsOfInstr (J t) = [id | TBlock id <- [t]]
 jumpDestsOfInstr (B t) = [id | TBlock id <- [t]]
-jumpDestsOfInstr (BL t _ _) = [ id | TBlock id <- [t]]
+jumpDestsOfInstr (BL t _) = [ id | TBlock id <- [t]]
 jumpDestsOfInstr (BCOND _ t) = [ id | TBlock id <- [t]]
 jumpDestsOfInstr _ = []
 
@@ -341,7 +353,7 @@ patchJumpInstr instr patchF
         CBNZ r (TBlock bid) -> CBNZ r (TBlock (patchF bid))
         J (TBlock bid) -> J (TBlock (patchF bid))
         B (TBlock bid) -> B (TBlock (patchF bid))
-        BL (TBlock bid) ps rs -> BL (TBlock (patchF bid)) ps rs
+        BL (TBlock bid) ps -> BL (TBlock (patchF bid)) ps
         BCOND c (TBlock bid) -> BCOND c (TBlock (patchF bid))
         _ -> panic $ "patchJumpInstr: " ++ instrCon instr
 
@@ -371,19 +383,18 @@ mkSpillInstr
    -> [Instr]
 
 mkSpillInstr config reg delta slot =
-  case (spillSlotToOffset config slot) - delta of
+  case off - delta of
     imm | -256 <= imm && imm <= 255                               -> [ mkStrSp imm ]
     imm | imm > 0 && imm .&. 0x7 == 0x0 && imm <= 0xfff           -> [ mkStrSp imm ]
     imm | imm > 0xfff && imm <= 0xffffff && imm .&. 0x7 == 0x0    -> [ mkIp0SpillAddr (imm .&~. 0xfff)
                                                                      , mkStrIp0 (imm .&.  0xfff)
                                                                      ]
-    imm -> pprPanic "mkSpillInstr" (text "Unable to spill into" <+> int imm)
+    imm -> pprPanic "mkSpillInstr" (text "Unable to spill register into" <+> int imm)
     where
         a .&~. b = a .&. (complement b)
 
-        fmt = case reg of
-            RegReal (RealRegSingle n) | n < 32 -> II64
-            _                                  -> FF64
+        fmt = fmtOfRealReg (case reg of { RegReal r -> r; _ -> panic "Expected real reg"})
+
         mkIp0SpillAddr imm = ANN (text "Spill: IP0 <- SP + " <> int imm) $ ADD ip0 sp (OpImm (ImmInt imm))
         mkStrSp imm = ANN (text "Spill@" <> int (off - delta)) $ STR fmt (OpReg W64 reg) (OpAddr (AddrRegImm (regSingle 31) (ImmInt imm)))
         mkStrIp0 imm = ANN (text "Spill@" <> int (off - delta)) $ STR fmt (OpReg W64 reg) (OpAddr (AddrRegImm (regSingle 16) (ImmInt imm)))
@@ -398,19 +409,17 @@ mkLoadInstr
    -> [Instr]
 
 mkLoadInstr config reg delta slot =
-  case (spillSlotToOffset config slot) - delta of
+  case off - delta of
     imm | -256 <= imm && imm <= 255                               -> [ mkLdrSp imm ]
     imm | imm > 0 && imm .&. 0x7 == 0x0 && imm <= 0xfff           -> [ mkLdrSp imm ]
     imm | imm > 0xfff && imm <= 0xffffff && imm .&. 0x7 == 0x0    -> [ mkIp0SpillAddr (imm .&~. 0xfff)
                                                                      , mkLdrIp0 (imm .&.  0xfff)
                                                                      ]
-    imm -> pprPanic "mkSpillInstr" (text "Unable to spill into" <+> int imm)
+    imm -> pprPanic "mkLoadInstr" (text "Unable to load spilled register at" <+> int imm)
     where
         a .&~. b = a .&. (complement b)
 
-        fmt = case reg of
-            RegReal (RealRegSingle n) | n < 32 -> II64
-            _                                  -> FF64
+        fmt = fmtOfRealReg (case reg of { RegReal r -> r; _ -> panic "Expected real reg"})
 
         mkIp0SpillAddr imm = ANN (text "Reload: IP0 <- SP + " <> int imm) $ ADD ip0 sp (OpImm (ImmInt imm))
         mkLdrSp imm = ANN (text "Reload@" <> int (off - delta)) $ LDR fmt (OpReg W64 reg) (OpAddr (AddrRegImm (regSingle 31) (ImmInt imm)))
@@ -433,7 +442,6 @@ isMetaInstr instr
     COMMENT{}   -> True
     MULTILINE_COMMENT{} -> True
     LOCATION{}  -> True
-    LDATA{}     -> True
     NEWBLOCK{}  -> True
     DELTA{}     -> True
     PUSH_STACK_FRAME -> True
@@ -536,11 +544,6 @@ data Instr
     -- location pseudo-op (file, line, col, name)
     | LOCATION Int Int Int String
 
-    -- some static data spat out during code
-    -- generation.  Will be extracted before
-    -- pretty-printing.
-    | LDATA   Section RawCmmStatics
-
     -- start a new basic block.  Useful during
     -- codegen, removed later.  Preceding
     -- instruction should be a jump, as per the
@@ -567,8 +570,8 @@ data Instr
     -- | ADDS Operand Operand Operand -- rd = rn + rm
     -- | ADR ...
     -- | ADRP ...
-    | CMN Operand Operand -- rd + op2
     | CMP Operand Operand -- rd - op2
+    | CMN Operand Operand -- rd + op2
     -- | MADD ...
     -- | MNEG ...
     | MSUB Operand Operand Operand Operand -- rd = ra - rn × rm
@@ -591,8 +594,8 @@ data Instr
     -- | UMADDL ...  -- Xd = Xa + Wn × Wm
     -- | UMNEGL ... -- Xd = - Wn × Wm
     -- | UMSUBL ... -- Xd = Xa - Wn × Wm
-    -- | UMULH ... -- Xd = (Xn × Xm)_127:64
-    -- | UMULL ... -- Xd = Wn × Wm
+    | UMULH Operand Operand Operand -- Xd = (Xn × Xm)_127:64
+    | UMULL Operand Operand Operand -- Xd = Wn × Wm
 
     -- 2. Bit Manipulation Instructions ----------------------------------------
     | SBFM Operand Operand Operand Operand -- rd = rn[i,j]
@@ -605,34 +608,33 @@ data Instr
     -- Signed/Unsigned bitfield extract
     | SBFX Operand Operand Operand Operand -- rd = rn[i,j]
     | UBFX Operand Operand Operand Operand -- rd = rn[i,j]
+    | CLZ  Operand Operand -- rd = countLeadingZeros(rn)
+    | RBIT Operand Operand -- rd = reverseBits(rn)
+    | REV Operand Operand   -- rd = reverseBytes(rn): (for 32 & 64 bit operands)
+                            -- 0xAABBCCDD -> 0xDDCCBBAA
+    | REV16 Operand Operand -- rd = reverseBytes16(rn)
+                            -- 0xAABB_CCDD -> xBBAA_DDCC
+    -- | REV32 Operand Operand -- rd = reverseBytes32(rn) - 64bit operands only!
+    --                         -- 0xAABBCCDD_EEFFGGHH -> 0XDDCCBBAA_HHGGFFEE
 
     -- 3. Logical and Move Instructions ----------------------------------------
     | AND Operand Operand Operand -- rd = rn & op2
-    | ANDS Operand Operand Operand -- rd = rn & op2
     | ASR Operand Operand Operand -- rd = rn ≫ rm  or  rd = rn ≫ #i, i is 6 bits
-    | BIC Operand Operand Operand -- rd = rn & ~op2
-    | BICS Operand Operand Operand -- rd = rn & ~op2
-    | EON Operand Operand Operand -- rd = rn ⊕ ~op2
     | EOR Operand Operand Operand -- rd = rn ⊕ op2
     | LSL Operand Operand Operand -- rd = rn ≪ rm  or rd = rn ≪ #i, i is 6 bits
     | LSR Operand Operand Operand -- rd = rn ≫ rm  or rd = rn ≫ #i, i is 6 bits
     | MOV Operand Operand -- rd = rn  or  rd = #i
     | MOVK Operand Operand
     -- | MOVN Operand Operand
-    -- | MOVZ Operand Operand
+    | MOVZ Operand Operand
     | MVN Operand Operand -- rd = ~rn
-    | ORN Operand Operand Operand -- rd = rn | ~op2
     | ORR Operand Operand Operand -- rd = rn | op2
-    | ROR Operand Operand Operand -- rd = rn ≫ rm  or  rd = rn ≫ #i, i is 6 bits
-    | TST Operand Operand -- rn & op2
     -- Load and stores.
     -- TODO STR/LDR might want to change to STP/LDP with XZR for the second register.
     | STR Format Operand Operand -- str Xn, address-mode // Xn -> *addr
     | STLR Format Operand Operand -- stlr Xn, address-mode // Xn -> *addr
     | LDR Format Operand Operand -- ldr Xn, address-mode // Xn <- *addr
     | LDAR Format Operand Operand -- ldar Xn, address-mode // Xn <- *addr
-    | STP Format Operand Operand Operand -- stp Xn, Xm, address-mode // Xn -> *addr, Xm -> *(addr + 8)
-    | LDP Format Operand Operand Operand -- stp Xn, Xm, address-mode // Xn <- *addr, Xm <- *(addr + 8)
 
     -- Conditional instructions
     | CSET Operand Cond   -- if(cond) op <- 1 else op <- 0
@@ -642,11 +644,11 @@ data Instr
     -- Branching.
     | J Target            -- like B, but only generated from genJump. Used to distinguish genJumps from others.
     | B Target            -- unconditional branching b/br. (To a blockid, label or register)
-    | BL Target [Reg] [Reg] -- branch and link (e.g. set x30 to next pc, and branch)
+    | BL Target [Reg] -- branch and link (e.g. set x30 to next pc, and branch)
     | BCOND Cond Target   -- branch with condition. b.<cond>
 
     -- 8. Synchronization Instructions -----------------------------------------
-    | DMBSY
+    | DMBISH
     -- 9. Floating Point Instructions
     -- Float ConVerT
     | FCVT Operand Operand
@@ -656,6 +658,16 @@ data Instr
     | FCVTZS Operand Operand
     -- Float ABSolute value
     | FABS Operand Operand
+    -- Float SQuare RooT
+    | FSQRT Operand Operand
+
+    -- | Floating-point fused multiply-add instructions
+    --
+    -- - fmadd : d =   r1 * r2 + r3
+    -- - fnmsub: d =   r1 * r2 - r3
+    -- - fmsub : d = - r1 * r2 + r3
+    -- - fnmadd: d = - r1 * r2 - r3
+    | FMA FMASign Operand Operand Operand Operand
 
 instrCon :: Instr -> String
 instrCon i =
@@ -664,7 +676,6 @@ instrCon i =
       MULTILINE_COMMENT{} -> "COMMENT"
       ANN{} -> "ANN"
       LOCATION{} -> "LOCATION"
-      LDATA{} -> "LDATA"
       NEWBLOCK{} -> "NEWBLOCK"
       DELTA{} -> "DELTA"
       SXTB{} -> "SXTB"
@@ -674,42 +685,41 @@ instrCon i =
       PUSH_STACK_FRAME{} -> "PUSH_STACK_FRAME"
       POP_STACK_FRAME{} -> "POP_STACK_FRAME"
       ADD{} -> "ADD"
-      CMN{} -> "CMN"
       CMP{} -> "CMP"
+      CMN{} -> "CMN"
       MSUB{} -> "MSUB"
       MUL{} -> "MUL"
       NEG{} -> "NEG"
       SDIV{} -> "SDIV"
       SMULH{} -> "SMULH"
       SMULL{} -> "SMULL"
+      UMULH{} -> "UMULH"
+      UMULL{} -> "UMULL"
       SUB{} -> "SUB"
       UDIV{} -> "UDIV"
       SBFM{} -> "SBFM"
       UBFM{} -> "UBFM"
       SBFX{} -> "SBFX"
       UBFX{} -> "UBFX"
+      CLZ{} -> "CLZ"
+      RBIT{} -> "RBIT"
+      REV{} -> "REV"
+      REV16{} -> "REV16"
+      -- REV32{} -> "REV32"
       AND{} -> "AND"
-      ANDS{} -> "ANDS"
       ASR{} -> "ASR"
-      BIC{} -> "BIC"
-      BICS{} -> "BICS"
-      EON{} -> "EON"
       EOR{} -> "EOR"
       LSL{} -> "LSL"
       LSR{} -> "LSR"
       MOV{} -> "MOV"
       MOVK{} -> "MOVK"
+      MOVZ{} -> "MOVZ"
       MVN{} -> "MVN"
-      ORN{} -> "ORN"
       ORR{} -> "ORR"
-      ROR{} -> "ROR"
-      TST{} -> "TST"
       STR{} -> "STR"
       STLR{} -> "STLR"
       LDR{} -> "LDR"
       LDAR{} -> "LDAR"
-      STP{} -> "STP"
-      LDP{} -> "LDP"
       CSET{} -> "CSET"
       CBZ{} -> "CBZ"
       CBNZ{} -> "CBNZ"
@@ -717,11 +727,18 @@ instrCon i =
       B{} -> "B"
       BL{} -> "BL"
       BCOND{} -> "BCOND"
-      DMBSY{} -> "DMBSY"
+      DMBISH{} -> "DMBISH"
       FCVT{} -> "FCVT"
       SCVTF{} -> "SCVTF"
       FCVTZS{} -> "FCVTZS"
       FABS{} -> "FABS"
+      FSQRT{} -> "FSQRT"
+      FMA variant _ _ _ _ ->
+        case variant of
+          FMAdd  -> "FMADD"
+          FMSub  -> "FMSUB"
+          FNMAdd -> "FNMADD"
+          FNMSub -> "FNMSUB"
 
 data Target
     = TBlock BlockId
@@ -766,6 +783,9 @@ xzr = OpReg W64 (RegReal (RealRegSingle (-1)))
 wzr = OpReg W32 (RegReal (RealRegSingle (-1)))
 sp  = OpReg W64 (RegReal (RealRegSingle 31))
 ip0 = OpReg W64 (RegReal (RealRegSingle 16))
+
+reg_zero :: Reg
+reg_zero = RegReal (RealRegSingle (-1))
 
 _x :: Int -> Operand
 _x i = OpReg W64 (RegReal (RealRegSingle i))

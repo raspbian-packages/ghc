@@ -49,7 +49,6 @@ import GHC.Types.Unique.FM
 import GHC.Types.Unique.Set
 import GHC.Exts( oneShot )
 import GHC.Utils.Panic
-import GHC.Utils.Panic.Plain
 import GHC.Data.FastString
 
 import Data.List ( mapAccumL )
@@ -734,8 +733,8 @@ itself not purely syntactic; it accounts for CastTys;
 see Note [Non-trivial definitional equality] in GHC.Core.TyCo.Rep
 
 Unlike the "impure unifiers" in the typechecker (the eager unifier in
-GHC.Tc.Utils.Unify, and the constraint solver itself in GHC.Tc.Solver.Canonical), the pure
-unifier does /not/ work up to ~.
+GHC.Tc.Utils.Unify, and the constraint solver itself in GHC.Tc.Solver.Equality),
+the pure unifier does /not/ work up to ~.
 
 The algorithm implemented here is rather delicate, and we depend on it
 to uphold certain properties. This is a summary of these required
@@ -1067,7 +1066,7 @@ unify_ty :: UMEnv
 -- Respects newtypes, PredTypes
 -- See Note [Computing equality on types] in GHC.Core.Type
 unify_ty _env (TyConApp tc1 []) (TyConApp tc2 []) _kco
-  -- See Note [Comparing nullary type synonyms] in GHC.Core.Type.
+  -- See Note [Comparing nullary type synonyms] in GHC.Core.TyCo.Compare
   | tc1 == tc2
   = return ()
 
@@ -1433,13 +1432,16 @@ data UMState = UMState
 newtype UM a
   = UM' { unUM :: UMState -> UnifyResultM (UMState, a) }
     -- See Note [The one-shot state monad trick] in GHC.Utils.Monad
-  deriving (Functor)
 
 pattern UM :: (UMState -> UnifyResultM (UMState, a)) -> UM a
 -- See Note [The one-shot state monad trick] in GHC.Utils.Monad
 pattern UM m <- UM' m
   where
     UM m = UM' (oneShot m)
+{-# COMPLETE UM #-}
+
+instance Functor UM where
+  fmap f (UM m) = UM (\s -> fmap (\(s', v) -> (s', f v)) (m s))
 
 instance Applicative UM where
       pure a = UM (\s -> pure (s, a))
@@ -1482,7 +1484,7 @@ getSubst :: UMEnv -> UM Subst
 getSubst env = do { tv_env <- getTvSubstEnv
                   ; cv_env <- getCvSubstEnv
                   ; let in_scope = rnInScopeSet (um_rn_env env)
-                  ; return (mkSubst in_scope tv_env cv_env emptyIdSubstEnv) }
+                  ; return (mkTCvSubst in_scope tv_env cv_env) }
 
 extendTvEnv :: TyVar -> Type -> UM ()
 extendTvEnv tv ty = UM $ \state ->
@@ -1675,10 +1677,14 @@ ty_co_match menv subst (FunTy { ft_mult = w, ft_arg = ty1, ft_res = ty2 })
     -- NB: we include the RuntimeRep arguments in the matching;
     --     not doing so caused #21205.
 
-ty_co_match menv subst (ForAllTy (Bndr tv1 _) ty1)
-                       (ForAllCo tv2 kind_co2 co2)
+ty_co_match menv subst (ForAllTy (Bndr tv1 vis1t) ty1)
+                       (ForAllCo tv2 vis1c vis2c kind_co2 co2)
                        lkco rkco
   | isTyVar tv1 && isTyVar tv2
+  , vis1t == vis1c && vis1c == vis2c -- Is this necessary?
+      -- Is this visibility check necessary?  @rae says: yes, I think the
+      -- check is necessary, if we're caring about visibility (and we are).
+      -- But ty_co_match is a dark and not important corner.
   = do { subst1 <- ty_co_match menv subst (tyVarKind tv1) kind_co2
                                ki_ki_co ki_ki_co
        ; let rn_env0 = me_env menv
@@ -1778,9 +1784,10 @@ pushRefl co =
       ->  Just (FunCo r af af (mkReflCo r w) (mkReflCo r ty1) (mkReflCo r ty2))
     Just (TyConApp tc tys, r)
       -> Just (TyConAppCo r tc (zipWith mkReflCo (tyConRoleListX r tc) tys))
-    Just (ForAllTy (Bndr tv _) ty, r)
-      -> Just (ForAllCo tv (mkNomReflCo (varType tv)) (mkReflCo r ty))
-    -- NB: NoRefl variant. Otherwise, we get a loop!
+    Just (ForAllTy (Bndr tv vis) ty, r)
+      -> Just (ForAllCo { fco_tcv = tv, fco_visL = vis, fco_visR = vis
+                        , fco_kind = mkNomReflCo (varType tv)
+                        , fco_body = mkReflCo r ty })
     _ -> Nothing
 
 {-

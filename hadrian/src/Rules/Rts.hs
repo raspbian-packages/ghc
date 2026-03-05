@@ -118,7 +118,7 @@ rtsLibffiLibrary stage way = do
 
 -- | Get the libffi files bundled with the rts (header and library files).
 -- Unless using the system libffi, this needs the libffi library. It must be
--- built before the targets can be calcuulated.
+-- built before the targets can be calculated.
 needRtsLibffiTargets :: Stage -> Action [FilePath]
 needRtsLibffiTargets stage = do
     rtsPath      <- rtsBuildPath stage
@@ -154,10 +154,9 @@ needRtsSymLinks :: Stage -> Set.Set Way -> Action ()
 needRtsSymLinks stage rtsWays
     = forM_ (Set.filter (wayUnit Dynamic) rtsWays) $ \ way -> do
         let ctx = Context stage rts way Final
-        libPath     <- libPath ctx
-        distDir     <- distDir stage
+        distDir     <- distDynDir ctx
         rtsLibFile  <- takeFileName <$> pkgLibraryFile ctx
-        need [removeRtsDummyVersion (libPath </> distDir </> rtsLibFile)]
+        need [removeRtsDummyVersion (distDir </> rtsLibFile)]
 
 prefix, versionlessPrefix :: String
 versionlessPrefix = "libHSrts"

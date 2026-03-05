@@ -4,7 +4,14 @@
 -- License     : BSD-style
 
 {-# LANGUAGE CPP #-}
+
+{-# LANGUAGE AllowAmbiguousTypes #-}
 {-# LANGUAGE ViewPatterns #-}
+-- We need @AllowAmbiguousTypes@ in order to be able to use @TypeApplications@
+-- to disambiguate the desired instance of class methods whose instance cannot
+-- be inferred from the caller's context.  We would otherwise have to use
+-- proxy arguments.  Here the 'RdInt' class methods used to generate tests for
+-- all the various 'readInt' types require explicit type applications.
 
 -- We are happy to sacrifice optimizations in exchange for faster compilation,
 -- but need to test rewrite rules. As one can check using -ddump-rule-firings,
@@ -36,8 +43,6 @@ module Properties.ByteStringLazy (tests) where
 import qualified Data.ByteString.Lazy as B
 #endif
 
-import Data.Word
-
 #else
 
 #ifndef BYTESTRING_LAZY
@@ -50,6 +55,9 @@ import qualified Data.ByteString.Lazy.Char8 as B
 #define BYTESTRING_TYPE B.ByteString
 #endif
 
+import Data.Int
+import Numeric.Natural (Natural)
+
 import Text.Read
 
 #endif
@@ -57,15 +65,22 @@ import Text.Read
 import Prelude hiding (head, tail)
 import Control.Arrow
 import Data.Char
+import Data.Data (toConstr, showConstr, Data)
 import Data.Foldable
+import Data.Generics.Text (gread, gshow)
 import qualified Data.List as List
 import qualified Data.List.NonEmpty as NE
 import Data.Semigroup
 import Data.String
 import Data.Tuple
+import Data.Word
 import Test.Tasty
 import Test.Tasty.QuickCheck
 import QuickCheckUtils
+
+#ifdef BYTESTRING_LAZY
+import Data.Int
+#endif
 
 #ifndef BYTESTRING_CHAR8
 toElem :: Word8 -> Word8
@@ -73,6 +88,51 @@ toElem = id
 #else
 toElem :: Char8 -> Char
 toElem (Char8 c) = c
+
+class (Integral a, Show a) => RdInt a where
+    bread :: BYTESTRING_TYPE -> Maybe (a, BYTESTRING_TYPE)
+    sread :: String -> Maybe (a, String)
+
+instance RdInt Int    where { bread = B.readInt;     sread = readInt }
+instance RdInt Int8   where { bread = B.readInt8;    sread = readInt8 }
+instance RdInt Int16  where { bread = B.readInt16;   sread = readInt16 }
+instance RdInt Int32  where { bread = B.readInt32;   sread = readInt32 }
+instance RdInt Int64  where { bread = B.readInt64;   sread = readInt64 }
+--
+instance RdInt Word   where { bread = B.readWord;    sread = readWord }
+instance RdInt Word8  where { bread = B.readWord8;   sread = readWord8 }
+instance RdInt Word16 where { bread = B.readWord16;  sread = readWord16 }
+instance RdInt Word32 where { bread = B.readWord32;  sread = readWord32 }
+instance RdInt Word64 where { bread = B.readWord64;  sread = readWord64 }
+--
+instance RdInt Integer where { bread = B.readInteger; sread = readInteger }
+instance RdInt Natural where { bread = B.readNatural; sread = readNatural }
+
+instance Arbitrary Natural where
+    arbitrary = i2n <$> arbitrary
+      where i2n :: Integer -> Natural
+            i2n i | i >= 0 = fromIntegral i
+                  | otherwise = fromIntegral $ negate i
+
+testRdInt :: forall a. (Arbitrary a, RdInt a) => String -> TestTree
+testRdInt s = testGroup s $
+    [ testProperty "from string" $ int64OK $ \value prefix suffix ->
+        let si = show @a value
+            b  = prefix <> B.pack si <> suffix
+         in fmap (second B.unpack) (bread @a b)
+            === sread @a (B.unpack prefix ++ si ++ B.unpack suffix)
+    , testProperty "from number" $ int64OK $ \n ->
+        bread @a (B.pack (show n)) === Just (n, B.empty)
+    ]
+#endif
+
+intToIndexTy :: Int -> IndexTy
+#ifdef BYTESTRING_LAZY
+type IndexTy = Int64
+intToIndexTy = fromIntegral @Int @Int64
+#else
+type IndexTy = Int
+intToIndexTy = id
 #endif
 
 tests :: [TestTree]
@@ -203,10 +263,8 @@ tests =
     \x y -> B.unpack (mappend x y) === B.unpack x `mappend` B.unpack y
   , testProperty "<>" $
     \x y -> B.unpack (x <> y) === B.unpack x <> B.unpack y
-#ifndef BYTESTRING_SHORT
   , testProperty "stimes" $
-    \(Sqrt (NonNegative n)) (Sqrt x) -> stimes (n :: Int) (x :: BYTESTRING_TYPE) === mtimesDefault n x
-#endif
+    \(Sqrt (NonNegative n)) (Sqrt x) -> stimes (n :: Int) (x :: BYTESTRING_TYPE) === stimesMonoid n x
 
   , testProperty "break" $
     \f x -> (B.unpack *** B.unpack) (B.break f x) === break f (B.unpack x)
@@ -261,7 +319,7 @@ tests =
 #endif
 
   , testProperty "drop" $
-    \n x -> B.unpack (B.drop n x) === List.genericDrop n (B.unpack x)
+    \(intToIndexTy -> n) x -> B.unpack (B.drop n x) === List.genericDrop n (B.unpack x)
   , testProperty "drop 10" $
     \x -> let n = 10 in B.unpack (B.drop n x) === List.genericDrop n (B.unpack x)
   , testProperty "drop 2^31" $
@@ -278,7 +336,7 @@ tests =
 #endif
 
   , testProperty "take" $
-    \n x -> B.unpack (B.take n x) === List.genericTake n (B.unpack x)
+    \(intToIndexTy -> n) x -> B.unpack (B.take n x) === List.genericTake n (B.unpack x)
   , testProperty "take 10" $
     \x -> let n = 10 in B.unpack (B.take n x) === List.genericTake n (B.unpack x)
   , testProperty "take 2^31" $
@@ -295,11 +353,11 @@ tests =
 #endif
 
   , testProperty "dropEnd" $
-    \n x -> B.dropEnd n x === B.take (B.length x - n) x
+    \(intToIndexTy -> n) x -> B.dropEnd n x === B.take (B.length x - n) x
   , testProperty "dropWhileEnd" $
     \f x -> B.dropWhileEnd f x === B.reverse (B.dropWhile f (B.reverse x))
   , testProperty "takeEnd" $
-    \n x -> B.takeEnd n x === B.drop (B.length x - n) x
+    \(intToIndexTy -> n) x -> B.takeEnd n x === B.drop (B.length x - n) x
   , testProperty "takeWhileEnd" $
     \f x -> B.takeWhileEnd f x === B.reverse (B.takeWhile f (B.reverse x))
 
@@ -309,7 +367,7 @@ tests =
   , testProperty "toChunks . fromChunks" $
     \xs -> B.toChunks (B.fromChunks xs) === filter (/= mempty) xs
   , testProperty "append lazy" $
-    \(toElem -> c) -> B.head (B.singleton c <> undefined) === c
+    \(toElem -> c) -> B.head (B.singleton c <> tooStrictErr) === c
   , testProperty "compareLength 1" $
     \x -> B.compareLength x (B.length x) === EQ
   , testProperty "compareLength 2" $
@@ -319,15 +377,15 @@ tests =
   , testProperty "compareLength 4" $
     \x (toElem -> c) -> B.compareLength (B.snoc x c <> undefined) (B.length x) === GT
   , testProperty "compareLength 5" $
-    \x n -> B.compareLength x n === compare (B.length x) n
+    \x (intToIndexTy -> n) -> B.compareLength x n === compare (B.length x) n
   , testProperty "dropEnd lazy" $
-    \(toElem -> c) -> B.take 1 (B.dropEnd 1 (B.singleton c <> B.singleton c <> B.singleton c <> undefined)) === B.singleton c
+    \(toElem -> c) -> B.take 1 (B.dropEnd 1 (B.singleton c <> B.singleton c <> B.singleton c <> tooStrictErr)) === B.singleton c
   , testProperty "dropWhileEnd lazy" $
-    \(toElem -> c) -> B.take 1 (B.dropWhileEnd (const False) (B.singleton c <> undefined)) === B.singleton c
+    \(toElem -> c) -> B.take 1 (B.dropWhileEnd (const False) (B.singleton c <> tooStrictErr)) === B.singleton c
   , testProperty "breakEnd lazy" $
-    \(toElem -> c) -> B.take 1 (fst $ B.breakEnd (const True) (B.singleton c <> undefined)) === B.singleton c
+    \(toElem -> c) -> B.take 1 (fst $ B.breakEnd (const True) (B.singleton c <> tooStrictErr)) === B.singleton c
   , testProperty "spanEnd lazy" $
-    \(toElem -> c) -> B.take 1 (fst $ B.spanEnd (const False) (B.singleton c <> undefined)) === B.singleton c
+    \(toElem -> c) -> B.take 1 (fst $ B.spanEnd (const False) (B.singleton c <> tooStrictErr)) === B.singleton c
 #endif
 
   , testProperty "length" $
@@ -423,7 +481,8 @@ tests =
       (l1 == l2 || l1 == l2 + 1) && sum (map B.length splits) + l2 == B.length x
 
   , testProperty "splitAt" $
-    \n x -> (B.unpack *** B.unpack) (B.splitAt n x) === List.genericSplitAt n (B.unpack x)
+    \(intToIndexTy -> n) x -> (B.unpack *** B.unpack) (B.splitAt n x)
+                          === List.genericSplitAt n (B.unpack x)
   , testProperty "splitAt 10" $
     \x -> let n = 10 in (B.unpack *** B.unpack) (B.splitAt n x) === List.genericSplitAt n (B.unpack x)
   , testProperty "splitAt (2^31)" $
@@ -542,30 +601,53 @@ tests =
     \f x y -> (B.zipWith f x y :: [Int]) === zipWith f (B.unpack x) (B.unpack y)
   , testProperty "packZipWith" $
     \f x y -> B.unpack (B.packZipWith ((toElem .) . f) x y) === zipWith ((toElem .) . f) (B.unpack x) (B.unpack y)
+# ifdef BYTESTRING_LAZY
+    -- Don't use (===) in these laziness tests:
+    -- We don't want printing the test case to fail!
+  , testProperty "zip is lazy in the longer input" $ zipLazyInLongerInputTest $
+      \x y -> B.zip x y == zip (B.unpack x) (B.unpack y)
+  , testProperty "zipWith is lazy in the longer input" $
+      \f -> zipLazyInLongerInputTest $
+      \x y -> (B.zipWith f x y :: [Int]) == zipWith f (B.unpack x) (B.unpack y)
+  , testProperty "packZipWith is lazy in the longer input" $
+      \f -> zipLazyInLongerInputTest $
+      \x y -> B.unpack (B.packZipWith ((toElem .) . f) x y) == zipWith ((toElem .) . f) (B.unpack x) (B.unpack y)
+  , testProperty "zip is maximally lazy" $ \x y ->
+      zip (B.unpack x) (B.unpack y) `List.isPrefixOf`
+      B.zip (x <> tooStrictErr) (y <> tooStrictErr)
+  , testProperty "zipWith is maximally lazy" $ \f x y ->
+      zipWith f (B.unpack x) (B.unpack y) `List.isPrefixOf`
+      B.zipWith @Int f (x <> tooStrictErr) (y <> tooStrictErr)
+  -- (It's not clear if packZipWith is required to be maximally lazy.)
+# endif
   , testProperty "unzip" $
     \(fmap (toElem *** toElem) -> xs) -> (B.unpack *** B.unpack) (B.unzip xs) === unzip xs
 #endif
 
   , testProperty "index" $
-    \(NonNegative n) x -> fromIntegral n < B.length x ==> B.index x (fromIntegral n) === B.unpack x !! n
+    \(NonNegative n) x -> intToIndexTy n < B.length x ==> B.index x (intToIndexTy n) === B.unpack x !! n
   , testProperty "indexMaybe" $
-    \(NonNegative n) x -> fromIntegral n < B.length x ==> B.indexMaybe x (fromIntegral n) === Just (B.unpack x !! n)
+    \(NonNegative n) x -> intToIndexTy n < B.length x ==> B.indexMaybe x (intToIndexTy n) === Just (B.unpack x !! n)
   , testProperty "indexMaybe Nothing" $
-    \n x -> (n :: Int) < 0 || fromIntegral n >= B.length x ==> B.indexMaybe x (fromIntegral n) === Nothing
+    \n x -> n < 0 || intToIndexTy n >= B.length x ==> B.indexMaybe x (intToIndexTy n) === Nothing
   , testProperty "!?" $
-    \n x -> B.indexMaybe x (fromIntegral (n :: Int)) === x B.!? (fromIntegral n)
+    \(intToIndexTy -> n) x -> B.indexMaybe x n === x B.!? n
 
 #ifdef BYTESTRING_CHAR8
   , testProperty "isString" $
     \x -> x === fromString (B.unpack x)
-  , testProperty "readInt 1" $
-    \x -> fmap (second B.unpack) (B.readInt x) === readInt (B.unpack x)
-  , testProperty "readInt 2" $
-    \n -> B.readInt (B.pack (show n)) === Just (n, B.empty)
-  , testProperty "readInteger 1" $
-    \x -> fmap (second B.unpack) (B.readInteger x) === readInteger (B.unpack x)
-  , testProperty "readInteger 2" $
-    \n -> B.readInteger (B.pack (show n)) === Just (n, B.empty)
+  , testRdInt @Int    "readInt"
+  , testRdInt @Int8   "readInt8"
+  , testRdInt @Int16  "readInt16"
+  , testRdInt @Int32  "readInt32"
+  , testRdInt @Int64  "readInt64"
+  , testRdInt @Word   "readWord"
+  , testRdInt @Word8  "readWord8"
+  , testRdInt @Word16 "readWord16"
+  , testRdInt @Word32 "readWord32"
+  , testRdInt @Word64 "readWord64"
+  , testRdInt @Integer "readInteger"
+  , testRdInt @Natural "readNatural"
   , testProperty "lines" $
     \x -> map B.unpack (B.lines x) === lines (B.unpack x)
   , testProperty "lines \\n" $ once $
@@ -612,6 +694,18 @@ tests =
   , testProperty "fromString literal" $
     fromString "\0\1\2\3\4" == B.pack [0,1,2,3,4]
 #endif
+
+#ifndef BYTESTRING_SHORT
+  , testProperty "toConstr is pack" $
+    \(x :: BYTESTRING_TYPE) -> showConstr (toConstr x) === "pack"
+#ifndef BYTESTRING_CHAR8
+  , testProperty "gshow" $
+    \x -> gshow x === "(pack " ++ gshow (B.unpack x) ++ ")"
+#endif
+--  -- gread is broken on bytestring-0.12 and fixed on bytestring-master
+--  , testProperty "gread . gshow = reads . show" $
+--    \(x :: BYTESTRING_TYPE) -> gread (gshow x) === (reads (show x) :: [(BYTESTRING_TYPE, String)])
+#endif
   ]
 
 unsnoc :: [a] -> Maybe ([a], a)
@@ -648,10 +742,70 @@ readInt xs = case readInteger xs of
     | y' <- fromInteger y, toInteger y' == y -> Just (y', zs)
   otherwise -> Nothing
 
+readWord :: String -> Maybe (Word, String)
+readWord xs = case readIntegerUnsigned xs of
+  Just (y, zs)
+    | y' <- fromInteger y, toInteger y' == y -> Just (y', zs)
+  otherwise -> Nothing
+
+readInt8 :: String -> Maybe (Int8, String)
+readInt8 xs = case readInteger xs of
+  Just (y, zs)
+    | y' <- fromInteger y, toInteger y' == y -> Just (y', zs)
+  otherwise -> Nothing
+
+readWord8 :: String -> Maybe (Word8, String)
+readWord8 xs = case readIntegerUnsigned xs of
+  Just (y, zs)
+    | y' <- fromInteger y, toInteger y' == y -> Just (y', zs)
+  otherwise -> Nothing
+
+readInt16 :: String -> Maybe (Int16, String)
+readInt16 xs = case readInteger xs of
+  Just (y, zs)
+    | y' <- fromInteger y, toInteger y' == y -> Just (y', zs)
+  otherwise -> Nothing
+
+readWord16 :: String -> Maybe (Word16, String)
+readWord16 xs = case readIntegerUnsigned xs of
+  Just (y, zs)
+    | y' <- fromInteger y, toInteger y' == y -> Just (y', zs)
+  otherwise -> Nothing
+
+readInt32 :: String -> Maybe (Int32, String)
+readInt32 xs = case readInteger xs of
+  Just (y, zs)
+    | y' <- fromInteger y, toInteger y' == y -> Just (y', zs)
+  otherwise -> Nothing
+
+readWord32 :: String -> Maybe (Word32, String)
+readWord32 xs = case readIntegerUnsigned xs of
+  Just (y, zs)
+    | y' <- fromInteger y, toInteger y' == y -> Just (y', zs)
+  otherwise -> Nothing
+
+readInt64 :: String -> Maybe (Int64, String)
+readInt64 xs = case readInteger xs of
+  Just (y, zs)
+    | y' <- fromInteger y, toInteger y' == y -> Just (y', zs)
+  otherwise -> Nothing
+
+readWord64 :: String -> Maybe (Word64, String)
+readWord64 xs = case readIntegerUnsigned xs of
+  Just (y, zs)
+    | y' <- fromInteger y, toInteger y' == y -> Just (y', zs)
+  otherwise -> Nothing
+
 readInteger :: String -> Maybe (Integer, String)
 readInteger ('+' : xs) = readIntegerUnsigned xs
 readInteger ('-' : xs) = fmap (first negate) (readIntegerUnsigned xs)
 readInteger xs = readIntegerUnsigned xs
+
+readNatural :: String -> Maybe (Natural, String)
+readNatural xs = case readIntegerUnsigned xs of
+  Just (y, zs)
+    | y >= 0 -> Just (fromIntegral @Integer @Natural y, zs)
+  _          -> Nothing
 
 readIntegerUnsigned :: String -> Maybe (Integer, String)
 readIntegerUnsigned xs = case readMaybe ys of
@@ -659,4 +813,18 @@ readIntegerUnsigned xs = case readMaybe ys of
   otherwise -> Nothing
   where
     (ys, zs) = span isDigit xs
+#endif
+
+#ifdef BYTESTRING_LAZY
+zipLazyInLongerInputTest
+  :: Testable prop
+  => (BYTESTRING_TYPE -> BYTESTRING_TYPE -> prop)
+  ->  BYTESTRING_TYPE -> BYTESTRING_TYPE -> Property
+zipLazyInLongerInputTest fun = \x0 y0 -> let
+  msg = "Input chunks are: " ++ show (B.toChunks x0, B.toChunks y0)
+  (x, y) | B.length x0 <= B.length y0
+         = (x0, y0 <> tooStrictErr)
+         | otherwise
+         = (x0 <> tooStrictErr, y0)
+  in counterexample msg (fun x y)
 #endif

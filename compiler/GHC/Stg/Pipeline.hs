@@ -33,6 +33,7 @@ import GHC.Unit.Module ( Module )
 
 import GHC.Utils.Error
 import GHC.Types.Var
+import GHC.Types.Var.Set
 import GHC.Types.Unique.Supply
 import GHC.Utils.Outputable
 import GHC.Utils.Logger
@@ -41,8 +42,7 @@ import Control.Monad.IO.Class
 import Control.Monad.Trans.Reader
 import GHC.Settings (Platform)
 import GHC.Stg.InferTags (inferTags)
-import GHC.Types.Name.Env (NameEnv)
-import GHC.Stg.InferTags.TagSig (TagSig)
+import GHC.Stg.InferTags.TagSig ( StgCgInfos )
 
 data StgPipelineOpts = StgPipelineOpts
   { stgPipeline_phases      :: ![StgToDo]
@@ -57,15 +57,11 @@ data StgPipelineOpts = StgPipelineOpts
 newtype StgM a = StgM { _unStgM :: ReaderT Char IO a }
   deriving (Functor, Applicative, Monad, MonadIO)
 
--- | Information to be exposed in interface files which is produced
--- by the stg2stg passes.
-type StgCgInfos = NameEnv TagSig
-
 instance MonadUnique StgM where
-  getUniqueSupplyM = StgM $ do { mask <- ask
-                               ; liftIO $! mkSplitUniqSupply mask}
-  getUniqueM = StgM $ do { mask <- ask
-                         ; liftIO $! uniqFromMask mask}
+  getUniqueSupplyM = StgM $ do { tag <- ask
+                               ; liftIO $! mkSplitUniqSupply tag}
+  getUniqueM = StgM $ do { tag <- ask
+                         ; liftIO $! uniqFromTag tag}
 
 runStgM :: Char -> StgM a -> IO a
 runStgM mask (StgM m) = runReaderT m mask
@@ -75,9 +71,10 @@ stg2stg :: Logger
         -> StgPipelineOpts
         -> Module                    -- ^ module being compiled
         -> [StgTopBinding]           -- ^ input program
-        -> IO ([CgStgTopBinding], StgCgInfos) -- output program
+        -> IO ([(CgStgTopBinding,IdSet)], StgCgInfos) -- output program
 stg2stg logger extra_vars opts this_mod binds
   = do  { dump_when Opt_D_dump_stg_from_core "Initial STG:" binds
+        ; stg_linter False "StgFromCore" binds
         ; showPass logger "Stg2Stg"
         -- Do the main business!
         ; binds' <- runStgM 'g' $
@@ -93,12 +90,15 @@ stg2stg logger extra_vars opts this_mod binds
           -- sorting pass is necessary.
           -- This pass will also augment each closure with non-global free variables
           -- annotations (which is used by code generator to compute offsets into closures)
-        ; let binds_sorted_with_fvs = depSortWithAnnotStgPgm this_mod binds'
+        ; let (binds_sorted_with_fvs, imp_fvs) = unzip (depSortWithAnnotStgPgm this_mod binds')
         -- See Note [Tag inference for interactive contexts]
-        ; inferTags (stgPipeline_pprOpts opts) (stgPipeline_forBytecode opts) logger this_mod binds_sorted_with_fvs
+        ; (cg_binds, cg_infos) <- inferTags (stgPipeline_pprOpts opts) (stgPipeline_forBytecode opts) logger this_mod binds_sorted_with_fvs
+        ; stg_linter False "StgCodeGen" cg_binds
+        ; pure (zip cg_binds imp_fvs, cg_infos)
    }
 
   where
+    stg_linter :: (BinderP a ~ Id, OutputablePass a) => Bool -> String -> [GenStgTopBinding a] -> IO ()
     stg_linter unarised
       | Just diag_opts <- stgPipeline_lint opts
       = lintStgTopBindings

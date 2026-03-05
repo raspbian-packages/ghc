@@ -129,11 +129,6 @@ main = getArgs >>= \args ->
                       "--data-decl"
                          -> putStr (gen_data_decl p_o_specs)
 
-                      "--has-side-effects"
-                         -> putStr (gen_switch_from_attribs
-                                       "has_side_effects"
-                                       "primOpHasSideEffects" p_o_specs)
-
                       "--out-of-line"
                          -> putStr (gen_switch_from_attribs
                                        "out_of_line"
@@ -149,10 +144,15 @@ main = getArgs >>= \args ->
                                        "code_size"
                                        "primOpCodeSize" p_o_specs)
 
-                      "--can-fail"
+                      "--is-work-free"
                          -> putStr (gen_switch_from_attribs
-                                       "can_fail"
-                                       "primOpCanFail" p_o_specs)
+                                       "work_free"
+                                       "primOpIsWorkFree" p_o_specs)
+
+                      "--is-cheap"
+                         -> putStr (gen_switch_from_attribs
+                                       "cheap"
+                                       "primOpIsCheap" p_o_specs)
 
                       "--strictness"
                          -> putStr (gen_switch_from_attribs
@@ -163,6 +163,11 @@ main = getArgs >>= \args ->
                          -> putStr (gen_switch_from_attribs
                                        "fixity"
                                        "primOpFixity" p_o_specs)
+
+                      "--primop-effects"
+                         -> putStr (gen_switch_from_attribs
+                                       "effect"
+                                       "primOpEffect" p_o_specs)
 
                       "--primop-primop-info"
                          -> putStr (gen_primop_info p_o_specs)
@@ -200,13 +205,14 @@ main = getArgs >>= \args ->
 known_args :: [String]
 known_args
    = [ "--data-decl",
-       "--has-side-effects",
        "--out-of-line",
        "--commutable",
        "--code-size",
-       "--can-fail",
+       "--is-work-free",
+       "--is-cheap",
        "--strictness",
        "--fixity",
+       "--primop-effects",
        "--primop-primop-info",
        "--primop-tag",
        "--primop-list",
@@ -290,7 +296,9 @@ gen_hs_source (Info defaults entries) =
            opt (OptionString n v) = n ++ " = { " ++ v ++ "}"
            opt (OptionInteger n v) = n ++ " = " ++ show v
            opt (OptionVector _)    = ""
-           opt (OptionFixity mf) = "fixity" ++ " = " ++ show mf
+           opt (OptionFixity mf) = "fixity = " ++ show mf
+           opt (OptionEffect eff) = "effect = " ++ show eff
+           opt (OptionCanFailWarnFlag wf) = "can_fail_warning = " ++ show wf
 
            hdr s@(Section {})                                    = sec s
            hdr (PrimOpSpec { name = n })                         = wrapOp n ++ ","
@@ -344,7 +352,10 @@ gen_hs_source (Info defaults entries) =
 
            can_fail options
              = [ "can fail with an unchecked exception"
-               | Just (OptionTrue _) <- [lookup_attrib "can_fail" options] ]
+               | Just (OptionEffect eff) <- [lookup_attrib "effect" options]
+               , Just (OptionCanFailWarnFlag wflag) <- [lookup_attrib "can_fail_warning" options]
+               , wflag /= DoNotWarnCanFail
+               , wflag == YesWarnCanFail || eff == CanFail ]
 
            prim_deprecated options n
               = [ "{-# DEPRECATED " ++ wrapOp n ++ " \"" ++ msg ++ "\" #-}"
@@ -611,6 +622,8 @@ gen_switch_from_attribs attrib_name fn_name (Info defaults entries)
          getAltRhs (OptionString _ s) = s
          getAltRhs (OptionVector _) = "True"
          getAltRhs (OptionFixity mf) = show mf
+         getAltRhs (OptionEffect eff) = show eff
+         getAltRhs (OptionCanFailWarnFlag wf) = show wf
 
          mkAlt po
             = case lookup_attrib attrib_name (opts po) of
@@ -624,13 +637,13 @@ gen_switch_from_attribs attrib_name fn_name (Info defaults entries)
             Nothing -> error ("gen_switch_from: " ++ attrib_name)
             Just xx
                -> unlines alternatives
-                  ++ fn_name ++ " _ = " ++ getAltRhs xx ++ "\n"
+                  ++ fn_name ++ " _thisOp = " ++ getAltRhs xx ++ "\n"
 
 {-
 Note [GHC.Prim Docs]
 ~~~~~~~~~~~~~~~~~~~~
 For haddocks of GHC.Prim we generate a dummy haskell file (gen_hs_source) that
-contains the type signatures and the commends (but no implementations)
+contains the type signatures and the comments (but no implementations)
 specifically for consumption by haddock.
 
 GHCi's :doc command reads directly from ModIface's though, and GHC.Prim has a
@@ -715,7 +728,9 @@ nonDepTyVarBinder bndr
 -- This assumes that such a re-ordering makes sense: the kinds of the inferred
 -- type variables may not depend on any of the other type variables.
 ppTyVarBinders :: [TyVar] -> ([TyVarBinder], [TyVarBinder])
-ppTyVarBinders names = case go names of { (infs, bndrs) -> (nub infs, nub bndrs) }
+ppTyVarBinders names =
+  case go names of
+    { (infs, bndrs) -> (nub infs, nub bndrs) }
   where
      go [] = ([], [])
      go (tv:tvs)
@@ -731,21 +746,24 @@ ppTyVar "a" = nonDepTyVarBinder "alphaTyVarSpec"
 ppTyVar "b" = nonDepTyVarBinder "betaTyVarSpec"
 ppTyVar "c" = nonDepTyVarBinder "gammaTyVarSpec"
 ppTyVar "s" = nonDepTyVarBinder "deltaTyVarSpec"
-ppTyVar "o" = PrimOpTyVarBinder
-              { inferredTyVarBinders = ["runtimeRep1TyVarInf"]
-              , primOpTyVarBinder    = "openAlphaTyVarSpec" }
-ppTyVar "p" = PrimOpTyVarBinder
-              { inferredTyVarBinders = ["runtimeRep2TyVarInf"]
-              , primOpTyVarBinder    = "openBetaTyVarSpec" }
-ppTyVar "v" = PrimOpTyVarBinder
-              { inferredTyVarBinders = ["levity1TyVarInf"]
-              , primOpTyVarBinder    = "levPolyAlphaTyVarSpec" }
-ppTyVar "w" = PrimOpTyVarBinder
-              { inferredTyVarBinders = ["levity2TyVarInf"]
-              , primOpTyVarBinder    = "levPolyBetaTyVarSpec" }
-ppTyVar _   = error "Unknown type var"
--- o, p, v and w have a special meaning. See primops.txt.pp
--- Note [Levity and representation polymorphic primops]
+-- See Note [Levity and representation polymorphic primops] in primops.txt.pp
+ppTyVar "a_reppoly"
+  = PrimOpTyVarBinder
+  { inferredTyVarBinders = ["runtimeRep1TyVarInf"]
+  , primOpTyVarBinder    = "openAlphaTyVarSpec" }
+ppTyVar "b_reppoly"
+  = PrimOpTyVarBinder
+  { inferredTyVarBinders = ["runtimeRep2TyVarInf"]
+  , primOpTyVarBinder    = "openBetaTyVarSpec" }
+ppTyVar "a_levpoly"
+  = PrimOpTyVarBinder
+  { inferredTyVarBinders = ["levity1TyVarInf"]
+  , primOpTyVarBinder    = "levPolyAlphaTyVarSpec" }
+ppTyVar "b_levpoly"
+  = PrimOpTyVarBinder
+  { inferredTyVarBinders = ["levity2TyVarInf"]
+  , primOpTyVarBinder    = "levPolyBetaTyVarSpec" }
+ppTyVar var = error $ "Unknown type variable name '" ++ var ++ "'"
 
 ppType :: Ty -> String
 ppType (TyApp (TyCon "Any")         []) = "anyTy"
@@ -778,12 +796,11 @@ ppType (TyVar "a")                      = "alphaTy"
 ppType (TyVar "b")                      = "betaTy"
 ppType (TyVar "c")                      = "gammaTy"
 ppType (TyVar "s")                      = "deltaTy"
-ppType (TyVar "o")                      = "openAlphaTy"
-ppType (TyVar "p")                      = "openBetaTy"
-ppType (TyVar "v")                      = "levPolyAlphaTy"
-ppType (TyVar "w")                      = "levPolyBetaTy"
--- o, p, v and w have a special meaning. See primops.txt.pp
--- Note [Levity and representation polymorphic primops]
+-- See Note [Levity and representation polymorphic primops] in primops.txt.pp
+ppType (TyVar "a_reppoly")              = "openAlphaTy"
+ppType (TyVar "b_reppoly")              = "openBetaTy"
+ppType (TyVar "a_levpoly")              = "levPolyAlphaTy"
+ppType (TyVar "b_levpoly")              = "levPolyBetaTy"
 
 ppType (TyApp (TyCon "State#") [x])             = "mkStatePrimTy " ++ ppType x
 ppType (TyApp (TyCon "MutVar#") [x,y])          = "mkMutVarPrimTy " ++ ppType x

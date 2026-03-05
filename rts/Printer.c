@@ -259,40 +259,79 @@ printClosure( const StgClosure *obj )
 
     case UPDATE_FRAME:
         {
-            StgUpdateFrame* u = (StgUpdateFrame*)obj;
+            StgUpdateFrame* frame = (StgUpdateFrame*)obj;
             debugBelch("%s(", info_update_frame(obj));
-            printPtr((StgPtr)GET_INFO((StgClosure *)u));
+            printPtr((StgPtr)GET_INFO((StgClosure *)frame));
             debugBelch(",");
-            printPtr((StgPtr)u->updatee);
+            printPtr((StgPtr)frame->updatee);
             debugBelch(")\n");
             break;
         }
 
     case CATCH_FRAME:
         {
-            StgCatchFrame* u = (StgCatchFrame*)obj;
+            StgCatchFrame* frame = (StgCatchFrame*)obj;
             debugBelch("CATCH_FRAME(");
-            printPtr((StgPtr)GET_INFO((StgClosure *)u));
+            printPtr((StgPtr)GET_INFO((StgClosure *)frame));
             debugBelch(",");
-            printPtr((StgPtr)u->handler);
+            printPtr((StgPtr)frame->handler);
             debugBelch(")\n");
             break;
         }
 
     case UNDERFLOW_FRAME:
         {
-            StgUnderflowFrame* u = (StgUnderflowFrame*)obj;
+            StgUnderflowFrame* frame = (StgUnderflowFrame*)obj;
             debugBelch("UNDERFLOW_FRAME(");
-            printPtr((StgPtr)u->next_chunk);
+            printPtr((StgPtr)frame->next_chunk);
             debugBelch(")\n");
             break;
         }
 
     case STOP_FRAME:
         {
-            StgStopFrame* u = (StgStopFrame*)obj;
+            StgStopFrame* frame = (StgStopFrame*)obj;
             debugBelch("STOP_FRAME(");
-            printPtr((StgPtr)GET_INFO((StgClosure *)u));
+            printPtr((StgPtr)GET_INFO((StgClosure *)frame));
+            debugBelch(")\n");
+            break;
+        }
+
+    case ATOMICALLY_FRAME:
+        {
+            StgAtomicallyFrame* frame = (StgAtomicallyFrame*)obj;
+            debugBelch("ATOMICALLY_FRAME(");
+            printPtr((StgPtr)GET_INFO((StgClosure *)frame));
+            debugBelch(",");
+            printPtr((StgPtr)frame->code);
+            debugBelch(",");
+            printPtr((StgPtr)frame->result);
+            debugBelch(")\n");
+            break;
+        }
+
+    case CATCH_RETRY_FRAME:
+        {
+            StgCatchRetryFrame* frame = (StgCatchRetryFrame*)obj;
+            debugBelch("CATCH_RETRY_FRAME(");
+            printPtr((StgPtr)GET_INFO((StgClosure *)frame));
+            debugBelch(",");
+            printPtr((StgPtr)frame->first_code);
+            debugBelch(",");
+            printPtr((StgPtr)frame->alt_code);
+            debugBelch(")\n");
+            break;
+        }
+
+    case CATCH_STM_FRAME:
+        {
+            StgCatchSTMFrame* frame = (StgCatchSTMFrame*)obj;
+            debugBelch("CATCH_STM_FRAME(");
+            printPtr((StgPtr)GET_INFO((StgClosure *)frame));
+            debugBelch(",");
+            printPtr((StgPtr)frame->code);
+            debugBelch(",");
+            printPtr((StgPtr)frame->handler);
             debugBelch(")\n");
             break;
         }
@@ -319,6 +358,10 @@ printClosure( const StgClosure *obj )
         debugBelch("MUT_ARR_PTRS_FROZEN_CLEAN(size=%" FMT_Word ")\n", (W_)((StgMutArrPtrs *)obj)->ptrs);
         break;
 
+    case MUT_ARR_PTRS_FROZEN_DIRTY:
+        debugBelch("MUT_ARR_PTRS_FROZEN_DIRTY(size=%" FMT_Word ")\n", (W_)((StgMutArrPtrs *)obj)->ptrs);
+        break;
+
     case SMALL_MUT_ARR_PTRS_CLEAN:
         debugBelch("SMALL_MUT_ARR_PTRS_CLEAN(size=%" FMT_Word ")\n",
                    (W_)((StgSmallMutArrPtrs *)obj)->ptrs);
@@ -331,6 +374,11 @@ printClosure( const StgClosure *obj )
 
     case SMALL_MUT_ARR_PTRS_FROZEN_CLEAN:
         debugBelch("SMALL_MUT_ARR_PTRS_FROZEN_CLEAN(size=%" FMT_Word ")\n",
+                   (W_)((StgSmallMutArrPtrs *)obj)->ptrs);
+        break;
+
+    case SMALL_MUT_ARR_PTRS_FROZEN_DIRTY:
+        debugBelch("SMALL_MUT_ARR_PTRS_FROZEN_DIRTY(size=%" FMT_Word ")\n",
                    (W_)((StgSmallMutArrPtrs *)obj)->ptrs);
         break;
 
@@ -533,6 +581,9 @@ printStackChunk( StgPtr sp, StgPtr spBottom )
         case CATCH_FRAME:
         case UNDERFLOW_FRAME:
         case STOP_FRAME:
+        case ATOMICALLY_FRAME:
+        case CATCH_RETRY_FRAME:
+        case CATCH_STM_FRAME:
             printClosure((StgClosure*)sp);
             continue;
 
@@ -662,17 +713,17 @@ printStackChunk( StgPtr sp, StgPtr spBottom )
             debugBelch("RET_FUN (%p) (type=%d)\n", ret_fun->fun, (int)fun_info->f.fun_type);
             switch (fun_info->f.fun_type) {
             case ARG_GEN:
-                printSmallBitmap(spBottom, sp+2,
+                printSmallBitmap(spBottom, (StgPtr) &ret_fun->payload,
                                  BITMAP_BITS(fun_info->f.b.bitmap),
                                  BITMAP_SIZE(fun_info->f.b.bitmap));
                 break;
             case ARG_GEN_BIG:
-                printLargeBitmap(spBottom, sp+2,
+                printLargeBitmap(spBottom, (StgPtr) &ret_fun->payload,
                                  GET_FUN_LARGE_BITMAP(fun_info),
                                  GET_FUN_LARGE_BITMAP(fun_info)->size);
                 break;
             default:
-                printSmallBitmap(spBottom, sp+2,
+                printSmallBitmap(spBottom, (StgPtr) &ret_fun->payload,
                                  BITMAP_BITS(stg_arg_bitmaps[fun_info->f.fun_type]),
                                  BITMAP_SIZE(stg_arg_bitmaps[fun_info->f.fun_type]));
                 break;

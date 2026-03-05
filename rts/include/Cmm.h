@@ -35,6 +35,7 @@
 #define CMINUSMINUS 1
 
 #include "ghcconfig.h"
+#include "rts/TSANUtils.h"
 
 /* -----------------------------------------------------------------------------
    Types
@@ -193,8 +194,10 @@
 
 #if SIZEOF_W == 4
 #define cmpxchgW cmpxchg32
+#define xchgW xchg32
 #elif SIZEOF_W == 8
 #define cmpxchgW cmpxchg64
+#define xchgW xchg64
 #endif
 
 /* -----------------------------------------------------------------------------
@@ -412,7 +415,7 @@
     TICK_BUMP(HEAP_CHK_ctr);                            \
     Hp = Hp + (bytes);                                  \
     if (Hp > HpLim) { HpAlloc = (bytes); failure; }     \
-    TICK_ALLOC_HEAP_NOCTR(bytes);
+    TICK_ALLOC_RTS(bytes);
 
 #define ALLOC_PRIM_WITH_CUSTOM_FAILURE(bytes,failure)           \
     HEAP_CHECK(bytes,failure)                                   \
@@ -433,7 +436,7 @@
 
 #define HP_CHK_GEN_TICKY(bytes)                 \
    HP_CHK_GEN(bytes);                           \
-   TICK_ALLOC_HEAP_NOCTR(bytes);
+   TICK_ALLOC_RTS(bytes);
 
 #define HP_CHK_P(bytes, fun, arg)               \
    HEAP_CHECK(bytes, GC_PRIM_P(fun,arg))
@@ -442,11 +445,19 @@
 //         -NSF March 2013
 #define ALLOC_P_TICKY(bytes, fun, arg)          \
    HP_CHK_P(bytes);                             \
-   TICK_ALLOC_HEAP_NOCTR(bytes);
+   TICK_ALLOC_RTS(bytes);
+
+// Load a field out of structure with relaxed ordering.
+#define RELAXED_LOAD_FIELD(fld, ptr) \
+    REP_##fld![(ptr) + OFFSET_##fld]
+
+// Load a field out of an StgClosure with relaxed ordering.
+#define RELAXED_LOAD_CLOSURE_FIELD(fld, ptr) \
+    REP_##fld![(ptr) + SIZEOF_StgHeader + OFFSET_##fld]
 
 #define CHECK_GC()                                                      \
   (bdescr_link(CurrentNursery) == NULL ||                               \
-   generation_n_new_large_words(W_[g0]) >= TO_W_(CLong[large_alloc_lim]))
+   RELAXED_LOAD_FIELD(generation_n_new_large_words, W_[g0]) >= TO_W_(CLong[large_alloc_lim]))
 
 // allocate() allocates from the nursery, so we check to see
 // whether the nursery is nearly empty in any function that uses
@@ -594,6 +605,7 @@
 /* Getting/setting the info pointer of a closure */
 #define SET_INFO(p,info) StgHeader_info(p) = info
 #define SET_INFO_RELEASE(p,info) %release StgHeader_info(p) = info
+#define SET_INFO_RELAXED(p,info) %relaxed StgHeader_info(p) = info
 #define GET_INFO(p) StgHeader_info(p)
 #define GET_INFO_ACQUIRE(p) %acquire GET_INFO(p)
 
@@ -605,16 +617,20 @@
 #define BITMAP_SIZE(bitmap) ((bitmap) & BITMAP_SIZE_MASK)
 #define BITMAP_BITS(bitmap) ((bitmap) >> BITMAP_BITS_SHIFT)
 
+#define LOOKS_LIKE_PTR(p) ((p) != NULL && (p) != INVALID_GHC_POINTER)
+
 /* Debugging macros */
 #define LOOKS_LIKE_INFO_PTR(p)                                  \
-   ((p) != NULL &&                                              \
+   (LOOKS_LIKE_PTR(p) &&                                        \
     LOOKS_LIKE_INFO_PTR_NOT_NULL(p))
 
 #define LOOKS_LIKE_INFO_PTR_NOT_NULL(p)                         \
    ( (TO_W_(%INFO_TYPE(%STD_INFO(p))) != INVALID_OBJECT) &&     \
      (TO_W_(%INFO_TYPE(%STD_INFO(p))) <  N_CLOSURE_TYPES))
 
-#define LOOKS_LIKE_CLOSURE_PTR(p) (LOOKS_LIKE_INFO_PTR(GET_INFO(UNTAG(p))))
+#define LOOKS_LIKE_CLOSURE_PTR(p)                               \
+   ( LOOKS_LIKE_PTR(p) &&                                       \
+     LOOKS_LIKE_INFO_PTR(GET_INFO(UNTAG(p))))
 
 /*
  * The layout of the StgFunInfoExtra part of an info table changes
@@ -647,9 +663,9 @@
 #define mutArrPtrsCardWords(n) ROUNDUP_BYTES_TO_WDS(mutArrPtrCardUp(n))
 
 #if defined(PROFILING) || defined(DEBUG)
-#define OVERWRITING_CLOSURE_SIZE(c, size) foreign "C" overwritingClosureSize(c "ptr", size)
-#define OVERWRITING_CLOSURE(c) foreign "C" overwritingClosure(c "ptr")
-#define OVERWRITING_CLOSURE_MUTABLE(c, off) foreign "C" overwritingMutableClosureOfs(c "ptr", off)
+#define OVERWRITING_CLOSURE_SIZE(c, size) foreign "C" stg_overwritingClosureSize(c "ptr", size)
+#define OVERWRITING_CLOSURE(c) foreign "C" stg_overwritingClosure(c "ptr")
+#define OVERWRITING_CLOSURE_MUTABLE(c, off) foreign "C" stg_overwritingMutableClosureOfs(c "ptr", off)
 #else
 #define OVERWRITING_CLOSURE_SIZE(c, size) /* nothing */
 #define OVERWRITING_CLOSURE(c) /* nothing */
@@ -657,7 +673,7 @@
  * this whenever profiling is enabled as described in Note [slop on the heap]
  * in Storage.c. */
 #define OVERWRITING_CLOSURE_MUTABLE(c, off) \
-    if (TO_W_(RtsFlags_ProfFlags_doHeapProfile(RtsFlags)) != 0) { foreign "C" overwritingMutableClosureOfs(c "ptr", off); }
+    if (TO_W_(RtsFlags_ProfFlags_doHeapProfile(RtsFlags)) != 0) { foreign "C" stg_overwritingMutableClosureOfs(c "ptr", off); }
 #endif
 
 #define IS_STACK_CLEAN(stack) \
@@ -671,23 +687,33 @@
  * explicit ordered accesses to make ordering apparent to TSAN.
  */
 
-// Memory barriers.
+// Memory barriers
 // For discussion of how these are used to fence heap object
 // accesses see Note [Heap memory barriers] in SMP.h.
 #if defined(THREADED_RTS)
-#define prim_read_barrier prim %read_barrier()
 #define prim_write_barrier prim %write_barrier()
 
 // See Note [ThreadSanitizer and fences]
-#define RELEASE_FENCE prim %write_barrier()
-#define ACQUIRE_FENCE prim %read_barrier()
+#define RELEASE_FENCE prim %fence_release();
+#define ACQUIRE_FENCE prim %fence_acquire();
+#define SEQ_CST_FENCE prim %fence_seq_cst();
+
+#if defined(TSAN_ENABLED)
+// This is may be efficient than a fence but TSAN can reason about it.
+#if SIZEOF_W == 8
+#define ACQUIRE_FENCE_ON(x) if (1) { W_ tmp; (tmp) = prim %load_acquire64(x); }
+#elif SIZEOF_W == 4
+#define ACQUIRE_FENCE_ON(x) if (1) { W_ tmp; (tmp) = prim %load_acquire32(x); }
+#endif
+#else
+#define ACQUIRE_FENCE_ON(x) ACQUIRE_FENCE
+#endif
 
 #else
 
-#define prim_read_barrier /* nothing */
-#define prim_write_barrier /* nothing */
 #define RELEASE_FENCE /* nothing */
 #define ACQUIRE_FENCE /* nothing */
+#define ACQUIRE_FENCE_ON(x) /* nothing */
 #endif /* THREADED_RTS */
 
 /* -----------------------------------------------------------------------------
@@ -695,7 +721,7 @@
    -------------------------------------------------------------------------- */
 
 #if defined(TICKY_TICKY)
-#define TICK_BUMP_BY(ctr,n) W_[ctr] = W_[ctr] + n
+#define TICK_BUMP_BY(ctr,n) %relaxed W_[ctr] = W_![ctr] + n
 #else
 #define TICK_BUMP_BY(ctr,n) /* nothing */
 #endif
@@ -783,7 +809,7 @@
   TICK_BUMP(UPD_CON_IN_NEW_ctr);                \
   TICK_HISTO(UPD_CON_IN_NEW,n)
 
-#define TICK_ALLOC_HEAP_NOCTR(bytes)            \
+#define TICK_ALLOC_RTS(bytes)            \
     TICK_BUMP(ALLOC_RTS_ctr);                   \
     TICK_BUMP_BY(ALLOC_RTS_tot,bytes)
 

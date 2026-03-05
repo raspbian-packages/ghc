@@ -39,16 +39,25 @@ haddockBuilderArgs = mconcat
         output   <- getOutput
         pkg      <- getPackage
         root     <- getBuildRoot
+        stage    <- getStage
         context  <- getContext
         version  <- expr $ pkgVersion  pkg
         synopsis <- expr $ pkgSynopsis pkg
         haddocks <- expr $ haddockDependencies context
-        haddocks_with_versions <- expr $ sequence $ [(,h) <$> pkgIdentifier p | (p, h) <- haddocks]
+        haddocks_with_versions <- expr $ sequence $ [(,,h) <$> pkgSimpleIdentifier p <*> pkgUnitId stage p | (p, h) <- haddocks]
+
         hVersion <- expr $ pkgVersion haddock
         statsDir <- expr $ haddockStatsFilesDir
         baseUrlTemplate <- expr (docsBaseUrl <$> userSetting defaultDocArgs)
-        let baseUrl p = substituteTemplate baseUrlTemplate p
+        -- The path to where the docs for a package are
+        let docpath p = substituteTemplate baseUrlTemplate p
+        -- The path to where the src folder is for a package (typically docs ++ "/src/")
+        let srcpath p = docpath p ++ "/src/"
         ghcOpts  <- haddockGhcArgs
+        -- These are the options which are necessary to perform the build. Additional
+        -- options such as `--hyperlinked-source`, `--hoogle`, `--quickjump` are
+        -- added by the `extraArgs` field in the flavour. The defaults are provided
+        -- by `defaultHaddockExtraArgs`.
         mconcat
             [ arg "--verbosity=0"
             , arg $ "-B" ++ root -/- stageString Stage1 -/- "lib"
@@ -56,9 +65,6 @@ haddockBuilderArgs = mconcat
             , arg $ "--odir=" ++ takeDirectory output
             , arg $ "--dump-interface=" ++ output
             , arg "--html"
-            , arg "--hyperlinked-source"
-            , arg "--hoogle"
-            , arg "--quickjump"
             , arg "--mathjax=file:///usr/share/javascript/mathjax/MathJax.js"
             , arg $ "--title=" ++ pkgName pkg ++ "-" ++ version
                     ++ ": " ++ synopsis
@@ -66,15 +72,18 @@ haddockBuilderArgs = mconcat
             , arg $ "--optghc=-D__HADDOCK_VERSION__="
                     ++ show (versionToInt hVersion)
             , map ("--hide=" ++) <$> getContextData otherModules
-            , pure [ "--read-interface=../" ++ p
-                     ++ "," ++ baseUrl p ++ "/src/%{MODULE}.html#%{NAME},"
-                     ++ haddock | (p, haddock) <- haddocks_with_versions ]
+            , pure [ "--read-interface=" ++ docpath (p, pid)
+                     ++ "," ++ srcpath (p, pid) ++ ","
+                     ++ haddock | (p, pid, haddock) <- haddocks_with_versions ]
             , pure [ "--optghc=" ++ opt | opt <- ghcOpts, not ("--package-db" `isInfixOf` opt) ]
-            , getInputs
             , arg "+RTS"
             , arg $ "-t" ++ (statsDir -/- pkgName pkg ++ ".t")
             , arg "--machine-readable"
             , arg "-RTS" ] ]
 
-substituteTemplate :: String -> String -> String
-substituteTemplate baseTemplate pkgId = T.unpack . T.replace "%pkg%" (T.pack pkgId) . T.pack $ baseTemplate
+substituteTemplate :: String -> (String, String) -> String
+substituteTemplate baseTemplate (pkg, pkgId) =
+  T.unpack
+    . T.replace "%pkg%" (T.pack pkg)
+    . T.replace "%pkgid%" (T.pack pkgId)
+    . T.pack $ baseTemplate

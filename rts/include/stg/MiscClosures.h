@@ -52,6 +52,7 @@ RTS_RET(stg_upd_frame);
 RTS_RET(stg_bh_upd_frame);
 RTS_RET(stg_marked_upd_frame);
 RTS_RET(stg_noupd_frame);
+RTS_RET(stg_orig_thunk_info_frame);
 RTS_RET(stg_catch_frame);
 RTS_RET(stg_catch_retry_frame);
 RTS_RET(stg_atomically_frame);
@@ -589,6 +590,11 @@ RTS_FUN_DECL(stg_traceMarkerzh);
 RTS_FUN_DECL(stg_getThreadAllocationCounterzh);
 RTS_FUN_DECL(stg_setThreadAllocationCounterzh);
 
+RTS_FUN_DECL(stg_castWord64ToDoublezh);
+RTS_FUN_DECL(stg_castDoubleToWord64zh);
+RTS_FUN_DECL(stg_castWord32ToFloatzh);
+RTS_FUN_DECL(stg_castFloatToWord32zh);
+
 /* Other misc stuff */
 // See wiki:commentary/compiler/backends/ppr-c#prototypes
 
@@ -626,6 +632,7 @@ extern StgWord RTS_VAR(stable_name_table);
 
 // Profiling.c
 extern unsigned int RTS_VAR(era);
+extern StgWord RTS_VAR(user_era);
 extern unsigned int RTS_VAR(entering_PAP);
 extern StgWord      CCS_OVERHEAD[];
 extern StgWord      CCS_SYSTEM[];

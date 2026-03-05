@@ -108,6 +108,9 @@ deriving instance Data (HsPatSynDir GhcPs)
 deriving instance Data (HsPatSynDir GhcRn)
 deriving instance Data (HsPatSynDir GhcTc)
 
+deriving instance Data (HsMultAnn GhcPs)
+deriving instance Data (HsMultAnn GhcRn)
+deriving instance Data (HsMultAnn GhcTc)
 -- ---------------------------------------------------------------------
 -- Data derivations from GHC.Hs.Decls ----------------------------------
 
@@ -287,6 +290,14 @@ deriving instance Data (FieldLabelStrings GhcPs)
 deriving instance Data (FieldLabelStrings GhcRn)
 deriving instance Data (FieldLabelStrings GhcTc)
 
+deriving instance Data (HsRecUpdParent GhcPs)
+deriving instance Data (HsRecUpdParent GhcRn)
+deriving instance Data (HsRecUpdParent GhcTc)
+
+deriving instance Data (LHsRecUpdFields GhcPs)
+deriving instance Data (LHsRecUpdFields GhcRn)
+deriving instance Data (LHsRecUpdFields GhcTc)
+
 deriving instance Data (DotFieldOcc GhcPs)
 deriving instance Data (DotFieldOcc GhcRn)
 deriving instance Data (DotFieldOcc GhcTc)
@@ -371,17 +382,10 @@ deriving instance Data (ApplicativeArg GhcPs)
 deriving instance Data (ApplicativeArg GhcRn)
 deriving instance Data (ApplicativeArg GhcTc)
 
-deriving instance Data (HsStmtContext GhcPs)
-deriving instance Data (HsStmtContext GhcRn)
-deriving instance Data (HsStmtContext GhcTc)
-
 deriving instance Data HsArrowMatchContext
 
-deriving instance Data HsDoFlavour
-
-deriving instance Data (HsMatchContext GhcPs)
-deriving instance Data (HsMatchContext GhcRn)
-deriving instance Data (HsMatchContext GhcTc)
+deriving instance Data fn => Data (HsStmtContext fn)
+deriving instance Data fn => Data (HsMatchContext fn)
 
 -- deriving instance (DataIdLR p p) => Data (HsUntypedSplice p)
 deriving instance Data (HsUntypedSplice GhcPs)
@@ -450,6 +454,11 @@ deriving instance (Data body) => Data (HsRecFields GhcTc body)
 -- ---------------------------------------------------------------------
 -- Data derivations from GHC.Hs.Type ----------------------------------
 
+-- deriving instance Data (HsBndrVis p)
+deriving instance Data (HsBndrVis GhcPs)
+deriving instance Data (HsBndrVis GhcRn)
+deriving instance Data (HsBndrVis GhcTc)
+
 -- deriving instance (DataIdLR p p) => Data (LHsQTyVars p)
 deriving instance Data (LHsQTyVars GhcPs)
 deriving instance Data (LHsQTyVars GhcRn)
@@ -475,6 +484,11 @@ deriving instance Data (HsPatSigType GhcPs)
 deriving instance Data (HsPatSigType GhcRn)
 deriving instance Data (HsPatSigType GhcTc)
 
+-- deriving instance (DataIdLR p p) => Data (HsTyPat p)
+deriving instance Data (HsTyPat GhcPs)
+deriving instance Data (HsTyPat GhcRn)
+deriving instance Data (HsTyPat GhcTc)
+
 -- deriving instance (DataIdLR p p) => Data (HsForAllTelescope p)
 deriving instance Data (HsForAllTelescope GhcPs)
 deriving instance Data (HsForAllTelescope GhcRn)
@@ -495,11 +509,6 @@ deriving instance Data (HsTyLit GhcPs)
 deriving instance Data (HsTyLit GhcRn)
 deriving instance Data (HsTyLit GhcTc)
 
--- deriving instance Data (HsLinearArrowTokens p)
-deriving instance Data (HsLinearArrowTokens GhcPs)
-deriving instance Data (HsLinearArrowTokens GhcRn)
-deriving instance Data (HsLinearArrowTokens GhcTc)
-
 -- deriving instance (DataIdLR p p) => Data (HsArrow p)
 deriving instance Data (HsArrow GhcPs)
 deriving instance Data (HsArrow GhcRn)
@@ -510,10 +519,10 @@ deriving instance Data thing => Data (HsScaled GhcPs thing)
 deriving instance Data thing => Data (HsScaled GhcRn thing)
 deriving instance Data thing => Data (HsScaled GhcTc thing)
 
-deriving instance (Data a, Data b) => Data (HsArg a b)
--- deriving instance Data (HsArg (Located (HsType GhcPs)) (Located (HsKind GhcPs)))
--- deriving instance Data (HsArg (Located (HsType GhcRn)) (Located (HsKind GhcRn)))
--- deriving instance Data (HsArg (Located (HsType GhcTc)) (Located (HsKind GhcTc)))
+-- deriving instance (Data a, Data b) => Data (HsArg p a b)
+deriving instance (Data a, Data b) => Data (HsArg GhcPs a b)
+deriving instance (Data a, Data b) => Data (HsArg GhcRn a b)
+deriving instance (Data a, Data b) => Data (HsArg GhcTc a b)
 
 -- deriving instance (DataIdLR p p) => Data (ConDeclField p)
 deriving instance Data (ConDeclField GhcPs)
@@ -548,6 +557,8 @@ deriving instance Eq (IE GhcTc)
 
 -- ---------------------------------------------------------------------
 
+deriving instance Data HsThingRn
+deriving instance Data XXExprGhcRn
 deriving instance Data XXExprGhcTc
 deriving instance Data XXPatGhcTc
 

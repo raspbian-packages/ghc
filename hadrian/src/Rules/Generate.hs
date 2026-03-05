@@ -5,22 +5,28 @@ module Rules.Generate (
     templateRules
     ) where
 
+import Development.Shake.FilePath
 import Data.Char (isSpace)
 import qualified Data.Set as Set
 import Base
 import qualified Context
 import Expression
 import Hadrian.Oracles.TextFile (lookupSystemConfig)
-import Oracles.Flag
+import Oracles.Flag hiding (arSupportsAtFile, arSupportsDashL)
 import Oracles.ModuleFiles
 import Oracles.Setting
 import Hadrian.Haskell.Cabal.Type (PackageData(version))
+import Hadrian.Haskell.Cabal
 import Hadrian.Oracles.Cabal (readPackageData)
 import Packages
 import Rules.Libffi
 import Settings
 import Target
 import Utilities
+
+import GHC.Toolchain as Toolchain hiding (HsCpp(HsCpp))
+import GHC.Toolchain.Program
+import GHC.Platform.ArchOS
 
 -- | Track this file to rebuild generated files whenever it changes.
 trackGenerateHs :: Expr ()
@@ -66,19 +72,23 @@ rtsDependencies = do
 
 compilerDependencies :: Expr [FilePath]
 compilerDependencies = do
+    let fixed = ("compiler" -/-) <$>
+                  [ "GHC/CmmToLlvm/Version/Bounds.hs"
+                  ]
     stage   <- getStage
     ghcPath <- expr $ buildPath (vanillaContext stage compiler)
-    pure $ (ghcPath -/-) <$>
-                  [ "primop-can-fail.hs-incl"
-                  , "primop-code-size.hs-incl"
+    let buildSpecific = (ghcPath -/-) <$>
+                  [ "primop-code-size.hs-incl"
                   , "primop-commutable.hs-incl"
                   , "primop-data-decl.hs-incl"
                   , "primop-fixity.hs-incl"
-                  , "primop-has-side-effects.hs-incl"
+                  , "primop-effects.hs-incl"
                   , "primop-list.hs-incl"
                   , "primop-out-of-line.hs-incl"
                   , "primop-primop-info.hs-incl"
                   , "primop-strictness.hs-incl"
+                  , "primop-is-work-free.hs-incl"
+                  , "primop-is-cheap.hs-incl"
                   , "primop-tag.hs-incl"
                   , "primop-vector-tycons.hs-incl"
                   , "primop-vector-tys-exports.hs-incl"
@@ -88,6 +98,7 @@ compilerDependencies = do
                   , "GHC/Platform/Constants.hs"
                   , "GHC/Settings/Config.hs"
                   ]
+    pure $ fixed ++ buildSpecific
 
 generatedDependencies :: Expr [FilePath]
 generatedDependencies = do
@@ -145,9 +156,10 @@ generatePackageCode context@(Context stage pkg _ _) = do
             let h = path -/- "include/DerivedConstants.h"
             need [h]
             build $ target context GenApply [h] [file]
-        let go gen file = generate file (semiEmptyTarget stage) gen
-        root -/- "**" -/- dir -/- "include/ghcautoconf.h" %> go generateGhcAutoconfH
-        root -/- "**" -/- dir -/- "include/ghcplatform.h" %> go generateGhcPlatformH
+        root -/- "**" -/- dir -/- "include/ghcautoconf.h" %> \_ ->
+            need . pure =<< pkgSetupConfigFile context
+        root -/- "**" -/- dir -/- "include/ghcplatform.h" %> \_ ->
+            need . pure =<< pkgSetupConfigFile context
         root -/- "**" -/- dir -/- "include/DerivedConstants.h" %> genPlatformConstantsHeader context
         root -/- "**" -/- dir -/- "include/rts/EventLogConstants.h" %> genEventTypes "--event-types-defines"
         root -/- "**" -/- dir -/- "include/rts/EventTypes.h" %> genEventTypes "--event-types-array"
@@ -197,7 +209,14 @@ copyRules = do
         prefix -/- "ghci-usage.txt"    <~ return "driver"
         prefix -/- "llvm-targets"      <~ return "."
         prefix -/- "llvm-passes"       <~ return "."
+        prefix -/- "ghc-interp.js"     <~ return "."
         prefix -/- "template-hsc.h" <~ return (pkgPath hsc2hs -/- "data")
+
+        prefix -/- "post-link.mjs" %> \file -> do
+            copyFile ("utils/jsffi" -/- makeRelative prefix file) file
+            makeExecutable file
+
+        prefix -/- "prelude.js"        <~ pure "utils/jsffi"
 
         prefix -/- "html/**"           <~ return "utils/haddock/haddock-api/resources"
         prefix -/- "latex/**"          <~ return "utils/haddock/haddock-api/resources"
@@ -256,56 +275,38 @@ runInterpolations (Interpolations mk_substs) input = do
         subst = foldr (.) id [replace ("@"++k++"@") v | (k,v) <- substs]
     return (subst input)
 
-toCabalBool :: Bool -> String
-toCabalBool True  = "True"
-toCabalBool False = "False"
-
--- | Interpolate the given variable with the value of the given 'Flag', using
--- Cabal's boolean syntax.
-interpolateCabalFlag :: String -> Flag -> Interpolations
-interpolateCabalFlag name flg = interpolateVar name $ do
-    val <- flag flg
-    return (toCabalBool val)
-
 -- | Interpolate the given variable with the value of the given 'Setting'.
 interpolateSetting :: String -> Setting -> Interpolations
 interpolateSetting name settng = interpolateVar name $ setting settng
 
--- | Interpolate the @ProjectVersion@ and @ProjectVersionMunged@ variables.
+-- | Interpolate the @ProjectVersion@, @ProjectVersionMunged@, and @ProjectVersionForLib@ variables.
 projectVersion :: Interpolations
 projectVersion = mconcat
     [ interpolateSetting "ProjectVersion" ProjectVersion
     , interpolateSetting "ProjectVersionMunged" ProjectVersionMunged
+    , interpolateSetting "ProjectVersionForLib" ProjectVersionForLib
     ]
-
-rtsCabalFlags :: Interpolations
-rtsCabalFlags = mconcat
-    [ flag "CabalHaveLibdw" UseLibdw
-    , flag "CabalHaveLibm" UseLibm
-    , flag "CabalHaveLibrt" UseLibrt
-    , flag "CabalHaveLibdl" UseLibdl
-    , flag "CabalNeedLibpthread" UseLibpthread
-    , flag "CabalHaveLibbfd" UseLibbfd
-    , flag "CabalHaveLibNuma" UseLibnuma
-    , flag "CabalNeedLibatomic" NeedLibatomic
-    , flag "CabalUseSystemLibFFI" UseSystemFfi
-    , flag "CabalLibffiAdjustors" UseLibffiForAdjustors
-    , flag "CabalLeadingUnderscore" LeadingUnderscore
-    , interpolateVar "Cabal64bit" $ do
-        let settingWord :: Setting -> Action Word
-            settingWord s = read <$> setting s
-        ws <- settingWord TargetWordSize
-        return $ toCabalBool (ws == 8)
-    ]
-  where
-    flag = interpolateCabalFlag
 
 packageVersions :: Interpolations
 packageVersions = foldMap f [ base, ghcPrim, compiler, ghc, cabal, templateHaskell, ghcCompact, array ]
   where
     f :: Package -> Interpolations
     f pkg = interpolateVar var $ version <$> readPackageData pkg
-      where var = "LIBRARY_" <> pkgName pkg <> "_VERSION"
+      where var = "LIBRARY_" <> escapedPkgName pkg <> "_VERSION"
+
+packageUnitIds :: Stage -> Interpolations
+packageUnitIds stage =
+    foldMap f [ base, ghcPrim, compiler, ghc, cabal, templateHaskell, ghcCompact, array ]
+  where
+    f :: Package -> Interpolations
+    f pkg = interpolateVar var $ pkgUnitId stage pkg
+      where var = "LIBRARY_" <> escapedPkgName pkg <> "_UNIT_ID"
+
+escapedPkgName :: Package -> String
+escapedPkgName = map f . pkgName
+  where
+    f '-'   = '_'
+    f other = other
 
 templateRule :: FilePath -> Interpolations -> Rules ()
 templateRule outPath interps = do
@@ -318,22 +319,38 @@ templateRule outPath interps = do
 templateRules :: Rules ()
 templateRules = do
   templateRule "compiler/ghc.cabal" $ projectVersion
-  templateRule "rts/rts.cabal" $ rtsCabalFlags
   templateRule "driver/ghci/ghci-wrapper.cabal" $ projectVersion
   templateRule "ghc/ghc-bin.cabal" $ projectVersion
   templateRule "utils/iserv/iserv.cabal" $ projectVersion
-  templateRule "utils/iserv-proxy/iserv-proxy.cabal" $ projectVersion
   templateRule "utils/remote-iserv/remote-iserv.cabal" $ projectVersion
   templateRule "utils/runghc/runghc.cabal" $ projectVersion
   templateRule "libraries/ghc-boot/ghc-boot.cabal" $ projectVersion
   templateRule "libraries/ghc-boot-th/ghc-boot-th.cabal" $ projectVersion
   templateRule "libraries/ghci/ghci.cabal" $ projectVersion
   templateRule "libraries/ghc-heap/ghc-heap.cabal" $ projectVersion
+  templateRule "libraries/ghc-internal/ghc-internal.cabal" $ projectVersion
+  templateRule "libraries/ghc-experimental/ghc-experimental.cabal" $ projectVersion
+  templateRule "libraries/base/base.cabal" $ projectVersion
   templateRule "utils/ghc-pkg/ghc-pkg.cabal" $ projectVersion
-  templateRule "libraries/libiserv/libiserv.cabal" $ projectVersion
   templateRule "libraries/template-haskell/template-haskell.cabal" $ projectVersion
   templateRule "libraries/prologue.txt" $ packageVersions
-  templateRule "docs/index.html" $ packageVersions
+  templateRule "rts/include/ghcversion.h" $ mconcat
+    [ interpolateSetting "ProjectVersionInt" ProjectVersionInt
+    , interpolateSetting "ProjectVersion" ProjectVersion
+    , interpolateSetting "ProjectPatchLevel1" ProjectPatchLevel1
+    , interpolateSetting "ProjectPatchLevel2" ProjectPatchLevel2
+    ]
+  templateRule "docs/index.html" $ packageUnitIds Stage1
+  templateRule "docs/users_guide/ghc_config.py" $ mconcat
+    [ projectVersion
+    , packageUnitIds Stage1
+    , interpolateSetting "LlvmMinVersion" LlvmMinVersion
+    , interpolateSetting "LlvmMaxVersion" LlvmMaxVersion
+    ]
+  templateRule "compiler/GHC/CmmToLlvm/Version/Bounds.hs" $ mconcat
+    [ interpolateVar "LlvmMinVersion" $ replaceEq '.' ',' <$> setting LlvmMinVersion
+    , interpolateVar "LlvmMaxVersion" $ replaceEq '.' ',' <$> setting LlvmMaxVersion
+    ]
 
 
 -- Generators
@@ -355,115 +372,63 @@ ghcWrapper stage  = do
                                      else [])
                                ++ [ "$@" ]
 
--- | Given a 'String' replace characters '.' and '-' by underscores ('_') so that
--- the resulting 'String' is a valid C preprocessor identifier.
-cppify :: String -> String
-cppify = replaceEq '-' '_' . replaceEq '.' '_'
-
--- | Generate @ghcplatform.h@ header.
-generateGhcPlatformH :: Expr String
-generateGhcPlatformH = do
-    trackGenerateHs
-    stage    <- getStage
-    let chooseSetting x y = getSetting $ case stage of { Stage0 {} -> x; _ -> y }
-    buildPlatform  <- chooseSetting BuildPlatform HostPlatform
-    buildArch      <- chooseSetting BuildArch     HostArch
-    buildOs        <- chooseSetting BuildOs       HostOs
-    buildVendor    <- chooseSetting BuildVendor   HostVendor
-    hostPlatform   <- chooseSetting HostPlatform  TargetPlatform
-    hostArch       <- chooseSetting HostArch      TargetArch
-    hostOs         <- chooseSetting HostOs        TargetOs
-    hostVendor     <- chooseSetting HostVendor    TargetVendor
-    ghcUnreg       <- getFlag    GhcUnregisterised
-    return . unlines $
-        [ "#if !defined(__GHCPLATFORM_H__)"
-        , "#define __GHCPLATFORM_H__"
-        , ""
-        , "#define BuildPlatform_TYPE  " ++ cppify buildPlatform
-        , "#define HostPlatform_TYPE   " ++ cppify hostPlatform
-        , ""
-        , "#define " ++ cppify buildPlatform   ++ "_BUILD 1"
-        , "#define " ++ cppify hostPlatform ++ "_HOST 1"
-        , ""
-        , "#define " ++ buildArch   ++ "_BUILD_ARCH 1"
-        , "#define " ++ hostArch ++ "_HOST_ARCH 1"
-        , "#define BUILD_ARCH " ++ show buildArch
-        , "#define HOST_ARCH "  ++ show hostArch
-        , ""
-        , "#define " ++ buildOs   ++ "_BUILD_OS 1"
-        , "#define " ++ hostOs ++ "_HOST_OS 1"
-        , "#define BUILD_OS " ++ show buildOs
-        , "#define HOST_OS "  ++ show hostOs
-        , ""
-        , "#define " ++ buildVendor   ++ "_BUILD_VENDOR 1"
-        , "#define " ++ hostVendor ++ "_HOST_VENDOR 1"
-        , "#define BUILD_VENDOR " ++ show buildVendor
-        , "#define HOST_VENDOR "  ++ show hostVendor
-        , ""
-        ]
-        ++
-        [ "#define UnregisterisedCompiler 1" | ghcUnreg ]
-        ++
-        [ ""
-        , "#endif /* __GHCPLATFORM_H__ */"
-        ]
-
--- See Note [tooldir: How GHC finds mingw on Windows]
 generateSettings :: Expr String
 generateSettings = do
     ctx <- getContext
     settings <- traverse sequence $
-        [ ("GCC extra via C opts", expr $ lookupSystemConfig "gcc-extra-via-c-opts")
-        , ("C compiler command", expr $ settingsFileSetting SettingsFileSetting_CCompilerCommand)
-        , ("C compiler flags", expr $ settingsFileSetting SettingsFileSetting_CCompilerFlags)
-        , ("C++ compiler command", expr $ settingsFileSetting SettingsFileSetting_CxxCompilerCommand)
-        , ("C++ compiler flags", expr $ settingsFileSetting SettingsFileSetting_CxxCompilerFlags)
-        , ("C compiler link flags", expr $ settingsFileSetting SettingsFileSetting_CCompilerLinkFlags)
-        , ("C compiler supports -no-pie", expr $ settingsFileSetting SettingsFileSetting_CCompilerSupportsNoPie)
-        , ("Haskell CPP command", expr $ settingsFileSetting SettingsFileSetting_HaskellCPPCommand)
-        , ("Haskell CPP flags", expr $ settingsFileSetting SettingsFileSetting_HaskellCPPFlags)
-        , ("ld command", expr $ settingsFileSetting SettingsFileSetting_LdCommand)
-        , ("ld flags", expr $ settingsFileSetting SettingsFileSetting_LdFlags)
-        , ("ld supports compact unwind", expr $ lookupSystemConfig "ld-has-no-compact-unwind")
-        , ("ld supports filelist", expr $ lookupSystemConfig "ld-has-filelist")
-        , ("ld is GNU ld", expr $ lookupSystemConfig "ld-is-gnu-ld")
-        , ("ld supports single module", expr $ lookupSystemConfig "ld-supports-single-module")
-        , ("Merge objects command", expr $ settingsFileSetting SettingsFileSetting_MergeObjectsCommand)
-        , ("Merge objects flags", expr $ settingsFileSetting SettingsFileSetting_MergeObjectsFlags)
-        , ("ar command", expr $ settingsFileSetting SettingsFileSetting_ArCommand)
-        , ("ar flags", expr $ lookupSystemConfig "ar-args")
-        , ("ar supports at file", expr $ yesNo <$> flag ArSupportsAtFile)
-        , ("ar supports -L", expr $ yesNo <$> flag ArSupportsDashL)
-        , ("ranlib command", expr $ settingsFileSetting SettingsFileSetting_RanlibCommand)
-        , ("otool command", expr $ settingsFileSetting SettingsFileSetting_OtoolCommand)
-        , ("install_name_tool command", expr $ settingsFileSetting SettingsFileSetting_InstallNameToolCommand)
-        , ("touch command", expr $ settingsFileSetting SettingsFileSetting_TouchCommand)
-        , ("dllwrap command", expr $ settingsFileSetting SettingsFileSetting_DllWrapCommand)
-        , ("windres command", expr $ settingsFileSetting SettingsFileSetting_WindresCommand)
-        , ("unlit command", ("$topdir/bin/" <>) <$> expr (programName (ctx { Context.package = unlit })))
+        [ ("C compiler command",   queryTarget ccPath)
+        , ("C compiler flags",     queryTarget ccFlags)
+        , ("C++ compiler command", queryTarget cxxPath)
+        , ("C++ compiler flags",   queryTarget cxxFlags)
+        , ("C compiler link flags",       queryTarget clinkFlags)
+        , ("C compiler supports -no-pie", queryTarget linkSupportsNoPie)
+        , ("CPP command",         queryTarget cppPath)
+        , ("CPP flags",           queryTarget cppFlags)
+        , ("Haskell CPP command", queryTarget hsCppPath)
+        , ("Haskell CPP flags",   queryTarget hsCppFlags)
+        , ("JavaScript CPP command", queryTarget jsCppPath)
+        , ("JavaScript CPP flags", queryTarget jsCppFlags)
+        , ("C-- CPP command", queryTarget cmmCppPath)
+        , ("C-- CPP flags",   queryTarget cmmCppFlags)
+        , ("C-- CPP supports -g0", queryTarget cmmCppSupportsG0')
+        , ("ld supports compact unwind", queryTarget linkSupportsCompactUnwind)
+        , ("ld supports filelist",       queryTarget linkSupportsFilelist)
+        , ("ld supports single module",       queryTarget linkSupportsSingleModule)
+        , ("ld is GNU ld",               queryTarget linkIsGnu)
+        , ("Merge objects command", queryTarget mergeObjsPath)
+        , ("Merge objects flags", queryTarget mergeObjsFlags)
+        , ("Merge objects supports response files", queryTarget mergeObjsSupportsResponseFiles')
+        , ("ar command",          queryTarget arPath)
+        , ("ar flags",            queryTarget arFlags)
+        , ("ar supports at file", queryTarget arSupportsAtFile')
+        , ("ar supports -L",      queryTarget arSupportsDashL')
+        , ("ranlib command", queryTarget ranlibPath)
+        , ("otool command", expr $ settingsFileSetting ToolchainSetting_OtoolCommand)
+        , ("install_name_tool command", expr $ settingsFileSetting ToolchainSetting_InstallNameToolCommand)
+        , ("windres command", queryTarget (maybe "/bin/false" prgPath . tgtWindres)) -- TODO: /bin/false is not available on many distributions by default, but we keep it as it were before the ghc-toolchain patch. Fix-me.
+        , ("unlit command", ("$topdir/../bin/" <>) <$> expr (programName (ctx { Context.package = unlit })))
         , ("cross compiling", expr $ yesNo <$> flag CrossCompiling)
-        , ("target platform string", getSetting TargetPlatform)
-        , ("target os", getSetting TargetOsHaskell)
-        , ("target arch", getSetting TargetArchHaskell)
-        , ("target word size", expr $ lookupSystemConfig "target-word-size")
-        , ("target word big endian", expr $ lookupSystemConfig "target-word-big-endian")
-        , ("target has GNU nonexec stack", expr $ lookupSystemConfig "target-has-gnu-nonexec-stack")
-        , ("target has .ident directive", expr $ lookupSystemConfig "target-has-ident-directive")
-        , ("target has subsections via symbols", expr $ lookupSystemConfig "target-has-subsections-via-symbols")
-        , ("target has RTS linker", expr $ lookupSystemConfig "target-has-rts-linker")
+        , ("target platform string", queryTarget targetPlatformTriple)
+        , ("target os",        queryTarget (show . archOS_OS . tgtArchOs))
+        , ("target arch",      queryTarget (show . archOS_arch . tgtArchOs))
+        , ("target word size", queryTarget wordSize)
+        , ("target word big endian",       queryTarget isBigEndian)
+        , ("target has GNU nonexec stack", queryTarget (yesNo . Toolchain.tgtSupportsGnuNonexecStack))
+        , ("target has .ident directive",  queryTarget (yesNo . Toolchain.tgtSupportsIdentDirective))
+        , ("target has subsections via symbols", queryTarget (yesNo . Toolchain.tgtSupportsSubsectionsViaSymbols))
         , ("target has libm", expr $  lookupSystemConfig "target-has-libm")
-        , ("Unregisterised", expr $ yesNo <$> flag GhcUnregisterised)
-        , ("LLVM target", getSetting LlvmTarget)
-        , ("LLVM llc command", expr $ settingsFileSetting SettingsFileSetting_LlcCommand)
-        , ("LLVM opt command", expr $ settingsFileSetting SettingsFileSetting_OptCommand)
-        , ("LLVM clang command", expr $ settingsFileSetting SettingsFileSetting_ClangCommand)
-        , ("Use inplace MinGW toolchain", expr $ settingsFileSetting SettingsFileSetting_DistroMinGW)
+        , ("Unregisterised", queryTarget (yesNo . tgtUnregisterised))
+        , ("LLVM target", queryTarget tgtLlvmTarget)
+        , ("LLVM llc command", expr $ settingsFileSetting ToolchainSetting_LlcCommand)
+        , ("LLVM opt command", expr $ settingsFileSetting ToolchainSetting_OptCommand)
+        , ("LLVM llvm-as command", expr $ settingsFileSetting ToolchainSetting_LlvmAsCommand)
+        , ("Use inplace MinGW toolchain", expr $ settingsFileSetting ToolchainSetting_DistroMinGW)
 
         , ("Use interpreter", expr $ yesNo <$> ghcWithInterpreter)
         , ("Support SMP", expr $ yesNo <$> targetSupportsSMP)
         , ("RTS ways", escapeArgs . map show . Set.toList <$> getRtsWays)
-        , ("Tables next to code", expr $ yesNo <$> flag TablesNextToCode)
-        , ("Leading underscore", expr $ yesNo <$> flag LeadingUnderscore)
+        , ("Tables next to code", queryTarget (yesNo . tgtTablesNextToCode))
+        , ("Leading underscore",  queryTarget (yesNo . tgtSymbolsHaveLeadingUnderscore))
         , ("Use LibFFI", expr $ yesNo <$> useLibffiForAdjustors)
         , ("RTS expects libdw", yesNo <$> getFlag UseLibdw)
         ]
@@ -474,18 +439,57 @@ generateSettings = do
             ("[" ++ showTuple s)
             : ((\s' -> "," ++ showTuple s') <$> ss)
             ++ ["]"]
+  where
+    ccPath  = prgPath . ccProgram . tgtCCompiler
+    ccFlags = escapeArgs . prgFlags . ccProgram . tgtCCompiler
+    cxxPath  = prgPath . cxxProgram . tgtCxxCompiler
+    cxxFlags = escapeArgs . prgFlags . cxxProgram . tgtCxxCompiler
+    clinkFlags = escapeArgs . prgFlags . ccLinkProgram . tgtCCompilerLink
+    linkSupportsNoPie = yesNo . ccLinkSupportsNoPie . tgtCCompilerLink
+    cppPath  = prgPath . cppProgram . tgtCPreprocessor
+    cppFlags = escapeArgs . prgFlags . cppProgram . tgtCPreprocessor
+    hsCppPath  = prgPath . hsCppProgram . tgtHsCPreprocessor
+    hsCppFlags = escapeArgs . prgFlags . hsCppProgram . tgtHsCPreprocessor
+    jsCppPath  = maybe "" (prgPath . jsCppProgram) . tgtJsCPreprocessor
+    jsCppFlags = maybe "" (escapeArgs . prgFlags . jsCppProgram) . tgtJsCPreprocessor
+    cmmCppPath  = prgPath . cmmCppProgram . tgtCmmCPreprocessor
+    cmmCppFlags = escapeArgs . prgFlags . cmmCppProgram . tgtCmmCPreprocessor
+    cmmCppSupportsG0' = yesNo . cmmCppSupportsG0 . tgtCmmCPreprocessor
+    mergeObjsPath  = maybe "" (prgPath . mergeObjsProgram) . tgtMergeObjs
+    mergeObjsFlags = maybe "" (escapeArgs . prgFlags . mergeObjsProgram) . tgtMergeObjs
+    linkSupportsSingleModule    = yesNo . ccLinkSupportsSingleModule . tgtCCompilerLink
+    linkSupportsFilelist        = yesNo . ccLinkSupportsFilelist . tgtCCompilerLink
+    linkSupportsCompactUnwind   = yesNo . ccLinkSupportsCompactUnwind . tgtCCompilerLink
+    linkIsGnu                   = yesNo . ccLinkIsGnu . tgtCCompilerLink
+    arPath  = prgPath . arMkArchive . tgtAr
+    arFlags = escapeArgs . prgFlags . arMkArchive . tgtAr
+    arSupportsAtFile' = yesNo . arSupportsAtFile . tgtAr
+    arSupportsDashL' = yesNo . arSupportsDashL . tgtAr
+    ranlibPath  = maybe "" (prgPath . ranlibProgram) . tgtRanlib
+    isBigEndian = yesNo . (\case BigEndian -> True; LittleEndian -> False) . tgtEndianness
+    wordSize    = show . wordSize2Bytes . tgtWordSize
+    mergeObjsSupportsResponseFiles' = maybe "NO" (yesNo . mergeObjsSupportsResponseFiles) . tgtMergeObjs
 
 
 -- | Generate @Config.hs@ files.
 generateConfigHs :: Expr String
 generateConfigHs = do
     stage <- getStage
-    let chooseSetting x y = getSetting $ case stage of { Stage0 {} -> x; _ -> y }
-    buildPlatform <- chooseSetting BuildPlatform HostPlatform
-    hostPlatform <- chooseSetting HostPlatform TargetPlatform
+    let chooseSetting x y = case stage of { Stage0 {} -> x; _ -> y }
+    buildPlatform <- chooseSetting (queryBuild targetPlatformTriple) (queryHost targetPlatformTriple)
+    hostPlatform <- chooseSetting (queryHost targetPlatformTriple) (queryTarget targetPlatformTriple)
     trackGenerateHs
     cProjectName        <- getSetting ProjectName
     cBooterVersion      <- getSetting GhcVersion
+    -- We now give a unit-id with a version and a hash to ghc.
+    -- See Note [GHC's Unit Id] in GHC.Unit.Types
+    --
+    -- It's crucial that the unit-id matches the unit-key -- ghc is no longer
+    -- part of the WiringMap, so we don't to go back and forth between the
+    -- unit-id and the unit-key -- we take care that they are the same by using
+    -- 'pkgUnitId' on 'compiler' (the ghc-library package) to create the
+    -- unit-id in both situations.
+    cProjectUnitId <- expr . (`pkgUnitId` compiler) =<< getStage
     return $ unlines
         [ "module GHC.Settings.Config"
         , "  ( module GHC.Version"
@@ -494,6 +498,7 @@ generateConfigHs = do
         , "  , cProjectName"
         , "  , cBooterVersion"
         , "  , cStage"
+        , "  , cProjectUnitId"
         , "  ) where"
         , ""
         , "import GHC.Prelude.Basic"
@@ -514,6 +519,9 @@ generateConfigHs = do
         , ""
         , "cStage                :: String"
         , "cStage                = show (" ++ stageString stage ++ " :: Int)"
+        , ""
+        , "cProjectUnitId :: String"
+        , "cProjectUnitId = " ++ show cProjectUnitId
         ]
   where
     stageString (Stage0 InTreeLibs) = "1"
@@ -522,26 +530,6 @@ generateConfigHs = do
     stageString Stage3 = "4"
     stageString (Stage0 GlobalLibs) = error "stageString: StageBoot"
 
-
--- | Generate @ghcautoconf.h@ header.
-generateGhcAutoconfH :: Expr String
-generateGhcAutoconfH = do
-    trackGenerateHs
-    configHContents  <- expr $ mapMaybe undefinePackage <$> readFileLines configH
-    return . unlines $
-        [ "#if !defined(__GHCAUTOCONF_H__)"
-        , "#define __GHCAUTOCONF_H__" ]
-        ++ configHContents ++
-        [ "#endif /* __GHCAUTOCONF_H__ */" ]
-  where
-    undefinePackage s
-        | "#define PACKAGE_" `isPrefixOf` s
-            = Just $ "/* #undef " ++ takeWhile (/=' ') (drop 8 s) ++ " */"
-        | "#define __GLASGOW_HASKELL" `isPrefixOf` s
-            = Nothing
-        | "/* REMOVE ME */" == s
-            = Nothing
-        | otherwise = Just s
 
 -- | Generate @Version.hs@ files.
 generateVersionHs :: Expr String
@@ -553,6 +541,7 @@ generateVersionHs = do
     cProjectPatchLevel  <- getSetting ProjectPatchLevel
     cProjectPatchLevel1 <- getSetting ProjectPatchLevel1
     cProjectPatchLevel2 <- getSetting ProjectPatchLevel2
+
     return $ unlines
         [ "module GHC.Version where"
         , ""
@@ -581,18 +570,18 @@ generateVersionHs = do
 generatePlatformHostHs :: Expr String
 generatePlatformHostHs = do
     trackGenerateHs
-    cHostPlatformArch <- getSetting HostArchHaskell
-    cHostPlatformOS   <- getSetting HostOsHaskell
+    cHostPlatformArch <- queryHost (archOS_arch . tgtArchOs)
+    cHostPlatformOS   <- queryHost (archOS_OS . tgtArchOs)
     return $ unlines
         [ "module GHC.Platform.Host where"
         , ""
         , "import GHC.Platform.ArchOS"
         , ""
         , "hostPlatformArch :: Arch"
-        , "hostPlatformArch = " ++ cHostPlatformArch
+        , "hostPlatformArch = " ++ show cHostPlatformArch
         , ""
         , "hostPlatformOS   :: OS"
-        , "hostPlatformOS   = " ++ cHostPlatformOS
+        , "hostPlatformOS   = " ++ show cHostPlatformOS
         , ""
         , "hostPlatformArchOS :: ArchOS"
         , "hostPlatformArchOS = ArchOS hostPlatformArch hostPlatformOS"

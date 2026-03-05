@@ -143,7 +143,7 @@ void flushTrace (void)
     }
 }
 
-void tracingAddCapapilities (uint32_t from, uint32_t to)
+void tracingAddCapabilities (uint32_t from, uint32_t to)
 {
     if (eventlog_enabled) {
         moreCapEventBufs(from,to);
@@ -688,10 +688,14 @@ void traceIPE(const InfoProvEnt *ipe)
     if (RtsFlags.TraceFlags.tracing == TRACE_STDERR) {
         ACQUIRE_LOCK(&trace_utx);
 
+        char closure_desc_buf[CLOSURE_DESC_BUFFER_SIZE] = {};
+        formatClosureDescIpe(ipe, closure_desc_buf);
+
         tracePreface();
-        debugBelch("IPE: table_name %s, closure_desc %s, ty_desc %s, label %s, module %s, srcloc %s:%s\n",
-                   ipe->prov.table_name, ipe->prov.closure_desc, ipe->prov.ty_desc,
-                   ipe->prov.label, ipe->prov.module, ipe->prov.src_file, ipe->prov.src_span);
+        debugBelch("IPE: table_name %s, closure_desc %s, ty_desc %s, label %s, unit %s, module %s, srcloc %s:%s\n",
+                   ipe->prov.table_name, closure_desc_buf, ipe->prov.ty_desc,
+                   ipe->prov.label, ipe->prov.unit_id, ipe->prov.module,
+                   ipe->prov.src_file, ipe->prov.src_span);
 
         RELEASE_LOCK(&trace_utx);
     } else
@@ -918,11 +922,17 @@ void traceConcUpdRemSetFlush(Capability *cap)
         postConcUpdRemSetFlush(cap);
 }
 
-void traceNonmovingHeapCensus(uint32_t log_blk_size,
+void traceNonmovingHeapCensus(uint16_t blk_size,
                               const struct NonmovingAllocCensus *census)
 {
     if (eventlog_enabled && TRACE_nonmoving_gc)
-        postNonmovingHeapCensus(log_blk_size, census);
+        postNonmovingHeapCensus(blk_size, census);
+}
+
+void traceNonmovingPrunedSegments(uint32_t pruned_segments, uint32_t free_segments)
+{
+    if (eventlog_enabled && TRACE_nonmoving_gc)
+        postNonmovingPrunedSegments(pruned_segments, free_segments);
 }
 
 void traceThreadStatus_ (StgTSO *tso USED_IF_DEBUG)

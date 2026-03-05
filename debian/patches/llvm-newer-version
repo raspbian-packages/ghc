@@ -1,7 +1,4 @@
-From ae170155e82f1e5f78882f7a682d02a8e46a5823 Mon Sep 17 00:00:00 2001
-From: Olivier Benz <olivier.benz@b-data.ch>
-Date: Sat, 25 May 2024 12:29:13 +0200
-Subject: [PATCH] Bump max LLVM version to 19 (not inclusive)
+Subject: [PATCH] Bump max LLVM version to 19
 
 ---
  configure.ac | 2 +-
@@ -11,12 +8,12 @@ Index: b/configure.ac
 ===================================================================
 --- a/configure.ac
 +++ b/configure.ac
-@@ -556,7 +556,7 @@ AC_SUBST(InstallNameToolCmd)
+@@ -513,7 +513,7 @@ AC_SUBST(InstallNameToolCmd)
  # versions of LLVM simultaneously, but that stopped working around
  # 3.5/3.6 release of LLVM.
- LlvmMinVersion=11  # inclusive
+ LlvmMinVersion=13  # inclusive
 -LlvmMaxVersion=16 # not inclusive
-+LlvmMaxVersion=19 # not inclusive
++LlvmMaxVersion=22 # not inclusive
  AC_SUBST([LlvmMinVersion])
  AC_SUBST([LlvmMaxVersion])
- sUPPORTED_LLVM_VERSION_MIN=$(echo \($LlvmMinVersion\) | sed 's/\./,/')
+ 

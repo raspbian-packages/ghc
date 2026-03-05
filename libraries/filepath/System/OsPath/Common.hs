@@ -42,8 +42,9 @@ module System.OsPath
 #endif
   -- * Filepath construction
   , PS.encodeUtf
+  , PS.unsafeEncodeUtf
   , PS.encodeWith
-  , PS.encodeFS
+  , encodeFS
 #if defined(WINDOWS) || defined(POSIX)
   , pstr
 #else
@@ -54,7 +55,7 @@ module System.OsPath
   -- * Filepath deconstruction
   , PS.decodeUtf
   , PS.decodeWith
-  , PS.decodeFS
+  , decodeFS
   , PS.unpack
 
   -- * Word construction
@@ -109,16 +110,15 @@ where
 
 #ifdef WINDOWS
 import System.OsPath.Types
-import System.OsString.Windows.Hidden as PS
+import System.OsString.Windows as PS
     ( unsafeFromChar
     , toChar
     , decodeUtf
     , decodeWith
-    , decodeFS
     , pack
     , encodeUtf
+    , unsafeEncodeUtf
     , encodeWith
-    , encodeFS
     , unpack
     )
 import Data.Bifunctor ( bimap )
@@ -141,16 +141,15 @@ import Language.Haskell.TH.Syntax
 
 import GHC.IO.Encoding.UTF8 ( mkUTF8 )
 import System.OsPath.Types
-import System.OsString.Posix.Hidden as PS
+import System.OsString.Posix as PS
     ( unsafeFromChar
     , toChar
     , decodeUtf
     , decodeWith
-    , decodeFS
     , pack
     , encodeUtf
+    , unsafeEncodeUtf
     , encodeWith
-    , encodeFS
     , unpack
     )
 import Data.Bifunctor ( bimap )
@@ -162,16 +161,15 @@ import System.OsPath.Internal as PS
     ( osp
     , decodeUtf
     , decodeWith
-    , decodeFS
     , pack
     , encodeUtf
+    , unsafeEncodeUtf
     , encodeWith
-    , encodeFS
     , unpack
     )
 import System.OsPath.Types
     ( OsPath )
-import System.OsString.Internal.Hidden ( unsafeFromChar, toChar )
+import System.OsString ( unsafeFromChar, toChar )
 
 #if defined(mingw32_HOST_OS) || defined(__MINGW32__)
 import qualified System.OsPath.Windows as C
@@ -182,7 +180,8 @@ import qualified System.OsPath.Posix as C
 import Data.Bifunctor
     ( bimap )
 #endif
-import System.OsString.Internal.Types.Hidden
+import System.OsString.Internal.Types
+import System.OsString.Encoding.Internal
 
 
 ------------------------
@@ -1435,3 +1434,36 @@ isRelative (OSSTRING_NAME x) = C.isRelative x
 -- > isAbsolute x == not (isRelative x)
 isAbsolute :: FILEPATH_NAME -> Bool
 isAbsolute (OSSTRING_NAME x) = C.isAbsolute x
+
+
+-- things not defined in os-string
+
+#ifdef WINDOWS
+encodeFS :: String -> IO WindowsPath
+encodeFS = fmap WindowsString . encodeWithBaseWindows
+
+decodeFS :: WindowsPath -> IO String
+decodeFS (WindowsString x) = decodeWithBaseWindows x
+#elif defined(POSIX)
+encodeFS :: String -> IO PosixPath
+encodeFS = fmap PosixString . encodeWithBasePosix
+
+decodeFS :: PosixPath -> IO String
+decodeFS (PosixString x) = decodeWithBasePosix x
+#else
+encodeFS :: String -> IO OsPath
+#if defined(mingw32_HOST_OS) || defined(__MINGW32__)
+encodeFS = fmap (OsString . WindowsString) . encodeWithBaseWindows
+#else
+encodeFS = fmap (OsString . PosixString) . encodeWithBasePosix
+#endif
+
+decodeFS :: OsPath -> IO String
+#if defined(mingw32_HOST_OS) || defined(__MINGW32__)
+decodeFS (OsString (WindowsString x)) = decodeWithBaseWindows x
+#else
+decodeFS (OsString (PosixString x)) = decodeWithBasePosix x
+#endif
+
+#endif
+

@@ -4,7 +4,7 @@ test('heap_all',
      [when(have_profiling(), extra_ways(['prof'])),
       # These ways produce slightly different heap representations.
       # Currently we don't test them.
-      omit_ways(['ghci', 'hpc',
+      omit_ways(ghci_ways + ['hpc',
                  'nonmoving', 'nonmoving_thr', 'nonmoving_thr_ghc',
                  'nonmoving_thr_sanity']),
       # The debug RTS initializes some fields with 0xaa and so
@@ -17,7 +17,8 @@ test('heap_weak',
      [when(have_profiling(), extra_ways(['prof'])),
       # These ways produce slightly different heap representations.
       # Currently we don't test them.
-      omit_ways(['ghci', 'hpc'])
+      omit_ways(['hpc']),
+      expect_broken_for(23272, ['ghci-opt'])
      ],
      compile_and_run, [''])
 
@@ -27,7 +28,7 @@ test('closure_size',
       when(have_profiling(), extra_ways(['prof'])),
       # These ways produce slightly different heap representations.
       # Currently we don't test them.
-      omit_ways(['hpc'])
+      omit_ways(ghci_ways + ['hpc'])
      ],
      compile_and_run, [''])
 
@@ -57,3 +58,48 @@ test('parse_tso_flags',
 test('T21622',
      only_ways(['normal']),
      compile_and_run, [''])
+
+test('stack_big_ret',
+     [
+        extra_files(['TestUtils.hs']),
+        ignore_stdout,
+        ignore_stderr
+     ],
+     compile_and_run,
+     [''])
+
+# Options:
+# - `-kc512B -kb64B`: Make stack chunk size small to provoke underflow
+#   stack frames.
+test('stack_underflow',
+     [
+        extra_files(['TestUtils.hs']),
+        extra_run_opts('+RTS -kc512B -kb64B -RTS'),
+        ignore_stdout,
+        ignore_stderr
+     ],
+     compile_and_run,
+     [''])
+
+test('stack_stm_frames',
+     [
+        extra_files(['TestUtils.hs']),
+        ignore_stdout,
+        ignore_stderr
+      ],
+     compile_and_run,
+     [''])
+
+test('stack_misc_closures',
+     [
+        extra_files(['stack_misc_closures_c.c', 'stack_misc_closures_prim.cmm', 'TestUtils.hs']),
+        ignore_stdout,
+        ignore_stderr
+      ],
+     multi_compile_and_run,
+     ['stack_misc_closures',
+        [ ('stack_misc_closures_c.c', '')
+         ,('stack_misc_closures_prim.cmm', '')
+         ]
+      , '-debug' # Debug RTS to use checkSTACK() (Sanity.c)
+      ])

@@ -2,6 +2,7 @@ module Settings.Warnings (defaultGhcWarningsArgs, ghcWarningsArgs) where
 
 import Expression
 import Oracles.Flag
+import Oracles.Setting (isOsxTarget, isWinTarget)
 import Packages
 
 -- See @mk/warnings.mk@ for warning-related arguments in the Make build system.
@@ -12,7 +13,11 @@ defaultGhcWarningsArgs = mconcat
     [ notStage0 ? arg "-Wnoncanonical-monad-instances"
     , notM (flag CcLlvmBackend) ? arg "-optc-Wno-error=inline"
     , flag CcLlvmBackend ? arg "-optc-Wno-unknown-pragmas"
-    , arg "-optP-Wno-nonportable-include-path" -- #17798
+      -- Cabal can seemingly produce filepaths with incorrect case on filesystems
+      -- with case-insensitive names. Ignore such issues for now as they seem benign.
+      -- See #17798.
+    , isOsxTarget ? arg "-optP-Wno-nonportable-include-path"
+    , isWinTarget ? arg "-optP-Wno-nonportable-include-path"
     ]
 
 -- | Package-specific warnings-related arguments, mostly suppressing various warnings.
@@ -26,10 +31,13 @@ ghcWarningsArgs = do
                                       , "-fno-warn-unused-imports" ] ]
         , notStage0 ? mconcat
         [ libraryPackage       ? pure [ "-Wno-deprecated-flags" ]
+        , package ghcInternal  ? pure [ "-Wno-trustworthy-safe" ]
         , package base         ? pure [ "-Wno-trustworthy-safe" ]
         , package binary       ? pure [ "-Wno-deprecations" ]
         , package bytestring   ? pure [ "-Wno-inline-rule-shadowing" ]
-        , package compiler     ? pure [ "-Wcpp-undef" ]
+        , package compiler     ? pure [ "-Wcpp-undef"
+                                      , "-Wno-deprecations"
+                                      ]
         , package directory    ? pure [ "-Wno-unused-imports"
                                       , "-Wno-deprecations" -- https://gitlab.haskell.org/ghc/ghc/-/issues/24240
                                       ]
@@ -39,16 +47,19 @@ ghcWarningsArgs = do
                                       ]
         , package ghcPrim      ? pure [ "-Wno-trustworthy-safe" ]
         , package haddock      ? pure [ "-Wno-unused-imports"
-                                      , "-Wno-deprecations" ]
+                                      , "-Wno-deprecations"
+                                      , "-Wno-x-partial" ]
         , package haskeline    ? pure [ "-Wno-deprecations"
+                                      , "-Wno-x-partial"
                                       , "-Wno-unused-imports"
                                       , "-Wno-redundant-constraints"
                                       , "-Wno-simplifiable-class-constraints" ]
+        , package osString     ? pure [ "-Wno-unused-imports" ]
         , package pretty       ? pure [ "-Wno-unused-imports" ]
         , package primitive    ? pure [ "-Wno-unused-imports"
                                       , "-Wno-deprecations" ]
         , package rts          ? pure [ "-Wcpp-undef" ]
-        , package text         ? pure [ "-Wno-deprecations" ]
+        , package text         ? pure [ "-Wno-deprecations", "-Wno-unused-imports" ]
         , package terminfo     ? pure [ "-Wno-unused-imports" ]
         , package transformers ? pure [ "-Wno-unused-matches"
                                       , "-Wno-unused-imports"

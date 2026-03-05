@@ -22,7 +22,7 @@ module GHC.Core.DataCon (
         eqSpecPair, eqSpecPreds,
 
         -- ** Field labels
-        FieldLabel(..), FieldLabelString,
+        FieldLabel(..), flLabel, FieldLabelString,
 
         -- ** Type construction
         mkDataCon, fIRST_TAG,
@@ -35,6 +35,7 @@ module GHC.Core.DataCon (
         dataConNonlinearType,
         dataConDisplayType,
         dataConUnivTyVars, dataConExTyCoVars, dataConUnivAndExTyCoVars,
+        dataConConcreteTyVars,
         dataConUserTyVars, dataConUserTyVarBinders,
         dataConTheta,
         dataConStupidTheta,
@@ -69,6 +70,7 @@ module GHC.Core.DataCon (
 import GHC.Prelude
 
 import Language.Haskell.Syntax.Basic
+import Language.Haskell.Syntax.Module.Name
 
 import {-# SOURCE #-} GHC.Types.Id.Make ( DataConBoxer )
 import GHC.Core.Type as Type
@@ -96,10 +98,11 @@ import GHC.Types.Unique.Set
 import GHC.Builtin.Uniques( mkAlphaTyVarUnique )
 import GHC.Data.Graph.UnVar  -- UnVarSet and operations
 
+import {-# SOURCE #-} GHC.Tc.Utils.TcType ( ConcreteTyVars )
+
 import GHC.Utils.Outputable
 import GHC.Utils.Misc
 import GHC.Utils.Panic
-import GHC.Utils.Panic.Plain
 
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Builder as BSB
@@ -107,8 +110,6 @@ import qualified Data.ByteString.Lazy    as LBS
 import qualified Data.Data as Data
 import Data.Char
 import Data.List( find )
-
-import Language.Haskell.Syntax.Module.Name
 
 {-
 Note [Data constructor representation]
@@ -141,7 +142,19 @@ becomes
         case e of { T a' b -> let a = I# a' in ... }
 
 To keep ourselves sane, we name the different versions of the data constructor
-differently, as follows.
+differently, as follows in Note [Data Constructor Naming].
+
+The `dcRepType` field of a `DataCon` contains the type of the representation of
+the constructor /worker/, also called the Core representation.
+
+The Core representation may differ from the type of the constructor /wrapper/
+(built by `mkDataConRep`). Besides unpacking (as seen in the example above),
+dictionaries and coercions become explict arguments in the Core representation
+of a constructor.
+
+Note that this representation is still *different* from runtime
+representation. (Which is what STG uses after unarise).
+See Note [Constructor applications in STG] in GHC.Stg.Syntax.
 
 
 Note [Data Constructor Naming]
@@ -209,7 +222,8 @@ Note [Data constructor workers and wrappers]
 * See Note [Data Constructor Naming] for how the worker and wrapper
   are named
 
-* Neither_ the worker _nor_ the wrapper take the dcStupidTheta dicts as arguments
+* The workers don't take the dcStupidTheta dicts as arguments, while the
+  wrappers currently do
 
 * The wrapper (if it exists) takes dcOrigArgTys as its arguments.
   The worker takes dataConRepArgTys as its arguments
@@ -437,6 +451,14 @@ data DataCon
         -- INVARIANT: the UnivTyVars and ExTyCoVars all have distinct OccNames
         -- Reason: less confusing, and easier to generate Iface syntax
 
+        -- The type variables of this data constructor that must be
+        -- instantiated to concrete types. For example: the RuntimeRep
+        -- variables of unboxed tuples and unboxed sums.
+        --
+        -- See Note [Representation-polymorphism checking built-ins]
+        -- in GHC.Tc.Gen.Head.
+        dcConcreteTyVars :: ConcreteTyVars,
+
         -- The type/coercion vars in the order the user wrote them [c,y,x,b]
         -- INVARIANT(dataConTyVars): the set of tyvars in dcUserTyVarBinders is
         --    exactly the set of tyvars (*not* covars) of dcExTyCoVars unioned
@@ -528,7 +550,7 @@ data DataCon
                                 --      forall a x y. (a~(x,y), x~y, Ord x) =>
                                 --        x -> y -> T a
                                 -- (this is *not* of the constructor wrapper Id:
-                                --  see Note [Data con representation] below)
+                                --  see Note [Data constructor representation])
         -- Notice that the existential type parameters come *second*.
         -- Reason: in a case expression we may find:
         --      case (e :: T t) of
@@ -549,12 +571,10 @@ data DataCon
 
 
 {- Note [TyVarBinders in DataCons]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-For the TyVarBinders in a DataCon and PatSyn:
-
- * Each argument flag is Inferred or Specified.
-   None are Required. (A DataCon is a term-level function; see
-   Note [No Required PiTyBinder in terms] in GHC.Core.TyCo.Rep.)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+For the TyVarBinders in a DataCon and PatSyn,
+each argument flag is either Inferred or Specified, never Required.
+Lifting this restriction is tracked at #18389 (DataCon) and #23704 (PatSyn).
 
 Why do we need the TyVarBinders, rather than just the TyVars?  So that
 we can construct the right type for the DataCon with its foralls
@@ -586,12 +606,22 @@ Function call 'dataConKindEqSpec' returns [k'~k]
 
 Note [DataCon arities]
 ~~~~~~~~~~~~~~~~~~~~~~
-A `DataCon`'s source arity and core representation arity may differ:
-`dcSourceArity` does not take constraints into account, but `dcRepArity` does.
+A `DataCon`'s source and core representation may differ, meaning the source
+arity (`dcSourceArity`) and the core representation arity (`dcRepArity`) may
+differ too.
 
-The additional arguments taken into account by `dcRepArity` include quantified
-dictionaries and coercion arguments, lifted and unlifted (despite the unlifted
-coercion arguments having a zero-width runtime representation).
+Note that the source arity isn't exactly the number of arguments the data con
+/wrapper/ has, since `dcSourceArity` doesn't count constraints -- which may
+appear in the wrapper through `DatatypeContexts`, or if the constructor stores a
+dictionary. In this sense, the source arity counts the number of non-constraint
+arguments that appear at the source level.
+  On the other hand, the Core representation arity is the number of arguments
+of the data constructor in its Core representation, which is also the number
+of arguments of the data con /worker/.
+
+The arity might differ since `dcRepArity` takes into account arguments such as
+quantified dictionaries and coercion arguments, lifted and unlifted (despite
+the unlifted coercion arguments having a zero-width runtime representation).
 For example:
    MkT :: Ord a => a -> T a
     dcSourceArity = 1
@@ -600,6 +630,15 @@ For example:
    MkU :: (b ~ '[]) => U b
     dcSourceArity = 0
     dcRepArity    = 1
+
+The arity might also differ due to unpacking, for example, consider the
+following datatype and its wrapper and worker's type:
+   data V = MkV !() !Int
+   $WMkV :: () -> Int -> V
+     MkV :: Int# -> V
+As you see, because of unpacking we have both dropped the unit argument and
+unboxed the Int. In this case, the source arity (which is the arity of the
+wrapper) is 2, while the Core representation arity (the arity of the worker) is 1.
 
 
 Note [DataCon user type variable binders]
@@ -625,7 +664,7 @@ A DataCon has two different sets of type variables:
     (that is, they are TyVars/TyCoVars instead of ForAllTyBinders).
 
 Often (dcUnivTyVars ++ dcExTyCoVars) = dcUserTyVarBinders; but they may differ
-for three reasons, coming next:
+for two reasons, coming next:
 
 --- Reason (R1): Order of quantification in GADT syntax ---
 
@@ -713,55 +752,6 @@ GADT equality -- that is, used on the left-hand side of an element of dcEqSpec:
 Putting this all together, all variables used on the left-hand side of an
 equation in the dcEqSpec will be in dcUnivTyVars but *not* in
 dcUserTyVarBinders.
-
---- Reason (R3): Kind equalities may have been solved ---
-
-Consider now this case:
-
-  type family F a where
-    F Type = False
-    F _    = True
-  type T :: forall k. (F k ~ True) => k -> k -> Type
-  data T a b where
-    MkT :: T Maybe List
-
-The constraint F k ~ True tells us that T does not want to be indexed by, say,
-Int. Now let's consider the Core types involved:
-
-  axiom for F: axF[0] :: F Type ~ False
-               axF[1] :: forall a. F a ~ True   (a must be apart from Type)
-  tycon: T :: forall k. (F k ~ True) -> k -> k -> Type
-  wrapper: MkT :: T @(Type -> Type) @(Eq# (axF[1] (Type -> Type)) Maybe List
-  worker:  MkT :: forall k (c :: F k ~ True) (a :: k) (b :: k).
-                  (k ~# (Type -> Type), a ~# Maybe, b ~# List) =>
-                  T @k @c a b
-
-The key observation here is that the worker quantifies over c, while the wrapper
-does not. The worker *must* quantify over c, because c is a universal variable,
-and the result of the worker must be the type constructor applied to a sequence
-of plain type variables. But the wrapper certainly does not need to quantify over
-any evidence that F (Type -> Type) ~ True, as no variables are needed there.
-
-(Aside: the c here is a regular type variable, *not* a coercion variable. This
-is because F k ~ True is a *lifted* equality, not the unlifted ~#. This is why
-we see Eq# in the type of the wrapper: Eq# boxes the unlifted ~# to become a
-lifted ~. See also Note [The equality types story] in GHC.Builtin.Types.Prim about
-Eq# and Note [Constraints in kinds] in GHC.Core.TyCo.Rep about having this constraint
-in the first place.)
-
-In this case, we'll have these fields of the DataCon:
-
-  dcUserTyVarBinders = []    -- the wrapper quantifies over nothing
-  dcUnivTyVars = [k, c, a, b]
-  dcExTyCoVars = []  -- no existentials here, but a different constructor might have
-  dcEqSpec = [k ~# (Type -> Type), a ~# Maybe, b ~# List]
-
-Note that c is in the dcUserTyVars, but mentioned neither in the dcUserTyVarBinders nor
-in the dcEqSpec. We thus have Reason (R3): a variable might be missing from the
-dcUserTyVarBinders if its type's kind is Constraint.
-
-(At one point, we thought that the dcEqSpec would have to be non-empty. But that
-wouldn't account for silly cases like type T :: (True ~ True) => Type.)
 
 --- End of Reasons ---
 
@@ -859,7 +849,7 @@ type DataConEnv a = UniqFM DataCon a     -- Keyed by DataCon
 -- emit a warning (in checkValidDataCon) and treat it like
 -- @(HsSrcBang _ NoSrcUnpack SrcLazy)@
 data HsSrcBang =
-  HsSrcBang SourceText -- Note [Pragma source text] in GHC.Types.SourceText
+  HsSrcBang SourceText -- Note [Pragma source text] in "GHC.Types.SourceText"
             SrcUnpackedness
             SrcStrictness
   deriving Data.Data
@@ -1018,51 +1008,6 @@ we consult HsImplBang:
 The boolean flag is used only for this warning.
 See #11270 for motivation.
 
-Note [Data con representation]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-The dcRepType field contains the type of the representation of a constructor
-This may differ from the type of the constructor *Id* (built
-by MkId.mkDataConId) for two reasons:
-        a) the constructor Id may be overloaded, but the dictionary isn't stored
-           e.g.    data Eq a => T a = MkT a a
-
-        b) the constructor may store an unboxed version of a strict field.
-
-So whenever this module talks about the representation of a data constructor
-what it means is the DataCon with all Unpacking having been applied.
-We can think of this as the Core representation.
-
-Here's an example illustrating the Core representation:
-        data Ord a => T a = MkT Int! a Void#
-Here
-        T :: Ord a => Int -> a -> Void# -> T a
-but the rep type is
-        Trep :: Int# -> a -> Void# -> T a
-Actually, the unboxed part isn't implemented yet!
-
-Note that this representation is still *different* from runtime
-representation. (Which is what STG uses after unarise).
-
-This is how T would end up being used in STG post-unarise:
-
-  let x = T 1# y
-  in ...
-      case x of
-        T int a -> ...
-
-The Void# argument is dropped and the boxed int is replaced by an unboxed
-one. In essence we only generate binders for runtime relevant values.
-
-We also flatten out unboxed tuples in this process. See the unarise
-pass for details on how this is done. But as an example consider
-`data S = MkS Bool (# Bool | Char #)` which when matched on would
-result in an alternative with three binders like this
-
-    MkS bool tag tpl_field ->
-
-See Note [Translating unboxed sums to unboxed tuples] and Note [Unarisation]
-for the details of this transformation.
-
 
 ************************************************************************
 *                                                                      *
@@ -1197,6 +1142,9 @@ mkDataCon :: Name
                             -- if it is a record, otherwise empty
           -> [TyVar]        -- ^ Universals.
           -> [TyCoVar]      -- ^ Existentials.
+          -> ConcreteTyVars
+                                -- ^ TyVars which must be instantiated with
+                                -- concrete types
           -> [InvisTVBinder]    -- ^ User-written 'TyVarBinder's.
                                 --   These must be Inferred/Specified.
                                 --   See @Note [TyVarBinders in DataCons]@
@@ -1217,7 +1165,7 @@ mkDataCon :: Name
 mkDataCon name declared_infix prom_info
           arg_stricts   -- Must match orig_arg_tys 1-1
           fields
-          univ_tvs ex_tvs user_tvbs
+          univ_tvs ex_tvs conc_tvs user_tvbs
           eq_spec theta
           orig_arg_tys orig_res_ty rep_info rep_tycon tag
           stupid_theta work_id rep
@@ -1237,6 +1185,7 @@ mkDataCon name declared_infix prom_info
                   dcVanilla = is_vanilla, dcInfix = declared_infix,
                   dcUnivTyVars = univ_tvs,
                   dcExTyCoVars = ex_tvs,
+                  dcConcreteTyVars = conc_tvs,
                   dcUserTyVarBinders = user_tvbs,
                   dcEqSpec = eq_spec,
                   dcOtherTheta = theta,
@@ -1279,11 +1228,9 @@ mkDataCon name declared_infix prom_info
       -- fresh_names: make sure that the "anonymous" tyvars don't
       -- clash in name or unique with the universal/existential ones.
       -- Tiresome!  And unnecessary because these tyvars are never looked at
-    prom_theta_bndrs = [ mkInvisAnonTyConBinder (mkTyVar n t)
-     {- Invisible -}   | (n,t) <- fresh_names `zip` theta ]
     prom_arg_bndrs   = [ mkAnonTyConBinder (mkTyVar n t)
      {- Visible -}     | (n,t) <- dropList theta fresh_names `zip` map scaledThing orig_arg_tys ]
-    prom_bndrs       = prom_tv_bndrs ++ prom_theta_bndrs ++ prom_arg_bndrs
+    prom_bndrs       = prom_tv_bndrs ++ prom_arg_bndrs
     prom_res_kind    = orig_res_ty
     promoted         = mkPromotedDataCon con name prom_info prom_bndrs
                                          prom_res_kind roles rep_info
@@ -1356,6 +1303,15 @@ dataConExTyCoVars (MkData { dcExTyCoVars = tvbs }) = tvbs
 dataConUnivAndExTyCoVars :: DataCon -> [TyCoVar]
 dataConUnivAndExTyCoVars (MkData { dcUnivTyVars = univ_tvs, dcExTyCoVars = ex_tvs })
   = univ_tvs ++ ex_tvs
+
+-- | Which type variables of this data constructor that must be
+-- instantiated to concrete types?
+-- For example: the RuntimeRep variables of unboxed tuples and unboxed sums.
+--
+-- See Note [Representation-polymorphism checking built-ins]
+-- in GHC.Tc.Gen.Head.
+dataConConcreteTyVars :: DataCon -> ConcreteTyVars
+dataConConcreteTyVars (MkData { dcConcreteTyVars = concs }) = concs
 
 -- See Note [DataCon user type variable binders]
 -- | The type variables of the constructor, in the order the user wrote them
@@ -1737,13 +1693,25 @@ dataConOtherTheta dc = dcOtherTheta dc
 -- evidence, after any flattening has been done and without substituting for
 -- any type variables
 dataConRepArgTys :: DataCon -> [Scaled Type]
-dataConRepArgTys (MkData { dcRep = rep
-                         , dcEqSpec = eq_spec
+dataConRepArgTys (MkData { dcRep        = rep
+                         , dcEqSpec     = eq_spec
                          , dcOtherTheta = theta
-                         , dcOrigArgTys = orig_arg_tys })
+                         , dcOrigArgTys = orig_arg_tys
+                         , dcRepTyCon   = tc })
   = case rep of
-      NoDataConRep -> assert (null eq_spec) $ map unrestricted theta ++ orig_arg_tys
       DCR { dcr_arg_tys = arg_tys } -> arg_tys
+      NoDataConRep
+        | isTypeDataTyCon tc -> assert (null theta)   $
+                                orig_arg_tys
+          -- `type data` declarations can be GADTs (and hence have an eq_spec)
+          -- but no wrapper.  They cannot have a theta.
+          -- See Note [Type data declarations] in GHC.Rename.Module
+          -- You might wonder why we ever call dataConRepArgTys for `type data`;
+          -- I think it's because of the call in mkDataCon, which in turn feeds
+          -- into dcRepArity, which in turn is used in mkDataConWorkId.
+          -- c.f. #23022
+        | otherwise          -> assert (null eq_spec) $
+                                map unrestricted theta ++ orig_arg_tys
 
 -- | The string @package:module.name@ identifying a constructor, which is attached
 -- to its info table and used by the GHCi debugger and the heap profiler
@@ -1917,20 +1885,15 @@ checkDataConTyVars dc@(MkData { dcUnivTyVars = univ_tvs
                               , dcExTyCoVars = ex_tvs
                               , dcEqSpec = eq_spec })
      -- use of sets here: (R1) from the Note
-  = mkUnVarSet depleted_worker_vars == mkUnVarSet depleted_wrapper_vars &&
+  = mkUnVarSet depleted_worker_vars == mkUnVarSet wrapper_vars &&
     all (not . is_eq_spec_var) wrapper_vars
   where
-    is_constraint_var v = typeTypeOrConstraint (tyVarKind v) == ConstraintLike
-      -- implements (R3) from the Note
-
     worker_vars = univ_tvs ++ ex_tvs
     eq_spec_tvs = mkUnVarSet (map eqSpecTyVar eq_spec)
     is_eq_spec_var = (`elemUnVarSet` eq_spec_tvs)  -- (R2) from the Note
-    depleted_worker_vars = filterOut (is_eq_spec_var <||> is_constraint_var)
-                                     worker_vars
+    depleted_worker_vars = filterOut is_eq_spec_var worker_vars
 
     wrapper_vars = dataConUserTyVars dc
-    depleted_wrapper_vars = filterOut is_constraint_var wrapper_vars
 
 dataConUserTyVarsNeedWrapper :: DataCon -> Bool
 -- Check whether the worker and wapper have the same type variables

@@ -1,8 +1,5 @@
-{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE CPP #-}
-{-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE DerivingStrategies #-}
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE MagicHash #-}
 {-# LANGUAGE UnboxedTuples #-}
 {-# LANGUAGE UnliftedFFITypes #-}
@@ -51,6 +48,9 @@ module GHC.Data.FastString
         -- * ShortByteString
         fastStringToShortByteString,
         mkFastStringShortByteString,
+
+        -- * ShortText
+        fastStringToShortText,
 
         -- * FastZString
         FastZString,
@@ -130,6 +130,7 @@ import qualified Data.ByteString.Short    as SBS
 #if !MIN_VERSION_bytestring(0,11,0)
 import qualified Data.ByteString.Short.Internal as SBS
 #endif
+import GHC.Data.ShortText (ShortText(..))
 import Foreign.C
 import System.IO
 import Data.Data
@@ -142,9 +143,6 @@ import Foreign
 import GHC.Conc.Sync    (sharedCAF)
 #endif
 
-#if __GLASGOW_HASKELL__ < 811
-import GHC.Base (unpackCString#,unpackNBytes#)
-#endif
 import GHC.Exts
 import GHC.IO
 
@@ -158,6 +156,9 @@ fastStringToByteString = bytesFS
 
 fastStringToShortByteString :: FastString -> ShortByteString
 fastStringToShortByteString = fs_sbs
+
+fastStringToShortText :: FastString -> ShortText
+fastStringToShortText = ShortText . fs_sbs
 
 fastZStringToByteString :: FastZString -> ByteString
 fastZStringToByteString (FastZString bs) = bs
@@ -392,7 +393,7 @@ stringTable = unsafePerformIO $ do
 #else
   sharedCAF tab getOrSetLibHSghcFastStringTable
 
--- from the 9.3 RTS; the previouss RTS before might not have this symbol.  The
+-- from the 9.3 RTS; the previous RTS before might not have this symbol.  The
 -- right way to do this however would be to define some HAVE_FAST_STRING_TABLE
 -- or similar rather than use (odd parity) development versions.
 foreign import ccall unsafe "getOrSetLibHSghcFastStringTable"
@@ -412,7 +413,8 @@ prototyping safe newtype-coercions: GHC.NT.Type.NT was imported, but could not
 be looked up /by the plugin/.
 
    let rdrName = mkModuleName "GHC.NT.Type" `mkRdrQual` mkTcOcc "NT"
-   putMsgS $ showSDoc dflags $ ppr $ lookupGRE_RdrName rdrName $ mg_rdr_env guts
+   putMsgS $ showSDoc dflags $ ppr $
+     lookupGRE (mg_rdr_env guts) (LookupRdrName rdrName AllRelevantGREs)
 
 `mkTcOcc` involves the lookup (or creation) of a FastString.  Since the
 plugin's FastString.string_table is empty, constructing the RdrName also
@@ -501,6 +503,10 @@ bucket_match fs sbs = go fs
         go (fs@(FastString {fs_sbs=fs_sbs}) : ls)
           | fs_sbs == sbs = Just fs
           | otherwise     = go ls
+-- bucket_match used to inline before changes to instance Eq ShortByteString
+-- in bytestring-0.12, which made it slightly larger than inlining threshold.
+-- Non-inlining causes a small, but measurable performance regression, so let's force it.
+{-# INLINE bucket_match #-}
 
 mkFastStringBytes :: Ptr Word8 -> Int -> FastString
 mkFastStringBytes !ptr !len =
@@ -575,11 +581,7 @@ hashStr sbs@(SBS.SBS ba#) = loop 0# 0#
           -- DO NOT move this let binding! indexCharOffAddr# reads from the
           -- pointer so we need to evaluate this based on the length check
           -- above. Not doing this right caused #17909.
-#if __GLASGOW_HASKELL__ >= 901
           !c = int8ToInt# (indexInt8Array# ba# n)
-#else
-          !c = indexInt8Array# ba# n
-#endif
           !h2 = (h *# 16777619#) `xorI#` c
         in
           loop h2 (n +# 1#)

@@ -11,7 +11,7 @@ module GHC.CmmToLlvm
    )
 where
 
-import GHC.Prelude hiding ( head )
+import GHC.Prelude
 
 import GHC.Llvm
 import GHC.CmmToLlvm.Base
@@ -21,13 +21,14 @@ import GHC.CmmToLlvm.Data
 import GHC.CmmToLlvm.Ppr
 import GHC.CmmToLlvm.Regs
 import GHC.CmmToLlvm.Mangler
+import GHC.CmmToLlvm.Version
 
 import GHC.StgToCmm.CgUtils ( fixStgRegisters )
 import GHC.Cmm
-import GHC.Cmm.Dataflow.Collections
+import GHC.Cmm.Dataflow.Label
 
 import GHC.Utils.BufHandle
-import GHC.Driver.Session
+import GHC.Driver.DynFlags
 import GHC.Platform ( platformArch, Arch(..) )
 import GHC.Utils.Error
 import GHC.Data.FastString
@@ -37,8 +38,7 @@ import GHC.Utils.Logger
 import qualified GHC.Data.Stream as Stream
 
 import Control.Monad ( when, forM_ )
-import Data.List.NonEmpty ( head )
-import Data.Maybe ( fromMaybe, catMaybes )
+import Data.Maybe ( fromMaybe, catMaybes, isNothing )
 import System.IO
 
 -- -----------------------------------------------------------------------------
@@ -68,11 +68,13 @@ llvmCodeGen logger cfg h cmm_stream
            "up to" <+> text (llvmVersionStr supportedLlvmVersionUpperBound) <+> "(non inclusive) is supported." <+>
            "System LLVM version: " <> text (llvmVersionStr ver) $$
            "We will try though..."
-         let isS390X = platformArch (llvmCgPlatform cfg)  == ArchS390X
-         let major_ver = head . llvmVersionNE $ ver
-         when (isS390X && major_ver < 10 && doWarn) $ putMsg logger $
-           "Warning: For s390x the GHC calling convention is only supported since LLVM version 10." <+>
-           "You are using LLVM version: " <> text (llvmVersionStr ver)
+
+       when (isNothing mb_ver) $ do
+         let doWarn = llvmCgDoWarn cfg
+         when doWarn $ putMsg logger $
+           "Failed to detect LLVM version!" $$
+           "Make sure LLVM is installed correctly." $$
+           "We will try though..."
 
        -- HACK: the Nothing case here is potentially wrong here but we
        -- currently don't use the LLVM version to guide code generation
@@ -91,7 +93,7 @@ llvmCodeGen logger cfg h cmm_stream
 llvmCodeGen' :: LlvmCgConfig -> Stream.Stream IO RawCmmGroup a -> LlvmM a
 llvmCodeGen' cfg cmm_stream
   = do  -- Preamble
-        renderLlvm header
+        renderLlvm (llvmHeader cfg) (llvmHeader cfg)
         ghcInternalFunctions
         cmmMetaLlvmPrelude
 
@@ -99,20 +101,23 @@ llvmCodeGen' cfg cmm_stream
         a <- Stream.consume cmm_stream liftIO llvmGroupLlvmGens
 
         -- Declare aliases for forward references
-        renderLlvm . pprLlvmData cfg =<< generateExternDecls
+        decls <- generateExternDecls
+        renderLlvm (pprLlvmData cfg decls)
+                   (pprLlvmData cfg decls)
 
         -- Postamble
         cmmUsedLlvmGens
 
         return a
-  where
-    header :: SDoc
-    header =
-      let target  = llvmCgLlvmTarget cfg
-          llvmCfg = llvmCgLlvmConfig cfg
-      in     (text "target datalayout = \"" <> text (getDataLayout llvmCfg target) <> text "\"")
-         $+$ (text "target triple = \"" <> text target <> text "\"")
 
+llvmHeader :: IsDoc doc => LlvmCgConfig -> doc
+llvmHeader cfg =
+  let target  = llvmCgLlvmTarget cfg
+      llvmCfg = llvmCgLlvmConfig cfg
+  in lines_
+      [ text "target datalayout = \"" <> text (getDataLayout llvmCfg target) <> text "\""
+      , text "target triple = \"" <> text target <> text "\"" ]
+  where
     getDataLayout :: LlvmConfig -> String -> String
     getDataLayout config target =
       case lookup target (llvmTargets config) of
@@ -121,6 +126,8 @@ llvmCodeGen' cfg cmm_stream
                    text "Target:" <+> text target $$
                    hang (text "Available targets:") 4
                         (vcat $ map (text . fst) $ llvmTargets config)
+{-# SPECIALIZE llvmHeader :: LlvmCgConfig -> SDoc #-}
+{-# SPECIALIZE llvmHeader :: LlvmCgConfig -> HDoc #-} -- see Note [SPECIALIZE to HDoc] in GHC.Utils.Outputable
 
 llvmGroupLlvmGens :: RawCmmGroup -> LlvmM ()
 llvmGroupLlvmGens cmm = do
@@ -156,10 +163,11 @@ cmmDataLlvmGens statics
                         = funInsert l ty
            regGlobal _  = pure ()
        mapM_ regGlobal gs
-       gss' <- mapM aliasify $ gs
+       gss' <- mapM aliasify gs
 
        cfg <- getConfig
-       renderLlvm $ pprLlvmData cfg (concat gss', concat tss)
+       renderLlvm (pprLlvmData cfg (concat gss', concat tss))
+                  (pprLlvmData cfg (concat gss', concat tss))
 
 -- | Complete LLVM code generation phase for a single top-level chunk of Cmm.
 cmmLlvmGen ::RawCmmDecl -> LlvmM ()
@@ -175,12 +183,12 @@ cmmLlvmGen cmm@CmmProc{} = do
     -- generate llvm code from cmm
     llvmBC <- withClearVars $ genLlvmProc fixed_cmm
 
-    -- pretty print
-    (docs, ivars) <- fmap unzip $ mapM pprLlvmCmmDecl llvmBC
-
-    -- Output, note down used variables
-    renderLlvm (vcat docs)
-    mapM_ markUsedVar $ concat ivars
+    -- pretty print - print as we go, since we produce HDocs, we know
+    -- no nesting state needs to be maintained for the SDocs.
+    forM_ llvmBC (\decl -> do
+        (hdoc, sdoc) <- pprLlvmCmmDecl decl
+        renderLlvm (hdoc $$ empty) (sdoc $$ empty)
+      )
 
 cmmLlvmGen _ = return ()
 
@@ -206,15 +214,15 @@ cmmMetaLlvmPrelude = do
 
   platform <- getPlatform
   cfg <- getConfig
-  let code_model_metas =
+  let stack_alignment_metas =
           case platformArch platform of
-            -- FIXME: We should not rely on LLVM
-            ArchLoongArch64 -> [mkCodeModelMeta CMMedium]
+            ArchX86_64 | llvmCgAvxEnabled cfg -> [mkStackAlignmentMeta 32]
             _                                 -> []
-  module_flags_metas <- mkModuleFlagsMeta code_model_metas
+  module_flags_metas <- mkModuleFlagsMeta stack_alignment_metas
   let metas = tbaa_metas ++ module_flags_metas
   cfg <- getConfig
-  renderLlvm $ ppLlvmMetas cfg metas
+  renderLlvm (ppLlvmMetas cfg metas)
+             (ppLlvmMetas cfg metas)
 
 mkNamedMeta :: LMString -> [MetaExpr] -> LlvmM [MetaDecl]
 mkNamedMeta name exprs = do
@@ -229,15 +237,9 @@ mkModuleFlagsMeta :: [ModuleFlag] -> LlvmM [MetaDecl]
 mkModuleFlagsMeta =
     mkNamedMeta "llvm.module.flags" . map moduleFlagToMetaExpr
 
--- LLVM's @LLVM::CodeModel::Model@ enumeration
-data CodeModel = CMMedium
-
--- Pass -mcmodel=medium option to LLVM on LoongArch64
-mkCodeModelMeta :: CodeModel -> ModuleFlag
-mkCodeModelMeta codemodel =
-    ModuleFlag MFBError "Code Model" (MetaLit $ LMIntLit n i32)
-  where
-    n = case codemodel of CMMedium -> 3 -- as of LLVM 8
+mkStackAlignmentMeta :: Integer -> ModuleFlag
+mkStackAlignmentMeta alignment =
+    ModuleFlag MFBError "override-stack-alignment" (MetaLit $ LMIntLit alignment i32)
 
 
 -- -----------------------------------------------------------------------------
@@ -263,4 +265,7 @@ cmmUsedLlvmGens = do
       lmUsed    = LMGlobal lmUsedVar (Just usedArray)
   if null ivars
      then return ()
-     else getConfig >>= renderLlvm . flip pprLlvmData ([lmUsed], [])
+     else do
+      cfg <- getConfig
+      renderLlvm (pprLlvmData cfg ([lmUsed], []))
+                 (pprLlvmData cfg ([lmUsed], []))

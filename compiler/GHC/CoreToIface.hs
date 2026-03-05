@@ -49,8 +49,6 @@ module GHC.CoreToIface
 
 import GHC.Prelude
 
-import Data.Word
-
 import GHC.StgToCmm.Types
 
 import GHC.ByteCode.Types
@@ -310,9 +308,12 @@ toIfaceCoercionX fr co
     go (FunCo { fco_role = r, fco_mult = w, fco_arg = co1, fco_res = co2 })
       = IfaceFunCo r (go w) (go co1) (go co2)
 
-    go (ForAllCo tv k co) = IfaceForAllCo (toIfaceBndr tv)
-                                          (toIfaceCoercionX fr' k)
-                                          (toIfaceCoercionX fr' co)
+    go (ForAllCo tv visL visR k co)
+      = IfaceForAllCo (toIfaceBndr tv)
+                      visL
+                      visR
+                      (toIfaceCoercionX fr' k)
+                      (toIfaceCoercionX fr' co)
                           where
                             fr' = fr `delVarSet` tv
 
@@ -320,7 +321,6 @@ toIfaceCoercionX fr co
     go_prov (PhantomProv co)    = IfacePhantomProv (go co)
     go_prov (ProofIrrelProv co) = IfaceProofIrrelProv (go co)
     go_prov (PluginProv str)    = IfacePluginProv str
-    go_prov (CorePrepProv b)    = IfaceCorePrepProv b
 
 toIfaceTcArgs :: TyCon -> [Type] -> IfaceAppArgs
 toIfaceTcArgs = toIfaceTcArgsX emptyVarSet
@@ -359,12 +359,8 @@ toIfaceAppArgsX fr kind ty_args
         ts' = go (extendTCvSubst env tv t) res ts
 
     go env (FunTy { ft_af = af, ft_res = res }) (t:ts)
-      = IA_Arg (toIfaceTypeX fr t) argf (go env res ts)
-      where
-        argf | isVisibleFunArg af = Required
-             | otherwise          = Inferred
-             -- It's rare for a kind to have a constraint argument, but it
-             -- can happen. See Note [AnonTCB with constraint arg] in GHC.Core.TyCon.
+      = assert (isVisibleFunArg af)
+        IA_Arg (toIfaceTypeX fr t) Required (go env res ts)
 
     go env ty ts@(t1:ts1)
       | not (isEmptyTCvSubst env)
@@ -440,7 +436,7 @@ toIfaceLetBndr :: Id -> IfaceLetBndr
 toIfaceLetBndr id  = IfLetBndr (occNameFS (getOccName id))
                                (toIfaceType (idType id))
                                (toIfaceIdInfo (idInfo id))
-                               (toIfaceJoinInfo (isJoinId_maybe id))
+                               (idJoinPointHood id)
   -- Put into the interface file any IdInfo that GHC.Core.Tidy.tidyLetBndr
   -- has left on the Id.  See Note [IdInfo on nested let-bindings] in GHC.Iface.Syntax
 
@@ -455,14 +451,15 @@ toIfaceTopBndr id
 
 toIfaceIdDetails :: IdDetails -> IfaceIdDetails
 toIfaceIdDetails VanillaId                      = IfVanillaId
-toIfaceIdDetails (WorkerLikeId dmds)          = IfWorkerLikeId dmds
+toIfaceIdDetails (WorkerLikeId dmds)            = IfWorkerLikeId dmds
 toIfaceIdDetails (DFunId {})                    = IfDFunId
 toIfaceIdDetails (RecSelId { sel_naughty = n
-                           , sel_tycon = tc })  =
-  let iface = case tc of
-                RecSelData ty_con -> Left (toIfaceTyCon ty_con)
-                RecSelPatSyn pat_syn -> Right (patSynToIfaceDecl pat_syn)
-  in IfRecSelId iface n
+                           , sel_tycon = tc
+                           , sel_fieldLabel = fl }) =
+  let (iface, first_con) = case tc of
+                RecSelData ty_con    -> ( Left (toIfaceTyCon ty_con), dataConName $ head $ tyConDataCons ty_con)
+                RecSelPatSyn pat_syn -> ( Right (patSynToIfaceDecl pat_syn), patSynName pat_syn)
+  in IfRecSelId iface first_con n fl
 
   -- The remaining cases are all "implicit Ids" which don't
   -- appear in interface files at all
@@ -505,10 +502,6 @@ toIfaceIdInfo id_info
     inline_prag = inlinePragInfo id_info
     inline_hsinfo | isDefaultInlinePragma inline_prag = Nothing
                   | otherwise = Just (HsInline inline_prag)
-
-toIfaceJoinInfo :: Maybe JoinArity -> IfaceJoinInfo
-toIfaceJoinInfo (Just ar) = IfaceJoinPoint ar
-toIfaceJoinInfo Nothing   = IfaceNotJoinPoint
 
 --------------------------
 toIfUnfolding :: Bool -> Unfolding -> Maybe IfaceInfoItem
@@ -565,9 +558,7 @@ toIfaceExpr (Case s x ty as)
   | otherwise               = IfaceCase (toIfaceExpr s) (getOccFS x) (map toIfaceAlt as)
 toIfaceExpr (Let b e)       = IfaceLet (toIfaceBind b) (toIfaceExpr e)
 toIfaceExpr (Cast e co)     = IfaceCast (toIfaceExpr e) (toIfaceCoercion co)
-toIfaceExpr (Tick t e)
-  | Just t' <- toIfaceTickish t = IfaceTick t' (toIfaceExpr e)
-  | otherwise                   = toIfaceExpr e
+toIfaceExpr (Tick t e)      = IfaceTick (toIfaceTickish t) (toIfaceExpr e)
 
 toIfaceOneShot :: Id -> IfaceOneShot
 toIfaceOneShot id | isId id
@@ -577,13 +568,13 @@ toIfaceOneShot id | isId id
                   = IfaceNoOneShot
 
 ---------------------
-toIfaceTickish :: CoreTickish -> Maybe IfaceTickish
-toIfaceTickish (ProfNote cc tick push) = Just (IfaceSCC cc tick push)
-toIfaceTickish (HpcTick modl ix)       = Just (IfaceHpcTick modl ix)
-toIfaceTickish (SourceNote src names)  = Just (IfaceSource src names)
-toIfaceTickish (Breakpoint {})         = Nothing
-   -- Ignore breakpoints, since they are relevant only to GHCi, and
-   -- should not be serialised (#8333)
+toIfaceTickish :: CoreTickish -> IfaceTickish
+toIfaceTickish (ProfNote cc tick push) = IfaceSCC cc tick push
+toIfaceTickish (HpcTick modl ix)       = IfaceHpcTick modl ix
+toIfaceTickish (SourceNote src (LexicalFastString names)) =
+  IfaceSource src names
+toIfaceTickish (Breakpoint _ ix fv m) =
+  IfaceBreakpoint ix (toIfaceVar <$> fv) m
 
 ---------------------
 toIfaceBind :: Bind Id -> IfaceBinding IfaceLetBndr
@@ -664,7 +655,7 @@ toIfaceVar v
                                       -- Foreign calls have special syntax
 
     | isExternalName name             = IfaceExt name
-    | otherwise                       = IfaceLcl (getOccFS name)
+    | otherwise                       = IfaceLcl (occNameFS $ nameOccName name)
   where
     name = idName v
     ty   = idType v
@@ -700,7 +691,7 @@ toIfaceLFInfo nm lfi = case lfi of
 
 -- Dehydrating CgBreakInfo
 
-dehydrateCgBreakInfo :: [TyVar] -> [Maybe (Id, Word16)] -> Type -> CgBreakInfo
+dehydrateCgBreakInfo :: [TyVar] -> [Maybe (Id, Word)] -> Type -> CgBreakInfo
 dehydrateCgBreakInfo ty_vars idOffSets tick_ty =
           CgBreakInfo
             { cgb_tyvars = map toIfaceTvBndr ty_vars

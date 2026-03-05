@@ -15,7 +15,7 @@ import GHC.HsToCore.Errors.Types
 import GHC.Prelude
 import GHC.Types.Basic (pprRuleName)
 import GHC.Types.Error
-import GHC.Types.Error.Codes ( constructorCode )
+import GHC.Types.Error.Codes
 import GHC.Types.Id (idType)
 import GHC.Types.SrcLoc
 import GHC.Utils.Misc
@@ -26,10 +26,9 @@ import GHC.HsToCore.Pmc.Ppr
 
 instance Diagnostic DsMessage where
   type DiagnosticOpts DsMessage = NoDiagnosticOpts
-  defaultDiagnosticOpts = NoDiagnosticOpts
-  diagnosticMessage _ = \case
-    DsUnknownMessage (UnknownDiagnostic @e m)
-      -> diagnosticMessage (defaultDiagnosticOpts @e) m
+  diagnosticMessage opts = \case
+    DsUnknownMessage (UnknownDiagnostic f m)
+      -> diagnosticMessage (f opts) m
     DsEmptyEnumeration
       -> mkSimpleDecorated $ text "Enumeration is empty"
     DsIdentitiesFound conv_fn type_of_conv
@@ -208,6 +207,10 @@ instance Diagnostic DsMessage where
                           <+> text "for"<+> quotes (ppr lhs_id)
                           <+> text "might fire first")
                 ]
+    DsIncompleteRecordSelector name cons_wo_field not_full_examples -> mkSimpleDecorated $
+      text "The application of the record field" <+> quotes (ppr name)
+      <+> text "may fail for the following constructors:"
+      <+> vcat (map ppr cons_wo_field ++ [text "..." | not_full_examples])
 
   diagnosticReason = \case
     DsUnknownMessage m          -> diagnosticReason m
@@ -238,6 +241,7 @@ instance Diagnostic DsMessage where
     DsRecBindsNotAllowedForUnliftedTys{}        -> ErrorWithoutFlag
     DsRuleMightInlineFirst{}                    -> WarningWithFlag Opt_WarnInlineRuleShadowing
     DsAnotherRuleMightFireFirst{}               -> WarningWithFlag Opt_WarnInlineRuleShadowing
+    DsIncompleteRecordSelector{}                -> WarningWithFlag Opt_WarnIncompleteRecordSelectors
 
   diagnosticHints = \case
     DsUnknownMessage m          -> diagnosticHints m
@@ -274,6 +278,7 @@ instance Diagnostic DsMessage where
     DsRecBindsNotAllowedForUnliftedTys{}        -> noHints
     DsRuleMightInlineFirst _ lhs_id rule_act    -> [SuggestAddInlineOrNoInlinePragma lhs_id rule_act]
     DsAnotherRuleMightFireFirst _ bad_rule _    -> [SuggestAddPhaseToCompetingRule bad_rule]
+    DsIncompleteRecordSelector{}                -> noHints
 
   diagnosticCode = constructorCode
 
@@ -299,11 +304,11 @@ badMonadBind elt_ty
        2 (quotes (ppr elt_ty))
 
 -- Print a single clause (for redundant/with-inaccessible-rhs)
-pprEqn :: HsMatchContext GhcRn -> SDoc -> String -> SDoc
+pprEqn :: HsMatchContextRn -> SDoc -> String -> SDoc
 pprEqn ctx q txt = pprContext True ctx (text txt) $ \f ->
   f (q <+> matchSeparator ctx <+> text "...")
 
-pprContext :: Bool -> HsMatchContext GhcRn -> SDoc -> ((SDoc -> SDoc) -> SDoc) -> SDoc
+pprContext :: Bool -> HsMatchContextRn -> SDoc -> ((SDoc -> SDoc) -> SDoc) -> SDoc
 pprContext singular kind msg rest_of_msg_fun
   = vcat [text txt <+> msg,
           sep [ text "In" <+> ppr_match <> char ':'

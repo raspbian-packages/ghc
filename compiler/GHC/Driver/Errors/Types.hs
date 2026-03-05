@@ -8,7 +8,6 @@ module GHC.Driver.Errors.Types (
   , DriverMessage(..)
   , DriverMessageOpts(..)
   , DriverMessages, PsMessage(PsHeaderMessage)
-  , BuildingCabalPackage(..)
   , WarningMessages
   , ErrorMessages
   , WarnMsg
@@ -25,19 +24,23 @@ import GHC.Prelude
 import Data.Bifunctor
 import Data.Typeable
 
-import GHC.Driver.Session
+import GHC.Driver.DynFlags (DynFlags, PackageArg, gopt)
+import GHC.Driver.Flags (GeneralFlag (Opt_BuildingCabalPackage))
 import GHC.Types.Error
 import GHC.Unit.Module
 import GHC.Unit.State
 
 import GHC.Parser.Errors.Types ( PsMessage(PsHeaderMessage) )
-import GHC.Tc.Errors.Types     ( TcRnMessage )
 import GHC.HsToCore.Errors.Types ( DsMessage )
 import GHC.Hs.Extension          (GhcTc)
 
 import Language.Haskell.Syntax.Decls (RuleDecl)
+import qualified GHC.LanguageExtensions as LangExt
 
 import GHC.Generics ( Generic )
+
+import GHC.Tc.Errors.Types
+import GHC.Iface.Errors.Types
 
 -- | A collection of warning messages.
 -- /INVARIANT/: Each 'GhcMessage' in the collection should have 'SevWarning' severity.
@@ -90,7 +93,7 @@ data GhcMessage where
   -- 'Diagnostic' constraint ensures that worst case scenario we can still
   -- render this into something which can be eventually converted into a
   -- 'DecoratedSDoc'.
-  GhcUnknownMessage :: UnknownDiagnostic -> GhcMessage
+  GhcUnknownMessage :: (UnknownDiagnostic (DiagnosticOpts GhcMessage)) -> GhcMessage
 
   deriving Generic
 
@@ -108,7 +111,7 @@ data GhcMessageOpts = GhcMessageOpts { psMessageOpts :: DiagnosticOpts PsMessage
 -- GHC, as it would typically be used by plugin or library authors (see
 -- comment for the 'GhcUnknownMessage' type constructor)
 ghcUnknownMessage :: (DiagnosticOpts a ~ NoDiagnosticOpts, Diagnostic a, Typeable a) => a -> GhcMessage
-ghcUnknownMessage = GhcUnknownMessage . UnknownDiagnostic
+ghcUnknownMessage = GhcUnknownMessage . mkSimpleUnknownDiagnostic
 
 -- | Abstracts away the frequent pattern where we are calling 'ioMsgMaybe' on
 -- the result of 'IO (Messages TcRnMessage, a)'.
@@ -126,7 +129,7 @@ type DriverMessages = Messages DriverMessage
 -- | A message from the driver.
 data DriverMessage where
   -- | Simply wraps a generic 'Diagnostic' message @a@.
-  DriverUnknownMessage :: UnknownDiagnostic -> DriverMessage
+  DriverUnknownMessage :: UnknownDiagnostic (DiagnosticOpts DriverMessage) -> DriverMessage
 
   -- | A parse error in parsing a Haskell file header during dependency
   -- analysis
@@ -368,17 +371,25 @@ data DriverMessage where
 
   DriverHomePackagesNotClosed :: ![UnitId] -> DriverMessage
 
+  DriverInterfaceError :: !IfaceMessage -> DriverMessage
+
+  -- TODO: Add structure messages rather than a String
+  DriverInconsistentDynFlags :: String -> DriverMessage
+
+  DriverSafeHaskellIgnoredExtension :: !LangExt.Extension -> DriverMessage
+
+  DriverPackageTrustIgnored :: DriverMessage
+
+  DriverUnrecognisedFlag :: String -> DriverMessage
+
+  DriverDeprecatedFlag :: String -> String -> DriverMessage
+
 deriving instance Generic DriverMessage
 
 data DriverMessageOpts =
-  DriverMessageOpts { psDiagnosticOpts :: DiagnosticOpts PsMessage }
+  DriverMessageOpts { psDiagnosticOpts :: DiagnosticOpts PsMessage
+                    , ifaceDiagnosticOpts :: DiagnosticOpts IfaceMessage }
 
--- | Pass to a 'DriverMessage' the information whether or not the
--- '-fbuilding-cabal-package' flag is set.
-data BuildingCabalPackage
-  = YesBuildingCabalPackage
-  | NoBuildingCabalPackage
-  deriving Eq
 
 -- | Checks if we are building a cabal package by consulting the 'DynFlags'.
 checkBuildingCabalPackage :: DynFlags -> BuildingCabalPackage

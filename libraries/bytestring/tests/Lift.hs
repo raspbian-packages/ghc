@@ -1,6 +1,8 @@
 {-# LANGUAGE CPP #-}
-{-# LANGUAGE TemplateHaskell #-}
+
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE TemplateHaskell #-}
+
 module Lift (testSuite) where
 
 import           Test.Tasty (TestTree, testGroup)
@@ -11,6 +13,9 @@ import qualified Data.ByteString.Short as SBS
 import qualified Language.Haskell.TH.Syntax as TH
 
 testSuite :: TestTree
+#ifdef wasm32_HOST_ARCH
+testSuite = testGroup "Skipped, requires -fexternal-interpreter" []
+#else
 testSuite = testGroup "Lift"
   [ testGroup "strict"
     [ testProperty "normal" $
@@ -60,3 +65,4 @@ testSuite = testGroup "Lift"
 #endif
     ]
   ]
+#endif

@@ -90,8 +90,10 @@ void *loadNativeObj( pathchar *path, char **errmsg );
    Takes the handle returned from loadNativeObj() as an argument. */
 HsInt unloadNativeObj( void *handle );
 
+void *lookupSymbolInNativeObj(void *handle, const char *symbol_name);
+
 /* load a dynamic library */
-const char *addDLL( pathchar* dll_name );
+const char *addDLL(pathchar* dll_name);
 
 /* add a path to the library search path */
 HsPtr addLibrarySearchPath(pathchar* dll_path);

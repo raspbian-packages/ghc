@@ -7,7 +7,7 @@ Index: b/configure.ac
 ===================================================================
 --- a/configure.ac
 +++ b/configure.ac
-@@ -574,14 +574,18 @@ AC_SUBST([ClangCmd])
+@@ -523,21 +523,27 @@ AC_SUBST([ConfiguredEmsdkVersion])
  dnl ** Which LLVM llc to use?
  dnl --------------------------------------------------------------
  AC_ARG_VAR(LLC,[Use as the path to LLVM's llc [default=autodetect]])
@@ -27,12 +27,22 @@ Index: b/configure.ac
 +fi
  OptCmd="$OPT"
  AC_SUBST([OptCmd])
+ 
+ dnl ** Which LLVM assembler to use?
+ dnl --------------------------------------------------------------
+ AC_ARG_VAR(LLVMAS,[Use as the path to LLVM's assembler (typically clang) [default=autodetect]])
+-FIND_LLVM_PROG([LLVMAS], [clang], [$LlvmMinVersion], [$LlvmMaxVersion])
++if test -z "$LLVMAS"; then
++  FIND_LLVM_PROG([LLVMAS], [clang], [$LlvmMinVersion], [$LlvmMaxVersion])
++fi
+ LlvmAsCmd="$LLVMAS"
+ AC_SUBST([LlvmAsCmd])
  
 Index: b/distrib/configure.ac.in
 ===================================================================
 --- a/distrib/configure.ac.in
 +++ b/distrib/configure.ac.in
-@@ -152,14 +152,18 @@ LlvmMaxVersion=@LlvmMaxVersion@
+@@ -184,21 +184,27 @@ LlvmMaxVersion=@LlvmMaxVersion@
  dnl ** Which LLVM llc to use?
  dnl --------------------------------------------------------------
  AC_ARG_VAR(LLC,[Use as the path to LLVM's llc [default=autodetect]])
@@ -52,4 +62,14 @@ Index: b/distrib/configure.ac.in
 +fi
  OptCmd="$OPT"
  AC_SUBST([OptCmd])
+ 
+ dnl ** Which LLVM assembler to use?
+ dnl --------------------------------------------------------------
+ AC_ARG_VAR(LLVMAS,[Use as the path to LLVM's assembler (typically clang) [default=autodetect]])
+-FIND_LLVM_PROG([LLVMAS], [clang], [$LlvmMinVersion], [$LlvmMaxVersion])
++if test -z "$LLVMAS"; then
++  FIND_LLVM_PROG([LLVMAS], [clang], [$LlvmMinVersion], [$LlvmMaxVersion])
++fi
+ LlvmAsCmd="$LLVMAS"
+ AC_SUBST([LlvmAsCmd])
  

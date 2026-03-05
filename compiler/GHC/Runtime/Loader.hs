@@ -23,7 +23,7 @@ module GHC.Runtime.Loader (
 import GHC.Prelude
 import GHC.Data.FastString
 
-import GHC.Driver.Session
+import GHC.Driver.DynFlags
 import GHC.Driver.Ppr
 import GHC.Driver.Hooks
 import GHC.Driver.Plugins
@@ -33,34 +33,37 @@ import GHC.Linker.Loader       ( loadModule, loadName )
 import GHC.Runtime.Interpreter ( wormhole )
 import GHC.Runtime.Interpreter.Types
 
+import GHC.Rename.Names ( gresFromAvails )
+
 import GHC.Tc.Utils.Monad      ( initTcInteractive, initIfaceTcRn )
 import GHC.Iface.Load          ( loadPluginInterface, cannotFindModule )
-import GHC.Rename.Names ( gresFromAvails )
 import GHC.Builtin.Names ( pluginTyConName, frontendPluginTyConName )
 
 import GHC.Driver.Env
 import GHCi.RemoteTypes     ( HValue )
 import GHC.Core.Type        ( Type, mkTyConTy )
 import GHC.Core.TyCo.Compare( eqType )
-import GHC.Core.TyCon       ( TyCon )
+import GHC.Core.TyCon       ( TyCon(tyConName) )
+
 
 import GHC.Types.SrcLoc        ( noSrcSpan )
-import GHC.Types.Name    ( Name, nameModule_maybe )
+import GHC.Types.Name    ( Name, nameModule, nameModule_maybe )
 import GHC.Types.Id      ( idType )
 import GHC.Types.TyThing
 import GHC.Types.Name.Occurrence ( OccName, mkVarOccFS )
-import GHC.Types.Name.Reader   ( RdrName, ImportSpec(..), ImpDeclSpec(..)
-                               , ImpItemSpec(..), mkGlobalRdrEnv, lookupGRE_RdrName
-                               , greMangledName, mkRdrQual )
+import GHC.Types.Name.Reader
+import GHC.Types.Unique.DFM
 
 import GHC.Unit.Finder         ( findPluginModule, FindResult(..) )
 import GHC.Driver.Config.Finder ( initFinderOpts )
-import GHC.Unit.Module   ( Module, ModuleName )
+import GHC.Driver.Config.Diagnostic ( initIfaceMessageOpts )
+import GHC.Unit.Module   ( Module, ModuleName, thisGhcUnit, GenModule(moduleUnit) )
 import GHC.Unit.Module.ModIface
 import GHC.Unit.Env
 
 import GHC.Utils.Panic
 import GHC.Utils.Logger
+import GHC.Utils.Misc ( HasDebugCallStack )
 import GHC.Utils.Error
 import GHC.Utils.Outputable
 import GHC.Utils.Exception
@@ -69,9 +72,32 @@ import Control.Monad     ( unless )
 import Data.Maybe        ( mapMaybe )
 import Unsafe.Coerce     ( unsafeCoerce )
 import GHC.Linker.Types
-import GHC.Types.Unique.DFM
 import Data.List (unzip4)
+import GHC.Iface.Errors.Ppr
 import GHC.Driver.Monad
+
+{- Note [Timing of plugin initialization]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Plugins needs to be initialised as soon as possible in the pipeline. This is because
+driver plugins are executed immediately after being loaded, which can modify anything
+in the HscEnv, including the logger and DynFlags (for example #21279). For example,
+in ghc/Main.hs the logger is used almost immediately after the session has been initialised
+and so if a user overwrites the logger expecting all output to go there then unless
+the plugins are initialised before that point then unexpected things will happen.
+
+We initialise plugins in ghc/Main.hs for the main ghc executable.
+
+When people are using the GHC API, they also need to initialise plugins
+at the highest level possible for things to work as expected. We keep
+some defensive calls to plugin initialisation in functions like `load'` and `oneshot`
+to catch cases where API users have not initialised their own plugins.
+
+In addition to this, there needs to be an initialisation call for each module
+just in case the user has enabled a plugin just for that module using OPTIONS_GHC
+pragma.
+
+-}
 
 -- | Initialise plugins specified by the current DynFlags and update the session.
 initializeSessionPlugins :: GhcMonad m => m ()
@@ -176,7 +202,14 @@ loadPlugin' occ_name plugin_name hsc_env mod_name
             Just (name, mod_iface) ->
 
      do { plugin_tycon <- forceLoadTyCon hsc_env plugin_name
-        ; eith_plugin <- getValueSafely hsc_env name (mkTyConTy plugin_tycon)
+        ; case thisGhcUnit == (moduleUnit . nameModule . tyConName) plugin_tycon of {
+            False ->
+                throwGhcExceptionIO (CmdLineError $ showSDoc dflags $ hsep
+                          [ text "The plugin module", ppr mod_name
+                          , text "was built with a compiler that is incompatible with the one loading it"
+                          ]) ;
+            True ->
+     do { eith_plugin <- getValueSafely hsc_env name (mkTyConTy plugin_tycon)
         ; case eith_plugin of
             Left actual_type ->
                 throwGhcExceptionIO (CmdLineError $
@@ -187,7 +220,7 @@ loadPlugin' occ_name plugin_name hsc_env mod_name
                           , text "did not have the type"
                           , text "GHC.Plugins.Plugin"
                           , text "as required"])
-            Right (plugin, links, pkgs) -> return (plugin, mod_iface, links, pkgs) } } }
+            Right (plugin, links, pkgs) -> return (plugin, mod_iface, links, pkgs) } } } } }
 
 
 -- | Force the interfaces for the given modules to be loaded. The 'SDoc' parameter is used
@@ -303,7 +336,8 @@ lessUnsafeCoerce logger context what = do
 -- being compiled.  This was introduced by 57d6798.
 --
 -- Need the module as well to record information in the interface file
-lookupRdrNameInModuleForPlugins :: HscEnv -> ModuleName -> RdrName
+lookupRdrNameInModuleForPlugins :: HasDebugCallStack
+                                => HscEnv -> ModuleName -> RdrName
                                 -> IO (Maybe (Name, ModIface))
 lookupRdrNameInModuleForPlugins hsc_env mod_name rdr_name = do
     let dflags     = hsc_dflags hsc_env
@@ -323,17 +357,22 @@ lookupRdrNameInModuleForPlugins hsc_env mod_name rdr_name = do
             case mb_iface of
                 Just iface -> do
                     -- Try and find the required name in the exports
-                    let decl_spec = ImpDeclSpec { is_mod = mod_name, is_as = mod_name
+                    let decl_spec = ImpDeclSpec { is_mod = mod, is_as = mod_name
                                                 , is_qual = False, is_dloc = noSrcSpan }
                         imp_spec = ImpSpec decl_spec ImpAll
-                        env = mkGlobalRdrEnv (gresFromAvails (Just imp_spec) (mi_exports iface))
-                    case lookupGRE_RdrName rdr_name env of
-                        [gre] -> return (Just (greMangledName gre, iface))
+                        env = mkGlobalRdrEnv
+                            $ gresFromAvails hsc_env (Just imp_spec) (mi_exports iface)
+                    case lookupGRE env (LookupRdrName rdr_name (RelevantGREsFOS WantNormal)) of
+                        [gre] -> return (Just (greName gre, iface))
                         []    -> return Nothing
                         _     -> panic "lookupRdrNameInModule"
 
                 Nothing -> throwCmdLineErrorS dflags $ hsep [text "Could not determine the exports of the module", ppr mod_name]
-        err -> throwCmdLineErrorS dflags $ cannotFindModule hsc_env mod_name err
+        err ->
+          let opts   = initIfaceMessageOpts dflags
+              err_txt = missingInterfaceErrorDiagnostic opts
+                      $ cannotFindModule hsc_env mod_name err
+          in throwCmdLineErrorS dflags err_txt
   where
     doc = text "contains a name used in an invocation of lookupRdrNameInModule"
 

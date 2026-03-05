@@ -68,6 +68,7 @@ import GHC.Core.TyCo.Compare( eqType )
 import GHC.Types.Demand
 import GHC.Types.Cpr( CprSig, mkCprSig, botCpr )
 import GHC.Types.Id
+import GHC.Types.Var
 import GHC.Types.Var.Env
 import GHC.Types.Var.Set
 import GHC.Types.Basic
@@ -84,7 +85,6 @@ import GHC.Utils.GlobalVars( unsafeHasNoStateHack )
 import GHC.Utils.Constants (debugIsOn)
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
-import GHC.Utils.Panic.Plain
 import GHC.Utils.Misc
 
 import Data.Maybe( isJust )
@@ -134,6 +134,9 @@ joinRhsArity :: CoreExpr -> JoinArity
 -- Join points are supposed to have manifestly-visible
 -- lambdas at the top: no ticks, no casts, nothing
 -- Moreover, type lambdas count in JoinArity
+-- NB: For non-recursive bindings, the join arity of the binding may actually be
+-- less that the number of manifestly-visible lambdas.
+-- See Note [Join arity prediction based on joinRhsArity] in GHC.Core.Opt.OccurAnal
 joinRhsArity (Lam _ e) = 1 + joinRhsArity e
 joinRhsArity _         = 0
 
@@ -195,8 +198,10 @@ typeOneShots ty
   = go initRecTc ty
   where
     go rec_nts ty
-      | Just (_, ty')  <- splitForAllTyCoVar_maybe ty
-      = go rec_nts ty'
+      | Just (tcv, ty')  <- splitForAllTyCoVar_maybe ty
+      = if isCoVar tcv
+        then idOneShotInfo tcv : go rec_nts ty'
+        else go rec_nts ty'
 
       | Just (_,_,arg,res) <- splitFunTy_maybe ty
       = typeOneShot arg : go rec_nts res
@@ -510,8 +515,11 @@ this transformation.  So we try to limit it as much as possible:
 
 Of course both (1) and (2) are readily defeated by disguising the bottoms.
 
-4. Note [Newtype arity]
-~~~~~~~~~~~~~~~~~~~~~~~~
+There also is an interaction with Note [Combining arity type with demand info],
+outlined in Wrinkle (CAD1).
+
+Note [Newtype arity]
+~~~~~~~~~~~~~~~~~~~~
 Non-recursive newtypes are transparent, and should not get in the way.
 We do (currently) eta-expand recursive newtypes too.  So if we have, say
 
@@ -713,7 +721,7 @@ So safeArityType will trim it to (AT [C?, C?] Top), whose [ATLamInfo]
 now reflects the (cost-free) arity of the expression
 
 Why do we ever need an "unsafe" ArityType, such as the example above?
-Because its (cost-free) arity may increased by combineWithDemandOneShots
+Because its (cost-free) arity may increased by combineWithCallCards
 in findRhsArity. See Note [Combining arity type with demand info].
 
 Thus the function `arityType` returns a regular "unsafe" ArityType, that
@@ -852,7 +860,7 @@ data ArityOpts = ArityOpts
 
 -- | The Arity returned is the number of value args the
 -- expression can be applied to without doing much work
-exprEtaExpandArity :: ArityOpts -> CoreExpr -> Maybe SafeArityType
+exprEtaExpandArity :: HasDebugCallStack => ArityOpts -> CoreExpr -> Maybe SafeArityType
 -- exprEtaExpandArity is used when eta expanding
 --      e  ==>  \xy -> e x y
 -- Nothing if the expression has arity 0
@@ -915,14 +923,14 @@ findRhsArity opts is_rec bndr rhs
                          NonRecursive -> trimArityType ty_arity (cheapArityType rhs)
 
     ty_arity     = typeArity (idType bndr)
-    id_one_shots = idDemandOneShots bndr
+    use_call_cards = useSiteCallCards bndr
 
     step :: ArityEnv -> SafeArityType
     step env = trimArityType ty_arity $
                safeArityType $ -- See Note [Arity invariants for bindings], item (3)
-               arityType env rhs `combineWithDemandOneShots` id_one_shots
+               combineWithCallCards env (arityType env rhs) use_call_cards
        -- trimArityType: see Note [Trim arity inside the loop]
-       -- combineWithDemandOneShots: take account of the demand on the
+       -- combineWithCallCards: take account of the demand on the
        -- binder.  Perhaps it is always called with 2 args
        --   let f = \x. blah in (f 3 4, f 1 9)
        -- f's demand-info says how many args it is called with
@@ -947,14 +955,24 @@ findRhsArity opts is_rec bndr rhs
       where
         next_at = step (extendSigEnv init_env bndr cur_at)
 
-infixl 2 `combineWithDemandOneShots`
-
-combineWithDemandOneShots :: ArityType -> [OneShotInfo] -> ArityType
+combineWithCallCards :: ArityEnv -> ArityType -> [Card] -> ArityType
 -- See Note [Combining arity type with demand info]
-combineWithDemandOneShots at@(AT lams div) oss
+combineWithCallCards env at@(AT lams div) cards
   | null lams = at
   | otherwise = AT (zip_lams lams oss) div
   where
+    oss = map card_to_oneshot cards
+    card_to_oneshot n
+      | isAtMostOnce n, not (pedanticBottoms env)
+         -- Take care for -fpedantic-bottoms;
+         -- see Note [Combining arity type with demand info], Wrinkle (CAD1)
+      = OneShotLam
+      | n == C_11
+         -- Safe to eta-expand even in the presence of -fpedantic-bottoms
+         -- see Note [Combining arity type with demand info], Wrinkle (CAD1)
+      = OneShotLam
+      | otherwise
+      = NoOneShotInfo
     zip_lams :: [ATLamInfo] -> [OneShotInfo] -> [ATLamInfo]
     zip_lams lams []  = lams
     zip_lams []   oss | isDeadEndDiv div = []
@@ -963,29 +981,33 @@ combineWithDemandOneShots at@(AT lams div) oss
     zip_lams ((ch,os1):lams) (os2:oss)
       = (ch, os1 `bestOneShot` os2) : zip_lams lams oss
 
-idDemandOneShots :: Id -> [OneShotInfo]
-idDemandOneShots bndr
-  = call_arity_one_shots `zip_lams` dmd_one_shots
+useSiteCallCards :: Id -> [Card]
+useSiteCallCards bndr
+  = call_arity_one_shots `zip_cards` dmd_one_shots
   where
-    call_arity_one_shots :: [OneShotInfo]
+    call_arity_one_shots :: [Card]
     call_arity_one_shots
       | call_arity == 0 = []
-      | otherwise       = NoOneShotInfo : replicate (call_arity-1) OneShotLam
-    -- Call Arity analysis says the function is always called
-    -- applied to this many arguments.  The first NoOneShotInfo is because
-    -- if Call Arity says "always applied to 3 args" then the one-shot info
-    -- we get is [NoOneShotInfo, OneShotLam, OneShotLam]
+      | otherwise       = C_0N : replicate (call_arity-1) C_01
+    -- Call Arity analysis says /however often the function is called/, it is
+    -- always applied to this many arguments.
+    -- The first C_0N is because of the "however often it is called" part.
+    -- Thus if Call Arity says "always applied to 3 args" then the one-shot info
+    -- we get is [C_0N, C_01, C_01]
     call_arity = idCallArity bndr
 
-    dmd_one_shots :: [OneShotInfo]
+    dmd_one_shots :: [Card]
     -- If the demand info is C(x,C(1,C(1,.))) then we know that an
     -- application to one arg is also an application to three
-    dmd_one_shots = argOneShots (idDemandInfo bndr)
+    dmd_one_shots = case idDemandInfo bndr of
+      AbsDmd  -> [] -- There is no use in eta expanding
+      BotDmd  -> [] -- when the binding could be dropped instead
+      _ :* sd -> callCards sd
 
     -- Take the *longer* list
-    zip_lams (lam1:lams1) (lam2:lams2) = (lam1 `bestOneShot` lam2) : zip_lams lams1 lams2
-    zip_lams []           lams2        = lams2
-    zip_lams lams1        []           = lams1
+    zip_cards (n1:ns1) (n2:ns2) = (n1 `glbCard` n2) : zip_cards ns1 ns2
+    zip_cards []       ns2      = ns2
+    zip_cards ns1      []       = ns1
 
 {- Note [Arity analysis]
 ~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1081,7 +1103,7 @@ Combining these two pieces of info, we can get the final ArityType
 result: arity=3, which is better than we could do from either
 source alone.
 
-The "combining" part is done by combineWithDemandOneShots.  It
+The "combining" part is done by combineWithCallCards.  It
 uses info from both Call Arity and demand analysis.
 
 We may have /more/ call demands from the calls than we have lambdas
@@ -1099,6 +1121,22 @@ But /only/ for called-once demands.  Suppose we had
 Now we don't want to eta-expand f1 to have 3 args; only two.
 Nor, in the case of f2, do we want to push that error call under
 a lambda.  Hence the takeWhile in combineWithDemandDoneShots.
+
+Wrinkles:
+
+(CAD1) #24296 exposed a subtle interaction with -fpedantic-bottoms
+  (See Note [Dealing with bottom]). Consider
+
+    let f = \x y. error "blah" in
+    f 2 1 `seq` Just (f 3 2 1)
+      -- Demand on f is C(x,C(1,C(M,L)))
+
+  Usually, it is OK to consider a lambda that is called *at most* once (so call
+  cardinality C_01, abbreviated M) a one-shot lambda and eta-expand over it.
+  But with -fpedantic-bottoms that is no longer true: If we were to eta-expand
+  f to arity 3, we'd discard the error raised when evaluating `f 2 1`.
+  Hence in the presence of -fpedantic-bottoms, we must have C_11 for
+  eta-expansion.
 
 Note [Do not eta-expand join points]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1232,8 +1270,14 @@ arityLam id (AT oss div)
 floatIn :: Cost -> ArityType -> ArityType
 -- We have something like (let x = E in b),
 -- where b has the given arity type.
-floatIn IsCheap     at = at
-floatIn IsExpensive at = addWork at
+-- NB: be as lazy as possible in the Cost-of-E argument;
+--     we can often get away without ever looking at it
+--     See Note [Care with nested expressions]
+floatIn ch at@(AT lams div)
+  = case lams of
+      []                 -> at
+      (IsExpensive,_):_  -> at
+      (_,os):lams        -> AT ((ch,os):lams) div
 
 addWork :: ArityType -> ArityType
 -- Add work to the outermost level of the arity type
@@ -1315,6 +1359,25 @@ the True and False branches:
 That gives \1.T (see Note [Combining case branches: andWithTail],
 first bullet).  So 'go2' gets an arityType of \(C?)(C1).T, which is
 what we want.
+
+Note [Care with nested expressions]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Consider
+    arityType (Just <big-expressions>)
+We will take
+    arityType Just = AT [(IsCheap,os)] topDiv
+and then do
+    arityApp (AT [(IsCheap os)] topDiv) (exprCost <big-expression>)
+The result will be AT [] topDiv.  It doesn't matter what <big-expresison>
+is!  The same is true of
+    arityType (let x = <rhs> in <body>)
+where the cost of <rhs> doesn't matter unless <body> has a useful
+arityType.
+
+TL;DR in `floatIn`, do not to look at the Cost argument until you have to.
+
+I found this when looking at #24471, although I don't think it was really
+the main culprit.
 
 Note [Combining case branches: andWithTail]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1538,7 +1601,7 @@ arityType env (Case scrut bndr _ alts)
   = alts_type
 
   | otherwise            -- In the remaining cases we may not push
-  = addWork alts_type -- evaluation of the scrutinee in
+  = addWork alts_type    -- evaluation of the scrutinee in
   where
     env' = delInScope env bndr
     arity_type_alt (Alt _con bndrs rhs) = arityType (delInScopeList env' bndrs) rhs
@@ -1873,15 +1936,14 @@ The no-crap way is
   \(y::Int). let j' :: Int -> Bool
                  j' x = e y
              in b[j'/j] y
-where I have written to stress that j's type has
+where I have written b[j'/j] to stress that j's type has
 changed.  Note that (of course!) we have to push the application
 inside the RHS of the join as well as into the body.  AND if j
 has an unfolding we have to push it into there too.  AND j might
 be recursive...
 
-So for now I'm abandoning the no-crap rule in this case. I think
-that for the use in CorePrep it really doesn't matter; and if
-it does, then CoreToStg.myCollectArgs will fall over.
+So for now I'm abandoning the no-crap rule in this case, conscious that this
+causes the ugly Wrinkle (EA1) of Note [Eta expansion of arguments in CorePrep].
 
 (Moreover, I think that casts can make the no-crap rule fail too.)
 
@@ -2036,8 +2098,8 @@ This what eta_expand does.  We do it in two steps:
 
    Note that the /same/ EtaInfo drives both etaInfoAbs and etaInfoApp
 
-To a first approximation EtaInfo is just [Var].  But
-casts complicate the question.  If we have
+To a first approximation EtaInfo is just [Var].  But casts complicate
+the question.  If we have
    newtype N a = MkN (S -> a)
      axN :: N a  ~  S -> a
 and
@@ -2052,6 +2114,20 @@ We want to get one cast, at the top, to account for all those
 nested newtypes. This is expressed by the EtaInfo type:
 
    data EtaInfo = EI [Var] MCoercionR
+
+Precisely, here is the (EtaInfo Invariant):
+
+  EI bs co :: EtaInfo
+
+describes a particular eta-expansion, thus:
+
+  Abstraction:  (\b1 b2 .. bn. []) |> sym co
+  Application:  ([] |> co) b1 b2 .. bn
+
+  e  :: T
+  co :: T ~R (t1 -> t2 -> .. -> tn -> tr)
+  e = (\b1 b2 ... bn. (e |> co) b1 b2 .. bn) |> sym co
+
 
 Note [Check for reflexive casts in eta expansion]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -2108,13 +2184,7 @@ Now, when we push that eta_co inward in etaInfoApp:
 
 --------------
 data EtaInfo = EI [Var] MCoercionR
-
--- (EI bs co) describes a particular eta-expansion, as follows:
---  Abstraction:  (\b1 b2 .. bn. []) |> sym co
---  Application:  ([] |> co) b1 b2 .. bn
---
---    e :: T    co :: T ~ (t1 -> t2 -> .. -> tn -> tr)
---    e = (\b1 b2 ... bn. (e |> co) b1 b2 .. bn) |> sym co
+     -- See Note [The EtaInfo mechanism]
 
 instance Outputable EtaInfo where
   ppr (EI vs mco) = text "EI" <+> ppr vs <+> parens (ppr mco)
@@ -2228,14 +2298,14 @@ mkEtaWW orig_oss ppr_orig_expr in_scope orig_ty
 
     go n oss@(one_shot:oss1) subst ty
        ----------- Forall types  (forall a. ty)
-       | Just (tcv,ty') <- splitForAllTyCoVar_maybe ty
+       | Just (Bndr tcv vis, ty') <- splitForAllForAllTyBinder_maybe ty
        , (subst', tcv') <- Type.substVarBndr subst tcv
        , let oss' | isTyVar tcv = oss
                   | otherwise   = oss1
          -- A forall can bind a CoVar, in which case
          -- we consume one of the [OneShotInfo]
        , (in_scope, EI bs mco) <- go n oss' subst' ty'
-       = (in_scope, EI (tcv' : bs) (mkHomoForAllMCo tcv' mco))
+       = (in_scope, EI (tcv' : bs) (mkEtaForAllMCo (Bndr tcv' vis) ty' mco))
 
        ----------- Function types  (t1 -> t2)
        | Just (_af, mult, arg_ty, res_ty) <- splitFunTy_maybe ty
@@ -2278,6 +2348,19 @@ mkEtaWW orig_oss ppr_orig_expr in_scope orig_ty
         -- So we simply decline to eta-expand.  Otherwise we'd end up
         -- with an explicit lambda having a non-function type
 
+mkEtaForAllMCo :: ForAllTyBinder -> Type -> MCoercion -> MCoercion
+mkEtaForAllMCo (Bndr tcv vis) ty mco
+  = case mco of
+      MRefl | vis == coreTyLamForAllTyFlag -> MRefl
+            | otherwise                    -> mk_fco (mkRepReflCo ty)
+      MCo co                               -> mk_fco co
+  where
+    mk_fco co = MCo (mkForAllCo tcv vis coreTyLamForAllTyFlag
+                                (mkNomReflCo (varType tcv)) co)
+    -- coreTyLamForAllTyFlag: See Note [The EtaInfo mechanism], particularly
+    -- the (EtaInfo Invariant).  (sym co) wraps a lambda that always has
+    -- a ForAllTyFlag of coreTyLamForAllTyFlag; see Note [Required foralls in Core]
+    -- in GHC.Core.TyCo.Rep
 
 {-
 ************************************************************************
@@ -2717,9 +2800,19 @@ tryEtaReduce rec_ids bndrs body eval_sd
                                --   (and similarly for tyvars, coercion args)
                     , [CoreTickish])
     -- See Note [Eta reduction with casted arguments]
-    ok_arg bndr (Type ty) co _
-       | Just tv <- getTyVar_maybe ty
-       , bndr == tv  = Just (mkHomoForAllCos [tv] co, [])
+    ok_arg bndr (Type arg_ty) co fun_ty
+       | Just tv <- getTyVar_maybe arg_ty
+       , bndr == tv  = case splitForAllForAllTyBinder_maybe fun_ty of
+           Just (Bndr _ vis, _) -> Just (fco, [])
+             where !fco = mkForAllCo tv vis coreTyLamForAllTyFlag kco co
+                   -- The lambda we are eta-reducing always has visibility
+                   -- 'coreTyLamForAllTyFlag' which may or may not match
+                   -- the visibility on the inner function (#24014)
+                   kco = mkNomReflCo (tyVarKind tv)
+           Nothing -> pprPanic "tryEtaReduce: type arg to non-forall type"
+                               (text "fun:" <+> ppr bndr
+                                $$ text "arg:" <+> ppr arg_ty
+                                $$ text "fun_ty:" <+> ppr fun_ty)
     ok_arg bndr (Var v) co fun_ty
        | bndr == v
        , let mult = idMult bndr
@@ -2873,17 +2966,10 @@ pushCoValArg co
   = Just (MRefl, MRefl)
 
   | isFunTy tyL
-  , (co_mult, co1, co2) <- decomposeFunCo co
+  , (_, co1, co2) <- decomposeFunCo co
       -- If   co  :: (tyL1 -> tyL2) ~ (tyR1 -> tyR2)
       -- then co1 :: tyL1 ~ tyR1
       --      co2 :: tyL2 ~ tyR2
-
-  , isReflexiveCo co_mult
-    -- We can't push the coercion in the case where co_mult isn't reflexivity:
-    -- it could be an unsafe axiom, and losing this information could yield
-    -- ill-typed terms. For instance (fun x ::(1) Int -> (fun _ -> () |> co) x)
-    -- with co :: (Int -> ()) ~ (Int %1 -> ()), would reduce to (fun x ::(1) Int
-    -- -> (fun _ ::(Many) Int -> ()) x) which is ill-typed.
 
   , typeHasFixedRuntimeRep new_arg_ty
     -- We can't push the coercion inside if it would give rise to
@@ -2917,10 +3003,7 @@ pushCoercionIntoLambda in_scope x e co
     , Pair s1s2 t1t2 <- coercionKind co
     , Just {}              <- splitFunTy_maybe s1s2
     , Just (_, w1, t1,_t2) <- splitFunTy_maybe t1t2
-    , (co_mult, co1, co2)  <- decomposeFunCo co
-    , isReflexiveCo co_mult
-      -- We can't push the coercion in the case where co_mult isn't
-      -- reflexivity. See pushCoValArg for more details.
+    , (_, co1, co2)  <- decomposeFunCo co
     , typeHasFixedRuntimeRep t1
       -- We can't push the coercion into the lambda if it would create
       -- a representation-polymorphic binder.
@@ -3115,7 +3198,7 @@ etaExpandToJoinPointRule join_arity rule@(Rule { ru_bndrs = bndrs, ru_rhs = rhs
 -- Adds as many binders as asked for; assumes expr is not a lambda
 etaBodyForJoinPoint :: Int -> CoreExpr -> ([CoreBndr], CoreExpr)
 etaBodyForJoinPoint need_args body
-  = go need_args (exprType body) (init_subst body) [] body
+  = go need_args body_ty (mkEmptySubst in_scope) [] body
   where
     go 0 _  _     rev_bs e
       = (reverse rev_bs, e)
@@ -3134,9 +3217,16 @@ etaBodyForJoinPoint need_args body
       = pprPanic "etaBodyForJoinPoint" $ int need_args $$
                                          ppr body $$ ppr (exprType body)
 
-    init_subst e = mkEmptySubst (mkInScopeSet (exprFreeVars e))
-
-
+    body_ty = exprType body
+    in_scope = mkInScopeSet (exprFreeVars body `unionVarSet` tyCoVarsOfType body_ty)
+    -- in_scope is a bit tricky.
+    -- - We are wrapping `body` in some value lambdas, so must not shadow
+    --   any free vars of `body`
+    -- - We are wrapping `body` in some type lambdas, so must not shadow any
+    --   tyvars in body_ty.  Example: body is just a variable
+    --            (g :: forall (a::k). T k a -> Int)
+    --   We must not shadown that `k` when adding the /\a. So treat the free vars
+    --   of body_ty as in-scope.  Showed up in #23026.
 
 --------------
 freshEtaId :: Int -> Subst -> Scaled Type -> (Subst, Id)

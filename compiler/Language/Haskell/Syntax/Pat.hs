@@ -20,10 +20,11 @@
 -- See Note [Language.Haskell.Syntax.* Hierarchy] for why not GHC.Hs.*
 module Language.Haskell.Syntax.Pat (
         Pat(..), LPat,
-        ConLikeP,
+        ConLikeP, isInvisArgPat,
+        isVisArgPat,
 
-        HsConPatDetails, hsConPatArgs,
-        HsConPatTyArg(..),
+        HsConPatDetails, hsConPatArgs, hsConPatTyArgs,
+        HsConPatTyArg(..), XConPatTyArg,
         HsRecFields(..), HsFieldBind(..), LHsFieldBind,
         HsRecField, LHsRecField,
         HsRecUpdField, LHsRecUpdField,
@@ -36,7 +37,6 @@ import {-# SOURCE #-} Language.Haskell.Syntax.Expr (SyntaxExpr, LHsExpr, HsUntyp
 -- friends:
 import Language.Haskell.Syntax.Basic
 import Language.Haskell.Syntax.Lit
-import Language.Haskell.Syntax.Concrete
 import Language.Haskell.Syntax.Extension
 import Language.Haskell.Syntax.Type
 
@@ -79,16 +79,13 @@ data Pat p
 
   | AsPat       (XAsPat p)
                 (LIdP p)
-               !(LHsToken "@" p)
                 (LPat p)    -- ^ As pattern
     -- ^ - 'GHC.Parser.Annotation.AnnKeywordId' : 'GHC.Parser.Annotation.AnnAt'
 
     -- For details on above see Note [exact print annotations] in GHC.Parser.Annotation
 
   | ParPat      (XParPat p)
-               !(LHsToken "(" p)
                 (LPat p)                -- ^ Parenthesised pattern
-               !(LHsToken ")" p)
                                         -- See Note [Parens in HsSyn] in GHC.Hs.Expr
     -- ^ - 'GHC.Parser.Annotation.AnnKeywordId' : 'GHC.Parser.Annotation.AnnOpen' @'('@,
     --                                    'GHC.Parser.Annotation.AnnClose' @')'@
@@ -219,6 +216,14 @@ data Pat p
 
     -- ^ Pattern with a type signature
 
+  -- Embed the syntax of types into patterns.
+  -- Used with RequiredTypeArguments, e.g. fn (type t) = rhs
+  | EmbTyPat        (XEmbTyPat p)
+                    (HsTyPat (NoGhcTc p))
+
+  -- See Note [Invisible binders in functions] in GHC.Hs.Pat
+  | InvisPat (XInvisPat p) (HsTyPat (NoGhcTc p))
+
   -- Extension point; see Note [Trees That Grow] in Language.Haskell.Syntax.Extension
   | XPat
       !(XXPat p)
@@ -230,10 +235,16 @@ type family ConLikeP x
 
 -- | Type argument in a data constructor pattern,
 --   e.g. the @\@a@ in @f (Just \@a x) = ...@.
-data HsConPatTyArg p =
-  HsConPatTyArg
-    !(LHsToken "@" p)
-     (HsPatSigType p)
+data HsConPatTyArg p = HsConPatTyArg !(XConPatTyArg p) (HsTyPat p)
+
+type family XConPatTyArg p
+
+isInvisArgPat :: Pat p -> Bool
+isInvisArgPat InvisPat{} = True
+isInvisArgPat _   = False
+
+isVisArgPat :: Pat p -> Bool
+isVisArgPat = not . isInvisArgPat
 
 -- | Haskell Constructor Pattern Details
 type HsConPatDetails p = HsConDetails (HsConPatTyArg (NoGhcTc p)) (LPat p) (HsRecFields p (LPat p))
@@ -242,6 +253,11 @@ hsConPatArgs :: forall p . (UnXRec p) => HsConPatDetails p -> [LPat p]
 hsConPatArgs (PrefixCon _ ps) = ps
 hsConPatArgs (RecCon fs)      = Data.List.map (hfbRHS . unXRec @p) (rec_flds fs)
 hsConPatArgs (InfixCon p1 p2) = [p1,p2]
+
+hsConPatTyArgs :: forall p. HsConPatDetails p -> [HsConPatTyArg (NoGhcTc p)]
+hsConPatTyArgs (PrefixCon tyargs _) = tyargs
+hsConPatTyArgs (RecCon _)           = []
+hsConPatTyArgs (InfixCon _ _)       = []
 
 -- | Haskell Record Fields
 --
@@ -280,13 +296,13 @@ type LHsFieldBind p id arg = XRec p (HsFieldBind id arg)
 type LHsRecField  p arg = XRec p (HsRecField  p arg)
 
 -- | Located Haskell Record Update Field
-type LHsRecUpdField p   = XRec p (HsRecUpdField p)
+type LHsRecUpdField p q = XRec p (HsRecUpdField p q)
 
 -- | Haskell Record Field
 type HsRecField p arg   = HsFieldBind (LFieldOcc p) arg
 
 -- | Haskell Record Update Field
-type HsRecUpdField p    = HsFieldBind (LAmbiguousFieldOcc p) (LHsExpr p)
+type HsRecUpdField p q  = HsFieldBind (LAmbiguousFieldOcc p) (LHsExpr q)
 
 -- | Haskell Field Binding
 --
@@ -353,7 +369,7 @@ data HsFieldBind lhs rhs = HsFieldBind {
 --
 --     hfbLHS = Unambiguous "x" $sel:x:MkS  :: AmbiguousFieldOcc Id
 --
--- See also Note [Disambiguating record fields] in GHC.Tc.Gen.Head.
+-- See also Note [Disambiguating record updates] in GHC.Rename.Pat.
 
 hsRecFields :: forall p arg.UnXRec p => HsRecFields p arg -> [XCFieldOcc p]
 hsRecFields rbinds = Data.List.map (hsRecFieldSel . unXRec @p) (rec_flds rbinds)
@@ -363,4 +379,3 @@ hsRecFieldsArgs rbinds = Data.List.map (hfbRHS . unXRec @p) (rec_flds rbinds)
 
 hsRecFieldSel :: forall p arg. UnXRec p => HsRecField p arg -> XCFieldOcc p
 hsRecFieldSel = foExt . unXRec @p . hfbLHS
-

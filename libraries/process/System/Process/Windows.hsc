@@ -18,6 +18,8 @@ module System.Process.Windows
     , terminateJobUnsafe
     , waitForJobCompletion
     , timeout_Infinite
+    , HANDLE
+    , mkNamedPipe
     ) where
 
 import System.Process.Common
@@ -26,6 +28,7 @@ import Control.Exception
 import Control.Monad
 import Data.Bits
 import Data.Char (toLower)
+import Data.List (dropWhileEnd)
 import Foreign.C
 import Foreign.Marshal
 import Foreign.Ptr
@@ -36,8 +39,8 @@ import System.Posix.Internals
 import GHC.IO.Exception
 ##if defined(__IO_MANAGER_WINIO__)
 import GHC.IO.SubSystem
-import Graphics.Win32.Misc
 import qualified GHC.Event.Windows as Mgr
+import Graphics.Win32.Misc
 ##endif
 import GHC.IO.Handle.FD
 import GHC.IO.Handle.Types hiding (ClosedHandle)
@@ -57,7 +60,7 @@ import System.Win32.Process (getProcessId)
 
 ##if defined(i386_HOST_ARCH)
 ## define WINDOWS_CCONV stdcall
-##elif defined(x86_64_HOST_ARCH)
+##elif defined(x86_64_HOST_ARCH) || defined(aarch64_HOST_ARCH)
 ## define WINDOWS_CCONV ccall
 ##else
 ## error Unknown mingw32 arch
@@ -427,10 +430,26 @@ commandToProcess (ShellCommand string) = do
         -- I don't have the energy to find+fix them right now (ToDo). --SDM
         -- (later) Now I don't know what the above comment means.  sigh.
 commandToProcess (RawCommand cmd args)
-  | map toLower (takeExtension cmd) `elem` [".bat", ".cmd"]
+  | map toLower (takeWinExtension cmd) `elem` [".bat", ".cmd"]
   = return (cmd, translateInternal cmd ++ concatMap ((' ':) . translateCmdExeArg) args)
   | otherwise
   = return (cmd, translateInternal cmd ++ concatMap ((' ':) . translateInternal) args)
+
+-- TODO: filepath should also be updated with 'takeWinExtension'. Perhaps
+-- some day we can remove this logic from `process` but there is no hurry.
+
+-- | Get the extension of a Windows file, removing any trailing spaces or dots
+-- since they are ignored.
+--
+-- See: <https://learn.microsoft.com/en-us/troubleshoot/windows-client/shell-experience/file-folder-name-whitespace-characters>
+--
+-- >>> takeWinExtension "test.bat."
+-- ".bat"
+--
+-- >>> takeWinExtension "test.bat ."
+-- ".bat"
+takeWinExtension :: FilePath -> String
+takeWinExtension = takeExtension . dropWhileEnd (`elem` [' ', '.'])
 
 -- Find CMD.EXE (or COMMAND.COM on Win98).  We use the same algorithm as
 -- system() in the VC++ CRT (Vc7/crt/src/system.c in a VC++ installation).
@@ -491,6 +510,7 @@ translateCmdExeArg xs = "^\"" ++ snd (foldr escape (True,"^\"") xs)
   where escape '"'  (_,     str) = (True,  '\\' : '"'  : str)
         escape '\\' (True,  str) = (True,  '\\' : '\\' : str)
         escape '\\' (False, str) = (False, '\\' : str)
+        escape '%'  (_,     str) = (False, "%%cd:~,%" ++ str)
         escape c    (_,     str)
           | c `elem` "^<>|&()"   = (False, '^' : c : str)
           | otherwise            = (False,       c : str)
@@ -542,16 +562,16 @@ createPipeInternalHANDLE :: IO (Handle, Handle)
 createPipeInternalHANDLE =
   alloca $ \ pfdStdInput  ->
    alloca $ \ pfdStdOutput -> do
-     throwErrnoIf_  (==False) "c_mkNamedPipe" $
-       c_mkNamedPipe pfdStdInput True pfdStdOutput True
+     throwErrnoIf_  (==False) "mkNamedPipe" $
+       mkNamedPipe pfdStdInput True False pfdStdOutput True False
      Just hndStdInput  <- mbPipeHANDLE CreatePipe pfdStdInput ReadMode
      Just hndStdOutput <- mbPipeHANDLE CreatePipe pfdStdOutput WriteMode
      return (hndStdInput, hndStdOutput)
 
-
-foreign import ccall "mkNamedPipe" c_mkNamedPipe ::
-    Ptr HANDLE -> Bool -> Ptr HANDLE -> Bool -> IO Bool
 ##endif
+
+foreign import ccall "mkNamedPipe" mkNamedPipe ::
+  Ptr HANDLE -> Bool -> Bool -> Ptr HANDLE -> Bool -> Bool -> IO Bool
 
 close' :: CInt -> IO ()
 close' = throwErrnoIfMinus1_ "_close" . c__close

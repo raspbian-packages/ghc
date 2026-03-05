@@ -10,17 +10,13 @@ Profiling
 
 GHC comes with a time and space profiling system, so that you can answer
 questions like "why is my program so slow?", or "why is my program using
-so much memory?".
+so much memory?". We'll start by describing how to do time profiling.
 
-Profiling a program is a three-step process:
+Time profiling a program is a three-step process:
 
 1. Re-compile your program for profiling with the :ghc-flag:`-prof` option, and
    probably one of the options for adding automatic annotations:
-   :ghc-flag:`-fprof-auto` is the most common [1]_.
-
-   If you are using external packages with :command:`cabal`, you may need to
-   reinstall these packages with profiling support; typically this is
-   done with ``cabal install -p package --reinstall``.
+   :ghc-flag:`-fprof-late` is the recommended option.
 
 2. Having compiled the program for profiling, you now need to run it to
    generate the profile. For example, a simple time profile can be
@@ -36,6 +32,9 @@ Profiling a program is a three-step process:
 
 3. Examine the generated profiling information, use the information to
    optimise your program, and repeat as necessary.
+
+The time profiler measures the CPU time taken by the Haskell code in your application.
+In particular time taken by safe foreign calls is not tracked by the profiler (see :ref:`prof-foreign-calls`).
 
 .. _cost-centres:
 
@@ -197,7 +196,10 @@ Inserting cost centres by hand
 Cost centres are just program annotations. When you say ``-fprof-auto``
 to the compiler, it automatically inserts a cost centre annotation
 around every binding not marked INLINE in your program, but you are
-entirely free to add cost centre annotations yourself.
+entirely free to add cost centre annotations yourself. Be careful adding too many
+cost-centre annotations as the optimiser is careful to not move them around or
+remove them, which can severly affect how your program is optimised and hence the
+runtime performance!
 
 The syntax of a cost centre annotation for expressions is ::
 
@@ -212,7 +214,7 @@ may not appear in a position where it would change the grouping of
 subexpressions::
 
   a = 1 / 2 / 2                          -- accepted (a=0.25)
-  b = 1 / {-# SCC "name" #-} / 2 / 2     -- rejected (instead of b=1.0)
+  b = 1 / {-# SCC "name" #-} 2 / 2       -- rejected (instead of b=1.0)
 
 This restriction is required to maintain the property that inserting a pragma,
 just like inserting a comment, does not have unintended effects on the
@@ -311,6 +313,39 @@ and become CAFs. You will probably need to consult the Core
 .. index::
    single: -fprof-cafs
 
+.. _prof-foreign-calls:
+
+Profiling and foreign calls
+---------------------------
+
+Simply put, the profiler includes time spent in unsafe foreign
+calls but ignores time taken in safe foreign calls. For example, time spent blocked on IO
+operations (e.g. ``getLine``) is not accounted for in the profile as ``getLine`` is implemented
+using a safe foreign call.
+
+The profiler estimates CPU time, for Haskell threads within the program only.
+In particular, time "taken" by the program in blocking safe foreign calls
+is not accounted for in time profiles. The runtime has the notion of a virtual
+processor which is known as a "capability". Haskell threads are run on capabilities,
+and the profiler samples the capabilities in order to determine what is being
+executed at a certain time. When a safe foreign call is executed, it's run outside
+the context of a capability; hence the sampling does not account for the time
+taken. Whilst the safe call is executed, other
+Haskell threads are free to run on the capability, and their cost will be attributed
+to the profiler. When the safe call is finished, the blocked, descheduled thread can
+be resumed and rescheduled.
+
+However, the time taken by blocking on unsafe foreign calls is accounted for in the profile.
+This happens because unsafe foreign calls are executed by the same capability
+their calling Haskell thread is running on. Therefore, an unsafe foreign call will
+block the entire capability whilst it is running, and any time the capability is
+sampled the "cost" of the foreign call will be attributed to the calling cost-centre stack.
+
+However, do note that you are not supposed to use unsafe foreign calls for any
+operations which do block! Do not be tempted to replace your safe foreign calls
+with unsafe calls just so they appear in the profile. This prevents GC from
+happening until the foreign call returns, which can be catastrophic for performance.
+
 .. _prof-compiler-options:
 
 Compiler options for profiling
@@ -356,7 +391,9 @@ Automatically placing cost-centres
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 GHC has a number of flags for automatically inserting cost-centres into the
-compiled program.
+compiled program. Use these options carefully because inserting too many cost-centres
+in the wrong places will mean the optimiser will be less effective and the runtime behaviour
+of your profiled program will be different to that of the unprofiled one.
 
 .. ghc-flag:: -fprof-callers=⟨name⟩
     :shortdesc: Auto-add ``SCC``\\ s to all call-sites of the named function.
@@ -446,10 +483,12 @@ compiled program.
 
     :since: 9.4.1
 
-    Adds an automatic ``SCC`` annotation to all top level bindings late in the compilation pipeline after
-    the optimizer has run and unfoldings have been created. This means these cost centres will not interfere with core-level optimizations
+    Adds an automatic ``SCC`` annotation to all top level bindings which might perform work.
+    This is done late in the compilation pipeline after the optimizer has run and unfoldings have been created.
+    This means these cost centres will not interfere with core-level optimizations
     and the resulting profile will be closer to the performance profile of an optimized non-profiled
     executable.
+
     While the results of this are generally informative, some of the compiler internal names
     will leak into the profile. Further if a function is inlined into a use site it's costs will be counted against the
     caller's cost center.
@@ -480,6 +519,49 @@ compiled program.
     after inlining. Further there can be significant overhead from cost centres added to small functions if they are inlined often.
 
     You can try this mode if :ghc-flag:`-fprof-late` results in a profile that's too hard to interpret.
+
+.. ghc-flag:: -fprof-late-overloaded
+    :shortdesc: Auto-add ``SCC``\\ s to all top level overloaded bindings *after* the core pipeline has run.
+    :type: dynamic
+    :reverse: -fno-prof-late-overloaded
+    :category:
+
+    :since: 9.10.1
+
+    Adds an automatic ``SCC`` annotation to all *overloaded* top level bindings
+    late in the compilation pipeline after the optimizer has run and unfoldings
+    have been created. This means these cost centres will not interfere with
+    core-level optimizations and the resulting profile will be closer to the
+    performance profile of an optimized non-profiled executable.
+
+    This flag can help determine which top level bindings encountered during a
+    program's execution are still overloaded after inlining and specialization.
+
+.. ghc-flag:: -fprof-late-overloaded-calls
+    :shortdesc: Auto-add ``SCC``\\ s to all call sites that include dictionary arguments *after* the core pipeline has run.
+    :type: dynamic
+    :reverse: -fno-prof-late-overloaded-calls
+    :category:
+
+    :since: 9.10.1
+
+    Adds an automatic ``SCC`` annotation to all call sites that include
+    dictionary arguments late in the compilation pipeline after the optimizer
+    has run and unfoldings have been created. This means these cost centres will
+    not interfere with core-level optimizations and the resulting profile will
+    be closer to the performance profile of an optimized non-profiled
+    executable.
+
+    This flag is potentially more useful than :ghc-flag:`-fprof-late-overloaded`
+    since it will also add ``SCC`` annotations to call sites of imported
+    overloaded functions.
+
+    Some overloaded calls may not be annotated, specifically in cases where the
+    optimizer turns an overloaded function into a join point. Calls to such
+    functions will not be wrapped in ``SCC`` annotations, since it would make
+    them non-tail calls, which is a requirement for join points. Instead,
+    ``SCC`` annotations are added around the body of overloaded join variables
+    and given distinct names (``join-rhs-<var>``) to avoid confusion.
 
 .. ghc-flag:: -fprof-cafs
     :shortdesc: Auto-add ``SCC``\\ s to all CAFs
@@ -618,8 +700,10 @@ enclosed between ``+RTS ... -RTS`` as usual):
 JSON profile format
 ~~~~~~~~~~~~~~~~~~~
 
-When invoked with the :rts-flag:`-pj` flag the runtime will emit the cost-centre
-profile in a machine-readable JSON format. The top-level object of this format
+profile in a machine-readable JSON format. The JSON file can be directly loaded
+into `speedscope.app <https://www.speedscope.app/>`_ to interactively view the profile.
+
+The top-level object of this format
 has the following properties,
 
 ``program`` (string)
@@ -758,8 +842,12 @@ For instance, a simple profile might look like this,
       }
     }
 
+Eventlog profile format
+~~~~~~~~~~~~~~~~~~~~~~~
 
-
+In addition to the ``.prof`` and ``.json`` formats the cost centre definitions
+and samples are also emitted to the :ref:`eventlog <rts-eventlog>`. The format
+of the events is specified in the :ref:`eventlog encodings <eventlog-encodings>` section.
 
 
 .. _prof-heap:
@@ -774,17 +862,34 @@ program holds on to more memory at run-time that it needs to. Space
 leaks lead to slower execution due to heavy garbage collector activity,
 and may even cause the program to run out of memory altogether.
 
+Heap profiling differs from time profiling in the fact that is not always
+necessary to use the profiling runtime to generate a heap profile. There
+are two heap profiling modes (:rts-flag:`-hT` and :rts-flag:`-hi` [1]_) which are always
+available.
+
 To generate a heap profile from your program:
 
-1. Compile the program for profiling (:ref:`prof-compiler-options`).
+1. Assuming you need the profiling runtime, compile the program for profiling (:ref:`prof-compiler-options`).
 
 2. Run it with one of the heap profiling options described below (eg.
-   :rts-flag:`-hc` for a basic producer profile). This generates the file
-   :file:`{prog}.hp`.
+   :rts-flag:`-hc` for a basic producer profile) and enable the eventlog using :rts-flag:`-l <-l ⟨flags⟩>`.
 
-   If the :ref:`event log <rts-eventlog>` is enabled (with the :rts-flag:`-l ⟨flags⟩`
-   runtime system flag) heap samples will additionally be emitted to the GHC
+   Heap samples will be emitted to the GHC
    event log (see :ref:`heap-profiler-events` for details about event format).
+
+3. Render the heap profile using `eventlog2html <https://hackage.haskell.org/package/eventlog2html>`_.
+   This produces an HTML file which contains the visualised profile.
+
+4. Open the rendered interactive profile in your web browser.
+
+For example, here is a heap profile produced of using eventlog profiling on GHC
+compiling the Cabal library. You can read a lot more about eventlog2html on the website.
+
+.. image:: images/eventlog_profile.*
+
+Note that there is the legacy :file:`{prog}.hp` format which has been deprecated
+in favour of eventlog based profiling. In order to render the legacy format, the
+steps are as follows.
 
 3. Run :command:`hp2ps` to produce a Postscript file, :file:`{prog}.ps`. The
    :command:`hp2ps` utility is described in detail in :ref:`hp2ps`.
@@ -796,10 +901,6 @@ For example, here is a heap profile produced for the ``sphere`` program
 from GHC's ``nofib`` benchmark suite,
 
 .. image:: images/prof_scc.*
-
-You might also want to take a look at
-`hp2any <https://www.haskell.org/haskellwiki/Hp2any>`__, a more advanced
-suite of tools (not distributed with GHC) for displaying heap profiles.
 
 Note that there might be a big difference between the OS reported memory usage
 of your program and the amount of live data as reported by heap profiling.
@@ -817,19 +918,13 @@ following RTS options select which break-down to use:
 
 .. rts-flag:: -hT
 
-    Breaks down the graph by heap closure type.
+    Breaks down the graph by heap closure type. This does not require the profiling
+    runtime.
 
 .. rts-flag:: -hc
-              -h
 
     *Requires* :ghc-flag:`-prof`. Breaks down the graph by the cost-centre stack
     which produced the data.
-
-    .. note:: The meaning of the shortened :rts-flag:`-h` is dependent on whether
-              your program was compiled for profiling. When compiled for profiling,
-              :rts-flag:`-h` is equivalent to :rts-flag:`-hc`, but otherwise is
-              equivalent to :rts-flag:`-hT` (see :ref:`rts-profiling`). The :rts-flag:`-h`
-              is deprecated and will be removed in a future release.
 
 .. rts-flag:: -hm
 
@@ -848,6 +943,17 @@ following RTS options select which break-down to use:
     which have function type or unknown/polymorphic type, the string will
     represent an approximation to the actual type.
 
+.. rts-flag:: -he
+
+    :since: 9.10.1
+
+    *Requires* :ghc-flag:`-prof`. Break down the graph by era.
+
+    Each closure is tagged with the era in which it is created. Eras start at 1
+    and can be set in your program to domain specific values using functions from
+    ``GHC.Profiling.Eras`` or incremented automatically by the
+    :rts-flag:`--automatic-era-increment`.
+
 .. rts-flag:: -hr
 
     *Requires* :ghc-flag:`-prof`. Break down the graph by retainer set. Retainer
@@ -863,7 +969,7 @@ following RTS options select which break-down to use:
 
     Break down the graph by the address of the info table of a closure. For this
     to produce useful output the program must have been compiled with
-    :ghc-flag:`-finfo-table-map`.
+    :ghc-flag:`-finfo-table-map` but it does not require the profiling runtime.
 
 .. rts-flag:: -l
     :noindex:
@@ -890,42 +996,47 @@ follows:
 .. rts-flag:: -hc ⟨name⟩
     :noindex:
 
-    Restrict the profile to closures produced by cost-centre stacks with
+    *Requires* :ghc-flag:`-prof`. Restrict the profile to closures produced by cost-centre stacks with
     one of the specified cost centres at the top.
 
 .. rts-flag:: -hC ⟨name⟩
     :noindex:
 
-    Restrict the profile to closures produced by cost-centre stacks with
+    *Requires* :ghc-flag:`-prof`. Restrict the profile to closures produced by cost-centre stacks with
     one of the specified cost centres anywhere in the stack.
 
 .. rts-flag:: -hm ⟨module⟩
     :noindex:
 
-    Restrict the profile to closures produced by the specified modules.
+    *Requires* :ghc-flag:`-prof`. Restrict the profile to closures produced by the specified modules.
 
 .. rts-flag:: -hd ⟨desc⟩
     :noindex:
 
-    Restrict the profile to closures with the specified description
+    *Requires* :ghc-flag:`-prof`. Restrict the profile to closures with the specified description
     strings.
 
 .. rts-flag:: -hy ⟨type⟩
     :noindex:
 
-    Restrict the profile to closures with the specified types.
+    *Requires* :ghc-flag:`-prof`. Restrict the profile to closures with the specified types.
+
+.. rts-flag:: -he ⟨era⟩
+    :noindex:
+
+    *Requires* :ghc-flag:`-prof`. Restrict the profile to the specified era.
 
 .. rts-flag:: -hr ⟨cc⟩
     :noindex:
 
-    Restrict the profile to closures with retainer sets containing
+    *Requires* :ghc-flag:`-prof`. Restrict the profile to closures with retainer sets containing
     cost-centre stacks with one of the specified cost centres at the
     top.
 
 .. rts-flag:: -hb ⟨bio⟩
     :noindex:
 
-    Restrict the profile to closures with one of the specified
+    *Requires* :ghc-flag:`-prof`. Restrict the profile to closures with one of the specified
     biographies, where ⟨bio⟩ is one of ``lag``, ``drag``, ``void``, or
     ``use``.
 
@@ -959,6 +1070,20 @@ There are three more options which relate to heap profiling:
     option is enabled, it's expected that the user will manually start heap
     profiling or request specific samples using functions from ``GHC.Profiling``.
 
+.. rts-flag:: --no-automatic-time-samples
+
+    :since: 9.10.1
+
+    Don't start time profiling from the start of program execution. If this
+    option is enabled, it's expected that the user will manually start time
+    profiling or request specific samples using functions from ``GHC.Profiling``.
+
+.. rts-flag:: --automatic-era-increment
+
+    :since: 9.10.1
+
+    Increment the era by 1 on each major garbage collection. This is used
+    in conjunction with :rts-flag:`-he`.
 
 .. rts-flag:: --null-eventlog-writer
 
@@ -1041,6 +1166,14 @@ This trick isn't foolproof, because there might be other ``B`` closures in
 the heap which aren't the retainers we are interested in, but we've
 found this to be a useful technique in most cases.
 
+Precise Retainer Analysis
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+If you want to precisely answer questions about why a certain type of closure is
+retained then it is worthwhile using `ghc-debug <https://gitlab.haskell.org/ghc/ghc-debug>`_ which
+has a terminal interface which can be used to easily answer queries such as, what is retaining
+a certain closure.
+
 .. _biography-prof:
 
 Biographical Profiling
@@ -1119,6 +1252,9 @@ reasons for this:
 -  The program text itself, the C stack, any non-heap data (e.g. data
    allocated by foreign libraries, and data allocated by the RTS), and
    ``mmap()``\'d memory are not counted in the heap profile.
+
+For more discussion about understanding how understanding process residency see
+:ref:`hints-os-memory`.
 
 .. _hp2ps:
 
@@ -1241,123 +1377,6 @@ The flags are:
 .. option:: -?
 
     Print out usage information.
-
-.. _manipulating-hp:
-
-Manipulating the ``hp`` file
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-(Notes kindly offered by Jan-Willem Maessen.)
-
-The ``FOO.hp`` file produced when you ask for the heap profile of a
-program ``FOO`` is a text file with a particularly simple structure.
-Here's a representative example, with much of the actual data omitted:
-
-.. code-block:: none
-
-    JOB "FOO -hC"
-    DATE "Thu Dec 26 18:17 2002"
-    SAMPLE_UNIT "seconds"
-    VALUE_UNIT "bytes"
-    BEGIN_SAMPLE 0.00
-    END_SAMPLE 0.00
-    BEGIN_SAMPLE 15.07
-      ... sample data ...
-    END_SAMPLE 15.07
-    BEGIN_SAMPLE 30.23
-      ... sample data ...
-    END_SAMPLE 30.23
-    ... etc.
-    BEGIN_SAMPLE 11695.47
-    END_SAMPLE 11695.47
-
-The first four lines (``JOB``, ``DATE``, ``SAMPLE_UNIT``,
-``VALUE_UNIT``) form a header. Each block of lines starting with
-``BEGIN_SAMPLE`` and ending with ``END_SAMPLE`` forms a single sample
-(you can think of this as a vertical slice of your heap profile). The
-hp2ps utility should accept any input with a properly-formatted header
-followed by a series of *complete* samples.
-
-Zooming in on regions of your profile
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-You can look at particular regions of your profile simply by loading a
-copy of the ``.hp`` file into a text editor and deleting the unwanted
-samples. The resulting ``.hp`` file can be run through ``hp2ps`` and
-viewed or printed.
-
-Viewing the heap profile of a running program
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-The ``.hp`` file is generated incrementally as your program runs. In
-principle, running :command:`hp2ps` on the incomplete file should produce a
-snapshot of your program's heap usage. However, the last sample in the
-file may be incomplete, causing :command:`hp2ps` to fail. If you are using a
-machine with UNIX utilities installed, it's not too hard to work around
-this problem (though the resulting command line looks rather Byzantine):
-
-.. code-block:: sh
-
-    head -`fgrep -n END_SAMPLE FOO.hp | tail -1 | cut -d : -f 1` FOO.hp \
-        | hp2ps > FOO.ps
-
-The command ``fgrep -n END_SAMPLE FOO.hp`` finds the end of every
-complete sample in ``FOO.hp``, and labels each sample with its ending
-line number. We then select the line number of the last complete sample
-using :command:`tail` and :command:`cut`. This is used as a parameter to :command:`head`; the
-result is as if we deleted the final incomplete sample from :file:`FOO.hp`.
-This results in a properly-formatted .hp file which we feed directly to
-:command:`hp2ps`.
-
-Viewing a heap profile in real time
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-The :command:`gv` and :command:`ghostview` programs have a "watch file" option
-can be used to view an up-to-date heap profile of your program as it runs.
-Simply generate an incremental heap profile as described in the previous
-section. Run :command:`gv` on your profile:
-
-.. code-block:: sh
-
-      gv -watch -orientation=seascape FOO.ps
-
-If you forget the ``-watch`` flag you can still select "Watch file" from
-the "State" menu. Now each time you generate a new profile ``FOO.ps``
-the view will update automatically.
-
-This can all be encapsulated in a little script:
-
-.. code-block:: sh
-
-      #!/bin/sh
-      head -`fgrep -n END_SAMPLE FOO.hp | tail -1 | cut -d : -f 1` FOO.hp \
-        | hp2ps > FOO.ps
-      gv -watch -orientation=seascape FOO.ps &
-      while [ 1 ] ; do
-        sleep 10 # We generate a new profile every 10 seconds.
-        head -`fgrep -n END_SAMPLE FOO.hp | tail -1 | cut -d : -f 1` FOO.hp \
-          | hp2ps > FOO.ps
-      done
-
-Occasionally :command:`gv` will choke as it tries to read an incomplete copy of
-:file:`FOO.ps` (because :command:`hp2ps` is still running as an update occurs). A
-slightly more complicated script works around this problem, by using the
-fact that sending a SIGHUP to gv will cause it to re-read its input
-file:
-
-.. code-block:: sh
-
-      #!/bin/sh
-      head -`fgrep -n END_SAMPLE FOO.hp | tail -1 | cut -d : -f 1` FOO.hp \
-        | hp2ps > FOO.ps
-      gv FOO.ps &
-      gvpsnum=$!
-      while [ 1 ] ; do
-        sleep 10
-        head -`fgrep -n END_SAMPLE FOO.hp | tail -1 | cut -d : -f 1` FOO.hp \
-          | hp2ps > FOO.ps
-        kill -HUP $gvpsnum
-      done
 
 .. _prof-threaded:
 
@@ -1968,10 +1987,9 @@ Notes about ticky profiling
   in some columns. For this reason using an eventlog-based approach should be prefered if
   possible.
 
-
 .. [1]
-   :ghc-flag:`-fprof-auto` was known as ``-auto-all`` prior to
-   GHC 7.4.1.
+   :rts-flag:`-hi` profiling is avaible with the normal runtime but you will need to
+   compile with :ghc-flag:`-finfo-table-map` to interpret the results.
 
 .. [2]
    Note that this policy has changed slightly in GHC 7.4.1 relative to

@@ -6,27 +6,30 @@ Index: b/hadrian/src/Oracles/Setting.hs
 ===================================================================
 --- a/hadrian/src/Oracles/Setting.hs
 +++ b/hadrian/src/Oracles/Setting.hs
-@@ -292,13 +292,8 @@ hostSupportsRPaths = anyHostOs ["linux",
+@@ -196,16 +196,8 @@ hostSupportsRPaths = queryHostTarget (\t
  -- | Check whether the target supports GHCi.
  ghcWithInterpreter :: Action Bool
  ghcWithInterpreter = do
--    goodOs <- anyTargetOs [ "mingw32", "cygwin32", "linux", "solaris2"
--                          , "freebsd", "dragonfly", "netbsd", "openbsd"
--                          , "darwin", "kfreebsdgnu" ]
--    goodArch <- anyTargetArch [ "i386", "x86_64", "powerpc"
--                              , "arm", "aarch64", "s390x"
--                              , "powerpc64", "powerpc64le" ]
+-    goodOs <- anyTargetOs [ OSMinGW32, OSLinux, OSSolaris2 -- TODO "cygwin32"?,
+-                          , OSFreeBSD, OSDragonFly, OSNetBSD, OSOpenBSD
+-                          , OSDarwin, OSKFreeBSD ]
+-    goodArch <- (||) <$>
+-                anyTargetArch [ ArchX86, ArchX86_64, ArchPPC
+-                              , ArchAArch64, ArchS390X
+-                              , ArchPPC_64 ELF_V1, ArchPPC_64 ELF_V2
+-                              , ArchRISCV64 ]
+-                              <*> isArmTarget
 -    return $ goodOs && goodArch
 +    -- Enable GHCi on all platforms for Debian
 +    return True
  
- -- | Variants of the ARM architecture.
- data ArmVersion = ARMv5 | ARMv6 | ARMv7
+ -- | Which variant of the ARM architecture is the target (or 'Nothing' if not
+ -- ARM)?
 Index: b/hadrian/bindist/config.mk.in
 ===================================================================
 --- a/hadrian/bindist/config.mk.in
 +++ b/hadrian/bindist/config.mk.in
-@@ -140,8 +140,8 @@ GhcWithSMP := $(strip $(if $(filter YESN
+@@ -152,8 +152,8 @@ GhcWithSMP := $(strip $(if $(filter YESN
  
  # Whether to include GHCi in the compiler.  Depends on whether the RTS linker
  # has support for this OS/ARCH combination.

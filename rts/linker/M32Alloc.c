@@ -156,7 +156,10 @@ static bool
 is_okay_address(void *p) {
   int8_t *here = LINKER_LOAD_BASE;
   ssize_t displacement = (int8_t *) p - here;
-  return (displacement > -0x7fffffff) && (displacement < 0x7fffffff);
+  // if we assume -fPIC, we don't care where we load code.
+  // But we still want to use the m32 allocator to avoid fragmentation (#24432)
+  return RtsFlags.MiscFlags.linkerAlwaysPic
+         || ((displacement > -0x7fffffff) && (displacement < 0x7fffffff));
 }
 
 enum m32_page_type {
@@ -286,13 +289,13 @@ m32_release_page(struct m32_page_t *page)
 
   const size_t pgsz = getPageSize();
   ssize_t sz = page->filled_page.size;
-  IF_DEBUG(sanity, memset(page, 0xaa, sz));
 
   // Break the page, which may be a large multi-page allocation, into
   // individual pages for the page pool
   while (sz > 0) {
     if (m32_free_page_pool_size < M32_MAX_FREE_PAGE_POOL_SIZE) {
       mprotectForLinker(page, pgsz, MEM_READ_WRITE);
+      IF_DEBUG(sanity, memset(page, 0xaa, pgsz));
       SET_PAGE_TYPE(page, FREE_PAGE);
       page->free_page.next = m32_free_page_pool;
       m32_free_page_pool = page;

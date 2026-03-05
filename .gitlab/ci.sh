@@ -7,8 +7,9 @@
 set -Eeuo pipefail
 
 # Configuration:
-HACKAGE_INDEX_STATE="2020-12-21T14:48:20Z"
+HACKAGE_INDEX_STATE="2024-05-13T15:04:38Z"
 MIN_HAPPY_VERSION="1.20"
+MAX_HAPPY_VERSION="1.21" # Exclusive upper bound
 MIN_ALEX_VERSION="3.2.6"
 
 TOP="$(pwd)"
@@ -43,12 +44,13 @@ $0 - GHC continuous integration driver
 
 Common Modes:
 
-  usage         Show this usage message.
-  setup         Prepare environment for a build.
-  configure     Run ./configure.
-  clean         Clean the tree
-  shell         Run an interactive shell with a configured build environment.
-  save_cache    Preserve the cabal cache
+  usage             Show this usage message.
+  setup             Prepare environment for a build.
+  configure         Run ./configure.
+  clean             Clean the tree
+  shell             Run an interactive shell with a configured build environment.
+  save_test_output  Generate unexpected-test-output.tar.gz
+  save_cache        Preserve the cabal cache
 
 Hadrian build system
   build_hadrian Build GHC via the Hadrian build system
@@ -59,7 +61,7 @@ Environment variables affecting both build systems:
   CROSS_TARGET      Triple of cross-compilation target.
   VERBOSE           Set to non-empty for verbose build output
   RUNTEST_ARGS      Arguments passed to runtest.py
-  MSYSTEM           (Windows-only) Which platform to build form (MINGW64 or MINGW32).
+  MSYSTEM           (Windows-only) Which platform to build from (CLANG64).
   IGNORE_PERF_FAILURES
                     Whether to ignore perf failures (one of "increases",
                     "decreases", or "all")
@@ -73,16 +75,6 @@ Environment variables affecting both build systems:
   NIX_SYSTEM        On Darwin, the target platform of the desired toolchain
                     (either "x86-64-darwin" or "aarch-darwin")
   NO_BOOT           Whether to run ./boot or not, used when testing the source dist
-
-Environment variables determining build configuration of Make system:
-
-  BUILD_FLAVOUR     Which flavour to build.
-  BUILD_SPHINX_HTML Whether to build Sphinx HTML documentation.
-  BUILD_SPHINX_PDF  Whether to build Sphinx PDF documentation.
-  INTEGER_LIBRARY   Which integer library to use (integer-simple or integer-gmp).
-  HADDOCK_HYPERLINKED_SOURCES
-                    Whether to build hyperlinked Haddock sources.
-  TEST_TYPE         Which test rule to run.
 
 Environment variables determining build configuration of Hadrian system:
 
@@ -141,11 +133,7 @@ function setup_locale() {
 
 function mingw_init() {
   case "$MSYSTEM" in
-    MINGW32)
-      target_triple="i386-unknown-mingw32"
-      boot_triple="i386-unknown-mingw32" # triple of bootstrap GHC
-      ;;
-    MINGW64)
+    CLANG64)
       target_triple="x86_64-unknown-mingw32"
       boot_triple="x86_64-unknown-mingw32" # triple of bootstrap GHC
       ;;
@@ -164,6 +152,8 @@ function mingw_init() {
 
   # We always use mingw64 Python to avoid path length issues like #17483.
   export PYTHON="/mingw64/bin/python3"
+  # And need to use sphinx-build from the environment
+  export SPHINXBUILD="/mingw64/bin/sphinx-build.exe"
 }
 
 # This will contain GHC's local native toolchain
@@ -214,21 +204,18 @@ function set_toolchain_paths() {
           *) fail "unknown NIX_SYSTEM" ;;
         esac
         info "Building toolchain for $NIX_SYSTEM"
-        nix-build .gitlab/darwin/toolchain.nix --argstr system "$NIX_SYSTEM" -o toolchain.sh
-        cat toolchain.sh
+        nix-build --quiet .gitlab/darwin/toolchain.nix --argstr system "$NIX_SYSTEM" -o toolchain.sh
       fi
       source toolchain.sh
-      info "--info for GHC for $NIX_SYSTEM"
-      $GHC --info
       ;;
     env)
       # These are generally set by the Docker image but
       # we provide these handy fallbacks in case the
       # script isn't run from within a GHC CI docker image.
-      if [ -z "$GHC" ]; then GHC="$(which ghc)"; fi
-      if [ -z "$CABAL" ]; then CABAL="$(which cabal)"; fi
-      if [ -z "$HAPPY" ]; then HAPPY="$(which happy)"; fi
-      if [ -z "$ALEX" ]; then ALEX="$(which alex)"; fi
+      : ${GHC:=$(which ghc)}
+      : ${CABAL:=$(which cabal)}
+      : ${HAPPY:=$(which happy)}
+      : ${ALEX:=$(which alex)}
       ;;
     *) fail "bad toolchain_source"
   esac
@@ -246,7 +233,7 @@ function set_toolchain_paths() {
 function cabal_update() {
   # In principle -w shouldn't be necessary here but with
   # cabal-install 3.8.1.0 it is, due to cabal#8447.
-  run "$CABAL" update -w "$GHC" --index="$HACKAGE_INDEX_STATE"
+  run "$CABAL" update -w "$GHC" "hackage.haskell.org,${HACKAGE_INDEX_STATE}"
 }
 
 
@@ -278,6 +265,11 @@ function setup() {
   show_tool CABAL
   show_tool HAPPY
   show_tool ALEX
+
+  info "====================================================="
+  info "ghc --info"
+  info "====================================================="
+  $GHC --info
 }
 
 function fetch_ghc() {
@@ -316,13 +308,12 @@ function fetch_cabal() {
           fail "neither CABAL nor CABAL_INSTALL_VERSION are not set"
       fi
 
-      start_section "fetch GHC"
+      start_section "fetch cabal"
       case "$(uname)" in
         # N.B. Windows uses zip whereas all others use .tar.xz
         MSYS_*|MINGW*)
           case "$MSYSTEM" in
-            MINGW32) cabal_arch="i386" ;;
-            MINGW64) cabal_arch="x86_64" ;;
+            CLANG64) cabal_arch="x86_64" ;;
             *) fail "unknown MSYSTEM $MSYSTEM" ;;
           esac
           url="https://downloads.haskell.org/~cabal/cabal-install-$v/cabal-install-$v-$cabal_arch-windows.zip"
@@ -344,7 +335,7 @@ function fetch_cabal() {
           mv cabal "$toolchain/bin"
           ;;
       esac
-      end_section "fetch GHC"
+      end_section "fetch cabal"
   fi
 }
 
@@ -370,7 +361,7 @@ function setup_toolchain() {
   esac
 
   info "Building happy..."
-  $cabal_install happy --constraint="happy>=$MIN_HAPPY_VERSION"
+  $cabal_install happy --constraint="happy>=$MIN_HAPPY_VERSION" --constraint="happy<$MAX_HAPPY_VERSION"
 
   info "Building alex..."
   $cabal_install alex --constraint="alex>=$MIN_ALEX_VERSION"
@@ -390,26 +381,6 @@ function cleanup_submodules() {
     info "Not cleaning submodules, not in a git repo"
   fi;
   end_section "clean submodules"
-}
-
-function prepare_build_mk() {
-  if [[ -z "$BUILD_FLAVOUR" ]]; then fail "BUILD_FLAVOUR is not set"; fi
-  if [[ -z ${BUILD_SPHINX_HTML:-} ]]; then BUILD_SPHINX_HTML=YES; fi
-  if [[ -z ${BUILD_SPHINX_PDF:-} ]]; then BUILD_SPHINX_PDF=YES; fi
-
-  cat > mk/build.mk <<EOF
-BIGNUM_BACKEND=${BIGNUM_BACKEND}
-include mk/flavours/${BUILD_FLAVOUR}.mk
-GhcLibHcOpts+=-haddock
-EOF
-
-  if [ -n "${HADDOCK_HYPERLINKED_SOURCES:-}" ]; then
-    echo "EXTRA_HADDOCK_OPTS += --hyperlinked-source --quickjump" >> mk/build.mk
-  fi
-
-
-  info "build.mk is:"
-  cat mk/build.mk
 }
 
 function configure() {
@@ -433,6 +404,12 @@ function configure() {
     else
     args+=("--disable-numa")
   fi
+  if [[ -n ${HAPPY:-} ]]; then
+    args+=("HAPPY=$HAPPY")
+  fi
+  if [[ -n ${ALEX:-} ]]; then
+    args+=("ALEX=$ALEX")
+  fi
 
   start_section "configuring"
   # See https://stackoverflow.com/questions/7577052 for a rationale for the
@@ -441,8 +418,6 @@ function configure() {
     --enable-tarballs-autodownload \
     "${args[@]+"${args[@]}"}" \
     GHC="$GHC" \
-    HAPPY="$HAPPY" \
-    ALEX="$ALEX" \
     || ( cat config.log; fail "configure failed" )
   end_section "configuring"
 }
@@ -457,7 +432,7 @@ function push_perf_notes() {
     return
   fi
 
-  if [[ -n "${CROSS_TARGET:-}" ]]; then
+  if [ -n "${CROSS_TARGET:-}" ] && [ "${CROSS_EMULATOR:-}" != "js-emulator" ]; then
     info "Can't test cross-compiled build."
     return
   fi
@@ -512,18 +487,29 @@ function build_hadrian() {
 
   check_release_build
 
+  # Just to be sure, use the same hackage index state when building Hadrian.
+  echo "index-state: $HACKAGE_INDEX_STATE" > hadrian/cabal.project.local
+
   # We can safely enable parallel compression for x64. By the time
   # hadrian calls tar/xz to produce bindist, there's no other build
   # work taking place.
   if [[ "${CI_JOB_NAME:-}" != *"i386"* ]]; then
-    XZ_OPT="${XZ_OPT:-} -T$cores"
+    export XZ_OPT="${XZ_OPT:-} -T$cores"
   fi
 
   if [[ -n "${REINSTALL_GHC:-}" ]]; then
     run_hadrian build-cabal -V
   else
-    run_hadrian test:all_deps binary-dist -V
-    mv _build/bindist/ghc*.tar.xz "$BIN_DIST_NAME.tar.xz"
+    case "$(uname)" in
+        MSYS_*|MINGW*)
+          run_hadrian test:all_deps reloc-binary-dist -V
+          mv _build/reloc-bindist/ghc*.tar.xz "$BIN_DIST_NAME.tar.xz"
+          ;;
+        *)
+          run_hadrian test:all_deps binary-dist -V
+          mv _build/bindist/ghc*.tar.xz "$BIN_DIST_NAME.tar.xz"
+          ;;
+    esac
   fi
 
 }
@@ -608,16 +594,33 @@ function test_hadrian() {
   if [[ "${CROSS_EMULATOR:-}" == "NOT_SET" ]]; then
     info "Cannot test cross-compiled build without CROSS_EMULATOR being set."
     return
+    # special case for JS backend
+  elif [ -n "${CROSS_TARGET:-}" ] && [ "${CROSS_EMULATOR:-}" == "js-emulator" ]; then
+    # The JS backend doesn't support CROSS_EMULATOR logic yet
+    unset CROSS_EMULATOR
+    # run "hadrian test" directly, not using the bindist, even though it did get installed.
+    # This is a temporary solution, See !9515 for the status of hadrian support.
+    run_hadrian \
+      test \
+      --summary-junit=./junit.xml \
+      --test-have-intree-files    \
+      --docs=none                 \
+      "runtest.opts+=${RUNTEST_ARGS:-}" \
+      "runtest.opts+=--unexpected-output-dir=$TOP/unexpected-test-output" \
+      || fail "cross-compiled hadrian main testsuite"
+  elif [[ -n "${CROSS_TARGET:-}" ]] && [[ "${CROSS_TARGET:-}" == *"wasm"* ]]; then
+    run_hadrian \
+      test \
+      --summary-junit=./junit.xml \
+      "runtest.opts+=${RUNTEST_ARGS:-}" \
+      "runtest.opts+=--unexpected-output-dir=$TOP/unexpected-test-output" \
+      || fail "hadrian main testsuite targetting $CROSS_TARGET"
   elif [ -n "${CROSS_TARGET:-}" ]; then
     local instdir="$TOP/_build/install"
     local test_compiler="$instdir/bin/${cross_prefix}ghc$exe"
     install_bindist _build/bindist/ghc-*/ "$instdir"
     echo 'main = putStrLn "hello world"' > expected
     run "$test_compiler" -package ghc "$TOP/.gitlab/hello.hs" -o hello
-    # Despite "-o hello", ghc may output something like hello.exe or
-    # hello.wasm depending on the backend. For the time being let's
-    # just move it to hello before proceeding to running it.
-    mv hello.wasm hello || true
     ${CROSS_EMULATOR:-} ./hello > actual
     run diff expected actual
   elif [[ -n "${REINSTALL_GHC:-}" ]]; then
@@ -627,7 +630,9 @@ function test_hadrian() {
       --test-compiler=stage-cabal \
       --test-root-dirs=testsuite/tests/perf \
       --test-root-dirs=testsuite/tests/typecheck \
-      "runtest.opts+=${RUNTEST_ARGS:-}" || fail "hadrian cabal-install test"
+      "runtest.opts+=${RUNTEST_ARGS:-}" \
+      "runtest.opts+=--unexpected-output-dir=$TOP/unexpected-test-output" \
+      || fail "hadrian cabal-install test"
   else
     local instdir="$TOP/_build/install"
     local test_compiler="$instdir/bin/${cross_prefix}ghc$exe"
@@ -649,7 +654,7 @@ function test_hadrian() {
     then
       test_compiler_backend=$(${test_compiler} -e "GHC.Num.Backend.backendName")
       if [ $test_compiler_backend != "\"$BIGNUM_BACKEND\"" ]; then
-        fail "Test compiler has a different BIGNUM_BACKEND ($test_compiler_backend) thean requested ($BIGNUM_BACKEND)"
+        fail "Test compiler has a different BIGNUM_BACKEND ($test_compiler_backend) than requested ($BIGNUM_BACKEND)"
       fi
     fi
 
@@ -665,12 +670,13 @@ function test_hadrian() {
       --summary-junit=./junit.xml \
       --test-have-intree-files \
       --test-compiler="${test_compiler}" \
-      "runtest.opts+=${RUNTEST_ARGS:-}" || fail "hadrian main testsuite"
+      "runtest.opts+=${RUNTEST_ARGS:-}" \
+      "runtest.opts+=--unexpected-output-dir=$TOP/unexpected-test-output" \
+      || fail "hadrian main testsuite"
 
     info "STAGE2_TEST=$?"
 
-    fi
-
+  fi
 }
 
 function summarise_hi_files() {
@@ -762,6 +768,10 @@ function run_abi_test() {
   check_interfaces out/run1 out/run2 interfaces "Mismatched interface hashes"
 }
 
+function save_test_output() {
+    tar -czf unexpected-test-output.tar.gz unexpected-test-output
+}
+
 function save_cache () {
   info "Storing cabal cache from $CABAL_DIR to $CABAL_CACHE..."
   rm -Rf "$CABAL_CACHE"
@@ -797,7 +807,7 @@ function shell() {
   if [ -z "$cmd" ]; then
     cmd="bash -i"
   fi
-  run "$cmd"
+  run $cmd
 }
 
 function lint_author(){
@@ -906,8 +916,8 @@ determine_metric_baseline
 
 set_toolchain_paths
 
-case $1 in
-  usage) usage ;;
+case ${1:-help} in
+  help|usage) usage ;;
   setup) setup && cleanup_submodules ;;
   configure) time_it "configure" configure ;;
   build_hadrian) time_it "build" build_hadrian ;;
@@ -927,6 +937,7 @@ case $1 in
   lint_author) shift; lint_author "$@" ;;
   compare_interfaces_of) shift; compare_interfaces_of "$@" ;;
   clean) clean ;;
+  save_test_output) save_test_output ;;
   save_cache) save_cache ;;
   shell) shift; shell "$@" ;;
   *) fail "unknown mode $1" ;;

@@ -20,7 +20,7 @@ import GHC.Prelude
 
 import GHC.Driver.Env
 import GHC.Driver.Ppr
-import GHC.Driver.Session
+import GHC.Driver.DynFlags
 
 import GHC.Types.Basic (TypeOrKind(..))
 import GHC.Types.Fixity (defaultFixity)
@@ -47,14 +47,18 @@ import GHC.Unit.Module.ModDetails
 import GHC.Unit.Module.Imported
 import GHC.Unit.Module.Deps
 
+import GHC.Tc.Errors
 import GHC.Tc.Errors.Types
+import {-# SOURCE #-} GHC.Tc.Module
 import GHC.Tc.Gen.Export
 import GHC.Tc.Solver
 import GHC.Tc.TyCl.Utils
 import GHC.Tc.Types.Constraint
 import GHC.Tc.Types.Origin
+import GHC.Tc.Utils.Env
 import GHC.Tc.Utils.Monad
 import GHC.Tc.Utils.Instantiate
+import GHC.Tc.Utils.Unify
 import GHC.Tc.Utils.TcMType
 import GHC.Tc.Utils.TcType
 
@@ -71,14 +75,10 @@ import GHC.Iface.Syntax
 import GHC.Rename.Names
 import GHC.Rename.Fixity ( lookupFixityRn )
 
-import GHC.Tc.Utils.Env
-import GHC.Tc.Errors
-import GHC.Tc.Utils.Unify
-
 import GHC.Utils.Error
+import GHC.Utils.Misc ( HasDebugCallStack )
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
-import GHC.Utils.Panic.Plain
 
 import GHC.Data.FastString
 import GHC.Data.Maybe
@@ -86,36 +86,21 @@ import GHC.Data.Maybe
 import Control.Monad
 import Data.List (find)
 
-import {-# SOURCE #-} GHC.Tc.Module
-
-
-fixityMisMatch :: TyThing -> Fixity -> Fixity -> TcRnMessage
-fixityMisMatch real_thing real_fixity sig_fixity =
-  mkTcRnUnknownMessage $ mkPlainError noHints $
-    vcat [ppr real_thing <+> text "has conflicting fixities in the module",
-          text "and its hsig file",
-          text "Main module:" <+> ppr_fix real_fixity,
-          text "Hsig file:" <+> ppr_fix sig_fixity]
-  where
-    ppr_fix f =
-        ppr f <+>
-        (if f == defaultFixity
-            then parens (text "default")
-            else empty)
+import GHC.Iface.Errors.Types
 
 checkHsigDeclM :: ModIface -> TyThing -> TyThing -> TcRn ()
 checkHsigDeclM sig_iface sig_thing real_thing = do
     let name = getName real_thing
     -- TODO: Distinguish between signature merging and signature
     -- implementation cases.
-    checkBootDeclM False sig_thing real_thing
+    checkBootDeclM Hsig sig_thing real_thing
     real_fixity <- lookupFixityRn name
     let sig_fixity = case mi_fix_fn (mi_final_exts sig_iface) (occName name) of
                         Nothing -> defaultFixity
                         Just f -> f
     when (real_fixity /= sig_fixity) $
       addErrAt (nameSrcSpan name)
-        (fixityMisMatch real_thing real_fixity sig_fixity)
+        (TcRnHsigFixityMismatch real_thing real_fixity sig_fixity)
 
 -- | Given a 'ModDetails' of an instantiated signature (note that the
 -- 'ModDetails' must be knot-tied consistently with the actual implementation)
@@ -127,7 +112,7 @@ checkHsigDeclM sig_iface sig_thing real_thing = do
 -- a sufficient set of entities, since otherwise the renaming and then
 -- typechecking of the signature 'ModIface' would have failed.
 checkHsigIface :: TcGblEnv -> GlobalRdrEnv -> ModIface -> ModDetails -> TcRn ()
-checkHsigIface tcg_env gr sig_iface
+checkHsigIface tcg_env gre_env sig_iface
   ModDetails { md_insts = sig_insts, md_fam_insts = sig_fam_insts,
                md_types = sig_type_env, md_exports = sig_exports   } = do
     traceTc "checkHsigIface" $ vcat
@@ -135,8 +120,8 @@ checkHsigIface tcg_env gr sig_iface
     mapM_ check_export (map availName sig_exports)
     failIfErrsM -- See Note [Fail before checking instances in checkHsigIface]
     unless (null sig_fam_insts) $
-        panic ("GHC.Tc.Module.checkHsigIface: Cannot handle family " ++
-               "instances in hsig files yet...")
+        panic ("GHC.Tc.Utils.Backpack.checkHsigIface: " ++
+               "Cannot handle family instances in hsig files yet...")
     -- Delete instances so we don't look them up when
     -- checking instance satisfiability
     -- TODO: this should not be necessary
@@ -168,14 +153,14 @@ checkHsigIface tcg_env gr sig_iface
         -- tcg_env (TODO: but maybe this isn't relevant anymore).
         r <- tcLookupImported_maybe name
         case r of
-          Failed err -> addErr (TcRnInterfaceLookupError name err)
+          Failed err           -> addErr (TcRnInterfaceError err)
           Succeeded real_thing -> checkHsigDeclM sig_iface sig_thing real_thing
 
       -- The hsig did NOT define this function; that means it must
       -- be a reexport.  In this case, make sure the 'Name' of the
-      -- reexport matches the 'Name exported here.
-      | [gre] <- lookupGlobalRdrEnv gr (nameOccName name) = do
-        let name' = greMangledName gre
+      -- reexport matches the 'Name' exported here.
+      | [gre] <- lookupGRE gre_env (LookupOccName (nameOccName name) SameNameSpace) = do
+        let name' = greName gre
         when (name /= name') $ do
             -- See Note [Error reporting bad reexport]
             -- TODO: Actually this error swizzle doesn't work
@@ -188,11 +173,11 @@ checkHsigIface tcg_env gr sig_iface
                          -> getLocA e
                        _ -> nameSrcSpan name
             addErrAt loc
-                (badReexportedBootThing False name name')
+              (TcRnBootMismatch Hsig $ BadReexportedBootThing name name')
       -- This should actually never happen, but whatever...
       | otherwise =
         addErrAt (nameSrcSpan name)
-            (missingBootThing False name "exported by")
+            (missingBootThing Hsig name MissingBootExport)
 
 -- Note [Fail before checking instances in checkHsigIface]
 -- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -223,24 +208,25 @@ check_inst sig_inst@(ClsInst { is_dfun = dfun_id }) = do
     -- TODO: This could be very well generalized to support instance
     -- declarations in boot files.
     tcg_env <- getGblEnv
+    lcl_env <- getLclEnv
+
     -- NB: Have to tug on the interface, not necessarily
     -- tugged... but it didn't work?
     mapM_ tcLookupImported_maybe (nameSetElemsStable (orphNamesOfClsInst sig_inst))
 
     -- Based off of 'simplifyDeriv'
-    let origin = InstProvidedOrigin (tcg_semantic_mod tcg_env) sig_inst
     (skol_info, tvs_skols, inst_theta, cls, inst_tys) <- tcSkolDFunType (idType dfun_id)
     (tclvl,cts) <- pushTcLevelM $ do
+       given_ids <- mapM newEvVar inst_theta
+       let given_loc = mkGivenLoc topTcLevel skol_info (mkCtLocEnv lcl_env)
+           givens = [ CtGiven { ctev_pred = idType given_id
+                              -- Doesn't matter, make something up
+                              , ctev_evar = given_id
+                              , ctev_loc  = given_loc  }
+                    | given_id <- given_ids ]
+           origin    = InstProvidedOrigin (tcg_semantic_mod tcg_env) sig_inst
        wanted <- newWanted origin (Just TypeLevel) (mkClassPred cls inst_tys)
-       givens <- forM inst_theta $ \given -> do
-           loc <- getCtLocM origin (Just TypeLevel)
-           new_ev <- newEvVar given
-           return CtGiven { ctev_pred = given
-                          -- Doesn't matter, make something up
-                          , ctev_evar = new_ev
-                          , ctev_loc = loc
-                          }
-       return $ wanted : givens
+       return (wanted : givens)
     unsolved <- simplifyWantedsTcM cts
 
     (implic, _) <- buildImplicationFor tclvl skol_info tvs_skols [] unsolved
@@ -278,7 +264,7 @@ findExtraSigImports hsc_env HsigFile modname = do
       reqs       = requirementMerges unit_state modname
     holes <- forM reqs $ \(Module iuid mod_name) -> do
         initIfaceLoad hsc_env
-            . withException ctx
+            . withIfaceErr ctx
             $ moduleFreeHolesPrecise (text "findExtraSigImports")
                 (mkModule (VirtUnit iuid) mod_name)
     return (uniqDSetToList (unionManyUniqDSets holes))
@@ -400,7 +386,7 @@ thinModIface avails iface =
     decl_pred occs decl = nameOccName (ifName decl) `elemOccSet` occs
     filter_decls occs = filter (decl_pred occs . snd) (mi_decls iface)
 
-    exported_occs = mkOccSet [ occName n
+    exported_occs = mkOccSet [ nameOccName n
                              | a <- avails
                              , n <- availNames a ]
     exported_decls = filter_decls exported_occs
@@ -510,7 +496,7 @@ merge_msg mod_name reqs =
 -- from 'requirementMerges' into this signature, producing
 -- a final 'TcGblEnv' that matches the local signature and
 -- all required signatures.
-mergeSignatures :: HsParsedModule -> TcGblEnv -> ModIface -> TcRn TcGblEnv
+mergeSignatures :: HasDebugCallStack => HsParsedModule -> TcGblEnv -> ModIface -> TcRn TcGblEnv
 mergeSignatures
   (HsParsedModule { hpm_module = L loc (HsModule { hsmodExports = mb_exports }),
                     hpm_src_files = src_files })
@@ -537,8 +523,8 @@ mergeSignatures
         tcg_rn_decls   = tcg_rn_decls   orig_tcg_env,
         -- Annotations
         tcg_ann_env    = tcg_ann_env    orig_tcg_env,
-        -- Documentation header
-        tcg_doc_hdr    = tcg_doc_hdr orig_tcg_env
+        -- Documentation header and located module name
+        tcg_hdr_info    = tcg_hdr_info orig_tcg_env
         -- tcg_dus?
         -- tcg_th_used           = tcg_th_used orig_tcg_env,
         -- tcg_th_splice_used    = tcg_th_splice_used orig_tcg_env
@@ -547,7 +533,7 @@ mergeSignatures
 
     let outer_mod  = tcg_mod tcg_env
     let inner_mod  = tcg_semantic_mod tcg_env
-    let mod_name   = moduleName (tcg_mod tcg_env)
+    let mod_name   = moduleName outer_mod
     let unit_state = hsc_units hsc_env
     let dflags     = hsc_dflags hsc_env
 
@@ -563,9 +549,8 @@ mergeSignatures
             im = fst (getModuleInstantiation m)
             ctx = initSDocContext dflags defaultUserStyle
         fmap fst
-         . withException ctx
-         $ findAndReadIface hsc_env
-                            (text "mergeSignatures") im m NotBoot
+         . withIfaceErr ctx
+         $ findAndReadIface hsc_env (text "mergeSignatures") im m NotBoot
 
     -- STEP 3: Get the unrenamed exports of all these interfaces,
     -- thin it according to the export list, and do shaping on them.
@@ -650,12 +635,12 @@ mergeSignatures
                                             -- because we need module
                                             -- LocalSig (from the local
                                             -- export list) to match it!
-                                            is_mod  = mod_name,
+                                            is_mod  = mi_module ireq_iface,
                                             is_as   = mod_name,
                                             is_qual = False,
                                             is_dloc = locA loc
                                           } ImpAll
-                                rdr_env = mkGlobalRdrEnv (gresFromAvails (Just ispec) as1)
+                                rdr_env = mkGlobalRdrEnv $ gresFromAvails hsc_env (Just ispec) as1
                             setGblEnv tcg_env {
                                 tcg_rdr_env = rdr_env
                             } $ exports_from_avail mb_exports rdr_env
@@ -663,9 +648,9 @@ mergeSignatures
                                     emptyImportAvails
                                     (tcg_semantic_mod tcg_env)
                         case mb_r of
-                            Just (_, as2) -> return (thinModIface as2 ireq_iface, as2)
+                            Just (_, as2, _) -> return (thinModIface as2 ireq_iface, as2)
                             Nothing -> addMessages msgs >> failM
-                    -- We can't think signatures from non signature packages
+                    -- We can't thin signatures from non-signature packages
                     _ -> return (ireq_iface, as1)
             -- 3(c). Only identifiers from signature packages are "ok" to
             -- import (that is, they are safe from a PVP perspective.)
@@ -677,7 +662,7 @@ mergeSignatures
             -- 3(d). Extend the name substitution (performing shaping)
             mb_r <- extend_ns nsubst as2
             case mb_r of
-                Left err -> failWithTc (mkTcRnUnknownMessage $ mkPlainError noHints err)
+                Left err -> failWithTc (TcRnHsigShapeMismatch err)
                 Right nsubst' -> return (nsubst',oks',(imod, thinned_iface):ifaces)
         nsubst0 = mkNameShape (moduleName inner_mod) (mi_exports lcl_iface0)
         ok_to_use0 = mkOccSet (exportOccs (mi_exports lcl_iface0))
@@ -688,9 +673,9 @@ mergeSignatures
         <- foldM gen_subst (nsubst0, ok_to_use0, []) (zip reqs ireq_ifaces0)
     let thinned_ifaces = reverse rev_thinned_ifaces
         exports        = nameShapeExports nsubst
-        rdr_env        = mkGlobalRdrEnv (gresFromAvails Nothing exports)
+        rdr_env        = mkGlobalRdrEnv (gresFromAvails hsc_env Nothing exports)
         _warn_occs     = filter (not . (`elemOccSet` ok_to_use)) (exportOccs exports)
-        warns          = NoWarnings
+        warns          = emptyWarn
         {-
         -- TODO: Warnings are transitive, but this is not what we want here:
         -- if a module reexports an entity from a signature, that should be OK.
@@ -713,14 +698,14 @@ mergeSignatures
         -- reexports are picked up correctly
         tcg_imports = tcg_imports orig_tcg_env,
         tcg_exports = exports,
-        tcg_dus     = usesOnly (availsToNameSetWithSelectors exports),
+        tcg_dus     = usesOnly (availsToNameSet exports),
         tcg_warns   = warns
         } $ do
     tcg_env <- getGblEnv
 
     -- Make sure we didn't refer to anything that doesn't actually exist
     -- pprTrace "mergeSignatures: exports_from_avail" (ppr exports) $ return ()
-    (mb_lies, _) <- exports_from_avail mb_exports rdr_env
+    (mb_lies, _, _) <- exports_from_avail mb_exports rdr_env
                         (tcg_imports tcg_env) (tcg_semantic_mod tcg_env)
 
     {- -- NB: This is commented out, because warns above is disabled.
@@ -753,9 +738,9 @@ mergeSignatures
     let ifaces = lcl_iface : ext_ifaces
 
     -- STEP 4.1: Merge fixities (we'll verify shortly) tcg_fix_env
-    let fix_env = mkNameEnv [ (greMangledName rdr_elt, FixItem occ f)
+    let fix_env = mkNameEnv [ (greName rdr_elt, FixItem occ f)
                             | (occ, f) <- concatMap mi_fixities ifaces
-                            , rdr_elt <- lookupGlobalRdrEnv rdr_env occ ]
+                            , rdr_elt <- lookupGRE rdr_env (LookupOccName occ AllRelevantGREs) ]
 
     -- STEP 5: Typecheck the interfaces
     let type_env_var = tcg_type_env_var tcg_env
@@ -890,10 +875,10 @@ mergeSignatures
         n <- newDFunName (is_cls inst) (is_tys inst) (nameSrcSpan (is_dfun_name inst))
         let dfun = setVarName (is_dfun inst) n
         return (dfun, inst { is_dfun_name = n, is_dfun = dfun })
-    tcg_env <- return tcg_env {
-            tcg_insts = map snd dfun_insts,
-            tcg_type_env = extendTypeEnvWithIds (tcg_type_env tcg_env) (map fst dfun_insts)
-        }
+
+    tcg_env <- return $
+      tcg_env { tcg_insts    = map snd dfun_insts
+              , tcg_type_env = extendTypeEnvWithIds (tcg_type_env tcg_env) (map fst dfun_insts) }
 
     addDependentFiles src_files
 
@@ -927,19 +912,19 @@ tcRnInstantiateSignature hsc_env this_mod real_loc =
    logger = hsc_logger hsc_env
 
 exportOccs :: [AvailInfo] -> [OccName]
-exportOccs = concatMap (map occName . availNames)
+exportOccs = concatMap (map nameOccName . availNames)
 
 impl_msg :: UnitState -> Module -> InstantiatedModule -> SDoc
 impl_msg unit_state impl_mod (Module req_uid req_mod_name)
    = pprWithUnitState unit_state $
-      text "while checking that" <+> ppr impl_mod <+>
-      text "implements signature" <+> ppr req_mod_name <+>
-      text "in" <+> ppr req_uid
+      text "While checking that" <+> quotes (ppr impl_mod) <+>
+      text "implements signature" <+> quotes (ppr req_mod_name) <+>
+      text "in" <+> quotes (ppr req_uid) <> dot
 
 -- | Check if module implements a signature.  (The signature is
 -- always un-hashed, which is why its components are specified
 -- explicitly.)
-checkImplements :: Module -> InstantiatedModule -> TcRn TcGblEnv
+checkImplements :: HasDebugCallStack => Module -> InstantiatedModule -> TcRn TcGblEnv
 checkImplements impl_mod req_mod@(Module uid mod_name) = do
   hsc_env <- getTopEnv
   let unit_state = hsc_units hsc_env
@@ -957,7 +942,7 @@ checkImplements impl_mod req_mod@(Module uid mod_name) = do
     impl_iface <- initIfaceTcRn $
         loadSysInterface (text "checkImplements 1") impl_mod
     let impl_gr = mkGlobalRdrEnv
-                    (gresFromAvails Nothing (mi_exports impl_iface))
+                    (gresFromAvails hsc_env Nothing (mi_exports impl_iface))
         nsubst = mkNameShape (moduleName impl_mod) (mi_exports impl_iface)
 
     -- Load all the orphans, so the subsequent 'checkHsigIface' sees
@@ -967,9 +952,9 @@ checkImplements impl_mod req_mod@(Module uid mod_name) = do
 
     let avails = calculateAvails home_unit other_home_units
                     impl_iface False{- safe -} NotBoot ImportedBySystem
-        fix_env = mkNameEnv [ (greMangledName rdr_elt, FixItem occ f)
+        fix_env = mkNameEnv [ (greName rdr_elt, FixItem occ f)
                             | (occ, f) <- mi_fixities impl_iface
-                            , rdr_elt <- lookupGlobalRdrEnv impl_gr occ ]
+                            , rdr_elt <- lookupGRE impl_gr (LookupOccName occ AllRelevantGREs) ]
     updGblEnv (\tcg_env -> tcg_env {
         -- Setting tcg_rdr_env to treat all exported entities from
         -- the implementing module as in scope improves error messages,
@@ -996,18 +981,15 @@ checkImplements impl_mod req_mod@(Module uid mod_name) = do
                                                isig_mod sig_mod NotBoot
     isig_iface <- case mb_isig_iface of
         Succeeded (iface, _) -> return iface
-        Failed err -> failWithTc $ mkTcRnUnknownMessage $ mkPlainError noHints $
-            hang (text "Could not find hi interface for signature" <+>
-                  quotes (ppr isig_mod) <> colon) 4 err
+        Failed err ->
+          failWithTc $ TcRnInterfaceError $
+          Can'tFindInterface err (LookingForSig isig_mod)
 
     -- STEP 3: Check that the implementing interface exports everything
     -- we need.  (Notice we IGNORE the Modules in the AvailInfos.)
     forM_ (exportOccs (mi_exports isig_iface)) $ \occ ->
-        case lookupGlobalRdrEnv impl_gr occ of
-            [] -> addErr $ mkTcRnUnknownMessage $ mkPlainError noHints $
-                        quotes (ppr occ)
-                    <+> text "is exported by the hsig file, but not exported by the implementing module"
-                    <+> quotes (pprWithUnitState unit_state $ ppr impl_mod)
+        case lookupGRE impl_gr (LookupOccName occ SameNameSpace) of
+            [] -> addErr $ TcRnHsigMissingModuleExport occ unit_state impl_mod
             _ -> return ()
     failIfErrsM
 

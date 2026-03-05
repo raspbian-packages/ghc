@@ -25,9 +25,9 @@ toolArgs = do
   builder (Ghc ToolArgs) ? mconcat
               [ packageGhcArgs
               , includeGhcArgs
-              , map ("-optc" ++) <$> getStagedSettingList ConfCcArgs
-              , map ("-optP" ++) <$> getStagedSettingList ConfCppArgs
+              , map ("-optc" ++) <$> getStagedCCFlags
               , map ("-optP" ++) <$> getContextData cppOpts
+              , getContextData hcOpts
               ]
 
 compileAndLinkHs :: Args
@@ -57,7 +57,7 @@ compileC :: Args
 compileC = builder (Ghc CompileCWithGhc) ? do
     way <- getWay
     let ccArgs = [ getContextData ccOpts
-                 , getStagedSettingList ConfCcArgs
+                 , getStagedCCFlags
                  , cIncludeArgs
                  , Dynamic `wayUnit` way ? pure [ "-fPIC", "-DDYNAMIC" ] ]
     mconcat [ arg "-Wall"
@@ -74,7 +74,7 @@ compileCxx :: Args
 compileCxx = builder (Ghc CompileCppWithGhc) ? do
     way <- getWay
     let ccArgs = [ getContextData cxxOpts
-                 , getStagedSettingList ConfCcArgs
+                 , getStagedCCFlags
                  , cIncludeArgs
                  , Dynamic `wayUnit` way ? pure [ "-fPIC", "-DDYNAMIC" ] ]
     mconcat [ arg "-Wall"
@@ -98,21 +98,18 @@ ghcLinkArgs = builder (Ghc LinkHs) ? do
     -- Relative path from the output (rpath $ORIGIN).
     originPath <- dropFileName <$> getOutput
     context <- getContext
-    libPath' <- expr (libPath context)
-    st <- getStage
-    distDir <- expr (Context.distDir st)
+    distPath <- expr (Context.distDynDir context)
 
     useSystemFfi <- expr (flag UseSystemFfi)
     buildPath <- getBuildPath
     libffiName' <- libffiName
-    debugged <- ghcDebugged <$> expr flavour <*> getStage
+    debugged <- buildingCompilerStage' . ghcDebugged =<< expr flavour
 
     osxTarget <- expr isOsxTarget
     winTarget <- expr isWinTarget
 
     let
         dynamic = Dynamic `wayUnit` way
-        distPath = libPath' -/- distDir
         originToLibsDir = makeRelativeNoSysLink originPath distPath
         rpath
             -- Programs will end up in the bin dir ($ORIGIN) and will link to
@@ -204,8 +201,7 @@ commonGhcArgs = do
             -- to the @ghc-version@ file, to prevent GHC from trying to open the
             -- RTS package in the package database and failing.
             , package rts ? notStage0 ? arg "-ghcversion-file=rts/include/ghcversion.h"
-            , map ("-optc" ++) <$> getStagedSettingList ConfCcArgs
-            , map ("-optP" ++) <$> getStagedSettingList ConfCppArgs
+            , map ("-optc" ++) <$> getStagedCCFlags
             , map ("-optP" ++) <$> getContextData cppOpts
             , arg "-outputdir", arg path
               -- we need to enable color explicitly because the output is
@@ -217,6 +213,8 @@ commonGhcArgs = do
               -- input hash to avoid superfluous recompilation, avoiding
               -- #18672.
               arg "-fdiagnostics-color=always"
+            -- Important this is last.. as these options can override the default options
+            , getContextData hcOpts
             ]
 
 -- TODO: Do '-ticky' in all debug ways?
@@ -235,18 +233,35 @@ wayGhcArgs = do
             , map ("-optc"++) <$> wayCcArgs
             ]
 
+-- | Args related to correct handling of packages, such as setting
+-- -this-unit-id and passing -package-id for dependencies
 packageGhcArgs :: Args
 packageGhcArgs = do
     package <- getPackage
+    stage <- getStage
     ghc_ver <- readVersion <$> (expr . ghcVersionStage =<< getStage)
-    pkgId   <- expr $ pkgIdentifier package
+    -- ROMES: Until the boot compiler no longer needs ghc's
+    -- unit-id to be "ghc", the stage0 compiler must be built
+    -- with `-this-unit-id ghc`, while the wired-in unit-id of
+    -- ghc is correctly set to the unit-id we'll generate for
+    -- stage1 (set in generateConfigHs in Rules.Generate).
+    --
+    -- However, we don't need to set the unit-id of "ghc" to "ghc" when
+    -- building stage0 because we have a flag in compiler/ghc.cabal.in that is
+    -- sets `-this-unit-id ghc` when hadrian is building stage0, which will
+    -- overwrite this one.
+    pkgId   <- expr $ pkgUnitId stage package
+    pkgName <- expr $ pkgPackageName package
     mconcat [ arg "-hide-all-packages"
             , arg "-no-user-package-db"
             , arg "-package-env -"
             , packageDatabaseArgs
             -- We want to pass -this-unit-id for executables as well for multi-repl to
             -- work with executable packages but this is buggy on GHC-9.0.2
-            , (isLibrary package || (ghc_ver >= makeVersion [9,2,1])) ?  arg ("-this-unit-id " ++ pkgId)
+            , (isLibrary package || (ghc_ver >= makeVersion [9,2,1])) ? mconcat
+                [ arg ("-this-unit-id " ++ pkgId)
+                , arg ("-this-package-name " ++ pkgName)
+                ]
             , map ("-package-id " ++) <$> getContextData depIds ]
 
 includeGhcArgs :: Args

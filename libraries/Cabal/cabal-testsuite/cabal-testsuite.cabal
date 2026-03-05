@@ -1,7 +1,7 @@
 cabal-version: 2.2
 name:          cabal-testsuite
 version:       3
-copyright:     2003-2023, Cabal Development Team (see AUTHORS file)
+copyright:     2003-2024, Cabal Development Team (see AUTHORS file)
 license:       BSD-3-Clause
 license-file:  LICENSE
 author:        Cabal Development Team <cabal-devel@haskell.org>
@@ -26,10 +26,11 @@ common shared
   default-language: Haskell2010
 
   build-depends:
-    , base >= 4.9 && <4.20
+    , base >= 4.11 && < 4.20
     -- this needs to match the in-tree lib:Cabal version
-    , Cabal ^>= 3.10.3.0
-    , Cabal-syntax ^>= 3.10.3.0
+    , Cabal ^>= 3.12.1.0
+    , Cabal-syntax ^>= 3.12.1.0
+    , Cabal-tests
 
   ghc-options: -Wall -fwarn-tabs -fwarn-incomplete-uni-patterns
 
@@ -90,6 +91,8 @@ executable cabal-tests
   main-is: cabal-tests.hs
   hs-source-dirs: main
   ghc-options: -threaded
+  -- Make sure these are built before the executable is run
+  build-tool-depends: cabal-testsuite:test-runtime-deps
   build-depends:
     , cabal-testsuite
     -- constraints inherited via lib:cabal-testsuite component
@@ -101,6 +104,7 @@ executable cabal-tests
     , transformers
     -- dependencies specific to exe:cabal-tests
     , clock                 ^>= 0.7.2 || ^>=0.8
+    , directory
 
   build-tool-depends: cabal-testsuite:setup
   default-extensions: TypeOperators
@@ -110,11 +114,38 @@ executable setup
   import: shared
   main-is: Setup.simple.hs
 
+-- This executable component is used to describe the runtime dependencies of
+-- the tests. The Main.hs file and resulting executable are not useful in any way.
+
+-- Ideally this would be an empty library, but because build-type: Custom, we can't
+-- have sublibraries.
+
+-- If you require an external dependency for a test it must be listed here.
+executable test-runtime-deps
+  default-language: Haskell2010
+  build-depends: cabal-testsuite,
+                 base,
+                 directory,
+                 Cabal,
+                 Cabal-syntax,
+                 filepath,
+                 transformers,
+                 bytestring,
+                 time,
+                 process,
+                 exceptions
+  main-is: static/Main.hs
+  if !os(windows)
+    build-depends: unix
+  else
+    build-depends:
+      , Win32
+
 custom-setup
   -- we only depend on even stable releases of lib:Cabal
   -- and due to Custom complexity and ConstraintSetupCabalMaxVersion
   -- it has to be the latest release version plus
   -- you have to use the latest cabal-install release
-  setup-depends: Cabal == 3.10.3.0,
-                 Cabal-syntax == 3.10.3.0,
+  setup-depends: Cabal == 3.10.*,
+                 Cabal-syntax == 3.10.*,
                  base, filepath, directory

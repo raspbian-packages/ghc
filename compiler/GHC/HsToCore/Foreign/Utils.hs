@@ -27,7 +27,6 @@ import GHC.Builtin.Types.Prim
 
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
-import GHC.Utils.Panic.Plain
 
 type Binding = (Id, CoreExpr) -- No rec/nonrec structure;
                               -- the occurrence analyser will sort it all out
@@ -58,7 +57,7 @@ primTyDescChar :: Platform -> Type -> Char
 primTyDescChar !platform ty
  | ty `eqType` unitTy = 'v'
  | otherwise
- = case typePrimRep1 (getPrimTyOf ty) of
+ = case typePrimRepU (getPrimTyOf ty) of
      IntRep      -> signed_word
      WordRep     -> unsigned_word
      Int8Rep     -> 'B'

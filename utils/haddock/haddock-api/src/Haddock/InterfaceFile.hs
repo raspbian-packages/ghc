@@ -1,4 +1,6 @@
-{-# LANGUAGE CPP, RankNTypes, ScopedTypeVariables #-}
+{-# LANGUAGE CPP #-}
+{-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE NamedFieldPuns #-}
 {-# OPTIONS_GHC -fno-warn-orphans #-}
@@ -123,8 +125,8 @@ binaryInterfaceMagic = 0xD0Cface
 -- (2) set `binaryInterfaceVersionCompatibility` to [binaryInterfaceVersion]
 --
 binaryInterfaceVersion :: Word16
-#if MIN_VERSION_ghc(9,6,0) && !MIN_VERSION_ghc(9,7,0)
-binaryInterfaceVersion = 42
+#if MIN_VERSION_ghc(9,9,0) && !MIN_VERSION_ghc(9,11,0)
+binaryInterfaceVersion = 44
 
 binaryInterfaceVersionCompatibility :: [Word16]
 binaryInterfaceVersionCompatibility = [binaryInterfaceVersion]
@@ -210,8 +212,7 @@ readInterfaceFile :: NameCache
                   -> IO (Either String InterfaceFile)
 readInterfaceFile name_cache filename bypass_checks = do
   bh <- readBinMem filename
-
-  magic   <- get bh
+  magic <- get bh
   if magic /= binaryInterfaceMagic
     then return . Left $ "Magic number mismatch: couldn't load interface file: " ++ filename
     else do
@@ -310,12 +311,13 @@ putInterfaceFile_ bh (InterfaceFile env info ifaces) = do
   put_ bh ifaces
 
 instance Binary InstalledInterface where
-  put_ bh (InstalledInterface modu is_sig info docMap argMap
+  put_ bh (InstalledInterface modu is_sig info docMap argMap defMeths
            exps visExps opts fixMap) = do
     put_ bh modu
     put_ bh is_sig
     put_ bh info
     lazyPut bh (docMap, argMap)
+    put_ bh defMeths
     put_ bh exps
     put_ bh visExps
     put_ bh opts
@@ -326,13 +328,13 @@ instance Binary InstalledInterface where
     is_sig  <- get bh
     info    <- get bh
     ~(docMap, argMap) <- lazyGet bh
+    defMeths <- get bh
     exps    <- get bh
     visExps <- get bh
     opts    <- get bh
     fixMap  <- get bh
-    return (InstalledInterface modu is_sig info docMap argMap
-            exps visExps opts fixMap)
-
+    return (InstalledInterface modu is_sig info
+            docMap argMap defMeths exps visExps opts fixMap)
 
 instance Binary DocOption where
     put_ bh OptHide = do
@@ -345,6 +347,8 @@ instance Binary DocOption where
             putByte bh 3
     put_ bh OptShowExtensions = do
             putByte bh 4
+    put_ bh OptPrintRuntimeRep = do
+            putByte bh 5
     get bh = do
             h <- getByte bh
             case h of
@@ -358,8 +362,9 @@ instance Binary DocOption where
                     return OptNotHome
               4 -> do
                     return OptShowExtensions
-              _ -> fail "invalid binary data found"
-
+              5 -> do
+                    return OptPrintRuntimeRep
+              n -> fail $ "invalid binary data found: " <> show n
 
 instance Binary Example where
     put_ bh (Example expression result) = do
@@ -433,13 +438,20 @@ instance Binary a => Binary (TableCell a) where
         return (TableCell i j c)
 
 instance Binary Meta where
-    put_ bh (Meta v p) = do
+    put_ bh (Meta since) = do
+        put_ bh since
+    get bh = do
+        since <- get bh
+        return (Meta since)
+
+instance Binary MetaSince where
+    put_ bh (MetaSince v p) = do
         put_ bh v
         put_ bh p
     get bh = do
         v <- get bh
         p <- get bh
-        return (Meta v p)
+        return (MetaSince v p)
 
 instance (Binary mod, Binary id) => Binary (MetaDoc mod id) where
   put_ bh MetaDoc { _meta = m, _doc = d } = do

@@ -10,6 +10,10 @@
 
 #include "ghcconfig.h"
 
+#if !defined(CMINUSMINUS)
+#include "rts/storage/HeapAlloc.h"
+#endif
+
 /* The actual block and megablock-size constants are defined in
  * rts/include/Constants.h, all constants here are derived from these.
  */
@@ -87,7 +91,8 @@
 
 
 struct NonmovingSegmentInfo {
-  StgWord8 log_block_size;
+  StgWord16 allocator_idx; // nonmovingHeap.allocators[allocators_idx] is
+                           // this segment's allocator.
   StgWord16 next_free_snap;
 };
 
@@ -189,6 +194,7 @@ typedef struct bdescr_ {
 EXTERN_INLINE bdescr *Bdescr(StgPtr p);
 EXTERN_INLINE bdescr *Bdescr(StgPtr p)
 {
+  ASSERT(HEAP_ALLOCED_GC(p));
   return (bdescr *)
     ((((W_)p &  MBLOCK_MASK & ~BLOCK_MASK) >> (BLOCK_SHIFT-BDESCR_SHIFT))
      | ((W_)p & ~MBLOCK_MASK)
@@ -316,6 +322,10 @@ bdescr *allocGroupOnNode(uint32_t node, W_ n);
 //     bdescr->start % BLOCK_SIZE*n == 0
 //
 bdescr *allocAlignedGroupOnNode(uint32_t node, W_ n);
+
+// Allocate a MBlock worth of `n` block sized chunks aligned at `n`-block boundry.
+// This returns a linked list of `bdescr` of length `BLOCKS_PER_MBLOCK / n`.
+bdescr *allocMBlockAlignedGroupOnNode(uint32_t node, W_ n);
 
 EXTERN_INLINE bdescr* allocBlockOnNode(uint32_t node);
 EXTERN_INLINE bdescr* allocBlockOnNode(uint32_t node)

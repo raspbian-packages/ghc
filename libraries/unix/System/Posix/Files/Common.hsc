@@ -551,7 +551,7 @@ foreign import capi unsafe "sys/stat.h futimens"
     c_futimens :: CInt -> Ptr CTimeSpec -> IO CInt
 #endif
 
-data CTimeVal = CTimeVal CLong CLong
+data CTimeVal = CTimeVal (#type time_t) (#type suseconds_t)
 
 instance Storable CTimeVal where
     sizeOf    _ = #size struct timeval
@@ -993,7 +993,7 @@ defaultStatxMask = mempty
 newtype ExtendedFileStatus = ExtendedFileStatus (ForeignPtr CStatx) -- ^ The constructor is considered internal and may change.
 
 -- | The "preferred" block size for efficient filesystem I/O.
--- (Writing to a file in smaller chunks may cause an inefficient read-mod‐ify-rewrite.)
+-- (Writing to a file in smaller chunks may cause an inefficient read-modify-rewrite.)
 fileBlockSizeX             :: ExtendedFileStatus -> CBlkSize
 #if HAVE_STATX
 -- | Further status information about the file.

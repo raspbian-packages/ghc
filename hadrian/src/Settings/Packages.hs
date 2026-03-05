@@ -6,8 +6,11 @@ import Oracles.Setting
 import Oracles.Flag
 import Packages
 import Settings
-import Oracles.Flavour
 import Settings.Builders.Common (wayCcArgs)
+
+import GHC.Toolchain.Target
+import GHC.Platform.ArchOS
+import Data.Version.Extra
 
 -- | Package-specific command-line arguments.
 packageArgs :: Args
@@ -25,14 +28,13 @@ packageArgs = do
         -- are building. This is used to build cross-compilers
         bootCross = (==) <$> ghcVersionStage (stage0InTree) <*> ghcVersionStage Stage1
 
+        compilerStageOption f = buildingCompilerStage' . f =<< expr flavour
+
     cursesIncludeDir <- getSetting CursesIncludeDir
     cursesLibraryDir <- getSetting CursesLibDir
     ffiIncludeDir  <- getSetting FfiIncludeDir
     ffiLibraryDir  <- getSetting FfiLibDir
-    debugAssertions  <- ( `ghcDebugAssertions` (succStage stage) ) <$> expr flavour
-      -- NB: in this function, "stage" is the stage of the compiler we are
-      -- using to build, but ghcDebugAssertions wants the stage of the compiler
-      -- we are building, which we get using succStage.
+    stageVersion <- readVersion <$> (expr $ ghcVersionStage stage)
 
     mconcat
         --------------------------------- base ---------------------------------
@@ -55,7 +57,7 @@ packageArgs = do
           [ builder Alex ? arg "--latin1"
 
           , builder (Ghc CompileHs) ? mconcat
-            [ debugAssertions ? arg "-DDEBUG"
+            [ compilerStageOption ghcDebugAssertions ? arg "-DDEBUG"
 
             , inputs ["**/GHC.hs", "**/GHC/Driver/Make.hs"] ? arg "-fprof-auto"
             , input "**/Parser.hs" ?
@@ -71,13 +73,20 @@ packageArgs = do
 
           , builder (Cabal Setup) ? mconcat
             [ arg "--disable-library-for-ghci"
-            , anyTargetOs ["openbsd"] ? arg "--ld-options=-E"
-            , (getStage >>= expr . askGhcProfiled) ? arg "--ghc-pkg-option=--force" ]
+            , anyTargetOs [OSOpenBSD] ? arg "--ld-options=-E"
+            , compilerStageOption ghcProfiled ? arg "--ghc-pkg-option=--force" ]
 
           , builder (Cabal Flags) ? mconcat
             [ andM [expr ghcWithInterpreter, notStage0] `cabalFlag` "internal-interpreter"
             , notM cross `cabalFlag` "terminfo"
             , arg "-build-tool-depends"
+            , flag UseLibzstd `cabalFlag` "with-libzstd"
+            -- ROMES: While the boot compiler is not updated wrt -this-unit-id
+            -- not being fixed to `ghc`, when building stage0, we must set
+            -- -this-unit-id to `ghc` because the boot compiler expects that.
+            -- We do it through a cabal flag in ghc.cabal
+            , stageVersion < makeVersion [9,8,1] ? arg "+hadrian-stage0"
+            , flag StaticLibzstd `cabalFlag` "static-libzstd"
             ]
 
           , builder (Haddock BuildPackage) ? arg ("--optghc=-I" ++ path) ]
@@ -86,7 +95,7 @@ packageArgs = do
         , package ghc ? mconcat
           [ builder Ghc ? mconcat
              [ arg ("-I" ++ compilerPath)
-             , debugAssertions ? arg "-DDEBUG" ]
+             , compilerStageOption ghcDebugAssertions ? arg "-DDEBUG" ]
 
           , builder (Cabal Flags) ? mconcat
             [ andM [expr ghcWithInterpreter, notStage0] `cabalFlag` "internal-interpreter"
@@ -97,7 +106,7 @@ packageArgs = do
 
                   -- We build a threaded stage N, N>1 if the configuration calls
                   -- for it.
-                  ((ghcThreaded <$> expr flavour <*> getStage ) `cabalFlag` "threaded")
+                  (compilerStageOption ghcThreaded `cabalFlag` "threaded")
             ]
           ]
 
@@ -107,7 +116,7 @@ packageArgs = do
 
         -------------------------------- ghcPrim -------------------------------
         , package ghcPrim ? mconcat
-          [ builder (Cabal Flags) ? arg "include-ghc-prim"
+          [ builder (Cabal Flags) ? flag NeedLibatomic `cabalFlag` "need-atomic"
 
           , builder (Cc CompileC) ? (not <$> flag CcLlvmBackend) ?
             input "**/cbits/atomic.c"  ? arg "-Wno-sync-nand" ]
@@ -117,9 +126,9 @@ packageArgs = do
           [
           -- The use case here is that we want to build @iserv-proxy@ for the
           -- cross compiler. That one needs to be compiled by the bootstrap
-          -- compiler as it needs to run on the host. Hence @libiserv@ needs
-          -- @GHCi.TH@, @GHCi.Message@ and @GHCi.Run@ from @ghci@. And those are
-          -- behind the @-finternal-interpreter@ flag.
+          -- compiler as it needs to run on the host. Hence @iserv@ needs
+          -- @GHCi.TH@, @GHCi.Message@, @GHCi.Run@, and @GHCi.Server@ from
+          -- @ghci@. And those are behind the @-finternal-interpreter@ flag.
           --
           -- But it may not build if we have made some changes to ghci's
           -- dependencies (see #16051).
@@ -148,6 +157,10 @@ packageArgs = do
 
           ]
 
+        , package unix ? builder (Cabal Flags) ? arg "+os-string"
+        , package directory ? builder (Cabal Flags) ? arg "+os-string"
+        , package win32 ? builder (Cabal Flags) ? arg "+os-string"
+
         --------------------------------- iserv --------------------------------
         -- Add -Wl,--export-dynamic enables GHCi to load dynamic objects that
         -- refer to the RTS.  This is harmless if you don't use it (adds a bit
@@ -158,7 +171,7 @@ packageArgs = do
         -- does not need it since it exports all dynamic symbols by default
         , package iserv
           ? expr isElfTarget
-          ? notM (expr $ anyTargetOs ["freebsd", "solaris2"])? mconcat
+          ? notM (expr $ anyTargetOs [OSFreeBSD, OSSolaris2])? mconcat
           [ builder (Ghc LinkHs) ? arg "-optl-Wl,--export-dynamic" ]
 
         -------------------------------- haddock -------------------------------
@@ -258,41 +271,39 @@ ghcBignumArgs = package ghcBignum ? do
 rtsPackageArgs :: Args
 rtsPackageArgs = package rts ? do
     projectVersion <- getSetting ProjectVersion
-    hostPlatform   <- getSetting HostPlatform
-    hostArch       <- getSetting HostArch
-    hostOs         <- getSetting HostOs
-    hostVendor     <- getSetting HostVendor
-    buildPlatform  <- getSetting BuildPlatform
-    buildArch      <- getSetting BuildArch
-    buildOs        <- getSetting BuildOs
-    buildVendor    <- getSetting BuildVendor
-    targetPlatform <- getSetting TargetPlatform
-    targetArch     <- getSetting TargetArch
-    targetOs       <- getSetting TargetOs
-    targetVendor   <- getSetting TargetVendor
-    ghcUnreg       <- expr $ yesNo <$> flag GhcUnregisterised
-    ghcEnableTNC   <- expr $ yesNo <$> flag TablesNextToCode
+    hostPlatform   <- queryHost targetPlatformTriple
+    hostArch       <- queryHost queryArch
+    hostOs         <- queryHost queryOS
+    hostVendor     <- queryHost queryVendor
+    buildPlatform  <- queryBuild targetPlatformTriple
+    buildArch      <- queryBuild queryArch
+    buildOs        <- queryBuild queryOS
+    buildVendor    <- queryBuild queryVendor
+    targetPlatform <- queryTarget targetPlatformTriple
+    targetArch     <- queryTarget queryArch
+    targetOs       <- queryTarget queryOS
+    targetVendor   <- queryTarget queryVendor
+    ghcUnreg       <- queryTarget tgtUnregisterised
+    ghcEnableTNC   <- queryTarget tgtTablesNextToCode
     rtsWays        <- getRtsWays
     way            <- getWay
     path           <- getBuildPath
     top            <- expr topDirectory
-    useSystemFfi   <- expr $ flag UseSystemFfi
+    useSystemFfi   <- getFlag UseSystemFfi
     ffiIncludeDir  <- getSetting FfiIncludeDir
     ffiLibraryDir  <- getSetting FfiLibDir
     libdwIncludeDir   <- getSetting LibdwIncludeDir
     libdwLibraryDir   <- getSetting LibdwLibDir
     libnumaIncludeDir <- getSetting LibnumaIncludeDir
     libnumaLibraryDir <- getSetting LibnumaLibDir
+    libzstdIncludeDir <- getSetting LibZstdIncludeDir
+    libzstdLibraryDir <- getSetting LibZstdLibDir
+
 
     -- Arguments passed to GHC when compiling C and .cmm sources.
     let ghcArgs = mconcat
           [ arg "-Irts"
           , arg $ "-I" ++ path
-          , arg $ "-DRtsWay=\"rts_" ++ show way ++ "\""
-          -- Set the namespace for the rts fs functions
-          , arg $ "-DFS_NAMESPACE=rts"
-          , arg $ "-DCOMPILING_RTS"
-          , notM targetSupportsSMP           ? arg "-DNOSMP"
           , way `elem` [debug, debugDynamic] ? pure [ "-DTICKY_TICKY"
                                                     , "-optc-DTICKY_TICKY"]
           , Profiling `wayUnit` way          ? arg "-DPROFILING"
@@ -321,9 +332,16 @@ rtsPackageArgs = package rts ? do
                                                     , "-fno-omit-frame-pointer"
                                                     , "-g3"
                                                     , "-O0" ]
+          -- Set the namespace for the rts fs functions
+          , arg $ "-DFS_NAMESPACE=rts"
+
+          , arg $ "-DCOMPILING_RTS"
 
           , inputs ["**/RtsMessages.c", "**/Trace.c"] ?
-            arg ("-DProjectVersion=" ++ show projectVersion)
+            pure
+              ["-DProjectVersion=" ++ show projectVersion
+              , "-DRtsWay=\"rts_" ++ show way ++ "\""
+              ]
 
           , input "**/RtsUtils.c" ? pure
             [ "-DProjectVersion="            ++ show projectVersion
@@ -339,8 +357,9 @@ rtsPackageArgs = package rts ? do
             , "-DTargetArch="                ++ show targetArch
             , "-DTargetOS="                  ++ show targetOs
             , "-DTargetVendor="              ++ show targetVendor
-            , "-DGhcUnregisterised="         ++ show ghcUnreg
-            , "-DTablesNextToCode="          ++ show ghcEnableTNC
+            , "-DGhcUnregisterised="         ++ show (yesNo ghcUnreg)
+            , "-DTablesNextToCode="          ++ show (yesNo ghcEnableTNC)
+            , "-DRtsWay=\"rts_" ++ show way ++ "\""
             ]
 
           -- We're after pur performance here. So make sure fast math and
@@ -384,13 +403,27 @@ rtsPackageArgs = package rts ? do
           , any (wayUnit Debug) rtsWays     `cabalFlag` "debug"
           , any (wayUnit Dynamic) rtsWays   `cabalFlag` "dynamic"
           , any (wayUnit Threaded) rtsWays  `cabalFlag` "threaded"
+          , flag UseLibm                    `cabalFlag` "libm"
+          , flag UseLibrt                   `cabalFlag` "librt"
+          , flag UseLibdl                   `cabalFlag` "libdl"
           , useSystemFfi                    `cabalFlag` "use-system-libffi"
           , useLibffiForAdjustors           `cabalFlag` "libffi-adjustors"
+          , flag UseLibpthread              `cabalFlag` "need-pthread"
+          , flag UseLibbfd                  `cabalFlag` "libbfd"
+          , flag NeedLibatomic              `cabalFlag` "need-atomic"
+          , flag UseLibdw                   `cabalFlag` "libdw"
+          , flag UseLibnuma                 `cabalFlag` "libnuma"
+          , flag UseLibzstd                 `cabalFlag` "libzstd"
+          , flag StaticLibzstd              `cabalFlag` "static-libzstd"
+          , queryTargetTarget tgtSymbolsHaveLeadingUnderscore `cabalFlag` "leading-underscore"
+          , ghcUnreg                        `cabalFlag` "unregisterised"
+          , ghcEnableTNC                    `cabalFlag` "tables-next-to-code"
           , Debug `wayUnit` way             `cabalFlag` "find-ptr"
           ]
         , builder (Cabal Setup) ? mconcat
               [ cabalExtraDirs libdwIncludeDir libdwLibraryDir
               , cabalExtraDirs libnumaIncludeDir libnumaLibraryDir
+              , cabalExtraDirs libzstdIncludeDir libzstdLibraryDir
               , useSystemFfi ? cabalExtraDirs ffiIncludeDir ffiLibraryDir
               ]
         , builder (Cc (FindCDependencies CDep)) ? cArgs
@@ -436,8 +469,8 @@ rtsPackageArgs = package rts ? do
 -- collect2: ld returned 1 exit status
 speedHack :: Action Bool
 speedHack = do
-    i386   <- anyTargetArch ["i386"]
-    goodOS <- not <$> anyTargetOs ["darwin", "solaris2"]
+    i386   <- anyTargetArch [ArchX86]
+    goodOS <- not <$> anyTargetOs [OSDarwin, OSSolaris2]
     return $ i386 && goodOS
 
 -- See @rts/ghc.mk@.

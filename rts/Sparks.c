@@ -16,7 +16,7 @@
 #include "Sparks.h"
 #include "ThreadLabels.h"
 #include "sm/NonMovingMark.h"
-#include "sm/HeapAlloc.h"
+#include "rts/storage/HeapAlloc.h"
 
 #if defined(THREADED_RTS)
 
@@ -208,8 +208,7 @@ pruneSparkQueue (bool nonmovingMarkFinished, Capability *cap)
           cap->spark_stats.fizzled++;
           traceEventSparkFizzle(cap);
       } else {
-          info = RELAXED_LOAD(&spark->header.info);
-          load_load_barrier();
+          info = ACQUIRE_LOAD(&spark->header.info);
           if (IS_FORWARDING_PTR(info)) {
               tmp = (StgClosure*)UN_FORWARDING_PTR(info);
               /* if valuable work: shift inside the pool */

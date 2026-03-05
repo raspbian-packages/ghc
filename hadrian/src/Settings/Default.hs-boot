@@ -1,6 +1,6 @@
 module Settings.Default (
     SourceArgs (..), sourceArgs, defaultBuilderArgs, defaultPackageArgs,
-    defaultArgs, defaultLibraryWays, defaultRtsWays,
+    defaultExtraArgs, defaultHaddockExtraArgs, defaultLibraryWays, defaultRtsWays,
     defaultFlavour, defaultBignumBackend
     ) where
 
@@ -15,7 +15,7 @@ data SourceArgs = SourceArgs
 
 sourceArgs :: SourceArgs -> Args
 
-defaultBuilderArgs, defaultPackageArgs, defaultArgs :: Args
+defaultBuilderArgs, defaultPackageArgs, defaultExtraArgs, defaultHaddockExtraArgs :: Args
 defaultLibraryWays, defaultRtsWays :: Ways
 defaultFlavour :: Flavour
 defaultBignumBackend :: String

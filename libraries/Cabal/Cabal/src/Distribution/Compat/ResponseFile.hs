@@ -1,9 +1,11 @@
-{-# LANGUAGE CPP, RankNTypes, FlexibleContexts #-}
+{-# LANGUAGE CPP #-}
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE RankNTypes #-}
 
 -- Compatibility layer for GHC.ResponseFile
 -- Implementation from base 4.12.0 is used.
 -- http://hackage.haskell.org/package/base-4.12.0.0/src/LICENSE
-module Distribution.Compat.ResponseFile (expandResponse) where
+module Distribution.Compat.ResponseFile (expandResponse, escapeArgs) where
 
 import Distribution.Compat.Prelude
 import Prelude ()
@@ -13,7 +15,7 @@ import System.IO (hPutStrLn, stderr)
 import System.IO.Error
 
 #if MIN_VERSION_base(4,12,0)
-import GHC.ResponseFile (unescapeArgs)
+import GHC.ResponseFile (unescapeArgs, escapeArgs)
 #else
 
 unescapeArgs :: String -> [String]
@@ -47,8 +49,28 @@ unescape args = reverse . map reverse $ go args NoneQ False [] []
         | '"'  == c              = go cs DblQ  False a     as
         | otherwise              = go cs NoneQ False (c:a) as
 
+escapeArgs :: [String] -> String
+escapeArgs = unlines . map escapeArg
+
+escapeArg :: String -> String
+escapeArg = reverse . foldl' escape []
+
+escape :: String -> Char -> String
+escape cs c
+  |    isSpace c
+    || '\\' == c
+    || '\'' == c
+    || '"'  == c = c:'\\':cs -- n.b., our caller must reverse the result
+  | otherwise    = c:cs
+
 #endif
 
+-- | The arg file / response file parser.
+--
+-- This is not a well-documented capability, and is a bit eccentric
+-- (try @cabal \@foo \@bar@ to see what that does), but is crucial
+-- for allowing complex arguments to cabal and cabal-install when
+-- using command prompts with strongly-limited argument length.
 expandResponse :: [String] -> IO [String]
 expandResponse = go recursionLimit "."
   where
@@ -56,11 +78,11 @@ expandResponse = go recursionLimit "."
 
     go :: Int -> FilePath -> [String] -> IO [String]
     go n dir
-      | n >= 0    = fmap concat . traverse (expand n dir)
+      | n >= 0 = fmap concat . traverse (expand n dir)
       | otherwise = const $ hPutStrLn stderr "Error: response file recursion limit exceeded." >> exitFailure
 
     expand :: Int -> FilePath -> String -> IO [String]
-    expand n dir arg@('@':f) = readRecursively n (dir </> f) `catchIOError` (const $ print "?" >> return [arg])
+    expand n dir arg@('@' : f) = readRecursively n (dir </> f) `catchIOError` const (print "?" >> return [arg])
     expand _n _dir x = return [x]
 
     readRecursively :: Int -> FilePath -> IO [String]

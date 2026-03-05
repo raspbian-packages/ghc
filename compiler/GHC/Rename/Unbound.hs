@@ -9,29 +9,37 @@ unbound variables.
 module GHC.Rename.Unbound
    ( mkUnboundName
    , mkUnboundNameRdr
+   , mkUnboundGRE
+   , mkUnboundGRERdr
    , isUnboundName
    , reportUnboundName
    , reportUnboundName'
    , unknownNameSuggestions
+   , similarNameSuggestions
+   , fieldSelectorSuggestions
    , WhatLooking(..)
    , WhereLooking(..)
    , LookingFor(..)
    , unboundName
    , unboundNameX
+   , unboundTermNameInTypes
+   , IsTermInTypes(..)
    , notInScopeErr
    , nameSpacesRelated
+   , termNameInType
    )
 where
 
 import GHC.Prelude
 
-import GHC.Driver.Session
+import GHC.Driver.DynFlags
 import GHC.Driver.Ppr
 
 import GHC.Tc.Errors.Types
 import GHC.Tc.Utils.Monad
 import GHC.Builtin.Names ( mkUnboundName, isUnboundName, getUnique)
 import GHC.Utils.Misc
+import GHC.Utils.Panic (panic)
 
 import GHC.Data.Maybe
 import GHC.Data.FastString
@@ -93,8 +101,16 @@ data LookingFor = LF { lf_which :: WhatLooking
                      , lf_where :: WhereLooking
                      }
 
+data IsTermInTypes = UnknownTermInTypes RdrName | TermInTypes RdrName | NoTermInTypes
+
 mkUnboundNameRdr :: RdrName -> Name
 mkUnboundNameRdr rdr = mkUnboundName (rdrNameOcc rdr)
+
+mkUnboundGRE :: OccName -> GlobalRdrElt
+mkUnboundGRE occ = mkLocalGRE UnboundGRE NoParent $ mkUnboundName occ
+
+mkUnboundGRERdr :: RdrName -> GlobalRdrElt
+mkUnboundGRERdr rdr = mkLocalGRE UnboundGRE NoParent $ mkUnboundNameRdr rdr
 
 reportUnboundName' :: WhatLooking -> RdrName -> RnM Name
 reportUnboundName' what_look rdr = unboundName (LF what_look WL_Anywhere) rdr
@@ -107,11 +123,24 @@ unboundName lf rdr = unboundNameX lf rdr []
 
 unboundNameX :: LookingFor -> RdrName -> [GhcHint] -> RnM Name
 unboundNameX looking_for rdr_name hints
+  = unboundNameOrTermInType NoTermInTypes looking_for rdr_name hints
+
+unboundTermNameInTypes :: LookingFor -> RdrName -> RdrName  -> RnM Name
+unboundTermNameInTypes looking_for rdr_name demoted_rdr_name
+  = unboundNameOrTermInType (UnknownTermInTypes demoted_rdr_name) looking_for rdr_name []
+
+-- Catches imported qualified terms in type signatures
+-- with proper error message and suggestions
+termNameInType :: LookingFor -> RdrName -> RdrName -> [GhcHint] -> RnM Name
+termNameInType looking_for rdr_name demoted_rdr_name external_hints
+  = unboundNameOrTermInType (TermInTypes demoted_rdr_name) looking_for rdr_name external_hints
+
+unboundNameOrTermInType :: IsTermInTypes -> LookingFor -> RdrName -> [GhcHint] -> RnM Name
+unboundNameOrTermInType if_term_in_type looking_for rdr_name hints
   = do  { dflags <- getDynFlags
         ; let show_helpful_errors = gopt Opt_HelpfulErrors dflags
-              err = notInScopeErr (lf_where looking_for) rdr_name
         ; if not show_helpful_errors
-          then addErr $ TcRnNotInScope err rdr_name [] hints
+          then addErr $ make_error [] hints
           else do { local_env  <- getLocalRdrEnv
                   ; global_env <- getGlobalRdrEnv
                   ; impInfo <- getImports
@@ -122,9 +151,19 @@ unboundNameX looking_for rdr_name hints
                             dflags hpt currmod global_env local_env impInfo
                             rdr_name
                   ; addErr $
-                      TcRnNotInScope err rdr_name imp_errs (hints ++ suggs) }
+                      make_error imp_errs (hints ++ suggs) }
         ; return (mkUnboundNameRdr rdr_name) }
+    where
+      name_to_search = case if_term_in_type of
+        NoTermInTypes                   -> rdr_name
+        UnknownTermInTypes demoted_name -> demoted_name
+        TermInTypes demoted_name        -> demoted_name
 
+      err = notInScopeErr (lf_where looking_for) name_to_search
+
+      make_error imp_errs hints = case if_term_in_type of
+        TermInTypes demoted_name -> TcRnTermNameInType demoted_name hints
+        _ -> TcRnNotInScope err name_to_search imp_errs hints
 
 notInScopeErr :: WhereLooking -> RdrName -> NotInScopeError
 notInScopeErr where_look rdr_name
@@ -136,11 +175,17 @@ notInScopeErr where_look rdr_name
   = NotInScope
 
 -- | Called from the typechecker ("GHC.Tc.Errors") when we find an unbound variable
-unknownNameSuggestions :: WhatLooking -> DynFlags
-                       -> HomePackageTable -> Module
-                       -> GlobalRdrEnv -> LocalRdrEnv -> ImportAvails
-                       -> RdrName -> ([ImportError], [GhcHint])
-unknownNameSuggestions what_look = unknownNameSuggestions_ (LF what_look WL_Anywhere)
+unknownNameSuggestions :: LocalRdrEnv -> WhatLooking -> RdrName -> RnM ([ImportError], [GhcHint])
+unknownNameSuggestions lcl_env what_look tried_rdr_name =
+  do { dflags  <- getDynFlags
+     ; hpt     <- getHpt
+     ; rdr_env <- getGlobalRdrEnv
+     ; imp_info <- getImports
+     ; curr_mod <- getModule
+     ; return $
+        unknownNameSuggestions_
+          (LF what_look WL_Anywhere)
+          dflags hpt curr_mod rdr_env lcl_env imp_info tried_rdr_name }
 
 unknownNameSuggestions_ :: LookingFor -> DynFlags
                        -> HomePackageTable -> Module
@@ -152,7 +197,7 @@ unknownNameSuggestions_ looking_for dflags hpt curr_mod global_env local_env
     suggs = mconcat
       [ if_ne (SuggestSimilarNames tried_rdr_name) $
           similarNameSuggestions looking_for dflags global_env local_env tried_rdr_name
-      , map ImportSuggestion imp_suggs
+      , map (ImportSuggestion $ rdrNameOcc tried_rdr_name) imp_suggs
       , extensionSuggestions tried_rdr_name
       , fieldSelectorSuggestions global_env tried_rdr_name ]
     (imp_errs, imp_suggs) = importSuggestions looking_for global_env hpt curr_mod imports tried_rdr_name
@@ -168,9 +213,9 @@ fieldSelectorSuggestions global_env tried_rdr_name
   | null gres = []
   | otherwise = [RemindFieldSelectorSuppressed tried_rdr_name parents]
   where
-    gres = filter isNoFieldSelectorGRE $
-               lookupGRE_RdrName' tried_rdr_name global_env
-    parents = [ parent | ParentIs parent <- map gre_par gres ]
+    gres = filter isNoFieldSelectorGRE
+         $ lookupGRE global_env (LookupRdrName tried_rdr_name AllRelevantGREs)
+    parents = [ parent | ParentIs parent <- map greParent gres ]
 
 similarNameSuggestions :: LookingFor -> DynFlags
                        -> GlobalRdrEnv -> LocalRdrEnv
@@ -182,7 +227,7 @@ similarNameSuggestions looking_for@(LF what_look where_look) dflags global_env
     all_possibilities :: [(String, SimilarName)]
     all_possibilities = case what_look of
       WL_None -> []
-      _ -> [ (showPpr dflags r, SimilarRdrName r (LocallyBoundAt loc))
+      _ -> [ (showPpr dflags r, SimilarRdrName r (Just $ LocallyBoundAt loc))
            | (r,loc) <- local_possibilities local_env ]
         ++ [ (showPpr dflags r, rp) | (r, rp) <- global_possibilities global_env ]
 
@@ -213,7 +258,7 @@ similarNameSuggestions looking_for@(LF what_look where_look) dflags global_env
 
     global_possibilities :: GlobalRdrEnv -> [(RdrName, SimilarName)]
     global_possibilities global_env
-      | tried_is_qual = [ (rdr_qual, SimilarRdrName rdr_qual how)
+      | tried_is_qual = [ (rdr_qual, SimilarRdrName rdr_qual (Just how))
                         | gre <- globalRdrEnvElts global_env
                         , isGreOk looking_for gre
                         , let occ = greOccName gre
@@ -228,7 +273,7 @@ similarNameSuggestions looking_for@(LF what_look where_look) dflags global_env
                           rdr_unqual = mkRdrUnqual occ
                     , correct_name_space occ
                     , sim <- case (unquals_in_scope gre, quals_only gre) of
-                                (how:_, _)    -> [ SimilarRdrName rdr_unqual how ]
+                                (how:_, _)    -> [ SimilarRdrName rdr_unqual (Just how) ]
                                 ([],    pr:_) -> [ pr ]  -- See Note [Only-quals]
                                 ([],    [])   -> [] ]
 
@@ -256,7 +301,7 @@ similarNameSuggestions looking_for@(LF what_look where_look) dflags global_env
     quals_only :: GlobalRdrElt -> [SimilarName]
     -- Ones for which *only* the qualified version is in scope
     quals_only (gre@GRE { gre_imp = is })
-      = [ (SimilarRdrName (mkRdrQual (is_as ispec) (greOccName gre)) (ImportedBy ispec))
+      = [ (SimilarRdrName (mkRdrQual (is_as ispec) (greOccName gre)) (Just $ ImportedBy ispec))
         | i <- bagToList is, let ispec = is_decl i, is_qual ispec ]
 
 
@@ -278,9 +323,9 @@ importSuggestions looking_for global_env hpt currMod imports rdr_name
   , (mod : mods) <- map fst interesting_imports
   = ([ModulesDoNotExport (mod :| mods) occ_name], [])
   | mod : mods <- helpful_imports_non_hiding
-  = ([], [CouldImportFrom (mod :| mods) occ_name])
+  = ([], [CouldImportFrom (mod :| mods)])
   | mod : mods <- helpful_imports_hiding
-  = ([], [CouldUnhideFrom (mod :| mods) occ_name])
+  = ([], [CouldUnhideFrom (mod :| mods)])
   | otherwise
   = ([], [])
  where
@@ -288,7 +333,7 @@ importSuggestions looking_for global_env hpt currMod imports rdr_name
   (mod_name, occ_name) = case rdr_name of
     Unqual occ_name        -> (Nothing, occ_name)
     Qual mod_name occ_name -> (Just mod_name, occ_name)
-    _                      -> error "importSuggestions: dead code"
+    _                      -> panic "importSuggestions: dead code"
 
 
   -- What import statements provide "Mod" at all
@@ -312,7 +357,8 @@ importSuggestions looking_for global_env hpt currMod imports rdr_name
   helpful_imports = filter helpful interesting_imports
     where helpful (_,imv)
             = any (isGreOk looking_for) $
-              lookupGlobalRdrEnv (imv_all_exports imv) occ_name
+              lookupGRE (imv_all_exports imv)
+                (LookupOccName occ_name $ RelevantGREsFOS WantNormal)
 
   -- Which of these do that because of an explicit hiding list resp. an
   -- explicit import list
@@ -330,9 +376,9 @@ importSuggestions looking_for global_env hpt currMod imports rdr_name
       hpt_uniques = map fst (udfmToList hpt)
       is_last_loaded_mod modnam uniqs = lastMaybe uniqs == Just (getUnique modnam)
       glob_mods = nub [ mod
-                     | gre <- globalRdrEnvElts global_env
-                     , (mod, _) <- qualsInScope gre
-                     ]
+                      | gre <- globalRdrEnvElts global_env
+                      , (mod, _) <- qualsInScope gre
+                      ]
 
 extensionSuggestions :: RdrName -> [GhcHint]
 extensionSuggestions rdrName
@@ -374,12 +420,15 @@ nameSpacesRelated :: DynFlags    -- ^ to find out whether -XDataKinds is enabled
                   -> NameSpace   -- ^ Name space of a name that might have been meant
                   -> Bool
 nameSpacesRelated dflags what_looking ns ns'
-  = ns' `elem` ns : [ other_ns
-                    | (orig_ns, others) <- other_namespaces
-                    , ns == orig_ns
-                    , (other_ns, wls) <- others
-                    , what_looking `elem` WL_Anything : wls
-                    ]
+  | ns == ns'
+  = True
+  | otherwise
+  = or [ other_ns ns'
+       | (orig_ns, others) <- other_namespaces
+       , orig_ns ns
+       , (other_ns, wls) <- others
+       , what_looking `elem` WL_Anything : wls
+       ]
   where
     -- explanation:
     -- [(orig_ns, [(other_ns, what_looking_possibilities)])]
@@ -387,19 +436,21 @@ nameSpacesRelated dflags what_looking ns ns'
     -- and what_looking is either WL_Anything or is one of
     -- what_looking_possibilities
     other_namespaces =
-      [ (varName  , [(dataName, [WL_Constructor])])
-      , (dataName , [(varName , [WL_RecField])])
-      , (tvName   , (tcClsName, [WL_Constructor]) : promoted_datacons)
-      , (tcClsName, (tvName   , []) : promoted_datacons)
+      [ (isVarNameSpace     , [(isFieldNameSpace  , [WL_RecField])
+                              ,(isDataConNameSpace, [WL_Constructor])])
+      , (isDataConNameSpace , [(isVarNameSpace    , [WL_RecField])])
+      , (isTvNameSpace      , (isTcClsNameSpace   , [WL_Constructor])
+                              : promoted_datacons)
+      , (isTcClsNameSpace   , (isTvNameSpace     , [])
+                              : promoted_datacons)
       ]
     -- If -XDataKinds is enabled, the data constructor name space is also
     -- related to the type-level name spaces
     data_kinds = xopt LangExt.DataKinds dflags
-    promoted_datacons = [(dataName, [WL_Constructor]) | data_kinds]
+    promoted_datacons = [(isDataConNameSpace, [WL_Constructor]) | data_kinds]
 
-{-
-Note [Related name spaces]
-~~~~~~~~~~~~~~~~~~~~~~~~~
+{- Note [Related name spaces]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Name spaces are related if there is a chance to mean the one when one writes
 the other, i.e. variables <-> data constructors and type variables <-> type
 constructors.

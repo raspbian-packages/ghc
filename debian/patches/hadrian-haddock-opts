@@ -16,10 +16,10 @@ Index: b/hadrian/src/Settings/Builders/Haddock.hs
              , pure [ "--read-interface="
                       ++ (takeFileName . takeDirectory) haddock
                       ++ "," ++ haddock | haddock <- inputs ] ]
-@@ -58,6 +59,7 @@ haddockBuilderArgs = mconcat
-             , arg "--hyperlinked-source"
-             , arg "--hoogle"
-             , arg "--quickjump"
+@@ -64,6 +65,7 @@ haddockBuilderArgs = mconcat
+             , arg $ "--odir=" ++ takeDirectory output
+             , arg $ "--dump-interface=" ++ output
+             , arg "--html"
 +            , arg "--mathjax=file:///usr/share/javascript/mathjax/MathJax.js"
              , arg $ "--title=" ++ pkgName pkg ++ "-" ++ version
                      ++ ": " ++ synopsis

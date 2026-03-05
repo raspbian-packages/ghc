@@ -1,4 +1,4 @@
-ghc (9.6.6-4+rpi1) trixie-staging; urgency=medium
+ghc (9.10.3-3+rpi1) forky-staging; urgency=medium
 
   [changes brought forward from 7.6.3-21+rpi1 by Peter Michael Green <plugwash@raspbian.org> at Sun, 19 Apr 2015 14:00:16 +0000]
   * Change compiler defaults for armv6
@@ -6,10 +6,93 @@ ghc (9.6.6-4+rpi1) trixie-staging; urgency=medium
   [changes brought forward from 9.0.2-4+rpi2 by Peter Michael Green <plugwash@raspbian.org> at Tue, 04 Oct 2022 05:00:41 +0000]
   * Add build-conflicts on libllvm14
 
-  [changes introduced in 9.4.7-2+rpi1 by Peter Michael Green]
-  * replace dmb instruction with coprocessor barrier instruction.
+ -- Peter Michael Green <plugwash@raspbian.org>  Thu, 05 Mar 2026 18:42:23 +0000
 
- -- Raspbian forward porter <root@raspbian.org>  Sat, 08 Mar 2025 09:38:06 +0000
+ghc (9.10.3-3) unstable; urgency=medium
+
+  * Do not pass --hash-unit-ids to hadrian (Closes: #1126311)
+
+ -- Ilias Tsitsimpis <iliastsi@debian.org>  Sat, 24 Jan 2026 14:41:42 +0200
+
+ghc (9.10.3-2) unstable; urgency=medium
+
+  [ John Paul Adrian Glaubitz ]
+  * Build with --enable-unregisterised on loong64 for bootstrap
+  * Add patch to add platform support for hppa and sparc64
+  * Add patch to use modern GCC atomics built-ins in ghc-prim
+  * Build with -optc-no-integrated-cpp on powerpc
+
+  [ Ilias Tsitsimpis ]
+  * Patch configure to match arm-unknown-linux to armv7-unknown-linux (Closes:
+    #1124748)
+
+ -- Ilias Tsitsimpis <iliastsi@debian.org>  Mon, 19 Jan 2026 23:20:19 +0200
+
+ghc (9.10.3-1) unstable; urgency=medium
+
+  * Backport patch to fix FTBFS on hurd-any.
+    Thanks to Samuel Thibault for the fix (Closes: #1116556).
+  * Upload to unstable (Closes: #1115801, #1124045)
+  * Remove reference to deprecated common-licenses BSD file
+    Thanks to Bastian Germann for the fix (Closes: #1121056).
+
+ -- Ilias Tsitsimpis <iliastsi@debian.org>  Fri, 02 Jan 2026 23:10:23 +0200
+
+ghc (9.10.3-1~exp3) experimental; urgency=medium
+
+  * Switch to llvm-21, to fix build on armhf
+
+ -- Ilias Tsitsimpis <iliastsi@debian.org>  Sat, 22 Nov 2025 11:36:41 +0200
+
+ghc (9.10.3-1~exp2) experimental; urgency=medium
+
+  * Drop support for armel
+  * Add dependency on clang
+
+ -- Ilias Tsitsimpis <iliastsi@debian.org>  Mon, 29 Sep 2025 13:28:07 +0300
+
+ghc (9.10.3-1~exp1) experimental; urgency=medium
+
+  * New upstream release
+  * Update upstream signing key
+  * Fix unregisterised builds with GCC15 (Closes: #1096703)
+
+ -- Ilias Tsitsimpis <iliastsi@debian.org>  Sat, 27 Sep 2025 15:29:38 +0300
+
+ghc (9.8.4-1~0exp3) experimental; urgency=medium
+
+  * Re-enable registerised builds on i386 (relying on SSE2).
+
+ -- Clint Adams <clint@debian.org>  Mon, 15 Sep 2025 15:01:33 -0400
+
+ghc (9.8.4-1~0exp2) experimental; urgency=medium
+
+  * Fix patches.
+
+ -- Clint Adams <clint@debian.org>  Sun, 14 Sep 2025 23:36:30 -0400
+
+ghc (9.8.4-0~0exp1) experimental; urgency=medium
+
+  * New upstream release.
+  * Switch to llvm-19
+  * Refresh patches
+  * Drop patches now upstream:
+    - e2d3eb507da184cf3337d36715fd82a81643d91.patch
+    - hadrian-plans
+    - hurd-getExecutablePath
+    - hurd-hadrian-supportrpaths
+    - llvm-new-pass-manager
+    - pr-13096
+
+  [ fanpeng <fanpeng@loongson.cn> ]
+  * Pass the mcmodel=medium parameter to CC via GHC
+    (Closes: #1101273)
+
+  [ Clint Adams ]
+  * Build-Depend on hadrian 9.8.4.
+  * Patch hp2ps for C23 compatibility.
+
+ -- Clint Adams <clint@debian.org>  Fri, 12 Sep 2025 10:06:48 -0400
 
 ghc (9.6.6-4) unstable; urgency=medium
 

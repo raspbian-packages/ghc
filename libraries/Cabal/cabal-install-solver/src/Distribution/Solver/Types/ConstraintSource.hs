@@ -5,7 +5,8 @@ module Distribution.Solver.Types.ConstraintSource
     ) where
 
 import Distribution.Solver.Compat.Prelude
-import Prelude ()
+import Distribution.Solver.Types.ProjectConfigPath (ProjectConfigPath, docProjectConfigPath)
+import Text.PrettyPrint (render)
 
 -- | Source of a 'PackageConstraint'.
 data ConstraintSource =
@@ -14,7 +15,7 @@ data ConstraintSource =
   ConstraintSourceMainConfig FilePath
 
   -- | Local cabal.project file
-  | ConstraintSourceProjectConfig FilePath
+  | ConstraintSourceProjectConfig ProjectConfigPath
 
   -- | User config file, which is ./cabal.config by default.
   | ConstraintSourceUserConfig FilePath
@@ -27,7 +28,7 @@ data ConstraintSource =
   | ConstraintSourceUserTarget
 
   -- | Internal requirement to use installed versions of packages like ghc-prim.
-  | ConstraintSourceNonUpgradeablePackage
+  | ConstraintSourceNonReinstallablePackage
 
   -- | Internal constraint used by @cabal freeze@.
   | ConstraintSourceFreeze
@@ -35,6 +36,10 @@ data ConstraintSource =
   -- | Constraint specified by a config file, a command line flag, or a user
   -- target, when a more specific source is not known.
   | ConstraintSourceConfigFlagOrTarget
+
+  -- | Constraint introduced by --enable-multi-repl, which requires features
+  -- from Cabal >= 3.11
+  | ConstraintSourceMultiRepl
 
   -- | The source of the constraint is not specified.
   | ConstraintSourceUnknown
@@ -56,15 +61,17 @@ showConstraintSource :: ConstraintSource -> String
 showConstraintSource (ConstraintSourceMainConfig path) =
     "main config " ++ path
 showConstraintSource (ConstraintSourceProjectConfig path) =
-    "project config " ++ path
+    "project config " ++ render (docProjectConfigPath path)
 showConstraintSource (ConstraintSourceUserConfig path)= "user config " ++ path
 showConstraintSource ConstraintSourceCommandlineFlag = "command line flag"
 showConstraintSource ConstraintSourceUserTarget = "user target"
-showConstraintSource ConstraintSourceNonUpgradeablePackage =
-    "non-upgradeable package"
+showConstraintSource ConstraintSourceNonReinstallablePackage =
+    "non-reinstallable package"
 showConstraintSource ConstraintSourceFreeze = "cabal freeze"
 showConstraintSource ConstraintSourceConfigFlagOrTarget =
     "config file, command line flag, or user target"
+showConstraintSource ConstraintSourceMultiRepl =
+    "--enable-multi-repl"
 showConstraintSource ConstraintSourceUnknown = "unknown source"
 showConstraintSource ConstraintSetupCabalMinVersion =
     "minimum version of Cabal used by Setup.hs"

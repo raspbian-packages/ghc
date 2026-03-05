@@ -62,6 +62,7 @@ module GHC.Unit.Types
      -- * Wired-in units
    , primUnitId
    , bignumUnitId
+   , ghcInternalUnitId
    , baseUnitId
    , rtsUnitId
    , thUnitId
@@ -71,12 +72,14 @@ module GHC.Unit.Types
 
    , primUnit
    , bignumUnit
+   , ghcInternalUnit
    , baseUnit
    , rtsUnit
    , thUnit
    , mainUnit
    , thisGhcUnit
    , interactiveUnit
+   , experimentalUnit
 
    , isInteractiveModule
    , wiredInUnitIds
@@ -99,10 +102,11 @@ import GHC.Data.FastString
 import GHC.Utils.Encoding
 import GHC.Utils.Fingerprint
 import GHC.Utils.Misc
+import GHC.Settings.Config (cProjectUnitId)
 
-import Control.DeepSeq
+import Control.DeepSeq (NFData(..))
 import Data.Data
-import Data.List (sortBy )
+import Data.List (sortBy)
 import Data.Function
 import Data.Bifunctor
 import qualified Data.ByteString as BS
@@ -148,7 +152,8 @@ instance Uniquable Module where
 
 instance Binary a => Binary (GenModule a) where
   put_ bh (Module p n) = put_ bh p >> put_ bh n
-  get bh = do p <- get bh; n <- get bh; return (Module p n)
+  -- Module has strict fields, so use $! in order not to allocate a thunk
+  get bh = do p <- get bh; n <- get bh; return $! Module p n
 
 instance NFData (GenModule a) where
   rnf (Module unit name) = unit `seq` name `seq` ()
@@ -166,7 +171,7 @@ instance Outputable InstantiatedModule where
 instance Outputable InstantiatedUnit where
   ppr = pprInstantiatedUnit
 
-pprInstantiatedUnit :: IsLine doc => InstantiatedUnit -> doc
+pprInstantiatedUnit :: InstantiatedUnit -> SDoc
 pprInstantiatedUnit uid =
       -- getPprStyle $ \sty ->
       pprUnitId cid <>
@@ -180,8 +185,6 @@ pprInstantiatedUnit uid =
      where
       cid   = instUnitInstanceOf uid
       insts = instUnitInsts uid
-{-# SPECIALIZE pprInstantiatedUnit :: InstantiatedUnit -> SDoc #-}
-{-# SPECIALIZE pprInstantiatedUnit :: InstantiatedUnit -> HLine #-} -- see Note [SPECIALIZE to HDoc] in GHC.Utils.Outputable
 
 -- | Class for types that are used as unit identifiers (UnitKey, UnitId, Unit)
 --
@@ -203,14 +206,13 @@ instance IsUnitId u => IsUnitId (GenUnit u) where
    unitFS HoleUnit                = holeFS
 
 pprModule :: IsLine doc => Module -> doc
-pprModule mod@(Module p n) = docWithContext (doc . sdocStyle)
+pprModule mod@(Module p n) = docWithStyle code doc
  where
-  doc sty
-    | codeStyle sty =
-        (if p == mainUnit
+  code = (if p == mainUnit
                 then empty -- never qualify the main package in code
                 else ztext (zEncodeFS (unitFS p)) <> char '_')
             <> pprModuleName n
+  doc sty
     | qualModule sty mod =
         case p of
           HoleUnit -> angleBrackets (pprModuleName n)
@@ -319,13 +321,14 @@ instance Binary InstantiatedUnit where
     cid   <- get bh
     insts <- get bh
     let fs = mkInstantiatedUnitHash cid insts
-    return InstantiatedUnit {
-            instUnitInstanceOf = cid,
-            instUnitInsts = insts,
-            instUnitHoles = unionManyUniqDSets (map (moduleFreeHoles.snd) insts),
-            instUnitFS = fs,
-            instUnitKey = getUnique fs
-           }
+    -- InstantiatedUnit has strict fields, so use $! in order not to allocate a thunk
+    return $! InstantiatedUnit {
+                instUnitInstanceOf = cid,
+                instUnitInsts = insts,
+                instUnitHoles = unionManyUniqDSets (map (moduleFreeHoles.snd) insts),
+                instUnitFS = fs,
+                instUnitKey = getUnique fs
+              }
 
 instance IsUnitId u => Eq (GenUnit u) where
   uid1 == uid2 = unitUnique uid1 == unitUnique uid2
@@ -352,12 +355,10 @@ stableUnitCmp p1 p2 = unitFS p1 `lexicalCompareFS` unitFS p2
 instance Outputable Unit where
    ppr pk = pprUnit pk
 
-pprUnit :: IsLine doc => Unit -> doc
+pprUnit :: Unit -> SDoc
 pprUnit (RealUnit (Definite d)) = pprUnitId d
 pprUnit (VirtUnit uid) = pprInstantiatedUnit uid
 pprUnit HoleUnit       = ftext holeFS
-{-# SPECIALIZE pprUnit :: Unit -> SDoc #-}
-{-# SPECIALIZE pprUnit :: Unit -> HLine #-} -- see Note [SPECIALIZE to HDoc] in GHC.Utils.Outputable
 
 instance Show Unit where
     show = unitString
@@ -373,10 +374,12 @@ instance Binary Unit where
   put_ bh HoleUnit =
     putByte bh 2
   get bh = do b <- getByte bh
-              case b of
+              u <- case b of
                 0 -> fmap RealUnit (get bh)
                 1 -> fmap VirtUnit (get bh)
                 _ -> pure HoleUnit
+              -- Unit has strict fields that need forcing; otherwise we allocate a thunk.
+              pure $! u
 
 -- | Retrieve the set of free module holes of a 'Unit'.
 unitFreeModuleHoles :: GenUnit u -> UniqDSet ModuleName
@@ -535,12 +538,8 @@ instance Uniquable UnitId where
 instance Outputable UnitId where
     ppr = pprUnitId
 
-pprUnitId :: IsLine doc => UnitId -> doc
-pprUnitId (UnitId fs) = dualLine (sdocOption sdocUnitIdForUser ($ fs)) (ftext fs)
-                        -- see Note [Pretty-printing UnitId] in GHC.Unit
-                        -- also see Note [dualLine and dualDoc] in GHC.Utils.Outputable
-{-# SPECIALIZE pprUnitId :: UnitId -> SDoc #-}
-{-# SPECIALIZE pprUnitId :: UnitId -> HLine #-} -- see Note [SPECIALIZE to HDoc] in GHC.Utils.Outputable
+pprUnitId :: UnitId -> SDoc
+pprUnitId (UnitId fs) = sdocOption sdocUnitIdForUser ($ fs)
 
 -- | A 'DefUnitId' is an 'UnitId' with the invariant that
 -- it only refers to a definite library; i.e., one we have generated
@@ -596,27 +595,32 @@ Make sure you change 'GHC.Unit.State.findWiredInUnits' if you add an entry here.
 
 -}
 
-bignumUnitId, primUnitId, baseUnitId, rtsUnitId,
-  thUnitId, mainUnitId, thisGhcUnitId, interactiveUnitId  :: UnitId
+bignumUnitId, primUnitId, ghcInternalUnitId, baseUnitId, rtsUnitId,
+  thUnitId, mainUnitId, thisGhcUnitId, interactiveUnitId,
+  experimentalUnitId :: UnitId
 
-bignumUnit, primUnit, baseUnit, rtsUnit,
-  thUnit, mainUnit, thisGhcUnit, interactiveUnit  :: Unit
+bignumUnit, primUnit, ghcInternalUnit, baseUnit, rtsUnit,
+  thUnit, mainUnit, thisGhcUnit, interactiveUnit, experimentalUnit  :: Unit
 
 primUnitId        = UnitId (fsLit "ghc-prim")
 bignumUnitId      = UnitId (fsLit "ghc-bignum")
+ghcInternalUnitId = UnitId (fsLit "ghc-internal")
 baseUnitId        = UnitId (fsLit "base")
 rtsUnitId         = UnitId (fsLit "rts")
-thisGhcUnitId     = UnitId (fsLit "ghc")
+thisGhcUnitId     = UnitId (fsLit cProjectUnitId) -- See Note [GHC's Unit Id]
 interactiveUnitId = UnitId (fsLit "interactive")
 thUnitId          = UnitId (fsLit "template-haskell")
+experimentalUnitId = UnitId (fsLit "ghc-experimental")
 
 thUnit            = RealUnit (Definite thUnitId)
 primUnit          = RealUnit (Definite primUnitId)
 bignumUnit        = RealUnit (Definite bignumUnitId)
+ghcInternalUnit   = RealUnit (Definite ghcInternalUnitId)
 baseUnit          = RealUnit (Definite baseUnitId)
 rtsUnit           = RealUnit (Definite rtsUnitId)
 thisGhcUnit       = RealUnit (Definite thisGhcUnitId)
 interactiveUnit   = RealUnit (Definite interactiveUnitId)
+experimentalUnit  = RealUnit (Definite experimentalUnitId)
 
 -- | This is the package Id for the current program.  It is the default
 -- package Id if you don't specify a package name.  We don't add this prefix
@@ -631,11 +635,54 @@ wiredInUnitIds :: [UnitId]
 wiredInUnitIds =
    [ primUnitId
    , bignumUnitId
+   , ghcInternalUnitId
    , baseUnitId
    , rtsUnitId
    , thUnitId
-   , thisGhcUnitId
+   , experimentalUnitId
    ]
+   -- NB: ghc is no longer part of the wired-in units since its unit-id, given
+   -- by hadrian or cabal, is no longer overwritten and now matches both the
+   -- cProjectUnitId defined in build-time-generated module GHC.Version, and
+   -- the unit key.
+   --
+   -- See also Note [About units], taking into consideration ghc is still a
+   -- wired-in unit but whose unit-id no longer needs special handling because
+   -- we take care that it matches the unit key.
+
+{-
+Note [GHC's Unit Id]
+~~~~~~~~~~~~~~~~~~~~
+Previously, the unit-id of ghc-the-library was fixed as `ghc`.
+This was done primarily because the compiler must know the unit-id of
+some packages (including ghc) a-priori to define wired-in names.
+
+However, as seen in #20742, a reinstallable `ghc` whose unit-id is fixed
+to `ghc` might result in subtle bugs when different ghc's interact.
+
+A good example of this is having GHC_A load a plugin compiled by GHC_B,
+where GHC_A and GHC_B are linked to ghc-libraries that are ABI
+incompatible. Without a distinction between the unit-id of the ghc library
+GHC_A is linked against and the ghc library the plugin it is loading was
+compiled against, we can't check compatibility.
+
+Now, we give a better unit-id to ghc (`ghc-version-hash`) by
+
+(1) Not setting -this-unit-id fixed to `ghc` in `ghc.cabal`, but rather by having
+    (1.1) Hadrian pass the new unit-id with -this-unit-id for stage0-1
+    (1.2) Cabal pass the unit-id it computes to ghc, which it already does by default
+
+(2) Adding a definition to `GHC.Settings.Config` whose value is the new
+unit-id. This is crucial to define the wired-in name of the GHC unit
+(`thisGhcUnitId`) which *must* match the value of the -this-unit-id flag.
+(Where `GHC.Settings.Config` is a module generated by the build system which,
+be it either hadrian or cabal, knows exactly the unit-id it passed with -this-unit-id)
+
+Note that we also ensure the ghc's unit key matches its unit id, both when
+hadrian or cabal is building ghc. This way, we no longer need to add `ghc` to
+the WiringMap, and that's why 'wiredInUnitIds' no longer includes
+'thisGhcUnitId'.
+-}
 
 ---------------------------------------------------------------------
 -- Boot Modules

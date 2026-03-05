@@ -132,7 +132,7 @@ computeCbvInfo :: HasCallStack
                -> Id
 -- computeCbvInfo fun_id rhs = fun_id
 computeCbvInfo fun_id rhs
-  | is_wkr_like || isJust mb_join_id
+  | is_wkr_like || isJoinPoint mb_join_id
   , valid_unlifted_worker val_args
   = -- pprTrace "computeCbvInfo"
     --   (text "fun" <+> ppr fun_id $$
@@ -147,14 +147,14 @@ computeCbvInfo fun_id rhs
 
   | otherwise = fun_id
   where
-    mb_join_id  = isJoinId_maybe fun_id
+    mb_join_id  = idJoinPointHood fun_id
     is_wkr_like = isWorkerLikeId fun_id
 
     val_args = filter isId lam_bndrs
     -- When computing CbvMarks, we limit the arity of join points to
     -- the JoinArity, because that's the arity we are going to use
     -- when calling it. There may be more lambdas than that on the RHS.
-    lam_bndrs | Just join_arity <- mb_join_id
+    lam_bndrs | JoinPoint join_arity <- mb_join_id
               = fst $ collectNBinders join_arity rhs
               | otherwise
               = fst $ collectBinders rhs
@@ -234,8 +234,8 @@ tidyAlt env (Alt con vs rhs)
 
 ------------  Tickish  --------------
 tidyTickish :: TidyEnv -> CoreTickish -> CoreTickish
-tidyTickish env (Breakpoint ext ix ids)
-  = Breakpoint ext ix (map (tidyVarOcc env) ids)
+tidyTickish env (Breakpoint ext ix ids modl)
+  = Breakpoint ext ix (map (tidyVarOcc env) ids) modl
 tidyTickish _   other_tickish       = other_tickish
 
 ------------  Rules  --------------
@@ -430,7 +430,7 @@ We keep the OneShotInfo because we want it to propagate into the interface.
 Not all OneShotInfo is determined by a compiler analysis; some is added by a
 call of GHC.Exts.oneShot, which is then discarded before the end of the
 optimisation pipeline, leaving only the OneShotInfo on the lambda. Hence we
-must preserve this info in inlinings. See Note [The oneShot function] in GHC.Types.Id.Make.
+must preserve this info in inlinings. See Note [oneShot magic] in GHC.Types.Id.Make.
 
 This applies to lambda binders only, hence it is stored in IfaceLamBndr.
 -}

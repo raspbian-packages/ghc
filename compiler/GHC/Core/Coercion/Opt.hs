@@ -4,7 +4,6 @@
 
 module GHC.Core.Coercion.Opt
    ( optCoercion
-   , checkAxInstCo
    , OptCoercionOpts (..)
    )
 where
@@ -15,13 +14,14 @@ import GHC.Tc.Utils.TcType   ( exactTyCoVarsOfType )
 
 import GHC.Core.TyCo.Rep
 import GHC.Core.TyCo.Subst
-import GHC.Core.TyCo.Compare( eqType )
+import GHC.Core.TyCo.Compare( eqType, eqForAllVis )
 import GHC.Core.Coercion
 import GHC.Core.Type as Type hiding( substTyVarBndr, substTy )
 import GHC.Core.TyCon
 import GHC.Core.Coercion.Axiom
 import GHC.Core.Unify
 
+import GHC.Types.Var
 import GHC.Types.Var.Set
 import GHC.Types.Var.Env
 import GHC.Types.Unique.Set
@@ -33,7 +33,6 @@ import GHC.Utils.Outputable
 import GHC.Utils.Constants (debugIsOn)
 import GHC.Utils.Misc
 import GHC.Utils.Panic
-import GHC.Utils.Panic.Plain
 
 import Control.Monad   ( zipWithM )
 
@@ -290,11 +289,14 @@ opt_co4 env sym rep r (AppCo co1 co2)
   = mkAppCo (opt_co4_wrap env sym rep r co1)
             (opt_co4_wrap env sym False Nominal co2)
 
-opt_co4 env sym rep r (ForAllCo tv k_co co)
+opt_co4 env sym rep r (ForAllCo { fco_tcv = tv, fco_visL = visL, fco_visR = visR
+                                , fco_kind = k_co, fco_body = co })
   = case optForAllCoBndr env sym tv k_co of
-      (env', tv', k_co') -> mkForAllCo tv' k_co' $
+      (env', tv', k_co') -> mkForAllCo tv' visL' visR' k_co' $
                             opt_co4_wrap env' sym rep r co
      -- Use the "mk" functions to check for nested Refls
+  where
+    !(visL', visR') = swapSym sym (visL, visR)
 
 opt_co4 env sym rep r (FunCo _r afl afr cow co1 co2)
   = assert (r == _r) $
@@ -305,18 +307,18 @@ opt_co4 env sym rep r (FunCo _r afl afr cow co1 co2)
     cow' = opt_co1 env sym cow
     !r' | rep       = Representational
         | otherwise = r
-    !(afl', afr') | sym       = (afr,afl)
-                  | otherwise = (afl,afr)
+    !(afl', afr') = swapSym sym (afl, afr)
 
 opt_co4 env sym rep r (CoVarCo cv)
-  | Just co <- lookupCoVar (lcSubst env) cv
+  | Just co <- lcLookupCoVar env cv   -- see Note [Forall over coercion] for why
+                                      -- this is the right thing here
   = opt_co4_wrap (zapLiftingContext env) sym rep r co
 
   | ty1 `eqType` ty2   -- See Note [Optimise CoVarCo to Refl]
   = mkReflCo (chooseRole rep r) ty1
 
   | otherwise
-  = assert (isCoVar cv1 )
+  = assert (isCoVar cv1) $
     wrapRole rep r $ wrapSym sym $
     CoVarCo cv1
 
@@ -376,7 +378,7 @@ opt_co4 env sym rep r (SelCo (SelTyCon n r1) (TyConAppCo _ _ cos))
 opt_co4 env sym rep r (SelCo (SelFun fs) (FunCo _r2 _afl _afr w co1 co2))
   = opt_co4_wrap env sym rep r (getNthFun fs w co1 co2)
 
-opt_co4 env sym rep _ (SelCo SelForAll (ForAllCo _ eta _))
+opt_co4 env sym rep _ (SelCo SelForAll (ForAllCo { fco_kind = eta }))
       -- works for both tyvar and covar
   = opt_co4_wrap env sym rep Nominal eta
 
@@ -384,7 +386,7 @@ opt_co4 env sym rep r (SelCo n co)
   | Just nth_co <- case (co', n) of
       (TyConAppCo _ _ cos, SelTyCon n _) -> Just (cos `getNth` n)
       (FunCo _ _ _ w co1 co2, SelFun fs) -> Just (getNthFun fs w co1 co2)
-      (ForAllCo _ eta _, SelForAll)      -> Just eta
+      (ForAllCo { fco_kind = eta }, SelForAll) -> Just eta
       _                  -> Nothing
   = if rep && (r == Nominal)
       -- keep propagating the SubCo
@@ -413,10 +415,44 @@ opt_co4 env sym rep r (LRCo lr co)
     pick_lr CLeft  (l, _) = l
     pick_lr CRight (_, r) = r
 
+{-
+Note [Forall over coercion]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Example:
+  type (:~:) :: forall k. k -> k -> Type
+  Refl :: forall k (a :: k) (b :: k). forall (cv :: (~#) k k a b). (:~:) k a b
+  k1,k2,k3,k4 :: Type
+  eta :: (k1 ~# k2) ~# (k3 ~# k4)    ==    ((~#) Type Type k1 k2) ~# ((~#) Type Type k3 k4)
+  co1_3 :: k1 ~# k3
+  co2_4 :: k2 ~# k4
+  nth 2 eta :: k1 ~# k3
+  nth 3 eta :: k2 ~# k4
+  co11_31 :: <k1> ~# (sym co1_3)
+  co22_24 :: <k2> ~# co2_4
+  (forall (cv :: eta). Refl <Type> co1_3 co2_4 (co11_31 ;; cv ;; co22_24)) ::
+    (forall (cv :: k1 ~# k2). Refl Type k1 k2 (<k1> ;; cv ;; <k2>) ~#
+    (forall (cv :: k3 ~# k4). Refl Type k3 k4
+       (sym co1_3 ;; nth 2 eta ;; cv ;; sym (nth 3 eta) ;; co2_4))
+  co1_2 :: k1 ~# k2
+  co3_4 :: k3 ~# k4
+  co5 :: co1_2 ~# co3_4
+  InstCo (forall (cv :: eta). Refl <Type> co1_3 co2_4 (co11_31 ;; cv ;; co22_24)) co5 ::
+   (Refl Type k1 k2 (<k1> ;; cv ;; <k2>))[cv |-> co1_2] ~#
+   (Refl Type k3 k4 (sym co1_3 ;; nth 2 eta ;; cv ;; sym (nth 3 eta) ;; co2_4))[cv |-> co3_4]
+      ==
+   (Refl Type k1 k2 (<k1> ;; co1_2 ;; <k2>)) ~#
+    (Refl Type k3 k4 (sym co1_3 ;; nth 2 eta ;; co3_4 ;; sym (nth 3 eta) ;; co2_4))
+      ==>
+   Refl <Type> co1_3 co2_4 (co11_31 ;; co1_2 ;; co22_24)
+Conclusion: Because of the way this all works, we want to put in the *left-hand*
+coercion in co5's type. (In the code, co5 is called `arg`.)
+So we extend the environment binding cv to arg's left-hand type.
+-}
+
 -- See Note [Optimising InstCo]
 opt_co4 env sym rep r (InstCo co1 arg)
     -- forall over type...
-  | Just (tv, kind_co, co_body) <- splitForAllCo_ty_maybe co1
+  | Just (tv, _visL, _visR, kind_co, co_body) <- splitForAllCo_ty_maybe co1
   = opt_co4_wrap (extendLiftingContext env tv
                     (mkCoherenceRightCo Nominal t2 (mkSymCo kind_co) sym_arg))
                    -- mkSymCo kind_co :: k1 ~ k2
@@ -424,28 +460,24 @@ opt_co4 env sym rep r (InstCo co1 arg)
                    -- tv |-> (t1 :: k1) ~ (((t2 :: k2) |> (sym kind_co)) :: k1)
                  sym rep r co_body
 
-    -- forall over coercion...
-  | Just (cv, kind_co, co_body) <- splitForAllCo_co_maybe co1
+    -- See Note [Forall over coercion]
+  | Just (cv, _visL, _visR, _kind_co, co_body) <- splitForAllCo_co_maybe co1
   , CoercionTy h1 <- t1
-  , CoercionTy h2 <- t2
-  = let new_co = mk_new_co cv (opt_co4_wrap env sym False Nominal kind_co) h1 h2
-    in opt_co4_wrap (extendLiftingContext env cv new_co) sym rep r co_body
+  = opt_co4_wrap (extendLiftingContextCvSubst env cv h1) sym rep r co_body
 
     -- See if it is a forall after optimization
     -- If so, do an inefficient one-variable substitution, then re-optimize
 
     -- forall over type...
-  | Just (tv', kind_co', co_body') <- splitForAllCo_ty_maybe co1'
+  | Just (tv', _visL, _visR, kind_co', co_body') <- splitForAllCo_ty_maybe co1'
   = opt_co4_wrap (extendLiftingContext (zapLiftingContext env) tv'
                     (mkCoherenceRightCo Nominal t2' (mkSymCo kind_co') arg'))
             False False r' co_body'
 
-    -- forall over coercion...
-  | Just (cv', kind_co', co_body') <- splitForAllCo_co_maybe co1'
+    -- See Note [Forall over coercion]
+  | Just (cv', _visL, _visR, _kind_co', co_body') <- splitForAllCo_co_maybe co1'
   , CoercionTy h1' <- t1'
-  , CoercionTy h2' <- t2'
-  = let new_co = mk_new_co cv' kind_co' h1' h2'
-    in opt_co4_wrap (extendLiftingContext (zapLiftingContext env) cv' new_co)
+  = opt_co4_wrap (extendLiftingContextCvSubst (zapLiftingContext env) cv' h1')
                     False False r' co_body'
 
   | otherwise = InstCo co1' arg'
@@ -465,20 +497,6 @@ opt_co4 env sym rep r (InstCo co1 arg)
     -- lacks, so we need to use sym_arg to balance the number of Syms. (#15725)
     Pair t1  t2  = coercionKind sym_arg
     Pair t1' t2' = coercionKind arg'
-
-    mk_new_co cv kind_co h1 h2
-      = let -- h1 :: (t1 ~ t2)
-            -- h2 :: (t3 ~ t4)
-            -- kind_co :: (t1 ~ t2) ~ (t3 ~ t4)
-            -- n1 :: t1 ~ t3
-            -- n2 :: t2 ~ t4
-            -- new_co = (h1 :: t1 ~ t2) ~ ((n1;h2;sym n2) :: t1 ~ t2)
-            r2  = coVarRole cv
-            kind_co' = downgradeRole r2 Nominal kind_co
-            n1 = mkSelCo (SelTyCon 2 r2) kind_co'
-            n2 = mkSelCo (SelTyCon 3 r2) kind_co'
-         in mkProofIrrelCo Nominal (Refl (coercionType h1)) h1
-                           (n1 `mkTransCo` h2 `mkTransCo` (mkSymCo n2))
 
 opt_co4 env sym _rep r (KindCo co)
   = assert (r == Nominal) $
@@ -526,8 +544,8 @@ of arguments in a `CoTyConApp` can differ. Consider
 
   Any :: forall k. k
 
-  Any * Int                      :: *
-  Any (*->*) Maybe Int  :: *
+  Any @Type Int                :: Type
+  Any @(Type->Type) Maybe Int  :: Type
 
 Hence the need to compare argument lengths; see #13658
 
@@ -575,8 +593,10 @@ opt_univ env sym prov role oty1 oty2
 
   -- can't optimize the AppTy case because we can't build the kind coercions.
 
-  | Just (tv1, ty1) <- splitForAllTyVar_maybe oty1
-  , Just (tv2, ty2) <- splitForAllTyVar_maybe oty2
+  | Just (Bndr tv1 vis1, ty1) <- splitForAllForAllTyBinder_maybe oty1
+  , isTyVar tv1
+  , Just (Bndr tv2 vis2, ty2) <- splitForAllForAllTyBinder_maybe oty2
+  , isTyVar tv2
       -- NB: prov isn't interesting here either
   = let k1   = tyVarKind tv1
         k2   = tyVarKind tv2
@@ -585,11 +605,14 @@ opt_univ env sym prov role oty1 oty2
         ty2' = substTyWith [tv2] [TyVarTy tv1 `mkCastTy` eta] ty2
 
         (env', tv1', eta') = optForAllCoBndr env sym tv1 eta
+        !(vis1', vis2') = swapSym sym (vis1, vis2)
     in
-    mkForAllCo tv1' eta' (opt_univ env' sym prov' role ty1 ty2')
+    mkForAllCo tv1' vis1' vis2' eta' (opt_univ env' sym prov' role ty1 ty2')
 
-  | Just (cv1, ty1) <- splitForAllCoVar_maybe oty1
-  , Just (cv2, ty2) <- splitForAllCoVar_maybe oty2
+  | Just (Bndr cv1 vis1, ty1) <- splitForAllForAllTyBinder_maybe oty1
+  , isCoVar cv1
+  , Just (Bndr cv2 vis2, ty2) <- splitForAllForAllTyBinder_maybe oty2
+  , isCoVar cv2
       -- NB: prov isn't interesting here either
   = let k1    = varType cv1
         k2    = varType cv2
@@ -603,8 +626,9 @@ opt_univ env sym prov role oty1 oty2
         ty2'  = substTyWithCoVars [cv2] [n_co] ty2
 
         (env', cv1', eta') = optForAllCoBndr env sym cv1 eta
+        !(vis1', vis2') = swapSym sym (vis1, vis2)
     in
-    mkForAllCo cv1' eta' (opt_univ env' sym prov' role ty1 ty2')
+    mkForAllCo cv1' vis1' vis2' eta' (opt_univ env' sym prov' role ty1 ty2')
 
   | otherwise
   = let ty1 = substTyUnchecked (lcSubstLeft  env) oty1
@@ -616,13 +640,8 @@ opt_univ env sym prov role oty1 oty2
 
   where
     prov' = case prov of
-#if __GLASGOW_HASKELL__ < 901
--- This alt is redundant with the first match of the FunDef
-      PhantomProv kco    -> PhantomProv $ opt_co4_wrap env sym False Nominal kco
-#endif
       ProofIrrelProv kco -> ProofIrrelProv $ opt_co4_wrap env sym False Nominal kco
       PluginProv _       -> prov
-      CorePrepProv _     -> prov
 
 -------------
 opt_transList :: HasDebugCallStack => InScopeSet -> [NormalCo] -> [NormalCo] -> [NormalCo]
@@ -748,23 +767,23 @@ opt_trans_rule is co1 co2@(AppCo co2a co2b)
 -- Push transitivity inside forall
 -- forall over types.
 opt_trans_rule is co1 co2
-  | Just (tv1, eta1, r1) <- splitForAllCo_ty_maybe co1
-  , Just (tv2, eta2, r2) <- etaForAllCo_ty_maybe co2
-  = push_trans tv1 eta1 r1 tv2 eta2 r2
+  | Just (tv1, visL1, _visR1, eta1, r1) <- splitForAllCo_ty_maybe co1
+  , Just (tv2, _visL2, visR2, eta2, r2) <- etaForAllCo_ty_maybe co2
+  = push_trans tv1 eta1 r1 tv2 eta2 r2 visL1 visR2
 
-  | Just (tv2, eta2, r2) <- splitForAllCo_ty_maybe co2
-  , Just (tv1, eta1, r1) <- etaForAllCo_ty_maybe co1
-  = push_trans tv1 eta1 r1 tv2 eta2 r2
+  | Just (tv2, _visL2, visR2, eta2, r2) <- splitForAllCo_ty_maybe co2
+  , Just (tv1, visL1, _visR1, eta1, r1) <- etaForAllCo_ty_maybe co1
+  = push_trans tv1 eta1 r1 tv2 eta2 r2 visL1 visR2
 
   where
-  push_trans tv1 eta1 r1 tv2 eta2 r2
+  push_trans tv1 eta1 r1 tv2 eta2 r2 visL visR
     -- Given:
-    --   co1 = /\ tv1 : eta1. r1
-    --   co2 = /\ tv2 : eta2. r2
+    --   co1 = /\ tv1 : eta1 <visL, visM>. r1
+    --   co2 = /\ tv2 : eta2 <visM, visR>. r2
     -- Wanted:
-    --   /\tv1 : (eta1;eta2).  (r1; r2[tv2 |-> tv1 |> eta1])
+    --   /\tv1 : (eta1;eta2) <visL, visR>.  (r1; r2[tv2 |-> tv1 |> eta1])
     = fireTransRule "EtaAllTy_ty" co1 co2 $
-      mkForAllCo tv1 (opt_trans is eta1 eta2) (opt_trans is' r1 r2')
+      mkForAllCo tv1 visL visR (opt_trans is eta1 eta2) (opt_trans is' r1 r2')
     where
       is' = is `extendInScopeSet` tv1
       r2' = substCoWithUnchecked [tv2] [mkCastTy (TyVarTy tv1) eta1] r2
@@ -772,25 +791,25 @@ opt_trans_rule is co1 co2
 -- Push transitivity inside forall
 -- forall over coercions.
 opt_trans_rule is co1 co2
-  | Just (cv1, eta1, r1) <- splitForAllCo_co_maybe co1
-  , Just (cv2, eta2, r2) <- etaForAllCo_co_maybe co2
-  = push_trans cv1 eta1 r1 cv2 eta2 r2
+  | Just (cv1, visL1, _visR1, eta1, r1) <- splitForAllCo_co_maybe co1
+  , Just (cv2, _visL2, visR2, eta2, r2) <- etaForAllCo_co_maybe co2
+  = push_trans cv1 eta1 r1 cv2 eta2 r2 visL1 visR2
 
-  | Just (cv2, eta2, r2) <- splitForAllCo_co_maybe co2
-  , Just (cv1, eta1, r1) <- etaForAllCo_co_maybe co1
-  = push_trans cv1 eta1 r1 cv2 eta2 r2
+  | Just (cv2, _visL2, visR2, eta2, r2) <- splitForAllCo_co_maybe co2
+  , Just (cv1, visL1, _visR1, eta1, r1) <- etaForAllCo_co_maybe co1
+  = push_trans cv1 eta1 r1 cv2 eta2 r2 visL1 visR2
 
   where
-  push_trans cv1 eta1 r1 cv2 eta2 r2
+  push_trans cv1 eta1 r1 cv2 eta2 r2 visL visR
     -- Given:
-    --   co1 = /\ cv1 : eta1. r1
-    --   co2 = /\ cv2 : eta2. r2
+    --   co1 = /\ (cv1 : eta1) <visL, visM>. r1
+    --   co2 = /\ (cv2 : eta2) <visM, visR>. r2
     -- Wanted:
     --   n1 = nth 2 eta1
     --   n2 = nth 3 eta1
     --   nco = /\ cv1 : (eta1;eta2). (r1; r2[cv2 |-> (sym n1);cv1;n2])
     = fireTransRule "EtaAllTy_co" co1 co2 $
-      mkForAllCo cv1 (opt_trans is eta1 eta2) (opt_trans is' r1 r2')
+      mkForAllCo cv1 visL visR (opt_trans is eta1 eta2) (opt_trans is' r1 r2')
     where
       is'  = is `extendInScopeSet` cv1
       role = coVarRole cv1
@@ -804,37 +823,38 @@ opt_trans_rule is co1 co2
 -- Push transitivity inside axioms
 opt_trans_rule is co1 co2
 
-  -- See Note [Why call checkAxInstCo during optimisation]
+  -- See Note [Push transitivity inside axioms] and
+  -- Note [Push transitivity inside newtype axioms only]
   -- TrPushSymAxR
   | Just (sym, con, ind, cos1) <- co1_is_axiom_maybe
+  , isNewTyCon (coAxiomTyCon con)
   , True <- sym
   , Just cos2 <- matchAxiom sym con ind co2
   , let newAxInst = AxiomInstCo con ind (opt_transList is (map mkSymCo cos2) cos1)
-  , Nothing <- checkAxInstCo newAxInst
   = fireTransRule "TrPushSymAxR" co1 co2 $ SymCo newAxInst
 
   -- TrPushAxR
   | Just (sym, con, ind, cos1) <- co1_is_axiom_maybe
+  , isNewTyCon (coAxiomTyCon con)
   , False <- sym
   , Just cos2 <- matchAxiom sym con ind co2
   , let newAxInst = AxiomInstCo con ind (opt_transList is cos1 cos2)
-  , Nothing <- checkAxInstCo newAxInst
   = fireTransRule "TrPushAxR" co1 co2 newAxInst
 
   -- TrPushSymAxL
   | Just (sym, con, ind, cos2) <- co2_is_axiom_maybe
+  , isNewTyCon (coAxiomTyCon con)
   , True <- sym
   , Just cos1 <- matchAxiom (not sym) con ind co1
   , let newAxInst = AxiomInstCo con ind (opt_transList is cos2 (map mkSymCo cos1))
-  , Nothing <- checkAxInstCo newAxInst
   = fireTransRule "TrPushSymAxL" co1 co2 $ SymCo newAxInst
 
   -- TrPushAxL
   | Just (sym, con, ind, cos2) <- co2_is_axiom_maybe
+  , isNewTyCon (coAxiomTyCon con)
   , False <- sym
   , Just cos1 <- matchAxiom (not sym) con ind co1
   , let newAxInst = AxiomInstCo con ind (opt_transList is cos1 cos2)
-  , Nothing <- checkAxInstCo newAxInst
   = fireTransRule "TrPushAxL" co1 co2 newAxInst
 
   -- TrPushAxSym/TrPushSymAx
@@ -915,30 +935,87 @@ fireTransRule _rule _co1 _co2 res
   = Just res
 
 {-
-Note [Conflict checking with AxiomInstCo]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Consider the following type family and axiom:
+Note [Push transitivity inside axioms]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+opt_trans_rule tries to push transitivity inside axioms to deal with cases like
+the following:
 
-type family Equal (a :: k) (b :: k) :: Bool
-type instance where
-  Equal a a = True
-  Equal a b = False
---
-Equal :: forall k::*. k -> k -> Bool
-axEqual :: { forall k::*. forall a::k. Equal k a a ~ True
-           ; forall k::*. forall a::k. forall b::k. Equal k a b ~ False }
+    newtype N a = MkN a
 
-We wish to disallow (axEqual[1] <*> <Int> <Int). (Recall that the index is
-0-based, so this is the second branch of the axiom.) The problem is that, on
-the surface, it seems that (axEqual[1] <*> <Int> <Int>) :: (Equal * Int Int ~
-False) and that all is OK. But, all is not OK: we want to use the first branch
-of the axiom in this case, not the second. The problem is that the parameters
-of the first branch can unify with the supplied coercions, thus meaning that
-the first branch should be taken. See also Note [Apartness] in
-"GHC.Core.FamInstEnv".
+    axN :: N a ~R# a
+
+    covar :: a ~R# b
+    co1 = axN <a> :: N a ~R# a
+    co2 = axN <b> :: N b ~R# b
+
+    co :: a ~R# b
+    co = sym co1 ; N covar ; co2
+
+When we are optimising co, we want to notice that the two axiom instantiations
+cancel out. This is implemented by rules such as TrPushSymAxR, which transforms
+    sym (axN <a>) ; N covar
+into
+    sym (axN covar)
+so that TrPushSymAx can subsequently transform
+    sym (axN covar) ; axN <b>
+into
+    covar
+which is much more compact. In some perf test cases this kind of pattern can be
+generated repeatedly during simplification, so it is very important we squash it
+to stop coercions growing exponentially.  For more details see the paper:
+
+    Evidence normalisation in System FC
+    Dimitrios Vytiniotis and Simon Peyton Jones
+    RTA'13, 2013
+    https://www.microsoft.com/en-us/research/publication/evidence-normalization-system-fc-2/
+
+
+Note [Push transitivity inside newtype axioms only]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The optimization described in Note [Push transitivity inside axioms] is possible
+for both newtype and type family axioms.  However, for type family axioms it is
+relatively common to have transitive sequences of axioms instantiations, for
+example:
+
+    data Nat = Zero | Suc Nat
+
+    type family Index (n :: Nat) (xs :: [Type]) :: Type where
+      Index Zero    (x : xs) = x
+      Index (Suc n) (x : xs) = Index n xs
+
+    axIndex :: { forall x::Type. forall xs::[Type]. Index Zero (x : xs) ~ x
+               ; forall n::Nat. forall x::Type. forall xs::[Type]. Index (Suc n) (x : xs) ~ Index n xs }
+
+    co :: Index (Suc (Suc Zero)) [a, b, c] ~ c
+    co = axIndex[1] <Suc Zero> <a> <[b, c]>
+       ; axIndex[1] <Zero> <b> <[c]>
+       ; axIndex[0] <c> <[]>
+
+Not only are there no cancellation opportunities here, but calling matchAxiom
+repeatedly down the transitive chain is very expensive.  Hence we do not attempt
+to push transitivity inside type family axioms.  See #8095, !9210 and related tickets.
+
+This is implemented by opt_trans_rule checking that the axiom is for a newtype
+constructor (i.e. not a type family).  Adding these guards substantially
+improved performance (reduced bytes allocated by more than 10%) for the tests
+CoOpt_Singletons, LargeRecord, T12227, T12545, T13386, T15703, T5030, T8095.
+
+A side benefit is that we do not risk accidentally creating an ill-typed
+coercion; see Note [Why call checkAxInstCo during optimisation].
+
+There may exist programs that previously relied on pushing transitivity inside
+type family axioms to avoid creating huge coercions, which will regress in
+compile time performance as a result of this change.  We do not currently know
+of any examples, but if any come to light we may need to reconsider this
+behaviour.
+
 
 Note [Why call checkAxInstCo during optimisation]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+NB: The following is no longer relevant, because we no longer push transitivity
+into type family axioms (Note [Push transitivity inside newtype axioms only]).
+It is retained for reference in case we change this behaviour in the future.
+
 It is possible that otherwise-good-looking optimisations meet with disaster
 in the presence of axioms with multiple equations. Consider
 
@@ -1029,40 +1106,11 @@ The problem described here was first found in dependent/should_compile/dynamic-p
 
 -}
 
--- | Check to make sure that an AxInstCo is internally consistent.
--- Returns the conflicting branch, if it exists
--- See Note [Conflict checking with AxiomInstCo]
-checkAxInstCo :: Coercion -> Maybe CoAxBranch
--- defined here to avoid dependencies in GHC.Core.Coercion
--- If you edit this function, you may need to update the GHC formalism
--- See Note [GHC Formalism] in GHC.Core.Lint
-checkAxInstCo (AxiomInstCo ax ind cos)
-  = let branch       = coAxiomNthBranch ax ind
-        tvs          = coAxBranchTyVars branch
-        cvs          = coAxBranchCoVars branch
-        incomps      = coAxBranchIncomps branch
-        (tys, cotys) = splitAtList tvs (map coercionLKind cos)
-        co_args      = map stripCoercionTy cotys
-        subst        = zipTvSubst tvs tys `composeTCvSubst`
-                       zipCvSubst cvs co_args
-        target   = Type.substTys subst (coAxBranchLHS branch)
-        in_scope = mkInScopeSet $
-                   unionVarSets (map (tyCoVarsOfTypes . coAxBranchLHS) incomps)
-        flattened_target = flattenTys in_scope target in
-    check_no_conflict flattened_target incomps
-  where
-    check_no_conflict :: [Type] -> [CoAxBranch] -> Maybe CoAxBranch
-    check_no_conflict _    [] = Nothing
-    check_no_conflict flat (b@CoAxBranch { cab_lhs = lhs_incomp } : rest)
-         -- See Note [Apartness] in GHC.Core.FamInstEnv
-      | SurelyApart <- tcUnifyTysFG alwaysBindFun flat lhs_incomp
-      = check_no_conflict flat rest
-      | otherwise
-      = Just b
-checkAxInstCo _ = Nothing
-
-
 -----------
+swapSym :: SymFlag -> (a,a) -> (a,a)
+swapSym sym (x,y) | sym       = (y,x)
+                  | otherwise = (x,y)
+
 wrapSym :: SymFlag -> Coercion -> Coercion
 wrapSym sym co | sym       = mkSymCo co
                | otherwise = co
@@ -1162,31 +1210,39 @@ Here,
   eta2 = mkSelCo (SelTyCon 3 r) h1 :: (s2 ~ s4)
   h2   = mkInstCo g (cv1 ~ (sym eta1;c1;eta2))
 -}
-etaForAllCo_ty_maybe :: Coercion -> Maybe (TyVar, Coercion, Coercion)
+etaForAllCo_ty_maybe :: Coercion -> Maybe (TyVar, ForAllTyFlag, ForAllTyFlag, Coercion, Coercion)
 -- Try to make the coercion be of form (forall tv:kind_co. co)
 etaForAllCo_ty_maybe co
-  | Just (tv, kind_co, r) <- splitForAllCo_ty_maybe co
-  = Just (tv, kind_co, r)
+  | Just (tv, visL, visR, kind_co, r) <- splitForAllCo_ty_maybe co
+  = Just (tv, visL, visR, kind_co, r)
 
-  | Pair ty1 ty2  <- coercionKind co
-  , Just (tv1, _) <- splitForAllTyVar_maybe ty1
-  , isForAllTy_ty ty2
+  | (Pair ty1 ty2, role)  <- coercionKindRole co
+  , Just (Bndr tv1 vis1, _) <- splitForAllForAllTyBinder_maybe ty1
+  , isTyVar tv1
+  , Just (Bndr tv2 vis2, _) <- splitForAllForAllTyBinder_maybe ty2
+  , isTyVar tv2
+  -- can't eta-expand at nominal role unless visibilities match
+  , (role /= Nominal) || (vis1 `eqForAllVis` vis2)
   , let kind_co = mkSelCo SelForAll co
-  = Just ( tv1, kind_co
+  = Just ( tv1, vis1, vis2, kind_co
          , mkInstCo co (mkGReflRightCo Nominal (TyVarTy tv1) kind_co))
 
   | otherwise
   = Nothing
 
-etaForAllCo_co_maybe :: Coercion -> Maybe (CoVar, Coercion, Coercion)
+etaForAllCo_co_maybe :: Coercion -> Maybe (CoVar, ForAllTyFlag, ForAllTyFlag, Coercion, Coercion)
 -- Try to make the coercion be of form (forall cv:kind_co. co)
 etaForAllCo_co_maybe co
-  | Just (cv, kind_co, r) <- splitForAllCo_co_maybe co
-  = Just (cv, kind_co, r)
+  | Just (cv, visL, visR, kind_co, r) <- splitForAllCo_co_maybe co
+  = Just (cv, visL, visR, kind_co, r)
 
-  | Pair ty1 ty2  <- coercionKind co
-  , Just (cv1, _) <- splitForAllCoVar_maybe ty1
-  , isForAllTy_co ty2
+  | (Pair ty1 ty2, role)  <- coercionKindRole co
+  , Just (Bndr cv1 vis1, _) <- splitForAllForAllTyBinder_maybe ty1
+  , isCoVar cv1
+  , Just (Bndr cv2 vis2, _) <- splitForAllForAllTyBinder_maybe ty2
+  , isCoVar cv2
+  -- can't eta-expand at nominal role unless visibilities match
+  , (role /= Nominal)
   = let kind_co  = mkSelCo SelForAll co
         r        = coVarRole cv1
         l_co     = mkCoVarCo cv1
@@ -1194,7 +1250,7 @@ etaForAllCo_co_maybe co
         r_co     = mkSymCo (mkSelCo (SelTyCon 2 r) kind_co')
                    `mkTransCo` l_co
                    `mkTransCo` mkSelCo (SelTyCon 3 r) kind_co'
-    in Just ( cv1, kind_co
+    in Just ( cv1, vis1, vis2, kind_co
             , mkInstCo co (mkProofIrrelCo Nominal kind_co l_co r_co))
 
   | otherwise

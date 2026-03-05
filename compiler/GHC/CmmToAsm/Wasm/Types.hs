@@ -45,7 +45,6 @@ module GHC.CmmToAsm.Wasm.Types
     wasmStateM,
     wasmModifyM,
     wasmExecM,
-    wasmUniq,
   )
 where
 
@@ -53,7 +52,7 @@ import Control.Applicative
 import Data.ByteString (ByteString)
 import Data.Coerce
 import Data.Functor
-import qualified Data.IntSet as IS
+import qualified GHC.Data.Word64Set as WS
 import Data.Kind
 import Data.String
 import Data.Type.Equality
@@ -198,7 +197,7 @@ data DataSection = DataSection
 type SymMap = UniqMap SymName
 
 -- | No need to remember the symbols.
-type SymSet = IS.IntSet
+type SymSet = WS.Word64Set
 
 type GlobalInfo = (SymName, SomeWasmType)
 
@@ -306,6 +305,7 @@ data WasmInstr :: WasmType -> [WasmType] -> [WasmType] -> Type where
   WasmF32DemoteF64 :: WasmInstr w ('F64 : pre) ('F32 : pre)
   WasmF64PromoteF32 :: WasmInstr w ('F32 : pre) ('F64 : pre)
   WasmAbs :: WasmTypeTag t -> WasmInstr w (t : pre) (t : pre)
+  WasmSqrt :: WasmTypeTag t -> WasmInstr w (t : pre) (t : pre)
   WasmNeg :: WasmTypeTag t -> WasmInstr w (t : pre) (t : pre)
   WasmCond :: WasmInstr w pre pre -> WasmInstr w (w : pre) pre
 
@@ -428,7 +428,7 @@ initialWasmCodeGenState platform us =
   WasmCodeGenState
     { wasmPlatform =
         platform,
-      defaultSyms = IS.empty,
+      defaultSyms = WS.empty,
       funcTypes = emptyUniqMap,
       funcBodies =
         emptyUniqMap,
@@ -466,10 +466,18 @@ wasmStateM = coerce . State
 wasmModifyM :: (WasmCodeGenState w -> WasmCodeGenState w) -> WasmCodeGenM w ()
 wasmModifyM = coerce . modify
 
+wasmEvalM :: WasmCodeGenM w a -> WasmCodeGenState w -> a
+wasmEvalM (WasmCodeGenM s) = evalState s
+
 wasmExecM :: WasmCodeGenM w a -> WasmCodeGenState w -> WasmCodeGenState w
 wasmExecM (WasmCodeGenM s) = execState s
 
-wasmUniq :: WasmCodeGenM w Unique
-wasmUniq = wasmStateM $
-  \s@WasmCodeGenState {..} -> case takeUniqFromSupply wasmUniqSupply of
-    (u, us) -> (# u, s {wasmUniqSupply = us} #)
+instance MonadUnique (WasmCodeGenM w) where
+  getUniqueSupplyM = wasmGetsM wasmUniqSupply
+  getUniqueM = wasmStateM $
+    \s@WasmCodeGenState {..} -> case takeUniqFromSupply wasmUniqSupply of
+      (u, us) -> (# u, s {wasmUniqSupply = us} #)
+  getUniquesM = do
+    u <- getUniqueM
+    s <- WasmCodeGenM get
+    pure $ u:(wasmEvalM getUniquesM s)

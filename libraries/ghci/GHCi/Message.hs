@@ -14,6 +14,7 @@ module GHCi.Message
   , THMessage(..), THMsg(..)
   , QResult(..)
   , EvalStatus_(..), EvalStatus, EvalResult(..), EvalOpts(..), EvalExpr(..)
+  , EvalBreakpoint (..)
   , SerializableException(..)
   , toSerializableException, fromSerializableException
   , THResult(..), THResultType(..)
@@ -21,6 +22,8 @@ module GHCi.Message
   , QState(..)
   , getMessage, putMessage, getTHMessage, putTHMessage
   , Pipe(..), remoteCall, remoteTHCall, readPipe, writePipe
+  , BreakModule
+  , LoadedDLL
   ) where
 
 import Prelude -- See note [Why do we import Prelude here?]
@@ -28,11 +31,13 @@ import GHCi.RemoteTypes
 import GHCi.FFI
 import GHCi.TH.Binary () -- For Binary instances
 import GHCi.BreakArray
+import GHCi.ResolvedBCO
 
 import GHC.LanguageExtensions
 import qualified GHC.Exts.Heap as Heap
 import GHC.ForeignSrcLang
 import GHC.Fingerprint
+import GHC.Conc (pseq, par)
 import Control.Concurrent
 import Control.Exception
 import Data.Binary
@@ -69,8 +74,9 @@ data Message a where
   -- These all invoke the corresponding functions in the RTS Linker API.
   InitLinker :: Message ()
   LookupSymbol :: String -> Message (Maybe (RemotePtr ()))
+  LookupSymbolInDLL :: RemotePtr LoadedDLL -> String -> Message (Maybe (RemotePtr ()))
   LookupClosure :: String -> Message (Maybe HValueRef)
-  LoadDLL :: String -> Message (Maybe String)
+  LoadDLL :: String -> Message (Either String (RemotePtr LoadedDLL))
   LoadArchive :: String -> Message () -- error?
   LoadObj :: String -> Message () -- error?
   UnloadObj :: String -> Message () -- error?
@@ -82,10 +88,10 @@ data Message a where
   -- Interpreter -------------------------------------------
 
   -- | Create a set of BCO objects, and return HValueRefs to them
-  -- Note: Each ByteString contains a Binary-encoded [ResolvedBCO], not
-  -- a ResolvedBCO. The list is to allow us to serialise the ResolvedBCOs
-  -- in parallel. See @createBCOs@ in compiler/GHC/Runtime/Interpreter.hs.
-  CreateBCOs :: [LB.ByteString] -> Message [HValueRef]
+  -- See @createBCOs@ in compiler/GHC/Runtime/Interpreter.hs.
+  -- NB: this has a custom Binary behavior,
+  -- see Note [Parallelize CreateBCOs serialization]
+  CreateBCOs :: [ResolvedBCO] -> Message [HValueRef]
 
   -- | Release 'HValueRef's
   FreeHValueRefs :: [HValueRef] -> Message ()
@@ -225,6 +231,12 @@ data Message a where
   ResumeSeq
     :: RemoteRef (ResumeContext ())
     -> Message (EvalStatus ())
+
+  -- | Allocate a string for a breakpoint module name.
+  -- This uses an empty dummy type because @ModuleName@ isn't available here.
+  NewBreakModule
+   :: String
+   -> Message (RemotePtr BreakModule)
 
 deriving instance Show (Message a)
 
@@ -377,15 +389,24 @@ type EvalStatus a = EvalStatus_ a a
 
 data EvalStatus_ a b
   = EvalComplete Word64 (EvalResult a)
-  | EvalBreak Bool
+  | EvalBreak
        HValueRef{- AP_STACK -}
-       Int {- break index -}
-       Int {- uniq of ModuleName -}
+       (Maybe EvalBreakpoint)
        (RemoteRef (ResumeContext b))
        (RemotePtr CostCentreStack) -- Cost centre stack
   deriving (Generic, Show)
 
 instance Binary a => Binary (EvalStatus_ a b)
+
+data EvalBreakpoint = EvalBreakpoint
+  { eb_tick_mod   :: String -- ^ Breakpoint tick module
+  , eb_tick_index :: Int    -- ^ Breakpoint tick index
+  , eb_info_mod   :: String -- ^ Breakpoint info module
+  , eb_info_index :: Int    -- ^ Breakpoint info index
+  }
+  deriving (Generic, Show)
+
+instance Binary EvalBreakpoint
 
 data EvalResult a
   = EvalException SerializableException
@@ -393,6 +414,13 @@ data EvalResult a
   deriving (Generic, Show)
 
 instance Binary a => Binary (EvalResult a)
+
+-- | A dummy type that tags the pointer to a breakpoint's @ModuleName@, because
+-- that type isn't available here.
+data BreakModule
+
+-- | A dummy type that tags pointers returned by 'LoadDLL'.
+data LoadedDLL
 
 -- SomeException can't be serialized because it contains dynamic
 -- types.  However, we do very limited things with the exceptions that
@@ -494,7 +522,8 @@ getMessage = do
       9  -> Msg <$> RemoveLibrarySearchPath <$> get
       10 -> Msg <$> return ResolveObjs
       11 -> Msg <$> FindSystemLibrary <$> get
-      12 -> Msg <$> CreateBCOs <$> get
+      12 -> Msg <$> (CreateBCOs . concatMap (runGet get)) <$> (get :: Get [LB.ByteString])
+                    -- See Note [Parallelize CreateBCOs serialization]
       13 -> Msg <$> FreeHValueRefs <$> get
       14 -> Msg <$> MallocData <$> get
       15 -> Msg <$> MallocStrings <$> get
@@ -521,6 +550,8 @@ getMessage = do
       36 -> Msg <$> (Seq <$> get)
       37 -> Msg <$> return RtsRevertCAFs
       38 -> Msg <$> (ResumeSeq <$> get)
+      39 -> Msg <$> (NewBreakModule <$> get)
+      40 -> Msg <$> (LookupSymbolInDLL <$> get <*> get)
       _  -> error $ "Unknown Message code " ++ (show b)
 
 putMessage :: Message a -> Put
@@ -537,7 +568,8 @@ putMessage m = case m of
   RemoveLibrarySearchPath ptr -> putWord8 9  >> put ptr
   ResolveObjs                 -> putWord8 10
   FindSystemLibrary str       -> putWord8 11 >> put str
-  CreateBCOs bco              -> putWord8 12 >> put bco
+  CreateBCOs bco              -> putWord8 12 >> put (serializeBCOs bco)
+                              -- See Note [Parallelize CreateBCOs serialization]
   FreeHValueRefs val          -> putWord8 13 >> put val
   MallocData bs               -> putWord8 14 >> put bs
   MallocStrings bss           -> putWord8 15 >> put bss
@@ -553,7 +585,7 @@ putMessage m = case m of
   MkCostCentres mod ccs       -> putWord8 25 >> put mod >> put ccs
   CostCentreStackInfo ptr     -> putWord8 26 >> put ptr
   NewBreakArray sz            -> putWord8 27 >> put sz
-  SetupBreakpoint arr ix cnt    -> putWord8 28 >> put arr >> put ix >> put cnt
+  SetupBreakpoint arr ix cnt  -> putWord8 28 >> put arr >> put ix >> put cnt
   BreakpointStatus arr ix     -> putWord8 29 >> put arr >> put ix
   GetBreakpointVar a b        -> putWord8 30 >> put a >> put b
   StartTH                     -> putWord8 31
@@ -564,6 +596,36 @@ putMessage m = case m of
   Seq a                       -> putWord8 36 >> put a
   RtsRevertCAFs               -> putWord8 37
   ResumeSeq a                 -> putWord8 38 >> put a
+  NewBreakModule name         -> putWord8 39 >> put name
+  LookupSymbolInDLL dll str   -> putWord8 40 >> put dll >> put str
+
+{-
+Note [Parallelize CreateBCOs serialization]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Serializing ResolvedBCO is expensive, so we do it in parallel.
+We split the list [ResolvedBCO] into chunks of length <= 100,
+and serialize every chunk in parallel, getting a [LB.ByteString]
+where every bytestring corresponds to a single chunk (multiple ResolvedBCOs).
+
+Previously, we stored [LB.ByteString] in the Message object, but that
+incurs unneccessary serialization with the internal interpreter (#23919).
+-}
+
+serializeBCOs :: [ResolvedBCO] -> [LB.ByteString]
+serializeBCOs rbcos = parMap doChunk (chunkList 100 rbcos)
+ where
+  -- make sure we force the whole lazy ByteString
+  doChunk c = pseq (LB.length bs) bs
+    where bs = runPut (put c)
+
+  -- We don't have the parallel package, so roll our own simple parMap
+  parMap _ [] = []
+  parMap f (x:xs) = fx `par` (fxs `pseq` (fx : fxs))
+    where fx = f x; fxs = parMap f xs
+
+  chunkList :: Int -> [a] -> [[a]]
+  chunkList _ [] = []
+  chunkList n xs = as : chunkList n bs where (as,bs) = splitAt n xs
 
 -- -----------------------------------------------------------------------------
 -- Reading/writing messages

@@ -1,8 +1,10 @@
 {-# LANGUAGE ConstraintKinds #-}
+{-# LANGUAGE TupleSections   #-}
+
 {-|
 Module      : GHC.Hs.Utils
 Description : Generic helpers for the HsSyn type.
-Copyright   : (c) The University of Glasgow, 1992-2006
+Copyright   : (c) The University of Glasgow, 1992-2023
 
 Here we collect a variety of helper functions that construct or
 analyse HsSyn.  All these functions deal with generic HsSyn; functions
@@ -12,7 +14,7 @@ which deal with the instantiated versions are located elsewhere:
    ----------------          -------------
    GhcPs/RdrName             GHC.Parser.PostProcess
    GhcRn/Name                GHC.Rename.*
-   GhcTc/Id                  GHC.Tc.Utils.Zonk
+   GhcTc/Id                  GHC.Tc.Zonk.Type
 
 The @mk*@ functions attempt to construct a not-completely-useless SrcSpan
 from their components, compared with the @nl*@ functions which
@@ -33,18 +35,21 @@ just attach noSrcSpan to everything.
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE ViewPatterns #-}
+{-# LANGUAGE NamedFieldPuns #-}
 
 {-# OPTIONS_GHC -Wno-incomplete-record-updates #-}
+{-# LANGUAGE RecordWildCards #-}
 
 module GHC.Hs.Utils(
   -- * Terms
-  mkHsPar, mkHsApp, mkHsAppWith, mkHsApps, mkHsAppsWith,
+  mkHsPar, mkHsApp, mkHsAppWith, mkHsApps, mkHsAppsWith, mkHsSyntaxApps,
   mkHsAppType, mkHsAppTypes, mkHsCaseAlt,
   mkSimpleMatch, unguardedGRHSs, unguardedRHS,
   mkMatchGroup, mkLamCaseMatchGroup, mkMatch, mkPrefixFunRhs, mkHsLam, mkHsIf,
   mkHsWrap, mkLHsWrap, mkHsWrapCo, mkHsWrapCoR, mkLHsWrapCo,
   mkHsDictLet, mkHsLams,
-  mkHsOpApp, mkHsDo, mkHsDoAnns, mkHsComp, mkHsCompAnns, mkHsWrapPat, mkHsWrapPatCo,
+  mkHsOpApp, mkHsDo, mkHsDoAnns, mkHsComp, mkHsCompAnns,
+  mkHsWrapPat, mkLHsWrapPat, mkHsWrapPatCo,
   mkLHsPar, mkHsCmdWrap, mkLHsCmdWrap,
   mkHsCmdIf, mkConLikeTc,
 
@@ -86,7 +91,7 @@ module GHC.Hs.Utils(
   mkLetStmt,
 
   -- * Collecting binders
-  isUnliftedHsBind, isBangedHsBind,
+  isUnliftedHsBind, isUnliftedHsBinds, isBangedHsBind,
 
   collectLocalBinders, collectHsValBinders, collectHsBindListBinders,
   collectHsIdBinders,
@@ -97,12 +102,15 @@ module GHC.Hs.Utils(
   collectLStmtBinders, collectStmtBinders,
   CollectPass(..), CollectFlag(..),
 
+  TyDeclBinders(..), LConsWithFields(..),
   hsLTyClDeclBinders, hsTyClForeignBinders,
   hsPatSynSelectors, getPatSynBinds,
   hsForeignDeclsBinders, hsGroupBinders, hsDataFamInstBinders,
 
   -- * Collecting implicit binders
-  lStmtsImplicits, hsValBindsImplicits, lPatImplicits
+  ImplicitFieldBinders(..),
+  lStmtsImplicits, hsValBindsImplicits, lPatImplicits,
+  lHsRecFieldsImplicits
   ) where
 
 import GHC.Prelude hiding (head, init, last, tail)
@@ -113,6 +121,7 @@ import GHC.Hs.Expr
 import GHC.Hs.Pat
 import GHC.Hs.Type
 import GHC.Hs.Lit
+import Language.Haskell.Syntax.Decls
 import Language.Haskell.Syntax.Extension
 import GHC.Hs.Extension
 import GHC.Parser.Annotation
@@ -146,12 +155,16 @@ import GHC.Utils.Misc
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
 
-import Data.Either
+import Control.Arrow ( first )
 import Data.Foldable ( toList )
-import Data.Function
-import Data.List ( partition, deleteBy )
+import Data.List ( partition )
 import Data.List.NonEmpty ( nonEmpty )
 import qualified Data.List.NonEmpty as NE
+
+import Data.IntMap ( IntMap )
+import qualified Data.IntMap.Strict as IntMap
+import Data.Map ( Map )
+import qualified Data.Map.Strict as Map
 
 {-
 ************************************************************************
@@ -166,14 +179,14 @@ just attach 'noSrcSpan' to everything.
 -}
 
 -- | @e => (e)@
-mkHsPar :: LHsExpr (GhcPass id) -> LHsExpr (GhcPass id)
+mkHsPar :: IsPass p => LHsExpr (GhcPass p) -> LHsExpr (GhcPass p)
 mkHsPar e = L (getLoc e) (gHsPar e)
 
 mkSimpleMatch :: (Anno (Match (GhcPass p) (LocatedA (body (GhcPass p))))
                         ~ SrcSpanAnnA,
                   Anno (GRHS (GhcPass p) (LocatedA (body (GhcPass p))))
-                        ~ SrcAnn NoEpAnns)
-              => HsMatchContext (GhcPass p)
+                        ~ EpAnn NoEpAnns)
+              => HsMatchContext (LIdP (NoGhcTc (GhcPass p)))
               -> [LPat (GhcPass p)] -> LocatedA (body (GhcPass p))
               -> LMatch (GhcPass p) (LocatedA (body (GhcPass p)))
 mkSimpleMatch ctxt pats rhs
@@ -186,14 +199,14 @@ mkSimpleMatch ctxt pats rhs
                 (pat:_) -> combineSrcSpansA (getLoc pat) (getLoc rhs)
 
 unguardedGRHSs :: Anno (GRHS (GhcPass p) (LocatedA (body (GhcPass p))))
-                     ~ SrcAnn NoEpAnns
+                     ~ EpAnn NoEpAnns
                => SrcSpan -> LocatedA (body (GhcPass p)) -> EpAnn GrhsAnn
                -> GRHSs (GhcPass p) (LocatedA (body (GhcPass p)))
 unguardedGRHSs loc rhs an
   = GRHSs emptyComments (unguardedRHS an loc rhs) emptyLocalBinds
 
 unguardedRHS :: Anno (GRHS (GhcPass p) (LocatedA (body (GhcPass p))))
-                     ~ SrcAnn NoEpAnns
+                     ~ EpAnn NoEpAnns
              => EpAnn GrhsAnn -> SrcSpan -> LocatedA (body (GhcPass p))
              -> [LGRHS (GhcPass p) (LocatedA (body (GhcPass p)))]
 unguardedRHS an loc rhs = [L (noAnnSrcSpan loc) (GRHS an [] rhs)]
@@ -213,32 +226,32 @@ mkMatchGroup origin matches = MG { mg_ext = origin
 
 mkLamCaseMatchGroup :: AnnoBody p body
                     => Origin
-                    -> LamCaseVariant
+                    -> HsLamVariant
                     -> LocatedL [LocatedA (Match (GhcPass p) (LocatedA (body (GhcPass p))))]
                     -> MatchGroup (GhcPass p) (LocatedA (body (GhcPass p)))
-mkLamCaseMatchGroup origin lc_variant (L l matches)
+mkLamCaseMatchGroup origin lam_variant (L l matches)
   = mkMatchGroup origin (L l $ map fixCtxt matches)
-  where fixCtxt (L a match) = L a match{m_ctxt = LamCaseAlt lc_variant}
+  where fixCtxt (L a match) = L a match{m_ctxt = LamAlt lam_variant}
 
-mkLocatedList :: Semigroup a
-  => [GenLocated (SrcAnn a) e2] -> LocatedAn an [GenLocated (SrcAnn a) e2]
+mkLocatedList :: (Semigroup a, NoAnn an)
+  => [GenLocated (EpAnn a) e2] -> LocatedAn an [GenLocated (EpAnn a) e2]
 mkLocatedList ms = case nonEmpty ms of
     Nothing -> noLocA []
     Just ms1 -> L (noAnnSrcSpan $ locA $ combineLocsA (NE.head ms1) (NE.last ms1)) ms
 
 mkHsApp :: LHsExpr (GhcPass id) -> LHsExpr (GhcPass id) -> LHsExpr (GhcPass id)
-mkHsApp e1 e2 = addCLocAA e1 e2 (HsApp noComments e1 e2)
+mkHsApp e1 e2 = addCLocA e1 e2 (HsApp noExtField e1 e2)
 
 mkHsAppWith
   :: (LHsExpr (GhcPass id) -> LHsExpr (GhcPass id) -> HsExpr (GhcPass id) -> LHsExpr (GhcPass id))
   -> LHsExpr (GhcPass id)
   -> LHsExpr (GhcPass id)
   -> LHsExpr (GhcPass id)
-mkHsAppWith mkLocated e1 e2 = mkLocated e1 e2 (HsApp noAnn e1 e2)
+mkHsAppWith mkLocated e1 e2 = mkLocated e1 e2 (HsApp noExtField e1 e2)
 
 mkHsApps
   :: LHsExpr (GhcPass id) -> [LHsExpr (GhcPass id)] -> LHsExpr (GhcPass id)
-mkHsApps = mkHsAppsWith addCLocAA
+mkHsApps = mkHsAppsWith addCLocA
 
 mkHsAppsWith
  :: (LHsExpr (GhcPass id) -> LHsExpr (GhcPass id) -> HsExpr (GhcPass id) -> LHsExpr (GhcPass id))
@@ -248,10 +261,10 @@ mkHsAppsWith
 mkHsAppsWith mkLocated = foldl' (mkHsAppWith mkLocated)
 
 mkHsAppType :: LHsExpr GhcRn -> LHsWcType GhcRn -> LHsExpr GhcRn
-mkHsAppType e t = addCLocAA t_body e (HsAppType noExtField e noHsTok paren_wct)
+mkHsAppType e t = addCLocA t_body e (HsAppType noExtField e paren_wct)
   where
     t_body    = hswc_body t
-    paren_wct = t { hswc_body = parenthesizeHsType appPrec t_body }
+    paren_wct = t { hswc_body = t_body }
 
 mkHsAppTypes :: LHsExpr GhcRn -> [LHsWcType GhcRn] -> LHsExpr GhcRn
 mkHsAppTypes = foldl' mkHsAppType
@@ -260,20 +273,31 @@ mkHsLam :: (IsPass p, XMG (GhcPass p) (LHsExpr (GhcPass p)) ~ Origin)
         => [LPat (GhcPass p)]
         -> LHsExpr (GhcPass p)
         -> LHsExpr (GhcPass p)
-mkHsLam pats body = mkHsPar (L (getLoc body) (HsLam noExtField matches))
+mkHsLam pats body = mkHsPar (L (getLoc body) (HsLam noAnn LamSingle matches))
   where
-    matches = mkMatchGroup Generated
-                           (noLocA [mkSimpleMatch LambdaExpr pats' body])
+    matches = mkMatchGroup (Generated OtherExpansion SkipPmc)
+                           (noLocA [mkSimpleMatch (LamAlt LamSingle) pats' body])
     pats' = map (parenthesizePat appPrec) pats
 
 mkHsLams :: [TyVar] -> [EvVar] -> LHsExpr GhcTc -> LHsExpr GhcTc
 mkHsLams tyvars dicts expr = mkLHsWrap (mkWpTyLams tyvars
                                        <.> mkWpEvLams dicts) expr
 
+mkHsSyntaxApps :: SrcSpanAnnA -> SyntaxExprTc -> [LHsExpr GhcTc]
+               -> LHsExpr GhcTc
+mkHsSyntaxApps ann (SyntaxExprTc { syn_expr      = fun
+                                 , syn_arg_wraps = arg_wraps
+                                 , syn_res_wrap  = res_wrap }) args
+  = mkLHsWrap res_wrap (foldl' mkHsApp (L ann fun) (zipWithEqual "mkHsSyntaxApps"
+                                                     mkLHsWrap arg_wraps args))
+mkHsSyntaxApps _ NoSyntaxExprTc args = pprPanic "mkHsSyntaxApps" (ppr args)
+  -- this function should never be called in scenarios where there is no
+  -- syntax expr
+
 -- |A simple case alternative with a single pattern, no binds, no guards;
 -- pre-typechecking
 mkHsCaseAlt :: (Anno (GRHS (GhcPass p) (LocatedA (body (GhcPass p))))
-                     ~ SrcAnn NoEpAnns,
+                     ~ EpAnn NoEpAnns,
                  Anno (Match (GhcPass p) (LocatedA (body (GhcPass p))))
                         ~ SrcSpanAnnA)
             => LPat (GhcPass p) -> (LocatedA (body (GhcPass p)))
@@ -297,7 +321,7 @@ mkLHsPar = parenthesizeHsExpr appPrec
 mkParPat :: IsPass p => LPat (GhcPass p) -> LPat (GhcPass p)
 mkParPat = parenthesizePat appPrec
 
-nlParPat :: LPat (GhcPass name) -> LPat (GhcPass name)
+nlParPat :: IsPass p => LPat (GhcPass p) -> LPat (GhcPass p)
 nlParPat p = noLocA (gParPat p)
 
 -------------------------------
@@ -308,16 +332,16 @@ mkHsIntegral   :: IntegralLit -> HsOverLit GhcPs
 mkHsFractional :: FractionalLit -> HsOverLit GhcPs
 mkHsIsString   :: SourceText -> FastString -> HsOverLit GhcPs
 mkHsDo         :: HsDoFlavour -> LocatedL [ExprLStmt GhcPs] -> HsExpr GhcPs
-mkHsDoAnns     :: HsDoFlavour -> LocatedL [ExprLStmt GhcPs] -> EpAnn AnnList -> HsExpr GhcPs
+mkHsDoAnns     :: HsDoFlavour -> LocatedL [ExprLStmt GhcPs] -> AnnList -> HsExpr GhcPs
 mkHsComp       :: HsDoFlavour -> [ExprLStmt GhcPs] -> LHsExpr GhcPs
                -> HsExpr GhcPs
 mkHsCompAnns   :: HsDoFlavour -> [ExprLStmt GhcPs] -> LHsExpr GhcPs
-               -> EpAnn AnnList
+               -> AnnList
                -> HsExpr GhcPs
 
-mkNPat      :: LocatedAn NoEpAnns (HsOverLit GhcPs) -> Maybe (SyntaxExpr GhcPs) -> EpAnn [AddEpAnn]
+mkNPat      :: LocatedAn NoEpAnns (HsOverLit GhcPs) -> Maybe (SyntaxExpr GhcPs) -> [AddEpAnn]
             -> Pat GhcPs
-mkNPlusKPat :: LocatedN RdrName -> LocatedAn NoEpAnns (HsOverLit GhcPs) -> EpAnn EpaLocation
+mkNPlusKPat :: LocatedN RdrName -> LocatedAn NoEpAnns (HsOverLit GhcPs) -> EpaLocation
             -> Pat GhcPs
 
 -- NB: The following functions all use noSyntaxExpr: the generated expressions
@@ -326,7 +350,7 @@ mkLastStmt :: IsPass idR => LocatedA (bodyR (GhcPass idR))
            -> StmtLR (GhcPass idL) (GhcPass idR) (LocatedA (bodyR (GhcPass idR)))
 mkBodyStmt :: LocatedA (bodyR GhcPs)
            -> StmtLR (GhcPass idL) GhcPs (LocatedA (bodyR GhcPs))
-mkPsBindStmt :: EpAnn [AddEpAnn] -> LPat GhcPs -> LocatedA (bodyR GhcPs)
+mkPsBindStmt :: [AddEpAnn] -> LPat GhcPs -> LocatedA (bodyR GhcPs)
              -> StmtLR GhcPs GhcPs (LocatedA (bodyR GhcPs))
 mkRnBindStmt :: LPat GhcRn -> LocatedA (bodyR GhcRn)
              -> StmtLR GhcRn GhcRn (LocatedA (bodyR GhcRn))
@@ -350,7 +374,7 @@ mkRecStmt :: forall (idL :: Pass) bodyR.
                              (Anno (StmtLR (GhcPass idL) GhcPs bodyR))
                              (StmtLR (GhcPass idL) GhcPs bodyR)]
                         ~ SrcSpanAnnL)
-                 => EpAnn AnnList
+                 => AnnList
                  -> LocatedL [LStmtLR (GhcPass idL) GhcPs bodyR]
                  -> StmtLR (GhcPass idL) GhcPs bodyR
 mkRecStmt anns stmts  = (emptyRecStmt' anns :: StmtLR (GhcPass idL) GhcPs bodyR)
@@ -364,18 +388,21 @@ mkHsIsString src s  = OverLit noExtField (HsIsString   src s)
 mkHsDo     ctxt stmts      = HsDo noAnn ctxt stmts
 mkHsDoAnns ctxt stmts anns = HsDo anns  ctxt stmts
 mkHsComp ctxt stmts expr = mkHsCompAnns ctxt stmts expr noAnn
-mkHsCompAnns ctxt stmts expr anns = mkHsDoAnns ctxt (mkLocatedList (stmts ++ [last_stmt])) anns
+mkHsCompAnns ctxt stmts expr@(L l e) anns = mkHsDoAnns ctxt (L loc (stmts ++ [last_stmt])) anns
   where
-    -- Strip the annotations from the location, they are in the embedded expr
-    last_stmt = L (noAnnSrcSpan $ getLocA expr) $ mkLastStmt expr
+    -- Move the annotations to the top of the last_stmt
+    last = mkLastStmt (L (noAnnSrcSpan $ getLocA expr) e)
+    last_stmt = L l last
+    -- last_stmt actually comes first in a list comprehension, consider all spans
+    loc  = noAnnSrcSpan $ getHasLocList (last_stmt:stmts)
 
 -- restricted to GhcPs because other phases might need a SyntaxExpr
-mkHsIf :: LHsExpr GhcPs -> LHsExpr GhcPs -> LHsExpr GhcPs -> EpAnn AnnsIf
+mkHsIf :: LHsExpr GhcPs -> LHsExpr GhcPs -> LHsExpr GhcPs -> AnnsIf
        -> HsExpr GhcPs
 mkHsIf c a b anns = HsIf anns c a b
 
 -- restricted to GhcPs because other phases might need a SyntaxExpr
-mkHsCmdIf :: LHsExpr GhcPs -> LHsCmd GhcPs -> LHsCmd GhcPs -> EpAnn AnnsIf
+mkHsCmdIf :: LHsExpr GhcPs -> LHsCmd GhcPs -> LHsCmd GhcPs -> AnnsIf
        -> HsCmd GhcPs
 mkHsCmdIf c a b anns = HsCmdIf anns noSyntaxExpr c a b
 
@@ -383,17 +410,17 @@ mkNPat lit neg anns  = NPat anns lit neg noSyntaxExpr
 mkNPlusKPat id lit anns
   = NPlusKPat anns id lit (unLoc lit) noSyntaxExpr noSyntaxExpr
 
-mkTransformStmt    :: EpAnn [AddEpAnn] -> [ExprLStmt GhcPs] -> LHsExpr GhcPs
+mkTransformStmt    :: [AddEpAnn] -> [ExprLStmt GhcPs] -> LHsExpr GhcPs
                    -> StmtLR GhcPs GhcPs (LHsExpr GhcPs)
-mkTransformByStmt  :: EpAnn [AddEpAnn] -> [ExprLStmt GhcPs] -> LHsExpr GhcPs
+mkTransformByStmt  :: [AddEpAnn] -> [ExprLStmt GhcPs] -> LHsExpr GhcPs
                    -> LHsExpr GhcPs -> StmtLR GhcPs GhcPs (LHsExpr GhcPs)
-mkGroupUsingStmt   :: EpAnn [AddEpAnn] -> [ExprLStmt GhcPs] -> LHsExpr GhcPs
+mkGroupUsingStmt   :: [AddEpAnn] -> [ExprLStmt GhcPs] -> LHsExpr GhcPs
                    -> StmtLR GhcPs GhcPs (LHsExpr GhcPs)
-mkGroupByUsingStmt :: EpAnn [AddEpAnn] -> [ExprLStmt GhcPs] -> LHsExpr GhcPs
+mkGroupByUsingStmt :: [AddEpAnn] -> [ExprLStmt GhcPs] -> LHsExpr GhcPs
                    -> LHsExpr GhcPs
                    -> StmtLR GhcPs GhcPs (LHsExpr GhcPs)
 
-emptyTransStmt :: EpAnn [AddEpAnn] -> StmtLR GhcPs GhcPs (LHsExpr GhcPs)
+emptyTransStmt :: [AddEpAnn] -> StmtLR GhcPs GhcPs (LHsExpr GhcPs)
 emptyTransStmt anns = TransStmt { trS_ext = anns
                                 , trS_form = panic "emptyTransStmt: form"
                                 , trS_stmts = [], trS_bndrs = []
@@ -442,7 +469,7 @@ emptyRecStmtName = emptyRecStmt' noExtField
 emptyRecStmtId   = emptyRecStmt' unitRecStmtTc
                                         -- a panic might trigger during zonking
 
-mkLetStmt :: EpAnn [AddEpAnn] -> HsLocalBinds GhcPs -> StmtLR GhcPs GhcPs (LocatedA b)
+mkLetStmt :: [AddEpAnn] -> HsLocalBinds GhcPs -> StmtLR GhcPs GhcPs (LocatedA b)
 mkLetStmt anns binds = LetStmt anns binds
 
 -------------------------------
@@ -487,10 +514,10 @@ nlHsDataCon :: DataCon -> LHsExpr GhcTc
 nlHsDataCon con = noLocA (mkConLikeTc (RealDataCon con))
 
 nlHsLit :: HsLit (GhcPass p) -> LHsExpr (GhcPass p)
-nlHsLit n = noLocA (HsLit noComments n)
+nlHsLit n = noLocA (HsLit noExtField n)
 
 nlHsIntLit :: Integer -> LHsExpr (GhcPass p)
-nlHsIntLit n = noLocA (HsLit noComments (HsInt noExtField (mkIntegralLit n)))
+nlHsIntLit n = noLocA (HsLit noExtField (HsInt noExtField (mkIntegralLit n)))
 
 nlVarPat :: IsSrcSpanAnn p a
         => IdP (GhcPass p) -> LPat (GhcPass p)
@@ -500,18 +527,11 @@ nlLitPat :: HsLit GhcPs -> LPat GhcPs
 nlLitPat l = noLocA (LitPat noExtField l)
 
 nlHsApp :: IsPass id => LHsExpr (GhcPass id) -> LHsExpr (GhcPass id) -> LHsExpr (GhcPass id)
-nlHsApp f x = noLocA (HsApp noComments f (mkLHsPar x))
+nlHsApp f x = noLocA (HsApp noExtField f (mkLHsPar x))
 
 nlHsSyntaxApps :: SyntaxExprTc -> [LHsExpr GhcTc]
                -> LHsExpr GhcTc
-nlHsSyntaxApps (SyntaxExprTc { syn_expr      = fun
-                             , syn_arg_wraps = arg_wraps
-                             , syn_res_wrap  = res_wrap }) args
-  = mkLHsWrap res_wrap (foldl' nlHsApp (noLocA fun) (zipWithEqual "nlHsSyntaxApps"
-                                                     mkLHsWrap arg_wraps args))
-nlHsSyntaxApps NoSyntaxExprTc args = pprPanic "nlHsSyntaxApps" (ppr args)
-  -- this function should never be called in scenarios where there is no
-  -- syntax expr
+nlHsSyntaxApps = mkHsSyntaxApps noSrcSpanA
 
 nlHsApps :: IsSrcSpanAnn p a
          => IdP (GhcPass p) -> [LHsExpr (GhcPass p)] -> LHsExpr (GhcPass p)
@@ -522,7 +542,7 @@ nlHsVarApps :: IsSrcSpanAnn p a
 nlHsVarApps f xs = noLocA (foldl' mk (HsVar noExtField (noLocA f))
                                          (map ((HsVar noExtField) . noLocA) xs))
                  where
-                   mk f a = HsApp noComments (noLocA f) (noLocA a)
+                   mk f a = HsApp noExtField (noLocA f) (noLocA a)
 
 nlConVarPat :: RdrName -> [RdrName] -> LPat GhcPs
 nlConVarPat con vars = nlConPat con (map nlVarPat vars)
@@ -584,13 +604,15 @@ nlHsOpApp :: LHsExpr GhcPs -> IdP GhcPs -> LHsExpr GhcPs -> LHsExpr GhcPs
 nlHsOpApp e1 op e2 = noLocA (mkHsOpApp e1 op e2)
 
 nlHsLam  :: LMatch GhcPs (LHsExpr GhcPs) -> LHsExpr GhcPs
-nlHsPar  :: LHsExpr (GhcPass id) -> LHsExpr (GhcPass id)
+nlHsPar  :: IsPass p => LHsExpr (GhcPass p) -> LHsExpr (GhcPass p)
 nlHsCase :: LHsExpr GhcPs -> [LMatch GhcPs (LHsExpr GhcPs)]
          -> LHsExpr GhcPs
 nlList   :: [LHsExpr GhcPs] -> LHsExpr GhcPs
 
 -- AZ:Is this used?
-nlHsLam match = noLocA (HsLam noExtField (mkMatchGroup Generated (noLocA [match])))
+nlHsLam match = noLocA $ HsLam noAnn LamSingle
+                  $ mkMatchGroup (Generated OtherExpansion SkipPmc) (noLocA [match])
+
 nlHsPar e     = noLocA (gHsPar e)
 
 -- nlHsIf should generate if-expressions which are NOT subject to
@@ -599,42 +621,52 @@ nlHsIf :: LHsExpr GhcPs -> LHsExpr GhcPs -> LHsExpr GhcPs -> LHsExpr GhcPs
 nlHsIf cond true false = noLocA (HsIf noAnn cond true false)
 
 nlHsCase expr matches
-  = noLocA (HsCase noAnn expr (mkMatchGroup Generated (noLocA matches)))
+  = noLocA (HsCase noAnn expr (mkMatchGroup (Generated OtherExpansion SkipPmc) (noLocA matches)))
 nlList exprs          = noLocA (ExplicitList noAnn exprs)
 
 nlHsAppTy :: LHsType (GhcPass p) -> LHsType (GhcPass p) -> LHsType (GhcPass p)
 nlHsTyVar :: IsSrcSpanAnn p a
           => PromotionFlag -> IdP (GhcPass p)           -> LHsType (GhcPass p)
-nlHsFunTy :: LHsType (GhcPass p) -> LHsType (GhcPass p) -> LHsType (GhcPass p)
+nlHsFunTy :: forall p. IsPass p
+          => LHsType (GhcPass p) -> LHsType (GhcPass p) -> LHsType (GhcPass p)
 nlHsParTy :: LHsType (GhcPass p)                        -> LHsType (GhcPass p)
 
-nlHsAppTy f t = noLocA (HsAppTy noExtField f (parenthesizeHsType appPrec t))
+nlHsAppTy f t = noLocA (HsAppTy noExtField f t)
 nlHsTyVar p x = noLocA (HsTyVar noAnn p (noLocA x))
-nlHsFunTy a b = noLocA (HsFunTy noAnn (HsUnrestrictedArrow noHsUniTok) (parenthesizeHsType funPrec a) b)
+nlHsFunTy a b = noLocA (HsFunTy noExtField (HsUnrestrictedArrow x) a b)
+  where
+    x = case ghcPass @p of
+      GhcPs -> noAnn
+      GhcRn -> noExtField
+      GhcTc -> noExtField
 nlHsParTy t   = noLocA (HsParTy noAnn t)
 
-nlHsTyConApp :: IsSrcSpanAnn p a
+nlHsTyConApp :: forall p a. IsSrcSpanAnn p a
              => PromotionFlag
              -> LexicalFixity -> IdP (GhcPass p)
              -> [LHsTypeArg (GhcPass p)] -> LHsType (GhcPass p)
 nlHsTyConApp prom fixity tycon tys
   | Infix <- fixity
-  , HsValArg ty1 : HsValArg ty2 : rest <- tys
+  , HsValArg _ ty1 : HsValArg _ ty2 : rest <- tys
   = foldl' mk_app (noLocA $ HsOpTy noAnn prom ty1 (noLocA tycon) ty2) rest
   | otherwise
   = foldl' mk_app (nlHsTyVar prom tycon) tys
   where
     mk_app :: LHsType (GhcPass p) -> LHsTypeArg (GhcPass p) -> LHsType (GhcPass p)
-    mk_app fun@(L _ (HsOpTy {})) arg = mk_app (noLocA $ HsParTy noAnn fun) arg
+    mk_app fun@(L _ (HsOpTy {})) arg = mk_app (nlHsParTy fun) arg
       -- parenthesize things like `(A + B) C`
-    mk_app fun (HsValArg ty) = noLocA (HsAppTy noExtField fun (parenthesizeHsType appPrec ty))
-    mk_app fun (HsTypeArg _ ki) = noLocA (HsAppKindTy noSrcSpan fun (parenthesizeHsType appPrec ki))
-    mk_app fun (HsArgPar _) = noLocA (HsParTy noAnn fun)
+    mk_app fun (HsValArg _ ty) = nlHsAppTy fun ty
+    mk_app fun (HsTypeArg _ ki) = nlHsAppKindTy fun ki
+    mk_app fun (HsArgPar _) = nlHsParTy fun
 
-nlHsAppKindTy ::
+nlHsAppKindTy :: forall p. IsPass p =>
   LHsType (GhcPass p) -> LHsKind (GhcPass p) -> LHsType (GhcPass p)
-nlHsAppKindTy f k
-  = noLocA (HsAppKindTy noSrcSpan f (parenthesizeHsType appPrec k))
+nlHsAppKindTy f k = noLocA (HsAppKindTy x f k)
+  where
+    x = case ghcPass @p of
+      GhcPs -> noAnn
+      GhcRn -> noExtField
+      GhcTc -> noExtField
 
 {-
 Tuples.  All these functions are *pre-typechecker* because they lack
@@ -646,7 +678,7 @@ mkLHsTupleExpr :: [LHsExpr (GhcPass p)] -> XExplicitTuple (GhcPass p)
 -- Makes a pre-typechecker boxed tuple, deals with 1 case
 mkLHsTupleExpr [e] _ = e
 mkLHsTupleExpr es ext
-  = noLocA $ ExplicitTuple ext (map (Present noAnn) es) Boxed
+  = noLocA $ ExplicitTuple ext (map (Present noExtField) es) Boxed
 
 mkLHsVarTuple :: IsSrcSpanAnn p a
                => [IdP (GhcPass p)]  -> XExplicitTuple (GhcPass p)
@@ -656,7 +688,7 @@ mkLHsVarTuple ids ext = mkLHsTupleExpr (map nlHsVar ids) ext
 nlTuplePat :: [LPat GhcPs] -> Boxity -> LPat GhcPs
 nlTuplePat pats box = noLocA (TuplePat noAnn pats box)
 
-missingTupArg :: EpAnn EpaLocation -> HsTupArg GhcPs
+missingTupArg :: EpAnn Bool -> HsTupArg GhcPs
 missingTupArg ann = Missing ann
 
 mkLHsPatTup :: [LPat GhcRn] -> LPat GhcRn
@@ -690,12 +722,12 @@ mkBigLHsPatTup = mkChunkified mkLHsPatTup
 
 -- | Convert an 'LHsType' to an 'LHsSigType'.
 hsTypeToHsSigType :: LHsType GhcPs -> LHsSigType GhcPs
-hsTypeToHsSigType lty@(L loc ty) = L loc $ case ty of
+hsTypeToHsSigType lty@(L loc ty) = case ty of
   HsForAllTy { hst_tele = HsForAllInvis { hsf_xinvis = an
                                         , hsf_invis_bndrs = bndrs }
              , hst_body = body }
-    -> mkHsExplicitSigType an bndrs body
-  _ -> mkHsImplicitSigType lty
+    -> L loc $ mkHsExplicitSigType an bndrs body
+  _ -> L (l2l loc) $ mkHsImplicitSigType lty -- The annotations are in lty, erase them from loc
 
 -- | Convert an 'LHsType' to an 'LHsSigWcType'.
 hsTypeToHsSigWcType :: LHsType GhcPs -> LHsSigWcType GhcPs
@@ -773,6 +805,9 @@ mkHsWrapPat :: HsWrapper -> Pat GhcTc -> Type -> Pat GhcTc
 mkHsWrapPat co_fn p ty | isIdHsWrapper co_fn = p
                        | otherwise           = XPat $ CoPat co_fn p ty
 
+mkLHsWrapPat :: HsWrapper -> LPat GhcTc -> Type -> LPat GhcTc
+mkLHsWrapPat co_fn (L loc p) ty = L loc (mkHsWrapPat co_fn p ty)
+
 mkHsWrapPatCo :: TcCoercionN -> Pat GhcTc -> Type -> Pat GhcTc
 mkHsWrapPatCo co pat ty | isReflCo co = pat
                         | otherwise     = XPat $ CoPat (mkWpCastN co) pat ty
@@ -810,13 +845,13 @@ mkTopFunBind origin fn ms = FunBind { fun_id = fn
 mkHsVarBind :: SrcSpan -> RdrName -> LHsExpr GhcPs -> LHsBind GhcPs
 mkHsVarBind loc var rhs = mkSimpleGeneratedFunBind loc var [] rhs
 
-mkVarBind :: IdP (GhcPass p) -> LHsExpr (GhcPass p) -> LHsBind (GhcPass p)
+mkVarBind :: IdP GhcTc -> LHsExpr GhcTc -> LHsBind GhcTc
 mkVarBind var rhs = L (getLoc rhs) $
                     VarBind { var_ext = noExtField,
                               var_id = var, var_rhs = rhs }
 
 mkPatSynBind :: LocatedN RdrName -> HsPatSynDetails GhcPs
-             -> LPat GhcPs -> HsPatSynDir GhcPs -> EpAnn [AddEpAnn] -> HsBind GhcPs
+             -> LPat GhcPs -> HsPatSynDir GhcPs -> [AddEpAnn] -> HsBind GhcPs
 mkPatSynBind name details lpat dir anns = PatSynBind noExtField psb
   where
     psb = PSB{ psb_ext = anns
@@ -856,21 +891,23 @@ spanHsLocaLBinds (HsIPBinds _ (IPBinds _ bs))
 -- | Convenience function using 'mkFunBind'.
 -- This is for generated bindings only, do not use for user-written code.
 mkSimpleGeneratedFunBind :: SrcSpan -> RdrName -> [LPat GhcPs]
-                -> LHsExpr GhcPs -> LHsBind GhcPs
+                         -> LHsExpr GhcPs -> LHsBind GhcPs
 mkSimpleGeneratedFunBind loc fun pats expr
-  = L (noAnnSrcSpan loc) $ mkFunBind Generated (L (noAnnSrcSpan loc) fun)
-              [mkMatch (mkPrefixFunRhs (L (noAnnSrcSpan loc) fun)) pats expr
-                       emptyLocalBinds]
+  = L (noAnnSrcSpan loc) $ mkFunBind (Generated OtherExpansion SkipPmc) (L (noAnnSrcSpan loc) fun)
+                                     [mkMatch ctxt pats expr emptyLocalBinds]
+  where
+    ctxt :: HsMatchContextPs
+    ctxt = mkPrefixFunRhs (L (noAnnSrcSpan loc) fun)
 
 -- | Make a prefix, non-strict function 'HsMatchContext'
-mkPrefixFunRhs :: LIdP (NoGhcTc p) -> HsMatchContext p
-mkPrefixFunRhs n = FunRhs { mc_fun = n
-                          , mc_fixity = Prefix
+mkPrefixFunRhs :: fn -> HsMatchContext fn
+mkPrefixFunRhs n = FunRhs { mc_fun        = n
+                          , mc_fixity     = Prefix
                           , mc_strictness = NoSrcStrict }
 
 ------------
 mkMatch :: forall p. IsPass p
-        => HsMatchContext (GhcPass p)
+        => HsMatchContext (LIdP (NoGhcTc (GhcPass p)))
         -> [LPat (GhcPass p)]
         -> LHsExpr (GhcPass p)
         -> HsLocalBinds (GhcPass p)
@@ -878,7 +915,7 @@ mkMatch :: forall p. IsPass p
 mkMatch ctxt pats expr binds
   = noLocA (Match { m_ext   = noAnn
                   , m_ctxt  = ctxt
-                  , m_pats  = map mkParPat pats
+                  , m_pats  = pats
                   , m_grhss = GRHSs emptyComments (unguardedRHS noAnn noSrcSpan expr) binds })
 
 {-
@@ -905,55 +942,106 @@ to return a [Name] or [Id].  Before renaming the record punning
 and wild-card mechanism makes it hard to know what is bound.
 So these functions should not be applied to (HsSyn RdrName)
 
-Note [Unlifted id check in isUnliftedHsBind]
+Note [isUnliftedHsBind]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-The function isUnliftedHsBind is used to complain if we make a top-level
-binding for a variable of unlifted type.
+The function isUnliftedHsBind tells if the binding binds a variable of
+unlifted type.  e.g.
 
-Such a binding is illegal if the top-level binding would be unlifted;
-but also if the local letrec generated by desugaring AbsBinds would be.
-E.g.
-      f :: Num a => (# a, a #)
-      g :: Num a => a -> a
-      f = ...g...
-      g = ...g...
+  - I# x = blah
+  - Just (I# x) = blah
 
-The top-level bindings for f,g are not unlifted (because of the Num a =>),
-but the local, recursive, monomorphic bindings are:
+isUnliftedHsBind is used in two ways:
 
+* To complain if we make a top-level binding for a variable of unlifted
+  type. E.g. any of the above bindings are illegal at top level
+
+* To generate a case expression for a non-recursive local let.  E.g.
+     let Just (I# x) = blah in body
+  ==>
+     case blah of Just (I# x) -> body
+  See GHC.HsToCore.Expr.dsUnliftedBind.
+
+Wrinkles:
+
+(W1) For AbsBinds we must check if the local letrec generated by desugaring
+     AbsBinds would be unlifted; so we just recurse into the abs_binds. E.g.
+       f :: Num a => (# a, a #)
+       g :: Num a => a -> a
+       f = ...g...
+       g = ...g...
+
+    The top-level bindings for f,g are not unlifted (because of the Num a =>),
+    but the local, recursive, monomorphic bindings are:
       t = /\a \(d:Num a).
          letrec fm :: (# a, a #) = ...g...
                 gm :: a -> a = ...f...
          in (fm, gm)
 
-Here the binding for 'fm' is illegal.  So generally we check the abe_mono types.
+   Here the binding for 'fm' is illegal.  So we recurse into the abs_binds
 
-BUT we have a special case when abs_sig is true;
-  see Note [The abs_sig field of AbsBinds] in GHC.Hs.Binds
+(W2) BUT we have a special case when abs_sig is true;
+     see Note [The abs_sig field of AbsBinds] in GHC.Hs.Binds
+
+(W3) isUnliftedHsBind returns False even if the binding itself is
+     unlifted, provided it binds only lifted variables. E.g.
+      -  (# a,b #) = (# reverse xs, xs #)
+
+      -  x = sqrt# y#  :: Float#
+
+      -  type Unl :: UnliftedType
+         data Unl = MkUnl Int
+         MkUnl z = blah
+
+     In each case the RHS of the "=" has unlifted type, but isUnliftedHsBind
+     returns False.  Reason: see GHC Proposal #35
+        https://github.com/ghc-proposals/ghc-proposals/blob/master/
+        proposals/0035-unbanged-strict-patterns.rst
+
+(W4) In particular, (W3) applies to a pattern that binds no variables at all.
+     So   { _ = sqrt# y :: Float# } returns False from isUnliftedHsBind, but
+          { x = sqrt# y :: Float# } returns True.
+     This is arguably a bit confusing (see #22719)
 -}
 
 ----------------- Bindings --------------------------
 
 -- | Should we treat this as an unlifted bind? This will be true for any
 -- bind that binds an unlifted variable, but we must be careful around
--- AbsBinds. See Note [Unlifted id check in isUnliftedHsBind]. For usage
+-- AbsBinds. See Note [isUnliftedHsBind]. For usage
 -- information, see Note [Strict binds checks] is GHC.HsToCore.Binds.
 isUnliftedHsBind :: HsBind GhcTc -> Bool  -- works only over typechecked binds
-isUnliftedHsBind bind
-  | XHsBindsLR (AbsBinds { abs_exports = exports, abs_sig = has_sig }) <- bind
-  = if has_sig
-    then any (is_unlifted_id . abe_poly) exports
-    else any (is_unlifted_id . abe_mono) exports
+isUnliftedHsBind (XHsBindsLR (AbsBinds { abs_exports = exports
+                                       , abs_sig     = has_sig
+                                       , abs_binds   = binds }))
+  | has_sig   = any (is_unlifted_id . abe_poly) exports
+  | otherwise = isUnliftedHsBinds binds
+    -- See wrinkle (W1) and (W2) in Note [isUnliftedHsBind]
     -- If has_sig is True we will never generate a binding for abe_mono,
     -- so we don't need to worry about it being unlifted. The abe_poly
     -- binding might not be: e.g. forall a. Num a => (# a, a #)
+    -- If has_sig is False, just recurse
 
-  | otherwise
-  = any is_unlifted_id (collectHsBindBinders CollNoDictBinders bind)
-  where
-    is_unlifted_id id = isUnliftedType (idType id)
-      -- bindings always have a fixed RuntimeRep, so it's OK
-      -- to call isUnliftedType here
+isUnliftedHsBind (FunBind { fun_id = L _ fun })
+  = is_unlifted_id fun
+
+isUnliftedHsBind (VarBind { var_id = var })
+  = is_unlifted_id var
+
+isUnliftedHsBind (PatBind { pat_lhs = pat })
+  = any is_unlifted_id (collectPatBinders CollNoDictBinders pat)
+    -- If we changed our view on (W3) you could add
+    --    || isUnliftedType pat_ty
+    -- to this check
+
+isUnliftedHsBind (PatSynBind {}) = panic "isUnliftedBind: PatSynBind"
+
+isUnliftedHsBinds :: LHsBinds GhcTc -> Bool
+isUnliftedHsBinds = anyBag (isUnliftedHsBind . unLoc)
+
+is_unlifted_id :: Id -> Bool
+is_unlifted_id id = isUnliftedType (idType id)
+   -- Bindings always have a fixed RuntimeRep, so it's OK
+   -- to call isUnliftedType here
 
 -- | Is a binding a strict variable or pattern bind (e.g. @!x = ...@)?
 isBangedHsBind :: HsBind GhcTc -> Bool
@@ -1121,14 +1209,18 @@ collectPatsBinders
     -> [IdP p]
 collectPatsBinders flag pats = foldr (collect_lpat flag) [] pats
 
-
 -------------
 
--- | Indicate if evidence binders have to be collected.
+-- | Indicate if evidence binders and type variable binders have
+--   to be collected.
 --
--- This type is used as a boolean (should we collect evidence binders or not?)
--- but also to pass an evidence that the AST has been typechecked when we do
--- want to collect evidence binders, otherwise these binders are not available.
+-- This type enumerates the modes of collecting bound variables
+--                     | evidence |   type    |   term    |  ghc  |
+--                     | binders  | variables | variables |  pass |
+--                     --------------------------------------------
+-- CollNoDictBinders   |  no      |    no     |    yes    |  any  |
+-- CollWithDictBinders |  yes     |    no     |    yes    | GhcTc |
+-- CollVarTyVarBinders |  no      |    yes    |    yes    | GhcRn |
 --
 -- See Note [Dictionary binders in ConPatOut]
 data CollectFlag p where
@@ -1136,6 +1228,9 @@ data CollectFlag p where
     CollNoDictBinders   :: CollectFlag p
     -- | Collect evidence binders
     CollWithDictBinders :: CollectFlag GhcTc
+    -- | Collect variable and type variable binders, but no evidence binders
+    CollVarTyVarBinders :: CollectFlag GhcRn
+
 
 collect_lpat :: forall p. CollectPass p
              => CollectFlag p
@@ -1154,27 +1249,49 @@ collect_pat flag pat bndrs = case pat of
   WildPat _             -> bndrs
   LazyPat _ pat         -> collect_lpat flag pat bndrs
   BangPat _ pat         -> collect_lpat flag pat bndrs
-  AsPat _ a _ pat       -> unXRec @p a : collect_lpat flag pat bndrs
+  AsPat _ a pat         -> unXRec @p a : collect_lpat flag pat bndrs
   ViewPat _ _ pat       -> collect_lpat flag pat bndrs
-  ParPat _ _ pat _      -> collect_lpat flag pat bndrs
+  ParPat _ pat          -> collect_lpat flag pat bndrs
   ListPat _ pats        -> foldr (collect_lpat flag) bndrs pats
   TuplePat _ pats _     -> foldr (collect_lpat flag) bndrs pats
   SumPat _ pat _ _      -> collect_lpat flag pat bndrs
   LitPat _ _            -> bndrs
   NPat {}               -> bndrs
   NPlusKPat _ n _ _ _ _ -> unXRec @p n : bndrs
-  SigPat _ pat _        -> collect_lpat flag pat bndrs
+  SigPat _ pat sig      -> case flag of
+    CollNoDictBinders   -> collect_lpat flag pat bndrs
+    CollWithDictBinders -> collect_lpat flag pat bndrs
+    CollVarTyVarBinders -> collect_lpat flag pat bndrs ++ collectPatSigBndrs sig
   XPat ext              -> collectXXPat @p flag ext bndrs
   SplicePat ext _       -> collectXSplicePat @p flag ext bndrs
+  EmbTyPat _ tp         -> collect_ty_pat_bndrs flag tp bndrs
+  InvisPat _ tp         -> collect_ty_pat_bndrs flag tp bndrs
+
   -- See Note [Dictionary binders in ConPatOut]
   ConPat {pat_args=ps}  -> case flag of
     CollNoDictBinders   -> foldr (collect_lpat flag) bndrs (hsConPatArgs ps)
     CollWithDictBinders -> foldr (collect_lpat flag) bndrs (hsConPatArgs ps)
                            ++ collectEvBinders (cpt_binds (pat_con_ext pat))
+    CollVarTyVarBinders -> foldr (collect_lpat flag) bndrs (hsConPatArgs ps)
+                           ++ concatMap collectConPatTyArgBndrs (hsConPatTyArgs ps)
 
 collectEvBinders :: TcEvBinds -> [Id]
 collectEvBinders (EvBinds bs)   = foldr add_ev_bndr [] bs
 collectEvBinders (TcEvBinds {}) = panic "ToDo: collectEvBinders"
+
+collectConPatTyArgBndrs :: HsConPatTyArg GhcRn -> [Name]
+collectConPatTyArgBndrs (HsConPatTyArg _ tp) = collectTyPatBndrs tp
+
+collect_ty_pat_bndrs :: CollectFlag p -> HsTyPat (NoGhcTc p) -> [IdP p] -> [IdP p]
+collect_ty_pat_bndrs CollNoDictBinders _ bndrs = bndrs
+collect_ty_pat_bndrs CollWithDictBinders _ bndrs = bndrs
+collect_ty_pat_bndrs CollVarTyVarBinders tp bndrs = collectTyPatBndrs tp ++ bndrs
+
+collectTyPatBndrs :: HsTyPat GhcRn -> [Name]
+collectTyPatBndrs (HsTP (HsTPRn nwcs imp_tvs exp_tvs) _) = nwcs ++ imp_tvs ++ exp_tvs
+
+collectPatSigBndrs :: HsPatSigType GhcRn -> [Name]
+collectPatSigBndrs (HsPS (HsPSRn nwcs imp_tvs) _) = nwcs ++ imp_tvs
 
 add_ev_bndr :: EvBind -> [Id] -> [Id]
 add_ev_bndr (EvBind { eb_lhs = b }) bs | isId b    = b:bs
@@ -1211,7 +1328,7 @@ instance IsPass p => CollectPass (GhcPass p) where
         AbsBinds { abs_exports = dbinds } -> (map abe_poly dbinds ++)
         -- I don't think we want the binders from the abe_binds
 
-        -- binding (hence see AbsBinds) is in zonking in GHC.Tc.Utils.Zonk
+        -- binding (hence see AbsBinds) is in zonking in GHC.Tc.Zonk.Type
 
   collectXSplicePat flag ext =
       case ghcPass @p of
@@ -1305,17 +1422,31 @@ hsTyClForeignBinders :: [TyClGroup GhcRn]
 hsTyClForeignBinders tycl_decls foreign_decls
   =    map unLoc (hsForeignDeclsBinders foreign_decls)
     ++ getSelectorNames
-         (foldMap (foldMap hsLTyClDeclBinders . group_tyclds) tycl_decls
+         (foldMap (foldMap (tyDeclBinders . hsLTyClDeclBinders) . group_tyclds) tycl_decls
          `mappend`
-         foldMap (foldMap hsLInstDeclBinders . group_instds) tycl_decls)
+         (foldMap (foldMap hsLInstDeclBinders . group_instds) tycl_decls))
   where
     getSelectorNames :: ([LocatedA Name], [LFieldOcc GhcRn]) -> [Name]
     getSelectorNames (ns, fs) = map unLoc ns ++ map (foExt . unLoc) fs
 
 -------------------
-hsLTyClDeclBinders :: IsPass p
+
+data TyDeclBinders p
+  = TyDeclBinders
+  { tyDeclMainBinder     :: !(LocatedA (IdP (GhcPass p)), TyConFlavour ())
+  , tyDeclATs            :: ![(LocatedA (IdP (GhcPass p)), TyConFlavour ())]
+  , tyDeclOpSigs         :: ![LocatedA (IdP (GhcPass p))]
+  , tyDeclConsWithFields :: !(LConsWithFields p) }
+
+tyDeclBinders :: TyDeclBinders p -> ([LocatedA (IdP (GhcPass p))], [LFieldOcc (GhcPass p)])
+tyDeclBinders (TyDeclBinders main ats sigs consWithFields)
+  = (fst main : (fmap fst ats ++ sigs ++ cons), flds)
+  where
+    (cons, flds) = lconsWithFieldsBinders consWithFields
+
+hsLTyClDeclBinders :: (IsPass p, OutputableBndrId p)
                    => LocatedA (TyClDecl (GhcPass p))
-                   -> ([LocatedA (IdP (GhcPass p))], [LFieldOcc (GhcPass p)])
+                   -> TyDeclBinders p
 -- ^ Returns all the /binding/ names of the decl.  The first one is
 -- guaranteed to be the name of the decl. The first component
 -- represents all binding names except record fields; the second
@@ -1326,27 +1457,40 @@ hsLTyClDeclBinders :: IsPass p
 -- See Note [SrcSpan for binders]
 
 hsLTyClDeclBinders (L loc (FamDecl { tcdFam = FamilyDecl
-                                            { fdLName = (L _ name) } }))
-  = ([L loc name], [])
+                                            { fdLName = (L _ name)
+                                            , fdInfo  = fd_info } }))
+  = TyDeclBinders
+  { tyDeclMainBinder = (L loc name, familyInfoTyConFlavour Nothing fd_info)
+  , tyDeclATs = [], tyDeclOpSigs = []
+  , tyDeclConsWithFields = emptyLConsWithFields }
 hsLTyClDeclBinders (L loc (SynDecl
                                { tcdLName = (L _ name) }))
-  = ([L loc name], [])
+  = TyDeclBinders
+  { tyDeclMainBinder = (L loc name, TypeSynonymFlavour)
+  , tyDeclATs = [], tyDeclOpSigs = []
+  , tyDeclConsWithFields = emptyLConsWithFields }
 hsLTyClDeclBinders (L loc (ClassDecl
                                { tcdLName = (L _ cls_name)
                                , tcdSigs  = sigs
                                , tcdATs   = ats }))
-  = (L loc cls_name :
-     [ L fam_loc fam_name | (L fam_loc (FamilyDecl
-                                        { fdLName = L _ fam_name })) <- ats ]
-     ++
-     [ L mem_loc mem_name
-                          | (L mem_loc (ClassOpSig _ False ns _)) <- sigs
-                          , (L _ mem_name) <- ns ]
-    , [])
+  = TyDeclBinders
+  { tyDeclMainBinder = (L loc cls_name, ClassFlavour)
+  , tyDeclATs = [ (L fam_loc fam_name, familyInfoTyConFlavour (Just ()) fd_info)
+                | (L fam_loc (FamilyDecl { fdLName = L _ fam_name
+                                         , fdInfo = fd_info })) <- ats ]
+  , tyDeclOpSigs = [ L mem_loc mem_name
+                   | (L mem_loc (ClassOpSig _ False ns _)) <- sigs
+                   , (L _ mem_name) <- ns ]
+  , tyDeclConsWithFields = emptyLConsWithFields }
 hsLTyClDeclBinders (L loc (DataDecl    { tcdLName = (L _ name)
                                        , tcdDataDefn = defn }))
-  = (\ (xs, ys) -> (L loc name : xs, ys)) $ hsDataDefnBinders defn
-
+  = TyDeclBinders
+  { tyDeclMainBinder = (L loc name, flav )
+  , tyDeclATs = []
+  , tyDeclOpSigs = []
+  , tyDeclConsWithFields = hsDataDefnBinders defn }
+  where
+    flav = newOrDataToFlavour $ dataDefnConsNewOrData $ dd_cons defn
 
 -------------------
 hsForeignDeclsBinders :: forall p a. (UnXRec (GhcPass p), IsSrcSpanAnn p a)
@@ -1379,94 +1523,170 @@ getPatSynBinds binds
           , (unXRec @id -> (PatSynBind _ psb)) <- bagToList lbinds ]
 
 -------------------
-hsLInstDeclBinders :: IsPass p
+hsLInstDeclBinders :: (IsPass p, OutputableBndrId p)
                    => LInstDecl (GhcPass p)
-                   -> ([LocatedA (IdP (GhcPass p))], [LFieldOcc (GhcPass p)])
+                   -> ([(LocatedA (IdP (GhcPass p)))], [LFieldOcc (GhcPass p)])
 hsLInstDeclBinders (L _ (ClsInstD
                              { cid_inst = ClsInstDecl
                                           { cid_datafam_insts = dfis }}))
-  = foldMap (hsDataFamInstBinders . unLoc) dfis
+  = foldMap (lconsWithFieldsBinders . hsDataFamInstBinders . unLoc) dfis
 hsLInstDeclBinders (L _ (DataFamInstD { dfid_inst = fi }))
-  = hsDataFamInstBinders fi
+  = lconsWithFieldsBinders $ hsDataFamInstBinders fi
 hsLInstDeclBinders (L _ (TyFamInstD {})) = mempty
 
 -------------------
 -- | the 'SrcLoc' returned are for the whole declarations, not just the names
-hsDataFamInstBinders :: IsPass p
+hsDataFamInstBinders :: (IsPass p, OutputableBndrId p)
                      => DataFamInstDecl (GhcPass p)
-                     -> ([LocatedA (IdP (GhcPass p))], [LFieldOcc (GhcPass p)])
+                     -> LConsWithFields p
 hsDataFamInstBinders (DataFamInstDecl { dfid_eqn = FamEqn { feqn_rhs = defn }})
   = hsDataDefnBinders defn
   -- There can't be repeated symbols because only data instances have binders
 
 -------------------
 -- | the 'SrcLoc' returned are for the whole declarations, not just the names
-hsDataDefnBinders :: IsPass p
+hsDataDefnBinders :: (IsPass p, OutputableBndrId p)
                   => HsDataDefn (GhcPass p)
-                  -> ([LocatedA (IdP (GhcPass p))], [LFieldOcc (GhcPass p)])
+                  -> LConsWithFields p
 hsDataDefnBinders (HsDataDefn { dd_cons = cons })
   = hsConDeclsBinders (toList cons)
   -- See Note [Binders in family instances]
 
 -------------------
-type Seen p = [LFieldOcc (GhcPass p)] -> [LFieldOcc (GhcPass p)]
-                 -- Filters out ones that have already been seen
 
-hsConDeclsBinders :: forall p. IsPass p
+{- Note [Collecting record fields in data declarations]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+When renaming a data declaration that includes record constructors, we are, in
+the end, going to to create a mapping from constructor to its field labels,
+to store in 'GREInfo' (see 'IAmConLike'). This allows us to know, in the renamer,
+which constructor has what fields.
+
+In order to achieve this, we return the constructor and field information from
+hsConDeclsBinders in the following format:
+
+  - [(ConRdrName, [Located Int])], a list of the constructors, each associated
+    with its record fields, in the form of a list of Int indices into...
+  - IntMap FieldOcc, an IntMap of record fields.
+
+(In actual fact, we use [(ConRdrName, Maybe [Located Int])], with Nothing indicating
+that the constructor has unlabelled fields: see Note [Local constructor info in the renamer]
+in GHC.Types.GREInfo.)
+
+This allows us to do the following (see GHC.Rename.Names.getLocalNonValBinders.new_tc):
+
+  - create 'Name's for each of the record fields, to get IntMap FieldLabel,
+  - create 'Name's for each of the constructors, to get [(ConName, [Int])],
+  - look up the FieldLabels of each constructor, to get [(ConName, [FieldLabel])].
+
+NB: This can be a bit tricky to get right in the presence of data types with
+duplicate constructors or fields. Storing locations allows us to report an error
+for duplicate field declarations, see test cases T9156 T9156_DF.
+Other relevant test cases: rnfail015.
+
+-}
+
+-- | A mapping from constructors to all of their fields.
+--
+-- See Note [Collecting record fields in data declarations].
+data LConsWithFields p =
+  LConsWithFields
+    { consWithFieldIndices :: [(LocatedA (IdP (GhcPass p)), Maybe [Located Int])]
+    , consFields :: IntMap (LFieldOcc (GhcPass p))
+    }
+
+lconsWithFieldsBinders :: LConsWithFields p
+                       -> ([(LocatedA (IdP (GhcPass p)))], [LFieldOcc (GhcPass p)])
+lconsWithFieldsBinders (LConsWithFields cons fields)
+  = (map fst cons, IntMap.elems fields)
+
+emptyLConsWithFields :: LConsWithFields p
+emptyLConsWithFields = LConsWithFields [] IntMap.empty
+
+hsConDeclsBinders :: forall p. (IsPass p, OutputableBndrId p)
                   => [LConDecl (GhcPass p)]
-                  -> ([LocatedA (IdP (GhcPass p))], [LFieldOcc (GhcPass p)])
-   -- See hsLTyClDeclBinders for what this does
-   -- The function is boringly complicated because of the records
-   -- And since we only have equality, we have to be a little careful
-hsConDeclsBinders cons
-  = go id cons
+                  -> LConsWithFields p
+  -- The function is boringly complicated because of the records
+  -- And since we only have equality, we have to be a little careful
+hsConDeclsBinders cons = go emptyFieldIndices cons
   where
-    go :: Seen p -> [LConDecl (GhcPass p)]
-       -> ([LocatedA (IdP (GhcPass p))], [LFieldOcc (GhcPass p)])
-    go _ [] = ([], [])
-    go remSeen (r:rs)
+    go :: FieldIndices p -> [LConDecl (GhcPass p)] -> LConsWithFields p
+    go seen [] = LConsWithFields [] (fields seen)
+    go seen (r:rs)
       -- Don't re-mangle the location of field names, because we don't
       -- have a record of the full location of the field declaration anyway
       = let loc = getLoc r
         in case unLoc r of
-           -- remove only the first occurrence of any seen field in order to
-           -- avoid circumventing detection of duplicate fields (#9156)
            ConDeclGADT { con_names = names, con_g_args = args }
-             -> (toList (L loc . unLoc <$> names) ++ ns, flds ++ fs)
+             -> LConsWithFields (cons ++ ns) fs
              where
-                (remSeen', flds) = get_flds_gadt remSeen args
-                (ns, fs) = go remSeen' rs
+                cons = map ( , con_flds ) $ toList (L loc . unLoc <$> names)
+                (con_flds, seen') = get_flds_gadt seen args
+                LConsWithFields ns fs = go seen' rs
 
            ConDeclH98 { con_name = name, con_args = args }
-             -> ([L loc (unLoc name)] ++ ns, flds ++ fs)
+             -> LConsWithFields ([(L loc (unLoc name), con_flds)] ++ ns) fs
              where
-                (remSeen', flds) = get_flds_h98 remSeen args
-                (ns, fs) = go remSeen' rs
+                (con_flds, seen') = get_flds_h98 seen args
+                LConsWithFields ns fs = go seen' rs
 
-    get_flds_h98 :: Seen p -> HsConDeclH98Details (GhcPass p)
-                 -> (Seen p, [LFieldOcc (GhcPass p)])
-    get_flds_h98 remSeen (RecCon flds) = get_flds remSeen flds
-    get_flds_h98 remSeen _ = (remSeen, [])
+    get_flds_h98 :: FieldIndices p -> HsConDeclH98Details (GhcPass p)
+                 -> (Maybe [Located Int], FieldIndices p)
+    get_flds_h98 seen (RecCon flds) = first Just $ get_flds seen flds
+    get_flds_h98 seen (PrefixCon _ []) = (Just [], seen)
+    get_flds_h98 seen _ = (Nothing, seen)
 
-    get_flds_gadt :: Seen p -> HsConDeclGADTDetails (GhcPass p)
-                  -> (Seen p, [LFieldOcc (GhcPass p)])
-    get_flds_gadt remSeen (RecConGADT flds _) = get_flds remSeen flds
-    get_flds_gadt remSeen _ = (remSeen, [])
+    get_flds_gadt :: FieldIndices p -> HsConDeclGADTDetails (GhcPass p)
+                  -> (Maybe [Located Int], FieldIndices p)
+    get_flds_gadt seen (RecConGADT _ flds) = first Just $ get_flds seen flds
+    get_flds_gadt seen (PrefixConGADT _ []) = (Just [], seen)
+    get_flds_gadt seen _ = (Nothing, seen)
 
-    get_flds :: Seen p -> LocatedL [LConDeclField (GhcPass p)]
-             -> (Seen p, [LFieldOcc (GhcPass p)])
-    get_flds remSeen flds = (remSeen', fld_names)
-       where
-          fld_names = remSeen (concatMap (cd_fld_names . unLoc) (unLoc flds))
-          remSeen' = foldr (.) remSeen
-                               [deleteBy ((==) `on` unLoc . foLabel . unLoc) v
-                               | v <- fld_names]
+    get_flds :: FieldIndices p -> LocatedL [LConDeclField (GhcPass p)]
+             -> ([Located Int], FieldIndices p)
+    get_flds seen flds =
+      foldr add_fld ([], seen) fld_names
+      where
+        add_fld fld (is, ixs) =
+          let (i, ixs') = insertField fld ixs
+          in  (i:is, ixs')
+        fld_names = concatMap (cd_fld_names . unLoc) (unLoc flds)
+
+-- | A bijection between record fields of a datatype and integers,
+-- used to implement Note [Collecting record fields in data declarations].
+data FieldIndices p =
+  FieldIndices
+    { fields       :: IntMap (LFieldOcc (GhcPass p))
+        -- ^ Look up a field from its index.
+    , fieldIndices :: Map RdrName Int
+        -- ^ Look up the index of a field label in the previous 'IntMap'.
+    , newInt       :: !Int
+        -- ^ An integer @i@ such that no integer @i' >= i@ appears in the 'IntMap'.
+    }
+
+emptyFieldIndices :: FieldIndices p
+emptyFieldIndices =
+  FieldIndices { fields       = IntMap.empty
+               , fieldIndices = Map.empty
+               , newInt       = 0 }
+
+insertField :: LFieldOcc (GhcPass p) -> FieldIndices p -> (Located Int, FieldIndices p)
+insertField new_fld fi@(FieldIndices flds idxs new_idx)
+  | Just i <- Map.lookup rdr idxs
+  = (L loc i, fi)
+  | otherwise
+  = (L loc new_idx,
+      FieldIndices (IntMap.insert new_idx new_fld flds)
+                   (Map.insert rdr new_idx idxs)
+                   (new_idx + 1))
+  where
+    loc = getLocA new_fld
+    rdr = unLoc . foLabel . unLoc $ new_fld
 
 {-
 
 Note [SrcSpan for binders]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
-When extracting the (Located RdrNme) for a binder, at least for the
+When extracting the (Located RdrName) for a binder, at least for the
 main name (the TyCon of a type declaration etc), we want to give it
 the @SrcSpan@ of the whole /declaration/, not just the name itself
 (which is how it appears in the syntax tree).  This SrcSpan (for the
@@ -1487,32 +1707,69 @@ constructor is an *occurrence* not a binding site
 *                                                                      *
 ************************************************************************
 
-The job of this family of functions is to run through binding sites and find the set of all Names
-that were defined "implicitly", without being explicitly written by the user.
+The job of the following family of functions is to run through binding sites and find
+the set of all Names that were defined "implicitly", without being explicitly written
+by the user.
 
-The main purpose is to find names introduced by record wildcards so that we can avoid
-warning the user when they don't use those names (#4404)
+Note [Collecting implicit binders]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+We collect all the RHS Names that are implicitly introduced by record wildcards,
+so that we can:
 
-Since the addition of -Wunused-record-wildcards, this function returns a pair
-of [(SrcSpan, [Name])]. Each element of the list is one set of implicit
-binders, the first component of the tuple is the document describes the possible
-fix to the problem (by removing the ..).
+  - avoid warning the user when they don't use those names (#4404),
+  - report deprecation warnings for deprecated fields that are used (#23382).
 
-This means there is some unfortunate coupling between this function and where it
-is used but it's only used for one specific purpose in one place so it seemed
-easier.
+The functions that collect implicit binders return a collection of 'ImplicitFieldBinders',
+which associates each implicitly-introduced record field with the bound variables in the
+RHS of the record field pattern, e.g. in
+
+  data R = MkR { fld :: Int }
+  foo (MkR { .. }) = fld
+
+the renamer will elaborate this to
+
+  foo (MkR { fld = fld_var }) = fld_var
+
+and the implicit binders function will return
+
+  [ ImplicitFieldBinders { implFlBndr_field = fld
+                         , implFlBndr_binders = [fld_var] } ]
+
+This information is then used:
+
+  - in the calls to GHC.Rename.Utils.checkUnusedRecordWildcard, to emit
+    a warning when a record wildcard binds no new variables (redundant record wildcard)
+    or none of the bound variables are used (unused record wildcard).
+  - in GHC.Rename.Utils.deprecateUsedRecordWildcard, to emit a warning
+    when the field is deprecated and any of the binders are used.
+
+NOTE: the implFlBndr_binders field should always be a singleton
+      (since the RHS of an implicit binding should always be a VarPat,
+      created in rnHsRecPatsAndThen.mkVarPat)
+
 -}
 
+-- | All binders corresponding to a single implicit record field pattern.
+--
+-- See Note [Collecting implicit binders].
+data ImplicitFieldBinders
+  = ImplicitFieldBinders { implFlBndr_field :: Name
+                             -- ^ The 'Name' of the record field
+                         , implFlBndr_binders :: [Name]
+                             -- ^ The binders of the RHS of the record field pattern
+                             -- (in practice, always a singleton: see Note [Collecting implicit binders])
+                         }
+
 lStmtsImplicits :: [LStmtLR GhcRn (GhcPass idR) (LocatedA (body (GhcPass idR)))]
-                -> [(SrcSpan, [Name])]
+                -> [(SrcSpan, [ImplicitFieldBinders])]
 lStmtsImplicits = hs_lstmts
   where
     hs_lstmts :: [LStmtLR GhcRn (GhcPass idR) (LocatedA (body (GhcPass idR)))]
-              -> [(SrcSpan, [Name])]
+              -> [(SrcSpan, [ImplicitFieldBinders])]
     hs_lstmts = concatMap (hs_stmt . unLoc)
 
     hs_stmt :: StmtLR GhcRn (GhcPass idR) (LocatedA (body (GhcPass idR)))
-            -> [(SrcSpan, [Name])]
+            -> [(SrcSpan, [ImplicitFieldBinders])]
     hs_stmt (BindStmt _ pat _) = lPatImplicits pat
     hs_stmt (ApplicativeStmt _ args _) = concatMap do_arg args
       where do_arg (_, ApplicativeArgOne { app_arg_pattern = pat }) = lPatImplicits pat
@@ -1529,19 +1786,26 @@ lStmtsImplicits = hs_lstmts
     hs_local_binds (HsIPBinds {})           = []
     hs_local_binds (EmptyLocalBinds _)      = []
 
-hsValBindsImplicits :: HsValBindsLR GhcRn (GhcPass idR) -> [(SrcSpan, [Name])]
+hsValBindsImplicits :: HsValBindsLR GhcRn (GhcPass idR)
+                    -> [(SrcSpan, [ImplicitFieldBinders])]
 hsValBindsImplicits (XValBindsLR (NValBinds binds _))
   = concatMap (lhsBindsImplicits . snd) binds
 hsValBindsImplicits (ValBinds _ binds _)
   = lhsBindsImplicits binds
 
-lhsBindsImplicits :: LHsBindsLR GhcRn idR -> [(SrcSpan, [Name])]
+lhsBindsImplicits :: LHsBindsLR GhcRn idR -> [(SrcSpan, [ImplicitFieldBinders])]
 lhsBindsImplicits = foldBag (++) (lhs_bind . unLoc) []
   where
     lhs_bind (PatBind { pat_lhs = lpat }) = lPatImplicits lpat
     lhs_bind _ = []
 
-lPatImplicits :: LPat GhcRn -> [(SrcSpan, [Name])]
+-- | Collect all record wild card binders in the given pattern.
+--
+-- These are all the variables bound in all (possibly nested) record wildcard patterns
+-- appearing inside the pattern.
+--
+-- See Note [Collecting implicit binders].
+lPatImplicits :: LPat GhcRn -> [(SrcSpan, [ImplicitFieldBinders])]
 lPatImplicits = hs_lpat
   where
     hs_lpat lpat = hs_pat (unLoc lpat)
@@ -1550,33 +1814,44 @@ lPatImplicits = hs_lpat
 
     hs_pat (LazyPat _ pat)      = hs_lpat pat
     hs_pat (BangPat _ pat)      = hs_lpat pat
-    hs_pat (AsPat _ _ _ pat)    = hs_lpat pat
+    hs_pat (AsPat _ _ pat)      = hs_lpat pat
     hs_pat (ViewPat _ _ pat)    = hs_lpat pat
-    hs_pat (ParPat _ _ pat _)   = hs_lpat pat
+    hs_pat (ParPat _ pat)       = hs_lpat pat
     hs_pat (ListPat _ pats)     = hs_lpats pats
     hs_pat (TuplePat _ pats _)  = hs_lpats pats
-
     hs_pat (SigPat _ pat _)     = hs_lpat pat
 
-    hs_pat (ConPat {pat_con=con, pat_args=ps}) = details con ps
+    hs_pat (ConPat {pat_args=ps}) = details ps
 
     hs_pat _ = []
 
-    details :: LocatedN Name -> HsConPatDetails GhcRn -> [(SrcSpan, [Name])]
-    details _ (PrefixCon _ ps) = hs_lpats ps
-    details n (RecCon fs)      =
-      [(err_loc, collectPatsBinders CollNoDictBinders implicit_pats) | Just{} <- [rec_dotdot fs] ]
-        ++ hs_lpats explicit_pats
+    details :: HsConPatDetails GhcRn -> [(SrcSpan, [ImplicitFieldBinders])]
+    details (PrefixCon _ ps) = hs_lpats ps
+    details (RecCon (HsRecFields { rec_dotdot = Nothing, rec_flds }))
+      = hs_lpats $ map (hfbRHS . unLoc) rec_flds
+    details (RecCon (HsRecFields { rec_dotdot = Just (L err_loc rec_dotdot), rec_flds }))
+          = [(l2l err_loc, implicit_field_binders)]
+          ++ hs_lpats explicit_pats
 
-      where implicit_pats = map (hfbRHS . unLoc) implicit
-            explicit_pats = map (hfbRHS . unLoc) explicit
+          where (explicit_pats, implicit_field_binders)
+                  = rec_field_expl_impl rec_flds rec_dotdot
 
+    details (InfixCon p1 p2) = hs_lpat p1 ++ hs_lpat p2
 
-            (explicit, implicit) = partitionEithers [if pat_explicit then Left fld else Right fld
-                                                    | (i, fld) <- [0..] `zip` rec_flds fs
-                                                    ,  let  pat_explicit =
-                                                              maybe True ((i<) . unRecFieldsDotDot . unLoc)
-                                                                         (rec_dotdot fs)]
-            err_loc = maybe (getLocA n) getLoc (rec_dotdot fs)
+lHsRecFieldsImplicits :: [LHsRecField GhcRn (LPat GhcRn)]
+                      -> RecFieldsDotDot
+                      -> [ImplicitFieldBinders]
+lHsRecFieldsImplicits rec_flds rec_dotdot
+  = snd $ rec_field_expl_impl rec_flds rec_dotdot
 
-    details _ (InfixCon p1 p2) = hs_lpat p1 ++ hs_lpat p2
+rec_field_expl_impl :: [LHsRecField GhcRn (LPat GhcRn)]
+                    -> RecFieldsDotDot
+                    -> ([LPat GhcRn], [ImplicitFieldBinders])
+rec_field_expl_impl rec_flds (RecFieldsDotDot { .. })
+  = ( map (hfbRHS . unLoc) explicit_binds
+    , map implicit_field_binders implicit_binds )
+  where (explicit_binds, implicit_binds) = splitAt unRecFieldsDotDot rec_flds
+        implicit_field_binders (L _ (HsFieldBind { hfbLHS = L _ fld, hfbRHS = rhs }))
+          = ImplicitFieldBinders
+              { implFlBndr_field   = foExt fld
+              , implFlBndr_binders = collectPatBinders CollNoDictBinders rhs }

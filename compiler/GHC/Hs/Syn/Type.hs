@@ -42,13 +42,13 @@ hsLPatType :: LPat GhcTc -> Type
 hsLPatType (L _ p) = hsPatType p
 
 hsPatType :: Pat GhcTc -> Type
-hsPatType (ParPat _ _ pat _)            = hsLPatType pat
+hsPatType (ParPat _ pat)                = hsLPatType pat
 hsPatType (WildPat ty)                  = ty
 hsPatType (VarPat _ lvar)               = idType (unLoc lvar)
 hsPatType (BangPat _ pat)               = hsLPatType pat
 hsPatType (LazyPat _ pat)               = hsLPatType pat
 hsPatType (LitPat _ lit)                = hsLitType lit
-hsPatType (AsPat _ var _ _)             = idType (unLoc var)
+hsPatType (AsPat _ var _)               = idType (unLoc var)
 hsPatType (ViewPat ty _ _)              = ty
 hsPatType (ListPat ty _)                = mkListTy ty
 hsPatType (TuplePat tys _ bx)           = mkTupleTy1 bx tys
@@ -63,6 +63,8 @@ hsPatType (ConPat { pat_con = lcon
 hsPatType (SigPat ty _ _)               = ty
 hsPatType (NPat ty _ _ _)               = ty
 hsPatType (NPlusKPat ty _ _ _ _ _)      = ty
+hsPatType (EmbTyPat ty _)               = typeKind ty
+hsPatType (InvisPat ty _)               = typeKind ty
 hsPatType (XPat ext) =
   case ext of
     CoPat _ _ ty       -> ty
@@ -77,7 +79,13 @@ hsLitType (HsStringPrim _ _) = addrPrimTy
 hsLitType (HsInt _ _)        = intTy
 hsLitType (HsIntPrim _ _)    = intPrimTy
 hsLitType (HsWordPrim _ _)   = wordPrimTy
+hsLitType (HsInt8Prim _ _)   = int8PrimTy
+hsLitType (HsInt16Prim _ _)  = int16PrimTy
+hsLitType (HsInt32Prim _ _)  = int32PrimTy
 hsLitType (HsInt64Prim _ _)  = int64PrimTy
+hsLitType (HsWord8Prim _ _)  = word8PrimTy
+hsLitType (HsWord16Prim _ _) = word16PrimTy
+hsLitType (HsWord32Prim _ _) = word32PrimTy
 hsLitType (HsWord64Prim _ _) = word64PrimTy
 hsLitType (HsInteger _ _ ty) = ty
 hsLitType (HsRat _ _ ty)     = ty
@@ -98,13 +106,12 @@ hsExprType (HsOverLabel v _ _) = dataConCantHappen v
 hsExprType (HsIPVar v _) = dataConCantHappen v
 hsExprType (HsOverLit _ lit) = overLitType lit
 hsExprType (HsLit _ lit) = hsLitType lit
-hsExprType (HsLam     _ (MG { mg_ext = match_group })) = matchGroupTcType match_group
-hsExprType (HsLamCase _ _ (MG { mg_ext = match_group })) = matchGroupTcType match_group
+hsExprType (HsLam _ _ (MG { mg_ext = match_group })) = matchGroupTcType match_group
 hsExprType (HsApp _ f _) = funResultTy $ lhsExprType f
-hsExprType (HsAppType x f _ _) = piResultTy (lhsExprType f) x
+hsExprType (HsAppType x f _) = piResultTy (lhsExprType f) x
 hsExprType (OpApp v _ _ _) = dataConCantHappen v
 hsExprType (NegApp _ _ se) = syntaxExprType se
-hsExprType (HsPar _ _ e _) = lhsExprType e
+hsExprType (HsPar _ e) = lhsExprType e
 hsExprType (SectionL v _ _) = dataConCantHappen v
 hsExprType (SectionR v _ _) = dataConCantHappen v
 hsExprType (ExplicitTuple _ args box) = mkTupleTy box $ map hsTupArgType args
@@ -112,7 +119,7 @@ hsExprType (ExplicitSum alt_tys _ _ _) = mkSumTy alt_tys
 hsExprType (HsCase _ _ (MG { mg_ext = match_group })) = mg_res_ty match_group
 hsExprType (HsIf _ _ t _) = lhsExprType t
 hsExprType (HsMultiIf ty _) = ty
-hsExprType (HsLet _ _ _ _ body) = lhsExprType body
+hsExprType (HsLet _ _ body) = lhsExprType body
 hsExprType (HsDo ty _ _) = ty
 hsExprType (ExplicitList ty _) = mkListTy ty
 hsExprType (RecordCon con_expr _ _) = hsExprType con_expr
@@ -136,8 +143,9 @@ hsExprType (HsUntypedSplice ext _) = dataConCantHappen ext
 hsExprType (HsProc _ _ lcmd_top) = lhsCmdTopType lcmd_top
 hsExprType (HsStatic (_, ty) _s) = ty
 hsExprType (HsPragE _ _ e) = lhsExprType e
+hsExprType (HsEmbTy x _) = dataConCantHappen x
 hsExprType (XExpr (WrapExpr (HsWrap wrap e))) = hsWrapperType wrap $ hsExprType e
-hsExprType (XExpr (ExpansionExpr (HsExpanded _ tc_e))) = hsExprType tc_e
+hsExprType (XExpr (ExpandedThingTc _ e))  = hsExprType e
 hsExprType (XExpr (ConLikeTc con _ _)) = conLikeType con
 hsExprType (XExpr (HsTick _ e)) = lhsExprType e
 hsExprType (XExpr (HsBinTick _ _ e)) = lhsExprType e

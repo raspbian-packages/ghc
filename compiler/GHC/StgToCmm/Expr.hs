@@ -1,5 +1,4 @@
 {-# OPTIONS_GHC -Wno-incomplete-uni-patterns #-}
-{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE TypeFamilies #-}
 
@@ -37,7 +36,7 @@ import GHC.Cmm.Graph
 import GHC.Cmm.BlockId
 import GHC.Cmm hiding ( succ )
 import GHC.Cmm.Info
-import GHC.Cmm.Utils ( zeroExpr, cmmTagMask, mkWordCLit, mAX_PTR_TAG )
+import GHC.Cmm.Utils ( cmmTagMask, mkWordCLit, mAX_PTR_TAG )
 import GHC.Core
 import GHC.Core.DataCon
 import GHC.Types.ForeignCall
@@ -53,7 +52,6 @@ import GHC.Utils.Misc
 import GHC.Data.FastString
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
-import GHC.Utils.Panic.Plain
 
 import Control.Monad ( unless, void )
 import Control.Arrow ( first )
@@ -74,55 +72,51 @@ cgExpr (StgApp fun args)     = cgIdApp fun args
 cgExpr (StgOpApp (StgPrimOp SeqOp) [StgVarArg a, _] _res_ty) =
   cgIdApp a []
 
--- dataToTag# :: a -> Int#
--- See Note [dataToTag# magic] in GHC.Core.Opt.ConstantFold
--- TODO: There are some more optimization ideas for this code path
--- in #21710
-cgExpr (StgOpApp (StgPrimOp DataToTagOp) [StgVarArg a] _res_ty) = do
+-- dataToTagSmall# :: a_levpoly -> Int#
+-- See Note [DataToTag overview] in GHC.Tc.Instance.Class,
+-- particularly wrinkles H3 and DTW4
+cgExpr (StgOpApp (StgPrimOp DataToTagSmallOp) [StgVarArg a] _res_ty) = do
   platform <- getPlatform
-  emitComment (mkFastString "dataToTag#")
-  info <- getCgIdInfo a
-  let amode = idInfoToAmode info
-  tag_reg <- assignTemp $ cmmConstrTag1 platform amode
+  emitComment (mkFastString "dataToTagSmall#")
+
+  a_eval_reg <- newTemp (bWord platform)
+  _ <- withSequel (AssignTo [a_eval_reg] False) (cgIdApp a [])
+  let a_eval_expr = CmmReg (CmmLocal a_eval_reg)
+      tag1 = cmmConstrTag1 platform a_eval_expr
+
+  -- subtract 1 because we need to return a zero-indexed tag
+  emitReturn [cmmSubWord platform tag1 (CmmLit $ mkWordCLit platform 1)]
+
+-- dataToTagLarge# :: a_levpoly -> Int#
+-- See Note [DataToTag overview] in GHC.Tc.Instance.Class,
+-- particularly wrinkles H3 and DTW4
+cgExpr (StgOpApp (StgPrimOp DataToTagLargeOp) [StgVarArg a] _res_ty) = do
+  platform <- getPlatform
+  emitComment (mkFastString "dataToTagLarge#")
+
+  a_eval_reg <- newTemp (bWord platform)
+  _ <- withSequel (AssignTo [a_eval_reg] False) (cgIdApp a [])
+  let a_eval_expr = CmmReg (CmmLocal a_eval_reg)
+
+  tag1_reg <- assignTemp $ cmmConstrTag1 platform a_eval_expr
   result_reg <- newTemp (bWord platform)
-  let tag = CmmReg $ CmmLocal tag_reg
-      is_tagged = cmmNeWord platform tag (zeroExpr platform)
-      is_too_big_tag = cmmEqWord platform tag (cmmTagMask platform)
-  -- Here we will first check the tag bits of the pointer we were given;
-  -- if this doesn't work then enter the closure and use the info table
-  -- to determine the constructor. Note that all tag bits set means that
-  -- the constructor index is too large to fit in the pointer and therefore
-  -- we must look in the info table. See Note [Tagging big families].
+  let tag1_expr = CmmReg $ CmmLocal tag1_reg
+      is_too_big_tag = cmmEqWord platform tag1_expr (cmmTagMask platform)
 
-  (fast_path :: CmmAGraph) <- getCode $ do
-      -- Return the constructor index from the pointer tag
-      return_ptr_tag <- getCode $ do
-          emitAssign (CmmLocal result_reg)
-            $ cmmSubWord platform tag (CmmLit $ mkWordCLit platform 1)
-      -- Return the constructor index recorded in the info table
-      return_info_tag <- getCode $ do
-          profile     <- getProfile
-          align_check <- stgToCmmAlignCheck <$> getStgToCmmConfig
-          emitAssign (CmmLocal result_reg)
-            $ getConstrTag profile align_check (cmmUntag platform amode)
+  -- Return the constructor index from the pointer tag
+  -- (Used if pointer tag is small enough to be unambiguous)
+  return_ptr_tag <- getCode $ do
+    emitAssign (CmmLocal result_reg)
+      $ cmmSubWord platform tag1_expr (CmmLit $ mkWordCLit platform 1)
 
-      emit =<< mkCmmIfThenElse' is_too_big_tag return_info_tag return_ptr_tag (Just False)
-  -- If we know the argument is already tagged there is no need to generate code to evaluate it
-  -- so we skip straight to the fast path. If we don't know if there is a tag we take the slow
-  -- path which evaluates the argument before fetching the tag.
-  case (idTagSig_maybe a) of
-    Just sig
-      | isTaggedSig sig
-      -> emit fast_path
-    _ -> do
-          slow_path <- getCode $ do
-              tmp <- newTemp (bWord platform)
-              _ <- withSequel (AssignTo [tmp] False) (cgIdApp a [])
-              profile     <- getProfile
-              align_check <- stgToCmmAlignCheck <$> getStgToCmmConfig
-              emitAssign (CmmLocal result_reg)
-                $ getConstrTag profile align_check (cmmUntag platform (CmmReg (CmmLocal tmp)))
-          emit =<< mkCmmIfThenElse' is_tagged fast_path slow_path (Just True)
+  -- Return the constructor index recorded in the info table
+  return_info_tag <- getCode $ do
+    profile     <- getProfile
+    align_check <- stgToCmmAlignCheck <$> getStgToCmmConfig
+    emitAssign (CmmLocal result_reg)
+      $ getConstrTag profile align_check (cmmUntag platform a_eval_expr)
+
+  emit =<< mkCmmIfThenElse' is_too_big_tag return_info_tag return_ptr_tag (Just False)
   emitReturn [CmmReg $ CmmLocal result_reg]
 
 
@@ -200,9 +194,9 @@ cgLetNoEscapeRhsBody
     -> Id
     -> CgStgRhs
     -> FCode (CgIdInfo, FCode ())
-cgLetNoEscapeRhsBody local_cc bndr (StgRhsClosure _ cc _upd args body)
+cgLetNoEscapeRhsBody local_cc bndr (StgRhsClosure _ cc _upd args body _typ)
   = cgLetNoEscapeClosure bndr local_cc cc (nonVoidIds args) body
-cgLetNoEscapeRhsBody local_cc bndr (StgRhsCon cc con mn _ts args)
+cgLetNoEscapeRhsBody local_cc bndr (StgRhsCon cc con mn _ts args _typ)
   = cgLetNoEscapeClosure bndr local_cc cc []
       (StgConApp con mn args (pprPanic "cgLetNoEscapeRhsBody" $
                            text "StgRhsCon doesn't have type args"))
@@ -222,12 +216,11 @@ cgLetNoEscapeClosure
 
 cgLetNoEscapeClosure bndr cc_slot _unused_cc args body
   = do platform <- getPlatform
+       let code = forkLneBody $ withNewTickyCounterLNE bndr args $ do
+                { restoreCurrentCostCentre platform cc_slot
+                ; arg_regs <- bindArgsToRegs args
+                ; void $ noEscapeHeapCheck arg_regs (tickyEnterLNE >> cgExpr body) }
        return ( lneIdInfo platform bndr args, code )
-  where
-   code = forkLneBody $ withNewTickyCounterLNE bndr args $ do
-            { restoreCurrentCostCentre cc_slot
-            ; arg_regs <- bindArgsToRegs args
-            ; void $ noEscapeHeapCheck arg_regs (tickyEnterLNE >> cgExpr body) }
 
 
 ------------------------------------------------------------------------
@@ -240,6 +233,8 @@ It is quite interesting to decide whether to put a heap-check at the
 start of each alternative.  Of course we certainly have to do so if
 the case forces an evaluation, or if there is a primitive op which can
 trigger GC.
+
+NB: things are not settled here: see #8326.
 
 A more interesting situation is this (a Plan-B situation)
 
@@ -448,25 +443,53 @@ calls to nonVoidIds in various places.  So we must not look up
 
 Note [Dead-binder optimisation]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-A case-binder, or data-constructor argument, may be marked as dead,
-because we preserve occurrence-info on binders in GHC.Core.Tidy (see
+Consider:
+
+   case x of (y, z<dead>) -> rhs
+
+where `z` is unused in `rhs`.  When we return form the eval of `x`,
+GHC.StgToCmm.DataCon.bindConArgs will generate some loads, assuming the the
+value of `x` is returned in R1:
+   y := R1[1]
+   z := R1[2]
+
+If `z` is never used, the load `z := R1[2]` is a waste of a memory operation.
+CmmSink (which sinks loads to their usage sites, if any) will eliminate the dead
+load; but
+  1. CmmSink only runs with -O
+  2. It would save CmmSink work if we simply did not generate the load in the
+  first place.
+
+Hence STG uses dead-binder information, in `bindConArgs` to drop dead loads.
+That's why we preserve occurrence-info on binders in GHC.Core.Tidy (see
 GHC.Core.Tidy.tidyIdBndr).
 
-If the binder is dead, we can sometimes eliminate a load.  While
-CmmSink will eliminate that load, it's very easy to kill it at source
-(giving CmmSink less work to do), and in any case CmmSink only runs
-with -O. Since the majority of case binders are dead, this
-optimisation probably still has a great benefit-cost ratio and we want
-to keep it for -O0. See also Phab:D5358.
+So it's important that deadness is accurate.  But StgCse can invalidate it
+(#14895 #24233).  Here is an example:
 
-This probably also was the reason for occurrence hack in Phab:D5339 to
-exist, perhaps because the occurrence information preserved by
-'GHC.Core.Tidy.tidyIdBndr' was insufficient.  But now that CmmSink does the
-job we deleted the hacks.
+  map_either :: (a -> b) -> Either String a -> Either String b
+  map_either = \f e -> case e of b<dead> {
+    Right x -> Right (f x)
+    Left  x -> Left x
+  }
+
+  The case-binder "b" is dead (not used in the rhss of the alternatives).
+  StgCse notices that `Left x` doesn't need to be allocated as we can reuse `b`,
+  and we get:
+
+  map_either :: (a -> b) -> Either String a -> Either String b
+  map_either = \f e -> case e of b { -- b no longer dead!
+    Right x -> Right (f x)
+    Left  x -> b
+  }
+
+For now StgCse simply zaps occurrence information on case binders. A more
+accurate update would complexify the implementation and doesn't seem worth it.
+
 -}
 
 cgCase (StgApp v []) _ (PrimAlt _) alts
-  | isVoidRep (idPrimRep v)  -- See Note [Scrutinising VoidRep]
+  | isZeroBitTy (idType v)  -- See Note [Scrutinising VoidRep]
   , [GenStgAlt{alt_con=DEFAULT, alt_bndrs=_, alt_rhs=rhs}] <- alts
   = cgExpr rhs
 
@@ -500,9 +523,9 @@ cgCase (StgApp v []) bndr alt_type@(PrimAlt _) alts
        ; _ <- bindArgToReg (NonVoid bndr)
        ; cgAlts (NoGcInAlts,AssignedDirectly) (NonVoid bndr) alt_type alts }
   where
-    reps_compatible platform = primRepCompatible platform (idPrimRep v) (idPrimRep bndr)
+    reps_compatible platform = primRepCompatible platform (idPrimRepU v) (idPrimRepU bndr)
 
-    pp_bndr id = ppr id <+> dcolon <+> ppr (idType id) <+> parens (ppr (idPrimRep id))
+    pp_bndr id = ppr id <+> dcolon <+> ppr (idType id) <+> parens (ppr (idPrimRepU id))
 
 {- Note [Dodgy unsafeCoerce 2, #3132]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -519,7 +542,7 @@ cgCase scrut@(StgApp v []) _ (PrimAlt _) _
        ; mb_cc <- maybeSaveCostCentre True
        ; _ <- withSequel
                   (AssignTo [idToReg platform (NonVoid v)] False) (cgExpr scrut)
-       ; restoreCurrentCostCentre mb_cc
+       ; restoreCurrentCostCentre platform mb_cc
        ; emitComment $ mkFastString "should be unreachable code"
        ; l <- newBlockId
        ; emitLabel l
@@ -548,6 +571,58 @@ cgCase (StgOpApp (StgPrimOp SeqOp) [StgVarArg a, _] _) bndr alt_type alts
     -- Use the same return convention as vanilla 'a'.
     cgCase (StgApp a []) bndr alt_type alts
 
+{-
+Note [Eliminate trivial Solo# continuations]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+If we have code like this:
+
+    case scrut of bndr {
+      alt -> Solo# bndr
+    }
+
+The RHS of the only branch does nothing except wrap the case-binder
+returned by 'scrut' in a unary unboxed tuple.  But unboxed tuples
+don't exist at run-time, i.e. the branch is a no-op!  So we can
+generate code as if we just had 'scrut' instead of a case-expression.
+
+This situation can easily arise for IO or ST code, where the last
+operation a function performs is commonly 'pure $! someExpr'.
+See also #24264 and !11778.  More concretely, as of December 2023,
+when building a stage2 "perf+no_profiled_libs" ghc:
+
+ * The special case is reached 398 times.
+ * Of these, 158 have scrutinees that call a function or enter a
+   potential thunk, and would need to push a useless stack frame if
+   not for this optimisation.
+
+We might consider rewriting such case expressions in GHC.Stg.CSE as a
+slight extension of Note [All alternatives are the binder].  But the
+RuntimeReps of 'bndr' and 'Solo# bndr' are not exactly the same, and
+per Note [Typing the STG language] in GHC.Stg.Lint, we do expect Stg
+code to remain RuntimeRep-correct.  So we just detect the situation in
+StgToCmm instead.
+
+Crucially, the return conventions for 'ty' and '(# ty #)' are compatible:
+The returned value is passed in the same register(s) or stack slot in
+both conventions, and the set of allowed return values for 'ty'
+is a subset of the allowed return values for '(# ty #)':
+
+ * For a lifted type 'ty', the return convention for 'ty' promises to
+   return an evaluated-properly-tagged heap pointer, while a return
+   type '(# ty #)' only promises to return a heap pointer to an object
+   that can be evaluated later if need be.
+
+ * If 'ty' is unlifted, the allowed return
+   values for 'ty' and '(# ty #)' are identical.
+-}
+
+cgCase scrut bndr _alt_type [GenStgAlt { alt_rhs = rhs}]
+  -- see Note [Eliminate trivial Solo# continuations]
+  | StgConApp dc _ [StgVarArg v] _ <- rhs
+  , isUnboxedTupleDataCon dc
+  , v == bndr
+  = cgExpr scrut
+
 cgCase scrut bndr alt_type alts
   = -- the general case
     do { platform <- getPlatform
@@ -568,7 +643,7 @@ cgCase scrut bndr alt_type alts
 
        ; let sequel = AssignTo alt_regs do_gc{- Note [scrut sequel] -}
        ; ret_kind <- withSequel sequel (cgExpr scrut)
-       ; restoreCurrentCostCentre mb_cc
+       ; restoreCurrentCostCentre platform mb_cc
        ; _ <- bindArgsToRegs ret_bndrs
        ; cgAlts (gc_plan,ret_kind) (NonVoid bndr) alt_type alts
        }
@@ -579,20 +654,10 @@ cgCase scrut bndr alt_type alts
 
 {- Note [GC for conditionals]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-For boolean conditionals it seems that we have always done NoGcInAlts.
-That is, we have always done the GC check before the conditional.
-This is enshrined in the special case for
-   case tagToEnum# (a>b) of ...
-See Note [case on bool]
-
-It's odd, and it's flagrantly inconsistent with the rules described
-Note [Compiling case expressions].  However, after eliminating the
-tagToEnum# (#13397) we will have:
-   case (a>b) of ...
-Rather than make it behave quite differently, I am testing for a
-comparison operator here in the general case as well.
-
-ToDo: figure out what the Right Rule should be.
+For comparison operators (`is_cmp_op`) it seems that we have always done
+NoGcInAlts.  It's odd, and it's flagrantly inconsistent with the rules described
+Note [Compiling case expressions].  However, that's the way it has been for ages
+(there was some long-gone history involving tagToEnum#; see #13397, #8317, #8326).
 
 Note [scrut sequel]
 ~~~~~~~~~~~~~~~~~~~
@@ -640,8 +705,10 @@ isSimpleScrut _                    _         = return False
 isSimpleOp :: StgOp -> [StgArg] -> FCode Bool
 -- True iff the op cannot block or allocate
 isSimpleOp (StgFCallOp (CCall (CCallSpec _ _ safe)) _) _ = return $! not (playSafe safe)
--- dataToTag# evaluates its argument, see Note [dataToTag# magic] in GHC.Core.Opt.ConstantFold
-isSimpleOp (StgPrimOp DataToTagOp) _ = return False
+-- dataToTagSmall#/dataToTagLarge# evaluate an argument;
+-- see Note [DataToTag overview] in GHC.Tc.Instance.Class
+isSimpleOp (StgPrimOp DataToTagSmallOp) _ = return False
+isSimpleOp (StgPrimOp DataToTagLargeOp) _ = return False
 isSimpleOp (StgPrimOp op) stg_args                  = do
     arg_exprs <- getNonVoidArgAmodes stg_args
     cfg       <- getStgToCmmConfig
@@ -852,6 +919,7 @@ cgAlts _ _ _ _ = panic "cgAlts"
 
 
 -- Note [alg-alt heap check]
+-- ~~~~~~~~~~~~~~~~~~~~~~~~~
 --
 -- In an algebraic case with more than one alternative, we will have
 -- code like
@@ -1028,7 +1096,7 @@ cgIdApp fun_id args = do
                       (text "TagCheck failed on entry in" <+> ppr mod <+> text "- value:" <> ppr fun_id <+> pdoc platform fun))
                       fun
 
-        EnterIt -> assert (null args) $  -- Discarding arguments
+        EnterIt -> assertPpr (null args) (ppr fun_id $$ ppr args) $  -- Discarding arguments
                    emitEnter fun
 
         SlowCall -> do      -- A slow function call via the RTS apply routines
@@ -1157,7 +1225,7 @@ emitEnter fun = do
       Return -> do
         { let entry = entryCode platform
                 $ closureInfoPtr platform align_check
-                $ CmmReg nodeReg
+                $ CmmReg (nodeReg platform)
         ; emit $ mkJump profile NativeNodeCall entry
                         [cmmUntag platform fun] updfr_off
         ; return AssignedDirectly
@@ -1200,12 +1268,13 @@ emitEnter fun = do
          -- refer to fun via nodeReg after the copyout, to avoid having
          -- both live simultaneously; this sometimes enables fun to be
          -- inlined in the RHS of the R1 assignment.
-       ; let entry = entryCode platform (closureInfoPtr platform align_check (CmmReg nodeReg))
+       ; let node = CmmReg $ nodeReg platform
+             entry = entryCode platform (closureInfoPtr platform align_check node)
              the_call = toCall entry (Just lret) updfr_off off outArgs regs
        ; tscope <- getTickScope
        ; emit $
            copyout <*>
-           mkCbranch (cmmIsTagged platform (CmmReg nodeReg))
+           mkCbranch (cmmIsTagged platform node)
                      lret lcall Nothing <*>
            outOfLine lcall (the_call,tscope) <*>
            mkLabel lret tscope <*>

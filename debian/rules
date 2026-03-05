@@ -70,18 +70,14 @@ ifneq (,$(filter armel armhf, $(DEB_HOST_ARCH)))
   EXTRA_INSTALL_CONFIGURE_FLAGS += --enable-ld-override
 endif
 
-# From GHC 8.10 and later, native code generator support for legacy x87
-# floating point coprocessor has been removed. GHC now only support floating
-# point via SSE2. This causes a baseline violation on Debian for i386 where
-# there is no SSE support. Fallback to unregisterised builds on i386.
-ifneq (,$(filter i386 powerpcspe x32, $(DEB_HOST_ARCH)))
+ifneq (,$(filter loong64 powerpcspe x32, $(DEB_HOST_ARCH)))
   EXTRA_CONFIGURE_FLAGS += --enable-unregisterised
 endif
 
 # See https://bugs.debian.org/1060196
 ifneq (,$(filter powerpc, $(DEB_HOST_ARCH)))
   EXTRA_CONFIGURE_FLAGS += --enable-unregisterised
-  EXTRA_HADRIAN_FLAGS += "*.*.ghc.hs.opts += -optc--param -optcggc-min-expand=10 -optc-O3"
+  EXTRA_HADRIAN_FLAGS += "*.*.ghc.hs.opts += -optc--param -optcggc-min-expand=10 -optc-O3 -optc-no-integrated-cpp"
 endif
 
 
@@ -119,6 +115,13 @@ ifneq (,$(filter parallel=%,$(DEB_BUILD_OPTIONS)))
   NUMJOBS = $(patsubst parallel=%,%,$(filter parallel=%,$(DEB_BUILD_OPTIONS)))
 endif
 
+# The rts module fails to compile with GCC15 (unregisterised builds)
+# because GCC15 defaults to gnu23 standard, which doesn't support
+# function declaration without a prototype.
+# Use gnu17 standard instead.
+# See https://gitlab.haskell.org/ghc/ghc/-/issues/24897
+EXTRA_HADRIAN_FLAGS += "*.rts.ghc.hs.opts += -optc-std=gnu17"
+
 # Use system libffi
 EXTRA_CONFIGURE_FLAGS += --with-system-libffi
 
@@ -126,8 +129,8 @@ EXTRA_CONFIGURE_FLAGS += --with-system-libffi
 # If we don't set these, then the default value (llc / opt) will not work
 # on architectures where the default llc/opt version is different than
 # one of the supported versions.
-EXTRA_CONFIGURE_FLAGS += LLC=llc-18 OPT=opt-18
-EXTRA_INSTALL_CONFIGURE_FLAGS += LLC=llc-18 OPT=opt-18
+EXTRA_CONFIGURE_FLAGS += LLC=llc-21 OPT=opt-21 LLVMAS=clang-21
+EXTRA_INSTALL_CONFIGURE_FLAGS += LLC=llc-21 OPT=opt-21 LLVMAS=clang-21
 
 
 %:
@@ -177,6 +180,7 @@ ifeq (YES,$(BUILD_CROSS))
 endif
 	hadrian/hadrian \
 		-V -j$(NUMJOBS) \
+		--flavour=release \
 		--docs=no-haddocks --docs=no-sphinx-html --docs=no-sphinx-pdfs \
 		binary-dist-dir \
 		$(EXTRA_HADRIAN_FLAGS)
@@ -202,6 +206,7 @@ ifeq (YES,$(BUILD_CROSS))
 endif
 	hadrian/hadrian \
 		-V -j$(NUMJOBS) \
+		--flavour=release \
 		--docs=no-sphinx-pdfs \
 		binary-dist-dir \
 		$(EXTRA_HADRIAN_FLAGS)

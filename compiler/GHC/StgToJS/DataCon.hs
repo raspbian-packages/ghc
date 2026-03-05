@@ -27,14 +27,15 @@ where
 
 import GHC.Prelude
 
-import GHC.JS.Syntax
+import GHC.JS.JStg.Syntax
+import GHC.JS.Ident
 import GHC.JS.Make
+import GHC.JS.Transform
 
 import GHC.StgToJS.Closure
 import GHC.StgToJS.ExprCtx
 import GHC.StgToJS.Types
 import GHC.StgToJS.Monad
-import GHC.StgToJS.CoreUtils
 import GHC.StgToJS.Profiling
 import GHC.StgToJS.Utils
 import GHC.StgToJS.Ids
@@ -42,32 +43,33 @@ import GHC.StgToJS.Ids
 import GHC.Core.DataCon
 
 import GHC.Types.CostCentre
-import GHC.Types.Unique.Map
 
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
-import GHC.Data.FastString
 
 import Data.Maybe
 
 -- | Generate a data constructor. Special handling for unboxed tuples
-genCon :: ExprCtx -> DataCon -> [JExpr] -> G JStat
+genCon :: ExprCtx -> DataCon -> [JStgExpr] -> G JStgStat
 genCon ctx con args
   | isUnboxedTupleDataCon con
   = return $ assignToExprCtx ctx args
 
-  | [ValExpr (JVar ctxi)] <- concatMap typex_expr (ctxTarget ctx)
+  | [Var ctxi] <- concatMap (typex_expr) (ctxTarget ctx)
   = allocCon ctxi con currentCCS args
 
   | xs <- concatMap typex_expr (ctxTarget ctx)
-  = pprPanic "genCon: unhandled DataCon" (ppr (con, args, xs))
+  = pprPanic "genCon: unhandled DataCon" (ppr (con
+                                              , map jStgExprToJS args
+                                              , map jStgExprToJS xs
+                                              ))
 
 -- | Allocate a data constructor. Allocate in this context means bind the data
 -- constructor to 'to'
-allocCon :: Ident -> DataCon -> CostCentreStack -> [JExpr] -> G JStat
+allocCon :: Ident -> DataCon -> CostCentreStack -> [JStgExpr] -> G JStgStat
 allocCon to con cc xs
   | isBoolDataCon con || isUnboxableCon con =
-      return (toJExpr to |= allocUnboxedCon con xs)
+      return $ AssignStat (Var to) AssignOp (allocUnboxedCon con xs)
 {-  | null xs = do
       i <- varForId (dataConWorkId con)
       return (assignj to i) -}
@@ -81,44 +83,32 @@ allocCon to con cc xs
 -- | Allocate an unboxed data constructor. If we have a bool we calculate the
 -- right value. If not then we expect a singleton list and unbox by converting
 -- ''C x' to 'x'. NB. This function may panic.
-allocUnboxedCon :: DataCon -> [JExpr] -> JExpr
+allocUnboxedCon :: DataCon -> [JStgExpr] -> JStgExpr
 allocUnboxedCon con = \case
   []
     | isBoolDataCon con && dataConTag con == 1 -> false_
     | isBoolDataCon con && dataConTag con == 2 -> true_
   [x]
     | isUnboxableCon con -> x
-  xs -> pprPanic "allocUnboxedCon: not an unboxed constructor" (ppr (con,xs))
+  xs -> pprPanic "allocUnboxedCon: not an unboxed constructor" (ppr (con, map jStgExprToJS xs))
 
 -- | Allocate an entry function. See 'GHC.StgToJS.hs' for the object layout.
 allocDynamicE :: Bool          -- ^ csInlineAlloc from StgToJSConfig
-              -> JExpr
-              -> [JExpr]
-              -> Maybe JExpr
-              -> JExpr
+              -> JStgExpr
+              -> [JStgExpr]
+              -> Maybe JStgExpr
+              -> JStgExpr
 allocDynamicE  inline_alloc entry free cc
-  | inline_alloc || length free > 24 = newClosure $ Closure
-      { clEntry  = entry
-      , clField1 = fillObj1
-      , clField2 = fillObj2
-      , clMeta   = ValExpr (JInt 0)
-      , clCC     = cc
-      }
-  | otherwise = ApplExpr allocFun (toJExpr entry : free ++ maybeToList cc)
+  | inline_alloc || length free > jsClosureCount
+    = newClosure $ mkClosure entry free zero_ cc
+  | otherwise = ApplExpr allocFun (entry : free ++ maybeToList cc)
   where
     allocFun = allocClsA (length free)
-    (fillObj1,fillObj2)
-       = case free of
-                []  -> (null_, null_)
-                [x] -> (x,null_)
-                [x,y] -> (x,y)
-                (x:xs) -> (x,toJExpr (JHash $ listToUniqMap (zip dataFields xs)))
-    dataFields = map (mkFastString . ('d':) . show) [(1::Int)..]
 
 -- | Allocate a dynamic object
-allocDynamic :: StgToJSConfig -> Bool -> Ident -> JExpr -> [JExpr] -> Maybe JExpr -> JStat
+allocDynamic :: StgToJSConfig -> Bool -> Ident -> JStgExpr -> [JStgExpr] -> Maybe JStgExpr -> JStgStat
 allocDynamic s need_decl to entry free cc
   | need_decl = DeclStat to (Just value)
-  | otherwise = toJExpr to |= value
+  | otherwise = AssignStat (Var to) AssignOp value
     where
       value = allocDynamicE (csInlineAlloc s) entry free cc

@@ -33,6 +33,9 @@ AC_DEFUN([FPTOOLS_SET_HASKELL_PLATFORM_VARS_SHELL_FUNCTIONS],
         alpha)
             test -z "[$]2" || eval "[$]2=ArchAlpha"
             ;;
+        hppa|hppa1_1)
+            test -z "[$]2" || eval "[$]2=ArchHPPA"
+            ;;
         mips|mipseb)
             test -z "[$]2" || eval "[$]2=ArchMipseb"
             ;;
@@ -48,7 +51,10 @@ AC_DEFUN([FPTOOLS_SET_HASKELL_PLATFORM_VARS_SHELL_FUNCTIONS],
         loongarch64)
             test -z "[$]2" || eval "[$]2=ArchLoongArch64"
             ;;
-        hppa|hppa1_1|ia64|m68k|nios2|riscv32|loongarch32|rs6000|s390|sh4|sparc|sparc64|vax)
+        sparc64)
+            test -z "[$]2" || eval "[$]2=ArchSPARC64"
+            ;;
+        ia64|m68k|nios2|riscv32|loongarch32|rs6000|s390|sh4|sparc|vax)
             test -z "[$]2" || eval "[$]2=ArchUnknown"
             ;;
         javascript)
@@ -82,7 +88,7 @@ AC_DEFUN([FPTOOLS_SET_HASKELL_PLATFORM_VARS_SHELL_FUNCTIONS],
         solaris2)
             test -z "[$]2" || eval "[$]2=OSSolaris2"
             ;;
-        mingw32|windows)
+        mingw32|mingw64|windows)
             test -z "[$]2" || eval "[$]2=OSMinGW32"
             ;;
         freebsd)
@@ -162,8 +168,6 @@ AC_DEFUN([GHC_SUBSECTIONS_VIA_SYMBOLS],
             TargetHasSubsectionsViaSymbols=NO
          else
             TargetHasSubsectionsViaSymbols=YES
-            AC_DEFINE([HAVE_SUBSECTIONS_VIA_SYMBOLS],[1],
-                   [Define to 1 if Apple-style dead-stripping is supported.])
          fi
         ],
         [TargetHasSubsectionsViaSymbols=NO

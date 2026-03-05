@@ -1,7 +1,3 @@
-{-# LANGUAGE BangPatterns  #-}
-
-{-# LANGUAGE DeriveFunctor #-}
-
 module GHC.Tc.Solver.Rewrite(
    rewrite, rewriteForErrors, rewriteArgsNom,
    rewriteType
@@ -27,10 +23,9 @@ import GHC.Types.Unique.FM
 import GHC.Types.Var
 import GHC.Types.Var.Set
 import GHC.Types.Var.Env
-import GHC.Driver.Session
+import GHC.Driver.DynFlags
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
-import GHC.Utils.Panic.Plain
 import GHC.Tc.Solver.Monad as TcS
 
 import GHC.Utils.Misc
@@ -41,6 +36,7 @@ import Control.Applicative (liftA3)
 import GHC.Builtin.Types (tYPETyCon)
 import Data.List ( find )
 import GHC.Data.List.Infinite (Infinite)
+import GHC.Data.Bag( listToBag )
 import qualified GHC.Data.List.Infinite as Inf
 
 {-
@@ -55,7 +51,6 @@ import qualified GHC.Data.List.Infinite as Inf
 -- | The 'RewriteM' monad is a wrapper around 'TcS' with a 'RewriteEnv'
 newtype RewriteM a
   = RewriteM { runRewriteM :: RewriteEnv -> TcS a }
-  deriving (Functor)
 
 -- | Smart constructor for 'RewriteM', as describe in Note [The one-shot state
 -- monad trick] in "GHC.Utils.Monad".
@@ -71,6 +66,9 @@ instance Monad RewriteM where
 instance Applicative RewriteM where
   pure x = mkRewriteM $ \_ -> pure x
   (<*>) = ap
+
+instance Functor RewriteM where
+  fmap f (RewriteM x) = mkRewriteM $ \env -> fmap f (x env)
 
 instance HasDynFlags RewriteM where
   getDynFlags = liftTcS getDynFlags
@@ -91,9 +89,9 @@ runRewriteCtEv ev
 runRewrite :: CtLoc -> CtFlavour -> EqRel -> RewriteM a -> TcS (a, RewriterSet)
 runRewrite loc flav eq_rel thing_inside
   = do { rewriters_ref <- newTcRef emptyRewriterSet
-       ; let fmode = RE { re_loc  = loc
-                        , re_flavour = flav
-                        , re_eq_rel = eq_rel
+       ; let fmode = RE { re_loc       = loc
+                        , re_flavour   = flav
+                        , re_eq_rel    = eq_rel
                         , re_rewriters = rewriters_ref }
        ; res <- runRewriteM thing_inside fmode
        ; rewriters <- readTcRef rewriters_ref
@@ -155,7 +153,7 @@ bumpDepth (RewriteM thing_inside)
 -- Precondition: the CtEvidence is a CtWanted of an equality
 recordRewriter :: CtEvidence -> RewriteM ()
 recordRewriter (CtWanted { ctev_dest = HoleDest hole })
-  = RewriteM $ \env -> updTcRef (re_rewriters env) (`addRewriterSet` hole)
+  = RewriteM $ \env -> updTcRef (re_rewriters env) (`addRewriter` hole)
 recordRewriter other = pprPanic "recordRewriter" (ppr other)
 
 {-
@@ -315,7 +313,7 @@ For example, see the RTRNotFollowed case in rewriteTyVar.
 
 Why have these invariants on rewriting? Because we sometimes use typeKind
 during canonicalisation, and we want this kind to be zonked (e.g., see
-GHC.Tc.Solver.Canonical.canEqCanLHS).
+GHC.Tc.Solver.Equality.canEqCanLHS).
 
 Rewriting is always homogeneous. That is, the kind of the result of rewriting is
 always the same as the kind of the input, modulo zonking. More formally:
@@ -513,7 +511,7 @@ rewrite_one (FunTy { ft_af = vis, ft_mult = mult, ft_arg = ty1, ft_res = ty2 })
 
         -- Important: look at the *reduced* type, so that any unzonked variables
         -- in kinds are gone and the getRuntimeRep succeeds.
-        -- cf. Note [Decomposing FunTy] in GHC.Tc.Solver.Canonical.
+        -- cf. Note [Decomposing FunTy] in GHC.Tc.Solver.Equality.
        ; let arg_rep = getRuntimeRep (reductionReducedType arg_redn)
              res_rep = getRuntimeRep (reductionReducedType res_redn)
 
@@ -667,7 +665,7 @@ rewrite_vector ki roles tys
 
 {- Note [Do not rewrite newtypes]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-We flirted with unwrapping newtypes in the rewriter -- see GHC.Tc.Solver.Canonical
+We flirted with unwrapping newtypes in the rewriter -- see GHC.Tc.Solver.Equality
 Note [Unwrap newtypes first]. But that turned out to be a bad idea because
 of recursive newtypes, as that Note says.  So be careful if you re-add it!
 
@@ -945,7 +943,7 @@ runTcPluginRewriters rewriteEnv rewriterFunctions tys
            TcPluginRewriteTo
              { tcPluginReduction    = redn
              , tcRewriterNewWanteds = wanteds
-             } -> do { emitWork wanteds; return $ Just redn }
+             } -> do { emitWork (listToBag wanteds); return $ Just redn }
            TcPluginNoRewrite {} -> runRewriters givens rewriters
 
 {-
@@ -1012,9 +1010,9 @@ rewrite_tyvar2 tv fr@(_, eq_rel)
        ; case lookupDVarEnv ieqs tv of
            Just equal_ct_list
              | Just ct <- find can_rewrite equal_ct_list
-             , CEqCan { cc_ev = ctev, cc_lhs = TyVarLHS tv
-                      , cc_rhs = rhs_ty, cc_eq_rel = ct_eq_rel } <- ct
-             -> do { let wrw = isWantedCt ct
+             , EqCt { eq_ev = ctev, eq_lhs = TyVarLHS tv
+                    , eq_rhs = rhs_ty, eq_eq_rel = ct_eq_rel } <- ct
+             -> do { let wrw = isWanted ctev
                    ; traceRewriteM "Following inert tyvar" $
                         vcat [ ppr tv <+> equals <+> ppr rhs_ty
                              , ppr ctev
@@ -1035,8 +1033,8 @@ rewrite_tyvar2 tv fr@(_, eq_rel)
            _other -> return RTRNotFollowed }
 
   where
-    can_rewrite :: Ct -> Bool
-    can_rewrite ct = ctFlavourRole ct `eqCanRewriteFR` fr
+    can_rewrite :: EqCt -> Bool
+    can_rewrite ct = eqCtFlavourRole ct `eqCanRewriteFR` fr
       -- This is THE key call of eqCanRewriteFR
 
 {-
@@ -1056,8 +1054,9 @@ This means that rewriting must be recursive, but it does allow
   [G] b ~ Maybe c
 
 This avoids "saturating" the Givens, which can save a modest amount of work.
-It is easy to implement, in GHC.Tc.Solver.Interact.kick_out, by only kicking out an inert
-only if (a) the work item can rewrite the inert AND
+It is easy to implement, in GHC.Tc.Solver.InertSet.kickOutRewritableLHS, by
+only kicking out an inert only if
+        (a) the work item can rewrite the inert AND
         (b) the inert cannot rewrite the work item
 
 This is significantly harder to think about. It can save a LOT of work
@@ -1097,7 +1096,7 @@ ty_con_binders_ty_binders' = foldr go ([], False)
   where
     go (Bndr tv (NamedTCB vis)) (bndrs, _)
       = (Named (Bndr tv vis) : bndrs, True)
-    go (Bndr tv (AnonTCB af))   (bndrs, n)
-      = (Anon (tymult (tyVarKind tv)) af : bndrs, n)
+    go (Bndr tv AnonTCB)   (bndrs, n)
+      = (Anon (tymult (tyVarKind tv)) FTF_T_T : bndrs, n)
     {-# INLINE go #-}
 {-# INLINE ty_con_binders_ty_binders' #-}

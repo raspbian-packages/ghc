@@ -44,7 +44,9 @@ start with the event type id and a 64-bit timestamp:
 
     EventLog :
           EVENT_HEADER_BEGIN
+          EVENT_HET_BEGIN -- header event types begin
           EventType*
+          EVENT_HET_END -- header event types end
           EVENT_HEADER_END
           EVENT_DATA_BEGIN
           Event*
@@ -120,6 +122,18 @@ environment which the program is being run in.
 
    Describes the environment variables present in the program's environment.
 
+.. event-type:: WALL_CLOCK_TIME
+
+   :tag: 43
+   :length: fixed
+   :field CapSetId: Capability set
+   :field Word64: Unix epoch seconds
+   :field Word32: Nanoseconds
+
+   Records the wall clock time to make it possible to correlate events from
+   elsewhere with the eventlog.
+
+
 Thread and scheduling events
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -162,6 +176,7 @@ Thread and scheduling events
       * 12: BlockedOnSTM
       * 13: BlockedOnDoProc
       * 16: BlockedOnMsgThrowTo
+      * 20: BlockedOnMVarRead
 
    :field ThreadId: thread id of thread being blocked on (only for some status
                     values)
@@ -200,7 +215,7 @@ Thread and scheduling events
 .. event-type:: THREAD_LABEL
 
    :tag: 44
-   :length: fixed
+   :length: variable
    :field ThreadId: thread id
    :field String: label
 
@@ -332,9 +347,10 @@ in :ref:`nonmoving-gc-events`.
    :field Word64: bytes of fragmentation, the difference between total mblock size
                   and total block size. When all mblocks are full of full blocks,
                   this number is 0.
-   :field Word64: number of parallel garbage collection threads
+   :field Word32: number of parallel garbage collection threads
    :field Word64: maximum number of bytes copied by any single collector thread
    :field Word64: total bytes copied by all collector threads
+   :field Word64: the amount of balanced data copied by all threads
 
    Report various information about a major collection.
 
@@ -535,6 +551,15 @@ Task events
 
    Marks the migration of a task to a new capability.
 
+.. event-type:: TASK_DELETE
+
+   :tag: 57
+   :length: fixed
+   :field TaskId: task id
+
+   Marks the deletion of a task.
+
+
 Tracing events
 ~~~~~~~~~~~~~~
 
@@ -549,12 +574,13 @@ Tracing events
 .. event-type:: BLOCK_MARKER
 
    :tag: 18
-   :length: variable
-   :field Word32: size
+   :length: fixed
+   :field Word32: block size
    :field Word64: end time in nanoseconds
-   :field String: marker name
+   :field Word16: capability number, invalid if ``0xffff``.
 
-   TODO
+   Marks a chunk of events. The events that fit in the next ``block size``
+   bytes all belong to the block marker capability.
 
 .. event-type:: USER_MSG
 
@@ -829,6 +855,9 @@ A typical non-moving collection cycle will look something like the following:
 12. A :event-type:`NONMOVING_HEAP_CENSUS` event will be emitted describing the
     fragmentation state of the non-moving heap.
 
+13. A :event-type:`NONMOVING_PRUNED_SEGMENTS` event will be emitted showing
+    information about freeing of segments.
+
 
 .. event-type:: CONC_MARK_BEGIN
 
@@ -896,12 +925,23 @@ heap.
 
    :tag: 207
    :length: fixed
-   :field Word8: base-2 logarithm of *blk_sz*.
+   :field Word16: *blk_sz* in bytes.
    :field Word32: number of active segments.
    :field Word32: number of filled segments.
    :field Word32: number of live blocks.
 
    Describes the occupancy of the *blk_sz* sub-heap.
+
+.. event-type:: NONMOVING_PRUNED_SEGMENTS
+
+   :tag: 208
+   :length: fixed
+   :field Word32: number of pruned segments.
+   :field Word32: number of segments remaining on the free list.
+
+   Report the amount of segments pruned and those remaining on the nonmoving
+   heap's segment free list. Segments will be retained on the free list until
+   the entire megablock containing them can be freed.
 
 .. _ticky-event-format:
 

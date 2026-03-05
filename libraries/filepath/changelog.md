@@ -2,13 +2,23 @@
 
 _Note: below all `FilePath` values are unquoted, so `\\` really means two backslashes._
 
-## 1.4.300.1. *Jan 2024*
+## 1.5.4.0 *Nov 2024*
 
-* Backport bugfix for [`splitFileName`](https://github.com/haskell/filepath/issues/219) on windows
+* Don't catch async exceptions in internal functions wrt https://github.com/haskell/os-string/issues/22
 
-## 1.4.200.1. *Dec 2023*
+## 1.5.3.0 *Jun 2024*
 
-* Improve deprecation warnings wrt [#209](https://github.com/haskell/filepath/issues/209)
+* Adjust for `encodeFS`/`decodedFS` deprecation in os-string
+
+## 1.5.2.0 *Jan 2024*
+
+* Fix a bug in `[splitFileName](https://github.com/haskell/filepath/issues/219)`
+* make `osp :: QuasiQuoter` valid as a pattern wrt [#210](https://github.com/haskell/filepath/pull/210)
+* Add `unsafeEncodeUtf` from os-string
+
+## 1.5.0.0 *Nov 2023*
+
+* remove `OsString` modules
 
 ## 1.4.200.0 *Nov 2023*
 

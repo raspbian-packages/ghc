@@ -24,6 +24,7 @@ module GHC.Utils.Logger
     -- * Logger setup
     , initLogger
     , LogAction
+    , LogJsonAction
     , DumpAction
     , TraceAction
     , DumpFormat (..)
@@ -31,6 +32,8 @@ module GHC.Utils.Logger
     -- ** Hooks
     , popLogHook
     , pushLogHook
+    , popJsonLogHook
+    , pushJsonLogHook
     , popDumpHook
     , pushDumpHook
     , popTraceHook
@@ -49,12 +52,13 @@ module GHC.Utils.Logger
     , logVerbAtLeast
 
     -- * Logging
-    , jsonLogAction
     , putLogMsg
     , defaultLogAction
+    , defaultLogJsonAction
     , defaultLogActionHPrintDoc
     , defaultLogActionHPutStrDoc
     , logMsg
+    , logJsonMsg
     , logDumpMsg
 
     -- * Dumping
@@ -87,6 +91,7 @@ import GHC.Utils.Panic
 
 import GHC.Data.EnumSet (EnumSet)
 import qualified GHC.Data.EnumSet as EnumSet
+import GHC.Data.FastString
 
 import System.Directory
 import System.FilePath  ( takeDirectory, (</>) )
@@ -111,6 +116,7 @@ data LogFlags = LogFlags
   , log_default_dump_context :: SDocContext
   , log_dump_flags           :: !(EnumSet DumpFlag) -- ^ Dump flags
   , log_show_caret           :: !Bool               -- ^ Show caret in diagnostics
+  , log_diagnostics_as_json  :: !Bool               -- ^ Format diagnostics as JSON
   , log_show_warn_groups     :: !Bool               -- ^ Show warning flag groups
   , log_enable_timestamps    :: !Bool               -- ^ Enable timestamps
   , log_dump_to_file         :: !Bool               -- ^ Enable dump to file
@@ -130,6 +136,7 @@ defaultLogFlags = LogFlags
   , log_default_dump_context = defaultSDocContext
   , log_dump_flags           = EnumSet.empty
   , log_show_caret           = True
+  , log_diagnostics_as_json  = False
   , log_show_warn_groups     = True
   , log_enable_timestamps    = True
   , log_dump_to_file         = False
@@ -177,6 +184,11 @@ type LogAction = LogFlags
               -> SDoc
               -> IO ()
 
+type LogJsonAction = LogFlags
+                   -> MessageClass
+                   -> JsonDoc
+                   -> IO ()
+
 type DumpAction = LogFlags
                -> PprStyle
                -> DumpFlag
@@ -214,6 +226,9 @@ data Logger = Logger
     { log_hook   :: [LogAction -> LogAction]
         -- ^ Log hooks stack
 
+    , json_log_hook :: [LogJsonAction -> LogJsonAction]
+        -- ^ Json log hooks stack
+
     , dump_hook  :: [DumpAction -> DumpAction]
         -- ^ Dump hooks stack
 
@@ -249,6 +264,7 @@ initLogger = do
     dumps <- newMVar Map.empty
     return $ Logger
         { log_hook        = []
+        , json_log_hook   = []
         , dump_hook       = []
         , trace_hook      = []
         , generated_dumps = dumps
@@ -259,6 +275,10 @@ initLogger = do
 -- | Log something
 putLogMsg :: Logger -> LogAction
 putLogMsg logger = foldr ($) defaultLogAction (log_hook logger)
+
+-- | Log a JsonDoc
+putJsonLogMsg :: Logger -> LogJsonAction
+putJsonLogMsg logger = foldr ($) defaultLogJsonAction (json_log_hook logger)
 
 -- | Dump something
 putDumpFile :: Logger -> DumpAction
@@ -283,6 +303,15 @@ popLogHook :: Logger -> Logger
 popLogHook logger = case log_hook logger of
     []   -> panic "popLogHook: empty hook stack"
     _:hs -> logger { log_hook = hs }
+
+-- | Push a json log hook
+pushJsonLogHook :: (LogJsonAction -> LogJsonAction) -> Logger -> Logger
+pushJsonLogHook h logger = logger { json_log_hook = h:json_log_hook logger }
+
+popJsonLogHook :: Logger -> Logger
+popJsonLogHook logger = case json_log_hook logger of
+    []   -> panic "popJsonLogHook: empty hook stack"
+    _:hs -> logger { json_log_hook = hs}
 
 -- | Push a dump hook
 pushDumpHook :: (DumpAction -> DumpAction) -> Logger -> Logger
@@ -328,7 +357,23 @@ makeThreadSafe logger = do
            $ logger
 
 -- See Note [JSON Error Messages]
---
+defaultLogJsonAction :: LogJsonAction
+defaultLogJsonAction logflags msg_class jsdoc =
+  case msg_class of
+      MCOutput                     -> printOut msg
+      MCDump                       -> printOut (msg $$ blankLine)
+      MCInteractive                -> putStrSDoc msg
+      MCInfo                       -> printErrs msg
+      MCFatal                      -> printErrs msg
+      MCDiagnostic SevIgnore _ _   -> pure () -- suppress the message
+      MCDiagnostic _sev _rea _code -> printErrs msg
+  where
+    printOut   = defaultLogActionHPrintDoc  logflags False stdout
+    printErrs  = defaultLogActionHPrintDoc  logflags False stderr
+    putStrSDoc = defaultLogActionHPutStrDoc logflags False stdout
+    msg = renderJSON jsdoc
+-- See Note [JSON Error Messages]
+-- this is to be removed
 jsonLogAction :: LogAction
 jsonLogAction _ (MCDiagnostic SevIgnore _ _) _ _ = return () -- suppress the message
 jsonLogAction logflags msg_class srcSpan msg
@@ -338,10 +383,20 @@ jsonLogAction logflags msg_class srcSpan msg
     where
       str = renderWithContext (log_default_user_context logflags) msg
       doc = renderJSON $
-              JSObject [ ( "span", json srcSpan )
+              JSObject [ ( "span", spanToDumpJSON srcSpan )
                        , ( "doc" , JSString str )
                        , ( "messageClass", json msg_class )
                        ]
+      spanToDumpJSON :: SrcSpan -> JsonDoc
+      spanToDumpJSON s = case s of
+                 (RealSrcSpan rss _) -> JSObject [ ("file", json file)
+                                                , ("startLine", json $ srcSpanStartLine rss)
+                                                , ("startCol", json $ srcSpanStartCol rss)
+                                                , ("endLine", json $ srcSpanEndLine rss)
+                                                , ("endCol", json $ srcSpanEndCol rss)
+                                                ]
+                   where file = unpackFS $ srcSpanFile rss
+                 UnhelpfulSpan _ -> JSNull
 
 defaultLogAction :: LogAction
 defaultLogAction logflags msg_class srcSpan msg
@@ -362,14 +417,13 @@ defaultLogAction logflags msg_class srcSpan msg
       message = mkLocMessageWarningGroups (log_show_warn_groups logflags) msg_class srcSpan msg
 
       printDiagnostics = do
-        hPutChar stderr '\n'
         caretDiagnostic <-
             if log_show_caret logflags
             then getCaretDiagnostic msg_class srcSpan
             else pure empty
         printErrs $ getPprStyle $ \style ->
           withPprStyle (setStyleColoured True style)
-            (message $+$ caretDiagnostic)
+            (message $+$ caretDiagnostic $+$ blankLine)
         -- careful (#2302): printErrs prints in UTF-8,
         -- whereas converting to string first and using
         -- hPutStr would just emit the low 8 bits of
@@ -403,6 +457,12 @@ defaultLogActionHPutStrDoc logflags asciiSpace h d
 -- information to provide to the user but refactoring log_action is quite
 -- invasive as it is called in many places. So, for now I left it alone
 -- and we can refine its behaviour as users request different output.
+--
+-- The recent work here replaces the purpose of flag -ddump-json with
+-- -fdiagnostics-as-json. For temporary backwards compatibility while
+-- -ddump-json is being deprecated, `jsonLogAction` has been added in, but
+-- it should be removed along with -ddump-json. Similarly, the guard in
+-- `defaultLogAction` should be removed. This cleanup is tracked in #24113.
 
 -- | Default action for 'dumpAction' hook
 defaultDumpAction :: DumpCache -> LogAction -> DumpAction
@@ -505,7 +565,7 @@ chooseDumpFile logflags ways flag
 
     getPrefix
          -- dump file location is being forced
-         --      by the --ddump-file-prefix flag.
+         --      by the -ddump-file-prefix flag.
        | Just prefix <- log_dump_prefix_override logflags
           = prefix
          -- dump file locations, module specified to [modulename] set by
@@ -531,6 +591,9 @@ defaultTraceAction logflags title doc x =
 -- | Log something
 logMsg :: Logger -> MessageClass -> SrcSpan -> SDoc -> IO ()
 logMsg logger mc loc msg = putLogMsg logger (logFlags logger) mc loc msg
+
+logJsonMsg :: ToJson a => Logger -> MessageClass -> a -> IO ()
+logJsonMsg logger mc d = putJsonLogMsg logger (logFlags logger) mc  (json d)
 
 -- | Dump something
 logDumpFile :: Logger -> PprStyle -> DumpFlag -> String -> DumpFormat -> SDoc -> IO ()

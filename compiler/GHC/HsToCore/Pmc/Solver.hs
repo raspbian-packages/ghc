@@ -37,16 +37,14 @@ import GHC.Prelude
 import GHC.HsToCore.Pmc.Types
 import GHC.HsToCore.Pmc.Utils (tracePm, traceWhenFailPm, mkPmId)
 
-import GHC.Driver.Session
+import GHC.Driver.DynFlags
 import GHC.Driver.Config
 import GHC.Utils.Outputable
 import GHC.Utils.Misc
 import GHC.Utils.Monad (allM)
 import GHC.Utils.Panic
-import GHC.Utils.Panic.Plain
 import GHC.Data.Bag
 
-import GHC.Types.Basic (Levity(..))
 import GHC.Types.CompleteMatch
 import GHC.Types.Unique.Set
 import GHC.Types.Unique.DSet
@@ -93,7 +91,6 @@ import Control.Monad (foldM, forM, guard, mzero, when, filterM)
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.State.Strict
 import Data.Coerce
-import Data.Either   (partitionEithers)
 import Data.Foldable (foldlM, minimumBy, toList)
 import Data.Monoid   (Any(..))
 import Data.List     (sortBy, find)
@@ -153,8 +150,8 @@ vanillaCompleteMatchTC tc =
                tc == tYPETyCon    = Just []
              | -- Similarly, treat `type data` declarations as empty data types on
                -- the term level, as `type data` data constructors only exist at
-               -- the type level (#22964).
-               -- See Note [Type data declarations] in GHC.Rename.Module.
+               -- the type level (#22964).  See wrinkle (W2a) in
+               -- Note [Type data declarations] in GHC.Rename.Module.
                isTypeDataTyCon tc = Just []
              | otherwise          = tyConDataCons_maybe tc
   in vanillaCompleteMatch . mkUniqDSet . map RealDataCon <$> mb_dcs
@@ -610,7 +607,7 @@ addPhiCts nabla cts = runMaybeT $ do
   inhabitationTest initFuel (nabla_ty_st nabla) nabla''
 
 partitionPhiCts :: PhiCts -> ([PredType], [PhiCt])
-partitionPhiCts = partitionEithers . map to_either . toList
+partitionPhiCts = partitionWith to_either . toList
   where
     to_either (PhiTyCt pred_ty) = Left pred_ty
     to_either ct                = Right ct
@@ -646,8 +643,7 @@ nameTyCt :: PredType -> DsM EvVar
 nameTyCt pred_ty = do
   unique <- getUniqueM
   let occname = mkVarOccFS (fsLit ("pm_"++show unique))
-      idname  = mkInternalName unique occname noSrcSpan
-  return (mkLocalIdOrCoVar idname ManyTy pred_ty)
+  return (mkUserLocalOrCoVar occname unique ManyTy pred_ty noSrcSpan)
 
 -----------------------------
 -- ** Adding term constraints
@@ -680,7 +676,7 @@ addPhiTmCt nabla (PhiNotBotCt x)           = addNotBotCt nabla x
 filterUnliftedFields :: PmAltCon -> [Id] -> [Id]
 filterUnliftedFields con args =
   [ arg | (arg, bang) <- zipEqual "addPhiCt" args (pmAltConImplBangs con)
-        , isBanged bang || typeLevity_maybe (idType arg) == Just Unlifted ]
+        , isBanged bang || definitelyUnliftedType (idType arg) ]
 
 -- | Adds the constraint @x ~ ⊥@, e.g. that evaluation of a particular 'Id' @x@
 -- surely diverges. Quite similar to 'addConCt', only that it only cares about
@@ -692,7 +688,7 @@ addBotCt nabla@MkNabla{ nabla_tm_st = ts@TmSt{ ts_facts=env } } x = do
     IsNotBot -> mzero      -- There was x ≁ ⊥. Contradiction!
     IsBot    -> pure nabla -- There already is x ~ ⊥. Nothing left to do
     MaybeBot               -- We add x ~ ⊥
-      | Just Unlifted <- typeLevity_maybe (idType x)
+      | definitelyUnliftedType (idType x)
       -- Case (3) in Note [Strict fields and variables of unlifted type]
       -> mzero -- unlifted vars can never be ⊥
       | otherwise

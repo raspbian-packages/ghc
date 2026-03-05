@@ -17,19 +17,14 @@
 
 enum AllocLockMode { NO_LOCK, ALLOC_SPIN_LOCK, SM_LOCK };
 
-static inline unsigned long log2_ceil(unsigned long x);
 static struct NonmovingSegment *nonmovingAllocSegment(enum AllocLockMode mode, uint32_t node);
 static void nonmovingClearBitmap(struct NonmovingSegment *seg);
-static void nonmovingInitSegment(struct NonmovingSegment *seg, uint8_t log_block_size);
+static void nonmovingInitSegment(struct NonmovingSegment *seg, uint16_t block_size);
 static bool advance_next_free(struct NonmovingSegment *seg, const unsigned int blk_count);
 static struct NonmovingSegment *nonmovingPopFreeSegment(void);
 static struct NonmovingSegment *pop_active_segment(struct NonmovingAllocator *alloca);
 static void *nonmovingAllocate_(enum AllocLockMode mode, Capability *cap, StgWord sz);
 
-static inline unsigned long log2_ceil(unsigned long x)
-{
-    return (sizeof(unsigned long)*8) - __builtin_clzl(x-1);
-}
 
 static inline void acquire_alloc_lock(enum AllocLockMode mode) {
     switch (mode) {
@@ -70,19 +65,42 @@ static struct NonmovingSegment *nonmovingAllocSegment(enum AllocLockMode mode, u
     struct NonmovingSegment *ret;
     ret = nonmovingPopFreeSegment();
 
-    // Nothing in the free list, allocate a new segment...
+    // Nothing in the free list, allocate a new segment.
+    // We allocate a full megablock, and add spare segments to our free list.
     if (ret == NULL) {
         acquire_alloc_lock(mode);
-        bdescr *bd = allocAlignedGroupOnNode(node, NONMOVING_SEGMENT_BLOCKS);
-        // See Note [Live data accounting in nonmoving collector].
-        oldest_gen->n_blocks += bd->blocks;
-        oldest_gen->n_words  += BLOCK_SIZE_W * bd->blocks;
+        // Another thread might have allocated while we were waiting for the lock.
+        ret = nonmovingPopFreeSegment();
+        if (ret != NULL) {
+          release_alloc_lock(mode);
+          // Check alignment
+          ASSERT(((uintptr_t)ret % NONMOVING_SEGMENT_SIZE) == 0);
+          return ret;
+        }
+
+        bdescr *bd = allocMBlockAlignedGroupOnNode(node, NONMOVING_SEGMENT_BLOCKS);
         release_alloc_lock(mode);
 
-        for (StgWord32 i = 0; i < bd->blocks; ++i) {
+        W_ alloc_blocks = BLOCKS_PER_MBLOCK - (BLOCKS_PER_MBLOCK % NONMOVING_SEGMENT_BLOCKS);
+
+        // See Note [Live data accounting in nonmoving collector].
+        oldest_gen->n_blocks += alloc_blocks;
+        oldest_gen->n_words  += BLOCK_SIZE_W * alloc_blocks;
+
+        for (StgWord32 i = 0; i < alloc_blocks; ++i) {
             initBdescr(&bd[i], oldest_gen, oldest_gen);
             bd[i].flags = BF_NONMOVING;
         }
+
+        // Push all but the last segment to the free segment list.
+        while(bd->link) {
+          bdescr *next_bd = bd->link;
+          bd->link = NULL;
+          nonmovingPushFreeSegment((struct NonmovingSegment *)bd->start);
+          bd = next_bd;
+        }
+
+        // Use the last segment to service the allocation.
         ret = (struct NonmovingSegment *)bd->start;
     }
 
@@ -97,14 +115,14 @@ static void nonmovingClearBitmap(struct NonmovingSegment *seg)
     memset(seg->bitmap, 0, n);
 }
 
-static void nonmovingInitSegment(struct NonmovingSegment *seg, uint8_t log_block_size)
+static void nonmovingInitSegment(struct NonmovingSegment *seg, uint16_t allocator_idx)
 {
     bdescr *bd = Bdescr((P_) seg);
     seg->link = NULL;
     seg->todo_link = NULL;
     seg->next_free = 0;
     SET_SEGMENT_STATE(seg, FREE);
-    bd->nonmoving_segment.log_block_size = log_block_size;
+    bd->nonmoving_segment.allocator_idx = allocator_idx;
     bd->nonmoving_segment.next_free_snap = 0;
     bd->u.scan = nonmovingSegmentGetBlock(seg, 0);
     nonmovingClearBitmap(seg);
@@ -115,10 +133,10 @@ void nonmovingInitCapability(Capability *cap)
 {
     // Initialize current segment array
     struct NonmovingSegment **segs =
-        stgMallocBytes(sizeof(struct NonmovingSegment*) * NONMOVING_ALLOCA_CNT, "current segment array");
-    for (unsigned int i = 0; i < NONMOVING_ALLOCA_CNT; i++) {
+        stgMallocBytes(sizeof(struct NonmovingSegment*) * nonmoving_alloca_cnt, "current segment array");
+    for (unsigned int i = 0; i < nonmoving_alloca_cnt; i++) {
         segs[i] = nonmovingAllocSegment(NO_LOCK, cap->node);
-        nonmovingInitSegment(segs[i], NONMOVING_ALLOCA0 + i);
+        nonmovingInitSegment(segs[i], i);
         SET_SEGMENT_STATE(segs[i], CURRENT);
     }
     cap->current_segments = segs;
@@ -190,20 +208,27 @@ static struct NonmovingSegment *pop_active_segment(struct NonmovingAllocator *al
 
 static void *nonmovingAllocate_(enum AllocLockMode mode, Capability *cap, StgWord sz)
 {
-    unsigned int log_block_size = log2_ceil(sz * sizeof(StgWord));
-    unsigned int block_count = nonmovingBlockCountFromSize(log_block_size);
+    unsigned int block_size;
+    if (sz * sizeof(StgWord) <= NONMOVING_ALLOCA0 + (nonmoving_alloca_dense_cnt-1)*sizeof(StgWord)) {
+      block_size = sizeof(StgWord) * sz;
+    } else {
+      unsigned int log_block_size = log2_ceil(sz * sizeof(StgWord));
+      block_size = 1 << log_block_size;
+    }
 
-    // The max we ever allocate is 3276 bytes (anything larger is a large
+    // The max we ever allocate is NONMOVING_SEGMENT_SIZE bytes (anything larger is a large
     // object and not moved) which is covered by allocator 9.
-    ASSERT(log_block_size < NONMOVING_ALLOCA0 + NONMOVING_ALLOCA_CNT);
+    ASSERT(block_size < NONMOVING_SEGMENT_SIZE);
 
-    unsigned int alloca_idx = log_block_size - NONMOVING_ALLOCA0;
+    unsigned int alloca_idx = nonmovingAllocatorForSize(block_size);
     struct NonmovingAllocator *alloca = &nonmovingHeap.allocators[alloca_idx];
 
     // Allocate into current segment
     struct NonmovingSegment *current = cap->current_segments[alloca_idx];
     ASSERT(current); // current is never NULL
-    void *ret = nonmovingSegmentGetBlock_(current, log_block_size, current->next_free);
+    ASSERT(block_size == nonmovingSegmentBlockSize(current));
+    unsigned int block_count = nonmovingSegmentBlockCount(current);
+    void *ret = nonmovingSegmentGetBlock_(current, block_size, block_count, current->next_free);
     ASSERT(GET_CLOSURE_TAG(ret) == 0); // check alignment
 
     // Advance the current segment's next_free or allocate a new segment if full
@@ -216,7 +241,6 @@ static void *nonmovingAllocate_(enum AllocLockMode mode, Capability *cap, StgWor
         // Update live data estimate.
         // See Note [Live data accounting in nonmoving collector].
         unsigned int new_blocks = block_count - nonmovingSegmentInfo(current)->next_free_snap;
-        unsigned int block_size = 1 << log_block_size;
         atomic_inc(&oldest_gen->live_estimate, new_blocks * block_size / sizeof(W_));
 
         // push the current segment to the filled list
@@ -228,7 +252,7 @@ static void *nonmovingAllocate_(enum AllocLockMode mode, Capability *cap, StgWor
         // there are no active segments, allocate new segment
         if (new_current == NULL) {
             new_current = nonmovingAllocSegment(mode, cap->node);
-            nonmovingInitSegment(new_current, log_block_size);
+            nonmovingInitSegment(new_current, alloca_idx);
         }
 
         // make it current

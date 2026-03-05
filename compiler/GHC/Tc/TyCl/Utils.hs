@@ -1,4 +1,3 @@
-
 {-# LANGUAGE DeriveFunctor #-}
 {-# LANGUAGE TypeFamilies #-}
 
@@ -54,7 +53,6 @@ import GHC.Core.Coercion ( ltRole )
 
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
-import GHC.Utils.Panic.Plain
 import GHC.Utils.Misc
 import GHC.Utils.FV as FV
 
@@ -64,17 +62,16 @@ import GHC.Data.FastString
 
 import GHC.Unit.Module
 
-import GHC.Rename.Utils (wrapGenSpan)
+import GHC.Rename.Utils (genHsVar, genLHsApp, genLHsLit, genWildPat)
 
 import GHC.Types.Basic
-import GHC.Types.Error
 import GHC.Types.FieldLabel
 import GHC.Types.SrcLoc
 import GHC.Types.SourceFile
 import GHC.Types.SourceText
 import GHC.Types.Name
 import GHC.Types.Name.Env
-import GHC.Types.Name.Reader ( mkVarUnqual )
+import GHC.Types.Name.Reader ( mkRdrUnqual )
 import GHC.Types.Id
 import GHC.Types.Id.Info
 import GHC.Types.Var.Env
@@ -140,7 +137,8 @@ synonymTyConsOfType ty
      go_co (GRefl _ ty mco)       = go ty `plusNameEnv` go_mco mco
      go_co (TyConAppCo _ tc cs)   = go_tc tc `plusNameEnv` go_co_s cs
      go_co (AppCo co co')         = go_co co `plusNameEnv` go_co co'
-     go_co (ForAllCo _ co co')    = go_co co `plusNameEnv` go_co co'
+     go_co (ForAllCo { fco_kind = kind_co, fco_body = body_co })
+                                  = go_co kind_co `plusNameEnv` go_co body_co
      go_co (FunCo { fco_mult = m, fco_arg = a, fco_res = r })
                                   = go_co m `plusNameEnv` go_co a `plusNameEnv` go_co r
      go_co (CoVarCo _)            = emptyNameEnv
@@ -159,7 +157,6 @@ synonymTyConsOfType ty
      go_prov (PhantomProv co)     = go_co co
      go_prov (ProofIrrelProv co)  = go_co co
      go_prov (PluginProv _)       = emptyNameEnv
-     go_prov (CorePrepProv _)     = emptyNameEnv
 
      go_tc tc | isTypeSynonymTyCon tc = unitNameEnv (tyConName tc) tc
               | otherwise             = emptyNameEnv
@@ -170,7 +167,7 @@ synonymTyConsOfType ty
 -- track of the TyCons which are known to be acyclic, or
 -- a failure message reporting that a cycle was found.
 newtype SynCycleM a = SynCycleM {
-    runSynCycleM :: SynCycleState -> Either (SrcSpan, SDoc) (a, SynCycleState) }
+    runSynCycleM :: SynCycleState -> Either (SrcSpan, TySynCycleTyCons) (a, SynCycleState) }
     deriving (Functor)
 
 -- TODO: TyConSet is implemented as IntMap over uniques.
@@ -190,8 +187,8 @@ instance Monad SynCycleM where
                 runSynCycleM (f x) state'
             Left err -> Left err
 
-failSynCycleM :: SrcSpan -> SDoc -> SynCycleM ()
-failSynCycleM loc err = SynCycleM $ \_ -> Left (loc, err)
+failSynCycleM :: SrcSpan -> TySynCycleTyCons -> SynCycleM ()
+failSynCycleM loc seen_tcs = SynCycleM $ \_ -> Left (loc, seen_tcs)
 
 -- | Test if a 'Name' is acyclic, short-circuiting if we've
 -- seen it already.
@@ -211,7 +208,7 @@ checkTyConIsAcyclic tc m = SynCycleM $ \s ->
 checkSynCycles :: Unit -> [TyCon] -> [LTyClDecl GhcRn] -> TcM ()
 checkSynCycles this_uid tcs tyclds =
     case runSynCycleM (mapM_ (go emptyTyConSet []) tcs) emptyTyConSet of
-        Left (loc, err) -> setSrcSpan loc $ failWithTc (mkTcRnUnknownMessage $ mkPlainError noHints err)
+        Left (loc, err) -> setSrcSpan loc $ failWithTc (TcRnTypeSynonymCycle err)
         Right _  -> return ()
   where
     -- Try our best to print the LTyClDecl for locally defined things
@@ -228,9 +225,7 @@ checkSynCycles this_uid tcs tyclds =
     go' :: TyConSet -> [TyCon] -> TyCon -> SynCycleM ()
     go' so_far seen_tcs tc
         | tc `elemTyConSet` so_far
-            = failSynCycleM (getSrcSpan (head seen_tcs)) $
-                  sep [ text "Cycle in type synonym declarations:"
-                      , nest 2 (vcat (map ppr_decl seen_tcs)) ]
+            = failSynCycleM (getSrcSpan (head seen_tcs)) (lookup_decl <$> seen_tcs)
         -- Optimization: we don't allow cycles through external packages,
         -- so once we find a non-local name we are guaranteed to not
         -- have a cycle.
@@ -247,13 +242,10 @@ checkSynCycles this_uid tcs tyclds =
       where
         n = tyConName tc
         mod = nameModule n
-        ppr_decl tc =
-          case lookupNameEnv lcl_decls n of
-            Just (L loc decl) -> ppr (locA loc) <> colon <+> ppr decl
-            Nothing -> ppr (getSrcSpan n) <> colon <+> ppr n
-                       <+> text "from external module"
-         where
-          n = tyConName tc
+        lookup_decl tc =
+          case lookupNameEnv lcl_decls (tyConName tc) of
+            Just decl -> Right decl
+            Nothing -> Left tc
 
     go_ty :: TyConSet -> [TyCon] -> Type -> SynCycleM ()
     go_ty so_far seen_tcs ty =
@@ -307,19 +299,14 @@ Each step expands superclasses one layer, and clearly does not terminate.
 
 type ClassSet = UniqSet Class
 
-checkClassCycles :: Class -> Maybe SDoc
+checkClassCycles :: Class -> Maybe SuperclassCycle
 -- Nothing  <=> ok
 -- Just err <=> possible cycle error
 checkClassCycles cls
-  = do { (definite_cycle, err) <- go (unitUniqSet cls)
+  = do { (definite_cycle, details) <- go (unitUniqSet cls)
                                      cls (mkTyVarTys (classTyVars cls))
-       ; let herald | definite_cycle = text "Superclass cycle for"
-                    | otherwise      = text "Potential superclass cycle for"
-       ; return (vcat [ herald <+> quotes (ppr cls)
-                      , nest 2 err, hint]) }
+       ; return (MkSuperclassCycle cls definite_cycle details) }
   where
-    hint = text "Use UndecidableSuperClasses to accept this"
-
     -- Expand superclasses starting with (C a b), complaining
     -- if you find the same class a second time, or a type function
     -- or predicate headed by a type variable
@@ -327,12 +314,12 @@ checkClassCycles cls
     -- NB: this code duplicates TcType.transSuperClasses, but
     --     with more error message generation clobber
     -- Make sure the two stay in sync.
-    go :: ClassSet -> Class -> [Type] -> Maybe (Bool, SDoc)
+    go :: ClassSet -> Class -> [Type] -> Maybe (Bool, [SuperclassCycleDetail])
     go so_far cls tys = firstJusts $
                         map (go_pred so_far) $
                         immSuperClasses cls tys
 
-    go_pred :: ClassSet -> PredType -> Maybe (Bool, SDoc)
+    go_pred :: ClassSet -> PredType -> Maybe (Bool, [SuperclassCycleDetail])
        -- Nothing <=> ok
        -- Just (True, err)  <=> definite cycle
        -- Just (False, err) <=> possible cycle
@@ -340,31 +327,28 @@ checkClassCycles cls
        | Just (tc, tys) <- tcSplitTyConApp_maybe pred
        = go_tc so_far pred tc tys
        | hasTyVarHead pred
-       = Just (False, hang (text "one of whose superclass constraints is headed by a type variable:")
-                         2 (quotes (ppr pred)))
+       = Just (False, [SCD_HeadTyVar pred])
        | otherwise
        = Nothing
 
-    go_tc :: ClassSet -> PredType -> TyCon -> [Type] -> Maybe (Bool, SDoc)
+    go_tc :: ClassSet -> PredType -> TyCon -> [Type] -> Maybe (Bool, [SuperclassCycleDetail])
     go_tc so_far pred tc tys
       | isFamilyTyCon tc
-      = Just (False, hang (text "one of whose superclass constraints is headed by a type family:")
-                        2 (quotes (ppr pred)))
+      = Just (False, [SCD_HeadTyFam pred])
       | Just cls <- tyConClass_maybe tc
       = go_cls so_far cls tys
       | otherwise   -- Equality predicate, for example
       = Nothing
 
-    go_cls :: ClassSet -> Class -> [Type] -> Maybe (Bool, SDoc)
+    go_cls :: ClassSet -> Class -> [Type] -> Maybe (Bool, [SuperclassCycleDetail])
     go_cls so_far cls tys
        | cls `elementOfUniqSet` so_far
-       = Just (True, text "one of whose superclasses is" <+> quotes (ppr cls))
+       = Just (True, [SCD_Superclass cls])
        | isCTupleClass cls
        = go so_far cls tys
        | otherwise
-       = do { (b,err) <- go  (so_far `addOneToUniqSet` cls) cls tys
-          ; return (b, text "one of whose superclasses is" <+> quotes (ppr cls)
-                       $$ err) }
+       = do { (b, details) <- go (so_far `addOneToUniqSet` cls) cls tys
+            ; return (b, SCD_Superclass cls : details) }
 
 {-
 ************************************************************************
@@ -859,10 +843,10 @@ when typechecking the [d| .. |] quote, and typecheck them later.
 tcRecSelBinds :: [(Id, LHsBind GhcRn)] -> TcM TcGblEnv
 tcRecSelBinds sel_bind_prs
   = tcExtendGlobalValEnv [sel_id | (L _ (XSig (IdSig sel_id))) <- sigs] $
-    do { (rec_sel_binds, tcg_env) <- discardWarnings $
-                                     -- See Note [Impredicative record selectors]
-                                     setXOptM LangExt.ImpredicativeTypes $
-                                     tcValBinds TopLevel binds sigs getGblEnv
+    do { (rec_sel_binds, _, tcg_env) <- discardWarnings $
+                                       -- See Note [Impredicative record selectors]
+                                       setXOptM LangExt.ImpredicativeTypes $
+                                       tcValBinds TopLevel binds sigs getGblEnv
        ; return (tcg_env `addTypecheckedBinds` map snd rec_sel_binds) }
   where
     sigs = [ L (noAnnSrcSpan loc) (XSig $ IdSig sel_id)
@@ -896,13 +880,22 @@ mkOneRecordSelector all_cons idDetails fl has_sel
     locc     = noAnnSrcSpan loc
     lbl      = flLabel fl
     sel_name = flSelector fl
+    sel_lname = L locn sel_name
+    match_ctxt = mkPrefixFunRhs sel_lname
 
     sel_id = mkExportedLocalId rec_details sel_name sel_ty
-    rec_details = RecSelId { sel_tycon = idDetails, sel_naughty = is_naughty }
 
     -- Find a representative constructor, con1
-    cons_w_field = conLikesWithFields all_cons [lbl]
+    cons_partitioned@(cons_w_field, _) = conLikesWithFields all_cons [lbl]
     con1 = assert (not (null cons_w_field)) $ head cons_w_field
+
+    -- Construct the IdDetails
+    rec_details = RecSelId { sel_tycon      = idDetails
+                           , sel_naughty    = is_naughty
+                           , sel_fieldLabel = fl
+                           , sel_cons       = cons_partitioned }
+                               -- See Note [Detecting incomplete record selectors] in GHC.HsToCore.Pmc
+
 
     -- Selector type; Note [Polymorphic selectors]
     (univ_tvs, _, _, _, req_theta, _, data_ty) = conLikeFullSig con1
@@ -942,12 +935,11 @@ mkOneRecordSelector all_cons idDetails fl has_sel
     -- make the binding: sel (C2 { fld = x }) = x
     --                   sel (C7 { fld = x }) = x
     --    where cons_w_field = [C2,C7]
-    sel_bind = mkTopFunBind Generated sel_lname alts
+    sel_bind = mkTopFunBind (Generated OtherExpansion SkipPmc) sel_lname alts
       where
-        alts | is_naughty = [mkSimpleMatch (mkPrefixFunRhs sel_lname)
-                                           [] unit_rhs]
+        alts | is_naughty = [mkSimpleMatch match_ctxt [] unit_rhs]
              | otherwise =  map mk_match cons_w_field ++ deflt
-    mk_match con = mkSimpleMatch (mkPrefixFunRhs sel_lname)
+    mk_match con = mkSimpleMatch match_ctxt
                                  [L loc' (mk_sel_pat con)]
                                  (L loc' (HsVar noExtField (L locn field_var)))
     mk_sel_pat con = ConPat NoExtField (L locn (getName con)) (RecCon rec_fields)
@@ -956,23 +948,20 @@ mkOneRecordSelector all_cons idDetails fl has_sel
                         { hfbAnn = noAnn
                         , hfbLHS
                            = L locc (FieldOcc sel_name
-                                      (L locn $ mkVarUnqual (field_label lbl)))
+                                      (L locn $ mkRdrUnqual (nameOccName sel_name)))
                         , hfbRHS
                            = L loc' (VarPat noExtField (L locn field_var))
                         , hfbPun = False })
-    sel_lname = L locn sel_name
     field_var = mkInternalName (mkBuiltinUnique 1) (getOccName sel_name) loc
 
     -- Add catch-all default case unless the case is exhaustive
     -- We do this explicitly so that we get a nice error message that
     -- mentions this particular record selector
     deflt | all dealt_with all_cons = []
-          | otherwise = [mkSimpleMatch CaseAlt
-                            [wrapGenSpan (WildPat noExtField)]
-                            (wrapGenSpan
-                                (HsApp noComments
-                                    (wrapGenSpan (HsVar noExtField (wrapGenSpan (getName rEC_SEL_ERROR_ID))))
-                                    (wrapGenSpan (HsLit noComments msg_lit))))]
+          | otherwise = [mkSimpleMatch match_ctxt [genWildPat]
+                            (genLHsApp
+                                (genHsVar (getName rEC_SEL_ERROR_ID))
+                                (genLHsLit msg_lit))]
 
         -- Do not add a default case unless there are unmatched
         -- constructors.  We must take account of GADTs, else we
@@ -1070,7 +1059,7 @@ To determine naughtiness we distingish two cases:
   The selector is defined like this:
     $selReadPfld :: forall a. ReadP a => String -> a
     $selReadPfld @a (d::ReadP a) s = readp @a d s
-  Perfectly fine!  The (ReadP a) constraint lets us contruct a value of type
+  Perfectly fine!  The (ReadP a) constraint lets us construct a value of type
   'a' from a bare String.
 
   Another curious case (#23038):

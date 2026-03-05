@@ -10,6 +10,7 @@
 
 #include "rts/PosixSource.h"
 #include "Rts.h"
+#include "RtsFlags.h"
 
 #include "RtsUtils.h"
 #include "Profiling.h"
@@ -58,7 +59,7 @@ CostCentre      *CC_LIST  = NULL;
 static CostCentreStack *CCS_LIST = NULL;
 
 #if defined(THREADED_RTS)
-static Mutex ccs_mutex;
+Mutex ccs_mutex;
 #endif
 
 /*
@@ -150,14 +151,6 @@ void initProfiling (void)
     // initialise our arena
     prof_arena = newArena();
 
-    /* for the benefit of allocate()... */
-    {
-        uint32_t n;
-        for (n=0; n < getNumCapabilities(); n++) {
-            getCapability(n)->r.rCCCS = CCS_SYSTEM;
-        }
-    }
-
 #if defined(THREADED_RTS)
     initMutex(&ccs_mutex);
 #endif
@@ -211,6 +204,7 @@ void initProfiling (void)
 //
 void refreshProfilingCCSs (void)
 {
+    ACQUIRE_LOCK(&ccs_mutex);
     // make CCS_MAIN the parent of all the pre-defined CCSs.
     CostCentreStack *next;
     for (CostCentreStack *ccs = CCS_LIST; ccs != NULL; ) {
@@ -221,6 +215,7 @@ void refreshProfilingCCSs (void)
         ccs = next;
     }
     CCS_LIST = NULL;
+    RELEASE_LOCK(&ccs_mutex);
 }
 
 void
@@ -250,19 +245,14 @@ initProfilingLogFile(void)
     if (RtsFlags.CcFlags.outputFileNameStem) {
         stem = RtsFlags.CcFlags.outputFileNameStem;
     } else {
-        char *prog;
-
-        prog = arenaAlloc(prof_arena, strlen(prog_name) + 1);
+        char *prog = arenaAlloc(prof_arena, strlen(prog_name) + 1);
         strcpy(prog, prog_name);
+
+        // Drop the platform's executable suffix if there is one
 #if defined(mingw32_HOST_OS)
-        // on Windows, drop the .exe suffix if there is one
-        {
-            char *suff;
-            suff = strrchr(prog,'.');
-            if (suff != NULL && !strcmp(suff,".exe")) {
-                *suff = '\0';
-            }
-        }
+        dropExtension(prog, ".exe");
+#elif defined(wasm32_HOST_ARCH)
+        dropExtension(prog, ".wasm");
 #endif
         stem = prog;
     }
@@ -296,8 +286,10 @@ void
 initTimeProfiling(void)
 {
     traceProfBegin();
-    /* Start ticking */
-    startProfTimer();
+    if (RtsFlags.ProfFlags.startTimeProfileAtStartup) {
+        /* Start ticking */
+        startProfTimer();
+    }
 };
 
 void

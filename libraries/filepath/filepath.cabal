@@ -1,13 +1,13 @@
 cabal-version:      2.2
 name:               filepath
-version:            1.4.300.1
+version:            1.5.4.0
 
 -- NOTE: Don't forget to update ./changelog.md
 license:            BSD-3-Clause
 license-file:       LICENSE
 author:             Neil Mitchell <ndmitchell@gmail.com>
 maintainer:         Julian Ospald <hasufell@posteo.de>
-copyright:          Neil Mitchell 2005-2020, Julain Ospald 2021-2022
+copyright:          Neil Mitchell 2005-2020, Julian Ospald 2021-2022
 bug-reports:        https://github.com/haskell/filepath/issues
 homepage:
   https://github.com/haskell/filepath/blob/master/README.md
@@ -16,14 +16,14 @@ category:           System
 build-type:         Simple
 synopsis:           Library for manipulating FilePaths in a cross platform way.
 tested-with:
-  GHC ==8.0.2
-   || ==8.2.2
-   || ==8.4.4
-   || ==8.6.5
+  GHC ==8.6.5
    || ==8.8.4
    || ==8.10.7
    || ==9.0.2
-   || ==9.2.3
+   || ==9.2.8
+   || ==9.4.8
+   || ==9.6.3
+   || ==9.8.1
 
 description:
   This package provides functionality for manipulating @FilePath@ values, and is shipped with <https://www.haskell.org/ghc/ GHC>. It provides two variants for filepaths:
@@ -42,8 +42,7 @@ description:
   .
   * "System.FilePath" / "System.OsPath" for dealing with current platform-specific filepaths
   .
-  "System.OsString" is like "System.OsPath", but more general purpose. Refer to the documentation of
-  those modules for more information.
+  For more powerful string manipulation of @OsPath@, you can use the <https://hackage.haskell.org/package/os-string os-string package> (@OsPath@ is a type synonym for @OsString@).
   .
   An introduction into the new API can be found in this
   <https://hasufell.github.io/posts/2022-06-29-fixing-haskell-filepaths.html blog post>.
@@ -54,8 +53,6 @@ extra-source-files:
   Makefile
   System/FilePath/Internal.hs
   System/OsPath/Common.hs
-  System/OsString/Common.hs
-  tests/bytestring-tests/Properties/Common.hs
 
 extra-doc-files:
   changelog.md
@@ -77,32 +74,13 @@ library
     System.FilePath.Posix
     System.FilePath.Windows
     System.OsPath
-    System.OsPath.Data.ByteString.Short
-    System.OsPath.Data.ByteString.Short.Internal
-    System.OsPath.Data.ByteString.Short.Word16
     System.OsPath.Encoding
-    System.OsPath.Encoding.Internal
     System.OsPath.Internal
     System.OsPath.Posix
     System.OsPath.Posix.Internal
     System.OsPath.Types
     System.OsPath.Windows
     System.OsPath.Windows.Internal
-    System.OsString
-    System.OsString.Internal
-    System.OsString.Internal.Types
-    System.OsString.Posix
-    System.OsString.Windows
-
-  other-modules:
-    System.OsPath.Data.ByteString.Short.Hidden
-    System.OsPath.Data.ByteString.Short.Internal.Hidden
-    System.OsPath.Data.ByteString.Short.Word16.Hidden
-    System.OsPath.Encoding.Internal.Hidden
-    System.OsString.Internal.Hidden
-    System.OsString.Internal.Types.Hidden
-    System.OsString.Posix.Hidden
-    System.OsString.Windows.Hidden
 
   other-extensions:
     CPP
@@ -113,11 +91,12 @@ library
 
   default-language: Haskell2010
   build-depends:
-    , base              >=4.9      && <4.20
+    , base              >=4.12.0.0      && <4.22
     , bytestring        >=0.11.3.0
     , deepseq
     , exceptions
     , template-haskell
+    , os-string         >=2.0.1
 
   ghc-options:      -Wall
 
@@ -137,7 +116,9 @@ test-suite filepath-tests
     , base
     , bytestring  >=0.11.3.0
     , filepath
-    , QuickCheck  >=2.7      && <2.15
+    , os-string   >=2.0.1
+    , tasty
+    , tasty-quickcheck
 
   default-language: Haskell2010
   ghc-options:      -Wall
@@ -153,29 +134,17 @@ test-suite filepath-equivalent-tests
     Legacy.System.FilePath.Posix
     Legacy.System.FilePath.Windows
     TestUtil
+    Gen
 
   build-depends:
     , base
     , bytestring  >=0.11.3.0
     , filepath
-    , QuickCheck  >=2.7      && <2.15
-
-test-suite bytestring-tests
-  default-language: Haskell2010
-  ghc-options:      -Wall
-  type:             exitcode-stdio-1.0
-  main-is:          Main.hs
-  hs-source-dirs:   tests tests/bytestring-tests
-  other-modules:
-    Properties.ShortByteString
-    Properties.ShortByteString.Word16
-    TestUtil
-
-  build-depends:
-    , base
-    , bytestring  >=0.11.3.0
-    , filepath
-    , QuickCheck  >=2.7      && <2.15
+    , generic-random
+    , generic-deriving
+    , os-string   >=2.0.1
+    , tasty
+    , tasty-quickcheck
 
 test-suite abstract-filepath
   default-language: Haskell2010
@@ -185,7 +154,6 @@ test-suite abstract-filepath
   hs-source-dirs:   tests tests/abstract-filepath
   other-modules:
     Arbitrary
-    EncodingSpec
     OsPathSpec
     TestUtil
 
@@ -194,8 +162,10 @@ test-suite abstract-filepath
     , bytestring  >=0.11.3.0
     , deepseq
     , filepath
-    , QuickCheck  >=2.7      && <2.15
+    , os-string   >=2.0.1
     , quickcheck-classes-base ^>=0.6.2
+    , tasty
+    , tasty-quickcheck
 
 benchmark bench-filepath
   default-language: Haskell2010
@@ -208,6 +178,7 @@ benchmark bench-filepath
     , bytestring  >=0.11.3.0
     , deepseq
     , filepath
+    , os-string   >=2.0.1
     , tasty-bench
 
   ghc-options: -with-rtsopts=-A32m

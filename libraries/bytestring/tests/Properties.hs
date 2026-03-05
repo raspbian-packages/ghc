@@ -1,6 +1,9 @@
-{-# LANGUAGE BangPatterns #-}
-{-# LANGUAGE MagicHash #-}
-{-# LANGUAGE UnboxedTuples #-}
+{-# LANGUAGE AllowAmbiguousTypes #-}
+-- We need @AllowAmbiguousTypes@ in order to be able to use @TypeApplications@
+-- to disambiguate the desired instance of class methods whose instance cannot
+-- be inferred from the caller's context.  We would otherwise have to use
+-- proxy arguments.  Here the 'RdInt' class methods used to generate tests for
+-- all the various 'readInt' types require explicit type applications.
 
 module Properties (testSuite) where
 
@@ -22,7 +25,9 @@ import qualified Data.List as List
 import Data.Char
 import Data.Word
 import Data.Maybe
-import Data.Int (Int64)
+import Data.Either (isLeft)
+import Data.Bits (finiteBitSize, bit)
+import Data.Int (Int8, Int16, Int32, Int64)
 import Data.Semigroup
 import GHC.Exts (Int(..), newPinnedByteArray#, unsafeFreezeByteArray#)
 import GHC.ST (ST(..), runST)
@@ -47,7 +52,6 @@ import qualified Data.ByteString.Lazy.Char8 as LC
 import qualified Data.ByteString.Lazy.Char8 as D
 
 import qualified Data.ByteString.Lazy.Internal as L
-import Prelude hiding (abs)
 
 import QuickCheckUtils
 import Test.Tasty
@@ -97,12 +101,225 @@ prop_lines_lazy3 =
 
 prop_strip x = C.strip x == (C.dropSpace . C.reverse . C.dropSpace . C.reverse) x
 
--- Ensure that readInt and readInteger over lazy ByteStrings are not
+class (Bounded a, Integral a, Show a) => RdInt a where
+    rdIntC :: C.ByteString -> Maybe (a, C.ByteString)
+    rdIntD :: D.ByteString -> Maybe (a, D.ByteString)
+
+instance RdInt Int    where { rdIntC = C.readInt;    rdIntD = D.readInt }
+instance RdInt Int8   where { rdIntC = C.readInt8;   rdIntD = D.readInt8 }
+instance RdInt Int16  where { rdIntC = C.readInt16;  rdIntD = D.readInt16 }
+instance RdInt Int32  where { rdIntC = C.readInt32;  rdIntD = D.readInt32 }
+instance RdInt Int64  where { rdIntC = C.readInt64;  rdIntD = D.readInt64 }
+--
+instance RdInt Word   where { rdIntC = C.readWord;   rdIntD = D.readWord }
+instance RdInt Word8  where { rdIntC = C.readWord8;  rdIntD = D.readWord8 }
+instance RdInt Word16 where { rdIntC = C.readWord16; rdIntD = D.readWord16 }
+instance RdInt Word32 where { rdIntC = C.readWord32; rdIntD = D.readWord32 }
+instance RdInt Word64 where { rdIntC = C.readWord64; rdIntD = D.readWord64 }
+
+smax :: forall a. (Bounded a, Show a) => String
+smax = show $ maxBound @a
+smax1 :: forall a. (Bounded a, Integral a) => String
+smax1 = show $ fromIntegral @a @Integer maxBound + 1
+smax10 :: forall a. (Bounded a, Integral a) => String
+smax10 = show $ fromIntegral @a @Integer maxBound + 10
+
+smin :: forall a. (Bounded a, Show a) => String
+smin = show (minBound @a)
+smin1 :: forall a. (Bounded a, Integral a) => String
+smin1 = show $ fromIntegral @a @Integer minBound - 1
+smin10 :: forall a. (Bounded a, Integral a) => String
+smin10 = show $ fromIntegral @a @Integer minBound - 10
+
+-- Ensure that readWord64 and readInteger over lazy ByteStrings are not
 -- excessively strict.
-prop_readIntSafe         = (fst . fromJust . D.readInt) (Chunk (C.pack "1z") Empty)         == 1
-prop_readIntUnsafe       = (fst . fromJust . D.readInt) (Chunk (C.pack "2z") undefined)     == 2
+prop_readWordSafe        = (fst . fromJust . D.readWord64) (Chunk (C.pack "1z") Empty)      == 1
+prop_readWordUnsafe      = (fst . fromJust . D.readWord64) (Chunk (C.pack "2z") undefined)  == 2
 prop_readIntegerSafe     = (fst . fromJust . D.readInteger) (Chunk (C.pack "1z") Empty)     == 1
 prop_readIntegerUnsafe   = (fst . fromJust . D.readInteger) (Chunk (C.pack "2z") undefined) == 2
+prop_readNaturalSafe     = (fst . fromJust . D.readNatural) (Chunk (C.pack "1z") Empty)     == 1
+prop_readNaturalUnsafe   = (fst . fromJust . D.readNatural) (Chunk (C.pack "2z") undefined) == 2
+prop_readIntBoundsCC     =     rdWordBounds @Word
+                            && rdWordBounds @Word8
+                            && rdWordBounds @Word16
+                            && rdWordBounds @Word32
+                            && rdWordBounds @Word64
+                            && rdIntBounds  @Int
+                            && rdIntBounds  @Int8
+                            && rdIntBounds  @Int16
+                            && rdIntBounds  @Int32
+                            && rdIntBounds  @Int64
+  where
+    tailStr      = " tail"
+    zeroStr      = "000000000000000000000000000"
+    spack s      = C.pack $ s ++ tailStr
+    spackPlus s  = C.pack $ '+' : (s ++ tailStr)
+    spackMinus s = C.pack $ '-' : (s ++ tailStr)
+    spackLong s  = C.pack $ s ++ zeroStr ++ tailStr
+    spackZeros s = case s of
+                    '+':num -> C.pack $ '+' : zeroStr ++ num ++ tailStr
+                    '-':num -> C.pack $ '-' : zeroStr ++ num ++ tailStr
+                    num     -> C.pack $ zeroStr ++ num ++ tailStr
+    good i       = Just (i, C.pack tailStr)
+    --
+    rdWordBounds :: forall a. RdInt a => Bool
+    rdWordBounds =
+        -- Upper bound
+        rdIntC @a (spack (smax @a)) == good maxBound
+        -- With leading zeros
+        && rdIntC @a (spackZeros (smax @a)) == good maxBound
+        -- Overflow in last digit
+        && rdIntC @a (spack (smax1 @a)) == Nothing
+        -- Overflow in 2nd-last digit
+        && rdIntC @a (spack (smax10 @a)) == Nothing
+        -- Trailing zeros
+        && rdIntC @a (spackLong (smax @a)) == Nothing
+    --
+    rdIntBounds :: forall a. RdInt a => Bool
+    rdIntBounds =
+        rdWordBounds @a
+        -- Lower bound
+        && rdIntC @a (spack (smin @a)) == good minBound
+        -- With leading signs
+        && rdIntC @a (spackPlus (smax @a)) == good maxBound
+        && rdIntC @a (spackMinus (smax @a)) == good (negate maxBound)
+        -- With leading zeros
+        && rdIntC @a (spackZeros (smax @a)) == good maxBound
+        -- Underflow in last digit
+        && rdIntC @a (spack (smin1 @a)) == Nothing
+        -- Underflow in 2nd-last digit
+        && rdIntC @a (spack (smin10 @a)) == Nothing
+        -- Trailing zeros
+        && rdIntC @a (spackLong (smin @a)) == Nothing
+
+prop_readIntBoundsLC     =     rdWordBounds @Word
+                            && rdWordBounds @Word8
+                            && rdWordBounds @Word16
+                            && rdWordBounds @Word32
+                            && rdWordBounds @Word64
+                            && rdIntBounds  @Int
+                            && rdIntBounds  @Int8
+                            && rdIntBounds  @Int16
+                            && rdIntBounds  @Int32
+                            && rdIntBounds  @Int64
+  where
+    tailStr      = " tail"
+    zeroStr      = "000000000000000000000000000"
+    spack s      = LC.pack $ s ++ tailStr
+    spackPlus s  = LC.singleton '+' `D.append` LC.pack s `D.append` LC.pack tailStr
+    spackMinus s = LC.singleton '-' `D.append` LC.pack s `D.append` LC.pack tailStr
+    spackLong1 s = LC.pack s `D.append` LC.pack zeroStr `D.append` LC.pack tailStr
+    spackLong2 s = LC.pack (s ++ zeroStr) `D.append` LC.pack tailStr
+    spackZeros s = case s of
+                    '+':num -> LC.pack ('+' : zeroStr) `D.append` LC.pack (num ++ tailStr)
+                    '-':num -> LC.pack ('-' : zeroStr) `D.append` LC.pack (num ++ tailStr)
+                    num     -> LC.pack $ zeroStr ++ num ++ tailStr
+    good i       = Just (i, LC.pack tailStr)
+    --
+    rdWordBounds :: forall a. RdInt a => Bool
+    rdWordBounds =
+        -- Upper bound
+        rdIntD @a (spack (smax @a)) == good maxBound
+        -- With leading zeros
+        && rdIntD @a (spackZeros (smax @a)) == good maxBound
+        -- Overflow in last digit
+        && rdIntD @a (spack (smax1 @a)) == Nothing
+        -- Overflow in 2nd-last digit
+        && rdIntD @a (spack (smax10 @a)) == Nothing
+        -- Overflow across chunk boundary
+        && rdIntD @a (spackLong1 (smax @a)) == Nothing
+        -- Overflow within chunk
+        && rdIntD @a (spackLong2 (smax @a)) == Nothing
+        -- Sign with no digits
+        && rdIntD @a (LC.pack "+ foo") == Nothing
+        && rdIntD @a (LC.pack "-bar") == Nothing
+    --
+    rdIntBounds :: forall a. RdInt a => Bool
+    rdIntBounds =
+        rdWordBounds @a
+        -- Lower bound
+        && rdIntD @a (spack (smin @a)) == good minBound
+        -- With leading signs
+        && rdIntD @a (spackPlus (smax @a)) == good maxBound
+        && rdIntD @a (spackMinus (smax @a)) == good (negate maxBound)
+        -- With leading zeros
+        && rdIntD @a (spackZeros (smin @a)) == good minBound
+        -- Overflow in last digit
+        && rdIntD @a (spack (smin1 @a)) == Nothing
+        -- Overflow in 2nd-last digit
+        && rdIntD @a (spack (smin10 @a)) == Nothing
+        -- Overflow across chunk boundary
+        && rdIntD @a (spackLong1 (smin @a)) == Nothing
+        -- Overflow within chunk
+        && rdIntD @a (spackLong2 (smin @a)) == Nothing
+
+------------------------------------------------------------------------
+
+expectSizeOverflow :: a -> Property
+expectSizeOverflow val = ioProperty $ do
+  isLeft <$> try @P.SizeOverflowException (evaluate val)
+
+prop_checkedAdd = forAll (vectorOf 2 nonNeg) $ \[x, y] -> if oflo x y
+  then expectSizeOverflow (P.checkedAdd "" x y)
+  else property $ P.checkedAdd "" x y == x + y
+  where nonNeg = choose (0, (maxBound @Int))
+        oflo x y = toInteger x + toInteger y /= toInteger @Int (x + y)
+
+multCompl :: Int -> Gen Int
+multCompl x = choose (0, fromInteger @Int maxc)
+  -- This choice creates products with magnitude roughly in the range
+  -- [0..5*(maxBound @Int)], which results in a roughly even split
+  -- between positive and negative overflowed Int results, while still
+  -- producing a fair number of non-overflowing products.
+  where maxc = toInteger (maxBound @Int) * 5 `quot` max 5 (abs $ toInteger x)
+
+prop_checkedMultiply = forAll genScale $ \scale ->
+  forAll (genVal scale) $ \x ->
+    forAll (multCompl x) $ \y -> if oflo x y
+      then expectSizeOverflow (P.checkedMultiply "" x y)
+      else property $ P.checkedMultiply "" x y == x * y
+  where genScale = choose (0, finiteBitSize @Int 0 - 1)
+        genVal scale = choose (0, bit scale - 1)
+        oflo x y = toInteger x * toInteger y /= toInteger @Int (x * y)
+
+prop_stimesOverflowBasic bs = forAll (multCompl len) $ \n ->
+  toInteger n * toInteger len > maxInt ==> expectSizeOverflow (stimes n bs)
+  where
+    maxInt = toInteger @Int (maxBound @Int)
+    len = P.length bs
+
+prop_stimesOverflowScary bs =
+  -- "Scary" because this test will cause heap corruption
+  -- (not just memory exhaustion) with the old stimes implementation.
+  n > 1 ==> expectSizeOverflow (stimes reps bs)
+  where
+    n = P.length bs
+    reps = maxBound @Word `quot` fromIntegral @Int @Word n + 1
+
+prop_stimesOverflowEmpty = forAll (choose (0, maxBound @Word)) $ \n ->
+  stimes n mempty === mempty @P.ByteString
+
+concat32bitOverflow :: (Int -> a) -> ([a] -> a) -> Property
+concat32bitOverflow replicateLike concatLike = let
+  intBits = finiteBitSize @Int 0
+  largeBS = concatLike $ replicate (bit 14) $ replicateLike (bit 17)
+  in if intBits /= 32
+     then label "skipped due to non-32-bit Int" True
+     else expectSizeOverflow largeBS
+
+prop_32bitOverflow_Strict_mconcat :: Property
+prop_32bitOverflow_Strict_mconcat =
+  concat32bitOverflow (`P.replicate` 0) mconcat
+
+prop_32bitOverflow_Lazy_toStrict :: Property
+prop_32bitOverflow_Lazy_toStrict =
+  concat32bitOverflow (`P.replicate` 0) (L.toStrict . L.fromChunks)
+
+prop_32bitOverflow_Short_mconcat :: Property
+prop_32bitOverflow_Short_mconcat =
+  concat32bitOverflow makeShort mconcat
+  where makeShort n = Short.toShort $ P.replicate n 0
+
 
 ------------------------------------------------------------------------
 
@@ -233,7 +450,7 @@ prop_read_write_file_P x = ioProperty $ do
     P.writeFile fn x
     y <- P.readFile fn
     removeFile fn
-    return (x == y)
+    return (x === y)
 
 prop_read_write_file_C x = ioProperty $ do
     (fn, h) <- openTempFile "." "prop-compiled.tmp"
@@ -241,7 +458,7 @@ prop_read_write_file_C x = ioProperty $ do
     C.writeFile fn x
     y <- C.readFile fn
     removeFile fn
-    return (x == y)
+    return (x === y)
 
 prop_read_write_file_L x = ioProperty $ do
     (fn, h) <- openTempFile "." "prop-compiled.tmp"
@@ -249,7 +466,7 @@ prop_read_write_file_L x = ioProperty $ do
     L.writeFile fn x
     y <- L.readFile fn
     L.length y `seq` removeFile fn
-    return (x == y)
+    return (x === y)
 
 prop_read_write_file_D x = ioProperty $ do
     (fn, h) <- openTempFile "." "prop-compiled.tmp"
@@ -257,7 +474,7 @@ prop_read_write_file_D x = ioProperty $ do
     D.writeFile fn x
     y <- D.readFile fn
     D.length y `seq` removeFile fn
-    return (x == y)
+    return (x === y)
 
 ------------------------------------------------------------------------
 
@@ -268,7 +485,7 @@ prop_append_file_P x y = ioProperty $ do
     P.appendFile fn y
     z <- P.readFile fn
     removeFile fn
-    return (z == x `P.append` y)
+    return (z === x `P.append` y)
 
 prop_append_file_C x y = ioProperty $ do
     (fn, h) <- openTempFile "." "prop-compiled.tmp"
@@ -277,7 +494,7 @@ prop_append_file_C x y = ioProperty $ do
     C.appendFile fn y
     z <- C.readFile fn
     removeFile fn
-    return (z == x `C.append` y)
+    return (z === x `C.append` y)
 
 prop_append_file_L x y = ioProperty $ do
     (fn, h) <- openTempFile "." "prop-compiled.tmp"
@@ -286,7 +503,7 @@ prop_append_file_L x y = ioProperty $ do
     L.appendFile fn y
     z <- L.readFile fn
     L.length y `seq` removeFile fn
-    return (z == x `L.append` y)
+    return (z === x `L.append` y)
 
 prop_append_file_D x y = ioProperty $ do
     (fn, h) <- openTempFile "." "prop-compiled.tmp"
@@ -295,7 +512,7 @@ prop_append_file_D x y = ioProperty $ do
     D.appendFile fn y
     z <- D.readFile fn
     D.length y `seq` removeFile fn
-    return (z == x `D.append` y)
+    return (z === x `D.append` y)
 
 prop_packAddress = C.pack "this is a test"
             ==
@@ -417,6 +634,7 @@ testSuite = testGroup "Properties"
   , testGroup "StrictChar8"     PropBS8.tests
   , testGroup "LazyWord8"       PropBL.tests
   , testGroup "LazyChar8"       PropBL8.tests
+  , testGroup "Overflow"        overflow_tests
   , testGroup "Misc"            misc_tests
   , testGroup "IO"              io_tests
   , testGroup "Short"           short_tests
@@ -435,6 +653,17 @@ io_tests =
     , testProperty "appendFile        " prop_append_file_D
 
     , testProperty "packAddress       " prop_packAddress
+    ]
+
+overflow_tests =
+    [ testProperty "checkedAdd" prop_checkedAdd
+    , testProperty "checkedMultiply" prop_checkedMultiply
+    , testProperty "StrictByteString stimes (basic)" prop_stimesOverflowBasic
+    , testProperty "StrictByteString stimes (scary)" prop_stimesOverflowScary
+    , testProperty "StrictByteString stimes (empty)" prop_stimesOverflowEmpty
+    , testProperty "StrictByteString mconcat" prop_32bitOverflow_Strict_mconcat
+    , testProperty "LazyByteString toStrict"  prop_32bitOverflow_Lazy_toStrict
+    , testProperty "ShortByteString mconcat"  prop_32bitOverflow_Short_mconcat
     ]
 
 misc_tests =
@@ -475,10 +704,14 @@ misc_tests =
     , testProperty "strip"          prop_strip
     , testProperty "isSpace"        prop_isSpaceWord8
 
-    , testProperty "readIntSafe"       prop_readIntSafe
-    , testProperty "readIntUnsafe"     prop_readIntUnsafe
+    , testProperty "readWordSafe"      prop_readWordSafe
+    , testProperty "readWordUnsafe"    prop_readWordUnsafe
+    , testProperty "readIntBoundsCC"   prop_readIntBoundsCC
+    , testProperty "readIntBoundsLC"   prop_readIntBoundsLC
     , testProperty "readIntegerSafe"   prop_readIntegerSafe
     , testProperty "readIntegerUnsafe" prop_readIntegerUnsafe
+    , testProperty "readNaturalSafe"   prop_readNaturalSafe
+    , testProperty "readNaturalUnsafe" prop_readNaturalUnsafe
     ]
 
 strictness_checks =

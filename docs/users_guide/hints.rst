@@ -153,7 +153,7 @@ Use ``SPECIALIZE`` pragmas:
 
     .. code-block:: sh
 
-        $ ghc --show-iface Foo.hi | egrep '^[a-z].*::.*=>'
+        $ ghc --show-iface Foo.hi | grep -E '^[a-z].*::.*=>'
 
 Strict functions are your dear friends:
     And, among other things, lazy pattern-matching is your enemy.
@@ -415,7 +415,7 @@ user programs. Using a :ghc-flag:`-funfolding-case-threshold=⟨n⟩` of 1-2 wit
 :ghc-flag:`-funfolding-case-scaling=⟨n⟩` of 15-25 can cause usually small runtime
 regressions but will prevent most inlining loops from getting out of control.
 
-In extreme cases lowering scaling and treshold further can be useful, but at that
+In extreme cases lowering scaling and threshold further can be useful, but at that
 point it's very likely that beneficial inlining is prevented as well resulting
 in significant runtime regressions.
 

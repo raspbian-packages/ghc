@@ -21,7 +21,7 @@ import GHC.Unit.Types
 import GHC.Unit.State
 import GHC.Linker.MacOS
 import GHC.Linker.Unit
-import GHC.SysTools.Tasks
+import GHC.Linker.External
 import GHC.Utils.Logger
 import GHC.Utils.TmpFs
 
@@ -99,6 +99,8 @@ linkDynLib logger tmpfs dflags0 unit_env o_files dep_packages
     pkg_framework_opts <- getUnitFrameworkOpts unit_env (map unitId pkgs)
     let framework_opts = getFrameworkOpts (initFrameworkOpts dflags) platform
 
+    let linker_config = initLinkerConfig dflags
+
     case os of
         OSMinGW32 -> do
             -------------------------------------------------------------
@@ -108,7 +110,7 @@ linkDynLib logger tmpfs dflags0 unit_env o_files dep_packages
                             Just s -> s
                             Nothing -> "HSdll.dll"
 
-            runLink logger tmpfs dflags (
+            runLink logger tmpfs linker_config (
                     map Option verbFlags
                  ++ [ Option "-o"
                     , FileOption "" output_fn
@@ -171,7 +173,7 @@ linkDynLib logger tmpfs dflags0 unit_env o_files dep_packages
             instName <- case dylibInstallName dflags of
                 Just n -> return n
                 Nothing -> return $ "@rpath" `combine` (takeFileName output_fn)
-            runLink logger tmpfs dflags (
+            runLink logger tmpfs linker_config (
                     map Option verbFlags
                  ++ [ Option "-dynamiclib"
                     , Option "-o"
@@ -219,7 +221,7 @@ linkDynLib logger tmpfs dflags0 unit_env o_files dep_packages
                                 -- See Note [-Bsymbolic assumptions by GHC]
                                 ["-Wl,-Bsymbolic" | not unregisterised]
 
-            runLink logger tmpfs dflags (
+            runLink logger tmpfs linker_config (
                     map Option verbFlags
                  ++ libmLinkOpts platform
                  ++ [ Option "-o"

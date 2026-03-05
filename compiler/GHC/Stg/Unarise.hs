@@ -166,8 +166,8 @@ avoid #19645. Other alternatives considered include:
     way to fix what is ultimately a corner-case.
 
 
-Note [Types in StgConApp]
-~~~~~~~~~~~~~~~~~~~~~~~~~
+Note [Representations in StgConApp]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Suppose we have this unboxed sum term:
 
   (# 123 | #)
@@ -180,9 +180,21 @@ type of this term. For example, these are all valid tuples for this:
   (# 1#, 123, rubbish, rubbish #)
                          -- when type is (# Int | (# Int, Int, Int #) #)
 
-So we pass type arguments of the DataCon's TyCon in StgConApp to decide what
-layout to use. Note that unlifted values can't be let-bound, so we don't need
-types in StgRhsCon.
+Therefore, in StgConApp we store a list [[PrimRep]] of representations
+to decide what layout to use.
+Given (# T_1 | ... | T_n #), this list will be
+[typePrimRep T_1, ..., typePrimRep T_n].
+For example, given type
+  (# Int | String #)              we will store [[LiftedRep], [LiftedRep]]
+  (# Int | Float# #)              we will store [[LiftedRep], [FloatRep]]
+  (# Int | (# Int, Int, Int #) #) we will store [[LiftedRep], [LiftedRep, LiftedRep, LiftedRep]].
+
+This field is used for unboxed sums only and it's an empty list otherwise.
+Perhaps it would be more elegant to have a separate StgUnboxedSumCon,
+but that would require duplication of code in cases where the logic is shared.
+
+Note that unlifted values can't be let-bound, so we don't need
+representations in StgRhsCon.
 
 Note [Casting slot arguments]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -298,7 +310,7 @@ of Int64Rep. This means instead of retuning the original alt_rhs we will return:
       (x' :: Int32#) -> alt_rhs
   )
 
-We then run unarise on alt_rhs within that expression, which will replace the first occurence
+We then run unarise on alt_rhs within that expression, which will replace the first occurrence
 of `x` with sum_slot_arg_1 giving us post-unarise:
 
     f sum_tag sum_slot1 =
@@ -361,6 +373,7 @@ STG programs after unarisation have these invariants:
  2. No unboxed tuple binders. Tuples only appear in return position.
 
  3. Binders and literals always have zero (for void arguments) or one PrimRep.
+    (i.e. typePrimRep1 won't crash; see Note [VoidRep] in GHC.Types.RepType.)
 
  4. DataCon applications (StgRhsCon and StgConApp) don't have void arguments.
     This means that it's safe to wrap `StgArg`s of DataCon applications with
@@ -385,7 +398,6 @@ import GHC.Types.Id.Make (voidPrimId, voidArgId)
 import GHC.Utils.Monad (mapAccumLM)
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
-import GHC.Utils.Panic.Plain
 import GHC.Types.RepType
 import GHC.Stg.Syntax
 import GHC.Stg.Utils
@@ -447,10 +459,10 @@ instance Outputable UnariseVal where
 -- See Note [UnariseEnv]
 extendRho :: UnariseEnv -> Id -> UnariseVal -> UnariseEnv
 extendRho env x (MultiVal args)
-  = assert (all (isNvUnaryType . stgArgType) args)
+  = assert (all (isNvUnaryRep . stgArgRep) args)
     env { ue_rho = extendVarEnv (ue_rho env) x (MultiVal args) }
 extendRho env x (UnaryVal val)
-  = assert (isNvUnaryType (stgArgType val))
+  = assert (isNvUnaryRep (stgArgRep val))
     env { ue_rho = extendVarEnv (ue_rho env) x (UnaryVal val) }
 -- Properly shadow things from an outer scope.
 -- See Note [UnariseEnv]
@@ -480,14 +492,14 @@ unariseBinding rho (StgRec xrhss)
   = StgRec <$> mapM (\(x, rhs) -> (x,) <$> unariseRhs rho rhs) xrhss
 
 unariseRhs :: UnariseEnv -> StgRhs -> UniqSM StgRhs
-unariseRhs rho (StgRhsClosure ext ccs update_flag args expr)
+unariseRhs rho (StgRhsClosure ext ccs update_flag args expr typ)
   = do (rho', args1) <- unariseFunArgBinders rho args
        expr' <- unariseExpr rho' expr
-       return (StgRhsClosure ext ccs update_flag args1 expr')
+       return (StgRhsClosure ext ccs update_flag args1 expr' typ)
 
-unariseRhs rho (StgRhsCon ccs con mu ts args)
+unariseRhs rho (StgRhsCon ccs con mu ts args typ)
   = assert (not (isUnboxedTupleDataCon con || isUnboxedSumDataCon con))
-    return (StgRhsCon ccs con mu ts (unariseConArgs rho args))
+    return (StgRhsCon ccs con mu ts (unariseConArgs rho args) typ)
 
 --------------------------------------------------------------------------------
 
@@ -528,7 +540,7 @@ unariseExpr rho (StgConApp dc n args ty_args)
           -> return $ (mkTuple args')
   | otherwise =
       let args' = unariseConArgs rho args in
-      return $ (StgConApp dc n args' (map stgArgType args'))
+      return $ (StgConApp dc n args' [])
 
 unariseExpr rho (StgOpApp op args ty)
   = return (StgOpApp op (unariseFunArgs rho args) ty)
@@ -573,7 +585,7 @@ unariseExpr rho (StgTick tick e)
   = StgTick tick <$> unariseExpr rho e
 
 -- Doesn't return void args.
-unariseUbxSumOrTupleArgs :: UnariseEnv -> UniqSupply -> DataCon -> [InStgArg] -> [Type]
+unariseUbxSumOrTupleArgs :: UnariseEnv -> UniqSupply -> DataCon -> [InStgArg] -> [[PrimRep]]
                    -> ( [OutStgArg]           -- Arguments representing the unboxed sum
                       , Maybe (StgExpr -> StgExpr)) -- Transformation to apply to the arguments, to bring them
                                                     -- into the right Rep
@@ -596,13 +608,12 @@ unariseUbxSumOrTupleArgs rho us dc args ty_args
 -- See also Note [Rubbish literals] in GHC.Types.Literal.
 unariseLiteral_maybe :: Literal -> Maybe [OutStgArg]
 unariseLiteral_maybe (LitRubbish torc rep)
-  | [prep] <- preps
-  , assert (not (isVoidRep prep)) True
-  = Nothing   -- Single, non-void PrimRep. Nothing to do!
+  | [_] <- preps
+  = Nothing   -- Single PrimRep. Nothing to do!
 
-  | otherwise -- Multiple reps, possibly with VoidRep. Eliminate via elimCase
+  | otherwise -- Multiple reps, or zero. Eliminate via elimCase
   = Just [ StgLitArg (LitRubbish torc (primRepToRuntimeRep prep))
-         | prep <- preps, assert (not (isVoidRep prep)) True ]
+         | prep <- preps ]
   where
     preps = runtimeRepPrimRep (text "unariseLiteral_maybe") rep
 
@@ -746,7 +757,7 @@ mapTupleIdBinders
   -> UnariseEnv
   -> UnariseEnv
 mapTupleIdBinders ids args0 rho0
-  = assert (not (any (isZeroBitTy . stgArgType) args0)) $
+  = assert (not (any (null . stgArgRep) args0)) $
     let
       ids_unarised :: [(Id, [PrimRep])]
       ids_unarised = map (\id -> (id, typePrimRep (idType id))) ids
@@ -780,13 +791,13 @@ mapSumIdBinders
   -> UniqSM (UnariseEnv, OutStgExpr)
 
 mapSumIdBinders alt_bndr args rhs rho0
-  = assert (not (any (isZeroBitTy . stgArgType) args)) $ do
+  = assert (not (any (null . stgArgRep) args)) $ do
     uss <- listSplitUniqSupply <$> getUniqueSupplyM
     let
       fld_reps = typePrimRep (idType alt_bndr)
 
       -- Slots representing the whole sum
-      arg_slots = map primRepSlot $ concatMap (typePrimRep . stgArgType) args
+      arg_slots = map primRepSlot $ concatMap stgArgRep args
       -- The slots representing the field of the sum we bind.
       id_slots  = map primRepSlot $ fld_reps
       layout1   = layoutUbxSum arg_slots id_slots
@@ -797,15 +808,13 @@ mapSumIdBinders alt_bndr args rhs rho0
       -- Select only the args which contain parts of the current field.
       id_arg_exprs   = [ args !! i | i <- layout1 ]
       id_vars   = [v | StgVarArg v <- id_arg_exprs]
-      -- Output types for the field binders based on their rep
-      id_tys    = map primRepToType fld_reps
 
-      typed_id_arg_input = assert (equalLength id_vars id_tys) $
-                           zip3 id_vars id_tys uss
+      typed_id_arg_input = assert (equalLength id_vars fld_reps) $
+                           zip3 id_vars fld_reps uss
 
-      mkCastInput :: (Id,Type,UniqSupply) -> ([(PrimOp,Type,Unique)],Id,Id)
-      mkCastInput (id,tar_type,bndr_us) =
-        let (ops,types) = unzip $ getCasts (typePrimRep1 $ idType id) (typePrimRep1 tar_type)
+      mkCastInput :: (Id,PrimRep,UniqSupply) -> ([(PrimOp,Type,Unique)],Id,Id)
+      mkCastInput (id,rep,bndr_us) =
+        let (ops,types) = unzip $ getCasts (typePrimRepU $ idType id) rep
             cst_opts = zip3 ops types $ uniqsFromSupply bndr_us
             out_id = case cst_opts of
               [] -> id
@@ -823,7 +832,7 @@ mapSumIdBinders alt_bndr args rhs rho0
       typed_id_args = map StgVarArg typed_ids
 
       -- pprTrace "mapSumIdBinders"
-      --           (text "id_tys" <+> ppr id_tys $$
+      --           (text "fld_reps" <+> ppr fld_reps $$
       --           text "id_args" <+> ppr id_arg_exprs $$
       --           text "rhs" <+> ppr rhs $$
       --           text "rhs_with_casts" <+> ppr rhs_with_casts
@@ -851,7 +860,7 @@ mkCastVar uq ty = mkSysLocal (fsLit "cst_sum") uq ManyTy ty
 
 mkCast :: StgArg -> PrimOp -> OutId -> Type -> StgExpr -> StgExpr
 mkCast arg_in cast_op out_id out_ty in_rhs =
-  let r2 = typePrimRep1 out_ty
+  let r2 = typePrimRepU out_ty
       scrut = StgOpApp (StgPrimOp cast_op) [arg_in] out_ty
       alt = GenStgAlt { alt_con = DEFAULT, alt_bndrs = [], alt_rhs = in_rhs}
       alt_ty = PrimAlt r2
@@ -861,7 +870,7 @@ mkCast arg_in cast_op out_id out_ty in_rhs =
 --
 -- Example, for (# x | #) :: (# (# #) | Int #) we call
 --
---   mkUbxSum (# _ | #) [ (# #), Int ] [ voidPrimId ]
+--   mkUbxSum (# _ | #) [ [], [LiftedRep] ] [ voidPrimId ]
 --
 -- which returns
 --
@@ -870,7 +879,7 @@ mkCast arg_in cast_op out_id out_ty in_rhs =
 mkUbxSum
   :: HasDebugCallStack
   => DataCon      -- Sum data con
-  -> [Type]       -- Type arguments of the sum data con
+  -> [[PrimRep]]  -- Representations of type arguments of the sum data con
   -> [OutStgArg]  -- Actual arguments of the alternative.
   -> UniqSupply
   -> ([OutStgArg] -- Final tuple arguments
@@ -878,9 +887,9 @@ mkUbxSum
      )
 mkUbxSum dc ty_args args0 us
   = let
-      _ :| sum_slots = ubxSumRepType (map typePrimRep ty_args)
+      _ :| sum_slots = ubxSumRepType ty_args
       -- drop tag slot
-      field_slots = (mapMaybe (typeSlotTy . stgArgType) args0)
+      field_slots = (mapMaybe (repSlotTy . stgArgRep) args0)
       tag = dataConTag dc
       layout'  = layoutUbxSum sum_slots field_slots
 
@@ -897,7 +906,7 @@ mkUbxSum dc ty_args args0 us
       mkTupArg (arg_idx, arg_map, us, wrapper) slot
          | Just stg_arg <- IM.lookup arg_idx arg_map
          =  case castArg us slot stg_arg of
-              -- Slot and arg type missmatched, do a cast
+              -- Slot and arg type mismatched, do a cast
               Just (casted_arg,us',wrapper') ->
                 ( (arg_idx+1, arg_map, us', wrapper . wrapper')
                 , casted_arg)
@@ -913,9 +922,8 @@ mkUbxSum dc ty_args args0 us
       castArg :: UniqSupply -> SlotTy -> StgArg -> Maybe (StgArg,UniqSupply,StgExpr -> StgExpr)
       castArg us slot_ty arg
         -- Cast the argument to the type of the slot if required
-        | slotPrimRep slot_ty /= typePrimRep1 (stgArgType arg)
-        , out_ty <- primRepToType $ slotPrimRep slot_ty
-        , (ops,types) <- unzip $ getCasts (typePrimRep1 $ stgArgType arg) $ typePrimRep1 out_ty
+        | slotPrimRep slot_ty /= stgArgRepU arg
+        , (ops,types) <- unzip $ getCasts (stgArgRepU arg) $ slotPrimRep slot_ty
         , not . null $ ops
         = let (us1,us2) = splitUniqSupply us
               cast_uqs = uniqsFromSupply us1
@@ -964,13 +972,13 @@ For arguments (StgArg) and binders (Id) we have two kind of unarisation:
   - When unarising function arg binders and arguments, we don't want to remove
     void binders and arguments. For example,
 
-      f :: (# (# #), (# #) #) -> Void# -> RealWorld# -> ...
+      f :: (# (# #), (# #) #) -> Void# -> State# RealWorld -> ...
       f x y z = <body>
 
     Here after unarise we should still get a function with arity 3. Similarly
     in the call site we shouldn't remove void arguments:
 
-      f (# (# #), (# #) #) void# rw
+      f (# (# #), (# #) #) void# realWorld#
 
     When unarising <body>, we extend the environment with these binders:
 
@@ -1122,7 +1130,7 @@ isUnboxedTupleBndr :: Id -> Bool
 isUnboxedTupleBndr = isUnboxedTupleType . idType
 
 mkTuple :: [StgArg] -> StgExpr
-mkTuple args = StgConApp (tupleDataCon Unboxed (length args)) NoNumber args (map stgArgType args)
+mkTuple args = StgConApp (tupleDataCon Unboxed (length args)) NoNumber args []
 
 tagAltTy :: AltType
 tagAltTy = PrimAlt IntRep
@@ -1134,7 +1142,7 @@ voidArg :: StgArg
 voidArg = StgVarArg voidPrimId
 
 mkDefaultLitAlt :: [StgAlt] -> [StgAlt]
--- We have an exhauseive list of literal alternatives
+-- We have an exhaustive list of literal alternatives
 --    1# -> e1
 --    2# -> e2
 -- Since they are exhaustive, we can replace one with DEFAULT, to avoid

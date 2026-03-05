@@ -576,11 +576,8 @@ The available mode flags are:
     :type: mode
     :category: modes
 
-    Print ``YES`` if GHC was compiled with support for splitting generated
-    object files into smaller objects, ``NO`` otherwise.
-    This feature uses platform specific techniques and may not be available on
-    all platforms.
-    See :ghc-flag:`-split-objs` for details.
+    Prints ``NO`` as object splitting is no longer supported. See
+    :ghc-flag:`-split-sections` for a more portable and reliable alternative.
 
 .. ghc-flag:: --print-project-git-commit-id
     :shortdesc: display Git commit id GHC is built from
@@ -750,6 +747,60 @@ search path (see :ref:`search-path`).
     threads during compilation. If N is omitted, then it defaults to the
     number of processors. Note that compilation of a module may not begin
     until its dependencies have been built.
+
+
+GHC Jobserver Protocol
+~~~~~~~~~~~~~~~~~~~~~~
+
+The GHC Jobserver Protocol was specified in `GHC proposal #540 <https://github.com/ghc-proposals/ghc-proposals/blob/master/proposals/0540-jsem.rst>`__.
+
+This protocol allows
+a server to dynamically invoke many instances of a client process,
+while restricting all of those instances to use no more than <n> capabilities.
+This is achieved by coordination over a system semaphore (either a POSIX
+semaphore in the case of Linux and Darwin, or a Win32 semaphore
+in the case of Windows platforms).
+
+There are two kinds of participants in the GHC Jobserver protocol:
+
+- The *jobserver* creates a system semaphore with a certain number of
+  available tokens.
+
+  Each time the jobserver wants to spawn a new jobclient subprocess, it **must**
+  first acquire a single token from the semaphore, before spawning
+  the subprocess. This token **must** be released once the subprocess terminates.
+
+  Once work is finished, the jobserver **must** destroy the semaphore it created.
+
+- A *jobclient* is a subprocess spawned by the jobserver or another jobclient.
+
+  Each jobclient starts with one available token (its *implicit token*,
+  which was acquired by the parent which spawned it), and can request more
+  tokens through the Jobserver Protocol by waiting on the semaphore.
+
+  Each time a jobclient wants to spawn a new jobclient subprocess, it **must**
+  pass on a single token to the child jobclient. This token can either be the
+  jobclient's implicit token, or another token which the jobclient acquired
+  from the semaphore.
+
+  Each jobclient **must** release exactly as many tokens as it has acquired from
+  the semaphore (this does not include the implicit tokens).
+
+  GHC itself acts as a jobclient which can be enabled by using the flag ``-jsem``.
+
+.. ghc-flag:: -jsem
+    :shortdesc: When compiling with :ghc-flag:`--make`, coordinate with
+                other processes through the semaphore ⟨sem⟩ to compile
+                modules in parallel.
+    :type: dynamic
+    :category: misc
+
+    Perform compilation in parallel when possible, coordinating with other
+    processes through the semaphore ⟨sem⟩ (specified as a string).
+    Error if the semaphore doesn't exist.
+
+    Use of ``-jsem`` will override use of :ghc-flag:``-j[⟨n⟩]``,
+    and vice-versa.
 
 .. _multi-home-units:
 
@@ -1352,6 +1403,19 @@ messages and in GHCi:
     find the relevant errors or likely to ignore the warnings when they are
     mixed with many other messages.
 
+.. ghc-flag:: -fdiagnostics-as-json
+    :shortdesc: Output diagnostics in Json format specified by JSON schema
+    :type: dynamic
+    :category: verbosity
+
+    Causes GHC to emit diagnostic messages in a standardized JSON format,
+    and output them directly to ``stderr``. The format follows the `JSON Lines <https://jsonlines.org>`_
+    convention, where each diagnostic is its own JSON object separated by
+    a new line.
+
+    The structure of the output is described by a `JSON Schema <https://json-schema.org/>`_.
+    The schema can be downloaded :download:`here <diagnostics-as-json-schema-1_0.json>`.
+
 .. ghc-flag:: -fdiagnostics-color=⟨always|auto|never⟩
     :shortdesc: Use colors in error messages
     :type: dynamic
@@ -1418,6 +1482,20 @@ messages and in GHCi:
     Controls whether GHC displays information about the context in which an
     error occurred. This controls whether the part of the error message which
     says "In the equation..", "In the pattern.." etc is displayed or not.
+
+.. ghc-flag:: -fprint-error-index-links=⟨always|auto|never⟩
+    :shortdesc: Whether to emit diagnostic codes as ANSI hyperlinks to the
+                Haskell Error Index.
+    :type: dynamic
+    :category: verbosity
+
+    :default: auto
+
+    Controls whether GHC will emit error indices as ANSI hyperlinks to the
+    `Haskell Error Index <https://errors.haskell.org/>`_. When set to auto, this
+    flag will render hyperlinks if the terminal is capable; when set to always,
+    this flag will render the hyperlinks regardless of the capabilities of the
+    terminal.
 
 .. ghc-flag:: -ferror-spans
     :shortdesc: Output full span in error messages
@@ -1678,6 +1756,26 @@ Some flags only make sense for particular target platforms.
     :ref:`native code generator <native-code-gen>`. The resulting compiled
     code will only run on processors that support BMI2 (Intel Haswell and newer, AMD Excavator, Zen and newer).
 
+.. ghc-flag:: -mfma
+    :shortdesc: Use native FMA instructions for fused multiply-add floating-point operations
+    :type: dynamic
+    :category: platform-options
+
+    :default: off by default, except for Aarch64 where it's on by default.
+
+    :since: 9.8.1
+
+    Use native FMA instructions to implement the fused multiply-add floating-point
+    operations of the form ``x * y + z``.
+    This allows computing a multiplication and addition in a single instruction,
+    without an intermediate rounding step.
+    Supported architectures: X86 with the FMA3 instruction set (this includes
+    most consumer processors since 2013), PowerPC and AArch64.
+
+    When this flag is disabled, GHC falls back to the C implementation of fused
+    multiply-add, which might perform non-IEEE-compliant software emulation on
+    some platforms (depending on the implementation of the C standard library).
+
 Haddock
 -------
 
@@ -1696,8 +1794,8 @@ Haddock
     top-level type-signature.  With this flag GHC will parse Haddock comments
     and include them in the interface file it produces.
 
-    Note that this flag makes GHC's parser more strict so programs which are
-    accepted without Haddock may be rejected with :ghc-flag:`-haddock`.
+    Consider using :ghc-flag:`-Winvalid-haddock` to be informed about discarded
+    documentation comments.
 
 Miscellaneous flags
 -------------------
@@ -1740,6 +1838,10 @@ GHC can also be configured using various environment variables.
 .. envvar:: GHC_NO_UNICODE
 
     When non-empty, disables Unicode diagnostics output regardless of locale settings.
+    GHC can usually determine that locale is not Unicode-capable and fallback to ASCII
+    automatically, but in some corner cases (e. g., when GHC output is redirected)
+    you might hit ``invalid argument (cannot encode character '\8216')``,
+    in which case do set ``GHC_NO_UNICODE``.
 
 .. envvar:: GHC_CHARENC
 

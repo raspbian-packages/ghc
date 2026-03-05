@@ -19,27 +19,31 @@ module System.Process.Common
     , mbFd
     , mbPipe
     , pfdToHandle
+    , rawFdToHandle
 
 -- Avoid a warning on Windows
-#ifdef WINDOWS
+#if defined(mingw32_HOST_OS)
     , CGid (..)
 #else
     , CGid
 #endif
 
--- WINIO is only available on GHC 8.12 and up.
-#if defined(__IO_MANAGER_WINIO__)
+#if defined(mingw32_HOST_OS)
     , HANDLE
+-- WINIO is only available on GHC 9.0 and up.
+#  if defined(__IO_MANAGER_WINIO__)
     , mbHANDLE
     , mbPipeHANDLE
+    , rawHANDLEToHandle
+#  endif
 #endif
     ) where
 
 import Control.Concurrent
 import Control.Exception
-import Data.String
+import Data.String ( IsString(..) )
 import Foreign.Ptr
-import Foreign.Storable
+import Foreign.Storable ( Storable(peek) )
 
 import System.Posix.Internals
 import GHC.IO.Exception
@@ -63,7 +67,7 @@ import GHC.JS.Prim (JSVal)
 
 -- We do a minimal amount of CPP here to provide uniform data types across
 -- Windows and POSIX.
-#ifdef WINDOWS
+#if defined(mingw32_HOST_OS)
 import Data.Word (Word32)
 import System.Win32.DebugApi (PHANDLE)
 #if defined(__IO_MANAGER_WINIO__)
@@ -75,7 +79,7 @@ import System.Posix.Types
 
 #if defined(javascript_HOST_ARCH)
 type PHANDLE = JSVal
-#elif defined(WINDOWS)
+#elif defined(mingw32_HOST_OS)
 -- Define some missing types for Windows compatibility. Note that these values
 -- will never actually be used, as the setuid/setgid system calls are not
 -- applicable on Windows. No value of this type will ever exist.
@@ -93,7 +97,8 @@ data CreateProcess = CreateProcess{
   std_in       :: StdStream,               -- ^ How to determine stdin
   std_out      :: StdStream,               -- ^ How to determine stdout
   std_err      :: StdStream,               -- ^ How to determine stderr
-  close_fds    :: Bool,                    -- ^ Close all file descriptors except stdin, stdout and stderr in the new process (on Windows, only works if std_in, std_out, and std_err are all Inherit). This implementation will call close on every fd from 3 to the maximum of open files, which can be slow for high maximum of open files. XXX verify what happens with fds in nodejs child processes
+  -- XXX verify what happens with fds in nodejs child processes
+  close_fds    :: Bool,                    -- ^ Close all file descriptors except stdin, stdout and stderr in the new process (on Windows, only works if std_in, std_out, and std_err are all Inherit). This implementation will call close on every fd from 3 to the maximum of open files, which can be slow for high maximum of open files.
   create_group :: Bool,                    -- ^ Create a new process group. On JavaScript this also creates a new session.
   delegate_ctlc:: Bool,                    -- ^ Delegate control-C handling. Use this for interactive console processes to let them handle control-C themselves (see below for details).
                                            --
@@ -278,8 +283,11 @@ mbPipe CreatePipe pfd  mode = fmap Just (pfdToHandle pfd mode)
 mbPipe _std      _pfd _mode = return Nothing
 
 pfdToHandle :: Ptr FD -> IOMode -> IO Handle
-pfdToHandle pfd mode = do
-  fd <- peek pfd
+pfdToHandle pfd mode =
+  ( \ fd -> rawFdToHandle fd mode ) =<< peek pfd
+
+rawFdToHandle :: FD -> IOMode -> IO Handle
+rawFdToHandle fd mode = do
   let filepath = "fd:" ++ show fd
   (fD,fd_type) <- FD.mkFD (fromIntegral fd) mode
                        (Just (Stream,0,0)) -- avoid calling fstat()
@@ -292,6 +300,11 @@ pfdToHandle pfd mode = do
   let enc = localeEncoding
 #endif
   mkHandleFromFD fD' fd_type filepath mode False {-is_socket-} (Just enc)
+
+
+#if defined(mingw32_HOST_OS) && !defined(__IO_MANAGER_WINIO__)
+type HANDLE = Ptr ()
+#endif
 
 #if defined(__IO_MANAGER_WINIO__)
 -- It is not completely safe to pass the values -1 and -2 as HANDLE as it's an
@@ -307,11 +320,14 @@ mbHANDLE _std NoStream        = return $ intPtrToPtr (-2)
 mbHANDLE _std (UseHandle hdl) = handleToHANDLE hdl
 
 mbPipeHANDLE :: StdStream -> Ptr HANDLE -> IOMode -> IO (Maybe Handle)
-mbPipeHANDLE CreatePipe pfd  mode =
-  do raw_handle <- peek pfd
-     let hwnd  = fromHANDLE raw_handle :: Io NativeHandle
-         ident = "hwnd:" ++ show raw_handle
-     enc <- fmap Just getLocaleEncoding
-     Just <$> mkHandleFromHANDLE hwnd Stream ident mode enc
+mbPipeHANDLE CreatePipe pfd mode =
+  Just <$> ( ( \ hANDLE -> rawHANDLEToHandle hANDLE mode ) =<< peek pfd )
 mbPipeHANDLE _std      _pfd _mode = return Nothing
+
+rawHANDLEToHandle :: HANDLE -> IOMode-> IO Handle
+rawHANDLEToHandle raw_handle mode  = do
+  let hwnd  = fromHANDLE raw_handle :: Io NativeHandle
+      ident = "hwnd:" ++ show raw_handle
+  enc <- getLocaleEncoding
+  mkHandleFromHANDLE hwnd Stream ident mode (Just enc)
 #endif

@@ -102,7 +102,8 @@ trivColorable
         -> Triv VirtualReg RegClass RealReg
 
 trivColorable platform virtualRegSqueeze realRegSqueeze RcInteger conflicts exclusions
-        | let cALLOCATABLE_REGS_INTEGER
+        | -- Allocatable are all regs of this class, where freeReg == True (MachRegs.h)
+          let cALLOCATABLE_REGS_INTEGER
                   =        (case platformArch platform of
                             ArchX86       -> 3
                             ArchX86_64    -> 5
@@ -110,6 +111,9 @@ trivColorable platform virtualRegSqueeze realRegSqueeze RcInteger conflicts excl
                             ArchPPC_64 _  -> 15
                             ArchARM _ _ _ -> panic "trivColorable ArchARM"
                             -- N.B. x18 is reserved by the platform on AArch64/Darwin
+                            -- 32 - Base - Sp - Hp - R1..R6 - SpLim - IP0 - SP - LR - FP - X18
+                            -- -> 32 - 15 = 17
+                            -- (one stack pointer for Haskell, one for C)
                             ArchAArch64   -> 17
                             ArchAlpha     -> panic "trivColorable ArchAlpha"
                             ArchMipseb    -> panic "trivColorable ArchMipseb"
@@ -174,12 +178,13 @@ trivColorable platform virtualRegSqueeze realRegSqueeze RcDouble conflicts exclu
                             ArchX86_64    -> 10
                             -- in x86_64 there are 16 XMM registers
                             -- xmm0 .. xmm15, here 10 is a
-                            -- "dont need to solve conflicts" count that
+                            -- "don't need to solve conflicts" count that
                             -- was chosen at some point in the past.
                             ArchPPC       -> 26
                             ArchPPC_64 _  -> 20
                             ArchARM _ _ _ -> panic "trivColorable ArchARM"
-                            ArchAArch64   -> 32
+                            ArchAArch64   -> 24 -- 32 - F1 .. F4, D1..D4 - it's odd but see Note [AArch64 Register assignments] for our reg use.
+                                                -- Seems we reserve different registers for D1..D4 and F1 .. F4 somehow, we should fix this.
                             ArchAlpha     -> panic "trivColorable ArchAlpha"
                             ArchMipseb    -> panic "trivColorable ArchMipseb"
                             ArchMipsel    -> panic "trivColorable ArchMipsel"

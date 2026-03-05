@@ -120,6 +120,7 @@ data Flag
   | Flag_SinceQualification String
   | Flag_IgnoreLinkSymbol String
   | Flag_ParCount (Maybe Int)
+  | Flag_TraceArgs
   deriving (Eq, Show)
 
 
@@ -237,7 +238,9 @@ options backwardsCompat =
     Option [] ["ignore-link-symbol"] (ReqArg Flag_IgnoreLinkSymbol "SYMBOL")
       "name of a symbol which does not trigger a warning in case of link issue",
     Option ['j'] [] (OptArg (\count -> Flag_ParCount (fmap read count)) "n")
-      "load modules in parallel"
+      "load modules in parallel",
+    Option []  ["trace-args"]  (NoArg Flag_TraceArgs)
+      "print the arguments provided for this invocation to stdout"
   ]
 
 
@@ -337,7 +340,6 @@ qualification flags =
       ["full"]       -> Right OptFullQual
       ["local"]      -> Right OptLocalQual
       ["relative"]   -> Right OptRelativeQual
-      ["aliased"]    -> Right OptAliasedQual
       [arg]          -> Left $ "unknown qualification type " ++ show arg
       _:_            -> Left "qualification option given multiple times"
 
@@ -415,16 +417,19 @@ readIfaceArgs flags = [ parseIfaceOption s | Flag_ReadInterface s <- flags ]
               let src' = case src of
                     "" -> Nothing
                     _  -> Just src
+                  docPaths = DocPaths { docPathsHtml = fpath
+                                      , docPathsSources = src'
+                                      }
               in
               case break (==',') rest' of
                 (visibility, ',':file) | visibility == "hidden" ->
-                  ((fpath, src'), Hidden, file)
+                  (docPaths, Hidden, file)
                                        | otherwise ->
-                  ((fpath, src'), Visible, file)
+                  (docPaths, Visible, file)
                 (file, _) ->
-                  ((fpath, src'), Visible, file)
-            (file, _) -> ((fpath, Nothing), Visible, file)
-        (file, _) -> (("", Nothing), Visible, file)
+                  (docPaths, Visible, file)
+            (file, _) -> (DocPaths fpath Nothing, Visible, file)
+        (file, _) -> (DocPaths "" Nothing, Visible, file)
 
 
 -- | Like 'listToMaybe' but returns the last element instead of the first.

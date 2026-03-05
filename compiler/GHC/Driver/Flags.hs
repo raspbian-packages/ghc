@@ -4,15 +4,22 @@ module GHC.Driver.Flags
    , enabledIfVerbose
    , GeneralFlag(..)
    , Language(..)
+   , defaultLanguage
    , optimisationFlags
    , codeGenFlags
 
    -- * Warnings
+   , WarningGroup(..)
+   , warningGroupName
+   , warningGroupFlags
+   , warningGroupIncludesExtendedWarnings
    , WarningFlag(..)
    , warnFlagNames
    , warningGroups
    , warningHierarchies
    , smallestWarningGroups
+   , smallestWarningGroupsForCategory
+
    , standardWarnings
    , minusWOpts
    , minusWallOpts
@@ -32,8 +39,13 @@ import Control.Monad (guard)
 import Data.List.NonEmpty (NonEmpty(..))
 import Data.Maybe (fromMaybe,mapMaybe)
 
-data Language = Haskell98 | Haskell2010 | GHC2021
+data Language = Haskell98 | Haskell2010 | GHC2021 | GHC2024
    deriving (Eq, Enum, Show, Bounded)
+
+-- | The default Language is used if one is not specified explicitly, by both
+-- GHC and GHCi.
+defaultLanguage :: Language
+defaultLanguage = GHC2021
 
 instance Outputable Language where
     ppr = text . show
@@ -47,7 +59,7 @@ instance NFData Language where
 
 -- | Debugging flags
 data DumpFlag
--- See Note [Updating flag description in the User's Guide]
+-- See Note [Updating flag description in the User's Guide] in GHC.Driver.Session
 
    -- debugging flags
    = Opt_D_dump_cmm
@@ -102,6 +114,7 @@ data DumpFlag
    | Opt_D_dump_simpl
    | Opt_D_dump_simpl_iterations
    | Opt_D_dump_spec
+   | Opt_D_dump_spec_constr
    | Opt_D_dump_prep
    | Opt_D_dump_late_cc
    | Opt_D_dump_stg_from_core -- ^ Initial STG (CoreToStg output)
@@ -111,8 +124,8 @@ data DumpFlag
    | Opt_D_dump_stg_final     -- ^ Final STG (before cmm gen)
    | Opt_D_dump_call_arity
    | Opt_D_dump_exitify
-   | Opt_D_dump_stranal
-   | Opt_D_dump_str_signatures
+   | Opt_D_dump_dmdanal
+   | Opt_D_dump_dmd_signatures
    | Opt_D_dump_cpranal
    | Opt_D_dump_cpr_signatures
    | Opt_D_dump_tc
@@ -121,6 +134,10 @@ data DumpFlag
    | Opt_D_dump_types
    | Opt_D_dump_rules
    | Opt_D_dump_cse
+   | Opt_D_dump_float_out
+   | Opt_D_dump_float_in
+   | Opt_D_dump_liberate_case
+   | Opt_D_dump_static_argument_transformation
    | Opt_D_dump_worker_wrapper
    | Opt_D_dump_rn_trace
    | Opt_D_dump_rn_stats
@@ -195,7 +212,7 @@ enabledIfVerbose _                                 = True
 
 -- | Enumerates the simple on-or-off dynamic flags
 data GeneralFlag
--- See Note [Updating flag description in the User's Guide]
+-- See Note [Updating flag description in the User's Guide] in GHC.Driver.Session
 
    = Opt_DumpToFile                     -- ^ Append dump output to files instead of stdout.
    | Opt_DumpWithWays                   -- ^ Use foo.ways.<dumpFlag> instead of foo.<dumpFlag>
@@ -260,7 +277,9 @@ data GeneralFlag
    | Opt_LiberateCase
    | Opt_SpecConstr
    | Opt_SpecConstrKeen
+   | Opt_SpecialiseIncoherents
    | Opt_DoLambdaEtaExpansion
+   | Opt_DoCleverArgEtaExpansion        -- See Note [Eta expansion of arguments in CorePrep]
    | Opt_IgnoreAsserts
    | Opt_DoEtaReduction
    | Opt_CaseMerge
@@ -280,6 +299,7 @@ data GeneralFlag
    | Opt_CmmElimCommonBlocks
    | Opt_CmmControlFlow
    | Opt_AsmShortcutting
+   | Opt_InterModuleFarJumps
    | Opt_OmitYields
    | Opt_FunToThunk               -- deprecated
    | Opt_DictsStrict                     -- be strict in argument dictionaries
@@ -297,6 +317,9 @@ data GeneralFlag
    | Opt_NumConstantFolding
    | Opt_CoreConstantFolding
    | Opt_FastPAPCalls                  -- #6084
+   | Opt_SpecEval
+   | Opt_SpecEvalDictFun   -- See Note [Controlling Speculative Evaluation]
+
 
    -- Inference flags
    | Opt_DoTagInferenceChecks
@@ -309,14 +332,21 @@ data GeneralFlag
    | Opt_IgnoreInterfacePragmas
    | Opt_OmitInterfacePragmas
    | Opt_ExposeAllUnfoldings
+   | Opt_KeepAutoRules -- ^Keep auto-generated rules even if they seem to have become useless
    | Opt_WriteInterface -- forces .hi files to be written even with -fno-code
    | Opt_WriteHie -- generate .hie files
+
+   -- JavaScript opts
+   | Opt_DisableJsMinifier -- ^ render JavaScript pretty-printed instead of minified (compacted)
+   | Opt_DisableJsCsources -- ^ don't link C sources (compiled to JS) with Haskell code (compiled to JS)
 
    -- profiling opts
    | Opt_AutoSccsOnIndividualCafs
    | Opt_ProfCountEntries
    | Opt_ProfLateInlineCcs
    | Opt_ProfLateCcs
+   | Opt_ProfLateOverloadedCcs
+   | Opt_ProfLateoverloadedCallsCCs
    | Opt_ProfManualCcs -- ^ Ignore manual SCC annotations
 
    -- misc opts
@@ -326,6 +356,7 @@ data GeneralFlag
    | Opt_IgnoreHpcChanges
    | Opt_ExcessPrecision
    | Opt_EagerBlackHoling
+   | Opt_OrigThunkInfo
    | Opt_NoHsMain
    | Opt_SplitSections
    | Opt_StgStats
@@ -344,6 +375,7 @@ data GeneralFlag
    | Opt_BuildingCabalPackage
    | Opt_IgnoreDotGhci
    | Opt_GhciSandbox
+   | Opt_InsertBreakpoints
    | Opt_GhciHistory
    | Opt_GhciLeakCheck
    | Opt_ValidateHie
@@ -385,12 +417,14 @@ data GeneralFlag
    | Opt_KeepGoing
    | Opt_ByteCode
    | Opt_ByteCodeAndObjectCode
+   | Opt_UnoptimizedCoreForInterpreter
    | Opt_LinkRts
 
    -- output style opts
    | Opt_ErrorSpans -- Include full span info in error messages,
                     -- instead of just the start position.
    | Opt_DeferDiagnostics
+   | Opt_DiagnosticsAsJSON  -- ^ Dump diagnostics as JSON
    | Opt_DiagnosticsShowCaret -- Show snippets of offending code
    | Opt_PprCaseAsLet
    | Opt_PprShowTicks
@@ -511,6 +545,7 @@ optimisationFlags = EnumSet.fromList
    , Opt_CmmSink
    , Opt_CmmElimCommonBlocks
    , Opt_AsmShortcutting
+   , Opt_InterModuleFarJumps
    , Opt_FunToThunk
    , Opt_DmdTxDictSel
    , Opt_Loopification
@@ -520,6 +555,8 @@ optimisationFlags = EnumSet.fromList
    , Opt_WorkerWrapper
    , Opt_WorkerWrapperUnlift
    , Opt_SolveConstantDicts
+   , Opt_SpecEval
+   , Opt_SpecEvalDictFun
    ]
 
 -- | The set of flags which affect code generation and can change a program's
@@ -552,6 +589,7 @@ codeGenFlags = EnumSet.fromList
      -- Flags that affect generated code
    , Opt_ExposeAllUnfoldings
    , Opt_NoTypeableBinds
+   , Opt_Haddock
 
      -- Flags that affect catching of runtime errors
    , Opt_CatchNonexhaustiveCases
@@ -563,10 +601,11 @@ codeGenFlags = EnumSet.fromList
    , Opt_InfoTableMap
    , Opt_InfoTableMapWithStack
    , Opt_InfoTableMapWithFallback
+   , Opt_OrigThunkInfo
    ]
 
 data WarningFlag =
--- See Note [Updating flag description in the User's Guide]
+-- See Note [Updating flag description in the User's Guide] in GHC.Driver.Session
      Opt_WarnDuplicateExports
    | Opt_WarnDuplicateConstraints
    | Opt_WarnRedundantConstraints
@@ -596,10 +635,9 @@ data WarningFlag =
    | Opt_WarnUnusedRecordWildcards
    | Opt_WarnRedundantBangPatterns
    | Opt_WarnRedundantRecordWildcards
-   | Opt_WarnWarningsDeprecations
    | Opt_WarnDeprecatedFlags
    | Opt_WarnMissingMonadFailInstances               -- since 8.0, has no effect since 8.8
-   | Opt_WarnSemigroup                               -- since 8.0
+   | Opt_WarnSemigroup                               -- since 8.0, has no effect since 9.8
    | Opt_WarnDodgyExports
    | Opt_WarnDodgyImports
    | Opt_WarnOrphans
@@ -657,6 +695,7 @@ data WarningFlag =
    | Opt_WarnAmbiguousFields                         -- Since 9.2
    | Opt_WarnImplicitLift                            -- Since 9.2
    | Opt_WarnMissingKindSignatures                   -- Since 9.2
+   | Opt_WarnMissingPolyKindSignatures               -- Since 9.8
    | Opt_WarnMissingExportedPatternSynonymSignatures -- since 9.2
    | Opt_WarnRedundantStrictnessFlags                -- Since 9.4
    | Opt_WarnForallIdentifier                        -- Since 9.4
@@ -664,7 +703,17 @@ data WarningFlag =
    | Opt_WarnGADTMonoLocalBinds                      -- Since 9.4
    | Opt_WarnTypeEqualityOutOfScope                  -- Since 9.4
    | Opt_WarnTypeEqualityRequiresOperators           -- Since 9.4
-   | Opt_WarnLoopySuperclassSolve                    -- Since 9.6
+   | Opt_WarnLoopySuperclassSolve                    -- Since 9.6, has no effect since 9.10
+   | Opt_WarnTermVariableCapture                     -- Since 9.8
+   | Opt_WarnMissingRoleAnnotations                  -- Since 9.8
+   | Opt_WarnImplicitRhsQuantification               -- Since 9.8
+   | Opt_WarnIncompleteExportWarnings                -- Since 9.8
+   | Opt_WarnIncompleteRecordSelectors               -- Since 9.10
+   | Opt_WarnBadlyStagedTypes                        -- Since 9.10
+   | Opt_WarnInconsistentFlags                       -- Since 9.8
+   | Opt_WarnDataKindsTC                             -- Since 9.10
+   | Opt_WarnDeprecatedTypeAbstractions              -- Since 9.10
+   | Opt_WarnDefaultedExceptionContext               -- Since 9.10
    deriving (Eq, Ord, Show, Enum, Bounded)
 
 -- | Return the names of a WarningFlag
@@ -676,11 +725,11 @@ warnFlagNames wflag = case wflag of
   Opt_WarnAlternativeLayoutRuleTransitional       -> "alternative-layout-rule-transitional" :| []
   Opt_WarnAmbiguousFields                         -> "ambiguous-fields" :| []
   Opt_WarnAutoOrphans                             -> "auto-orphans" :| []
+  Opt_WarnTermVariableCapture                     -> "term-variable-capture" :| []
   Opt_WarnCPPUndef                                -> "cpp-undef" :| []
   Opt_WarnUnbangedStrictPatterns                  -> "unbanged-strict-patterns" :| []
   Opt_WarnDeferredTypeErrors                      -> "deferred-type-errors" :| []
   Opt_WarnDeferredOutOfScopeVariables             -> "deferred-out-of-scope-variables" :| []
-  Opt_WarnWarningsDeprecations                    -> "deprecations" :| ["warnings-deprecations"]
   Opt_WarnDeprecatedFlags                         -> "deprecated-flags" :| []
   Opt_WarnDerivingDefaults                        -> "deriving-defaults" :| []
   Opt_WarnDerivingTypeable                        -> "deriving-typeable" :| []
@@ -709,6 +758,7 @@ warnFlagNames wflag = case wflag of
   Opt_WarnSemigroup                               -> "semigroup" :| []
   Opt_WarnMissingSignatures                       -> "missing-signatures" :| []
   Opt_WarnMissingKindSignatures                   -> "missing-kind-signatures" :| []
+  Opt_WarnMissingPolyKindSignatures               -> "missing-poly-kind-signatures" :| []
   Opt_WarnMissingExportedSignatures               -> "missing-exported-signatures" :| []
   Opt_WarnMonomorphism                            -> "monomorphism-restriction" :| []
   Opt_WarnNameShadowing                           -> "name-shadowing" :| []
@@ -771,6 +821,15 @@ warnFlagNames wflag = case wflag of
   Opt_WarnTypeEqualityOutOfScope                  -> "type-equality-out-of-scope" :| []
   Opt_WarnLoopySuperclassSolve                    -> "loopy-superclass-solve" :| []
   Opt_WarnTypeEqualityRequiresOperators           -> "type-equality-requires-operators" :| []
+  Opt_WarnMissingRoleAnnotations                  -> "missing-role-annotations" :| []
+  Opt_WarnImplicitRhsQuantification               -> "implicit-rhs-quantification" :| []
+  Opt_WarnIncompleteExportWarnings                -> "incomplete-export-warnings" :| []
+  Opt_WarnIncompleteRecordSelectors               -> "incomplete-record-selectors" :| []
+  Opt_WarnBadlyStagedTypes                        -> "badly-staged-types" :| []
+  Opt_WarnInconsistentFlags                       -> "inconsistent-flags" :| []
+  Opt_WarnDataKindsTC                             -> "data-kinds-tc" :| []
+  Opt_WarnDeprecatedTypeAbstractions              -> "deprecated-type-abstractions" :| []
+  Opt_WarnDefaultedExceptionContext               -> "defaulted-exception-context" :| []
 
 -- -----------------------------------------------------------------------------
 -- Standard sets of warning options
@@ -778,24 +837,62 @@ warnFlagNames wflag = case wflag of
 -- Note [Documenting warning flags]
 -- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 --
--- If you change the list of warning enabled by default
+-- If you change the list of warnings enabled by default
 -- please remember to update the User's Guide. The relevant file is:
 --
 --  docs/users_guide/using-warnings.rst
+
+
+-- | A group of warning flags that can be enabled or disabled collectively,
+-- e.g. using @-Wcompat@ to enable all warnings in the 'W_compat' group.
+data WarningGroup = W_compat
+                  | W_unused_binds
+                  | W_extended_warnings
+                  | W_default
+                  | W_extra
+                  | W_all
+                  | W_everything
+  deriving (Bounded, Enum, Eq)
+
+warningGroupName :: WarningGroup -> String
+warningGroupName W_compat            = "compat"
+warningGroupName W_unused_binds      = "unused-binds"
+warningGroupName W_extended_warnings = "extended-warnings"
+warningGroupName W_default           = "default"
+warningGroupName W_extra             = "extra"
+warningGroupName W_all               = "all"
+warningGroupName W_everything        = "everything"
+
+warningGroupFlags :: WarningGroup -> [WarningFlag]
+warningGroupFlags W_compat            = minusWcompatOpts
+warningGroupFlags W_unused_binds      = unusedBindsFlags
+warningGroupFlags W_extended_warnings = []
+warningGroupFlags W_default           = standardWarnings
+warningGroupFlags W_extra             = minusWOpts
+warningGroupFlags W_all               = minusWallOpts
+warningGroupFlags W_everything        = minusWeverythingOpts
+
+-- | Does this warning group contain (all) extended warning categories?  See
+-- Note [Warning categories] in GHC.Unit.Module.Warnings.
+--
+-- The 'W_extended_warnings' group contains extended warnings but no
+-- 'WarningFlag's, but extended warnings are also treated as part of 'W_default'
+-- and every warning group that includes it.
+warningGroupIncludesExtendedWarnings :: WarningGroup -> Bool
+warningGroupIncludesExtendedWarnings W_compat            = False
+warningGroupIncludesExtendedWarnings W_unused_binds      = False
+warningGroupIncludesExtendedWarnings W_extended_warnings = True
+warningGroupIncludesExtendedWarnings W_default           = True
+warningGroupIncludesExtendedWarnings W_extra             = True
+warningGroupIncludesExtendedWarnings W_all               = True
+warningGroupIncludesExtendedWarnings W_everything        = True
 
 -- | Warning groups.
 --
 -- As all warnings are in the Weverything set, it is ignored when
 -- displaying to the user which group a warning is in.
-warningGroups :: [(String, [WarningFlag])]
-warningGroups =
-    [ ("compat",       minusWcompatOpts)
-    , ("unused-binds", unusedBindsFlags)
-    , ("default",      standardWarnings)
-    , ("extra",        minusWOpts)
-    , ("all",          minusWallOpts)
-    , ("everything",   minusWeverythingOpts)
-    ]
+warningGroups :: [WarningGroup]
+warningGroups = [minBound..maxBound]
 
 -- | Warning group hierarchies, where there is an explicit inclusion
 -- relation.
@@ -808,31 +905,34 @@ warningGroups =
 -- hierarchies with no inherent relation to be defined.
 --
 -- The special-case Weverything group is not included.
-warningHierarchies :: [[String]]
+warningHierarchies :: [[WarningGroup]]
 warningHierarchies = hierarchies ++ map (:[]) rest
   where
-    hierarchies = [["default", "extra", "all"]]
-    rest = filter (`notElem` "everything" : concat hierarchies) $
-           map fst warningGroups
+    hierarchies = [[W_default, W_extra, W_all]]
+    rest = filter (`notElem` W_everything : concat hierarchies) warningGroups
 
 -- | Find the smallest group in every hierarchy which a warning
 -- belongs to, excluding Weverything.
-smallestWarningGroups :: WarningFlag -> [String]
+smallestWarningGroups :: WarningFlag -> [WarningGroup]
 smallestWarningGroups flag = mapMaybe go warningHierarchies where
     -- Because each hierarchy is arranged from smallest to largest,
     -- the first group we find in a hierarchy which contains the flag
     -- is the smallest.
     go (group:rest) = fromMaybe (go rest) $ do
-        flags <- lookup group warningGroups
-        guard (flag `elem` flags)
+        guard (flag `elem` warningGroupFlags group)
         pure (Just group)
     go [] = Nothing
+
+-- | The smallest group in every hierarchy to which a custom warning
+-- category belongs is currently always @-Wextended-warnings@.
+-- See Note [Warning categories] in "GHC.Unit.Module.Warnings".
+smallestWarningGroupsForCategory :: [WarningGroup]
+smallestWarningGroupsForCategory = [W_extended_warnings]
 
 -- | Warnings enabled unless specified otherwise
 standardWarnings :: [WarningFlag]
 standardWarnings -- see Note [Documenting warning flags]
     = [ Opt_WarnOverlappingPatterns,
-        Opt_WarnWarningsDeprecations,
         Opt_WarnDeprecatedFlags,
         Opt_WarnDeferredTypeErrors,
         Opt_WarnTypedHoles,
@@ -864,11 +964,13 @@ standardWarnings -- see Note [Documenting warning flags]
         Opt_WarnNonCanonicalMonadInstances,
         Opt_WarnNonCanonicalMonoidInstances,
         Opt_WarnOperatorWhitespaceExtConflict,
-        Opt_WarnForallIdentifier,
         Opt_WarnUnicodeBidirectionalFormatCharacters,
         Opt_WarnGADTMonoLocalBinds,
-        Opt_WarnLoopySuperclassSolve,
-        Opt_WarnTypeEqualityRequiresOperators
+        Opt_WarnBadlyStagedTypes,
+        Opt_WarnTypeEqualityRequiresOperators,
+        Opt_WarnInconsistentFlags,
+        Opt_WarnDataKindsTC,
+        Opt_WarnTypeEqualityOutOfScope
       ]
 
 -- | Things you get with -W
@@ -902,7 +1004,8 @@ minusWallOpts
         Opt_WarnUnusedRecordWildcards,
         Opt_WarnRedundantRecordWildcards,
         Opt_WarnIncompleteUniPatterns,
-        Opt_WarnIncompletePatternsRecUpd
+        Opt_WarnIncompletePatternsRecUpd,
+        Opt_WarnIncompleteExportWarnings
       ]
 
 -- | Things you get with -Weverything, i.e. *all* known warnings flags
@@ -916,10 +1019,9 @@ minusWeverythingOpts = [ toEnum 0 .. ]
 -- code future compatible to fix issues before they even generate warnings.
 minusWcompatOpts :: [WarningFlag]
 minusWcompatOpts
-    = [ Opt_WarnSemigroup
-      , Opt_WarnNonCanonicalMonoidInstances
-      , Opt_WarnCompatUnqualifiedImports
-      , Opt_WarnTypeEqualityOutOfScope
+    = [ Opt_WarnCompatUnqualifiedImports
+      , Opt_WarnImplicitRhsQuantification
+      , Opt_WarnDeprecatedTypeAbstractions
       ]
 
 -- | Things you get with -Wunused-binds

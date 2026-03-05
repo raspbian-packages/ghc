@@ -6,17 +6,19 @@ module GHC.Core.UsageEnv
   , bottomUE
   , deleteUE
   , lookupUE
+  , popUE
   , scaleUE
   , scaleUsage
   , supUE
   , supUEs
-  , unitUE
+  , singleUsageUE
   , zeroUE
   ) where
 
 import Data.Foldable
 import GHC.Prelude
 import GHC.Core.Multiplicity
+import GHC.Types.Var
 import GHC.Types.Name
 import GHC.Types.Name.Env
 import GHC.Utils.Outputable
@@ -54,8 +56,13 @@ scaleUsage x     (MUsage y) = MUsage $ mkMultMul x y
 -- For now, we use extra multiplicity Bottom for empty case.
 data UsageEnv = UsageEnv !(NameEnv Mult) Bool
 
-unitUE :: NamedThing n => n -> Mult -> UsageEnv
-unitUE x w = UsageEnv (unitNameEnv (getName x) w) False
+-- | Record a single usage of an Id, i.e. {n: 1}
+-- Exception: We do not record external names (both GlobalIds and top-level LocalIds)
+-- because they're not relevant to linearity checking.
+singleUsageUE :: Id -> UsageEnv
+singleUsageUE x | isExternalName n = zeroUE
+                | otherwise = UsageEnv (unitNameEnv n OneTy) False
+  where n = getName x
 
 zeroUE, bottomUE :: UsageEnv
 zeroUE = UsageEnv emptyNameEnv False
@@ -97,6 +104,9 @@ lookupUE (UsageEnv e has_bottom) x =
   case lookupNameEnv e (getName x) of
     Just w  -> MUsage w
     Nothing -> if has_bottom then Bottom else Zero
+
+popUE :: NamedThing n => UsageEnv -> n -> (Usage, UsageEnv)
+popUE ue x = (lookupUE ue x, deleteUE ue x)
 
 instance Outputable UsageEnv where
   ppr (UsageEnv ne b) = text "UsageEnv:" <+> ppr ne <+> ppr b

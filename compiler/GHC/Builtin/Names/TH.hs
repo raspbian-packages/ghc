@@ -11,9 +11,9 @@ import GHC.Prelude ()
 import GHC.Builtin.Names( mk_known_key_name )
 import GHC.Unit.Types
 import GHC.Types.Name( Name )
-import GHC.Types.Name.Occurrence( tcName, clsName, dataName, varName )
+import GHC.Types.Name.Occurrence( tcName, clsName, dataName, varName, fieldName )
 import GHC.Types.Name.Reader( RdrName, nameRdrName )
-import GHC.Types.Unique
+import GHC.Types.Unique ( Unique )
 import GHC.Builtin.Uniques
 import GHC.Data.FastString
 
@@ -31,7 +31,8 @@ templateHaskellNames :: [Name]
 
 templateHaskellNames = [
     returnQName, bindQName, sequenceQName, newNameName, liftName, liftTypedName,
-    mkNameName, mkNameG_vName, mkNameG_dName, mkNameG_tcName, mkNameLName,
+    mkNameName, mkNameG_vName, mkNameG_dName, mkNameG_tcName, mkNameG_fldName,
+    mkNameLName,
     mkNameSName, mkNameQName,
     mkModNameName,
     liftStringName,
@@ -46,6 +47,7 @@ templateHaskellNames = [
     litPName, varPName, tupPName, unboxedTupPName, unboxedSumPName,
     conPName, tildePName, bangPName, infixPName,
     asPName, wildPName, recPName, listPName, sigPName, viewPName,
+    typePName, invisPName,
     -- FieldPat
     fieldPatName,
     -- Match
@@ -60,6 +62,7 @@ templateHaskellNames = [
     fromEName, fromThenEName, fromToEName, fromThenToEName,
     listEName, sigEName, recConEName, recUpdEName, staticEName, unboundVarEName,
     labelEName, implicitParamVarEName, getFieldEName, projectionEName,
+    typeEName,
     -- FieldExp
     fieldExpName,
     -- Body
@@ -73,10 +76,11 @@ templateHaskellNames = [
     classDName, instanceWithOverlapDName,
     standaloneDerivWithStrategyDName, sigDName, kiSigDName, forImpDName,
     pragInlDName, pragOpaqueDName, pragSpecDName, pragSpecInlDName, pragSpecInstDName,
-    pragRuleDName, pragCompleteDName, pragAnnDName, defaultSigDName, defaultDName,
+    pragRuleDName, pragCompleteDName, pragAnnDName, pragSCCFunDName, pragSCCFunNamedDName,
+    defaultSigDName, defaultDName,
     dataFamilyDName, openTypeFamilyDName, closedTypeFamilyDName,
     dataInstDName, newtypeInstDName, tySynInstDName,
-    infixLDName, infixRDName, infixNDName,
+    infixLWithSpecDName, infixRWithSpecDName, infixNWithSpecDName,
     roleAnnotDName, patSynDName, patSynSigDName,
     implicitParamBindDName,
     -- Cxt
@@ -109,8 +113,11 @@ templateHaskellNames = [
     -- TyVarBndr
     plainTVName, kindedTVName,
     plainInvisTVName, kindedInvisTVName,
+    plainBndrTVName, kindedBndrTVName,
     -- Specificity
     specifiedSpecName, inferredSpecName,
+    -- Visibility
+    bndrReqName, bndrInvisName,
     -- Role
     nominalRName, representationalRName, phantomRName, inferRName,
     -- Kind
@@ -134,6 +141,9 @@ templateHaskellNames = [
     -- Overlap
     overlappableDataConName, overlappingDataConName, overlapsDataConName,
     incoherentDataConName,
+    -- NamespaceSpecifier
+    noNamespaceSpecifierDataConName, typeNamespaceSpecifierDataConName,
+    dataNamespaceSpecifierDataConName,
     -- DerivStrategy
     stockStrategyName, anyclassStrategyName,
     newtypeStrategyName, viaStrategyName,
@@ -152,11 +162,14 @@ templateHaskellNames = [
     liftClassName, quoteClassName,
 
     -- And the tycons
-    qTyConName, nameTyConName, patTyConName, fieldPatTyConName, matchTyConName,
+    qTyConName, nameTyConName, patTyConName,
+    fieldPatTyConName, matchTyConName,
     expQTyConName, fieldExpTyConName, predTyConName,
     stmtTyConName,  decsTyConName, conTyConName, bangTypeTyConName,
     varBangTypeTyConName, typeQTyConName, expTyConName, decTyConName,
-    typeTyConName, tyVarBndrUnitTyConName, tyVarBndrSpecTyConName, clauseTyConName,
+    typeTyConName,
+    tyVarBndrUnitTyConName, tyVarBndrSpecTyConName, tyVarBndrVisTyConName,
+    clauseTyConName,
     patQTyConName, funDepTyConName, decsQTyConName,
     ruleBndrTyConName, tySynEqnTyConName,
     roleTyConName, codeTyConName, injAnnTyConName, kindTyConName,
@@ -174,14 +187,19 @@ qqLib = mkTHModule (fsLit "Language.Haskell.TH.Quote")
 mkTHModule :: FastString -> Module
 mkTHModule m = mkModule thUnit (mkModuleNameFS m)
 
-libFun, libTc, thFun, thTc, thCls, thCon, qqFun :: FastString -> Unique -> Name
+libFun, libTc, thFun, thTc, thCls, thCon :: FastString -> Unique -> Name
 libFun = mk_known_key_name varName  thLib
 libTc  = mk_known_key_name tcName   thLib
 thFun  = mk_known_key_name varName  thSyn
 thTc   = mk_known_key_name tcName   thSyn
 thCls  = mk_known_key_name clsName  thSyn
 thCon  = mk_known_key_name dataName thSyn
-qqFun  = mk_known_key_name varName  qqLib
+
+thFld :: FastString -> FastString -> Unique -> Name
+thFld con = mk_known_key_name (fieldName con) thSyn
+
+qqFld :: FastString -> Unique -> Name
+qqFld = mk_known_key_name (fieldName (fsLit "QuasiQuoter")) qqLib
 
 -------------------- TH.Syntax -----------------------
 liftClassName :: Name
@@ -214,7 +232,7 @@ overlapTyConName       = thTc (fsLit "Overlap")        overlapTyConKey
 modNameTyConName       = thTc (fsLit "ModName")        modNameTyConKey
 
 returnQName, bindQName, sequenceQName, newNameName, liftName,
-    mkNameName, mkNameG_vName, mkNameG_dName, mkNameG_tcName,
+    mkNameName, mkNameG_vName, mkNameG_fldName, mkNameG_dName, mkNameG_tcName,
     mkNameLName, mkNameSName, liftStringName, unTypeName, unTypeCodeName,
     unsafeCodeCoerceName, liftTypedName, mkModNameName, mkNameQName :: Name
 returnQName    = thFun (fsLit "returnQ")   returnQIdKey
@@ -227,11 +245,12 @@ mkNameName     = thFun (fsLit "mkName")     mkNameIdKey
 mkNameG_vName  = thFun (fsLit "mkNameG_v")  mkNameG_vIdKey
 mkNameG_dName  = thFun (fsLit "mkNameG_d")  mkNameG_dIdKey
 mkNameG_tcName = thFun (fsLit "mkNameG_tc") mkNameG_tcIdKey
+mkNameG_fldName= thFun (fsLit "mkNameG_fld") mkNameG_fldIdKey
 mkNameLName    = thFun (fsLit "mkNameL")    mkNameLIdKey
 mkNameQName    = thFun (fsLit "mkNameQ")    mkNameQIdKey
 mkNameSName    = thFun (fsLit "mkNameS")    mkNameSIdKey
 mkModNameName  = thFun (fsLit "mkModName")  mkModNameIdKey
-unTypeName     = thFun (fsLit "unType")     unTypeIdKey
+unTypeName     = thFld (fsLit "TExp") (fsLit "unType") unTypeIdKey
 unTypeCodeName    = thFun (fsLit "unTypeCode") unTypeCodeIdKey
 unsafeCodeCoerceName = thFun (fsLit "unsafeCodeCoerce") unsafeCodeCoerceIdKey
 liftTypedName = thFun (fsLit "liftTyped") liftTypedIdKey
@@ -256,7 +275,7 @@ charPrimLName   = libFun (fsLit "charPrimL")   charPrimLIdKey
 -- data Pat = ...
 litPName, varPName, tupPName, unboxedTupPName, unboxedSumPName, conPName,
     infixPName, tildePName, bangPName, asPName, wildPName, recPName, listPName,
-    sigPName, viewPName :: Name
+    sigPName, viewPName, typePName, invisPName :: Name
 litPName   = libFun (fsLit "litP")   litPIdKey
 varPName   = libFun (fsLit "varP")   varPIdKey
 tupPName   = libFun (fsLit "tupP")   tupPIdKey
@@ -272,6 +291,8 @@ recPName   = libFun (fsLit "recP")   recPIdKey
 listPName  = libFun (fsLit "listP")  listPIdKey
 sigPName   = libFun (fsLit "sigP")   sigPIdKey
 viewPName  = libFun (fsLit "viewP")  viewPIdKey
+typePName  = libFun (fsLit "typeP")  typePIdKey
+invisPName = libFun (fsLit "invisP")  invisPIdKey
 
 -- type FieldPat = ...
 fieldPatName :: Name
@@ -290,7 +311,7 @@ varEName, conEName, litEName, appEName, appTypeEName, infixEName, infixAppName,
     sectionLName, sectionRName, lamEName, lamCaseEName, lamCasesEName, tupEName,
     unboxedTupEName, unboxedSumEName, condEName, multiIfEName, letEName,
     caseEName, doEName, mdoEName, compEName, staticEName, unboundVarEName,
-    labelEName, implicitParamVarEName, getFieldEName, projectionEName :: Name
+    labelEName, implicitParamVarEName, getFieldEName, projectionEName, typeEName :: Name
 varEName              = libFun (fsLit "varE")              varEIdKey
 conEName              = libFun (fsLit "conE")              conEIdKey
 litEName              = libFun (fsLit "litE")              litEIdKey
@@ -331,6 +352,7 @@ labelEName            = libFun (fsLit "labelE")            labelEIdKey
 implicitParamVarEName = libFun (fsLit "implicitParamVarE") implicitParamVarEIdKey
 getFieldEName         = libFun (fsLit "getFieldE")         getFieldEIdKey
 projectionEName       = libFun (fsLit "projectionE")       projectionEIdKey
+typeEName             = libFun (fsLit "typeE")             typeEIdKey
 
 -- type FieldExp = ...
 fieldExpName :: Name
@@ -358,11 +380,12 @@ recSName    = libFun (fsLit "recS")    recSIdKey
 funDName, valDName, dataDName, newtypeDName, typeDataDName, tySynDName, classDName,
     instanceWithOverlapDName, sigDName, kiSigDName, forImpDName, pragInlDName,
     pragSpecDName, pragSpecInlDName, pragSpecInstDName, pragRuleDName,
-    pragAnnDName, standaloneDerivWithStrategyDName, defaultSigDName, defaultDName,
+    pragAnnDName, pragSCCFunDName, pragSCCFunNamedDName,
+    standaloneDerivWithStrategyDName, defaultSigDName, defaultDName,
     dataInstDName, newtypeInstDName, tySynInstDName, dataFamilyDName,
-    openTypeFamilyDName, closedTypeFamilyDName, infixLDName, infixRDName,
-    infixNDName, roleAnnotDName, patSynDName, patSynSigDName,
-    pragCompleteDName, implicitParamBindDName, pragOpaqueDName :: Name
+    openTypeFamilyDName, closedTypeFamilyDName, infixLWithSpecDName,
+    infixRWithSpecDName, infixNWithSpecDName, roleAnnotDName, patSynDName,
+    patSynSigDName, pragCompleteDName, implicitParamBindDName, pragOpaqueDName :: Name
 funDName                         = libFun (fsLit "funD")                         funDIdKey
 valDName                         = libFun (fsLit "valD")                         valDIdKey
 dataDName                        = libFun (fsLit "dataD")                        dataDIdKey
@@ -385,15 +408,17 @@ pragSpecInstDName                = libFun (fsLit "pragSpecInstD")               
 pragRuleDName                    = libFun (fsLit "pragRuleD")                    pragRuleDIdKey
 pragCompleteDName                = libFun (fsLit "pragCompleteD")                pragCompleteDIdKey
 pragAnnDName                     = libFun (fsLit "pragAnnD")                     pragAnnDIdKey
+pragSCCFunDName                  = libFun (fsLit "pragSCCFunD")                  pragSCCFunDKey
+pragSCCFunNamedDName             = libFun (fsLit "pragSCCFunNamedD")             pragSCCFunNamedDKey
 dataInstDName                    = libFun (fsLit "dataInstD")                    dataInstDIdKey
 newtypeInstDName                 = libFun (fsLit "newtypeInstD")                 newtypeInstDIdKey
 tySynInstDName                   = libFun (fsLit "tySynInstD")                   tySynInstDIdKey
 openTypeFamilyDName              = libFun (fsLit "openTypeFamilyD")              openTypeFamilyDIdKey
 closedTypeFamilyDName            = libFun (fsLit "closedTypeFamilyD")            closedTypeFamilyDIdKey
 dataFamilyDName                  = libFun (fsLit "dataFamilyD")                  dataFamilyDIdKey
-infixLDName                      = libFun (fsLit "infixLD")                      infixLDIdKey
-infixRDName                      = libFun (fsLit "infixRD")                      infixRDIdKey
-infixNDName                      = libFun (fsLit "infixND")                      infixNDIdKey
+infixLWithSpecDName              = libFun (fsLit "infixLWithSpecD")              infixLWithSpecDIdKey
+infixRWithSpecDName              = libFun (fsLit "infixRWithSpecD")              infixRWithSpecDIdKey
+infixNWithSpecDName              = libFun (fsLit "infixNWithSpecD")              infixNWithSpecDIdKey
 roleAnnotDName                   = libFun (fsLit "roleAnnotD")                   roleAnnotDIdKey
 patSynDName                      = libFun (fsLit "patSynD")                      patSynDIdKey
 patSynSigDName                   = libFun (fsLit "patSynSigD")                   patSynSigDIdKey
@@ -492,10 +517,19 @@ plainInvisTVName, kindedInvisTVName :: Name
 plainInvisTVName  = libFun (fsLit "plainInvisTV")  plainInvisTVIdKey
 kindedInvisTVName = libFun (fsLit "kindedInvisTV") kindedInvisTVIdKey
 
+plainBndrTVName, kindedBndrTVName :: Name
+plainBndrTVName  = libFun (fsLit "plainBndrTV")  plainBndrTVIdKey
+kindedBndrTVName = libFun (fsLit "kindedBndrTV") kindedBndrTVIdKey
+
 -- data Specificity = ...
 specifiedSpecName, inferredSpecName :: Name
 specifiedSpecName = libFun (fsLit "specifiedSpec") specifiedSpecKey
 inferredSpecName  = libFun (fsLit "inferredSpec")  inferredSpecKey
+
+-- data BndrVis = ...
+bndrReqName, bndrInvisName :: Name
+bndrReqName   = libFun (fsLit "bndrReq")   bndrReqKey
+bndrInvisName = libFun (fsLit "bndrInvis") bndrInvisKey
 
 -- data Role = ...
 nominalRName, representationalRName, phantomRName, inferRName :: Name
@@ -569,7 +603,7 @@ patQTyConName, expQTyConName, stmtTyConName,
     varBangTypeTyConName, typeQTyConName,
     decsQTyConName, ruleBndrTyConName, tySynEqnTyConName, roleTyConName,
     derivClauseTyConName, kindTyConName,
-    tyVarBndrUnitTyConName, tyVarBndrSpecTyConName,
+    tyVarBndrUnitTyConName, tyVarBndrSpecTyConName, tyVarBndrVisTyConName,
     derivStrategyTyConName :: Name
 -- These are only used for the types of top-level splices
 expQTyConName           = libTc (fsLit "ExpQ")           expQTyConKey
@@ -589,14 +623,15 @@ derivClauseTyConName   = thTc (fsLit "DerivClause")   derivClauseTyConKey
 kindTyConName          = thTc (fsLit "Kind")          kindTyConKey
 tyVarBndrUnitTyConName = libTc (fsLit "TyVarBndrUnit") tyVarBndrUnitTyConKey
 tyVarBndrSpecTyConName = libTc (fsLit "TyVarBndrSpec") tyVarBndrSpecTyConKey
+tyVarBndrVisTyConName  = libTc (fsLit "TyVarBndrVis")  tyVarBndrVisTyConKey
 derivStrategyTyConName = thTc (fsLit "DerivStrategy") derivStrategyTyConKey
 
 -- quasiquoting
 quoteExpName, quotePatName, quoteDecName, quoteTypeName :: Name
-quoteExpName        = qqFun (fsLit "quoteExp")  quoteExpKey
-quotePatName        = qqFun (fsLit "quotePat")  quotePatKey
-quoteDecName        = qqFun (fsLit "quoteDec")  quoteDecKey
-quoteTypeName       = qqFun (fsLit "quoteType") quoteTypeKey
+quoteExpName  = qqFld (fsLit "quoteExp")  quoteExpKey
+quotePatName  = qqFld (fsLit "quotePat")  quotePatKey
+quoteDecName  = qqFld (fsLit "quoteDec")  quoteDecKey
+quoteTypeName = qqFld (fsLit "quoteType") quoteTypeKey
 
 -- data Inline = ...
 noInlineDataConName, inlineDataConName, inlinableDataConName :: Name
@@ -625,6 +660,17 @@ overlappingDataConName  = thCon (fsLit "Overlapping")  overlappingDataConKey
 overlapsDataConName     = thCon (fsLit "Overlaps")     overlapsDataConKey
 incoherentDataConName   = thCon (fsLit "Incoherent")   incoherentDataConKey
 
+-- data NamespaceSpecifier = ...
+noNamespaceSpecifierDataConName,
+  typeNamespaceSpecifierDataConName,
+  dataNamespaceSpecifierDataConName :: Name
+noNamespaceSpecifierDataConName =
+  thCon (fsLit "NoNamespaceSpecifier") noNamespaceSpecifierDataConKey
+typeNamespaceSpecifierDataConName =
+  thCon (fsLit "TypeNamespaceSpecifier") typeNamespaceSpecifierDataConKey
+dataNamespaceSpecifierDataConName =
+  thCon (fsLit "DataNamespaceSpecifier") dataNamespaceSpecifierDataConKey
+
 {- *********************************************************************
 *                                                                      *
                      Class keys
@@ -652,7 +698,7 @@ quoteClassKey = mkPreludeClassUnique 201
 expTyConKey, matchTyConKey, clauseTyConKey, qTyConKey, expQTyConKey,
     patTyConKey,
     stmtTyConKey, conTyConKey, typeQTyConKey, typeTyConKey,
-    tyVarBndrUnitTyConKey, tyVarBndrSpecTyConKey,
+    tyVarBndrUnitTyConKey, tyVarBndrSpecTyConKey, tyVarBndrVisTyConKey,
     decTyConKey, bangTypeTyConKey, varBangTypeTyConKey,
     fieldExpTyConKey, fieldPatTyConKey, nameTyConKey, patQTyConKey,
     funDepTyConKey, predTyConKey,
@@ -694,6 +740,7 @@ decsTyConKey            = mkPreludeTyConUnique 236
 tyVarBndrSpecTyConKey   = mkPreludeTyConUnique 237
 codeTyConKey            = mkPreludeTyConUnique 238
 modNameTyConKey         = mkPreludeTyConUnique 239
+tyVarBndrVisTyConKey    = mkPreludeTyConUnique 240
 
 {- *********************************************************************
 *                                                                      *
@@ -731,6 +778,13 @@ overlappingDataConKey  = mkPreludeDataConUnique 210
 overlapsDataConKey     = mkPreludeDataConUnique 211
 incoherentDataConKey   = mkPreludeDataConUnique 212
 
+-- data NamespaceSpecifier = ...
+noNamespaceSpecifierDataConKey,
+  typeNamespaceSpecifierDataConKey,
+  dataNamespaceSpecifierDataConKey :: Unique
+noNamespaceSpecifierDataConKey = mkPreludeDataConUnique 213
+typeNamespaceSpecifierDataConKey = mkPreludeDataConUnique 214
+dataNamespaceSpecifierDataConKey = mkPreludeDataConUnique 215
 {- *********************************************************************
 *                                                                      *
                      Id keys
@@ -741,7 +795,7 @@ incoherentDataConKey   = mkPreludeDataConUnique 212
 -- If you want to change this, make sure you check in GHC.Builtin.Names
 
 returnQIdKey, bindQIdKey, sequenceQIdKey, liftIdKey, newNameIdKey,
-    mkNameIdKey, mkNameG_vIdKey, mkNameG_dIdKey, mkNameG_tcIdKey,
+    mkNameIdKey, mkNameG_vIdKey, mkNameG_fldIdKey, mkNameG_dIdKey, mkNameG_tcIdKey,
     mkNameLIdKey, mkNameSIdKey, unTypeIdKey, unTypeCodeIdKey,
     unsafeCodeCoerceIdKey, liftTypedIdKey, mkModNameIdKey, mkNameQIdKey :: Unique
 returnQIdKey        = mkPreludeMiscIdUnique 200
@@ -761,6 +815,7 @@ liftTypedIdKey        = mkPreludeMiscIdUnique 214
 mkModNameIdKey        = mkPreludeMiscIdUnique 215
 unsafeCodeCoerceIdKey = mkPreludeMiscIdUnique 216
 mkNameQIdKey         = mkPreludeMiscIdUnique 217
+mkNameG_fldIdKey     = mkPreludeMiscIdUnique 218
 
 
 -- data Lit = ...
@@ -784,7 +839,7 @@ liftStringIdKey     = mkPreludeMiscIdUnique 230
 -- data Pat = ...
 litPIdKey, varPIdKey, tupPIdKey, unboxedTupPIdKey, unboxedSumPIdKey, conPIdKey,
   infixPIdKey, tildePIdKey, bangPIdKey, asPIdKey, wildPIdKey, recPIdKey,
-  listPIdKey, sigPIdKey, viewPIdKey :: Unique
+  listPIdKey, sigPIdKey, viewPIdKey, typePIdKey, invisPIdKey :: Unique
 litPIdKey         = mkPreludeMiscIdUnique 240
 varPIdKey         = mkPreludeMiscIdUnique 241
 tupPIdKey         = mkPreludeMiscIdUnique 242
@@ -800,6 +855,8 @@ recPIdKey         = mkPreludeMiscIdUnique 251
 listPIdKey        = mkPreludeMiscIdUnique 252
 sigPIdKey         = mkPreludeMiscIdUnique 253
 viewPIdKey        = mkPreludeMiscIdUnique 254
+typePIdKey        = mkPreludeMiscIdUnique 255
+invisPIdKey       = mkPreludeMiscIdUnique 256
 
 -- type FieldPat = ...
 fieldPatIdKey :: Unique
@@ -822,7 +879,7 @@ varEIdKey, conEIdKey, litEIdKey, appEIdKey, appTypeEIdKey, infixEIdKey,
     fromEIdKey, fromThenEIdKey, fromToEIdKey, fromThenToEIdKey,
     listEIdKey, sigEIdKey, recConEIdKey, recUpdEIdKey, staticEIdKey,
     unboundVarEIdKey, labelEIdKey, implicitParamVarEIdKey, mdoEIdKey,
-    getFieldEIdKey, projectionEIdKey :: Unique
+    getFieldEIdKey, projectionEIdKey, typeEIdKey :: Unique
 varEIdKey              = mkPreludeMiscIdUnique 270
 conEIdKey              = mkPreludeMiscIdUnique 271
 litEIdKey              = mkPreludeMiscIdUnique 272
@@ -832,7 +889,7 @@ infixEIdKey            = mkPreludeMiscIdUnique 275
 infixAppIdKey          = mkPreludeMiscIdUnique 276
 sectionLIdKey          = mkPreludeMiscIdUnique 277
 sectionRIdKey          = mkPreludeMiscIdUnique 278
-lamEIdKey              = mkPreludeMiscIdUnique 279
+lamEIdKey           = mkPreludeMiscIdUnique 279
 lamCaseEIdKey          = mkPreludeMiscIdUnique 280
 lamCasesEIdKey         = mkPreludeMiscIdUnique 281
 tupEIdKey              = mkPreludeMiscIdUnique 282
@@ -859,28 +916,29 @@ implicitParamVarEIdKey = mkPreludeMiscIdUnique 302
 mdoEIdKey              = mkPreludeMiscIdUnique 303
 getFieldEIdKey         = mkPreludeMiscIdUnique 304
 projectionEIdKey       = mkPreludeMiscIdUnique 305
+typeEIdKey             = mkPreludeMiscIdUnique 306
 
 -- type FieldExp = ...
 fieldExpIdKey :: Unique
-fieldExpIdKey       = mkPreludeMiscIdUnique 306
+fieldExpIdKey       = mkPreludeMiscIdUnique 307
 
 -- data Body = ...
 guardedBIdKey, normalBIdKey :: Unique
-guardedBIdKey     = mkPreludeMiscIdUnique 307
-normalBIdKey      = mkPreludeMiscIdUnique 308
+guardedBIdKey     = mkPreludeMiscIdUnique 308
+normalBIdKey      = mkPreludeMiscIdUnique 309
 
 -- data Guard = ...
 normalGEIdKey, patGEIdKey :: Unique
-normalGEIdKey     = mkPreludeMiscIdUnique 309
-patGEIdKey        = mkPreludeMiscIdUnique 310
+normalGEIdKey     = mkPreludeMiscIdUnique 310
+patGEIdKey        = mkPreludeMiscIdUnique 311
 
 -- data Stmt = ...
 bindSIdKey, letSIdKey, noBindSIdKey, parSIdKey, recSIdKey :: Unique
-bindSIdKey       = mkPreludeMiscIdUnique 311
-letSIdKey        = mkPreludeMiscIdUnique 312
-noBindSIdKey     = mkPreludeMiscIdUnique 313
-parSIdKey        = mkPreludeMiscIdUnique 314
-recSIdKey        = mkPreludeMiscIdUnique 315
+bindSIdKey       = mkPreludeMiscIdUnique 312
+letSIdKey        = mkPreludeMiscIdUnique 313
+noBindSIdKey     = mkPreludeMiscIdUnique 314
+parSIdKey        = mkPreludeMiscIdUnique 315
+recSIdKey        = mkPreludeMiscIdUnique 316
 
 -- data Dec = ...
 funDIdKey, valDIdKey, dataDIdKey, newtypeDIdKey, tySynDIdKey, classDIdKey,
@@ -889,9 +947,10 @@ funDIdKey, valDIdKey, dataDIdKey, newtypeDIdKey, tySynDIdKey, classDIdKey,
     pragRuleDIdKey, pragAnnDIdKey, defaultSigDIdKey, dataFamilyDIdKey,
     openTypeFamilyDIdKey, closedTypeFamilyDIdKey, dataInstDIdKey,
     newtypeInstDIdKey, tySynInstDIdKey, standaloneDerivWithStrategyDIdKey,
-    infixLDIdKey, infixRDIdKey, infixNDIdKey, roleAnnotDIdKey, patSynDIdKey,
-    patSynSigDIdKey, pragCompleteDIdKey, implicitParamBindDIdKey,
-    kiSigDIdKey, defaultDIdKey, pragOpaqueDIdKey, typeDataDIdKey :: Unique
+    infixLWithSpecDIdKey, infixRWithSpecDIdKey, infixNWithSpecDIdKey,
+    roleAnnotDIdKey, patSynDIdKey, patSynSigDIdKey, pragCompleteDIdKey,
+    implicitParamBindDIdKey, kiSigDIdKey, defaultDIdKey, pragOpaqueDIdKey,
+    typeDataDIdKey, pragSCCFunDKey, pragSCCFunNamedDKey :: Unique
 funDIdKey                         = mkPreludeMiscIdUnique 320
 valDIdKey                         = mkPreludeMiscIdUnique 321
 dataDIdKey                        = mkPreludeMiscIdUnique 322
@@ -914,9 +973,9 @@ dataInstDIdKey                    = mkPreludeMiscIdUnique 338
 newtypeInstDIdKey                 = mkPreludeMiscIdUnique 339
 tySynInstDIdKey                   = mkPreludeMiscIdUnique 340
 closedTypeFamilyDIdKey            = mkPreludeMiscIdUnique 341
-infixLDIdKey                      = mkPreludeMiscIdUnique 342
-infixRDIdKey                      = mkPreludeMiscIdUnique 343
-infixNDIdKey                      = mkPreludeMiscIdUnique 344
+infixLWithSpecDIdKey              = mkPreludeMiscIdUnique 342
+infixRWithSpecDIdKey              = mkPreludeMiscIdUnique 343
+infixNWithSpecDIdKey              = mkPreludeMiscIdUnique 344
 roleAnnotDIdKey                   = mkPreludeMiscIdUnique 345
 standaloneDerivWithStrategyDIdKey = mkPreludeMiscIdUnique 346
 defaultSigDIdKey                  = mkPreludeMiscIdUnique 347
@@ -928,6 +987,8 @@ kiSigDIdKey                       = mkPreludeMiscIdUnique 352
 defaultDIdKey                     = mkPreludeMiscIdUnique 353
 pragOpaqueDIdKey                  = mkPreludeMiscIdUnique 354
 typeDataDIdKey                    = mkPreludeMiscIdUnique 355
+pragSCCFunDKey                    = mkPreludeMiscIdUnique 356
+pragSCCFunNamedDKey               = mkPreludeMiscIdUnique 357
 
 -- type Cxt = ...
 cxtIdKey :: Unique
@@ -1022,6 +1083,10 @@ plainInvisTVIdKey, kindedInvisTVIdKey :: Unique
 plainInvisTVIdKey       = mkPreludeMiscIdUnique 482
 kindedInvisTVIdKey      = mkPreludeMiscIdUnique 483
 
+plainBndrTVIdKey, kindedBndrTVIdKey :: Unique
+plainBndrTVIdKey       = mkPreludeMiscIdUnique 484
+kindedBndrTVIdKey      = mkPreludeMiscIdUnique 485
+
 -- data Role = ...
 nominalRIdKey, representationalRIdKey, phantomRIdKey, inferRIdKey :: Unique
 nominalRIdKey          = mkPreludeMiscIdUnique 416
@@ -1106,6 +1171,11 @@ specifiedSpecKey, inferredSpecKey :: Unique
 specifiedSpecKey = mkPreludeMiscIdUnique 498
 inferredSpecKey  = mkPreludeMiscIdUnique 499
 
+-- data BndrVis = ...
+bndrReqKey, bndrInvisKey :: Unique
+bndrReqKey   = mkPreludeMiscIdUnique 800  -- TODO (int-index): make up some room in the 5** numberspace?
+bndrInvisKey = mkPreludeMiscIdUnique 801
+
 {-
 ************************************************************************
 *                                                                      *
@@ -1114,27 +1184,7 @@ inferredSpecKey  = mkPreludeMiscIdUnique 499
 ************************************************************************
 -}
 
-lift_RDR, liftTyped_RDR, mkNameG_dRDR, mkNameG_vRDR, unsafeCodeCoerce_RDR :: RdrName
+lift_RDR, liftTyped_RDR, unsafeCodeCoerce_RDR :: RdrName
 lift_RDR     = nameRdrName liftName
 liftTyped_RDR = nameRdrName liftTypedName
 unsafeCodeCoerce_RDR = nameRdrName unsafeCodeCoerceName
-mkNameG_dRDR = nameRdrName mkNameG_dName
-mkNameG_vRDR = nameRdrName mkNameG_vName
-
--- data Exp = ...
-conE_RDR, litE_RDR, appE_RDR, infixApp_RDR :: RdrName
-conE_RDR     = nameRdrName conEName
-litE_RDR     = nameRdrName litEName
-appE_RDR     = nameRdrName appEName
-infixApp_RDR = nameRdrName infixAppName
-
--- data Lit = ...
-stringL_RDR, intPrimL_RDR, wordPrimL_RDR, floatPrimL_RDR,
-    doublePrimL_RDR, stringPrimL_RDR, charPrimL_RDR :: RdrName
-stringL_RDR     = nameRdrName stringLName
-intPrimL_RDR    = nameRdrName intPrimLName
-wordPrimL_RDR   = nameRdrName wordPrimLName
-floatPrimL_RDR  = nameRdrName floatPrimLName
-doublePrimL_RDR = nameRdrName doublePrimLName
-stringPrimL_RDR = nameRdrName stringPrimLName
-charPrimL_RDR   = nameRdrName charPrimLName

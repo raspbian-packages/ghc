@@ -1,4 +1,3 @@
-{-# LANGUAGE BangPatterns #-}
 {-# OPTIONS_GHC -Wno-incomplete-uni-patterns   #-}
 
 -- | Tidying types and coercions for printing in error messages.
@@ -228,7 +227,8 @@ tidyCo env@(_, subst) co
     go (GRefl r ty mco)      = (GRefl r $! tidyType env ty) $! go_mco mco
     go (TyConAppCo r tc cos) = TyConAppCo r tc $! strictMap go cos
     go (AppCo co1 co2)       = (AppCo $! go co1) $! go co2
-    go (ForAllCo tv h co)    = ((ForAllCo $! tvp) $! (go h)) $! (tidyCo envp co)
+    go (ForAllCo tv visL visR h co)
+      = ((((ForAllCo $! tvp) $! visL) $! visR) $! (go h)) $! (tidyCo envp co)
                                where (envp, tvp) = tidyVarBndr env tv
             -- the case above duplicates a bit of work in tidying h and the kind
             -- of tv. But the alternative is to use coercionKind, which seems worse.
@@ -252,7 +252,6 @@ tidyCo env@(_, subst) co
     go_prov (PhantomProv co)    = PhantomProv $! go co
     go_prov (ProofIrrelProv co) = ProofIrrelProv $! go co
     go_prov p@(PluginProv _)    = p
-    go_prov p@(CorePrepProv _)  = p
 
 tidyCos :: TidyEnv -> [Coercion] -> [Coercion]
 tidyCos env = strictMap (tidyCo env)

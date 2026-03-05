@@ -12,10 +12,12 @@ import GHC.Prelude
 import GHC.Parser.Errors.Basic
 import GHC.Types.Hint
 
+import GHC.Core.FamInstEnv (FamFlavor(..))
+import GHC.Core.TyCon
+import GHC.Core.TyCo.Rep     ( mkVisFunTyMany )
 import GHC.Hs.Expr ()   -- instance Outputable
-import {-# SOURCE #-} GHC.Tc.Types.Origin ( ClsInstOrQC(..) )
 import GHC.Types.Id
-import GHC.Types.Name (NameSpace, pprDefinedAt, occNameSpace, pprNameSpace, isValNameSpace, nameModule)
+import GHC.Types.Name
 import GHC.Types.Name.Reader (RdrName,ImpDeclSpec (..), rdrNameOcc, rdrNameSpace)
 import GHC.Types.SrcLoc (SrcSpan(..), srcSpanStartLine)
 import GHC.Unit.Module.Imported (ImportedModsVal(..))
@@ -125,26 +127,28 @@ instance Outputable GhcHint where
       -> text "To use (or export) this operator in"
             <+> text "modules with StarIsType,"
          $$ text "    including the definition module, you must qualify it."
-    SuggestTypeSignatureForm
-      -> text "A type signature should be of form <variables> :: <type>"
+    SuggestTypeSignatureRemoveQualifier
+      -> text "Perhaps you meant to omit the qualifier"
     SuggestAddToHSigExportList _name mb_mod
       -> let header = text "Try adding it to the export list of"
          in case mb_mod of
               Nothing -> header <+> text "the hsig file."
               Just mod -> header <+> ppr (moduleName mod) <> text "'s hsig file."
-    SuggestFixOrphanInstance
-      -> vcat [ text "Move the instance declaration to the module of the class or of the type, or"
+    SuggestFixOrphanInst { isFamilyInstance = mbFamFlavor }
+      -> vcat [ text "Move the instance declaration to the module of the" <+> what <+> text "or of the type, or"
               , text "wrap the type with a newtype and declare the instance on the new type."
               ]
+      where
+        what = case mbFamFlavor of
+          Nothing                  -> text "class"
+          Just  SynFamilyInst      -> text "type family"
+          Just (DataFamilyInst {}) -> text "data family"
     SuggestAddStandaloneDerivation
       -> text "Use a standalone deriving declaration instead"
+    SuggestAddStandaloneKindSignature name
+      -> text "Add a standalone kind signature for" <+> quotes (ppr name)
     SuggestFillInWildcardConstraint
       -> text "Fill in the wildcard constraint yourself"
-    SuggestRenameForall
-      -> vcat [ text "Consider using another name, such as"
-              , quotes (text "forAll") <> comma <+>
-                quotes (text "for_all") <> comma <+> text "or" <+>
-                quotes (text "forall_") <> dot ]
     SuggestAppropriateTHTick ns
       -> text "Perhaps use a" <+> how_many <+> text "tick"
         where
@@ -193,10 +197,8 @@ instance Outputable GhcHint where
         whose | null parents = empty
               | otherwise    = text "belonging to the type" <> plural parents
                                  <+> pprQuotedList parents
-    ImportSuggestion import_suggestion
-      -> pprImportSuggestion import_suggestion
-    SuggestImportingDataCon
-      -> text "Import the data constructor to bring it into scope"
+    ImportSuggestion occ_name import_suggestion
+      -> pprImportSuggestion occ_name import_suggestion
     SuggestPlacePragmaInHeader
       -> text "Perhaps you meant to place it in the module header?"
       $$ text "The module header is the section at the top of the file, before the" <+> quotes (text "module") <+> text "keyword"
@@ -207,14 +209,54 @@ instance Outputable GhcHint where
            <+> quotes (ppr name) <+> text "has an INLINABLE pragma"
          where
            mod = nameModule name
-    LoopySuperclassSolveHint pty cls_or_qc
-      -> vcat [ text "Add the constraint" <+> quotes (ppr pty) <+> text "to the" <+> what <> comma
-              , text "even though it seems logically implied by other constraints in the context." ]
-        where
-          what :: SDoc
-          what = case cls_or_qc of
-            IsClsInst -> text "instance context"
-            IsQC {}   -> text "context of the quantified constraint"
+    SuggestRenameTypeVariable
+      -> text "Consider renaming the type variable."
+    SuggestExplicitBidiPatSyn name pat args
+      -> hang (text "Instead use an explicitly bidirectional"
+               <+> text "pattern synonym, e.g.")
+            2 (hang (text "pattern" <+> pp_name <+> pp_args <+> larrow
+                     <+> ppr pat <+> text "where")
+                  2 (pp_name <+> pp_args <+> equals <+> text "..."))
+         where
+           pp_name = ppr name
+           pp_args = hsep (map ppr args)
+    SuggestSafeHaskell
+      -> text "Enable Safe Haskell through either Safe, Trustworthy or Unsafe."
+    SuggestRemoveRecordWildcard
+      -> text "Omit the" <+> quotes (text "..")
+    SuggestIncreaseReductionDepth ->
+      vcat
+        [ text "Use -freduction-depth=0 to disable this check"
+        , text "(any upper bound you could choose might fail unpredictably with"
+        , text " minor updates to GHC, so disabling the check is recommended if"
+        , text " you're sure that type checking should terminate)" ]
+    SuggestMoveNonCanonicalDefinition lhs rhs refURL ->
+      text "Move definition from" <+>
+      quotes (pprPrefixUnqual rhs) <+>
+      text "to" <+> quotes (pprPrefixUnqual lhs) $$
+      text "See also:" <+> text refURL
+    SuggestRemoveNonCanonicalDefinition lhs rhs refURL ->
+      text "Either remove definition for" <+>
+      quotes (pprPrefixUnqual lhs) <+> text "(recommended)" <+>
+      text "or define as" <+>
+      quotes (pprPrefixUnqual lhs <+> text "=" <+> pprPrefixUnqual rhs) $$
+      text "See also:" <+> text refURL
+    SuggestEtaReduceAbsDataTySyn tc
+      -> text "If possible, eta-reduce the type synonym" <+> ppr_tc <+> text "so that it is nullary."
+        where ppr_tc = quotes (ppr $ tyConName tc)
+    RemindRecordMissingField x r a ->
+      text "NB: There is no field selector" <+> ppr_sel
+        <+> text "in scope for record type" <+> ppr_r
+      where ppr_sel = quotes (ftext x <+> dcolon <+> ppr_arr_r_a)
+            ppr_arr_r_a = ppr $ mkVisFunTyMany r a
+            ppr_r = quotes $ ppr r
+    SuggestBindTyVarOnLhs tv
+      -> text "Bind" <+> quotes (ppr tv) <+> text "on the LHS of the type declaration"
+    SuggestAnonymousWildcard
+      -> text "Use an anonymous wildcard" <+> quotes (text "_")
+    SuggestExplicitQuantification tv
+      -> hsep [ text "Use an explicit", quotes (text "forall")
+              , text "to quantify over", quotes (ppr tv) ]
     SuggestBindTyVarExplicitly tv
       -> text "bind" <+> quotes (ppr tv)
          <+> text "explicitly with" <+> quotes (char '@' <> ppr tv)
@@ -223,69 +265,110 @@ perhapsAsPat :: SDoc
 perhapsAsPat = text "Perhaps you meant an as-pattern, which must not be surrounded by whitespace"
 
 -- | Pretty-print an 'ImportSuggestion'.
-pprImportSuggestion :: ImportSuggestion -> SDoc
-pprImportSuggestion (CouldImportFrom mods occ_name)
+pprImportSuggestion :: OccName -> ImportSuggestion -> SDoc
+pprImportSuggestion occ_name (CouldImportFrom mods)
   | (mod, imv) NE.:| [] <- mods
   = fsep
-      [ text "Perhaps you want to add"
+      [ text "Add"
       , quotes (ppr occ_name)
       , text "to the import list"
       , text "in the import of"
       , quotes (ppr mod)
-      , parens (ppr (imv_span imv)) <> dot
+      , parens (text "at" <+> ppr (imv_span imv)) <> dot
       ]
   | otherwise
   = fsep
-      [ text "Perhaps you want to add"
+      [ text "Add"
       , quotes (ppr occ_name)
       , text "to one of these import lists:"
       ]
     $$
     nest 2 (vcat
-        [ quotes (ppr mod) <+> parens (ppr (imv_span imv))
+        [ quotes (ppr mod) <+> parens (text "at" <+> ppr (imv_span imv))
         | (mod,imv) <- NE.toList mods
         ])
-pprImportSuggestion (CouldUnhideFrom mods occ_name)
+pprImportSuggestion occ_name (CouldUnhideFrom mods)
   | (mod, imv) NE.:| [] <- mods
   = fsep
-      [ text "Perhaps you want to remove"
+      [ text "Remove"
       , quotes (ppr occ_name)
       , text "from the explicit hiding list"
       , text "in the import of"
       , quotes (ppr mod)
-      , parens (ppr (imv_span imv)) <> dot
+      , parens (text "at" <+> ppr (imv_span imv)) <> dot
       ]
   | otherwise
   = fsep
-      [ text "Perhaps you want to remove"
+      [ text "Remove"
       , quotes (ppr occ_name)
       , text "from the hiding clauses"
       , text "in one of these imports:"
       ]
     $$
     nest 2 (vcat
-        [ quotes (ppr mod) <+> parens (ppr (imv_span imv))
+        [ quotes (ppr mod) <+> parens (text "at" <+> ppr (imv_span imv))
         | (mod,imv) <- NE.toList mods
         ])
+pprImportSuggestion occ_name (CouldAddTypeKeyword mod)
+  = vcat [ text "Add the" <+> quotes (text "type")
+          <+> text "keyword to the import statement:"
+         , nest 2 $ text "import"
+            <+> ppr mod
+            <+> parens_sp (text "type" <+> pprPrefixOcc occ_name)
+         ]
+  where
+    parens_sp d = parens (space <> d <> space)
+pprImportSuggestion occ_name (CouldRemoveTypeKeyword mod)
+  = vcat [ text "Remove the" <+> quotes (text "type")
+             <+> text "keyword from the import statement:"
+         , nest 2 $ text "import"
+             <+> ppr mod
+             <+> parens_sp (pprPrefixOcc occ_name) ]
+  where
+    parens_sp d = parens (space <> d <> space)
+pprImportSuggestion dc_occ (ImportDataCon Nothing parent_occ)
+  = text "Import the data constructor" <+> quotes (ppr dc_occ) <+>
+    text "of" <+> quotes (ppr parent_occ)
+pprImportSuggestion dc_occ (ImportDataCon (Just (mod, patsyns_enabled)) parent_occ)
+  = vcat $ [ text "Use"
+           , nest 2 $ text "import"
+               <+> ppr mod
+               <+> parens_sp (pprPrefixOcc parent_occ <> parens_sp (pprPrefixOcc dc_occ))
+           , text "or"
+           , nest 2 $ text "import"
+               <+> ppr mod
+               <+> parens_sp (pprPrefixOcc parent_occ <> text "(..)")
+           ] ++ if patsyns_enabled
+                then [ text "or"
+                     , nest 2 $ text "import"
+                         <+> ppr mod
+                         <+> parens_sp (text "pattern" <+> pprPrefixOcc dc_occ)
+                     ]
+                else []
+  where
+    parens_sp d = parens (space <> d <> space)
 
 -- | Pretty-print a 'SimilarName'.
 pprSimilarName :: NameSpace -> SimilarName -> SDoc
 pprSimilarName _ (SimilarName name)
   = quotes (ppr name) <+> parens (pprDefinedAt name)
 pprSimilarName tried_ns (SimilarRdrName rdr_name how_in_scope)
-  = case how_in_scope of
-      LocallyBoundAt loc ->
-        pp_ns rdr_name <+> quotes (ppr rdr_name) <+> loc'
-          where
-            loc' = case loc of
-              UnhelpfulSpan l -> parens (ppr l)
-              RealSrcSpan l _ -> parens (text "line" <+> int (srcSpanStartLine l))
-      ImportedBy is ->
-        pp_ns rdr_name <+> quotes (ppr rdr_name) <+>
-        parens (text "imported from" <+> ppr (is_mod is))
-
+  = pp_ns rdr_name <+> quotes (ppr rdr_name) <+> loc
   where
+    loc = case how_in_scope of
+      Nothing -> empty
+      Just scope -> case scope of
+        LocallyBoundAt loc ->
+          case loc of
+            UnhelpfulSpan l -> parens (ppr l)
+            RealSrcSpan l _ -> parens (text "line" <+> int (srcSpanStartLine l))
+        ImportedBy is ->
+          parens (text "imported from" <+> ppr (moduleName $ is_mod is))
     pp_ns :: RdrName -> SDoc
     pp_ns rdr | ns /= tried_ns = pprNameSpace ns
               | otherwise      = empty
       where ns = rdrNameSpace rdr
+
+pprPrefixUnqual :: Name -> SDoc
+pprPrefixUnqual name =
+  pprPrefixOcc (getOccName name)

@@ -4,6 +4,7 @@ let
   sources = import ./nix/sources.nix;
   nixpkgsSrc = sources.nixpkgs;
   pkgs = import nixpkgsSrc { inherit system; };
+  hostPkgs = import nixpkgsSrc { };
 in
 
 let
@@ -13,23 +14,25 @@ let
   targetTriple = pkgs.stdenv.targetPlatform.config;
 
   ghcBindists = let version = ghc.version; in {
-    aarch64-darwin = pkgs.fetchurl {
+    aarch64-darwin = hostPkgs.fetchurl {
       url = "https://downloads.haskell.org/ghc/${version}/ghc-${version}-aarch64-apple-darwin.tar.xz";
-      sha256 = "sha256-tQUHsingxBizLktswGAoi6lJf92RKWLjsHB9CisANlg=";
+      sha256 = "sha256-kTQEdgVAG60I2KhFvOkqzyJRVHU8/Ivd8KKrqob0r0I=";
     };
-    x86_64-darwin = pkgs.fetchurl {
+    x86_64-darwin = hostPkgs.fetchurl {
       url = "https://downloads.haskell.org/ghc/${version}/ghc-${version}-x86_64-apple-darwin.tar.xz";
-      sha256 = "sha256-OjXjVe+ZODDCc/hqtihqqz6CX25TKI0ZgORzkR5O3pQ=";
+      sha256 = "sha256-tnBEEN2TujA3ZVq/taTVzg2/+Bq3h9v4Yu4vz3nfYtw=";
     };
+
   };
 
   ghc = pkgs.stdenv.mkDerivation rec {
-    version = "9.4.4";
+    version = "9.6.6";
     name = "ghc";
     src = ghcBindists.${pkgs.stdenv.hostPlatform.system};
     configureFlags = [
       "CC=/usr/bin/clang"
       "CLANG=/usr/bin/clang"
+      "AR=/usr/bin/ar"
       "LLC=${llvm}/bin/llc"
       "OPT=${llvm}/bin/opt"
       "CONF_CC_OPTS_STAGE2=--target=${targetTriple}"
@@ -51,19 +54,6 @@ let
       chmod +x configure
       cat configure
 
-    '';
-
-    # N.B. Work around #20253.
-    nativeBuildInputs = [ pkgs.gnused ];
-    postInstallPhase = ''
-      settings="$out/lib/ghc-${version}/settings"
-      sed -i -e "s%\"llc\"%\"${llvm}/bin/llc\"%" $settings
-      sed -i -e "s%\"opt\"%\"${llvm}/bin/opt\"%" $settings
-      sed -i -e "s%\"clang\"%\"/usr/bin/clang\"%" $settings
-      sed -i -e 's%("C compiler command", "")%("C compiler command", "/usr/bin/clang")%' $settings
-      sed -i -e 's%("C compiler flags", "")%("C compiler flags", "--target=${targetTriple}")%' $settings
-      sed -i -e 's%("C++ compiler flags", "")%("C++ compiler flags", "--target=${targetTriple}")%' $settings
-      sed -i -e 's%("C compiler link flags", "")%("C compiler link flags", "--target=${targetTriple}")%' $settings
     '';
 
     # Sanity check: verify that we can compile hello world.
@@ -92,7 +82,7 @@ let
     };
   fonts = with pkgs; makeFontsConf { fontDirectories = [ dejavu_fonts ]; };
 
-  llvm = pkgs.llvm_11;
+  llvm = pkgs.llvm_15;
 in
 pkgs.writeTextFile {
   name = "toolchain";
@@ -113,6 +103,8 @@ pkgs.writeTextFile {
     export CABAL="$CABAL_INSTALL"
 
     sdk_path="$(xcrun --sdk macosx --show-sdk-path)"
-    export CONFIGURE_ARGS="$CONFIGURE_ARGS --with-ffi-libraries=$sdk_path/usr/lib --with-ffi-includes=$sdk_path/usr/include/ffi --build=${targetTriple}"
+    : ''${CONFIGURE_ARGS:=}
+    CONFIGURE_ARGS+="''${CONFIGURE_ARGS:+ }--with-ffi-libraries=$sdk_path/usr/lib --with-ffi-includes=$sdk_path/usr/include/ffi --build=${targetTriple}"
+    export CONFIGURE_ARGS
   '';
 }

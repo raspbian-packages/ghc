@@ -4,8 +4,10 @@ fixity environment during renaming.
 -}
 
 module GHC.Rename.Fixity
-   ( MiniFixityEnv
+   ( MiniFixityEnv(..)
    , addLocalFixities
+   , lookupMiniFixityEnv
+   , emptyMiniFixityEnv
    , lookupFixityRn
    , lookupFixityRn_help
    , lookupFieldFixityRn
@@ -24,7 +26,6 @@ import GHC.Unit.Module.ModIface
 import GHC.Types.Fixity.Env
 import GHC.Types.Name
 import GHC.Types.Name.Env
-import GHC.Types.Name.Reader
 import GHC.Types.Fixity
 import GHC.Types.SourceText
 import GHC.Types.SrcLoc
@@ -64,31 +65,60 @@ deprecation declarations, and lookup of names in GHCi.
 -}
 
 --------------------------------
-type MiniFixityEnv = FastStringEnv (Located Fixity)
-        -- Mini fixity env for the names we're about
-        -- to bind, in a single binding group
-        --
-        -- It is keyed by the *FastString*, not the *OccName*, because
-        -- the single fixity decl       infix 3 T
-        -- affects both the data constructor T and the type constructor T
-        --
-        -- We keep the location so that if we find
-        -- a duplicate, we can report it sensibly
+
+-- | Mini fixity env for the names we're about
+-- to bind, in a single binding group
+--
+-- It is keyed by the *FastString*, not the *OccName*, because
+-- the single fixity decl       @infix 3 T@
+-- affects both the data constructor T and the type constructor T
+--
+-- We keep the location so that if we find
+-- a duplicate, we can report it sensibly
+--
+-- Fixity declarations may influence names in a single namespace by using
+-- a type or data specifier, e.g. in:
+--
+-- >  data a :*: b = a :*: b
+-- >  infix 3 type :*:
+--
+-- To handle that correctly, MiniFixityEnv contains separate
+-- fields for type-level and data-level names.
+-- If no namespace specifier is provided, the declaration will
+-- populate both the type-level and data-level fields.
+data MiniFixityEnv = MFE
+  { mfe_data_level_names :: FastStringEnv (Located Fixity)
+  , mfe_type_level_names :: FastStringEnv (Located Fixity)
+  }
 
 --------------------------------
 -- Used for nested fixity decls to bind names along with their fixities.
 -- the fixities are given as a UFM from an OccName's FastString to a fixity decl
 
 addLocalFixities :: MiniFixityEnv -> [Name] -> RnM a -> RnM a
-addLocalFixities mini_fix_env names thing_inside
+addLocalFixities env names thing_inside
   = extendFixityEnv (mapMaybe find_fixity names) thing_inside
   where
-    find_fixity name
-      = case lookupFsEnv mini_fix_env (occNameFS occ) of
+    find_fixity name = case lookupMiniFixityEnv env name of
           Just lfix -> Just (name, FixItem occ (unLoc lfix))
           Nothing   -> Nothing
       where
         occ = nameOccName name
+
+lookupMiniFixityEnv :: MiniFixityEnv -> Name -> Maybe (Located Fixity)
+lookupMiniFixityEnv MFE{mfe_data_level_names, mfe_type_level_names} name
+  | isValNameSpace namespace = find_fixity_in_env mfe_data_level_names name
+  | otherwise                = find_fixity_in_env mfe_type_level_names name
+  where
+    namespace = nameNameSpace name
+
+    find_fixity_in_env mini_fix_env name
+      = lookupFsEnv mini_fix_env (occNameFS occ)
+      where
+        occ = nameOccName name
+
+emptyMiniFixityEnv :: MiniFixityEnv
+emptyMiniFixityEnv = MFE emptyFsEnv emptyFsEnv
 
 {-
 --------------------------------
@@ -107,10 +137,7 @@ lookupFixity is a bit strange.
 -}
 
 lookupFixityRn :: Name -> RnM Fixity
-lookupFixityRn name = lookupFixityRn' name (nameOccName name)
-
-lookupFixityRn' :: Name -> OccName -> RnM Fixity
-lookupFixityRn' name = fmap snd . lookupFixityRn_help' name
+lookupFixityRn = fmap snd . lookupFixityRn_help
 
 -- | 'lookupFixityRn_help' returns @(True, fixity)@ if it finds a 'Fixity'
 -- in a local environment or from an interface file. Otherwise, it returns
@@ -118,13 +145,7 @@ lookupFixityRn' name = fmap snd . lookupFixityRn_help' name
 -- user-supplied fixity declarations).
 lookupFixityRn_help :: Name
                     -> RnM (Bool, Fixity)
-lookupFixityRn_help name =
-    lookupFixityRn_help' name (nameOccName name)
-
-lookupFixityRn_help' :: Name
-                     -> OccName
-                     -> RnM (Bool, Fixity)
-lookupFixityRn_help' name occ
+lookupFixityRn_help name
   | isUnboundName name
   = return (False, Fixity NoSourceText minPrecedence InfixL)
     -- Minimise errors from unbound names; eg
@@ -144,6 +165,7 @@ lookupFixityRn_help' name occ
          then return (False, defaultFixity)
          else lookup_imported } } }
   where
+    occ = nameOccName name
     lookup_imported
       -- For imported names, we have to get their fixities by doing a
       -- loadInterfaceForName, and consulting the Ifaces that comes back
@@ -180,10 +202,5 @@ lookupFixityRn_help' name occ
 lookupTyFixityRn :: LocatedN Name -> RnM Fixity
 lookupTyFixityRn = lookupFixityRn . unLoc
 
--- | Look up the fixity of an occurrence of a record field selector.
--- We use 'lookupFixityRn'' so that we can specify the 'OccName' as
--- the field label, which might be different to the 'OccName' of the
--- selector 'Name' if @DuplicateRecordFields@ is in use (#1173).
 lookupFieldFixityRn :: FieldOcc GhcRn -> RnM Fixity
-lookupFieldFixityRn (FieldOcc n lrdr)
-  = lookupFixityRn' n (rdrNameOcc (unLoc lrdr))
+lookupFieldFixityRn (FieldOcc n _) = lookupFixityRn n

@@ -1,3 +1,5 @@
+{-# LANGUAGE GADTs #-}
+
 module Rules.Gmp (gmpRules, gmpBuildPath, gmpObjects) where
 
 import Base
@@ -9,7 +11,7 @@ import Target
 import Utilities
 import Hadrian.BuildPath
 import Hadrian.Expression
-import Settings.Builders.Common (cArgs)
+import Settings.Builders.Common (cArgs, getStagedCCFlags)
 
 -- | Build in-tree GMP library objects (if GmpInTree flag is set) and return
 -- their paths.
@@ -96,7 +98,8 @@ gmpRules = do
         --  - <root>/stageN/gmp/gmp.h
         --  - <root>/stageN/gmp/libgmp.a
         --  - <root>/stageN/gmp/objs/*.o (unpacked objects from libgmp.a)
-        [gmpPath -/- "libgmp.a", gmpPath -/- "gmp.h"] &%> \[lib,header] -> do
+        (gmpPath -/- "libgmp.a" :& gmpPath -/- "gmp.h" :& Nil) &%>
+          \( lib :& header :& _) -> do
             let gmpP = takeDirectory lib
             ctx <- makeGmpPathContext gmpP
             -- build libgmp.a via gmp's Makefile
@@ -119,7 +122,7 @@ gmpRules = do
             let gmpBuildP = takeDirectory mk
                 gmpP      = takeDirectory gmpBuildP
             ctx <- makeGmpPathContext gmpP
-            cFlags <- interpretInContext ctx $ mconcat [ cArgs, getStagedSettingList ConfCcArgs ]
+            cFlags <- interpretInContext ctx $ mconcat [ cArgs, getStagedCCFlags ]
             env <- sequence
                      [ builderEnvironment "CC" $ Cc CompileC (stage ctx)
                      , return . AddEnv "CFLAGS" $ unwords cFlags
@@ -133,28 +136,24 @@ gmpRules = do
         -- Extract in-tree GMP sources and apply patches. Produce
         --  - <root>/stageN/gmp/gmpbuild/Makefile.in
         --  - <root>/stageN/gmp/gmpbuild/configure
-        [gmpPath -/- "gmpbuild/Makefile.in", gmpPath -/- "gmpbuild/configure"] &%> \[mkIn,_] -> do
+        (gmpPath -/- "gmpbuild/Makefile.in" :& gmpPath -/- "gmpbuild/configure" :& Nil)
+           &%> \( mkIn :& _ ) -> do
             top <- topDirectory
             let gmpBuildP = takeDirectory mkIn
                 gmpP      = takeDirectory gmpBuildP
             ctx <- makeGmpPathContext gmpP
             removeDirectory gmpBuildP
-            -- Note: We use a tarball like gmp-4.2.4-nodoc.tar.bz2, which is
-            -- gmp-4.2.4.tar.bz2 repacked without the doc/ directory contents.
+            -- Note: We use a tarball like gmp-4.2.4-nodoc.tar.xz, which is
+            -- gmp-4.2.4.tar.xz repacked without the doc/ directory contents.
             -- That's because the doc/ directory contents are under the GFDL,
             -- which causes problems for Debian.
             tarball <- unifyPath . fromSingleton "Exactly one GMP tarball is expected"
-                   <$> getDirectoryFiles top [gmpBase -/- "gmp-tarballs/gmp*.tar.bz2"]
+                   <$> getDirectoryFiles top [gmpBase -/- "gmp-tarballs/gmp*.tar.xz"]
 
             withTempDir $ \dir -> do
                 let tmp = unifyPath dir
                 need [top -/- tarball]
                 build $ target ctx (Tar Extract) [top -/- tarball] [tmp]
-
-                let patch     = gmpBase -/- "gmpsrc.patch"
-                    patchName = takeFileName patch
-                copyFile patch $ tmp -/- patchName
-                applyPatch tmp patchName
 
                 let name    = dropExtension . dropExtension $ takeFileName tarball
                     unpack  = fromMaybe . error $ "gmpRules: expected suffix "

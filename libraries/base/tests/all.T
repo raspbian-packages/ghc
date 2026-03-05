@@ -14,6 +14,7 @@ def normalise_quotes (str):
 #--------------------------------------
 test('SystemInfoTest', normal, compile_and_run, [''])
 test('readFloat', exit_code(1), compile_and_run, [''])
+test('read-float-double', normal, compile_and_run, [''])
 test('enumDouble', normal, compile_and_run, [''])
 test('enumRatio', normal, compile_and_run, [''])
 test('enumNumeric', normal, compile_and_run, [''])
@@ -80,8 +81,9 @@ test('length001',
      # stack limit and mark it as failing under a few conditions.
      [extra_run_opts('+RTS -K8m -RTS'),
      expect_fail_for(['normal', 'threaded1', 'llvm', 'nonmoving', 'nonmoving_thr', 'nonmoving_thr_ghc']),
-     # JS doesn't support stack limit so the test sometimes passes just fine. We decrease the timeout duration to force the failure.
-     when(js_arch(), run_timeout_multiplier(0.2))],
+     # JS doesn't support stack limit so the test sometimes passes just fine. Therefore the test is
+     # marked as fragile.
+     when(js_arch(), fragile(22921))],
      compile_and_run, [''])
 
 test('ratio001', 	normal, compile_and_run, [''])
@@ -96,11 +98,11 @@ test('addr001',		normal, compile_and_run, [''])
 test('dynamic001',      normal, compile_and_run, [''])
 test('dynamic002',      normal, compile_and_run, [''])
 test('dynamic003',      extra_run_opts('+RTS -K32m -RTS'), compile_and_run, [''])
-test('dynamic004',      omit_ways(['normal', 'threaded1', 'ghci']), compile_and_run, [''])
+test('dynamic004',      omit_ways(['normal', 'threaded1']), compile_and_run, [''])
 test('dynamic005',      normal, compile_and_run, [''])
 
 enum_setups = [when(fast(), skip)]
-def enum_test(name):
+def enum_test(name, omit):
     """
     These tests have a funky Python preprocessor which require some headstands
     to run on Windows.
@@ -108,18 +110,20 @@ def enum_test(name):
     if opsys('mingw32'):
         test(name,
              [when(opsys('mingw32'), extra_files(['enum_processor.bat'])),
+              omit_ways(omit),
               extra_files(['enum_processor.py'])],
              compile_and_run,
              ['-F -pgmF ./enum_processor.bat'])
     else:
         test(name,
-             [extra_files(['enum_processor.py'])],
+             [extra_files(['enum_processor.py']),
+              omit_ways(omit)],
              compile_and_run,
              ['-F -pgmF ./enum_processor.py'])
 
-enum_test('enum01')
-enum_test('enum02')
-enum_test('enum03')
+enum_test('enum01', ['ghci-opt'])
+enum_test('enum02', [])
+enum_test('enum03', [])
 test('enum04', normal, compile_and_run, [''])
 
 test('exceptionsrun001',        normal, compile_and_run, [''])
@@ -158,7 +162,7 @@ test('T2528', normal, compile_and_run, [''])
 # May 2014: seems to work on msys2
 # May 2018: The behavior of printf seems very implementation dependent.
 #     so let's normalise the output.
-test('T4006', [js_broken(22349), normalise_fun(normalise_quotes), req_process], compile_and_run, [''])
+test('T4006', [normalise_fun(normalise_quotes), req_process], compile_and_run, [''])
 
 test('T5943', normal, compile_and_run, [''])
 test('T5962', normal, compile_and_run, [''])
@@ -169,7 +173,13 @@ test('qsemn001', normal, compile_and_run, [''])
 
 test('T7457', normal, compile_and_run, [''])
 
-test('T7773', [when(opsys('mingw32'), skip), js_broken(22261)], compile_and_run, [''])
+test('T7773',
+     [when(opsys('mingw32'), skip),
+      js_broken(22261),
+      expect_broken_for(23272, ['ghci-opt']) # unclear
+     ],
+     compile_and_run,
+     [''])
 # Andreas says that T7773 will not (and should not) work on Windows
 
 # Tests for kind-polymorphic Category
@@ -178,13 +188,13 @@ test('CatEntail', normal, compile, [''])
 
 # When running with WAY=ghci and profiled ways, T7653 uses a lot of memory.
 test('T7653', [when(opsys('mingw32'), skip),
-               omit_ways(prof_ways+['ghci'])], compile_and_run, [''])
+               omit_ways(prof_ways + ghci_ways)], compile_and_run, [''])
 test('T7787', normal, compile_and_run, [''])
 
 test('topHandler01', [when(opsys('mingw32'), skip), js_broken(22261), req_process], compile_and_run, [''])
 test('topHandler02',
      [when(opsys('mingw32'), skip),
-      omit_ways(['ghci']),
+      omit_ghci,
       signal_exit_code(2),
      js_broken(22261)
      ], compile_and_run, [''])
@@ -223,11 +233,15 @@ test('T9681', normal, compile_fail, [''])
 #   Probably something like 1s is already enough, but I don't know enough to
 #   make an educated guess how long it needs to be guaranteed to reach the C
 #   call."
+#
+# We ignore stderr since the test itself may print "Killed: 9" (see #24361);
+# all we care about is that the test timed out, for which the
+# exit_code check is sufficient.
 test('T8089',
-     [exit_code(99), run_timeout_multiplier(0.01)],
+     [exit_code(99), ignore_stderr, run_timeout_multiplier(0.01)],
      compile_and_run, [''])
 test('T8684', expect_broken(8684), compile_and_run, [''])
-test('hWaitForInput-accurate-stdin', [js_broken(22349), expect_broken_for(16535, threaded_ways), omit_ways(['ghci']), req_process], compile_and_run, [''])
+test('hWaitForInput-accurate-stdin', [js_broken(22349), expect_broken_for(16535, threaded_ways), req_process], compile_and_run, [''])
 test('T9826',normal, compile_and_run,[''])
 test('T9848',
         [ collect_stats('bytes allocated')
@@ -242,7 +256,10 @@ test('T11555', normal, compile_and_run, [''])
 test('T12494', normal, compile_and_run, [''])
 test('T12852', [when(opsys('mingw32'), skip), js_broken(22374), req_process], compile_and_run, [''])
 test('lazySTexamples', normal, compile_and_run, [''])
-test('T11760', req_smp, compile_and_run, ['-threaded -with-rtsopts=-N2'])
+test('T11760', [req_ghc_smp,
+               req_target_smp,
+               only_ways(['threaded1', 'threaded2', 'nonmoving_thr'])],
+               compile_and_run, ['-threaded -with-rtsopts=-N2'])
 test('T12874', normal, compile_and_run, [''])
 test('T13191',
         [ collect_stats('bytes allocated', 5)
@@ -253,6 +270,7 @@ test('T13191',
       ['-O'])
 test('T13525', [when(opsys('mingw32'), skip), js_broken(22374), req_process], compile_and_run, [''])
 test('T13097', normal, compile_and_run, [''])
+test('T13660', when(opsys('mingw32'), skip), compile_and_run, [''])
 test('functorOperators', normal, compile_and_run, [''])
 test('T3474',
      [collect_stats('max_bytes_used',5),
@@ -268,11 +286,12 @@ test('T13167',
      [ when(opsys('mingw32')
      , only_ways(['winio', 'winio_threaded']))
      , fragile_for(16536, concurrent_ways)
-     , js_broken(22261)
+       # fragile on JS
+     , when(js_arch(), fragile(22921))
      ],
      compile_and_run, [''])
 test('T15183', normal, compile_and_run, [''])
-test('T15349', [exit_code(1), expect_broken_for(15349, ['ghci'])], compile_and_run, [''])
+test('T15349', [exit_code(1), expect_broken_for(15349, ghci_ways)], compile_and_run, [''])
 test('T16111', exit_code(1), compile_and_run, [''])
 test('T16943a', normal, compile_and_run, [''])
 test('T16943b', normal, compile_and_run, [''])
@@ -282,7 +301,7 @@ test('clamp', normal, compile_and_run, [''])
 test('T18642',
      [extra_run_opts('+RTS -T -RTS'),
       # The nonmoving GC's residency behavior is very conservative
-      omit_ways(['nonmoving', 'nonmoving_thr', 'nonmoving_thr_sanity']),
+      omit_ways(['nonmoving', 'nonmoving_thr', 'nonmoving_thr_sanity'] + ghci_ways),
       js_broken(22374)],
      compile_and_run, ['-O2'])
 test('T19288', exit_code(1), compile_and_run, [''])
@@ -291,5 +310,17 @@ test('T20107', extra_run_opts('+RTS -M50M'), compile_and_run, ['-package bytestr
 test('T22816', normal, compile_and_run, [''])
 test('trace', normal, compile_and_run, [''])
 test('listThreads', normal, compile_and_run, [''])
-test('listThreads1', normal, compile_and_run, [''])
+test('listThreads1', omit_ghci, compile_and_run, [''])
 test('inits1tails1', normal, compile_and_run, [''])
+test('CLC149', normal, compile, [''])
+test('AtomicModifyIORef', js_fragile(24259), compile_and_run, [''])
+test('AtomicSwapIORef', normal, compile_and_run, [''])
+test('T23454', normal, compile_fail, [''])
+test('T23687', normal, compile_and_run, [''])
+test('T23697',
+  [ when(opsys('mingw32'), skip) # header not found
+  , when(opsys('darwin'), skip)  # permission denied
+  ], makefile_test, ['T23697'])
+test('stimesEndo', normal, compile_and_run, [''])
+test('T24807', exit_code(1), compile_and_run, [''])
+test('T25066', [only_ways(['optasm']), grep_errmsg('T25066.g')], compile, ['-ddump-dmd-signatures'])

@@ -27,37 +27,39 @@ module System.Posix.Directory.PosixPath (
    createDirectory, removeDirectory,
 
    -- * Reading directories
-   DirStream,
+   Common.DirStream,
    openDirStream,
    readDirStream,
-   rewindDirStream,
-   closeDirStream,
-   DirStreamOffset,
+   readDirStreamMaybe,
+   Common.rewindDirStream,
+   Common.closeDirStream,
+   Common.DirStreamOffset,
 #ifdef HAVE_TELLDIR
-   tellDirStream,
+   Common.tellDirStream,
 #endif
 #ifdef HAVE_SEEKDIR
-   seekDirStream,
+   Common.seekDirStream,
 #endif
 
    -- * The working directory
    getWorkingDirectory,
    changeWorkingDirectory,
-   changeWorkingDirectoryFd,
+   Common.changeWorkingDirectoryFd,
   ) where
 
+import Control.Monad ((>=>))
+import Data.Maybe
 import System.Posix.Types
 import Foreign
 import Foreign.C
 
-import System.OsPath.Types
-import System.Posix.Directory hiding (createDirectory, openDirStream, readDirStream, getWorkingDirectory, changeWorkingDirectory, removeDirectory)
+import System.OsPath.Posix
 import qualified System.Posix.Directory.Common as Common
 import System.Posix.PosixPath.FilePath
 
 -- | @createDirectory dir mode@ calls @mkdir@ to
 --   create a new directory, @dir@, with permissions based on
---  @mode@.
+--   @mode@.
 createDirectory :: PosixPath -> FileMode -> IO ()
 createDirectory name mode =
   withFilePath name $ \s ->
@@ -70,7 +72,7 @@ foreign import ccall unsafe "mkdir"
 
 -- | @openDirStream dir@ calls @opendir@ to obtain a
 --   directory stream for @dir@.
-openDirStream :: PosixPath -> IO DirStream
+openDirStream :: PosixPath -> IO Common.DirStream
 openDirStream name =
   withFilePath name $ \s -> do
     dirp <- throwErrnoPathIfNullRetry "openDirStream" name $ c_opendir s
@@ -82,37 +84,22 @@ foreign import capi unsafe "HsUnix.h opendir"
 -- | @readDirStream dp@ calls @readdir@ to obtain the
 --   next directory entry (@struct dirent@) for the open directory
 --   stream @dp@, and returns the @d_name@ member of that
---  structure.
-readDirStream :: DirStream -> IO PosixPath
-readDirStream (Common.DirStream dirp) = alloca $ \ptr_dEnt  -> loop ptr_dEnt
- where
-  loop ptr_dEnt = do
-    resetErrno
-    r <- c_readdir dirp ptr_dEnt
-    if (r == 0)
-         then do dEnt <- peek ptr_dEnt
-                 if (dEnt == nullPtr)
-                    then return mempty
-                    else do
-                     entry <- (d_name dEnt >>= peekFilePath)
-                     c_freeDirEnt dEnt
-                     return entry
-         else do errno <- getErrno
-                 if (errno == eINTR) then loop ptr_dEnt else do
-                 let (Errno eo) = errno
-                 if (eo == 0)
-                    then return mempty
-                    else throwErrno "readDirStream"
+--   structure.
+--
+--   Note that this function returns an empty filepath if the end of the
+--   directory stream is reached. For a safer alternative use
+--   'readDirStreamMaybe'.
+readDirStream :: Common.DirStream -> IO PosixPath
+readDirStream = fmap (fromMaybe mempty) . readDirStreamMaybe
 
--- traversing directories
-foreign import ccall unsafe "__hscore_readdir"
-  c_readdir  :: Ptr Common.CDir -> Ptr (Ptr Common.CDirent) -> IO CInt
-
-foreign import ccall unsafe "__hscore_free_dirent"
-  c_freeDirEnt  :: Ptr Common.CDirent -> IO ()
-
-foreign import ccall unsafe "__hscore_d_name"
-  d_name :: Ptr Common.CDirent -> IO CString
+-- | @readDirStreamMaybe dp@ calls @readdir@ to obtain the
+--   next directory entry (@struct dirent@) for the open directory
+--   stream @dp@. It returns the @d_name@ member of that
+--   structure wrapped in a @Just d_name@ if an entry was read and @Nothing@ if
+--   the end of the directory stream was reached.
+readDirStreamMaybe :: Common.DirStream -> IO (Maybe PosixPath)
+readDirStreamMaybe = Common.readDirStreamWith
+  (Common.dirEntName >=> peekFilePath)
 
 
 -- | @getWorkingDirectory@ calls @getcwd@ to obtain the name

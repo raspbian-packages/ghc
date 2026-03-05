@@ -3,14 +3,15 @@ module Packages (
     -- * GHC packages
     array, base, binary, bytestring, cabal, cabalSyntax, checkPpr,
     checkExact, countDeps,
-    compareSizes, compiler, containers, deepseq, deriveConstants, directory,
-    exceptions, filepath, genapply, genprimopcode, ghc, ghcBignum, ghcBoot, ghcBootTh,
-    ghcCompact, ghcConfig, ghcHeap, ghci, ghciWrapper, ghcPkg, ghcPrim, haddock, haskeline,
+    compareSizes, compiler, containers, deepseq, deriveConstants, directory, dumpDecls,
+    exceptions, filepath, genapply, genprimopcode, ghc, ghcBignum, ghcBoot, ghcBootTh, ghcPlatform,
+    ghcCompact, ghcConfig, ghcExperimental, ghcHeap, ghcInternal, ghci, ghciWrapper, ghcPkg, ghcPrim,
+    ghcToolchain, ghcToolchainBin, haddock, haskeline,
     hsc2hs, hp2ps, hpc, hpcBin, integerGmp, integerSimple, iserv, iservProxy,
-    libffi, libiserv, mtl, parsec, pretty, primitive, process, remoteIserv, rts,
-    runGhc, stm, templateHaskell, terminfo, text, time, timeout, touchy,
+    libffi, mtl, osString, parsec, pretty, primitive, process, remoteIserv, rts,
+    runGhc, semaphoreCompat, stm, templateHaskell, terminfo, text, time, timeout,
     transformers, unlit, unix, win32, xhtml,
-    lintersCommon, lintNotes, lintCommitMsg, lintSubmoduleRefs, lintWhitespace,
+    lintersCommon, lintNotes, lintCodes, lintCommitMsg, lintSubmoduleRefs, lintWhitespace,
     ghcPackages, isGhcPackage,
 
     -- * Package information
@@ -35,15 +36,16 @@ import Oracles.Setting
 ghcPackages :: [Package]
 ghcPackages =
     [ array, base, binary, bytestring, cabalSyntax, cabal, checkPpr, checkExact, countDeps
-    , compareSizes, compiler, containers, deepseq, deriveConstants, directory
-    , exceptions, filepath, genapply, genprimopcode, ghc, ghcBignum, ghcBoot, ghcBootTh
-    , ghcCompact, ghcConfig, ghcHeap, ghci, ghciWrapper, ghcPkg, ghcPrim, haddock, haskeline, hsc2hs
-    , hp2ps, hpc, hpcBin, integerGmp, integerSimple, iserv, libffi, libiserv, mtl
-    , parsec, pretty, process, rts, runGhc, stm, templateHaskell
-    , terminfo, text, time, touchy, transformers, unlit, unix, win32, xhtml
+    , compareSizes, compiler, containers, deepseq, deriveConstants, directory, dumpDecls
+    , exceptions, filepath, genapply, genprimopcode, ghc, ghcBignum, ghcBoot, ghcBootTh, ghcPlatform
+    , ghcCompact, ghcConfig, ghcExperimental, ghcHeap, ghcInternal, ghci, ghciWrapper, ghcPkg, ghcPrim
+    , ghcToolchain, ghcToolchainBin, haddock, haskeline, hsc2hs
+    , hp2ps, hpc, hpcBin, integerGmp, integerSimple, iserv, libffi, mtl, osString
+    , parsec, pretty, process, rts, runGhc, stm, semaphoreCompat, templateHaskell
+    , terminfo, text, time, transformers, unlit, unix, win32, xhtml
     , timeout
     , lintersCommon
-    , lintNotes, lintCommitMsg, lintSubmoduleRefs, lintWhitespace ]
+    , lintNotes, lintCodes, lintCommitMsg, lintSubmoduleRefs, lintWhitespace ]
 
 -- TODO: Optimise by switching to sets of packages.
 isGhcPackage :: Package -> Bool
@@ -51,14 +53,15 @@ isGhcPackage = (`elem` ghcPackages)
 
 -- | Package definitions, see 'Package'.
 array, base, binary, bytestring, cabalSyntax, cabal, checkPpr, checkExact, countDeps,
-  compareSizes, compiler, containers, deepseq, deriveConstants, directory,
-  exceptions, filepath, genapply, genprimopcode, ghc, ghcBignum, ghcBoot, ghcBootTh,
-  ghcCompact, ghcConfig, ghcHeap, ghci, ghciWrapper, ghcPkg, ghcPrim, haddock, haskeline, hsc2hs,
-  hp2ps, hpc, hpcBin, integerGmp, integerSimple, iserv, iservProxy, remoteIserv, libffi, libiserv, mtl,
-  parsec, pretty, primitive, process, rts, runGhc, stm, templateHaskell,
-  terminfo, text, time, touchy, transformers, unlit, unix, win32, xhtml,
+  compareSizes, compiler, containers, deepseq, deriveConstants, directory, dumpDecls,
+  exceptions, filepath, genapply, genprimopcode, ghc, ghcBignum, ghcBoot, ghcBootTh, ghcPlatform,
+  ghcCompact, ghcConfig, ghcExperimental, ghcHeap, ghci, ghcInternal, ghciWrapper, ghcPkg, ghcPrim,
+  ghcToolchain, ghcToolchainBin, haddock, haskeline, hsc2hs,
+  hp2ps, hpc, hpcBin, integerGmp, integerSimple, iserv, iservProxy, remoteIserv, libffi, mtl,
+  osString, parsec, pretty, primitive, process, rts, runGhc, semaphoreCompat, stm, templateHaskell,
+  terminfo, text, time, transformers, unlit, unix, win32, xhtml,
   timeout,
-  lintersCommon, lintNotes, lintCommitMsg, lintSubmoduleRefs, lintWhitespace
+  lintersCommon, lintNotes, lintCodes, lintCommitMsg, lintSubmoduleRefs, lintWhitespace
     :: Package
 array               = lib  "array"
 base                = lib  "base"
@@ -75,6 +78,7 @@ containers          = lib  "containers"      `setPath` "libraries/containers/con
 deepseq             = lib  "deepseq"
 deriveConstants     = util "deriveConstants"
 directory           = lib  "directory"
+dumpDecls           = util "dump-decls"
 exceptions          = lib  "exceptions"
 filepath            = lib  "filepath"
 genapply            = util "genapply"
@@ -83,14 +87,19 @@ ghc                 = prg  "ghc-bin"         `setPath` "ghc"
 ghcBignum           = lib  "ghc-bignum"
 ghcBoot             = lib  "ghc-boot"
 ghcBootTh           = lib  "ghc-boot-th"
+ghcPlatform         = lib  "ghc-platform"
 ghcCompact          = lib  "ghc-compact"
 ghcConfig           = prg  "ghc-config"      `setPath` "testsuite/ghc-config"
+ghcExperimental     = lib  "ghc-experimental"
 ghcHeap             = lib  "ghc-heap"
+ghcInternal         = lib  "ghc-internal"
 ghci                = lib  "ghci"
 ghciWrapper         = prg  "ghci-wrapper"    `setPath` "driver/ghci"
                       -- See Note [Hadrian's ghci-wrapper package]
 ghcPkg              = util "ghc-pkg"
 ghcPrim             = lib  "ghc-prim"
+ghcToolchain        = lib  "ghc-toolchain"     `setPath` "utils/ghc-toolchain"
+ghcToolchainBin     = prg  "ghc-toolchain-bin" `setPath` "utils/ghc-toolchain/exe" -- workaround for #23690
 haddock             = util "haddock"
 haskeline           = lib  "haskeline"
 hsc2hs              = util "hsc2hs"
@@ -102,8 +111,8 @@ integerSimple       = lib  "integer-simple"
 iserv               = util "iserv"
 iservProxy          = util "iserv-proxy"
 libffi              = top  "libffi"
-libiserv            = lib  "libiserv"
 mtl                 = lib  "mtl"
+osString            = lib  "os-string"
 parsec              = lib  "parsec"
 pretty              = lib  "pretty"
 primitive           = lib  "primitive"
@@ -111,13 +120,13 @@ process             = lib  "process"
 remoteIserv         = util "remote-iserv"
 rts                 = top  "rts"
 runGhc              = util "runghc"
+semaphoreCompat     = lib  "semaphore-compat"
 stm                 = lib  "stm"
 templateHaskell     = lib  "template-haskell"
 terminfo            = lib  "terminfo"
 text                = lib  "text"
 time                = lib  "time"
 timeout             = util "timeout"         `setPath` "testsuite/timeout"
-touchy              = util "touchy"
 transformers        = lib  "transformers"
 unlit               = util "unlit"
 unix                = lib  "unix"
@@ -126,6 +135,7 @@ xhtml               = lib  "xhtml"
 
 lintersCommon       = lib     "linters-common"      `setPath` "linters/linters-common"
 lintNotes           = linter  "lint-notes"
+lintCodes           = linter  "lint-codes"
 lintCommitMsg       = linter  "lint-commit-msg"
 lintSubmoduleRefs   = linter  "lint-submodule-refs"
 lintWhitespace      = linter  "lint-whitespace"
@@ -192,14 +202,8 @@ programName Context {..} = do
 -- | The 'FilePath' to a program executable in a given 'Context'.
 programPath :: Context -> Action FilePath
 programPath context@Context {..} = do
-    -- TODO: The @touchy@ utility lives in the @lib/bin@ directory instead of
-    -- @bin@, which is likely just a historical accident that should be fixed.
-    -- See: https://github.com/snowleopard/hadrian/issues/570
-    -- Likewise for @iserv@ and @unlit@.
     name <- programName context
-    path <- if package `elem` [touchy, unlit]
-              then stageLibPath stage <&> (-/- "bin")
-              else stageBinPath stage
+    path <- stageBinPath stage
     return $ path -/- name <.> exe
 
 -- TODO: Move @timeout@ to the @util@ directory and build in a more standard
@@ -210,7 +214,7 @@ timeoutPath = "testsuite/timeout/install-inplace/bin/timeout" <.> exe
 -- TODO: Can we extract this information from Cabal files?
 -- | Some program packages should not be linked with Haskell main function.
 nonHsMainPackage :: Package -> Bool
-nonHsMainPackage = (`elem` [hp2ps, iserv, touchy, unlit, ghciWrapper])
+nonHsMainPackage = (`elem` [hp2ps, iserv, unlit, ghciWrapper])
 
 -- TODO: Combine this with 'programName'.
 -- | Path to the @autogen@ directory generated by 'buildAutogenFiles'.

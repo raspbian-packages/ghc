@@ -42,9 +42,9 @@ import Prelude (Integer)
 ************************************************************************
 -}
 
--- Note [Literal source text] in GHC.Types.Basic for SourceText fields in
+-- Note [Literal source text] in "GHC.Types.SourceText" for SourceText fields in
 -- the following
--- Note [Trees That Grow] in Language.Haskell.Syntax.Extension for the Xxxxx
+-- Note [Trees That Grow] in "Language.Haskell.Syntax.Extension" for the Xxxxx
 -- fields in the following
 -- | Haskell Literal
 data HsLit x
@@ -63,8 +63,20 @@ data HsLit x
       -- ^ literal @Int#@
   | HsWordPrim (XHsWordPrim x) {- SourceText -} Integer
       -- ^ literal @Word#@
+  | HsInt8Prim (XHsInt8Prim x) {- SourceText -} Integer
+      -- ^ literal @Int8#@
+  | HsInt16Prim (XHsInt16Prim x) {- SourceText -} Integer
+      -- ^ literal @Int16#@
+  | HsInt32Prim (XHsInt32Prim x) {- SourceText -} Integer
+      -- ^ literal @Int32#@
   | HsInt64Prim (XHsInt64Prim x) {- SourceText -} Integer
       -- ^ literal @Int64#@
+  | HsWord8Prim (XHsWord8Prim x) {- SourceText -} Integer
+      -- ^ literal @Word8#@
+  | HsWord16Prim (XHsWord16Prim x) {- SourceText -} Integer
+      -- ^ literal @Word16#@
+  | HsWord32Prim (XHsWord32Prim x) {- SourceText -} Integer
+      -- ^ literal @Word32#@
   | HsWord64Prim (XHsWord64Prim x) {- SourceText -} Integer
       -- ^ literal @Word64#@
   | HsInteger (XHsInteger x) {- SourceText -} Integer Type
@@ -107,7 +119,7 @@ data HsOverLit p
   | XOverLit
       !(XXOverLit p)
 
--- Note [Literal source text] in GHC.Types.Basic for SourceText fields in
+-- Note [Literal source text] in "GHC.Types.SourceText" for SourceText fields in
 -- the following
 -- | Overloaded Literal Value
 data OverLitVal
@@ -149,4 +161,3 @@ instance Ord OverLitVal where
   compare (HsIsString _ s1)   (HsIsString _ s2)   = s1 `lexicalCompareFS` s2
   compare (HsIsString _ _)    (HsIntegral   _)    = GT
   compare (HsIsString _ _)    (HsFractional _)    = GT
-

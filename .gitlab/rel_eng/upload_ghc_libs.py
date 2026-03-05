@@ -25,6 +25,7 @@ import tempfile
 import re
 import pickle
 import os
+import glob
 
 
 WORK_DIR = Path('.upload-libs')
@@ -47,6 +48,10 @@ def no_prep():
 def prep_base():
     shutil.copy('config.guess', 'libraries/base')
     shutil.copy('config.sub', 'libraries/base')
+
+def prep_ghc_internal():
+    shutil.copy('config.guess', 'libraries/ghc-internal')
+    shutil.copy('config.sub', 'libraries/ghc-internal')
 
 def build_copy_file(pkg: Package, f: Path):
     target = Path('_build') / 'stage1' / pkg.path / 'build' / f
@@ -92,6 +97,8 @@ PACKAGES = {
     pkg.name: pkg
     for pkg in [
         Package('base', Path("libraries/base"), prep_base),
+        Package('ghc-internal', Path("libraries/ghc-internal"), prep_ghc_internal),
+        Package('ghc-experimental', Path("libraries/ghc-experimental"), no_prep),
         Package('ghc-prim', Path("libraries/ghc-prim"), prep_ghc_prim),
         Package('integer-gmp', Path("libraries/integer-gmp"), no_prep),
         Package('ghc-bignum', Path("libraries/ghc-bignum"), prep_ghc_bignum),
@@ -100,7 +107,6 @@ PACKAGES = {
         Package('ghc-boot', Path("libraries/ghc-boot"), prep_ghc_boot),
         Package('ghc-boot-th', Path("libraries/ghc-boot-th"), no_prep),
         Package('ghc-compact', Path("libraries/ghc-compact"), no_prep),
-        Package('libiserv', Path("libraries/libiserv"), no_prep),
         Package('ghc', Path("compiler"), prep_ghc),
     ]
 }
@@ -152,7 +158,10 @@ def prepare_docs(bindist: Path, pkg: Package):
     cabal_file = pkg.path / f'{pkg.name}.cabal'
     version = get_version(cabal_file)
     assert version is not None
-    docdir = bindist / 'doc' / 'html' / 'libraries' / (pkg.name + "-" + version)
+    docdir_prefix = bindist / 'doc' / 'html' / 'libraries' / (pkg.name + "-" + version)
+
+    docdir = glob.glob(str(docdir_prefix) + "*")[0]
+    print(docdir)
 
     # Build the documentation tarball from the bindist documentation
     stem = f'{pkg.name}-{version}-docs'

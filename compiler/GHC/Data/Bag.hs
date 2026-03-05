@@ -7,19 +7,20 @@ Bag: an unordered collection with duplicates
 -}
 
 {-# LANGUAGE ScopedTypeVariables, DeriveTraversable, TypeFamilies #-}
+{-# OPTIONS_GHC -Wno-unrecognised-warning-flags -Wno-x-data-list-nonempty-unzip #-}
 
 module GHC.Data.Bag (
         Bag, -- abstract type
 
         emptyBag, unitBag, unionBags, unionManyBags,
-        mapBag,
+        mapBag, pprBag,
         elemBag, lengthBag,
         filterBag, partitionBag, partitionBagWith,
         concatBag, catBagMaybes, foldBag,
         isEmptyBag, isSingletonBag, consBag, snocBag, anyBag, allBag,
         listToBag, nonEmptyToBag, bagToList, headMaybe, mapAccumBagL,
-        concatMapBag, concatMapBagPair, mapMaybeBag, unzipBag,
-        mapBagM, mapBagM_,
+        concatMapBag, concatMapBagPair, mapMaybeBag, mapMaybeBagM, unzipBag,
+        mapBagM, mapBagM_, lookupBag,
         flatMapBagM, flatMapBagPairM,
         mapAndUnzipBagM, mapAccumBagLM,
         anyBagM, filterBagM
@@ -38,6 +39,7 @@ import Data.List ( partition, mapAccumL )
 import Data.List.NonEmpty ( NonEmpty(..) )
 import qualified Data.List.NonEmpty as NE
 import qualified Data.Semigroup ( (<>) )
+import Control.Applicative( Alternative( (<|>) ) )
 import Control.DeepSeq
 
 infixr 3 `consBag`
@@ -121,6 +123,18 @@ filterBagM pred (TwoBags b1 b2) = do
 filterBagM pred (ListBag vs) = do
   sat <- filterM pred (toList vs)
   return (listToBag sat)
+{-# INLINEABLE filterBagM #-}
+
+lookupBag :: Eq a => a -> Bag (a,b) -> Maybe b
+lookupBag _ EmptyBag        = Nothing
+lookupBag k (UnitBag kv)    = lookup_one k kv
+lookupBag k (TwoBags b1 b2) = lookupBag k b1 <|> lookupBag k b2
+lookupBag k (ListBag xs)    = foldr ((<|>) . lookup_one k) Nothing xs
+{-# INLINEABLE lookupBag #-}
+
+lookup_one :: Eq a => a -> (a,b) -> Maybe b
+lookup_one k (k',v) | k==k'     = Just v
+                    | otherwise = Nothing
 
 allBag :: (a -> Bool) -> Bag a -> Bool
 allBag _ EmptyBag        = True
@@ -141,6 +155,7 @@ anyBagM p (TwoBags b1 b2) = do flag <- anyBagM p b1
                                if flag then return True
                                        else anyBagM p b2
 anyBagM p (ListBag xs)    = anyM p xs
+{-# INLINEABLE anyBagM #-}
 
 concatBag :: Bag (Bag a) -> Bag a
 concatBag = foldr unionBags emptyBag
@@ -228,6 +243,17 @@ mapMaybeBag f (UnitBag x)     = case f x of
 mapMaybeBag f (TwoBags b1 b2) = unionBags (mapMaybeBag f b1) (mapMaybeBag f b2)
 mapMaybeBag f (ListBag xs)    = listToBag $ mapMaybe f (toList xs)
 
+mapMaybeBagM :: Monad m => (a -> m (Maybe b)) -> Bag a -> m (Bag b)
+mapMaybeBagM _ EmptyBag        = return EmptyBag
+mapMaybeBagM f (UnitBag x)     = do r <- f x
+                                    return $ case r of
+                                      Nothing -> EmptyBag
+                                      Just y  -> UnitBag y
+mapMaybeBagM f (TwoBags b1 b2) = do r1 <- mapMaybeBagM f b1
+                                    r2 <- mapMaybeBagM f b2
+                                    return $ unionBags r1 r2
+mapMaybeBagM f (ListBag xs)    = listToBag <$> mapMaybeM f (toList xs)
+
 mapBagM :: Monad m => (a -> m b) -> Bag a -> m (Bag b)
 mapBagM _ EmptyBag        = return EmptyBag
 mapBagM f (UnitBag x)     = do r <- f x
@@ -237,12 +263,14 @@ mapBagM f (TwoBags b1 b2) = do r1 <- mapBagM f b1
                                return (TwoBags r1 r2)
 mapBagM f (ListBag    xs) = do rs <- mapM f xs
                                return (ListBag rs)
+{-# INLINEABLE mapBagM #-}
 
 mapBagM_ :: Monad m => (a -> m b) -> Bag a -> m ()
 mapBagM_ _ EmptyBag        = return ()
 mapBagM_ f (UnitBag x)     = f x >> return ()
 mapBagM_ f (TwoBags b1 b2) = mapBagM_ f b1 >> mapBagM_ f b2
 mapBagM_ f (ListBag    xs) = mapM_ f xs
+{-# INLINEABLE mapBagM_ #-}
 
 flatMapBagM :: Monad m => (a -> m (Bag b)) -> Bag a -> m (Bag b)
 flatMapBagM _ EmptyBag        = return EmptyBag
@@ -253,6 +281,7 @@ flatMapBagM f (TwoBags b1 b2) = do r1 <- flatMapBagM f b1
 flatMapBagM f (ListBag    xs) = foldrM k EmptyBag xs
   where
     k x b2 = do { b1 <- f x; return (b1 `unionBags` b2) }
+{-# INLINEABLE flatMapBagM #-}
 
 flatMapBagPairM :: Monad m => (a -> m (Bag b, Bag c)) -> Bag a -> m (Bag b, Bag c)
 flatMapBagPairM _ EmptyBag        = return (EmptyBag, EmptyBag)
@@ -264,6 +293,7 @@ flatMapBagPairM f (ListBag    xs) = foldrM k (EmptyBag, EmptyBag) xs
   where
     k x (r2,s2) = do { (r1,s1) <- f x
                      ; return (r1 `unionBags` r2, s1 `unionBags` s2) }
+{-# INLINEABLE flatMapBagPairM #-}
 
 mapAndUnzipBagM :: Monad m => (a -> m (b,c)) -> Bag a -> m (Bag b, Bag c)
 mapAndUnzipBagM _ EmptyBag        = return (EmptyBag, EmptyBag)
@@ -275,6 +305,7 @@ mapAndUnzipBagM f (TwoBags b1 b2) = do (r1,s1) <- mapAndUnzipBagM f b1
 mapAndUnzipBagM f (ListBag xs)    = do ts <- mapM f xs
                                        let (rs,ss) = NE.unzip ts
                                        return (ListBag rs, ListBag ss)
+{-# INLINEABLE mapAndUnzipBagM #-}
 
 mapAccumBagL ::(acc -> x -> (acc, y)) -- ^ combining function
             -> acc                    -- ^ initial state
@@ -300,6 +331,7 @@ mapAccumBagLM f s (TwoBags b1 b2) = do { (s1, b1') <- mapAccumBagLM f s  b1
                                        ; return (s2, TwoBags b1' b2') }
 mapAccumBagLM f s (ListBag xs)    = do { (s', xs') <- mapAccumLM f s xs
                                        ; return (s', ListBag xs') }
+{-# INLINEABLE mapAccumBagLM #-}
 
 listToBag :: [a] -> Bag a
 listToBag [] = EmptyBag
@@ -331,7 +363,10 @@ headMaybe (TwoBags b1 _) = headMaybe b1
 headMaybe (ListBag (v:|_)) = Just v
 
 instance (Outputable a) => Outputable (Bag a) where
-    ppr bag = braces (pprWithCommas ppr (bagToList bag))
+    ppr = pprBag
+
+pprBag :: Outputable a => Bag a -> SDoc
+pprBag bag = braces (pprWithCommas ppr (bagToList bag))
 
 instance Data a => Data (Bag a) where
   gfoldl k z b = z listToBag `k` bagToList b -- traverse abstract type abstractly

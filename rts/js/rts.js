@@ -4,7 +4,7 @@ var h$start = new Date();
 
 function h$rts_eval(action, unbox) {
   return new Promise((accept, reject) =>
-    h$run(MK_AP3( h$baseZCGHCziJSziPrimziresolveIO
+    h$run(MK_AP3( h$ghczminternalZCGHCziInternalziJSziPrimziresolveIO
                 , x => { accept(unbox(x))}
                 , e => { reject(new h$HaskellException(e))}
                 , action
@@ -15,9 +15,9 @@ function h$rts_eval(action, unbox) {
 function h$rts_eval_sync(closure, unbox) {
   var res, status = 0;
   try {
-  h$runSync(MK_AP3( h$baseZCGHCziJSziPrimziresolveIO
-           , MK_JSVAL(x => { status = 1; res = unbox(x); })
-           , MK_JSVAL(e => { status = 2; res = new h$HaskellException(e); })
+  h$runSync(MK_AP3( h$ghczminternalZCGHCziInternalziJSziPrimziresolveIO
+           , x => { status = 1; res = unbox(x); }
+           , e => { status = 2; res = new h$HaskellException(e); }
            , closure), false);
   } catch(e) { status = 2; res = e; }
   switch(status) {
@@ -26,7 +26,6 @@ function h$rts_eval_sync(closure, unbox) {
     default: throw res;
   }
 }
-
 
 function h$rts_apply(f, x) {
   return MK_AP1(f, x);
@@ -51,7 +50,7 @@ function h$rts_apply(f, x) {
 function h$rts_mkChar(x) { return x|0; }
 function h$rts_getChar(x) { return UNWRAP_NUMBER(x); }
 
-function h$rts_mkWord(x) { return x|0; }
+function h$rts_mkWord(x) { return x>>>0; }
 function h$rts_getWord(x) { return UNWRAP_NUMBER(x); }
 
 function h$rts_mkInt(x) { return x|0; }
@@ -60,7 +59,7 @@ function h$rts_getInt(x) { return UNWRAP_NUMBER(x); }
 function h$rts_mkInt32(x) { return x|0; }
 function h$rts_getInt32(x) { return UNWRAP_NUMBER(x); }
 
-function h$rts_mkWord32(x) { return x|0; }
+function h$rts_mkWord32(x) { return x>>>0; }
 function h$rts_getWord32(x) { return UNWRAP_NUMBER(x); }
 
 function h$rts_mkInt16(x) { return (x<<16)>>16; }
@@ -112,24 +111,53 @@ function h$rts_toString(x) {
 
 function h$rts_mkPtr(x) {
   var buf, off = 0;
-  if(typeof x == 'string') {
-    // string: UTF-8 encode
+  // null pointer
+  if(x === null) {
+    buf = null;
+    off = 0;
+  }
+  // Haskell pointer
+  else if(typeof x == 'object' &&
+     typeof x.offset == 'number' &&
+     typeof x.array !== 'undefined') {
+    buf = x.array;
+    off = x.offset;
+  }
+  // JS string: UTF-8 encode
+  else if(typeof x == 'string') {
     buf = h$encodeUtf8(x);
     off = 0;
-  } else if(typeof x == 'object' &&
+  }
+  // Haskell ByteArray
+  else if(typeof x == 'object' &&
      typeof x.len == 'number' &&
      x.buf instanceof ArrayBuffer) {
-    // already a Haskell ByteArray
     buf = x;
     off = 0;
-  } else if(x.isView) {
-    // ArrayBufferView: make ByteArray with the same byteOffset
+  }
+  // Offset in the Emscripten heap
+  else if (typeof x == 'number' && h$HEAP !== null) {
+    if (x == 0) {
+      buf = null;
+      off = 0;
+    }
+    else {
+      buf = h$HEAP;
+      off = x;
+    }
+  }
+  // ArrayBufferView: make ByteArray with the same byteOffset
+  else if(x.isView) {
     buf = h$wrapBuffer(x.buffer, true, 0, x.buffer.byteLength);
     off = x.byteOffset;
-  } else {
-    // plain ArrayBuffer
+  }
+  // plain ArrayBuffer
+  else if (x instanceof ArrayBuffer) {
     buf = h$wrapBuffer(x, true, 0, x.byteLength);
     off = 0;
+  }
+  else {
+    throw new Error ("h$rts_mkPtr: invalid argument: " + x);
   }
   return MK_PTR(buf, off);
 }
@@ -151,7 +179,7 @@ function h$rts_getFunPtr(x) {
 }
 
 function h$rts_toIO(x) {
-  return MK_AP1(h$baseZCGHCziJSziPrimzitoIO, x);
+  return MK_AP1(h$ghczminternalZCGHCziInternalziJSziPrimzitoIO, x);
 }
 
 // running IO actions
@@ -245,7 +273,7 @@ function h$printcl(i) {
     r += " ";
     switch(cl.i[i]) {
       case h$vt_ptr:
-      r += "[ Ptr :: " + d["d"+idx].f.n + "]";
+      r += "[ Ptr :: " + d["d"+idx] + "]";
       idx++;
       break;
       case h$vt_void:
@@ -266,10 +294,6 @@ function h$printcl(i) {
       case h$vt_addr:
       r += "(" + d["d"+idx].length + "," + d["d"+(idx+1)] + " :: ptr)";
       idx+=2;
-      break;
-      case h$vt_rtsobj:
-      r += "(" + d["d"+idx].toString() + " :: RTS object)";
-      idx++;
       break;
       default:
       r += "unknown field: " + cl.i[i];
@@ -365,14 +389,7 @@ function h$printReg(r) {
     } else if(r.f.t === h$ct_blackhole && r.x) {
       return ("blackhole: -> " + h$printReg({ f: r.x.x1, d: r.d1.x2 }) + ")");
     } else {
-      var iv = "";
-      if(r.f.n === "integer-gmp:GHC.Integer.Type.Jp#" ||
-      r.f.n === "integer-gmp:GHC.Integer.Type.Jn#") {
-        iv = ' [' + r.d1.join(',') + '](' + h$ghcjsbn_showBase(r.d1, 10) + ')'
-      } else if(r.f.n === "integer-gmp:GHC.Integer.Type.S#") {
-        iv = ' (S: ' + r.d1 + ')';
-      }
-      return ((r.alloc ? r.alloc + ': ' : '') + r.f.n + " (" + h$closureTypeName(r.f.t) + ", " + r.f.a + ")" + iv);
+      return ((r.alloc ? r.alloc + ': ' : '') + r.f.n + " (" + h$closureTypeName(r.f.t) + ", " + r.f.a + ")");
     }
   } else if(typeof r === 'object') {
     var res = h$collectProps(r);
@@ -424,9 +441,7 @@ function h$throw(e, async) {
       if(async) { // async exceptions always propagate
         h$currentThread.transaction = null;
       } else if(!h$stmValidateTransaction()) { // restart transaction if invalid, don't propagate exception
-      h$sp++;
-      h$stack[h$sp] = h$checkInvariants_e;
-      return h$stmStartTransaction(h$stack[h$sp-1]);
+        return h$stmStartTransaction(h$stack[h$sp]);
     }
   }
   if(f === h$catchStm_e && !async) break; // catchSTM only catches sync
@@ -536,14 +551,7 @@ function h$dumpStackTop(stack, start, sp) {
           if(s.f.t === h$ct_blackhole && s.d1 && s.d1.x1 && s.d1.x1.n) {
             h$log("stack[" + i + "] = blackhole -> " + s.d1.x1.n);
           } else {
-            var iv = "";
-            if(s.f.n === "integer-gmp:GHC.Integer.Type.Jp#" ||
-            s.f.n === "integer-gmp:GHC.Integer.Type.Jn#") {
-              iv = ' [' + s.d1.join(',') + '](' + h$ghcjsbn_showBase(s.d1, 10) + ')'
-            } else if(s.f.n === "integer-gmp:GHC.Integer.Type.S#") {
-              iv = ' (S: ' + s.d1 + ')';
-            }
-            h$log("stack[" + i + "] = -> " + (s.alloc ? s.alloc + ': ' : '') + s.f.n + " (" + h$closureTypeName(s.f.t) + ", a: " + s.f.a + ")" + iv);
+            h$log("stack[" + i + "] = -> " + (s.alloc ? s.alloc + ': ' : '') + s.f.n + " (" + h$closureTypeName(s.f.t) + ", a: " + s.f.a + ")");
           }
         }
       } else if(h$isInstanceOf(s,h$MVar)) {
@@ -713,3 +721,24 @@ function h$keepAlive(x, f) {
   h$r1 = f;
   return h$ap_1_0_fast();
 }
+
+// It is required by Google Closure Compiler to be at least defined if
+// somewhere it is used
+var h$libdwLookupLocation, h$libdwPoolRelease, h$libdwPoolTake,
+  h$libdwGetBacktrace, h$backtraceFree
+h$libdwLookupLocation
+  = h$libdwPoolRelease
+  = h$libdwPoolTake
+  = h$libdwGetBacktrace
+  = h$backtraceFree
+  = function() {
+    throw new Error('Libdw: Not Implemented Yet')
+  }
+
+// It is required by Google Closure Compiler to be at least defined if
+// somewhere it is used
+var h$lookupIPE
+h$lookupIPE
+  = function () {
+    throw new Error('IPE: Not Implemented Yet')
+  }

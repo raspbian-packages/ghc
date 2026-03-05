@@ -2,8 +2,6 @@
 /dist/
 /dist-*/
 
-/rts.cabal
-
 /include/ghcversion.h
 
 /package.conf.inplace
@@ -12,7 +10,13 @@
 /package.conf.install.raw
 /fs.*
 
+/aclocal.m4
 /autom4te.cache/
 /config.log
 /config.status
 /configure
+
+/external-symbols.list
+/ghcautoconf.h.autoconf.in
+/ghcautoconf.h.autoconf
+/include/ghcautoconf.h

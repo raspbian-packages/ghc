@@ -49,7 +49,7 @@ import GHC.Utils.Monad.State.Strict
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
 import GHC.Platform
-import GHC.Cmm.Dataflow.Collections
+import GHC.Cmm.Dataflow.Label
 
 import Data.List (nub, foldl1', find)
 import Data.Maybe
@@ -398,12 +398,6 @@ cleanBackward' liveSlotsOnEntry reloadedBy noReloads acc (li : instrs)
                         $ IntSet.toList slotsReloadedByTargets
 
                 cleanBackward liveSlotsOnEntry noReloads' (li : acc) instrs
-
-#if __GLASGOW_HASKELL__ <= 810
-        -- some other instruction
-        | otherwise
-        = cleanBackward liveSlotsOnEntry noReloads (li : acc) instrs
-#endif
 
 
 -- | Combine the associations from all the inward control flow edges.

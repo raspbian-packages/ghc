@@ -18,6 +18,14 @@ module GHC.Exts.Heap.Closures (
     , allClosures
     , closureSize
 
+    -- * Stack
+    , StgStackClosure
+    , GenStgStackClosure(..)
+    , StackFrame
+    , GenStackFrame(..)
+    , StackField
+    , GenStackField(..)
+
     -- * Boxes
     , Box(..)
     , areBoxesEqual
@@ -27,15 +35,24 @@ module GHC.Exts.Heap.Closures (
 import Prelude -- See note [Why do we import Prelude here?]
 import GHC.Exts.Heap.Constants
 #if defined(PROFILING)
+import GHC.Exts.Heap.InfoTable () -- see Note [No way-dependent imports]
 import GHC.Exts.Heap.InfoTableProf
 #else
 import GHC.Exts.Heap.InfoTable
+import GHC.Exts.Heap.InfoTableProf () -- see Note [No way-dependent imports]
 
--- `ghc -M` currently doesn't properly account for ways when generating
--- dependencies (#15197). This import ensures correct build-ordering between
--- this module and GHC.Exts.Heap.InfoTableProf. It should be removed when #15197
--- is fixed.
-import GHC.Exts.Heap.InfoTableProf ()
+{-
+Note [No way-dependent imports]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+`ghc -M` currently assumes that the imports for a module are the same
+in every way.  This is arguably a bug, but breaking this assumption by
+importing different things in different ways can cause trouble.  For
+example, this module in the profiling way imports and uses
+GHC.Exts.Heap.InfoTableProf.  When it was not also imported in the
+vanilla way, there were intermittent build failures due to this module
+being compiled in the profiling way before GHC.Exts.Heap.InfoTableProf
+in the profiling way. (#15197)
+-}
 #endif
 
 import GHC.Exts.Heap.ProfInfo.Types
@@ -95,7 +112,6 @@ areBoxesEqual (Box a) (Box b) = case reallyUnsafePtrEqualityUpToTag# a b of
 
 ------------------------------------------------------------------------
 -- Closures
-
 type Closure = GenClosure Box
 
 -- | This is the representation of a Haskell value on the heap. It reflects
@@ -329,7 +345,7 @@ data GenClosure b
     -- | Primitive Addr
   | AddrClosure
         { ptipe      :: PrimType
-        , addrVal    :: !Int }
+        , addrVal    :: !(Ptr ()) }
 
     -- | Primitive Float
   | FloatClosure
@@ -354,8 +370,110 @@ data GenClosure b
   | UnsupportedClosure
         { info       :: !StgInfoTable
         }
+
+    -- | A primitive word from a bitmap encoded stack frame payload
+    --
+    -- The type itself cannot be restored (i.e. it might represent a Word8#
+    -- or an Int#).
+  |  UnknownTypeWordSizedPrimitive
+        { wordVal :: !Word }
   deriving (Show, Generic, Functor, Foldable, Traversable)
 
+type StgStackClosure = GenStgStackClosure Box
+
+-- | A decoded @StgStack@ with `StackFrame`s
+--
+-- Stack related data structures (`GenStgStackClosure`, `GenStackField`,
+-- `GenStackFrame`) are defined separately from `GenClosure` as their related
+-- functions are very different. Though, both are closures in the sense of RTS
+-- structures, their decoding logic differs: While it's safe to keep a reference
+-- to a heap closure, the garbage collector does not update references to stack
+-- located closures.
+--
+-- Additionally, stack frames don't appear outside of the stack. Thus, keeping
+-- `GenStackFrame` and `GenClosure` separated, makes these types more precise
+-- (in the sense what values to expect.)
+data GenStgStackClosure b = GenStgStackClosure
+      { ssc_info            :: !StgInfoTable
+      , ssc_stack_size      :: !Word32 -- ^ stack size in *words*
+      , ssc_stack           :: ![GenStackFrame b]
+      }
+  deriving (Foldable, Functor, Generic, Show, Traversable)
+
+type StackField = GenStackField Box
+
+-- | Bitmap-encoded payload on the stack
+data GenStackField b
+    -- | A non-pointer field
+    = StackWord !Word
+    -- | A pointer field
+    | StackBox  !b
+  deriving (Foldable, Functor, Generic, Show, Traversable)
+
+type StackFrame = GenStackFrame Box
+
+-- | A single stack frame
+data GenStackFrame b =
+   UpdateFrame
+      { info_tbl           :: !StgInfoTable
+      , updatee            :: !b
+      }
+
+  | CatchFrame
+      { info_tbl            :: !StgInfoTable
+      , handler             :: !b
+      }
+
+  | CatchStmFrame
+      { info_tbl            :: !StgInfoTable
+      , catchFrameCode      :: !b
+      , handler             :: !b
+      }
+
+  | CatchRetryFrame
+      { info_tbl            :: !StgInfoTable
+      , running_alt_code    :: !Word
+      , first_code          :: !b
+      , alt_code            :: !b
+      }
+
+  | AtomicallyFrame
+      { info_tbl            :: !StgInfoTable
+      , atomicallyFrameCode :: !b
+      , result              :: !b
+      }
+
+  | UnderflowFrame
+      { info_tbl            :: !StgInfoTable
+      , nextChunk           :: !(GenStgStackClosure b)
+      }
+
+  | StopFrame
+      { info_tbl            :: !StgInfoTable }
+
+  | RetSmall
+      { info_tbl            :: !StgInfoTable
+      , stack_payload       :: ![GenStackField b]
+      }
+
+  | RetBig
+      { info_tbl            :: !StgInfoTable
+      , stack_payload       :: ![GenStackField b]
+      }
+
+  | RetFun
+      { info_tbl            :: !StgInfoTable
+      , retFunSize          :: !Word
+      , retFunFun           :: !b
+      , retFunPayload       :: ![GenStackField b]
+      }
+
+  |  RetBCO
+      { info_tbl            :: !StgInfoTable
+      , bco                 :: !b -- ^ always a BCOClosure
+      , bcoArgs             :: ![GenStackField b]
+      }
+  deriving (Foldable, Functor, Generic, Show, Traversable)
 
 data PrimType
   = PInt

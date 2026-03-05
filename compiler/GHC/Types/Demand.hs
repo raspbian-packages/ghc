@@ -22,24 +22,26 @@ module GHC.Types.Demand (
     absDmd, topDmd, botDmd, seqDmd, topSubDmd,
     -- *** Least upper bound
     lubCard, lubDmd, lubSubDmd,
+    -- *** Greatest lower bound
+    glbCard,
     -- *** Plus
     plusCard, plusDmd, plusSubDmd,
     -- *** Multiply
     multCard, multDmd, multSubDmd,
     -- ** Predicates on @Card@inalities and @Demand@s
-    isAbs, isUsedOnce, isStrict,
-    isAbsDmd, isUsedOnceDmd, isStrUsedDmd, isStrictDmd,
+    isAbs, isAtMostOnce, isStrict,
+    isAbsDmd, isAtMostOnceDmd, isStrUsedDmd, isStrictDmd,
     isTopDmd, isWeakDmd, onlyBoxedArguments,
     -- ** Special demands
     evalDmd,
     -- *** Demands used in PrimOp signatures
     lazyApply1Dmd, lazyApply2Dmd, strictOnceApply1Dmd, strictManyApply1Dmd,
     -- ** Other @Demand@ operations
-    oneifyCard, oneifyDmd, strictifyDmd, strictifyDictDmd, lazifyDmd,
+    oneifyCard, oneifyDmd, strictifyDmd, strictifyDictDmd, lazifyDmd, floatifyDmd,
     peelCallDmd, peelManyCalls, mkCalledOnceDmd, mkCalledOnceDmds,
     mkWorkerDemand, subDemandIfEvaluated,
     -- ** Extracting one-shot information
-    argOneShots, argsOneShots, saturatedByOneShots,
+    callCards, argOneShots, argsOneShots, saturatedByOneShots,
     -- ** Manipulating Boxity of a Demand
     unboxDeeplyDmd,
 
@@ -88,8 +90,7 @@ import GHC.Types.Unique.FM
 import GHC.Types.Basic
 import GHC.Data.Maybe   ( orElse )
 
-import GHC.Core.Type    ( Type )
-import GHC.Core.TyCon   ( isNewTyCon, isClassTyCon )
+import GHC.Core.Type    ( Type, isTerminatingType )
 import GHC.Core.DataCon ( splitDataProductType_maybe, StrictnessMark, isMarkedStrict )
 import GHC.Core.Multiplicity    ( scaledThing )
 
@@ -97,7 +98,6 @@ import GHC.Utils.Binary
 import GHC.Utils.Misc
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
-import GHC.Utils.Panic.Plain
 
 import Data.Coerce (coerce)
 import Data.Function
@@ -542,9 +542,9 @@ isAbs :: Card -> Bool
 isAbs (Card c) = c .&. 0b110 == 0 -- simply check 1 and n bit are not set
 
 -- | True <=> upper bound is 1.
-isUsedOnce :: Card -> Bool
+isAtMostOnce :: Card -> Bool
 -- See Note [Bit vector representation for Card]
-isUsedOnce (Card c) = c .&. 0b100 == 0 -- simply check n bit is not set
+isAtMostOnce (Card c) = c .&. 0b100 == 0 -- simply check n bit is not set
 
 -- | Is this a 'CardNonAbs'?
 isCardNonAbs :: Card -> Bool
@@ -552,7 +552,7 @@ isCardNonAbs = not . isAbs
 
 -- | Is this a 'CardNonOnce'?
 isCardNonOnce :: Card -> Bool
-isCardNonOnce n = isAbs n || not (isUsedOnce n)
+isCardNonOnce n = isAbs n || not (isAtMostOnce n)
 
 -- | Intersect with [0,1].
 oneifyCard :: Card -> Card
@@ -607,22 +607,22 @@ multCard (Card a) (Card b)
 --
 -- Examples (using Note [Demand notation]):
 --
---   * 'seq' puts demand @1A@ on its first argument: It evaluates the argument
---     strictly (@1@), but not any deeper (@A@).
---   * 'fst' puts demand @1P(1L,A)@ on its argument: It evaluates the argument
+--   * 'seq' puts demand `1A` on its first argument: It evaluates the argument
+--     strictly (`1`), but not any deeper (`A`).
+--   * 'fst' puts demand `1P(1L,A)` on its argument: It evaluates the argument
 --     pair strictly and the first component strictly, but no nested info
---     beyond that (@L@). Its second argument is not used at all.
---   * '$' puts demand @1C(1,L)@ on its first argument: It calls (@C@) the
---     argument function with one argument, exactly once (@1@). No info
---     on how the result of that call is evaluated (@L@).
---   * 'maybe' puts demand @MC(M,L)@ on its second argument: It evaluates
+--     beyond that (`L`). Its second argument is not used at all.
+--   * '$' puts demand `1C(1,L)` on its first argument: It calls (`C`) the
+--     argument function with one argument, exactly once (`1`). No info
+--     on how the result of that call is evaluated (`L`).
+--   * 'maybe' puts demand `MC(M,L)` on its second argument: It evaluates
 --     the argument function at most once ((M)aybe) and calls it once when
 --     it is evaluated.
---   * @fst p + fst p@ puts demand @SP(SL,A)@ on @p@: It's @1P(1L,A)@
---     multiplied by two, so we get @S@ (used at least once, possibly multiple
+--   * `fst p + fst p` puts demand `SP(SL,A)` on `p`: It's `1P(1L,A)`
+--     multiplied by two, so we get `S` (used at least once, possibly multiple
 --     times).
 --
--- This data type is quite similar to @'Scaled' 'SubDemand'@, but it's scaled
+-- This data type is quite similar to `'Scaled' 'SubDemand'`, but it's scaled
 -- by 'Card', which is an /interval/ on 'Multiplicity', the upper bound of
 -- which could be used to infer uniqueness types. Also we treat 'AbsDmd' and
 -- 'BotDmd' specially, as the concept of a 'SubDemand' doesn't apply when there
@@ -929,8 +929,8 @@ isStrUsedDmd :: Demand -> Bool
 isStrUsedDmd (n :* _) = isStrict n && not (isAbs n)
 
 -- | Is the value used at most once?
-isUsedOnceDmd :: Demand -> Bool
-isUsedOnceDmd (n :* _) = isUsedOnce n
+isAtMostOnceDmd :: Demand -> Bool
+isAtMostOnceDmd (n :* _) = isAtMostOnce n
 
 -- | We try to avoid tracking weak free variable demands in strictness
 -- signatures for analysis performance reasons.
@@ -964,15 +964,15 @@ strictOnceApply1Dmd = C_11 :* mkCall C_11 topSubDmd
 strictManyApply1Dmd :: Demand
 strictManyApply1Dmd = C_1N :* mkCall C_1N topSubDmd
 
--- | First argument of catch#: @MC(M,L)@.
+-- | First argument of catch#: @MC(1,L)@.
 -- Evaluates its arg lazily, but then applies it exactly once to one argument.
 lazyApply1Dmd :: Demand
-lazyApply1Dmd = C_01 :* mkCall C_01 topSubDmd
+lazyApply1Dmd = C_01 :* mkCall C_11 topSubDmd
 
--- | Second argument of catch#: @MC(M,C(1,L))@.
--- Calls its arg lazily, but then applies it exactly once to an additional argument.
+-- | Second argument of catch#: @MC(1,C(1,L))@.
+-- Evaluates its arg lazily, but then applies it exactly once to two arguments.
 lazyApply2Dmd :: Demand
-lazyApply2Dmd = C_01 :* mkCall C_01 (mkCall C_11 topSubDmd)
+lazyApply2Dmd = C_01 :* mkCall C_11 (mkCall C_11 topSubDmd)
 
 -- | Make a 'Demand' evaluated at-most-once.
 oneifyDmd :: Demand -> Demand
@@ -984,7 +984,10 @@ oneifyDmd (n :* sd) = oneifyCard n :* sd
 strictifyDmd :: Demand -> Demand
 strictifyDmd = plusDmd seqDmd
 
--- | If the argument is a used non-newtype dictionary, give it strict demand.
+-- | If the argument is a guaranteed-terminating type
+--   (i.e. a non-newtype dictionary) give it strict demand.
+--   This is sound because terminating types can't be bottom:
+--         See GHC.Core Note [NON-BOTTOM-DICTS invariant]
 -- Also split the product type & demand and recur in order to similarly
 -- strictify the argument's contained used non-newtype superclass dictionaries.
 -- We use the demand as our recursive measure to guarantee termination.
@@ -998,11 +1001,9 @@ strictifyDictDmd ty (n :* Prod b ds)
     -- Return a TyCon and a list of field types if the given
     -- type is a non-newtype dictionary type
     as_non_newtype_dict ty
-      | Just (tycon, _arg_tys, _data_con, map scaledThing -> inst_con_arg_tys)
-          <- splitDataProductType_maybe ty
-      , not (isNewTyCon tycon)
-      , isClassTyCon tycon
-      = Just inst_con_arg_tys
+      | isTerminatingType ty
+      , Just (_tc, _arg_tys, _data_con, field_tys) <- splitDataProductType_maybe ty
+      = Just (map scaledThing field_tys)
       | otherwise
       = Nothing
 strictifyDictDmd _  dmd = dmd
@@ -1010,6 +1011,11 @@ strictifyDictDmd _  dmd = dmd
 -- | Make a 'Demand' lazy.
 lazifyDmd :: Demand -> Demand
 lazifyDmd = multDmd C_01
+
+-- | Adjust the demand on a binding that may float outwards
+-- See Note [Floatifying demand info when floating]
+floatifyDmd :: Demand -> Demand
+floatifyDmd = multDmd C_0N
 
 -- | Wraps the 'SubDemand' with a one-shot call demand: @d@ -> @C(1,d)@.
 mkCalledOnceDmd :: SubDemand -> SubDemand
@@ -1069,12 +1075,16 @@ argOneShots :: Demand          -- ^ depending on saturation
 argOneShots AbsDmd    = [] -- This defn conflicts with 'saturatedByOneShots',
 argOneShots BotDmd    = [] -- according to which we should return
                            -- @repeat OneShotLam@ here...
-argOneShots (_ :* sd) = go sd
+argOneShots (_ :* sd) = map go (callCards sd)
   where
-    go (Call n sd)
-      | isUsedOnce n = OneShotLam    : go sd
-      | otherwise    = NoOneShotInfo : go sd
-    go _    = []
+    go n | isAtMostOnce n = OneShotLam
+         | otherwise      = NoOneShotInfo
+
+-- | See Note [Computing one-shot info]
+callCards :: SubDemand -> [Card]
+callCards (Call n sd) = n : callCards sd
+callCards (Poly _ _n) = [] -- n is never C_01 or C_11 so we may as well stop here
+callCards Prod{}      = []
 
 -- |
 -- @saturatedByOneShots n C(M,C(M,...)) = True@
@@ -1084,7 +1094,7 @@ argOneShots (_ :* sd) = go sd
 saturatedByOneShots :: Int -> Demand -> Bool
 saturatedByOneShots _ AbsDmd    = True
 saturatedByOneShots _ BotDmd    = True
-saturatedByOneShots n (_ :* sd) = isUsedOnce $ fst $ peelManyCalls n sd
+saturatedByOneShots n (_ :* sd) = isAtMostOnce $ fst $ peelManyCalls n sd
 
 {- Note [Strict demands]
 ~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1427,7 +1437,7 @@ see Note [Data-con worker strictness].
 --
 -- [n] nontermination (e.g. loops)
 -- [i] throws imprecise exception
--- [p] throws precise exceTtion
+-- [p] throws precise exception
 -- [c] converges (reduces to WHNF).
 --
 -- The different lattice elements correspond to different subsets, indicated by
@@ -1735,7 +1745,7 @@ a consequence of fixed-point iteration, it's not important that they agree.
 -- Subject to Note [Default demand on free variables and arguments]
 -- | Captures the result of an evaluation of an expression, by
 --
---   * Listing how the free variables of that expression have been evaluted
+--   * Listing how the free variables of that expression have been evaluated
 --     ('de_fvs')
 --   * Saying whether or not evaluation would surely diverge ('de_div')
 --
@@ -2629,7 +2639,12 @@ So, L can denote a 'Card', polymorphic 'SubDemand' or polymorphic 'Demand',
 but it's always clear from context which "overload" is meant. It's like
 return-type inference of e.g. 'read'.
 
-Examples are in the haddock for 'Demand'.
+Examples are in the haddock for 'Demand'.  Here are some more:
+   SA                 Strict, but does not look at subcomponents (`seq`)
+   SP(L,L)            Strict boxed pair, components lazy
+   S!P(L,L)           Strict unboxed pair, components lazy
+   LP(SA,SA)          Lazy pair, but if it is evaluated will evaluated its components
+   LC(1C(L))          Lazy, but if called will apply the result exactly once
 
 This is the syntax for demand signatures:
 

@@ -20,6 +20,9 @@ module Test.Cabal.Monad (
     cabalProgram,
     diffProgram,
     python3Program,
+    requireSuccess,
+    initWorkDir,
+    recordLog,
     -- * The test environment
     TestEnv(..),
     getTestEnv,
@@ -30,12 +33,14 @@ module Test.Cabal.Monad (
     testCurrentDir,
     testWorkDir,
     testPrefixDir,
+    testLibInstallDir,
     testDistDir,
     testPackageDbDir,
     testRepoDir,
     testKeysDir,
     testSourceCopyDir,
     testCabalDir,
+    testStoreDir,
     testUserCabalConfigFile,
     testActualFile,
     -- * Skipping tests
@@ -59,9 +64,10 @@ import Test.Cabal.Plan
 import Test.Cabal.OutputNormalizer
 import Test.Cabal.TestCode
 
+import Distribution.Pretty (prettyShow)
 import Distribution.Simple.Compiler
     ( PackageDBStack, PackageDB(..), compilerFlavor
-    , Compiler, compilerVersion )
+    , Compiler, compilerVersion, showCompilerIdWithAbi )
 import Distribution.System
 import Distribution.Simple.Program.Db
 import Distribution.Simple.Program
@@ -70,6 +76,7 @@ import Distribution.Simple.Configure
 import qualified Distribution.Simple.Utils as U (cabalVersion)
 import Distribution.Text
 
+import Test.Utils.TempTestDir (removeDirectoryRecursiveHack)
 import Distribution.Verbosity
 import Distribution.Version
 
@@ -88,15 +95,20 @@ import System.Exit
 import System.FilePath
 import System.IO
 import System.IO.Error (isDoesNotExistError)
-import System.IO.Temp (withSystemTempDirectory)
+import Distribution.Simple.Utils hiding (info)
 import System.Process hiding (env)
 import Options.Applicative
+import Test.Cabal.Run
+import qualified Data.ByteString.Char8 as C
+import Data.List
+import GHC.Stack
 
 data CommonArgs = CommonArgs {
         argCabalInstallPath    :: Maybe FilePath,
         argGhcPath             :: Maybe FilePath,
         argHackageRepoToolPath :: Maybe FilePath,
         argHaddockPath         :: Maybe FilePath,
+        argKeepTmpFiles        :: Bool,
         argAccept              :: Bool,
         argSkipSetupTests      :: Bool
     }
@@ -125,6 +137,10 @@ commonArgParser = CommonArgs
        <> metavar "PATH"
         ))
     <*> switch
+        ( long "keep-tmp-files"
+       <> help "Keep temporary files"
+        )
+    <*> switch
         ( long "accept"
        <> help "Accept output"
         )
@@ -137,10 +153,12 @@ renderCommonArgs args =
     maybe [] (\x -> ["--with-haddock",           x]) (argHaddockPath         args) ++
     maybe [] (\x -> ["--with-hackage-repo-tool", x]) (argHackageRepoToolPath args) ++
     (if argAccept args then ["--accept"] else []) ++
+    (if argKeepTmpFiles args then ["--keep-tmp-files"] else []) ++
     (if argSkipSetupTests args then ["--skip-setup-tests"] else [])
 
 data TestArgs = TestArgs {
         testArgDistDir    :: FilePath,
+        testArgPackageDb  :: Maybe FilePath,
         testArgScriptPath :: FilePath,
         testCommonArgs    :: CommonArgs
     }
@@ -151,6 +169,10 @@ testArgParser = TestArgs
         ( help "Build directory of cabal-testsuite"
        <> long "builddir"
        <> metavar "DIR")
+    <*> optional (option str
+        ( help "Package DB which contains Cabal and Cabal-syntax"
+       <> long "extra-package-db"
+       <> metavar "DIR"))
     <*> argument str ( metavar "FILE")
     <*> commonArgParser
 
@@ -174,6 +196,7 @@ unexpectedSuccess :: TestM ()
 unexpectedSuccess = liftIO $ do
     putStrLn "UNEXPECTED OK"
     E.throwIO TestCodeUnexpectedOk
+
 
 trySkip :: IO a -> IO (Either String a)
 trySkip m = fmap Right m `E.catch` \e -> case e of
@@ -225,14 +248,21 @@ python3Program = simpleProgram "python3"
 
 -- | Run a test in the test monad according to program's arguments.
 runTestM :: String -> TestM a -> IO a
-runTestM mode m = withSystemTempDirectory "cabal-testsuite" $ \tmp_dir -> do
-    args <- execParser (info testArgParser Data.Monoid.mempty)
+runTestM mode m =
+    liftIO $ getTemporaryDirectory >>= \systemTmpDir ->
+    execParser (info testArgParser Data.Monoid.mempty) >>= \args ->
+    withTempDirectoryEx verbosity (defaultTempFileOptions { optKeepTempFiles = argKeepTmpFiles (testCommonArgs args) })
+                               systemTmpDir
+                               "cabal-testsuite" $ \tmp_dir -> do
     let dist_dir = testArgDistDir args
         (script_dir0, script_filename) = splitFileName (testArgScriptPath args)
-        script_base = dropExtensions script_filename
+
+        stripped = stripExtension ".test.hs" script_filename
+               <|> stripExtension ".multitest.hs" script_filename
+        script_base = fromMaybe (dropExtensions script_filename) stripped
+
     -- Canonicalize this so that it is stable across working directory changes
     script_dir <- canonicalizePath script_dir0
-    let verbosity = normal -- TODO: configurable
     senv <- mkScriptEnv verbosity
     -- Add test suite specific programs
     let program_db0 =
@@ -271,6 +301,8 @@ runTestM mode m = withSystemTempDirectory "cabal-testsuite" $ \tmp_dir -> do
                 program_db1
                 verbosity
 
+    (configuredGhcProg, _) <- requireProgram verbosity ghcProgram program_db2
+
     program_db3 <-
         reconfigurePrograms verbosity
             ([("cabal", p)   | p <- maybeToList (argCabalInstallPath cargs)] ++
@@ -283,24 +315,7 @@ runTestM mode m = withSystemTempDirectory "cabal-testsuite" $ \tmp_dir -> do
     -- them up we must configure them
     program_db <- configureAllKnownPrograms verbosity program_db3
 
-    let ghcAndRunnedGhcAreTheSame :: Bool
-        ghcAndRunnedGhcAreTheSame = fromMaybe False $ do
-            ghc_program        <- lookupProgram ghcProgram program_db
-            runner_ghc_program <- lookupProgram ghcProgram (runnerProgramDb senv)
-            return $ programPath ghc_program == programPath runner_ghc_program
-
-    let db_stack =
-            case argGhcPath (testCommonArgs args) of
-                Nothing -> runnerPackageDbStack senv -- NB: canonicalized
-                -- Can't use the build package db stack since they
-                -- are all for the wrong versions!  TODO: Make
-                -- this configurable
-                --
-                -- Oleg: if runner ghc and provided ghc are the same,
-                -- use runnerPackageDbStack. See 'hasCabalForGhc' check.
-                Just _
-                    | ghcAndRunnedGhcAreTheSame -> runnerPackageDbStack senv
-                    | otherwise                 -> [GlobalPackageDB]
+    let db_stack = [GlobalPackageDB]
         env = TestEnv {
                     testSourceDir = script_dir,
                     testTmpDir = tmp_dir,
@@ -309,11 +324,13 @@ runTestM mode m = withSystemTempDirectory "cabal-testsuite" $ \tmp_dir -> do
                     testProgramDb = program_db,
                     testPlatform = platform,
                     testCompiler = comp,
+                    testCompilerPath = programPath configuredGhcProg,
                     testPackageDBStack = db_stack,
                     testVerbosity = verbosity,
                     testMtimeChangeDelay = Nothing,
                     testScriptEnv = senv,
                     testSetupPath = dist_dir </> "build" </> "setup" </> "setup",
+                    testPackageDbPath = testArgPackageDb args,
                     testSkipSetupTests =  argSkipSetupTests (testCommonArgs args),
                     testHaveCabalShared = runnerWithSharedLib senv,
                     testEnvironment =
@@ -324,30 +341,30 @@ runTestM mode m = withSystemTempDirectory "cabal-testsuite" $ \tmp_dir -> do
                         -- Set CABAL_DIR in addition to HOME, since HOME has no
                         -- effect on Windows.
                         , ("CABAL_DIR", Just (testCabalDir env))
-                        , ("CABAL_CONFIG", Just $ testCabalDir env </> "config")
+                        , ("CABAL_CONFIG", Just (testUserCabalConfigFile env))
                         ],
                     testShouldFail = False,
                     testRelativeCurrentDir = ".",
                     testHavePackageDb = False,
                     testHaveRepo = False,
-                    testHaveSourceCopy = False,
                     testCabalInstallAsSetup = False,
-                    testCabalProjectFile = "cabal.project",
+                    testCabalProjectFile = Nothing,
                     testPlan = Nothing,
                     testRecordDefaultMode = DoNotRecord,
                     testRecordUserMode = Nothing,
-                    testRecordNormalizer = id,
-                    testSourceCopyRelativeDir = "source"
+                    testMaybeStoreDir = Nothing
                 }
     let go = do cleanup
-                r <- m
+                r <- withSourceCopy m
                 check_expect (argAccept (testCommonArgs args))
                 return r
     runReaderT go env
   where
+    verbosity = normal -- TODO: configurable
+
     cleanup = do
         env <- getTestEnv
-        onlyIfExists . removeDirectoryRecursive $ testWorkDir env
+        onlyIfExists . removeDirectoryRecursiveHack verbosity $ testWorkDir env
         -- NB: it's important to initialize this ourselves, as
         -- the default configuration hardcodes Hackage, which we do
         -- NOT want to assume for these tests (no test should
@@ -383,6 +400,105 @@ readFileOrEmpty f = readFile f `E.catch` \e ->
                                         then return ""
                                         else E.throwIO e
 
+-- | Run an IO action, and suppress a "does not exist" error.
+onlyIfExists :: MonadIO m => IO () -> m ()
+onlyIfExists m =
+    liftIO $ E.catch m $ \(e :: IOError) ->
+        unless (isDoesNotExistError e) $ E.throwIO e
+
+-- | Make a hermetic copy of the test directory.
+--
+-- This requires the test repository to be a Git checkout, because
+-- we use the Git metadata to figure out what files to copy into the
+-- hermetic copy.
+withSourceCopy :: TestM a -> TestM a
+withSourceCopy m = do
+    env <- getTestEnv
+    initWorkDir
+    let curdir  = testSourceDir env
+        dest = testSourceCopyDir env
+    fs <- getSourceFiles
+    when (null fs)
+      (error (unlines [ "withSourceCopy: No files to copy from " ++ curdir
+                      , "You need to \"git add\" any files before they are copied by the testsuite."]))
+    forM_ fs $ \f -> do
+        unless (isTestFile f) $ liftIO $ do
+            putStrLn ("Copying " ++ (curdir </> f) ++ " to " ++ (dest </> f))
+            createDirectoryIfMissing True (takeDirectory (dest </> f))
+            d <- liftIO $ doesDirectoryExist (curdir </> f)
+            if d
+              then
+                copyDirectoryRecursive normal (curdir </> f) (dest </> f)
+              else
+                copyFile (curdir </> f) (dest </> f)
+    m
+
+
+-- NB: Keep this synchronized with partitionTests
+isTestFile :: FilePath -> Bool
+isTestFile f =
+    case takeExtensions f of
+        ".test.hs"      -> True
+        ".multitest.hs" -> True
+        _               -> False
+
+
+initWorkDir :: TestM ()
+initWorkDir = do
+    env <- getTestEnv
+    liftIO $ createDirectoryIfMissing True (testWorkDir env)
+
+
+
+getSourceFiles :: TestM [FilePath]
+getSourceFiles = do
+    env <- getTestEnv
+    configured_prog <- requireProgramM gitProgram
+    r <- liftIO $ run (testVerbosity env)
+                 (Just (testSourceDir env))
+                 (testEnvironment env)
+                 (programPath configured_prog)
+                 ["ls-files", "--cached", "--modified"]
+                 Nothing
+    recordLog r
+    _ <- requireSuccess r
+    return (lines $ resultOutput r)
+
+recordLog :: Result -> TestM ()
+recordLog res = do
+    env <- getTestEnv
+    let mode = testRecordMode env
+    initWorkDir
+    liftIO $ C.appendFile (testWorkDir env </> "test.log")
+                         (C.pack $ "+ " ++ resultCommand res ++ "\n"
+                            ++ resultOutput res ++ "\n\n")
+    liftIO . C.appendFile (testActualFile env) . C.pack $
+        case mode of
+            RecordAll    -> unlines (lines (resultOutput res))
+            RecordMarked -> getMarkedOutput (resultOutput res)
+            DoNotRecord  -> ""
+
+------------------------------------------------------------------------
+-- * Subprocess run results
+
+requireSuccess :: Result -> TestM Result
+requireSuccess r@Result { resultCommand = cmd
+                        , resultExitCode = exitCode
+                        , resultOutput = output } = withFrozenCallStack $ do
+    env <- getTestEnv
+    when (exitCode /= ExitSuccess && not (testShouldFail env)) $
+        assertFailure $ "Command " ++ cmd ++ " failed.\n" ++
+        "Output:\n" ++ output ++ "\n"
+    when (exitCode == ExitSuccess && testShouldFail env) $
+        assertFailure $ "Command " ++ cmd ++ " succeeded.\n" ++
+        "Output:\n" ++ output ++ "\n"
+    return r
+
+assertFailure :: String -> m ()
+assertFailure msg = withFrozenCallStack $ error msg
+
+
+
 -- | Runs 'diff' with some arguments on two files, outputting the
 -- diff to stderr, and returning true if the two files differ
 diff :: [String] -> FilePath -> FilePath -> TestM Bool
@@ -412,23 +528,40 @@ mkNormalizerEnv = do
                       ["list", "--global", "--simple-output"] ""
     tmpDir <- liftIO $ getTemporaryDirectory
 
+    canonicalizedTestTmpDir <- liftIO $ canonicalizePath (testTmpDir env)
+
+    -- 'cabal' is configured in the package-db, but doesn't specify how to find the program version
+    -- Thus we find the program location, if it exists, and query for the program version for
+    -- output normalisation.
+    cabalVersionM <- do
+        cabalProgM <- needProgramM "cabal"
+        case cabalProgM of
+            Nothing -> pure Nothing
+            Just cabalProg -> do
+                liftIO (findProgramVersion "--numeric-version" id (testVerbosity env) (programPath cabalProg))
+
     return NormalizerEnv {
         normalizerRoot
             = addTrailingPathSeparator (testSourceDir env),
         normalizerTmpDir
             = addTrailingPathSeparator (testTmpDir env),
+        normalizerCanonicalTmpDir
+            = addTrailingPathSeparator canonicalizedTestTmpDir,
         normalizerGblTmpDir
             = addTrailingPathSeparator tmpDir,
         normalizerGhcVersion
             = compilerVersion (testCompiler env),
+        normalizerGhcPath
+            = testCompilerPath env,
         normalizerKnownPackages
             = mapMaybe simpleParse (words list_out),
         normalizerPlatform
             = testPlatform env,
         normalizerCabalVersion
-            = cabalVersionLibrary
+            = cabalVersionLibrary,
+        normalizerCabalInstallVersion
+            = cabalVersionM
     }
-    where
 
 cabalVersionLibrary :: Version
 cabalVersionLibrary = U.cabalVersion
@@ -439,6 +572,11 @@ requireProgramM program = do
     (configured_program, _) <- liftIO $
         requireProgram (testVerbosity env) program (testProgramDb env)
     return configured_program
+
+needProgramM :: String -> TestM (Maybe ConfiguredProgram)
+needProgramM program = do
+    env <- getTestEnv
+    return $ lookupProgramByName program (testProgramDb env)
 
 programPathM :: Program -> TestM FilePath
 programPathM program = do
@@ -456,11 +594,21 @@ isAvailableProgram program = do
                 Just _  -> return True
                 Nothing -> return False
 
--- | Run an IO action, and suppress a "does not exist" error.
-onlyIfExists :: MonadIO m => IO () -> m ()
-onlyIfExists m =
-    liftIO $ E.catch m $ \(e :: IOError) ->
-        unless (isDoesNotExistError e) $ E.throwIO e
+
+getMarkedOutput :: String -> String -- trailing newline
+getMarkedOutput out = unlines (go (lines out) False)
+  where
+    go [] _ = []
+    go (x:xs) True
+        | "-----END CABAL OUTPUT-----"   `isPrefixOf` x
+                    =     go xs False
+        | otherwise = x : go xs True
+    go (x:xs) False
+        -- NB: Windows has extra goo at the end
+        | "-----BEGIN CABAL OUTPUT-----" `isPrefixOf` x
+                    = go xs True
+        | otherwise = go xs False
+
 
 data TestEnv = TestEnv
     -- UNCHANGING:
@@ -471,6 +619,7 @@ data TestEnv = TestEnv
       testSourceDir     :: FilePath
     -- | Somewhere to stow temporary files needed by the test.
     , testTmpDir        :: FilePath
+
     -- | Test sub-name, used to qualify dist/database directory to avoid
     -- conflicts.
     , testSubName       :: String
@@ -481,6 +630,7 @@ data TestEnv = TestEnv
     , testProgramDb     :: ProgramDb
     -- | Compiler we are running tests for
     , testCompiler      :: Compiler
+    , testCompilerPath  :: FilePath
     -- | Platform we are running tests on
     , testPlatform      :: Platform
     -- | Package database stack (actually this changes lol)
@@ -495,6 +645,9 @@ data TestEnv = TestEnv
     , testScriptEnv :: ScriptEnv
     -- | Setup script path
     , testSetupPath :: FilePath
+    -- | Setup package-db path which contains Cabal and Cabal-syntax for cabal-install to
+    -- use when compiling custom setups.
+    , testPackageDbPath :: Maybe FilePath
     -- | Skip Setup tests?
     , testSkipSetupTests :: Bool
     -- | Do we have shared libraries for the Cabal-under-tests?
@@ -514,12 +667,10 @@ data TestEnv = TestEnv
     , testHavePackageDb  :: Bool
     -- | Says if we've setup a repository
     , testHaveRepo :: Bool
-    -- | Says if we've copied the source to a hermetic directory
-    , testHaveSourceCopy :: Bool
     -- | Says if we're testing cabal-install as setup
     , testCabalInstallAsSetup :: Bool
     -- | Says what cabal.project file to use (probed)
-    , testCabalProjectFile :: FilePath
+    , testCabalProjectFile :: Maybe FilePath
     -- | Cached record of the plan metadata from a new-build
     -- invocation; controlled by 'withPlan'.
     , testPlan :: Maybe Plan
@@ -527,12 +678,10 @@ data TestEnv = TestEnv
     , testRecordDefaultMode :: RecordMode
     -- | User explicitly set record mode.  Not implemented ATM.
     , testRecordUserMode :: Maybe RecordMode
-    -- | Function to normalize recorded output
-    , testRecordNormalizer :: String -> String
-    -- | Name of the subdirectory we copied the test's sources to,
-    -- relative to 'testSourceDir'
-    , testSourceCopyRelativeDir :: FilePath
+    -- | Path to the storedir used by the test, if not the default
+    , testMaybeStoreDir      :: Maybe FilePath
     }
+    deriving Show
 
 testRecordMode :: TestEnv -> RecordMode
 testRecordMode env = fromMaybe (testRecordDefaultMode env) (testRecordUserMode env)
@@ -550,10 +699,7 @@ getTestEnv = ask
 -- where the Cabal file lives.  This is what you want the CWD of cabal
 -- calls to be.
 testCurrentDir :: TestEnv -> FilePath
-testCurrentDir env =
-    (if testHaveSourceCopy env
-        then testSourceCopyDir env
-        else testSourceDir env) </> testRelativeCurrentDir env
+testCurrentDir env = testSourceCopyDir env </> testRelativeCurrentDir env
 
 testName :: TestEnv -> String
 testName env = testSubName env <.> testMode env
@@ -562,12 +708,21 @@ testName env = testSubName env <.> testMode env
 -- files for ALL tests associated with a test (respecting
 -- subtests.)  To clean, you ONLY need to delete this directory.
 testWorkDir :: TestEnv -> FilePath
-testWorkDir env =
-    testSourceDir env </> (testName env <.> "dist")
+testWorkDir env = testTmpDir env </> (testName env <.> "dist")
 
 -- | The absolute prefix where installs go.
 testPrefixDir :: TestEnv -> FilePath
 testPrefixDir env = testWorkDir env </> "usr"
+
+-- | The absolute path where library installs go.
+testLibInstallDir :: TestEnv -> FilePath
+testLibInstallDir env = libDir </> compilerDir
+  where
+    platform@(Platform _ os) = testPlatform env
+    libDir = case os of
+      Windows -> testPrefixDir env
+      _ -> testPrefixDir env </> "lib"
+    compilerDir = prettyShow platform ++ "-" ++ showCompilerIdWithAbi (testCompiler env)
 
 -- | The absolute path to the build directory that should be used
 -- for the current package in a test.
@@ -594,11 +749,16 @@ testKeysDir env = testWorkDir env </> "keys"
 
 -- | If 'withSourceCopy' is used, where the source files go.
 testSourceCopyDir :: TestEnv -> FilePath
-testSourceCopyDir env = testWorkDir env </> testSourceCopyRelativeDir env
+testSourceCopyDir env = testTmpDir env
 
 -- | The user cabal directory
 testCabalDir :: TestEnv -> FilePath
 testCabalDir env = testHomeDir env </> ".cabal"
+
+testStoreDir :: TestEnv -> FilePath
+testStoreDir env = case testMaybeStoreDir env of
+                      Just dir -> dir
+                      Nothing -> testCabalDir env </> "store"
 
 -- | The user cabal config file
 testUserCabalConfigFile :: TestEnv -> FilePath

@@ -1,5 +1,5 @@
 #if __GLASGOW_HASKELL__ >= 709
-{-# LANGUAGE Safe #-}
+{-# LANGUAGE Trustworthy #-}
 #else
 {-# LANGUAGE Trustworthy #-}
 #endif
@@ -45,6 +45,8 @@ module System.Win32.Console (
         generateConsoleCtrlEvent,
         -- * Command line
         commandLineToArgv,
+        getCommandLineW,
+        getArgs,
         -- * Screen buffer
         CONSOLE_SCREEN_BUFFER_INFO(..),
         CONSOLE_SCREEN_BUFFER_INFOEX(..),
@@ -54,7 +56,11 @@ module System.Win32.Console (
         getConsoleScreenBufferInfo,
         getCurrentConsoleScreenBufferInfo,
         getConsoleScreenBufferInfoEx,
-        getCurrentConsoleScreenBufferInfoEx
+        getCurrentConsoleScreenBufferInfoEx,
+
+        -- * Env
+        getEnv,
+        getEnvironment
   ) where
 
 #include <windows.h>
@@ -62,22 +68,22 @@ module System.Win32.Console (
 ##include "windows_cconv.h"
 #include "wincon_compat.h"
 
+import Data.Char (chr)
 import System.Win32.Types
+import System.Win32.String
+import System.Win32.Console.Internal
 import Graphics.Win32.Misc
 import Graphics.Win32.GDI.Types (COLORREF)
 
-import Foreign.C.Types (CInt(..))
+import GHC.IO (bracket)
+import GHC.IO.Exception (IOException(..), IOErrorType(OtherError))
+import Foreign.Ptr (plusPtr)
+import Foreign.C.Types (CWchar)
 import Foreign.C.String (withCWString, CWString)
-import Foreign.Ptr (Ptr, plusPtr)
 import Foreign.Storable (Storable(..))
-import Foreign.Marshal.Array (peekArray, pokeArray)
+import Foreign.Marshal.Array (peekArray, peekArray0)
 import Foreign.Marshal.Alloc (alloca)
 
-foreign import WINDOWS_CCONV unsafe "windows.h GetConsoleMode"
-        c_GetConsoleMode :: HANDLE -> LPDWORD -> IO BOOL
-
-foreign import WINDOWS_CCONV unsafe "windows.h SetConsoleMode"
-        c_SetConsoleMode :: HANDLE -> DWORD -> IO BOOL
 
 getConsoleMode :: HANDLE -> IO DWORD
 getConsoleMode h = alloca $ \ptr -> do
@@ -107,35 +113,11 @@ eNABLE_VIRTUAL_TERMINAL_PROCESSING = 4
 dISABLE_NEWLINE_AUTO_RETURN = 8
 eNABLE_LVB_GRID_WORLDWIDE = 16
 
-foreign import WINDOWS_CCONV unsafe "windows.h GetConsoleCP"
-        getConsoleCP :: IO UINT
-
-foreign import WINDOWS_CCONV unsafe "windows.h SetConsoleCP"
-        setConsoleCP :: UINT -> IO ()
-
-foreign import WINDOWS_CCONV unsafe "windows.h GetConsoleOutputCP"
-        getConsoleOutputCP :: IO UINT
-
-foreign import WINDOWS_CCONV unsafe "windows.h SetConsoleOutputCP"
-        setConsoleOutputCP :: UINT -> IO ()
-
-type CtrlEvent = DWORD
-#{enum CtrlEvent,
-    , cTRL_C_EVENT      = 0
-    , cTRL_BREAK_EVENT  = 1
-    }
-
 generateConsoleCtrlEvent :: CtrlEvent -> DWORD -> IO ()
 generateConsoleCtrlEvent e p
     = failIfFalse_
         "generateConsoleCtrlEvent"
         $ c_GenerateConsoleCtrlEvent e p
-
-foreign import WINDOWS_CCONV safe "windows.h GenerateConsoleCtrlEvent"
-    c_GenerateConsoleCtrlEvent :: CtrlEvent -> DWORD -> IO BOOL
-
-foreign import WINDOWS_CCONV unsafe "Shellapi.h CommandLineToArgvW"
-     c_CommandLineToArgvW :: CWString -> Ptr CInt -> IO (Ptr CWString)
 
 -- | This function can be used to parse command line arguments and return
 --   the split up arguments as elements in a list.
@@ -150,118 +132,12 @@ commandLineToArgv arg =
          _ <- localFree res
          mapM peekTString args
 
-data CONSOLE_SCREEN_BUFFER_INFO = CONSOLE_SCREEN_BUFFER_INFO
-    { dwSize              :: COORD
-    , dwCursorPosition    :: COORD
-    , wAttributes         :: WORD
-    , srWindow            :: SMALL_RECT
-    , dwMaximumWindowSize :: COORD
-    } deriving (Show, Eq)
-
-instance Storable CONSOLE_SCREEN_BUFFER_INFO where
-    sizeOf = const #{size CONSOLE_SCREEN_BUFFER_INFO}
-    alignment _ = #alignment CONSOLE_SCREEN_BUFFER_INFO
-    peek buf = do
-        dwSize'              <- (#peek CONSOLE_SCREEN_BUFFER_INFO, dwSize) buf
-        dwCursorPosition'    <- (#peek CONSOLE_SCREEN_BUFFER_INFO, dwCursorPosition) buf
-        wAttributes'         <- (#peek CONSOLE_SCREEN_BUFFER_INFO, wAttributes) buf
-        srWindow'            <- (#peek CONSOLE_SCREEN_BUFFER_INFO, srWindow) buf
-        dwMaximumWindowSize' <- (#peek CONSOLE_SCREEN_BUFFER_INFO, dwMaximumWindowSize) buf
-        return $ CONSOLE_SCREEN_BUFFER_INFO dwSize' dwCursorPosition' wAttributes' srWindow' dwMaximumWindowSize'
-    poke buf info = do
-        (#poke CONSOLE_SCREEN_BUFFER_INFO, dwSize) buf (dwSize info)
-        (#poke CONSOLE_SCREEN_BUFFER_INFO, dwCursorPosition) buf (dwCursorPosition info)
-        (#poke CONSOLE_SCREEN_BUFFER_INFO, wAttributes) buf (wAttributes info)
-        (#poke CONSOLE_SCREEN_BUFFER_INFO, srWindow) buf (srWindow info)
-        (#poke CONSOLE_SCREEN_BUFFER_INFO, dwMaximumWindowSize) buf (dwMaximumWindowSize info)
-
-data CONSOLE_SCREEN_BUFFER_INFOEX = CONSOLE_SCREEN_BUFFER_INFOEX
-    { dwSizeEx              :: COORD
-    , dwCursorPositionEx    :: COORD
-    , wAttributesEx         :: WORD
-    , srWindowEx            :: SMALL_RECT
-    , dwMaximumWindowSizeEx :: COORD
-    , wPopupAttributes      :: WORD
-    , bFullscreenSupported  :: BOOL
-    , colorTable            :: [COLORREF]
-      -- ^ Only the first 16 'COLORREF' values passed to the Windows Console
-      -- API. If fewer than 16 values, the remainder are padded with @0@ when
-      -- passed to the API.
-    } deriving (Show, Eq)
-
-instance Storable CONSOLE_SCREEN_BUFFER_INFOEX where
-    sizeOf = const #{size CONSOLE_SCREEN_BUFFER_INFOEX}
-    alignment = const #{alignment CONSOLE_SCREEN_BUFFER_INFOEX}
-    peek buf = do
-        dwSize'               <- (#peek CONSOLE_SCREEN_BUFFER_INFOEX, dwSize) buf
-        dwCursorPosition'     <- (#peek CONSOLE_SCREEN_BUFFER_INFOEX, dwCursorPosition) buf
-        wAttributes'          <- (#peek CONSOLE_SCREEN_BUFFER_INFOEX, wAttributes) buf
-        srWindow'             <- (#peek CONSOLE_SCREEN_BUFFER_INFOEX, srWindow) buf
-        dwMaximumWindowSize'  <- (#peek CONSOLE_SCREEN_BUFFER_INFOEX, dwMaximumWindowSize) buf
-        wPopupAttributes'     <- (#peek CONSOLE_SCREEN_BUFFER_INFOEX, wPopupAttributes) buf
-        bFullscreenSupported' <- (#peek CONSOLE_SCREEN_BUFFER_INFOEX, bFullscreenSupported) buf
-        colorTable'           <- peekArray 16 ((#ptr CONSOLE_SCREEN_BUFFER_INFOEX, ColorTable) buf)
-        return $ CONSOLE_SCREEN_BUFFER_INFOEX dwSize' dwCursorPosition'
-          wAttributes' srWindow' dwMaximumWindowSize' wPopupAttributes'
-          bFullscreenSupported' colorTable'
-    poke buf info = do
-        (#poke CONSOLE_SCREEN_BUFFER_INFOEX, cbSize) buf cbSize
-        (#poke CONSOLE_SCREEN_BUFFER_INFOEX, dwSize) buf (dwSizeEx info)
-        (#poke CONSOLE_SCREEN_BUFFER_INFOEX, dwCursorPosition) buf (dwCursorPositionEx info)
-        (#poke CONSOLE_SCREEN_BUFFER_INFOEX, wAttributes) buf (wAttributesEx info)
-        (#poke CONSOLE_SCREEN_BUFFER_INFOEX, srWindow) buf (srWindowEx info)
-        (#poke CONSOLE_SCREEN_BUFFER_INFOEX, dwMaximumWindowSize) buf (dwMaximumWindowSizeEx info)
-        (#poke CONSOLE_SCREEN_BUFFER_INFOEX, wPopupAttributes) buf (wPopupAttributes info)
-        (#poke CONSOLE_SCREEN_BUFFER_INFOEX, bFullscreenSupported) buf (bFullscreenSupported info)
-        pokeArray ((#ptr CONSOLE_SCREEN_BUFFER_INFOEX, ColorTable) buf) colorTable'
-      where
-        cbSize :: ULONG
-        cbSize = #{size CONSOLE_SCREEN_BUFFER_INFOEX}
-        colorTable' = take 16 $ colorTable info ++ repeat 0
-
-data COORD = COORD
-    { xPos :: SHORT
-    , yPos :: SHORT
-    } deriving (Show, Eq)
-
-instance Storable COORD where
-    sizeOf = const #{size COORD}
-    alignment _ = #alignment COORD
-    peek buf = do
-        x' <- (#peek COORD, X) buf
-        y' <- (#peek COORD, Y) buf
-        return $ COORD x' y'
-    poke buf coord = do
-        (#poke COORD, X) buf (xPos coord)
-        (#poke COORD, Y) buf (yPos coord)
-
-data SMALL_RECT = SMALL_RECT
-    { leftPos   :: SHORT
-    , topPos    :: SHORT
-    , rightPos  :: SHORT
-    , bottomPos :: SHORT
-    } deriving (Show, Eq)
-
-instance Storable SMALL_RECT where
-    sizeOf _ = #{size SMALL_RECT}
-    alignment _ = #alignment SMALL_RECT
-    peek buf = do
-        left'   <- (#peek SMALL_RECT, Left) buf
-        top'    <- (#peek SMALL_RECT, Top) buf
-        right'  <- (#peek SMALL_RECT, Right) buf
-        bottom' <- (#peek SMALL_RECT, Bottom) buf
-        return $ SMALL_RECT left' top' right' bottom'
-    poke buf small_rect = do
-        (#poke SMALL_RECT, Left) buf (leftPos small_rect)
-        (#poke SMALL_RECT, Top) buf (topPos small_rect)
-        (#poke SMALL_RECT, Right) buf (rightPos small_rect)
-        (#poke SMALL_RECT, Bottom) buf (bottomPos small_rect)
-
-foreign import WINDOWS_CCONV safe "windows.h GetConsoleScreenBufferInfo"
-    c_GetConsoleScreenBufferInfo :: HANDLE -> Ptr CONSOLE_SCREEN_BUFFER_INFO -> IO BOOL
-
-foreign import WINDOWS_CCONV safe "windows.h GetConsoleScreenBufferInfoEx"
-    c_GetConsoleScreenBufferInfoEx :: HANDLE -> Ptr CONSOLE_SCREEN_BUFFER_INFOEX -> IO BOOL
+-- | Based on 'GetCommandLineW'. This behaves slightly different
+-- than 'System.Environment.getArgs'. See the online documentation:
+-- <https://learn.microsoft.com/en-us/windows/win32/api/processenv/nf-processenv-getcommandlinew>
+getArgs :: IO [String]
+getArgs = do
+  getCommandLineW >>= peekTString >>= commandLineToArgv
 
 getConsoleScreenBufferInfo :: HANDLE -> IO CONSOLE_SCREEN_BUFFER_INFO
 getConsoleScreenBufferInfo h = alloca $ \ptr -> do
@@ -288,3 +164,71 @@ getCurrentConsoleScreenBufferInfoEx :: IO CONSOLE_SCREEN_BUFFER_INFOEX
 getCurrentConsoleScreenBufferInfoEx = do
     h <- failIf (== nullHANDLE) "getStdHandle" $ getStdHandle sTD_OUTPUT_HANDLE
     getConsoleScreenBufferInfoEx h
+
+
+-- c_GetEnvironmentVariableW :: LPCWSTR -> LPWSTR -> DWORD -> IO DWORD
+getEnv :: String -> IO (Maybe String)
+getEnv name =
+  withCWString name $ \c_name -> withTStringBufferLen maxLength $ \(buf, len) -> do
+    let c_len = fromIntegral len
+    c_len' <- c_GetEnvironmentVariableW c_name buf c_len
+    case c_len' of
+      0 -> do
+        err_code <- getLastError
+        if err_code  == eERROR_ENVVAR_NOT_FOUND
+        then return Nothing
+        else errorWin "GetEnvironmentVariableW"
+      _ | c_len' > fromIntegral maxLength ->
+            -- shouldn't happen, because we provide maxLength
+            ioError (IOError Nothing OtherError "GetEnvironmentVariableW" ("Unexpected return code: " <> show c_len') Nothing Nothing)
+        | otherwise -> do
+            let len' = fromIntegral c_len'
+            Just <$> peekTStringLen (buf, len')
+ where
+  -- according to https://learn.microsoft.com/en-us/windows/win32/api/processenv/nf-processenv-getenvironmentvariablew
+  -- max characters (wide chars): 32767
+  -- => bytes = 32767 * 2 = 65534
+  -- +1 byte for NUL (although not needed I think)
+  maxLength :: Int
+  maxLength = 65535
+
+
+getEnvironment :: IO [(String, String)]
+getEnvironment = bracket c_GetEnvironmentStringsW c_FreeEnvironmentStrings $ \lpwstr -> do
+    strs <- builder lpwstr
+    return (divvy <$> strs)
+ where
+  divvy :: String -> (String, String)
+  divvy str =
+    case break (=='=') str of
+      (xs,[])        -> (xs,[]) -- don't barf (like Posix.getEnvironment)
+      (name,_:value) -> (name,value)
+
+  builder :: LPWSTR -> IO [String]
+  builder ptr = go 0
+   where
+    go :: Int -> IO [String]
+    go off = do
+      (str, l) <- peekCWStringOff ptr off
+      if l == 0
+      then pure []
+      else (str:) <$> go (((l + 1) * 2) + off)
+
+
+peekCWStringOff :: CWString -> Int -> IO (String, Int)
+peekCWStringOff cp off = do
+  cs <- peekArray0 wNUL (cp `plusPtr` off)
+  return (cWcharsToChars cs, length cs)
+
+wNUL :: CWchar
+wNUL = 0
+
+cWcharsToChars :: [CWchar] -> [Char]
+cWcharsToChars = map chr . fromUTF16 . map fromIntegral
+ where
+  fromUTF16 (c1:c2:wcs)
+    | 0xd800 <= c1 && c1 <= 0xdbff && 0xdc00 <= c2 && c2 <= 0xdfff =
+      ((c1 - 0xd800)*0x400 + (c2 - 0xdc00) + 0x10000) : fromUTF16 wcs
+  fromUTF16 (c:wcs) = c : fromUTF16 wcs
+  fromUTF16 [] = []
+

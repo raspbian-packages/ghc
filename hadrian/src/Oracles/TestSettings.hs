@@ -25,8 +25,9 @@ data TestSetting = TestHostOS
                  | TestTARGETPLATFORM
                  | TestTargetOS_CPP
                  | TestTargetARCH_CPP
+                 | TestRTSWay
                  | TestGhcStage
-                 | TestGhcDebugged
+                 | TestGhcDebugAssertions
                  | TestGhcWithNativeCodeGen
                  | TestGhcWithInterpreter
                  | TestGhcWithRtsLinker
@@ -36,7 +37,6 @@ data TestSetting = TestHostOS
                  | TestGhcDynamic
                  | TestGhcProfiled
                  | TestAR
-                 | TestCLANG
                  | TestLLC
                  | TestTEST_CC
                  | TestTEST_CC_OPTS
@@ -56,8 +56,9 @@ testSetting key = do
         TestTARGETPLATFORM        -> "TARGETPLATFORM"
         TestTargetOS_CPP          -> "TargetOS_CPP"
         TestTargetARCH_CPP        -> "TargetARCH_CPP"
+        TestRTSWay                -> "RTSWay"
         TestGhcStage              -> "GhcStage"
-        TestGhcDebugged           -> "GhcDebugged"
+        TestGhcDebugAssertions    -> "GhcDebugAssertions"
         TestGhcWithNativeCodeGen  -> "GhcWithNativeCodeGen"
         TestGhcWithInterpreter    -> "GhcWithInterpreter"
         TestGhcWithRtsLinker      -> "GhcWithRtsLinker"
@@ -67,7 +68,6 @@ testSetting key = do
         TestGhcDynamic            -> "GhcDynamic"
         TestGhcProfiled           -> "GhcProfiled"
         TestAR                    -> "AR"
-        TestCLANG                 -> "CLANG"
         TestLLC                   -> "LLC"
         TestTEST_CC               -> "TEST_CC"
         TestTEST_CC_OPTS          -> "TEST_CC_OPTS"
@@ -111,7 +111,7 @@ getCompilerPath "stage-cabal" = do
 getCompilerPath compiler = pure compiler
 
 isInTreeCompiler :: String -> Bool
-isInTreeCompiler c = c `elem` ["stage1","stage2","stage3"]
+isInTreeCompiler c = isJust (stageOfTestCompiler c)
 
 -- | Get the full path to the given program.
 fullPath :: Stage -> Package -> Action FilePath

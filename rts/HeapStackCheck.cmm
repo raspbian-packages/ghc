@@ -26,6 +26,8 @@ import CLOSURE large_alloc_lim;
 import CLOSURE stg_MSG_THROWTO_info;
 import CLOSURE stg_MVAR_DIRTY_info;
 import CLOSURE stg_WHITEHOLE_info;
+import CLOSURE stg_ap_stack_entries;
+import CLOSURE stg_apply_interp_info;
 import CLOSURE stg_arg_bitmaps;
 import CLOSURE stg_block_putmvar_info;
 import CLOSURE stg_block_readmvar_info;
@@ -40,6 +42,7 @@ import CLOSURE stg_ret_f_info;
 import CLOSURE stg_ret_l_info;
 import CLOSURE stg_ret_n_info;
 import CLOSURE stg_ret_p_info;
+import CLOSURE stg_stack_save_entries;
 #endif
 
 /* Stack/Heap Check Failure
@@ -96,9 +99,10 @@ import CLOSURE stg_ret_p_info;
  * the stack is already too big.
  */
 
-#define PRE_RETURN(why,what_next)                       \
-  StgTSO_what_next(CurrentTSO) = what_next::I16;        \
-  StgRegTable_rRet(BaseReg) = why;                      \
+// N.B. the access to what_next may synchronize with throwToMsg
+#define PRE_RETURN(why,what_next)                           \
+  %relaxed StgTSO_what_next(CurrentTSO) = what_next::I16;   \
+  StgRegTable_rRet(BaseReg) = why;                          \
   R1 = BaseReg;
 
 /* Remember that the return address is *removed* when returning to a

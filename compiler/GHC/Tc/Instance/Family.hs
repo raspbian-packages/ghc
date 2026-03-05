@@ -6,7 +6,6 @@ module GHC.Tc.Instance.Family (
         checkFamInstConsistency, tcExtendLocalFamInstEnv,
         tcLookupDataFamInst, tcLookupDataFamInst_maybe,
         tcInstNewTyCon_maybe, tcTopNormaliseNewTypeTF_maybe,
-        newFamInst,
 
         -- * Injectivity
         reportInjectivityErrors, reportConflictingInjectivityErrs
@@ -14,11 +13,10 @@ module GHC.Tc.Instance.Family (
 
 import GHC.Prelude
 
-import GHC.Driver.Session
+import GHC.Driver.DynFlags
 import GHC.Driver.Env
 
 import GHC.Core.FamInstEnv
-import GHC.Core.InstEnv( roughMatchTcs )
 import GHC.Core.Coercion
 import GHC.Core.TyCon
 import GHC.Core.Coercion.Axiom
@@ -31,7 +29,6 @@ import GHC.Iface.Load
 import GHC.Tc.Errors.Types
 import GHC.Tc.Types.Evidence
 import GHC.Tc.Utils.Monad
-import GHC.Tc.Utils.Instantiate( freshenTyVarBndrs, freshenCoVarBndrsX )
 import GHC.Tc.Utils.TcType
 
 import GHC.Unit.External
@@ -49,7 +46,6 @@ import GHC.Types.Var.Set
 import GHC.Utils.Outputable
 import GHC.Utils.Misc
 import GHC.Utils.Panic
-import GHC.Utils.Panic.Plain
 import GHC.Utils.FV
 
 import GHC.Data.Bag( Bag, unionBags, unitBag )
@@ -62,6 +58,7 @@ import Data.Function ( on )
 
 import qualified GHC.LanguageExtensions  as LangExt
 import GHC.Unit.Env (unitEnv_hpts)
+import Data.List (sortOn)
 
 {- Note [The type family instance consistency story]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -161,44 +158,6 @@ addressed yet.
 {-
 ************************************************************************
 *                                                                      *
-                 Making a FamInst
-*                                                                      *
-************************************************************************
--}
-
--- All type variables in a FamInst must be fresh. This function
--- creates the fresh variables and applies the necessary substitution
--- It is defined here to avoid a dependency from FamInstEnv on the monad
--- code.
-
-newFamInst :: FamFlavor -> CoAxiom Unbranched -> TcM FamInst
--- Freshen the type variables of the FamInst branches
-newFamInst flavor axiom@(CoAxiom { co_ax_tc = fam_tc })
-  = do {
-         -- Freshen the type variables
-         (subst, tvs') <- freshenTyVarBndrs tvs
-       ; (subst, cvs') <- freshenCoVarBndrsX subst cvs
-       ; let lhs'     = substTys subst lhs
-             rhs'     = substTy  subst rhs
-
-       ; return (FamInst { fi_fam      = tyConName fam_tc
-                         , fi_flavor   = flavor
-                         , fi_tcs      = roughMatchTcs lhs
-                         , fi_tvs      = tvs'
-                         , fi_cvs      = cvs'
-                         , fi_tys      = lhs'
-                         , fi_rhs      = rhs'
-                         , fi_axiom    = axiom }) }
-  where
-    CoAxBranch { cab_tvs = tvs
-               , cab_cvs = cvs
-               , cab_lhs = lhs
-               , cab_rhs = rhs } = coAxiomSingleBranch axiom
-
-
-{-
-************************************************************************
-*                                                                      *
         Optimised overlap checking for family instances
 *                                                                      *
 ************************************************************************
@@ -229,9 +188,6 @@ two modules are consistent--because we checked that when we compiled M.
 For every other pair of family instance modules we import (directly or
 indirectly), we check that they are consistent now. (So that we can be
 certain that the modules in our `GHC.Driver.Env.dep_finsts' are consistent.)
-
-There is some fancy footwork regarding hs-boot module loops, see
-Note [Don't check hs-boot type family instances too early]
 
 Note [Checking family instance optimization]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -284,11 +240,51 @@ That situation should be pretty common in practice, there's usually
 a set of utility modules that every module imports directly or indirectly.
 
 This is basically the idea from #13092, comment:14.
+
+Note [Order of type family consistency checks]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Consider a module M which imports modules A, B and C, all defining (open) type
+family instances.
+
+We can waste a lot of work in type family consistency checking depending on the
+order in which the modules are processed.
+
+Suppose for example that C imports A and B. When we compiled C, we will have
+checked A and B for consistency against eachother. This means that, when
+processing the imports of M to check type family instance consistency:
+
+* if C is processed first, then A and B will not need to be checked for
+  consistency against eachother again,
+* if we process A and B before C,then the
+  consistency checks between A and B will be performed again. This is wasted
+  work, as we already performed them for C.
+
+This can make a significant difference. Keeping the nomenclature of the above
+example for illustration, we have observed situations in practice in which the
+compilation time of M goes from 1 second (the "processing A and B first" case)
+down to 80 milliseconds (the "processing C first" case).
+
+Clearly we should engineer that C is checked before B and A, but by what scheme?
+
+A simple one is to observe that if a module M is in the transitive closure of X
+then the size of the consistent family set of M is less than or equal to size
+of the consistent family set of X.
+
+Therefore, by sorting the imports by the size of the consistent family set and
+processing the largest first, we make sure to process modules in topological
+order.
+
+For a particular project, without this change we did 40 million checks and with
+this change we did 22.9 million checks. This is significant as before this change
+type family consistency checks accounted for 26% of total type checker allocations which
+was reduced to 15%.
+
+See tickets #25554 for discussion about this exact issue and #25555 for
+why we still do redundant checks.
+
 -}
 
--- This function doesn't check ALL instances for consistency,
--- only ones that aren't involved in recursive knot-tying
--- loops; see Note [Don't check hs-boot type family instances too early].
 -- We don't need to check the current module, this is done in
 -- tcExtendLocalFamInstEnv.
 -- See Note [The type family instance consistency story].
@@ -315,6 +311,12 @@ checkFamInstConsistency directlyImpMods
                  where
                  deps = dep_finsts . mi_deps . modIface $ mod
 
+             ; debug_consistent_set = map (\x -> (x, length (modConsistent x))) directlyImpMods
+
+             -- Sorting the list by size has the effect of performing a topological sort.
+             -- See Note [Order of type family consistency checks]
+             ; init_consistent_set = reverse (sortOn (length . modConsistent) directlyImpMods)
+
              ; hmiModule     = mi_module . hm_iface
              ; hmiFamInstEnv = extendFamInstEnvList emptyFamInstEnv
                                . md_fam_insts . hm_details
@@ -324,7 +326,8 @@ checkFamInstConsistency directlyImpMods
 
              }
 
-       ; checkMany hpt_fam_insts modConsistent directlyImpMods
+       ; traceTc "init_consistent_set" (ppr debug_consistent_set)
+       ; checkMany hpt_fam_insts modConsistent init_consistent_set
        }
   where
     -- See Note [Checking family instance optimization]
@@ -342,6 +345,11 @@ checkFamInstConsistency directlyImpMods
          -> TcM ()
       go _ _ [] = return ()
       go consistent consistent_set (mod:mods) = do
+        traceTc "checkManySize" (vcat [text "mod:" <+> ppr mod
+                                      , text "m1:" <+> ppr (length to_check_from_mod)
+                                      , text "m2:" <+> ppr (length (to_check_from_consistent))
+                                      , text "product:" <+> ppr (length to_check_from_mod * length to_check_from_consistent)
+                                      ])
         sequence_
           [ check hpt_fam_insts m1 m2
           | m1 <- to_check_from_mod
@@ -391,68 +399,7 @@ checkFamInstConsistency directlyImpMods
                  sizeE2 = famInstEnvSize env2'
                  (env1, env2) = if sizeE1 < sizeE2 then (env1', env2')
                                                    else (env2', env1')
-           -- Note [Don't check hs-boot type family instances too early]
-           -- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-           -- Family instance consistency checking involves checking that
-           -- the family instances of our imported modules are consistent with
-           -- one another; this might lead you to think that this process
-           -- has nothing to do with the module we are about to typecheck.
-           -- Not so!  Consider the following case:
-           --
-           --   -- A.hs-boot
-           --   type family F a
-           --
-           --   -- B.hs
-           --   import {-# SOURCE #-} A
-           --   type instance F Int = Bool
-           --
-           --   -- A.hs
-           --   import B
-           --   type family F a
-           --
-           -- When typechecking A, we are NOT allowed to poke the TyThing
-           -- for F until we have typechecked the family.  Thus, we
-           -- can't do consistency checking for the instance in B
-           -- (checkFamInstConsistency is called during renaming).
-           -- Failing to defer the consistency check lead to #11062.
-           --
-           -- Additionally, we should also defer consistency checking when
-           -- type from the hs-boot file of the current module occurs on
-           -- the left hand side, as we will poke its TyThing when checking
-           -- for overlap.
-           --
-           --   -- F.hs
-           --   type family F a
-           --
-           --   -- A.hs-boot
-           --   import F
-           --   data T
-           --
-           --   -- B.hs
-           --   import {-# SOURCE #-} A
-           --   import F
-           --   type instance F T = Int
-           --
-           --   -- A.hs
-           --   import B
-           --   data T = MkT
-           --
-           -- In fact, it is even necessary to defer for occurrences in
-           -- the RHS, because we may test for *compatibility* in event
-           -- of an overlap.
-           --
-           -- Why don't we defer ALL of the checks to later?  Well, many
-           -- instances aren't involved in the recursive loop at all.  So
-           -- we might as well check them immediately; and there isn't
-           -- a good time to check them later in any case: every time
-           -- we finish kind-checking a type declaration and add it to
-           -- a context, we *then* consistency check all of the instances
-           -- which mentioned that type.  We DO want to check instances
-           -- as quickly as possible, so that we aren't typechecking
-           -- values with inconsistent axioms in scope.
-           --
-           -- See also Note [Tying the knot]
-           -- for why we are doing this at all.
+
            ; let check_now = famInstEnvElts env1
            ; mapM_ (checkForConflicts (emptyFamInstEnv, env2))           check_now
            ; mapM_ (checkForInjectivityConflicts (emptyFamInstEnv,env2)) check_now
@@ -512,7 +459,7 @@ tcLookupDataFamInst_maybe fam_inst_envs tc tc_args
   , let rep_tc = dataFamInstRepTyCon rep_fam
         co     = mkUnbranchedAxInstCo Representational ax rep_args
                                       (mkCoVarCos cvs)
-  = assert (null rep_cos) $ -- See Note [Constrained family instances] in GHC.Core.FamInstEnv
+  = assert (null rep_cos) $ -- See Note [Constrained family instances] in ??? (renamed?)
     Just (rep_tc, rep_args, co)
 
   | otherwise

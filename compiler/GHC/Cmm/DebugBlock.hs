@@ -39,7 +39,7 @@ import GHC.Platform
 import GHC.Cmm.BlockId
 import GHC.Cmm.CLabel
 import GHC.Cmm
-import GHC.Cmm.Reg ( pprGlobalReg )
+import GHC.Cmm.Reg ( pprGlobalReg, pprGlobalRegUse )
 import GHC.Cmm.Utils
 import GHC.Data.FastString ( nilFS, mkFastString )
 import GHC.Unit.Module
@@ -47,10 +47,9 @@ import GHC.Utils.Outputable
 import GHC.Utils.Panic
 import GHC.Types.SrcLoc
 import GHC.Types.Tickish
-import GHC.Utils.Misc      ( seqList )
+import GHC.Utils.Misc      ( partitionWith, seqList )
 
 import GHC.Cmm.Dataflow.Block
-import GHC.Cmm.Dataflow.Collections
 import GHC.Cmm.Dataflow.Graph
 import GHC.Cmm.Dataflow.Label
 
@@ -58,7 +57,6 @@ import Data.Maybe
 import Data.List     ( minimumBy, nubBy )
 import Data.Ord      ( comparing )
 import qualified Data.Map as Map
-import Data.Either   ( partitionEithers )
 
 -- | Debug information about a block of code. Ticks scope over nested
 -- blocks.
@@ -110,7 +108,7 @@ cmmDebugGen modLoc decls = map (blocksForScope Nothing) topScopes
       -- Analyse tick scope structure: Each one is either a top-level
       -- tick scope, or the child of another.
       (topScopes, childScopes)
-        = partitionEithers $ map (\a -> findP a a) $ Map.keys blockCtxs
+        = partitionWith (\a -> findP a a) $ Map.keys blockCtxs
       findP tsc GlobalScope = Left tsc -- top scope
       findP tsc scp | scp' `Map.member` blockCtxs = Right (scp', tsc)
                     | otherwise                   = findP tsc scp'
@@ -119,9 +117,6 @@ cmmDebugGen modLoc decls = map (blocksForScope Nothing) topScopes
               -- recover by copying ticks below.
               scp' | SubScope _ scp' <- scp      = scp'
                    | CombinedScope scp' _ <- scp = scp'
-#if __GLASGOW_HASKELL__ < 901
-                   | otherwise                   = panic "findP impossible"
-#endif
 
       scopeMap = foldl' (\acc (key, scope) -> insertMulti key scope acc) Map.empty childScopes
 
@@ -513,7 +508,7 @@ type UnwindTable = Map.Map GlobalReg (Maybe UnwindExpr)
 
 -- | Expressions, used for unwind information
 data UnwindExpr = UwConst !Int                  -- ^ literal value
-                | UwReg !GlobalReg !Int         -- ^ register plus offset
+                | UwReg !GlobalRegUse !Int      -- ^ register plus offset
                 | UwDeref UnwindExpr            -- ^ pointer dereferencing
                 | UwLabel CLabel
                 | UwPlus UnwindExpr UnwindExpr
@@ -535,7 +530,7 @@ pprUnwindTable platform u = brackets (fsep (punctuate comma (map print_entry (Ma
 pprUnwindExpr :: IsLine doc => Rational -> Platform -> UnwindExpr -> doc
 pprUnwindExpr p env = \case
   UwConst i     -> int i
-  UwReg g 0     -> pprGlobalReg g
+  UwReg g 0     -> pprGlobalRegUse g
   UwReg g x     -> pprUnwindExpr p env (UwPlus (UwReg g 0) (UwConst x))
   UwDeref e     -> char '*' <> pprUnwindExpr 3 env e
   UwLabel l     -> pprAsmLabel env l

@@ -1,11 +1,5 @@
-{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE CPP #-}
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE GADTs #-}
-{-# LANGUAGE MultiParamTypeClasses #-}
-{-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE StandaloneDeriving #-}
 {-# LANGUAGE UndecidableInstances #-}
 {-# LANGUAGE LambdaCase #-}
 
@@ -41,7 +35,6 @@ import GHC.Types.Basic (FunctionOrData(..))
 import GHC.Platform
 import GHC.Cmm.Dataflow.Block
 import GHC.Cmm.Dataflow.Graph
-import GHC.Cmm.Dataflow.Collections
 import GHC.Cmm.Dataflow.Label
 import Data.Foldable (toList)
 import Data.Functor.Classes (liftCompare)
@@ -565,7 +558,6 @@ instance UserOfRegs GlobalReg (CmmNode e x) where
     where fold :: forall a b.  UserOfRegs GlobalReg a
                => (b -> GlobalReg -> b) -> b -> a -> b
           fold f z n = foldRegsUsed platform f z n
-
 instance (Ord r, UserOfRegs r CmmReg) => UserOfRegs r ForeignTarget where
   -- The (Ord r) in the context is necessary here
   -- See Note [Recursive superclasses] in GHC.Tc.TyCl.Instance

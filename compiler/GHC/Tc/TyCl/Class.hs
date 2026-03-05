@@ -35,21 +35,24 @@ import GHC.Tc.Types.Evidence ( idHsWrapper )
 import GHC.Tc.Gen.Bind
 import GHC.Tc.Utils.Env
 import GHC.Tc.Utils.Unify
-import GHC.Tc.Utils.Instantiate( tcSuperSkolTyVars )
+import GHC.Tc.Utils.Instantiate( newFamInst, tcSuperSkolTyVars )
 import GHC.Tc.Gen.HsType
 import GHC.Tc.Utils.TcMType
-import GHC.Core.Type     ( extendTvSubstWithClone, piResultTys )
-import GHC.Core.Predicate
-import GHC.Core.Multiplicity
 import GHC.Tc.Types.Origin
 import GHC.Tc.Utils.TcType
 import GHC.Tc.Utils.Monad
 import GHC.Tc.TyCl.Build( TcMethInfo )
+
+import GHC.Core.Type     ( extendTvSubstWithClone, piResultTys )
+import GHC.Core.Predicate
+import GHC.Core.Multiplicity
 import GHC.Core.Class
 import GHC.Core.Coercion ( pprCoAxiom )
-import GHC.Driver.Session
-import GHC.Tc.Instance.Family
 import GHC.Core.FamInstEnv
+import GHC.Core.TyCon
+
+import GHC.Driver.DynFlags
+
 import GHC.Types.Error
 import GHC.Types.Id
 import GHC.Types.Name
@@ -58,13 +61,13 @@ import GHC.Types.Name.Set
 import GHC.Types.Var
 import GHC.Types.Var.Env ( lookupVarEnv )
 import GHC.Types.SourceFile (HscSource(..))
+import GHC.Types.SrcLoc
+import GHC.Types.Basic
+
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
-import GHC.Utils.Panic.Plain
-import GHC.Types.SrcLoc
-import GHC.Core.TyCon
+
 import GHC.Data.Maybe
-import GHC.Types.Basic
 import GHC.Data.Bag
 import GHC.Data.BooleanFormula
 
@@ -192,7 +195,7 @@ tcClassDecl2 (L _ (ClassDecl {tcdLName = class_name, tcdSigs = sigs,
                                 tcdMeths = default_binds}))
   = recoverM (return emptyLHsBinds) $
     setSrcSpan (getLocA class_name) $
-    do  { clas <- tcLookupLocatedClass (n2l class_name)
+    do  { clas <- tcLookupLocatedClass (la2la class_name)
 
         -- We make a separate binding for each default method.
         -- At one time I used a single AbsBinds for all of them, thus
@@ -234,7 +237,7 @@ tcDefMeth :: Class -> [TyVar] -> EvVar -> LHsBinds GhcRn
 
 tcDefMeth _ _ _ _ _ prag_fn (sel_id, Nothing)
   = do { -- No default method
-         mapM_ (addLocMA (badDmPrag sel_id ))
+         mapM_ (addLocM (badDmPrag sel_id ))
                (lookupPragEnv prag_fn (idName sel_id))
        ; return emptyBag }
 
@@ -278,7 +281,7 @@ tcDefMeth clas tyvars this_dict binds_in hs_sig_fn prag_fn
 
              local_dm_ty = instantiateMethod clas global_dm_id (mkTyVarTys tyvars)
 
-             lm_bind     = dm_bind { fun_id = L (la2na bind_loc) local_dm_name }
+             lm_bind     = dm_bind { fun_id = L (l2l bind_loc) local_dm_name }
                              -- Substitute the local_meth_name for the binder
                              -- NB: the binding is always a FunBind
 
@@ -292,9 +295,9 @@ tcDefMeth clas tyvars this_dict binds_in hs_sig_fn prag_fn
              ctxt = FunSigCtxt sel_name warn_redundant
 
        ; let local_dm_id = mkLocalId local_dm_name ManyTy local_dm_ty
-             local_dm_sig = CompleteSig { sig_bndr = local_dm_id
-                                        , sig_ctxt  = ctxt
-                                        , sig_loc   = getLocA hs_ty }
+             local_dm_sig = CSig { sig_bndr = local_dm_id
+                                 , sig_ctxt = ctxt
+                                 , sig_loc  = getLocA hs_ty }
 
        ; (ev_binds, (tc_bind, _))
                <- checkConstraints skol_info tyvars [this_dict] $
@@ -597,6 +600,8 @@ warnMissingAT name
        -- hs-boot and signatures never need to provide complete "definitions"
        -- of any sort, as they aren't really defining anything, but just
        -- constraining items which are defined elsewhere.
-       ; let dia = TcRnNoExplicitAssocTypeOrDefaultDeclaration name
-       ; diagnosticTc  (warn && hsc_src == HsSrcFile) dia
+       ; let diag = TcRnIllegalInstance $ IllegalFamilyInstance
+                  $ InvalidAssoc $ InvalidAssocInstance
+                  $ AssocInstanceMissing name
+       ; diagnosticTc  (warn && hsc_src == HsSrcFile) diag
                        }

@@ -170,7 +170,11 @@
 #define BLOCK_SHIFT  12
 
 /* The size of a megablock (2^MBLOCK_SHIFT bytes) */
+#if defined(wasm32_HOST_ARCH)
+#define MBLOCK_SHIFT   16
+#else
 #define MBLOCK_SHIFT   20
+#endif
 
 /* -----------------------------------------------------------------------------
    Bitmap/size fields (used in info tables)
@@ -214,6 +218,21 @@
 #define LDV_STATE_CREATE        0x00000000
 #define LDV_STATE_USE           0x40000000
 #endif /* SIZEOF_VOID_P */
+
+/* See Note [Debugging predicates for pointers] in ClosureMacros.h */
+#if !defined(INVALID_GHC_POINTER)
+#if !defined(DEBUG)
+#define INVALID_GHC_POINTER 0x0
+#elif SIZEOF_VOID_P== 4
+/* N.B. this may result in false-negatives from LOOKS_LIKE_PTR on some
+ * platforms since this is a valid user-space address.
+ */
+#define INVALID_GHC_POINTER 0xaaaaaaaa
+#else
+/* N.B. this is typically a kernel-mode address on 64-bit platforms */
+#define INVALID_GHC_POINTER 0xaaaaaaaaaaaaaaaa
+#endif
+#endif
 
 /* -----------------------------------------------------------------------------
    TSO related constants
@@ -332,3 +351,10 @@
  * we can have static arrays of this size in the RTS for speed.
  */
 #define MAX_NUMA_NODES 16
+
+/*
+ * closure_desc of InfoProv is now uint32_t at all platforms, but
+ * we have to keep its stringified representation.
+ * It is known that maximum length of uint32_t in string is 10 chars (4294967295) + 1 NULL.
+ */
+#define CLOSURE_DESC_BUFFER_SIZE 11

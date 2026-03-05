@@ -54,6 +54,7 @@ typedef struct _GC_FLAGS {
     double  pcFreeHeap;
 
     bool         useNonmoving; // default = false
+    uint16_t     nonmovingDenseAllocatorCount; // Amount of dense nonmoving allocators. See Note [Allocator sizes]
     uint32_t     generations;
     bool squeezeUpdFrames;
 
@@ -88,6 +89,8 @@ typedef struct _GC_FLAGS {
 
     bool numa;                   /* Use NUMA */
     StgWord numaMask;
+
+    StgWord64 addressSpaceSize;  /* large address space size in bytes */
 } GC_FLAGS;
 
 /* See Note [Synchronization of flags and base APIs] */
@@ -143,10 +146,13 @@ typedef struct _PROFILING_FLAGS {
 
 # define HEAP_BY_CLOSURE_TYPE   8
 # define HEAP_BY_INFO_TABLE     9
+# define HEAP_BY_ERA            10
 
     Time        heapProfileInterval; /* time between samples */
     uint32_t    heapProfileIntervalTicks; /* ticks between samples (derived) */
     bool        startHeapProfileAtStartup; /* true if we start profiling from program startup */
+    bool        startTimeProfileAtStartup; /* true if we start profiling from program startup */
+    bool        incrementUserEra;
 
 
     bool        showCCSOnException;
@@ -161,6 +167,7 @@ typedef struct _PROFILING_FLAGS {
     const char*         ccSelector;
     const char*         ccsSelector;
     const char*         retainerSelector;
+    StgWord             eraSelector;
     const char*         bioSelector;
 
 } PROFILING_FLAGS;
@@ -281,6 +288,12 @@ typedef struct _PAR_FLAGS {
 } PAR_FLAGS;
 
 /* See Note [Synchronization of flags and base APIs] */
+typedef struct _HPC_FLAGS {
+  bool           writeTixFile;   /* Whether the RTS should write a tix
+                                    file at the end of execution */
+} HPC_FLAGS;
+
+/* See Note [Synchronization of flags and base APIs] */
 typedef struct _TICKY_FLAGS {
     bool showTickyStats;
     FILE   *tickyFile;
@@ -300,6 +313,7 @@ typedef struct _RTS_FLAGS {
     TRACE_FLAGS       TraceFlags;
     TICKY_FLAGS       TickyFlags;
     PAR_FLAGS         ParFlags;
+    HPC_FLAGS         HpcFlags;
 } RTS_FLAGS;
 
 #if defined(COMPILING_RTS_MAIN)

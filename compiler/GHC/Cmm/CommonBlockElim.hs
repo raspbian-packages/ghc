@@ -1,4 +1,4 @@
-{-# LANGUAGE GADTs, BangPatterns, ScopedTypeVariables #-}
+{-# LANGUAGE GADTs #-}
 
 module GHC.Cmm.CommonBlockElim
   ( elimCommonBlocks
@@ -17,7 +17,6 @@ import GHC.Cmm.ContFlowOpt
 import GHC.Cmm.Dataflow.Block
 import GHC.Cmm.Dataflow.Graph
 import GHC.Cmm.Dataflow.Label
-import GHC.Cmm.Dataflow.Collections
 import Data.Functor.Classes (liftEq)
 import Data.Maybe (mapMaybe)
 import qualified Data.List as List
@@ -26,6 +25,7 @@ import qualified Data.Map as M
 import qualified GHC.Data.TrieMap as TM
 import GHC.Types.Unique.FM
 import GHC.Types.Unique
+import GHC.Utils.Word64 (truncateWord64ToWord32)
 import Control.Arrow (first, second)
 import Data.List.NonEmpty (NonEmpty (..))
 import qualified Data.List.NonEmpty as NE
@@ -182,8 +182,10 @@ hash_block block =
 
         cvt = fromInteger . toInteger
 
+        -- Since we are hashing, we can savely downcast Word64 to Word32 here.
+        -- Although a different hashing function may be more effective.
         hash_unique :: Uniquable a => a -> Word32
-        hash_unique = cvt . getKey . getUnique
+        hash_unique = truncateWord64ToWord32 . getKey . getUnique
 
 -- | Ignore these node types for equality
 dont_care :: CmmNode O x -> Bool

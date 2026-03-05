@@ -20,25 +20,29 @@ module GHC.Tc.Gen.Expr
          tcCheckMonoExpr, tcCheckMonoExprNC,
          tcMonoExpr, tcMonoExprNC,
          tcInferRho, tcInferRhoNC,
-         tcPolyExpr, tcExpr,
+         tcPolyLExpr, tcPolyExpr, tcExpr, tcPolyLExprSig,
          tcSyntaxOp, tcSyntaxOpGen, SyntaxOpType(..), synKnownType,
          tcCheckId,
          ) where
 
 import GHC.Prelude
 
-import {-# SOURCE #-}   GHC.Tc.Gen.Splice( tcTypedSplice, tcTypedBracket, tcUntypedBracket )
+import Language.Haskell.Syntax.Basic (FieldLabelString(..))
+
+import {-# SOURCE #-} GHC.Tc.Gen.Splice
+  ( tcTypedSplice, tcTypedBracket, tcUntypedBracket, getUntypedSpliceBody )
 
 import GHC.Hs
 import GHC.Hs.Syn.Type
 import GHC.Rename.Utils
-import GHC.Tc.Utils.Zonk
 import GHC.Tc.Utils.Monad
 import GHC.Tc.Utils.Unify
 import GHC.Types.Basic
 import GHC.Types.Error
 import GHC.Types.FieldLabel
-import GHC.Types.Unique.Map ( UniqMap, listToUniqMap, lookupUniqMap )
+import GHC.Types.Unique.FM
+import GHC.Types.Unique.Map
+import GHC.Types.Unique.Set
 import GHC.Core.Multiplicity
 import GHC.Core.UsageEnv
 import GHC.Tc.Errors.Types
@@ -49,50 +53,43 @@ import GHC.Tc.Gen.Head
 import GHC.Tc.Gen.Bind        ( tcLocalBinds )
 import GHC.Tc.Instance.Family ( tcGetFamInstEnvs )
 import GHC.Core.FamInstEnv    ( FamInstEnvs )
-import GHC.Rename.Expr        ( mkExpandedExpr )
-import GHC.Rename.Env         ( addUsedGRE )
+import GHC.Rename.Env         ( addUsedGRE, getUpdFieldLbls )
 import GHC.Tc.Utils.Env
 import GHC.Tc.Gen.Arrow
-import GHC.Tc.Gen.Match
+import GHC.Tc.Gen.Match( tcBody, tcLambdaMatches, tcCaseMatches
+                       , tcGRHSList, tcDoStmts )
 import GHC.Tc.Gen.HsType
 import GHC.Tc.Utils.TcMType
+import GHC.Tc.Zonk.TcType
 import GHC.Tc.Types.Origin
 import GHC.Tc.Utils.TcType as TcType
 import GHC.Types.Id
 import GHC.Types.Id.Info
 import GHC.Core.ConLike
 import GHC.Core.DataCon
-import GHC.Core.PatSyn
 import GHC.Types.Name
 import GHC.Types.Name.Env
 import GHC.Types.Name.Set
 import GHC.Types.Name.Reader
+import GHC.Core.Class(classTyCon)
 import GHC.Core.TyCon
 import GHC.Core.Type
-import GHC.Core.Coercion( mkSymCo )
+import GHC.Core.Coercion
 import GHC.Tc.Types.Evidence
 import GHC.Builtin.Types
 import GHC.Builtin.Names
 import GHC.Builtin.Uniques ( mkBuiltinUnique )
-import GHC.Driver.Session
+import GHC.Driver.DynFlags
 import GHC.Types.SrcLoc
 import GHC.Utils.Misc
+import GHC.Data.Bag ( unitBag )
 import GHC.Data.List.SetOps
 import GHC.Data.Maybe
 import GHC.Utils.Outputable as Outputable
 import GHC.Utils.Panic
-import GHC.Utils.Panic.Plain
+
 import Control.Monad
-import GHC.Core.Class(classTyCon)
-import GHC.Types.Unique.Set ( UniqSet, mkUniqSet, elementOfUniqSet, nonDetEltsUniqSet )
-
-import Language.Haskell.Syntax.Basic (FieldLabelString(..))
-
-import Data.Function
-import Data.List (partition, sortBy, intersect)
 import qualified Data.List.NonEmpty as NE
-
-import GHC.Data.Bag ( unitBag )
 
 {-
 ************************************************************************
@@ -101,7 +98,6 @@ import GHC.Data.Bag ( unitBag )
 *                                                                      *
 ************************************************************************
 -}
-
 
 tcCheckPolyExpr, tcCheckPolyExprNC
   :: LHsExpr GhcRn         -- Expression to type check
@@ -116,12 +112,13 @@ tcCheckPolyExpr, tcCheckPolyExprNC
 tcCheckPolyExpr   expr res_ty = tcPolyLExpr   expr (mkCheckExpType res_ty)
 tcCheckPolyExprNC expr res_ty = tcPolyLExprNC expr (mkCheckExpType res_ty)
 
+-----------------
 -- These versions take an ExpType
 tcPolyLExpr, tcPolyLExprNC :: LHsExpr GhcRn -> ExpSigmaType
                            -> TcM (LHsExpr GhcTc)
 
 tcPolyLExpr (L loc expr) res_ty
-  = setSrcSpanA loc   $  -- Set location /first/; see GHC.Tc.Utils.Monad
+  = setSrcSpanA loc  $  -- Set location /first/; see GHC.Tc.Utils.Monad
     addExprCtxt expr $  -- Note [Error contexts in generated code]
     do { expr' <- tcPolyExpr expr res_ty
        ; return (L loc expr') }
@@ -130,6 +127,118 @@ tcPolyLExprNC (L loc expr) res_ty
   = setSrcSpanA loc    $
     do { expr' <- tcPolyExpr expr res_ty
        ; return (L loc expr') }
+
+-----------------
+tcPolyExpr :: HsExpr GhcRn -> ExpSigmaType -> TcM (HsExpr GhcTc)
+tcPolyExpr e (Infer inf) = tcExpr e (Infer inf)
+tcPolyExpr e (Check ty)  = tcPolyExprCheck e (Left ty)
+
+-----------------
+tcPolyLExprSig :: LHsExpr GhcRn -> TcCompleteSig -> TcM (LHsExpr GhcTc)
+tcPolyLExprSig (L loc expr) sig
+  = setSrcSpanA loc $
+    -- No addExprCtxt.  For (e :: ty) we don't want generate
+    --    In the expression e
+    --    In the expression e :: ty
+    -- We have already got an error-context for (e::ty), so when we
+    -- get to `e`, just add the location
+    do { traceTc "tcPolyLExprSig" (ppr loc $$ ppr expr)
+       ; expr' <- tcPolyExprCheck expr (Right sig)
+       ; return (L loc expr') }
+
+-----------------
+tcPolyExprCheck :: HsExpr GhcRn
+                -> Either TcSigmaType TcCompleteSig
+                -> TcM (HsExpr GhcTc)
+-- tcPolyExpCheck deals with the special case for HsLam, in case the pushed-down
+-- type is a forall-type.  E.g.    (\@a -> blah) :: forall b. b -> Int
+--
+-- The (Either TcSigmaType TcCompleteSig) deals with:
+--   Left ty:    (f e) pushes f's argument type `ty` into `e`
+--   Right sig:  (e :: sig) pushes `sig` into `e`
+-- The Either stuff is entirely local to this function and its immediate callers.
+--
+-- See Note [Skolemisation overview] in GHC.Tc.Utils.Unify
+
+tcPolyExprCheck expr res_ty
+  = outer_skolemise res_ty $ \pat_tys rho_ty ->
+    let
+      -- tc_body is a little loop that looks past parentheses
+      tc_body (HsPar x (L loc e))
+        = setSrcSpanA loc $
+          do { e' <- tc_body e
+             ; return (HsPar x (L loc e')) }
+
+      -- Look through any untyped splices (#24559)
+      -- c.f. Note [Looking through Template Haskell splices in splitHsApps]
+      tc_body (HsUntypedSplice splice_res _)
+        = do { body <- getUntypedSpliceBody splice_res
+             ; tc_body body }
+
+      -- The special case for lambda: go to tcLambdaMatches, passing pat_tys
+      tc_body e@(HsLam x lam_variant matches)
+        = do { (wrap, matches') <- tcLambdaMatches e lam_variant matches pat_tys
+                                                   (mkCheckExpType rho_ty)
+               -- NB: tcLambdaMatches concludes with deep skolemisation,
+               --     if DeepSubsumption is on;  hence no need to do that here
+             ; return (mkHsWrap wrap $ HsLam x lam_variant matches') }
+
+      -- The general case: just do deep skolemisation if necessary,
+      -- before handing off to tcExpr
+      tc_body e = do { ds_flag <- getDeepSubsumptionFlag
+                     ; inner_skolemise ds_flag rho_ty $ \rho_ty' ->
+                       tcExpr e (mkCheckExpType rho_ty') }
+    in tc_body expr
+  where
+    -- `outer_skolemise` is used always
+    -- It only does shallow skolemisation
+    -- It always makes an implication constraint if deferred-errors is on
+    outer_skolemise :: Either TcSigmaType TcCompleteSig
+                    -> ([ExpPatType] -> TcRhoType -> TcM (HsExpr GhcTc))
+                    -> TcM (HsExpr GhcTc)
+    outer_skolemise (Left ty) thing_inside
+      = do { (wrap, expr') <- tcSkolemiseExpectedType ty thing_inside
+           ; return (mkHsWrap wrap expr') }
+    outer_skolemise (Right sig) thing_inside
+      = do { (wrap, expr') <- tcSkolemiseCompleteSig sig thing_inside
+           ; return (mkHsWrap wrap expr') }
+
+    -- inner_skolemise is used when we do not have a lambda
+    -- With deep skolemisation we must remember to deeply skolemise
+    -- after the (always-shallow) tcSkolemiseCompleteSig
+    inner_skolemise :: DeepSubsumptionFlag -> TcRhoType
+                    -> (TcRhoType -> TcM (HsExpr GhcTc)) -> TcM (HsExpr GhcTc)
+    inner_skolemise Shallow rho_ty thing_inside
+      = -- We have already done shallow skolemisation, so nothing further to do
+        thing_inside rho_ty
+    inner_skolemise Deep rho_ty thing_inside
+      = -- Try deep skolemisation
+        do { (wrap, expr') <- tcSkolemise Deep ctxt rho_ty thing_inside
+           ; return (mkHsWrap wrap expr') }
+
+    ctxt = case res_ty of
+             Left {}   -> GenSigCtxt
+             Right sig -> sig_ctxt sig
+
+
+{- *********************************************************************
+*                                                                      *
+        tcExpr: the main expression typechecker
+*                                                                      *
+********************************************************************* -}
+
+tcInferRho, tcInferRhoNC :: LHsExpr GhcRn -> TcM (LHsExpr GhcTc, TcRhoType)
+-- Infer a *rho*-type. The return type is always instantiated.
+tcInferRho (L loc expr)
+  = setSrcSpanA loc   $  -- Set location /first/; see GHC.Tc.Utils.Monad
+    addExprCtxt expr $  -- Note [Error contexts in generated code]
+    do { (expr', rho) <- tcInfer (tcExpr expr)
+       ; return (L loc expr', rho) }
+
+tcInferRhoNC (L loc expr)
+  = setSrcSpanA loc $
+    do { (expr', rho) <- tcInfer (tcExpr expr)
+       ; return (L loc expr', rho) }
 
 ---------------
 tcCheckMonoExpr, tcCheckMonoExprNC
@@ -140,6 +249,7 @@ tcCheckMonoExpr, tcCheckMonoExprNC
 tcCheckMonoExpr   expr res_ty = tcMonoExpr   expr (mkCheckExpType res_ty)
 tcCheckMonoExprNC expr res_ty = tcMonoExprNC expr (mkCheckExpType res_ty)
 
+---------------
 tcMonoExpr, tcMonoExprNC
     :: LHsExpr GhcRn     -- Expression to type check
     -> ExpRhoType        -- Expected type
@@ -158,47 +268,20 @@ tcMonoExprNC (L loc expr) res_ty
         ; return (L loc expr') }
 
 ---------------
-tcInferRho, tcInferRhoNC :: LHsExpr GhcRn -> TcM (LHsExpr GhcTc, TcRhoType)
--- Infer a *rho*-type. The return type is always instantiated.
-tcInferRho (L loc expr)
-  = setSrcSpanA loc   $  -- Set location /first/; see GHC.Tc.Utils.Monad
-    addExprCtxt expr $  -- Note [Error contexts in generated code]
-    do { (expr', rho) <- tcInfer (tcExpr expr)
-       ; return (L loc expr', rho) }
-
-tcInferRhoNC (L loc expr)
-  = setSrcSpanA loc $
-    do { (expr', rho) <- tcInfer (tcExpr expr)
-       ; return (L loc expr', rho) }
-
-
-{- *********************************************************************
-*                                                                      *
-        tcExpr: the main expression typechecker
-*                                                                      *
-********************************************************************* -}
-
-tcPolyExpr :: HsExpr GhcRn -> ExpSigmaType -> TcM (HsExpr GhcTc)
-tcPolyExpr expr res_ty
-  = do { traceTc "tcPolyExpr" (ppr res_ty)
-       ; (wrap, expr') <- tcSkolemiseExpType GenSigCtxt res_ty $ \ res_ty ->
-                          tcExpr expr res_ty
-       ; return $ mkHsWrap wrap expr' }
-
 tcExpr :: HsExpr GhcRn -> ExpRhoType -> TcM (HsExpr GhcTc)
 
 -- Use tcApp to typecheck applications, which are treated specially
 -- by Quick Look.  Specifically:
---   - HsVar         lone variables, to ensure that they can get an
+--   - HsVar           lone variables, to ensure that they can get an
 --                     impredicative instantiation (via Quick Look
 --                     driven by res_ty (in checking mode)).
---   - HsApp         value applications
---   - HsAppType     type applications
---   - ExprWithTySig (e :: type)
---   - HsRecSel      overloaded record fields
---   - HsExpanded    renamer expansions
---   - HsOpApp       operator applications
---   - HsOverLit     overloaded literals
+--   - HsApp           value applications
+--   - HsAppType       type applications
+--   - ExprWithTySig   (e :: type)
+--   - HsRecSel        overloaded record fields
+--   - ExpandedThingRn renamer/pre-typechecker expansions
+--   - HsOpApp         operator applications
+--   - HsOverLit       overloaded literals
 -- These constructors are the union of
 --   - ones taken apart by GHC.Tc.Gen.Head.splitHsApps
 --   - ones understood by GHC.Tc.Gen.Head.tcInferAppHead_maybe
@@ -209,13 +292,14 @@ tcExpr e@(OpApp {})              res_ty = tcApp e res_ty
 tcExpr e@(HsAppType {})          res_ty = tcApp e res_ty
 tcExpr e@(ExprWithTySig {})      res_ty = tcApp e res_ty
 tcExpr e@(HsRecSel {})           res_ty = tcApp e res_ty
-tcExpr e@(XExpr (HsExpanded {})) res_ty = tcApp e res_ty
+
+tcExpr (XExpr e)                 res_ty = tcXExpr e res_ty
 
 tcExpr e@(HsOverLit _ lit) res_ty
   = do { mb_res <- tcShortCutLit lit res_ty
-         -- See Note [Short cut for overloaded literals] in GHC.Tc.Utils.Zonk
+         -- See Note [Short cut for overloaded literals] in GHC.Tc.Zonk.Type
        ; case mb_res of
-           Just lit' -> return (HsOverLit noAnn lit')
+           Just lit' -> return (HsOverLit noExtField lit')
            Nothing   -> tcApp e res_ty }
 
 -- Typecheck an occurrence of an unbound Id
@@ -233,9 +317,9 @@ tcExpr e@(HsLit x lit) res_ty
   = do { let lit_ty = hsLitType lit
        ; tcWrapResult e (HsLit x (convertLit lit)) lit_ty res_ty }
 
-tcExpr (HsPar x lpar expr rpar) res_ty
+tcExpr (HsPar x expr) res_ty
   = do { expr' <- tcMonoExprNC expr res_ty
-       ; return (HsPar x lpar expr' rpar) }
+       ; return (HsPar x expr') }
 
 tcExpr (HsPragE x prag expr) res_ty
   = do { expr' <- tcMonoExpr expr res_ty
@@ -264,22 +348,9 @@ tcExpr e@(HsIPVar _ x) res_ty
                           unwrapIP $ mkClassPred ipClass [x,ty]
   origin = IPOccOrigin x
 
-tcExpr (HsLam _ match) res_ty
-  = do  { (wrap, match') <- tcMatchLambda herald match_ctxt match res_ty
-        ; return (mkHsWrap wrap (HsLam noExtField match')) }
-  where
-    match_ctxt = MC { mc_what = LambdaExpr, mc_body = tcBody }
-    herald = ExpectedFunTyLam match
-
-tcExpr e@(HsLamCase x lc_variant matches) res_ty
-  = do { (wrap, matches')
-           <- tcMatchLambda herald match_ctxt matches res_ty
-       ; return (mkHsWrap wrap $ HsLamCase x lc_variant matches') }
-  where
-    match_ctxt = MC { mc_what = LamCaseAlt lc_variant, mc_body = tcBody }
-    herald = ExpectedFunTyLamCase lc_variant e
-
-
+tcExpr e@(HsLam x lam_variant matches) res_ty
+  = do { (wrap, matches') <- tcLambdaMatches e lam_variant matches [] res_ty
+       ; return (mkHsWrap wrap $ HsLam x lam_variant matches') }
 
 {-
 ************************************************************************
@@ -313,19 +384,12 @@ tcExpr expr@(ExplicitTuple x tup_args boxity) res_ty
                            -- See Note [Unboxed tuple RuntimeRep vars] in GHC.Core.TyCon
        ; let arg_tys' = case boxity of Unboxed -> drop arity arg_tys
                                        Boxed   -> arg_tys
-       ; tup_args1 <- tcTupArgs tup_args arg_tys'
+       ; tup_args1 <- tcCheckExplicitTuple tup_args arg_tys'
        ; return $ mkHsWrapCo coi (ExplicitTuple x tup_args1 boxity) }
 
   | otherwise
-  = -- The tup_args are a mixture of Present and Missing (for tuple sections)
-    do { let arity = length tup_args
-
-       ; arg_tys <- case boxity of
-           { Boxed   -> newFlexiTyVarTys arity liftedTypeKind
-           ; Unboxed -> replicateM arity newOpenFlexiTyVarTy }
-
-       -- Handle tuple sections where
-       ; tup_args1 <- tcTupArgs tup_args arg_tys
+  = -- The tup_args are a mixture of Present and Missing (for tuple sections).
+    do { (tup_args1, arg_tys) <- tcInferTupArgs boxity tup_args
 
        ; let expr'       = ExplicitTuple x tup_args1 boxity
              missing_tys = [Scaled mult ty | (Missing (Scaled mult _), ty) <- zip tup_args1 arg_tys]
@@ -353,7 +417,7 @@ tcExpr (ExplicitSum _ alt arity expr) res_ty
        -- This should cause an error, even though (17# :: Int#)
        -- is not representation-polymorphic: we don't know how
        -- wide the concrete representation of the sum type will be.
-       ; hasFixedRuntimeRep_syntactic FRRUnboxedSum res_ty
+       ; hasFixedRuntimeRep_syntactic (FRRUnboxedSum Nothing) res_ty
        ; return $ mkHsWrapCo coi (ExplicitSum arg_tys' alt arity expr' ) }
 
 
@@ -365,12 +429,14 @@ tcExpr (ExplicitSum _ alt arity expr) res_ty
 ************************************************************************
 -}
 
-tcExpr (HsLet x tkLet binds tkIn expr) res_ty
-  = do  { (binds', expr') <- tcLocalBinds binds $
-                             tcMonoExpr expr res_ty
-        ; return (HsLet x tkLet binds' tkIn expr') }
+tcExpr (HsLet x binds expr) res_ty
+  = do  { (binds', wrapper, expr') <- tcLocalBinds binds $
+                                      tcMonoExpr expr res_ty
+          -- The wrapper checks for correct multiplicities.
+          -- See Note [Wrapper returned from tcSubMult] in GHC.Tc.Utils.Unify.
+        ; return (HsLet x binds' (mkLHsWrap wrapper expr')) }
 
-tcExpr (HsCase x scrut matches) res_ty
+tcExpr (HsCase ctxt scrut matches) res_ty
   = do  {  -- We used to typecheck the case alternatives first.
            -- The case patterns tend to give good type info to use
            -- when typechecking the scrutinee.  For example
@@ -383,20 +449,16 @@ tcExpr (HsCase x scrut matches) res_ty
           mult <- newFlexiTyVarTy multiplicityTy
 
           -- Typecheck the scrutinee.  We use tcInferRho but tcInferSigma
-          -- would also be possible (tcMatchesCase accepts sigma-types)
+          -- would also be possible (tcCaseMatches accepts sigma-types)
           -- Interesting litmus test: do these two behave the same?
           --     case id        of {..}
           --     case (\v -> v) of {..}
           -- This design choice is discussed in #17790
         ; (scrut', scrut_ty) <- tcScalingUsage mult $ tcInferRho scrut
 
-        ; traceTc "HsCase" (ppr scrut_ty)
         ; hasFixedRuntimeRep_syntactic FRRCase scrut_ty
-        ; matches' <- tcMatchesCase match_ctxt (Scaled mult scrut_ty) matches res_ty
-        ; return (HsCase x scrut' matches') }
- where
-    match_ctxt = MC { mc_what = CaseAlt,
-                      mc_body = tcBody }
+        ; (mult_co_wrap, matches') <- tcCaseMatches ctxt tcBody (Scaled mult scrut_ty) matches res_ty
+        ; return (HsCase ctxt (mkLHsWrap mult_co_wrap scrut') matches') }
 
 tcExpr (HsIf x pred b1 b2) res_ty
   = do { pred'    <- tcCheckMonoExpr pred boolTy
@@ -430,11 +492,10 @@ Not using 'sup' caused #23814.
 -}
 
 tcExpr (HsMultiIf _ alts) res_ty
-  = do { (ues, alts') <- mapAndUnzipM (\alt -> tcCollectingUsage $ wrapLocMA (tcGRHS match_ctxt res_ty) alt) alts
+  = do { alts' <- tcGRHSList IfAlt tcBody alts res_ty
+                  -- See Note [MultiWayIf linearity checking]
        ; res_ty <- readExpType res_ty
-       ; tcEmitBindingUsage (supUEs ues)  -- See Note [MultiWayIf linearity checking]
        ; return (HsMultiIf res_ty alts') }
-  where match_ctxt = MC { mc_what = IfAlt, mc_body = tcBody }
 
 tcExpr (HsDo _ do_or_lc stmts) res_ty
   = tcDoStmts do_or_lc stmts res_ty
@@ -481,10 +542,12 @@ tcExpr (HsStatic fvs expr) res_ty
         ; let wrap = mkWpEvVarApps [typeable_ev] <.> mkWpTyApps [expr_ty]
         ; loc <- getSrcSpanM
         ; static_ptr_ty_con <- tcLookupTyCon staticPtrTyConName
-        ; return $ mkHsWrapCo co $ HsApp noComments
+        ; return $ mkHsWrapCo co $ HsApp noExtField
                             (L (noAnnSrcSpan loc) $ mkHsWrap wrap fromStaticPtr)
                             (L (noAnnSrcSpan loc) (HsStatic (fvs, mkTyConApp static_ptr_ty_con [expr_ty]) expr'))
         }
+
+tcExpr (HsEmbTy _ _) _ = failWith TcRnIllegalTypeExpr
 
 {-
 ************************************************************************
@@ -536,30 +599,38 @@ tcExpr expr@(RecordCon { rcon_con = L loc con_name
   where
     orig = OccurrenceOf con_name
 
--- Record updates via dot syntax are replaced by desugared expressions
+-- Record updates via dot syntax are replaced by expanded expressions
 -- in the renamer. See Note [Overview of record dot syntax] in
 -- GHC.Hs.Expr. This is why we match on 'rupd_flds = Left rbnds' here
 -- and panic otherwise.
-tcExpr expr@(RecordUpd { rupd_expr = record_expr, rupd_flds = Left rbnds }) res_ty
+tcExpr expr@(RecordUpd { rupd_expr = record_expr
+                       , rupd_flds =
+                           RegularRecUpdFields
+                             { xRecUpdFields = possible_parents
+                             , recUpdFields  = rbnds }
+                       })
+       res_ty
   = assert (notNull rbnds) $
-    do  { -- Desugar the record update. See Note [Record Updates].
-        ; (ds_expr, ds_res_ty, err_ctxt) <- desugarRecordUpd record_expr rbnds res_ty
+    do  { -- Expand the record update. See Note [Record Updates].
+        ; (ds_expr, ds_res_ty, err_ctxt)
+            <- expandRecordUpd record_expr possible_parents rbnds res_ty
 
-          -- Typecheck the desugared expression.
+          -- Typecheck the expanded expression.
         ; expr' <- addErrCtxt err_ctxt $
                    tcExpr (mkExpandedExpr expr ds_expr) (Check ds_res_ty)
             -- NB: it's important to use ds_res_ty and not res_ty here.
             -- Test case: T18802b.
 
         ; addErrCtxt err_ctxt $ tcWrapResultMono expr expr' ds_res_ty res_ty
-            -- We need to unify the result type of the desugared
+            -- We need to unify the result type of the expanded
             -- expression with the expected result type.
             --
             -- See Note [Unifying result types in tcRecordUpd].
             -- Test case: T10808.
         }
 
-tcExpr (RecordUpd {}) _ = panic "tcExpr: unexpected overloaded-dot RecordUpd"
+tcExpr e@(RecordUpd { rupd_flds = OverloadedRecUpdFields {}}) _
+  = pprPanic "tcExpr: unexpected overloaded-dot RecordUpd" $ ppr e
 
 {-
 ************************************************************************
@@ -582,7 +653,7 @@ tcExpr (ArithSeq _ witness seq) res_ty
 ************************************************************************
 -}
 
--- These terms have been replaced by desugaring in the renamer. See
+-- These terms have been replaced by their expanded expressions in the renamer. See
 -- Note [Overview of record dot syntax].
 tcExpr (HsGetField _ _ _) _ = panic "GHC.Tc.Gen.Expr: tcExpr: HsGetField: Not implemented"
 tcExpr (HsProjection _ _) _ = panic "GHC.Tc.Gen.Expr: tcExpr: HsProjection: Not implemented"
@@ -602,11 +673,14 @@ tcExpr e@(HsTypedBracket _ body)    res_ty = tcTypedBracket e body res_ty
 
 tcExpr e@(HsUntypedBracket ps body) res_ty = tcUntypedBracket e body ps res_ty
 tcExpr (HsUntypedSplice splice _)   res_ty
-  = case splice of
-      HsUntypedSpliceTop mod_finalizers expr
-        -> do { addModFinalizersWithLclEnv mod_finalizers
-              ; tcExpr expr res_ty }
-      HsUntypedSpliceNested {} -> panic "tcExpr: invalid nested splice"
+  -- Since `tcApp` deals with `HsUntypedSplice` (in `splitHsApps`), you might
+  -- wonder why we don't delegate to `tcApp` as we do for `HsVar`, etc.
+  -- (See the initial block of equations for `tcExpr`.) But we can't do this
+  -- for `HsUntypedSplice`; to see why, read Wrinkle (UTS1) in
+  -- Note [Looking through Template Haskell splices in splitHsApps] in
+  -- GHC.Tc.Gen.Head.
+  = do { expr <- getUntypedSpliceBody splice
+       ; tcExpr expr res_ty }
 
 {-
 ************************************************************************
@@ -620,6 +694,45 @@ tcExpr (HsOverLabel {})    ty = pprPanic "tcExpr:HsOverLabel"  (ppr ty)
 tcExpr (SectionL {})       ty = pprPanic "tcExpr:SectionL"    (ppr ty)
 tcExpr (SectionR {})       ty = pprPanic "tcExpr:SectionR"    (ppr ty)
 
+
+{-
+************************************************************************
+*                                                                      *
+                Expansion Expressions (XXExprGhcRn)
+*                                                                      *
+************************************************************************
+-}
+
+tcXExpr :: XXExprGhcRn -> ExpRhoType -> TcM (HsExpr GhcTc)
+
+tcXExpr (PopErrCtxt (L loc e)) res_ty
+  = popErrCtxt $ -- See Part 3 of Note [Expanding HsDo with XXExprGhcRn] in `GHC.Tc.Gen.Do`
+      setSrcSpanA loc $
+      tcExpr e res_ty
+
+tcXExpr xe@(ExpandedThingRn o e') res_ty
+  | OrigStmt ls@(L loc s@LetStmt{}) <- o
+  , HsLet x binds e <- e'
+  =  do { (binds', wrapper, e') <-  setSrcSpanA loc $
+                            addStmtCtxt s $
+                            tcLocalBinds binds $
+                            tcMonoExprNC e res_ty -- NB: Do not call tcMonoExpr here as it adds
+                                                  -- a duplicate error context
+        ; return $ mkExpandedStmtTc ls (HsLet x binds' (mkLHsWrap wrapper e'))
+        }
+  | OrigStmt ls@(L loc s@LastStmt{}) <- o
+  =  setSrcSpanA loc $
+          addStmtCtxt s $
+          mkExpandedStmtTc ls <$> tcExpr e' res_ty
+                -- It is important that we call tcExpr (and not tcApp) here as
+                -- `e` is the last statement's body expression
+                -- and not a HsApp of a generated (>>) or (>>=)
+                -- This improves error messages e.g. tests: DoExpansion1, DoExpansion2, DoExpansion3
+  | OrigStmt ls@(L loc _) <- o
+  = setSrcSpanA loc $
+       mkExpandedStmtTc ls <$> tcApp (XExpr xe) res_ty
+
+tcXExpr xe res_ty = tcApp (XExpr xe) res_ty
 
 {-
 ************************************************************************
@@ -682,26 +795,56 @@ arithSeqEltType (Just fl) res_ty
        ; return (idHsWrapper, elt_mult, elt_ty, Just fl') }
 
 ----------------
-tcTupArgs :: [HsTupArg GhcRn]
-          -> [TcSigmaType]
-              -- ^ Argument types.
-              -- This function ensures they all have
-              -- a fixed runtime representation.
-          -> TcM [HsTupArg GhcTc]
-tcTupArgs args tys
+
+-- | Typecheck an explicit tuple @(a,b,c)@ or @(\#a,b,c\#)@.
+--
+-- Does not handle tuple sections.
+tcCheckExplicitTuple :: [HsTupArg GhcRn]
+                     -> [TcSigmaType]
+                          -- ^ Argument types.
+                          -- This function ensures they all have
+                          -- a fixed runtime representation.
+                     -> TcM [HsTupArg GhcTc]
+tcCheckExplicitTuple args tys
   = do massert (equalLength args tys)
        checkTupSize (length args)
        zipWith3M go [1,2..] args tys
   where
     go :: Int -> HsTupArg GhcRn -> TcType -> TcM (HsTupArg GhcTc)
     go i (Missing {})     arg_ty
-      = do { mult <- newFlexiTyVarTy multiplicityTy
-           ; hasFixedRuntimeRep_syntactic (FRRTupleSection i) arg_ty
-           ; return (Missing (Scaled mult arg_ty)) }
+      = pprPanic "tcCheckExplicitTuple: tuple sections not handled here"
+          (ppr i $$ ppr arg_ty)
     go i (Present x expr) arg_ty
       = do { expr' <- tcCheckPolyExpr expr arg_ty
-           ; hasFixedRuntimeRep_syntactic (FRRTupleArg i) arg_ty
-           ; return (Present x expr') }
+           ; (co, _) <- hasFixedRuntimeRep (FRRUnboxedTuple i) arg_ty
+           ; return (Present x (mkLHsWrap (mkWpCastN co) expr')) }
+
+-- | Typecheck an explicit tuple or tuple section by performing type inference.
+tcInferTupArgs :: Boxity
+               -> [HsTupArg GhcRn] -- ^ argument types
+               -> TcM ([HsTupArg GhcTc], [TcSigmaTypeFRR])
+tcInferTupArgs boxity args
+  = do { checkTupSize (length args)
+       ; zipWithAndUnzipM tc_infer_tup_arg [1,2..] args }
+ where
+  tc_infer_tup_arg :: Int -> HsTupArg GhcRn -> TcM (HsTupArg GhcTc, TcSigmaTypeFRR)
+  tc_infer_tup_arg i (Missing {})
+    = do { mult <- newFlexiTyVarTy multiplicityTy
+         ; arg_ty <- new_arg_ty i
+         ; return (Missing (Scaled mult arg_ty), arg_ty) }
+  tc_infer_tup_arg i (Present x lexpr@(L l expr))
+    = do { (expr', arg_ty) <- case boxity of
+             Unboxed -> tcInferFRR (FRRUnboxedTuple i) (tcPolyExpr expr)
+             Boxed   -> do { arg_ty <- newFlexiTyVarTy liftedTypeKind
+                           ; L _ expr' <- tcCheckPolyExpr lexpr arg_ty
+                           ; return (expr', arg_ty) }
+         ; return (Present x (L l expr'), arg_ty) }
+
+  new_arg_ty :: Int -> TcM TcTypeFRR
+  new_arg_ty i =
+    case boxity of
+      Unboxed -> newOpenFlexiFRRTyVarTy (FRRUnboxedTupleSection i)
+      Boxed   -> newFlexiTyVarTy liftedTypeKind
 
 ---------------------------
 -- See TcType.SyntaxOpType also for commentary
@@ -729,7 +872,7 @@ tcSyntaxOpGen :: CtOrigin
               -> ([TcSigmaTypeFRR] -> [Mult] -> TcM a)
               -> TcM (a, SyntaxExprTc)
 tcSyntaxOpGen orig (SyntaxExprRn op) arg_tys res_ty thing_inside
-  = do { (expr, sigma) <- tcInferAppHead (op, VACall op 0 noSrcSpan) []
+  = do { (expr, sigma) <- tcInferAppHead (op, VACall op 0 noSrcSpan)
              -- Ugh!! But all this code is scheduled for demolition anyway
        ; traceTc "tcSyntaxOpGen" (ppr op $$ ppr expr $$ ppr sigma)
        ; (result, expr_wrap, arg_wraps, res_wrap)
@@ -762,8 +905,8 @@ tcSynArgE :: CtOrigin
            -- ^ returns a wrapper :: (type of right shape) "->" (type passed in)
 tcSynArgE orig op sigma_ty syn_ty thing_inside
   = do { (skol_wrap, (result, ty_wrapper))
-           <- tcTopSkolemise GenSigCtxt sigma_ty
-                (\ rho_ty -> go rho_ty syn_ty)
+           <- tcSkolemise Shallow GenSigCtxt sigma_ty $ \rho_ty ->
+              go rho_ty syn_ty
        ; return (result, skol_wrap <.> ty_wrapper) }
     where
     go rho_ty SynAny
@@ -785,7 +928,7 @@ tcSynArgE orig op sigma_ty syn_ty thing_inside
                  , res_wrapper )                     -- :: res_ty_out "->" res_ty
                , arg_wrapper1, [], arg_wrapper2 ) )  -- :: arg_ty "->" arg_ty_out
                <- matchExpectedFunTys herald GenSigCtxt 1 (mkCheckExpType rho_ty) $
-                  \ [arg_ty] res_ty ->
+                  \ [ExpFunPatTy arg_ty] res_ty ->
                   do { arg_tc_ty <- expTypeToType (scaledThing arg_ty)
                      ; res_tc_ty <- expTypeToType res_ty
 
@@ -832,8 +975,7 @@ tcSynArgA :: CtOrigin
             -- and a wrapper to be applied to the overall expression
 tcSynArgA orig op sigma_ty arg_shapes res_shape thing_inside
   = do { (match_wrapper, arg_tys, res_ty)
-           <- matchActualFunTysRho herald orig Nothing
-                                   (length arg_shapes) sigma_ty
+           <- matchActualFunTys herald orig (length arg_shapes) sigma_ty
               -- match_wrapper :: sigma_ty "->" (arg_tys -> res_ty)
        ; ((result, res_wrapper), arg_wrappers)
            <- tc_syn_args_e (map scaledThing arg_tys) arg_shapes $ \ arg_results arg_res_mults ->
@@ -909,152 +1051,19 @@ in the other order, the extra signature in f2 is reqd.
 
 {- *********************************************************************
 *                                                                      *
-                 Desugaring record update
+                 Expanding record update
 *                                                                      *
 ********************************************************************* -}
 
-{-
-Note [Type of a record update]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-The main complication with RecordUpd is that we need to explicitly
-handle the *non-updated* fields.  Consider:
-
-        data T a b c = MkT1 { fa :: a, fb :: (b,c) }
-                     | MkT2 { fa :: a, fb :: (b,c), fc :: c -> c }
-                     | MkT3 { fd :: a }
-
-        upd :: T a b c -> (b',c) -> T a b' c
-        upd t x = t { fb = x}
-
-The result type should be (T a b' c)
-not (T a b c),   because 'b' *is not* mentioned in a non-updated field
-not (T a b' c'), because 'c' *is*     mentioned in a non-updated field
-NB that it's not good enough to look at just one constructor; we must
-look at them all; cf #3219
-
-After all, upd should be equivalent to:
-        upd t x = case t of
-                        MkT1 p q -> MkT1 p x
-                        MkT2 a b -> MkT2 p b
-                        MkT3 d   -> error ...
-
-So we need to give a completely fresh type to the result record,
-and then constrain it by the fields that are *not* updated ("p" above).
-We call these the "fixed" type variables, and compute them in getFixedTyVars.
-
-Note that because MkT3 doesn't contain all the fields being updated,
-its RHS is simply an error, so it doesn't impose any type constraints.
-Hence the use of 'relevant_cont'.
-
-Note [Implicit type sharing]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~
-We also take into account any "implicit" non-update fields.  For example
-        data T a b where { MkT { f::a } :: T a a; ... }
-So the "real" type of MkT is: forall ab. (a~b) => a -> T a b
-
-Then consider
-        upd t x = t { f=x }
-We infer the type
-        upd :: T a b -> a -> T a b
-        upd (t::T a b) (x::a)
-           = case t of { MkT (co:a~b) (_:a) -> MkT co x }
-We can't give it the more general type
-        upd :: T a b -> c -> T c b
-
-Note [Criteria for update]
-~~~~~~~~~~~~~~~~~~~~~~~~~~
-We want to allow update for existentials etc, provided the updated
-field isn't part of the existential. For example, this should be ok.
-  data T a where { MkT { f1::a, f2::b->b } :: T a }
-  f :: T a -> b -> T b
-  f t b = t { f1=b }
-
-The criterion we use is this:
-
-  The types of the updated fields
-  mention only the universally-quantified type variables
-  of the data constructor
-
-NB: this is not (quite) the same as being a "naughty" record selector
-(See Note [Naughty record selectors]) in GHC.Tc.TyCl), at least
-in the case of GADTs. Consider
-   data T a where { MkT :: { f :: a } :: T [a] }
-Then f is not "naughty" because it has a well-typed record selector.
-But we don't allow updates for 'f'.  (One could consider trying to
-allow this, but it makes my head hurt.  Badly.  And no one has asked
-for it.)
-
-In principle one could go further, and allow
-  g :: T a -> T a
-  g t = t { f2 = \x -> x }
-because the expression is polymorphic...but that seems a bridge too far.
-
-Note [Data family example]
-~~~~~~~~~~~~~~~~~~~~~~~~~~
-    data instance T (a,b) = MkT { x::a, y::b }
-  --->
-    data :TP a b = MkT { a::a, y::b }
-    coTP a b :: T (a,b) ~ :TP a b
-
-Suppose r :: T (t1,t2), e :: t3
-Then  r { x=e } :: T (t3,t1)
-  --->
-      case r |> co1 of
-        MkT x y -> MkT e y |> co2
-      where co1 :: T (t1,t2) ~ :TP t1 t2
-            co2 :: :TP t3 t2 ~ T (t3,t2)
-The wrapping with co2 is done by the constructor wrapper for MkT
-
-Outgoing invariants
-~~~~~~~~~~~~~~~~~~~
-In the outgoing (HsRecordUpd scrut binds cons in_inst_tys out_inst_tys):
-
-  * cons are the data constructors to be updated
-
-  * in_inst_tys, out_inst_tys have same length, and instantiate the
-        *representation* tycon of the data cons.  In Note [Data
-        family example], in_inst_tys = [t1,t2], out_inst_tys = [t3,t2]
-
-Note [Mixed Record Field Updates]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Consider the following pattern synonym.
-
-  data MyRec = MyRec { foo :: Int, qux :: String }
-
-  pattern HisRec{f1, f2} = MyRec{foo = f1, qux=f2}
-
-This allows updates such as the following
-
-  updater :: MyRec -> MyRec
-  updater a = a {f1 = 1 }
-
-It would also make sense to allow the following update (which we reject).
-
-  updater a = a {f1 = 1, qux = "two" } ==? MyRec 1 "two"
-
-This leads to confusing behaviour when the selectors in fact refer the same
-field.
-
-  updater a = a {f1 = 1, foo = 2} ==? ???
-
-For this reason, we reject a mixture of pattern synonym and normal record
-selectors in the same update block. Although of course we still allow the
-following.
-
-  updater a = (a {f1 = 1}) {foo = 2}
-
-  > updater (MyRec 0 "str")
-  MyRec 2 "str"
-
-Note [Record Updates]
-~~~~~~~~~~~~~~~~~~~~~
-To typecheck a record update, we desugar it first.  Suppose we have
+{- Note [Record Updates]
+~~~~~~~~~~~~~~~~~~~~~~~~
+To typecheck a record update, we expand it first.  Suppose we have
     data T p q = T1 { x :: Int, y :: Bool, z :: Char }
                | T2 { v :: Char }
                | T3 { x :: Int }
                | T4 { p :: Float, y :: Bool, x :: Int }
                | T5
-Then the record update `e { x=e1, y=e2 }` desugars as follows
+Then the record update `e { x=e1, y=e2 }` expands as follows
 
        e { x=e1, y=e2 }
     ===>
@@ -1063,81 +1072,121 @@ Then the record update `e { x=e1, y=e2 }` desugars as follows
           T1 _ _ z -> T1 x' y' z
           T4 p _ _ -> T4 p y' x'
 T2, T3 and T5 should not occur, so we omit them from the match.
-The critical part of desugaring is to identify T and then T1/T4.
+The critical part of expansion is to identify T and then T1/T4.
 
 Wrinkle [Disambiguating fields]
-As outlined above, to typecheck a record update via desugaring, we first need
-to identify the parent record `TyCon` (`T` above). This can be tricky when several
-record types share the same field (with `-XDuplicateRecordFields`).
 
-Currently, we use the inferred type of the record to help disambiguate the record
-fields. For example, in
+  As explained in Note [Disambiguating record updates] in GHC.Rename.Pat,
+  to typecheck a record update we first need to disambiguate the field labels,
+  in order to find a parent which has at least one constructor with all of the fields
+  being updated.
 
-  ( mempty :: T a b ) { x = 3 }
+  As mentioned in Note [Type-directed record disambiguation], we sometimes use
+  type-directed disambiguation, although this mechanism is deprecated and
+  scheduled for removal via the implementation of GHC proposal #366
+  https://github.com/ghc-proposals/ghc-proposals/blob/master/proposals/0366-no-ambiguous-field-access.rst.
 
-the type signature on `mempty` allows us to disambiguate the record `TyCon` to `T`,
-when there might be other datatypes with field `x :: Int`.
-This complexity is scheduled for removal via the implementation of GHC proposal #366
-https://github.com/ghc-proposals/ghc-proposals/blob/master/proposals/0366-no-ambiguous-field-access.rst
 
-However, for the time being, we still need to disambiguate record fields using the
-inferred types. This means that, when typechecking a record update via desugaring,
-we need to do the following:
+All in all, this means that when typechecking a record update via expansion,
+we take the following steps:
 
-  D1. Perform a first typechecking pass on the record expression (`e` in the example above),
+  (0) Perform a first typechecking pass on the record expression (`e` in the example above),
       to infer the type of the record being updated.
-  D2. Desugar the record update as described above, using an HsExpansion.
-  D3. Typecheck the desugared code.
+  (1) Disambiguate the record fields (potentially using the type obtained in (0)).
+  (2) Expand the record update as described above, using an XXExprGhcRn.
+      (a) Create a let-binding to share the record update right-hand sides.
+      (b) Expand the record update to a case expression updating all the
+          relevant constructors (those that have all of the fields being updated).
+  (3) Typecheck the expanded code.
 
-In (D1), we call inferRho to infer the type of the record being updated. This returns the
+In (0), we call inferRho to infer the type of the record being updated. This returns the
 inferred type of the record, together with a typechecked expression (of type HsExpr GhcTc)
 and a collection of residual constraints.
 We have no need for the latter two, because we will typecheck again in (D3). So, for
 the time being (and until GHC proposal #366 is implemented), we simply drop them.
 
 Wrinkle [Using IdSig]
-As noted above, we want to let-bind the updated fields to avoid code duplication:
 
-  let { x' = e1; y' = e2 } in
-  case e of
-     T1 _ _ z -> T1 x' y' z
-     T4 p _ _ -> T4 p y' x'
+  As noted above, we want to let-bind the updated fields to avoid code duplication:
 
-However, doing so in a naive way would cause difficulties for type inference.
-For example:
+    let { x' = e1; y' = e2 } in
+    case e of
+       T1 _ _ z -> T1 x' y' z
+       T4 p _ _ -> T4 p y' x'
 
-  data R b = MkR { f :: (forall a. a -> a) -> (Int,b), c :: Int }
-  foo r = r { f = \ k -> (k 3, k 'x') }
+  However, doing so in a naive way would cause difficulties for type inference.
+  For example:
 
-If we desugar to:
+    data R b = MkR { f :: (forall a. a -> a) -> (Int,b), c :: Int }
+    foo r = r { f = \ k -> (k 3, k 'x') }
 
-  ds_foo r =
-    let f' = \ k -> (k 3, k 'x')
-    in case r of
-      MkR _ b -> MkR f' b
+  If we expand to:
 
-then we are unable to infer an appropriately polymorphic type for f', because we
-never infer higher-rank types. To circumvent this problem, we proceed as follows:
+    ds_foo r =
+      let f' = \ k -> (k 3, k 'x')
+      in case r of
+        MkR _ b -> MkR f' b
 
-  1. Obtain general field types by instantiating any of the constructors
-     that contain all the necessary fields. (Note that the field type must be
-     identical across different constructors of a given data constructor).
-  2. Let-bind an 'IdSig' with this type. This amounts to giving the let-bound
-     'Id's a partial type signature.
+  then we are unable to infer an appropriately polymorphic type for f', because we
+  never infer higher-rank types. To circumvent this problem, we proceed as follows:
 
-In the above example, it's as if we wrote:
+    1. Obtain general field types by instantiating any of the constructors
+       that contain all the necessary fields. (Note that the field type must be
+       identical across different constructors of a given data constructor).
+    2. Let-bind an 'IdSig' with this type. This amounts to giving the let-bound
+       'Id's a partial type signature.
 
-  ds_foo r =
-    let f' :: (forall a. a -> a) -> (Int, _b)
-        f' = \ k -> (k 3, k 'x')
-    in case r of
-      MkR _ b -> MkR f' b
+  In the above example, it's as if we wrote:
 
-This allows us to compute the right type for f', and thus accept this record update.
+    ds_foo r =
+      let f' :: (forall a. a -> a) -> (Int, _b)
+          f' = \ k -> (k 3, k 'x')
+      in case r of
+        MkR _ b -> MkR f' b
+
+  This allows us to compute the right type for f', and thus accept this record update.
+
+Note [Type-directed record disambiguation]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+GHC currently supports an additional type-directed disambiguation
+mechanism, which is deprecated and scheduled for removal as part of
+GHC proposal #366 https://github.com/ghc-proposals/ghc-proposals/blob/master/proposals/0366-no-ambiguous-field-access.rst.
+
+To perform this disambiguation, when there are multiple possible parents for
+a record update, the renamer defers to the typechecker.
+See GHC.Tc.Gen.Expr.disambiguateRecordBinds, and in particular the auxiliary
+function identifyParentLabels, which picks a parent for the record update
+using the following additional mechanisms:
+
+  (a) Use the type being pushed in, if it is already a TyConApp. The
+      following are valid updates at type `R`:
+
+        g :: R -> R
+        g x = x { fld1 = 3 }
+
+        g' x = x { fld1 = 3 } :: R
+
+  (b) Use the type signature of the record expression, if it exists and
+      is a TyConApp. Thus this is valid update at type `R`:
+
+        h x = (x :: R) { fld1 = 3 }
+
+Note that this type-directed disambiguation mechanism isn't very robust,
+as it doesn't properly integrate with the rest of the typechecker.
+For example, the following updates will all be rejected as ambiguous:
+
+    let r :: R
+        r = blah
+    in r { foo = 3 }
+
+    \r. (r { foo = 3 }, r :: R)
+
+Record updates which require constraint-solving should instead use the
+-XOverloadedRecordUpdate extension, as described in Note [Overview of record dot syntax].
 
 Note [Unifying result types in tcRecordUpd]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-After desugaring and typechecking a record update in the way described in
+After expanding and typechecking a record update in the way described in
 Note [Record Updates], we must take care to unify the result types.
 
 Example:
@@ -1148,7 +1197,7 @@ Example:
   f :: F Int -> D Bool -> D Int
   f i r = r { fld = i }
 
-This record update desugars to:
+This record update expands to:
 
   let x :: F alpha -- metavariable
       x = i
@@ -1182,31 +1231,35 @@ Wrinkle [GADT result type in tcRecordUpd]
 
 -}
 
--- | Desugars a record update @record_expr { fld1 = e1, fld2 = e2 }@ into a case expression
+-- | Expands a record update @record_expr { fld1 = e1, fld2 = e2 }@ into a case expression
 -- that matches on the constructors of the record @r@, as described in
 -- Note [Record Updates].
 --
 -- Returns a renamed but not-yet-typechecked expression, together with the
--- result type of this desugared record update.
-desugarRecordUpd :: LHsExpr GhcRn
+-- result type of this expanded record update.
+expandRecordUpd :: LHsExpr GhcRn
                       -- ^ @record_expr@: expression to which the record update is applied
-                 -> [LHsRecUpdField GhcRn]
+                 -> NE.NonEmpty (HsRecUpdParent GhcRn)
+                      -- ^ Possible parent 'TyCon'/'PatSyn's for the record update,
+                      -- with the associated constructors and field labels
+                 -> [LHsRecUpdField GhcRn GhcRn]
                       -- ^ the record update fields
                  -> ExpRhoType
                       -- ^ the expected result type of the record update
                  -> TcM ( HsExpr GhcRn
-                           -- desugared record update expression
+                           -- Expanded record update expression
                         , TcType
-                           -- result type of desugared record update
+                           -- result type of expanded record update
                         , SDoc
                            -- error context to push when typechecking
-                           -- the desugared code
+                           -- the expanded code
                         )
-desugarRecordUpd record_expr rbnds res_ty
-  = do {  -- STEP -2: typecheck the record_expr, the record to be updated
+expandRecordUpd record_expr possible_parents rbnds res_ty
+  = do {  -- STEP 0: typecheck the record_expr, the record to be updated.
+          --
           -- Until GHC proposal #366 is implemented, we still use the type of
           -- the record to disambiguate its fields, so we must infer the record
-          -- type here before we can desugar. See Wrinkle [Disambiguating fields]
+          -- type here before we can expand. See Wrinkle [Disambiguating fields]
           -- in Note [Record Updates].
        ; ((_, record_rho), _lie) <- captureConstraints    $ -- see (1) below
                                     tcScalingUsage ManyTy $ -- see (2) below
@@ -1216,7 +1269,7 @@ desugarRecordUpd record_expr rbnds res_ty
             -- Note that we capture, and then discard, the constraints.
             -- This `tcInferRho` is used *only* to identify the data type,
             -- so we can deal with field disambiguation.
-            -- Then we are going to generate a desugared record update, including `record_expr`,
+            -- Then we are going to generate a expanded record update, including `record_expr`,
             -- and typecheck it from scratch.  We don't want to generate the constraints twice!
 
             -- (2)
@@ -1234,73 +1287,36 @@ desugarRecordUpd record_expr rbnds res_ty
             --
             -- This should definitely *not* typecheck.
 
-       -- STEP -1  See Note [Disambiguating record fields] in GHC.Tc.Gen.Head
-       -- After this we know that rbinds is unambiguous
-       ; rbinds <- disambiguateRecordBinds record_expr record_rho rbnds res_ty
+       -- STEP 1: disambiguate the record update by computing a single parent
+       --         which has a constructor with all of the fields being updated.
+       --
+       -- See Note [Disambiguating record updates] in GHC.Rename.Pat.
+       ; (cons, rbinds)
+           <- disambiguateRecordBinds record_expr record_rho possible_parents rbnds res_ty
        ; let upd_flds = map (unLoc . hfbLHS . unLoc) rbinds
-             upd_fld_occs = map (FieldLabelString . occNameFS . rdrNameOcc . rdrNameAmbiguousFieldOcc) upd_flds
              sel_ids      = map selectorAmbiguousFieldOcc upd_flds
              upd_fld_names = map idName sel_ids
+             relevant_cons = nonDetEltsUniqSet cons
+             relevant_con = head relevant_cons
 
-       -- STEP 0
-       -- Check that the field names are really field names
-       -- and they are all field names for proper records or
-       -- all field names for pattern synonyms.
-       ; let bad_guys = [ setSrcSpan loc $ addErrTc (notSelector fld_name)
-                        | fld <- rbinds,
-                          -- Excludes class ops
-                          let L loc sel_id = hsRecUpdFieldId (unLoc fld),
-                          not (isRecordSelector sel_id),
-                          let fld_name = idName sel_id ]
-       ; unless (null bad_guys) (sequence bad_guys >> failM)
-       -- See Note [Mixed Record Field Updates]
-       ; let (data_sels, pat_syn_sels) =
-               partition isDataConRecordSelector sel_ids
-       ; massert (all isPatSynRecordSelector pat_syn_sels)
-       ; checkTc ( null data_sels || null pat_syn_sels )
-                 ( mixedSelectors data_sels pat_syn_sels )
-
-       -- STEP 1
-       -- Figure out the tycon and data cons from the first field name
-       ; let   -- It's OK to use the non-tc splitters here (for a selector)
-             sel_id : _  = sel_ids
-             con_likes :: [ConLike]
-             con_likes = case idDetails sel_id of
-                            RecSelId (RecSelData tc) _
-                               -> map RealDataCon (tyConDataCons tc)
-                            RecSelId (RecSelPatSyn ps) _
-                               -> [PatSynCon ps]
-                            _  -> panic "tcRecordUpd"
-               -- NB: for a data type family, the tycon is the instance tycon
-             relevant_cons = conLikesWithFields con_likes upd_fld_occs
-               -- A constructor is only relevant to this process if
-               -- it contains *all* the fields that are being updated
-               -- Other ones will cause a runtime error if they occur
-
-       -- STEP 2
-       -- Check that at least one constructor has all the named fields
-       -- i.e. has an empty set of bad fields returned by badFields
-       ; case relevant_cons of
-         { [] -> failWithTc (badFieldsUpd rbinds con_likes)
-         ; relevant_con : _ ->
-
-      -- STEP 3
-      -- Create new variables for the fields we are updating,
-      -- so that we can share them across constructors.
+      -- STEP 2: expand the record update.
       --
-      -- Example:
+      --  (a) Create new variables for the fields we are updating,
+      --      so that we can share them across constructors.
       --
-      --   e { x=e1, y=e2 }
+      --      Example:
       --
-      -- We want to let-bind variables to `e1` and `e2`:
+      --          e { x=e1, y=e2 }
       --
-      --   let x' :: Int
-      --       x' = e1
-      --       y' :: Bool
-      --       y' = e2
-      --   in ...
+      --        We want to let-bind variables to `e1` and `e2`:
+      --
+      --          let x' :: Int
+      --              x' = e1
+      --              y' :: Bool
+      --              y' = e2
+      --          in ...
 
-    do { -- Instantiate the type variables of any relevant constuctor
+         -- Instantiate the type variables of any relevant constuctor
          -- with metavariables to obtain a type for each 'Id'.
          -- This will allow us to have 'Id's with polymorphic types
          -- by using 'IdSig'. See Wrinkle [Using IdSig] in Note [Record Updates].
@@ -1320,7 +1336,7 @@ desugarRecordUpd record_expr rbnds res_ty
        -- e.g. (x', e1), (y', e2), ...
        ; let mk_upd_id :: Name -> LHsFieldBind GhcTc fld (LHsExpr GhcRn) -> TcM (Name, (TcId, LHsExpr GhcRn))
              mk_upd_id fld_nm (L _ rbind)
-               = do { let Scaled m arg_ty = lookupNameEnv_NF arg_ty_env fld_nm
+               = do { let Scaled _ arg_ty = lookupNameEnv_NF arg_ty_env fld_nm
                           nm_occ = rdrNameOcc . nameRdrName $ fld_nm
                           actual_arg_ty = substTy subst arg_ty
                           rhs = hfbRHS rbind
@@ -1331,11 +1347,17 @@ desugarRecordUpd record_expr rbnds res_ty
                       -- (As we will typecheck the let-bindings later, we can drop this coercion here.)
                       -- See RepPolyRecordUpdate test.
                     ; nm <- newNameAt nm_occ generatedSrcSpan
-                    ; let id = mkLocalId nm m actual_arg_ty
+                    ; let id = mkLocalId nm ManyTy actual_arg_ty
                       -- NB: create fresh names to avoid any accidental shadowing
                       -- occurring in the RHS expressions when creating the let bindings:
                       --
                       --  let x1 = e1; x2 = e2; ...
+                      --
+                      -- Above, we use multiplicity Many rather than the one associated to arg_ty.
+                      -- Normally, there shouldn't be a difference, since it's a let binding.
+                      -- But -XStrict can convert the let to a case, and this causes issues
+                      -- in test LinearRecUpd. Since we don't support linear record updates,
+                      -- using Many is simple and safe.
                     ; return (fld_nm, (id, rhs))
                     }
              arg_ty_env = mkNameEnv
@@ -1343,12 +1365,16 @@ desugarRecordUpd record_expr rbnds res_ty
                             (conLikeFieldLabels relevant_con)
                             arg_tys
 
+       ; traceTc "tcRecordUpd" $
+           vcat [ text "upd_fld_names:" <+> ppr upd_fld_names
+                , text "relevant_cons:" <+> ppr relevant_cons ]
+
        ; upd_ids <- zipWithM mk_upd_id upd_fld_names rbinds
        ; let updEnv :: UniqMap Name (Id, LHsExpr GhcRn)
              updEnv = listToUniqMap $ upd_ids
 
              make_pat :: ConLike -> LMatch GhcRn (LHsExpr GhcRn)
-             -- As explained in Note [Record Updates], to desugar
+             -- As explained in Note [Record Updates], to expand
              --
              --   e { x=e1, y=e2 }
              --
@@ -1361,7 +1387,7 @@ desugarRecordUpd record_expr rbnds res_ty
              -- we let-bind x' = e1, y' = e2 and generate the equation:
              --
              --   T1 _ _ z -> T1 x' y' z
-             make_pat conLike = mkSimpleMatch CaseAlt [pat] rhs
+             make_pat conLike = mkSimpleMatch RecUpd [pat] rhs
                where
                  (lhs_con_pats, rhs_con_args)
                     = zipWithAndUnzip mk_con_arg [1..] con_fields
@@ -1377,7 +1403,7 @@ desugarRecordUpd record_expr rbnds res_ty
                            , LHsExpr GhcRn )
                               -- RHS constructor argument
              mk_con_arg i fld_lbl =
-               -- The following generates the pattern matches of the desugared `case` expression.
+               -- The following generates the pattern matches of the expanded `case` expression.
                -- For fields being updated (for example `x`, `y` in T1 and T4 in Note [Record Updates]),
                -- wildcards are used to avoid creating unused variables.
                case lookupUniqMap updEnv $ flSelector fld_lbl of
@@ -1385,17 +1411,17 @@ desugarRecordUpd record_expr rbnds res_ty
                  Just (upd_id, _) -> (genWildPat, genLHsVar (idName upd_id))
                  -- Field is not being updated: LHS = variable pattern, RHS = that same variable.
                  _  -> let fld_nm = mkInternalName (mkBuiltinUnique i)
-                                      (mkVarOccFS (field_label $ flLabel fld_lbl))
+                                      (nameOccName $ flSelector $ fld_lbl)
                                       generatedSrcSpan
                        in (genVarPat fld_nm, genLHsVar fld_nm)
 
-       -- STEP 4
-       -- Desugar to HsCase, as per note [Record Updates]
+       -- STEP 2 (b): expand to HsCase, as per note [Record Updates]
        ; let ds_expr :: HsExpr GhcRn
-             ds_expr = HsLet noExtField noHsTok let_binds noHsTok (L gen case_expr)
+             ds_expr = HsLet noExtField let_binds (L gen case_expr)
 
              case_expr :: HsExpr GhcRn
-             case_expr = HsCase noExtField record_expr (mkMatchGroup Generated (wrapGenSpan matches))
+             case_expr = HsCase RecUpd record_expr
+                       $ mkMatchGroup (Generated OtherExpansion DoPmc) (wrapGenSpan matches)
              matches :: [LMatch GhcRn (LHsExpr GhcRn)]
              matches = map make_pat relevant_cons
 
@@ -1412,7 +1438,7 @@ desugarRecordUpd record_expr rbnds res_ty
                -- See Wrinkle [Using IdSig] in Note [Record Updates].
              gen = noAnnSrcSpan generatedSrcSpan
 
-        ; traceTc "desugarRecordUpd" $
+        ; traceTc "expandRecordUpd" $
             vcat [ text "relevant_con:" <+> ppr relevant_con
                  , text "res_ty:" <+> ppr res_ty
                  , text "ds_res_ty:" <+> ppr ds_res_ty
@@ -1432,7 +1458,7 @@ desugarRecordUpd record_expr rbnds res_ty
                    else [ text "existential variable" <> plural ex_tvs <+> pprQuotedList ex_tvs ]
               err_ctxt = make_lines_msg err_lines
 
-        ; return (ds_expr, ds_res_ty, err_ctxt) } } }
+        ; return (ds_expr, ds_res_ty, err_ctxt) }
 
 -- | Pretty-print a collection of lines, adding commas at the end of each line,
 -- and adding "and" to the start of the last line.
@@ -1446,118 +1472,142 @@ make_lines_msg (l:ls)  = l <> comma $$ make_lines_msg ls
 *                                                                      *
                  Record bindings
 *                                                                      *
-********************************************************************* -}
+**********************************************************************-}
 
--- Disambiguate the fields in a record update.
--- See Note [Disambiguating record fields] in GHC.Tc.Gen.Head
+-- | Disambiguate the fields in a record update.
+--
+-- Most of the disambiguation has been done by the renamer; this function
+-- performs a final type-directed disambiguation pass, as explained in
+-- Note [Type-directed record disambiguation].
 disambiguateRecordBinds :: LHsExpr GhcRn -> TcRhoType
-                 -> [LHsRecUpdField GhcRn] -> ExpRhoType
-                 -> TcM [LHsFieldBind GhcTc (LAmbiguousFieldOcc GhcTc) (LHsExpr GhcRn)]
-disambiguateRecordBinds record_expr record_rho rbnds res_ty
-    -- Are all the fields unambiguous?
-  = case mapM isUnambiguous rbnds of
-                     -- If so, just skip to looking up the Ids
-                     -- Always the case if DuplicateRecordFields is off
-      Just rbnds' -> mapM lookupSelector rbnds'
-      Nothing     -> -- If not, try to identify a single parent
-        do { fam_inst_envs <- tcGetFamInstEnvs
-             -- Look up the possible parents for each field
-           ; rbnds_with_parents <- getUpdFieldsParents
-           ; let possible_parents = map (map fst . snd) rbnds_with_parents
-             -- Identify a single parent
-           ; p <- identifyParent fam_inst_envs possible_parents
-             -- Pick the right selector with that parent for each field
-           ; checkNoErrs $ mapM (pickParent p) rbnds_with_parents }
+                        -> NE.NonEmpty (HsRecUpdParent GhcRn)
+                        -> [LHsRecUpdField GhcRn GhcRn] -> ExpRhoType
+                        -> TcM (UniqSet ConLike, [LHsRecUpdField GhcTc GhcRn])
+disambiguateRecordBinds record_expr record_rho possible_parents rbnds res_ty
+  = do { fam_inst_envs <- tcGetFamInstEnvs
+         -- Identify a single parent, using type-directed disambiguation
+         -- if necessary. (Note that type-directed disambiguation of
+         -- record field updates is is scheduled for removal, as per
+         -- Note [Type-directed record disambiguation].)
+       ; TcRecUpdParent
+           { tcRecUpdLabels = lbls
+           , tcRecUpdCons   = cons }
+             <- identifyParentLabels fam_inst_envs possible_parents
+         -- Pick the right selector with that parent for each field
+       ; rbnds' <- zipWithM lookupField (NE.toList lbls) rbnds
+       ; return (cons, rbnds') }
   where
-    -- Extract the selector name of a field update if it is unambiguous
-    isUnambiguous :: LHsRecUpdField GhcRn -> Maybe (LHsRecUpdField GhcRn,Name)
-    isUnambiguous x = case unLoc (hfbLHS (unLoc x)) of
-                        Unambiguous sel_name _ -> Just (x, sel_name)
-                        Ambiguous{}            -> Nothing
 
-    -- Look up the possible parents and selector GREs for each field
-    getUpdFieldsParents :: TcM [(LHsRecUpdField GhcRn
-                                , [(RecSelParent, GlobalRdrElt)])]
-    getUpdFieldsParents
-      = fmap (zip rbnds) $ mapM
-          (lookupParents False . unLoc . hsRecUpdFieldRdr . unLoc)
-          rbnds
+    -- Try to identify a single parent, using type-directed disambiguation.
+    --
+    -- Any non-type-directed disambiguation will have been done already.
+    -- See GHC.Rename.Env.lookupRecUpdFields.
+    identifyParentLabels :: FamInstEnvs
+                         -> NE.NonEmpty (HsRecUpdParent GhcRn)
+                         -> TcM (HsRecUpdParent GhcTc)
+    identifyParentLabels fam_inst_envs possible_parents
+      = case possible_parents of
 
-    -- Given a the lists of possible parents for each field,
-    -- identify a single parent
-    identifyParent :: FamInstEnvs -> [[RecSelParent]] -> TcM RecSelParent
-    identifyParent fam_inst_envs possible_parents
-      = case foldr1 intersect possible_parents of
-        -- No parents for all fields: record update is ill-typed
-        []  -> failWithTc (TcRnNoPossibleParentForFields rbnds)
+        -- Exactly one possible parent for the record update!
+        p NE.:| [] -> lookup_parent_flds p
 
-        -- Exactly one datatype with all the fields: use that
-        [p] -> return p
-
-        -- Multiple possible parents: try harder to disambiguate
+        -- Multiple possible parents: try harder to disambiguate.
         -- Can we get a parent TyCon from the pushed-in type?
-        _:_ | Just p <- tyConOfET fam_inst_envs res_ty ->
-              do { reportAmbiguousField p
-                 ; return (RecSelData p) }
+        --
+        -- See (a) in Note [Type-directed record disambiguation] in GHC.Rename.Pat.
+        _ NE.:| _ : _
+          | Just tc <- tyConOfET fam_inst_envs res_ty
+          -> do { reportAmbiguousUpdate possible_parents tc
+                ; try_disambiguated_tycon tc possible_parents }
 
         -- Does the expression being updated have a type signature?
-        -- If so, try to extract a parent TyCon from it
-            | Just {} <- obviousSig (unLoc record_expr)
-            , Just tc <- tyConOf fam_inst_envs record_rho
-            -> do { reportAmbiguousField tc
-                  ; return (RecSelData tc) }
+        -- If so, try to extract a parent TyCon from it.
+        --
+        -- See (b) inNote [Type-directed record disambiguation] in GHC.Rename.Pat.
+          | Just {} <- obviousSig (unLoc record_expr)
+          , Just tc <- tyConOf fam_inst_envs record_rho
+          -> do { reportAmbiguousUpdate possible_parents tc
+                ; try_disambiguated_tycon tc possible_parents }
 
         -- Nothing else we can try...
-        _ -> failWithTc (TcRnBadOverloadedRecordUpdate rbnds)
+        p1 NE.:| p2 : ps
+          -> do { p1 <- tcLookupRecSelParent p1
+                ; p2 <- tcLookupRecSelParent p2
+                ; ps <- mapM tcLookupRecSelParent ps
+                ; failWithTc $ TcRnBadRecordUpdate (getUpdFieldLbls rbnds)
+                             $ MultiplePossibleParents (p1, p2, ps) }
 
-    -- Make a field unambiguous by choosing the given parent.
-    -- Emits an error if the field cannot have that parent,
-    -- e.g. if the user writes
-    --     r { x = e } :: T
-    -- where T does not have field x.
-    pickParent :: RecSelParent
-               -> (LHsRecUpdField GhcRn, [(RecSelParent, GlobalRdrElt)])
-               -> TcM (LHsFieldBind GhcTc (LAmbiguousFieldOcc GhcTc) (LHsExpr GhcRn))
-    pickParent p (upd, xs)
-      = case lookup p xs of
-                      -- Phew! The parent is valid for this field.
-                      -- Previously ambiguous fields must be marked as
-                      -- used now that we know which one is meant, but
-                      -- unambiguous ones shouldn't be recorded again
-                      -- (giving duplicate deprecation warnings).
-          Just gre -> do { unless (null (tail xs)) $ do
-                             let L loc _ = hfbLHS (unLoc upd)
-                             setSrcSpanA loc $ addUsedGRE True gre
-                         ; lookupSelector (upd, greMangledName gre) }
-                      -- The field doesn't belong to this parent, so report
-                      -- an error but keep going through all the fields
-          Nothing  -> do { addErrTc (fieldNotInType p
-                                      (unLoc (hsRecUpdFieldRdr (unLoc upd))))
-                         ; lookupSelector (upd, greMangledName (snd (head xs))) }
+    -- Try to use the 'TyCon' we learned from type-directed disambiguation.
+    -- This might not work, if it doesn't match up with any of the parents we had
+    -- computed on the basis of the field labels.
+    -- (See test cases overloadedrecfields01 and T21946.)
+    try_disambiguated_tycon :: TyCon
+                            -> NE.NonEmpty (HsRecUpdParent GhcRn)
+                            -> TcM (HsRecUpdParent GhcTc)
+    try_disambiguated_tycon tc pars
+      = do { pars <- mapMaybeM (fmap (guard_parent tc) . lookup_parent_flds) (NE.toList pars)
+           ; case pars of
+               [par] -> return par
+               []    -> do { pars <- mapM tcLookupRecSelParent possible_parents
+                           ; failWithTc $ TcRnBadRecordUpdate (getUpdFieldLbls rbnds)
+                                        $ InvalidTyConParent tc pars }
+               _     -> pprPanic "try_disambiguated_tycon: more than 1 valid parent"
+                          (ppr $ map tcRecUpdParent pars) }
 
-    -- Given a (field update, selector name) pair, look up the
-    -- selector to give a field update with an unambiguous Id
-    lookupSelector :: (LHsRecUpdField GhcRn, Name)
-                 -> TcM (LHsFieldBind GhcRn (LAmbiguousFieldOcc GhcTc) (LHsExpr GhcRn))
-    lookupSelector (L l upd, n)
-      = do { i <- tcLookupId n
-           ; let L loc af = hfbLHS upd
-                 lbl      = rdrNameAmbiguousFieldOcc af
+    guard_parent :: TyCon -> HsRecUpdParent GhcTc -> Maybe (HsRecUpdParent GhcTc)
+    guard_parent disamb_tc cand_parent@(TcRecUpdParent { tcRecUpdParent = cand_tc })
+      = do { guard (RecSelData disamb_tc == cand_tc)
+           ; return cand_parent }
+
+    lookup_parent_flds :: HsRecUpdParent GhcRn
+                       -> TcM (HsRecUpdParent GhcTc)
+    lookup_parent_flds par@(RnRecUpdParent { rnRecUpdLabels = lbls, rnRecUpdCons = cons })
+      = do { let cons' :: NonDetUniqFM ConLike ConLikeName
+                 cons' = NonDetUniqFM $ unsafeCastUFMKey $ getUniqSet cons
+           ; cons <- traverse (tcLookupConLike . conLikeName_Name) cons'
+           ; tc   <- tcLookupRecSelParent par
+           ; return $
+               TcRecUpdParent
+                 { tcRecUpdParent = tc
+                 , tcRecUpdLabels = lbls
+                 , tcRecUpdCons   = unsafeUFMToUniqSet $ getNonDet cons } }
+
+    lookupField :: FieldGlobalRdrElt
+                -> LHsRecUpdField GhcRn GhcRn
+                -> TcM (LHsRecUpdField GhcTc GhcRn)
+    lookupField fld_gre (L l upd)
+      = do { let L loc af = hfbLHS upd
+                 lbl      = ambiguousFieldOccRdrName af
+                 mb_gre   = pickGREs lbl [fld_gre]
+                      -- NB: this GRE can be 'Nothing' when in GHCi.
+                      -- See test T10439.
+
+             -- Mark the record fields as used, now that we have disambiguated.
+             -- There is no risk of duplicate deprecation warnings, as we have
+             -- not marked the GREs as used previously.
+           ; setSrcSpanA loc $ mapM_ (addUsedGRE AllDeprecationWarnings) mb_gre
+           ; sel <- tcLookupId (greName fld_gre)
            ; return $ L l HsFieldBind
                { hfbAnn = hfbAnn upd
-               , hfbLHS
-                       = L (l2l loc) (Unambiguous i (L (l2l loc) lbl))
+               , hfbLHS = L (l2l loc) $ Unambiguous sel (L (l2l loc) lbl)
                , hfbRHS = hfbRHS upd
                , hfbPun = hfbPun upd
-               }
-           }
+               } }
 
-    -- See Note [Deprecating ambiguous fields] in GHC.Tc.Gen.Head
-    reportAmbiguousField :: TyCon -> TcM ()
-    reportAmbiguousField parent_type =
-        setSrcSpan loc $ addDiagnostic $ TcRnAmbiguousField rupd parent_type
+    -- The type-directed disambiguation mechanism is scheduled for removal,
+    -- as per Note [Type-directed record disambiguation].
+    -- So we emit a warning whenever the user relies on it.
+    reportAmbiguousUpdate :: NE.NonEmpty (HsRecUpdParent GhcRn)
+                          -> TyCon -> TcM ()
+    reportAmbiguousUpdate parents parent_type =
+        setSrcSpan loc $ addDiagnostic $ TcRnAmbiguousRecordUpdate rupd parent_type
       where
-        rupd = RecordUpd { rupd_expr = record_expr, rupd_flds = Left rbnds, rupd_ext = noExtField }
+        rupd = RecordUpd { rupd_expr = record_expr
+                         , rupd_flds =
+                             RegularRecUpdFields
+                              { xRecUpdFields = parents
+                              , recUpdFields  = rbnds }
+                         , rupd_ext = noExtField }
         loc  = getLocA (head rbnds)
 
 {-
@@ -1599,14 +1649,15 @@ tcRecordBinds con_like arg_tys (HsRecFields rbinds dd)
       = do { mb <- tcRecordField con_like flds_w_tys f rhs
            ; case mb of
                Nothing         -> return Nothing
-               -- Just (f', rhs') -> return (Just (L l (fld { hfbLHS = f'
-               --                                            , hfbRHS = rhs' }))) }
                Just (f', rhs') -> return (Just (L l (HsFieldBind
                                                      { hfbAnn = hfbAnn fld
                                                      , hfbLHS = f'
                                                      , hfbRHS = rhs'
                                                      , hfbPun = hfbPun fld}))) }
 
+fieldCtxt :: FieldLabelString -> SDoc
+fieldCtxt field_name
+  = text "In the" <+> quotes (ppr field_name) <+> text "field of a record"
 
 tcRecordField :: ConLike -> Assoc Name Type
               -> LFieldOcc GhcRn -> LHsExpr GhcRn
@@ -1623,7 +1674,7 @@ tcRecordField con_like flds_w_tys (L loc (FieldOcc sel_name lbl)) rhs
                 -- Yuk: the field_id has the *unique* of the selector Id
                 --          (so we can find it easily)
                 --      but is a LocalId with the appropriate type of the RHS
-                --          (so the desugarer knows the type of local binder to make)
+                --          (so the expansion knows the type of local binder to make)
            ; return (Just (L loc (FieldOcc field_id lbl), rhs')) }
       | otherwise
       = do { addErrTc (badFieldConErr (getName con_like) field_lbl)
@@ -1646,14 +1697,14 @@ checkMissingFields con_like rbinds arg_tys
 
   | otherwise = do              -- A record
     unless (null missing_s_fields) $ do
-        fs <- zonk_fields missing_s_fields
+        fs <- liftZonkM $ zonk_fields missing_s_fields
         -- It is an error to omit a strict field, because
         -- we can't substitute it with (error "Missing field f")
         addErrTc (TcRnMissingStrictFields con_like fs)
 
     warn <- woptM Opt_WarnMissingFields
     when (warn && notNull missing_ns_fields) $ do
-        fs <- zonk_fields missing_ns_fields
+        fs <- liftZonkM $ zonk_fields missing_ns_fields
         -- It is not an error (though we may want) to omit a
         -- lazy field, because we can always use
         -- (error "Missing field f") instead.
@@ -1684,103 +1735,6 @@ checkMissingFields con_like rbinds arg_tys
     field_strs = conLikeImplBangs con_like
 
     fl `elemField` flds = any (\ fl' -> flSelector fl == fl') flds
-
-{-
-************************************************************************
-*                                                                      *
-\subsection{Errors and contexts}
-*                                                                      *
-************************************************************************
-
-Boring and alphabetical:
--}
-
-fieldCtxt :: FieldLabelString -> SDoc
-fieldCtxt field_name
-  = text "In the" <+> quotes (ppr field_name) <+> text "field of a record"
-
-badFieldsUpd
-  :: [LHsFieldBind GhcTc (LAmbiguousFieldOcc GhcTc) (LHsExpr GhcRn)]
-               -- Field names that don't belong to a single datacon
-  -> [ConLike] -- Data cons of the type which the first field name belongs to
-  -> TcRnMessage
-badFieldsUpd rbinds data_cons
-  = TcRnNoConstructorHasAllFields conflictingFields
-          -- See Note [Finding the conflicting fields]
-  where
-    -- A (preferably small) set of fields such that no constructor contains
-    -- all of them.  See Note [Finding the conflicting fields]
-    conflictingFields = case nonMembers of
-        -- nonMember belongs to a different type.
-        (nonMember, _) : _ -> [aMember, nonMember]
-        [] -> let
-            -- All of rbinds belong to one type. In this case, repeatedly add
-            -- a field to the set until no constructor contains the set.
-
-            -- Each field, together with a list indicating which constructors
-            -- have all the fields so far.
-            growingSets :: [(FieldLabelString, [Bool])]
-            growingSets = scanl1 combine membership
-            combine (_, setMem) (field, fldMem)
-              = (field, zipWith (&&) setMem fldMem)
-            in
-            -- Fields that don't change the membership status of the set
-            -- are redundant and can be dropped.
-            map (fst . NE.head) $ NE.groupWith snd growingSets
-
-    aMember = assert (not (null members) ) fst (head members)
-    (members, nonMembers) = partition (or . snd) membership
-
-    -- For each field, which constructors contain the field?
-    membership :: [(FieldLabelString, [Bool])]
-    membership = sortMembership $
-        map (\fld -> (fld, map (fld `elementOfUniqSet`) fieldLabelSets)) $
-          map (FieldLabelString . occNameFS . rdrNameOcc . rdrNameAmbiguousFieldOcc . unLoc . hfbLHS . unLoc) rbinds
-
-    fieldLabelSets :: [UniqSet FieldLabelString]
-    fieldLabelSets = map (mkUniqSet . map flLabel . conLikeFieldLabels) data_cons
-
-    -- Sort in order of increasing number of True, so that a smaller
-    -- conflicting set can be found.
-    sortMembership =
-      map snd .
-      sortBy (compare `on` fst) .
-      map (\ item@(_, membershipRow) -> (countTrue membershipRow, item))
-
-    countTrue = count id
-
-{-
-Note [Finding the conflicting fields]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Suppose we have
-  data A = A {a0, a1 :: Int}
-         | B {b0, b1 :: Int}
-and we see a record update
-  x { a0 = 3, a1 = 2, b0 = 4, b1 = 5 }
-Then we'd like to find the smallest subset of fields that no
-constructor has all of.  Here, say, {a0,b0}, or {a0,b1}, etc.
-We don't really want to report that no constructor has all of
-{a0,a1,b0,b1}, because when there are hundreds of fields it's
-hard to see what was really wrong.
-
-We may need more than two fields, though; eg
-  data T = A { x,y :: Int, v::Int }
-          | B { y,z :: Int, v::Int }
-          | C { z,x :: Int, v::Int }
-with update
-   r { x=e1, y=e2, z=e3 }, we
-
-Finding the smallest subset is hard, so the code here makes
-a decent stab, no more.  See #7989.
--}
-
-mixedSelectors :: [Id] -> [Id] -> TcRnMessage
-mixedSelectors data_sels@(dc_rep_id:_) pat_syn_sels@(ps_rep_id:_)
-  = TcRnMixedSelectors (tyConName rep_dc) data_sels (patSynName rep_ps) pat_syn_sels
-  where
-    RecSelPatSyn rep_ps = recordSelectorTyCon ps_rep_id
-    RecSelData rep_dc = recordSelectorTyCon dc_rep_id
-mixedSelectors _ _ = panic "GHC.Tc.Gen.Expr: mixedSelectors emptylists"
 
 {-
 ************************************************************************

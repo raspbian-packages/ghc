@@ -6,6 +6,7 @@
 
 
 {-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE TupleSections #-}
 {-# LANGUAGE TypeFamilies #-}
 
 {-# OPTIONS_GHC -Wno-incomplete-record-updates #-}
@@ -21,6 +22,7 @@ where
 import GHC.Prelude
 
 import GHC.Hs
+import GHC.Rename.Bind ( rejectBootDecls )
 import GHC.Tc.Errors.Types
 import GHC.Tc.Gen.Bind
 import GHC.Tc.TyCl
@@ -32,7 +34,8 @@ import GHC.Tc.Solver( pushLevelAndSolveEqualitiesX, reportUnsolvedEqualities )
 import GHC.Tc.Gen.Sig
 import GHC.Tc.Utils.Monad
 import GHC.Tc.Validity
-import GHC.Tc.Utils.Zonk
+import GHC.Tc.Zonk.Type
+import GHC.Tc.Zonk.TcType
 import GHC.Tc.Utils.TcMType
 import GHC.Tc.Utils.TcType
 import GHC.Tc.Types.Constraint
@@ -48,6 +51,7 @@ import GHC.Tc.Deriv
 import GHC.Tc.Utils.Env
 import GHC.Tc.Gen.HsType
 import GHC.Tc.Utils.Unify
+import GHC.Builtin.Names ( unsatisfiableIdName )
 import GHC.Core        ( Expr(..), mkApps, mkVarApps, mkLams )
 import GHC.Core.Make   ( nO_METHOD_BINDING_ERROR_ID )
 import GHC.Core.Unfold.Make ( mkInlineUnfoldingWithArity, mkDFunUnfolding )
@@ -67,11 +71,12 @@ import GHC.Types.Var.Set
 import GHC.Data.Bag
 import GHC.Types.Basic
 import GHC.Types.Fixity
-import GHC.Driver.Session
+import GHC.Driver.DynFlags
 import GHC.Driver.Ppr
 import GHC.Utils.Logger
 import GHC.Data.FastString
 import GHC.Types.Id
+import GHC.Types.SourceFile
 import GHC.Types.SourceText
 import GHC.Data.List.SetOps
 import GHC.Types.Name
@@ -481,11 +486,12 @@ tcLocalInstDecl (L loc (ClsInstD { cid_inst = decl }))
 tcClsInstDecl :: LClsInstDecl GhcRn
               -> TcM ([InstInfo GhcRn], [FamInst], [DerivInfo])
 -- The returned DerivInfos are for any associated data families
-tcClsInstDecl (L loc (ClsInstDecl { cid_poly_ty = hs_ty, cid_binds = binds
+tcClsInstDecl (L loc (ClsInstDecl { cid_ext = lwarn
+                                  , cid_poly_ty = hs_ty, cid_binds = binds
                                   , cid_sigs = uprags, cid_tyfam_insts = ats
                                   , cid_overlap_mode = overlap_mode
                                   , cid_datafam_insts = adts }))
-  = setSrcSpanA loc                      $
+  = setSrcSpanA loc                   $
     addErrCtxt (instDeclCtxt1 hs_ty)  $
     do  { dfun_ty <- tcHsClsInstType (InstDeclCtxt False) hs_ty
         ; let (tyvars, theta, clas, inst_tys) = tcSplitDFunTy dfun_ty
@@ -536,8 +542,9 @@ tcClsInstDecl (L loc (ClsInstDecl { cid_poly_ty = hs_ty, cid_binds = binds
         ; dfun_name <- newDFunName clas inst_tys (getLocA hs_ty)
                 -- Dfun location is that of instance *header*
 
+        ; let warn = fmap unLoc lwarn
         ; ispec <- newClsInst (fmap unLoc overlap_mode) dfun_name
-                              tyvars theta clas inst_tys
+                              tyvars theta clas inst_tys warn
 
         ; let inst_binds = InstBindings
                              { ib_binds = binds
@@ -552,11 +559,13 @@ tcClsInstDecl (L loc (ClsInstDecl { cid_poly_ty = hs_ty, cid_binds = binds
               all_insts                      = tyfam_insts ++ datafam_insts
 
          -- In hs-boot files there should be no bindings
-        ; let no_binds = isEmptyLHsBinds binds && null uprags
-        ; is_boot <- tcIsHsBootOrSig
-        ; failIfTc (is_boot && not no_binds) TcRnIllegalHsBootFileDecl
-
-        ; return ( [inst_info], all_insts, deriv_infos ) }
+        ; gbl_env <- getGblEnv;
+        ; case tcg_src gbl_env of
+          { HsSrcFile -> return ()
+          ; HsBootOrSig boot_or_sig ->
+             do { rejectBootDecls boot_or_sig BootBindsRn (bagToList binds)
+                ; rejectBootDecls boot_or_sig BootInstanceSigs uprags } }
+        ; return ([inst_info], all_insts, deriv_infos) }
   where
     defined_ats = mkNameSet (map (tyFamInstDeclName . unLoc) ats)
                   `unionNameSet`
@@ -586,20 +595,26 @@ tcTyFamInstDecl mb_clsinfo (L loc decl@(TyFamInstDecl { tfid_eqn = eqn }))
     tcAddTyFamInstCtxt decl  $
     do { let fam_lname = feqn_tycon eqn
        ; fam_tc <- tcLookupLocatedTyCon fam_lname
-       ; tcFamInstDeclChecks mb_clsinfo fam_tc
+       ; tcFamInstDeclChecks mb_clsinfo IAmType fam_tc
 
          -- (0) Check it's an open type family
-       ; checkTc (isTypeFamilyTyCon fam_tc)     (wrongKindOfFamily fam_tc)
-       ; checkTc (isOpenTypeFamilyTyCon fam_tc) (TcRnNotOpenFamily fam_tc)
+       ; checkTc (isTypeFamilyTyCon fam_tc) $
+           TcRnIllegalInstance $ IllegalFamilyInstance $
+             FamilyCategoryMismatch fam_tc
+       ; checkTc (isOpenTypeFamilyTyCon fam_tc) $
+           TcRnIllegalInstance $ IllegalFamilyInstance $
+             NotAnOpenFamilyTyCon fam_tc
 
          -- (1) do the work of verifying the synonym group
          -- For some reason we don't have a location for the equation
          -- itself, so we make do with the location of family name
-       ; co_ax_branch <- tcTyFamInstEqn fam_tc mb_clsinfo
-                                        (L (na2la $ getLoc fam_lname) eqn)
+       ; (co_ax_branch, co_ax_validity_info)
+          <- tcTyFamInstEqn fam_tc mb_clsinfo
+                (L (l2l $ getLoc fam_lname) eqn)
 
          -- (2) check for validity
        ; checkConsistentFamInst mb_clsinfo fam_tc co_ax_branch
+       ; checkTyFamEqnValidityInfo fam_tc co_ax_validity_info
        ; checkValidCoAxBranch fam_tc co_ax_branch
 
          -- (3) construct coercion axiom
@@ -609,24 +624,32 @@ tcTyFamInstDecl mb_clsinfo (L loc decl@(TyFamInstDecl { tfid_eqn = eqn }))
 
 
 ---------------------
-tcFamInstDeclChecks :: AssocInstInfo -> TyCon -> TcM ()
+tcFamInstDeclChecks :: AssocInstInfo -> TypeOrData -> TyCon -> TcM ()
 -- Used for both type and data families
-tcFamInstDeclChecks mb_clsinfo fam_tc
+tcFamInstDeclChecks mb_clsinfo ty_or_data fam_tc
   = do { -- Type family instances require -XTypeFamilies
          -- and can't (currently) be in an hs-boot file
        ; traceTc "tcFamInstDecl" (ppr fam_tc)
        ; type_families <- xoptM LangExt.TypeFamilies
-       ; is_boot       <- tcIsHsBootOrSig   -- Are we compiling an hs-boot file?
-       ; checkTc type_families (TcRnBadFamInstDecl fam_tc)
-       ; checkTc (not is_boot) TcRnBadBootFamInstDecl
+       ; hs_src        <- tcHscSource   -- Are we compiling an hs-boot file?
+       ; checkTc type_families (TcRnTyFamsDisabled (TyFamsDisabledInstance fam_tc))
+       ; case hs_src of
+           HsBootOrSig boot_or_sig ->
+             addErrTc $ TcRnIllegalHsBootOrSigDecl boot_or_sig (BootFamInst fam_tc)
+           HsSrcFile               ->
+             return ()
 
-       -- Check that it is a family TyCon, and that
-       -- oplevel type instances are not for associated types.
-       ; checkTc (isFamilyTyCon fam_tc) (TcRnIllegalFamilyInstance fam_tc)
+       -- Check that it is a family TyCon
+       ; checkTc (isFamilyTyCon fam_tc) $
+          TcRnIllegalInstance $ IllegalFamilyInstance $
+            NotAFamilyTyCon ty_or_data fam_tc
 
+       -- Check that top-level type instances are not for associated types.
        ; when (isNotAssociated mb_clsinfo &&   -- Not in a class decl
-               isTyConAssoc fam_tc)            -- but an associated type
-              (addErr $ TcRnMissingClassAssoc fam_tc)
+               isTyConAssoc fam_tc) $          -- but an associated type
+          addErr $ TcRnIllegalInstance $ IllegalFamilyInstance
+                 $ InvalidAssoc $ InvalidAssocInstance
+                 $ AssocInstanceNotInAClass fam_tc
        }
 
 {- Note [Associated type instances]
@@ -681,16 +704,18 @@ tcDataFamInstDecl mb_clsinfo tv_skol_env
     tcAddDataFamInstCtxt decl  $
     do { fam_tc <- tcLookupLocatedTyCon lfam_name
 
-       ; tcFamInstDeclChecks mb_clsinfo fam_tc
+       ; tcFamInstDeclChecks mb_clsinfo IAmData fam_tc
 
        -- Check that the family declaration is for the right kind
-       ; checkTc (isDataFamilyTyCon fam_tc) (wrongKindOfFamily fam_tc)
+       ; checkTc (isDataFamilyTyCon fam_tc) $
+          TcRnIllegalInstance $ IllegalFamilyInstance $
+            FamilyCategoryMismatch fam_tc
        ; gadt_syntax <- dataDeclChecks fam_name hs_ctxt hs_cons
           -- Do /not/ check that the number of patterns = tyConArity fam_tc
           -- See [Arity of data families] in GHC.Core.FamInstEnv
        ; skol_info <- mkSkolemInfo FamInstSkol
        ; let new_or_data = dataDefnConsNewOrData hs_cons
-       ; (qtvs, pats, tc_res_kind, stupid_theta)
+       ; (qtvs, non_user_tvs, pats, tc_res_kind, stupid_theta)
              <- tcDataFamInstHeader mb_clsinfo skol_info fam_tc outer_bndrs fixity
                                     hs_ctxt hs_pats m_ksig new_or_data
 
@@ -739,17 +764,21 @@ tcDataFamInstDecl mb_clsinfo tv_skol_env
               , text "eta_tcbs" <+> ppr eta_tcbs ]
 
        -- Zonk the patterns etc into the Type world
-       ; ze                <- mkEmptyZonkEnv NoFlexi
-       ; (ze, ty_binders)  <- zonkTyVarBindersX   ze tc_ty_binders
-       ; res_kind          <- zonkTcTypeToTypeX   ze tc_res_kind
-       ; all_pats          <- zonkTcTypesToTypesX ze all_pats
-       ; eta_pats          <- zonkTcTypesToTypesX ze eta_pats
-       ; stupid_theta      <- zonkTcTypesToTypesX ze stupid_theta
-       ; let zonked_post_eta_qtvs = map (lookupTyVarX ze) post_eta_qtvs
-             zonked_eta_tvs       = map (lookupTyVarX ze) eta_tvs
-             -- All these qtvs are in ty_binders, and hence will be in
-             -- the ZonkEnv, ze.  We need the zonked (TyVar) versions to
-             -- put in the CoAxiom that we are about to build.
+       ; (ty_binders, res_kind, all_pats, eta_pats, stupid_theta,
+           zonked_post_eta_qtvs, zonked_eta_tvs) <-
+         initZonkEnv NoFlexi $
+         runZonkBndrT (zonkTyVarBindersX tc_ty_binders) $ \ ty_binders ->
+           do { res_kind             <- zonkTcTypeToTypeX   tc_res_kind
+              ; all_pats             <- zonkTcTypesToTypesX all_pats
+              ; eta_pats             <- zonkTcTypesToTypesX eta_pats
+              ; stupid_theta         <- zonkTcTypesToTypesX stupid_theta
+              ; zonked_post_eta_qtvs <- mapM lookupTyVarX   post_eta_qtvs
+              ; zonked_eta_tvs       <- mapM lookupTyVarX   eta_tvs
+                    -- All these qtvs are in ty_binders, and hence will be in
+                    -- the ZonkEnv, ze.  We need the zonked (TyVar) versions to
+                    -- put in the CoAxiom that we are about to build.
+              ; return (ty_binders, res_kind, all_pats, eta_pats, stupid_theta,
+                         zonked_post_eta_qtvs, zonked_eta_tvs) }
 
        ; traceTc "tcDataFamInstDecl" $
          vcat [ text "Fam tycon:" <+> ppr fam_tc
@@ -761,7 +790,7 @@ tcDataFamInstDecl mb_clsinfo tv_skol_env
               , text "res_kind:" <+> ppr res_kind
               , text "eta_pats" <+> ppr eta_pats
               , text "eta_tcbs" <+> ppr eta_tcbs ]
-       ; (rep_tc, axiom) <- fixM $ \ ~(rec_rep_tc, _) ->
+       ; (rep_tc, (axiom, ax_rhs)) <- fixM $ \ ~(rec_rep_tc, _) ->
            do { data_cons <- tcExtendTyVarEnv (binderVars tc_ty_binders) $
                   -- For H98 decls, the tyvars scope
                   -- over the data constructors
@@ -797,13 +826,15 @@ tcDataFamInstDecl mb_clsinfo tv_skol_env
                  -- further instance might not introduce a new recursive
                  -- dependency.  (2) They are always valid loop breakers as
                  -- they involve a coercion.
-              ; return (rep_tc, axiom) }
+
+              ; return (rep_tc, (axiom, ax_rhs)) }
 
        -- Remember to check validity; no recursion to worry about here
        -- Check that left-hand sides are ok (mono-types, no type families,
        -- consistent instantiations, etc)
        ; let ax_branch = coAxiomSingleBranch axiom
        ; checkConsistentFamInst mb_clsinfo fam_tc ax_branch
+       ; checkFamPatBinders fam_tc zonked_post_eta_qtvs non_user_tvs eta_pats ax_rhs
        ; checkValidCoAxBranch fam_tc ax_branch
        ; checkValidTyCon rep_tc
 
@@ -811,10 +842,10 @@ tcDataFamInstDecl mb_clsinfo tv_skol_env
              m_deriv_info = case derivs of
                []    -> Nothing
                preds ->
-                 Just $ DerivInfo { di_rep_tc  = rep_tc
+                 Just $ DerivInfo { di_rep_tc     = rep_tc
                                   , di_scoped_tvs = scoped_tvs
-                                  , di_clauses = preds
-                                  , di_ctxt    = tcMkDataFamInstCtxt decl }
+                                  , di_clauses    = preds
+                                  , di_ctxt       = tcMkDataFamInstCtxt decl }
 
        ; fam_inst <- newFamInst (DataFamilyInst rep_tc) axiom
        ; return (fam_inst, m_deriv_info) }
@@ -886,9 +917,9 @@ TyVarEnv will simply be empty, and there is nothing to worry about.
 tcDataFamInstHeader
     :: AssocInstInfo -> SkolemInfo -> TyCon -> HsOuterFamEqnTyVarBndrs GhcRn
     -> LexicalFixity -> Maybe (LHsContext GhcRn)
-    -> HsTyPats GhcRn -> Maybe (LHsKind GhcRn)
+    -> HsFamEqnPats GhcRn -> Maybe (LHsKind GhcRn)
     -> NewOrData
-    -> TcM ([TcTyVar], [TcType], TcKind, TcThetaType)
+    -> TcM ([TcTyVar], TyVarSet, [TcType], TcKind, TcThetaType)
          -- All skolem TcTyVars, all zonked so it's clear what the free vars are
 -- The "header" of a data family instance is the part other than
 -- the data constructors themselves
@@ -948,11 +979,15 @@ tcDataFamInstHeader mb_clsinfo skol_info fam_tc hs_outer_bndrs fixity
              -- the outer_tvs.  See Note [Generalising in tcTyFamInstEqnGuts]
        ; reportUnsolvedEqualities skol_info final_tvs tclvl wanted
 
-       ; final_tvs         <- zonkTcTyVarsToTcTyVars final_tvs
-       ; lhs_ty            <- zonkTcType  lhs_ty
-       ; master_res_kind   <- zonkTcType  master_res_kind
-       ; instance_res_kind <- zonkTcType  instance_res_kind
-       ; stupid_theta      <- zonkTcTypes stupid_theta
+       ; (final_tvs, non_user_tvs, lhs_ty, master_res_kind, instance_res_kind, stupid_theta) <-
+          liftZonkM $ do
+            { final_tvs         <- mapM zonkTcTyVarToTcTyVar final_tvs
+            ; non_user_tvs      <- mapM zonkTcTyVarToTcTyVar qtvs
+            ; lhs_ty            <- zonkTcType                lhs_ty
+            ; master_res_kind   <- zonkTcType                master_res_kind
+            ; instance_res_kind <- zonkTcType                instance_res_kind
+            ; stupid_theta      <- zonkTcTypes               stupid_theta
+            ; return (final_tvs, non_user_tvs, lhs_ty, master_res_kind, instance_res_kind, stupid_theta) }
 
        -- Check that res_kind is OK with checkDataKindSig.  We need to
        -- check that it's ok because res_kind can come from a user-written
@@ -964,7 +999,7 @@ tcDataFamInstHeader mb_clsinfo skol_info fam_tc hs_outer_bndrs fixity
        -- For the scopedSort see Note [Generalising in tcTyFamInstEqnGuts]
        ; let pats      = unravelFamInstPats lhs_ty
 
-       ; return (final_tvs, pats, master_res_kind, stupid_theta) }
+       ; return (final_tvs, mkVarSet non_user_tvs, pats, master_res_kind, stupid_theta) }
   where
     fam_name  = tyConName fam_tc
     data_ctxt = DataKindCtxt fam_name
@@ -1297,7 +1332,7 @@ tcInstDecl2 (InstInfo { iSpec = ispec, iBinds = ibinds })
              con_app_args = foldl' app_to_meth con_app_tys sc_meth_ids
 
              app_to_meth :: HsExpr GhcTc -> Id -> HsExpr GhcTc
-             app_to_meth fun meth_id = HsApp noComments (L loc' fun)
+             app_to_meth fun meth_id = HsApp noExtField (L loc' fun)
                                             (L loc' (wrapId arg_wrapper meth_id))
 
              inst_tv_tys = mkTyVarTys inst_tyvars
@@ -1463,7 +1498,7 @@ tcSuperClasses skol_info dfun_id cls tyvars dfun_evs dfun_ev_binds sc_theta
 
            ; sc_top_name  <- newName (mkSuperDictAuxOcc n (getOccName cls))
            ; sc_ev_id     <- newEvVar sc_pred
-           ; addTcEvBind ev_binds_var $ mkWantedEvBind sc_ev_id sc_ev_tm
+           ; addTcEvBind ev_binds_var $ mkWantedEvBind sc_ev_id True sc_ev_tm
            ; let sc_top_ty = tcMkDFunSigmaTy tyvars (map idType dfun_evs) sc_pred
                  sc_top_id = mkLocalId sc_top_name ManyTy sc_top_ty
                  export = ABE { abe_wrap = idHsWrapper
@@ -1644,7 +1679,7 @@ Answer:
        it is the superclass of an unblocked dictionary (wrinkle (W1)),
        that is Paterson-smaller than the instance head.
 
-    This is implemented in GHC.Tc.Solver.Canonical.mk_strict_superclasses
+    This is implemented in GHC.Tc.Solver.Dict.mk_strict_superclasses
     (in the mk_given_loc helper function).
 
   * Superclass "Wanted" constraints have CtOrigin of (ScOrigin NakedSc)
@@ -1655,25 +1690,11 @@ Answer:
     origin.  But if we apply an instance declaration, we can set the
     origin to (ScOrigin NotNakedSc), thus lifting any restrictions by
     making prohibitedSuperClassSolve return False. This happens
-    in GHC.Tc.Solver.Interact.checkInstanceOK.
+    in GHC.Tc.Solver.Dict.checkInstanceOK.
 
   * (sc2) ScOrigin wanted constraints can't be solved from a
     superclass selection, except at a smaller type.  This test is
     implemented by GHC.Tc.Solver.InertSet.prohibitedSuperClassSolve
-
-Note [Migrating away from loopy superclass solving]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-The logic from Note [Solving superclass constraints] was implemented in GHC 9.6.
-However, we want to provide a migration strategy for users, to avoid suddenly
-breaking their code going when upgrading to GHC 9.6. To this effect, we temporarily
-continue to allow the constraint solver to create these potentially non-terminating
-solutions, but emit a loud warning when doing so: see
-GHC.Tc.Solver.Interact.tryLastResortProhibitedSuperclass.
-
-Users can silence the warning by manually adding the necessary constraint to the
-context. GHC will then keep this user-written Given, dropping the Given arising
-from superclass expansion which has greater SC depth, as explained in
-Note [Replacement vs keeping] in GHC.Tc.Solver.Interact.
 
 Note [Silent superclass arguments] (historical interest only)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1785,6 +1806,9 @@ tcMethods skol_info dfun_id clas tyvars dfun_ev_vars inst_tys
     hs_sig_fn = mkHsSigFun sigs
     inst_loc  = getSrcSpan dfun_id
 
+    unsat_thetas =
+      mapMaybe (\ id -> (id,) <$> isUnsatisfiableCt_maybe (idType id)) dfun_ev_vars
+
     ----------------------
     tc_item :: ClassOpItem -> TcM (Id, LHsBind GhcTc, Maybe Implication)
     tc_item (sel_id, dm_info)
@@ -1801,41 +1825,72 @@ tcMethods skol_info dfun_id clas tyvars dfun_ev_vars inst_tys
     tc_default :: Id -> DefMethInfo
                -> TcM (TcId, LHsBind GhcTc, Maybe Implication)
 
-    tc_default sel_id (Just (dm_name, _))
-      = do { (meth_bind, inline_prags) <- mkDefMethBind inst_loc dfun_id clas sel_id dm_name
+    tc_default sel_id mb_dm = case mb_dm of
+
+      -- If the instance has an "Unsatisfiable msg" context,
+      -- add method bindings that use "unsatisfiable".
+      --
+      -- See Note [Implementation of Unsatisfiable constraints],
+      -- in GHC.Tc.Errors, point (D).
+      _ | (theta_id,unsat_msg) : _ <- unsat_thetas
+        -> do { (meth_id, _) <- mkMethIds clas tyvars dfun_ev_vars
+                                         inst_tys sel_id
+             ; unsat_id <- tcLookupId unsatisfiableIdName
+             -- Recall that unsatisfiable :: forall {rep} (msg :: ErrorMessage) (a :: TYPE rep). Unsatisfiable msg => a
+             --
+             -- So we need to instantiate the forall and pass the dictionary evidence.
+             ; let meth_rhs = L inst_loc' $
+                     wrapId
+                     (   mkWpEvApps [EvExpr $ Var theta_id]
+                     <.> mkWpTyApps [getRuntimeRep meth_tau, unsat_msg, meth_tau])
+                     unsat_id
+                   meth_bind = mkVarBind meth_id $ mkLHsWrap lam_wrapper meth_rhs
+             ; return (meth_id, meth_bind, Nothing) }
+
+      Just (dm_name, _) ->
+        do { (meth_bind, inline_prags) <- mkDefMethBind inst_loc dfun_id clas sel_id dm_name
            ; tcMethodBody skol_info clas tyvars dfun_ev_vars inst_tys
                           dfun_ev_binds is_derived hs_sig_fn
                           spec_inst_prags inline_prags
                           sel_id meth_bind inst_loc }
 
-    tc_default sel_id Nothing     -- No default method at all
-      = do { traceTc "tc_def: warn" (ppr sel_id)
+      -- No default method
+      Nothing ->
+        do { traceTc "tc_def: warn" (ppr sel_id)
            ; (meth_id, _) <- mkMethIds clas tyvars dfun_ev_vars
                                        inst_tys sel_id
            ; dflags <- getDynFlags
-           ; let meth_bind = mkVarBind meth_id $
-                             mkLHsWrap lam_wrapper (error_rhs dflags)
+            -- Add a binding whose RHS is an error
+            -- "No explicit nor default method for class operation 'meth'".
+           ; let meth_rhs  = error_rhs dflags
+                 meth_bind = mkVarBind meth_id $ mkLHsWrap lam_wrapper meth_rhs
            ; return (meth_id, meth_bind, Nothing) }
+
       where
         inst_loc' = noAnnSrcSpan inst_loc
         error_rhs dflags = L inst_loc'
-                                 $ HsApp noComments error_fun (error_msg dflags)
+                         $ HsApp noExtField error_fun (error_msg dflags)
         error_fun    = L inst_loc' $
                        wrapId (mkWpTyApps
                                 [ getRuntimeRep meth_tau, meth_tau])
                               nO_METHOD_BINDING_ERROR_ID
         error_msg dflags = L inst_loc'
-                                    (HsLit noComments (HsStringPrim NoSourceText
+                                    (HsLit noExtField (HsStringPrim NoSourceText
                                               (unsafeMkByteString (error_string dflags))))
         meth_tau     = classMethodInstTy sel_id inst_tys
         error_string dflags = showSDoc dflags
-                              (hcat [ppr inst_loc, vbar, ppr sel_id ])
+                              (hcat [ppr inst_loc, vbar, quotes (ppr sel_id) ])
         lam_wrapper  = mkWpTyLams tyvars <.> mkWpEvLams dfun_ev_vars
 
     ----------------------
     -- Check if one of the minimal complete definitions is satisfied
     checkMinimalDefinition
-      = whenIsJust (isUnsatisfied methodExists (classMinimalDef clas)) $
+      = when (null unsat_thetas) $
+        -- Don't warn if there is an "Unsatisfiable" constraint in the context.
+        --
+        -- See Note [Implementation of Unsatisfiable constraints] in GHC.Tc.Errors,
+        -- point (D).
+        whenIsJust (isUnsatisfied methodExists (classMinimalDef clas)) $
         warnUnsatisfiedMinimalDefinition
 
     methodExists meth = isJust (findMethodBind meth binds prag_fn)
@@ -1907,17 +1962,15 @@ through typing information everywhere in the algorithm that generates Ord
 instances in order to determine which cases were unreachable. This seems like
 a lot of work for minimal gain, so we have opted not to go for this approach.
 
-Instead, we take the much simpler approach of always disabling
--Winaccessible-code for derived code. To accomplish this, we do the following:
+Instead, we take the following approach:
 
-1. In tcMethods (which typechecks method bindings), disable
-   -Winaccessible-code.
+1. In tcMethods (which typechecks method bindings), use 'setInGeneratedCode'.
 2. When creating Implications during typechecking, record this flag
    (in ic_warn_inaccessible) at the time of creation.
 3. After typechecking comes error reporting, where GHC must decide how to
    report inaccessible code to the user, on an Implication-by-Implication
-   basis. If an Implication's DynFlags indicate that -Winaccessible-code was
-   disabled, then don't bother reporting it. That's it!
+   basis. If the ic_warn_inaccessible field of the Implication is False, then
+   we don't bother reporting it. That's it!
 -}
 
 ------------------------
@@ -2003,12 +2056,11 @@ tcMethodBodyHelp hs_sig_fn sel_id local_meth_id meth_bind
                     -- WantRCC <=> check for redundant constraints in the
                     --          user-specified instance signature
              inner_meth_id  = mkLocalId inner_meth_name ManyTy sig_ty
-             inner_meth_sig = CompleteSig { sig_bndr = inner_meth_id
-                                          , sig_ctxt = ctxt
-                                          , sig_loc  = getLocA hs_sig_ty }
+             inner_meth_sig = CSig { sig_bndr = inner_meth_id
+                                   , sig_ctxt = ctxt
+                                   , sig_loc  = getLocA hs_sig_ty }
 
-
-       ; (tc_bind, [inner_id]) <- tcPolyCheck no_prag_fn inner_meth_sig meth_bind
+       ; (tc_bind, [Scaled _ inner_id]) <- tcPolyCheck no_prag_fn inner_meth_sig meth_bind
 
        ; let export = ABE { abe_poly  = local_meth_id
                           , abe_mono  = inner_id
@@ -2063,7 +2115,7 @@ mkMethIds clas tyvars dfun_ev_vars inst_tys sel_id
     poly_meth_ty  = mkSpecSigmaTy tyvars theta local_meth_ty
     theta         = map idType dfun_ev_vars
 
-methSigCtxt :: Name -> TcType -> TcType -> TidyEnv -> TcM (TidyEnv, SDoc)
+methSigCtxt :: Name -> TcType -> TcType -> TidyEnv -> ZonkM (TidyEnv, SDoc)
 methSigCtxt sel_name sig_ty meth_ty env0
   = do { (env1, sig_ty)  <- zonkTidyTcType env0 sig_ty
        ; (env2, meth_ty) <- zonkTidyTcType env1 meth_ty
@@ -2166,7 +2218,7 @@ mkDefMethBind loc dfun_id clas sel_id dm_name
                                       , tyConBinderForAllTyFlag tcb /= Inferred ]
               rhs  = foldl' mk_vta (nlHsVar dm_name) visible_inst_tys
               bind = L (noAnnSrcSpan loc)
-                    $ mkTopFunBind Generated fn
+                    $ mkTopFunBind (Generated OtherExpansion SkipPmc) fn
                         [mkSimpleMatch (mkPrefixFunRhs fn) [] rhs]
 
         ; liftIO (putDumpFileMaybe logger Opt_D_dump_deriv "Filling in method body"
@@ -2179,7 +2231,7 @@ mkDefMethBind loc dfun_id clas sel_id dm_name
     (_, _, _, inst_tys) = tcSplitDFunTy (idType dfun_id)
 
     mk_vta :: LHsExpr GhcRn -> Type -> LHsExpr GhcRn
-    mk_vta fun ty = noLocA (HsAppType noExtField fun noHsTok
+    mk_vta fun ty = noLocA (HsAppType noExtField fun
         (mkEmptyWildCardBndrs $ nlHsParTy $ noLocA $ XHsType ty))
        -- NB: use visible type application
        -- See Note [Default methods in instances]
@@ -2372,7 +2424,7 @@ Note that
 tcSpecInstPrags :: DFunId -> InstBindings GhcRn
                 -> TcM ([LTcSpecPrag], TcPragEnv)
 tcSpecInstPrags dfun_id (InstBindings { ib_binds = binds, ib_pragmas = uprags })
-  = do { spec_inst_prags <- mapM (wrapLocAM (tcSpecInst dfun_id)) $
+  = do { spec_inst_prags <- mapM (wrapLocM (tcSpecInst dfun_id)) $
                             filter isSpecInstLSig uprags
              -- The filter removes the pragmas for methods
        ; return (spec_inst_prags, mkPragEnv uprags binds) }
@@ -2410,4 +2462,3 @@ instDeclCtxt2 dfun_ty
 inst_decl_ctxt :: SDoc -> SDoc
 inst_decl_ctxt doc = hang (text "In the instance declaration for")
                         2 (quotes doc)
-

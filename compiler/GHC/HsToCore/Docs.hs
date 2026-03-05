@@ -1,12 +1,7 @@
 -- | Extract docs from the renamer output so they can be serialized.
 {-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE RankNTypes #-}
-{-# LANGUAGE TypeApplications #-}
-{-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeFamilies #-}
-{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE ViewPatterns #-}
-{-# LANGUAGE BangPatterns #-}
 
 module GHC.HsToCore.Docs where
 
@@ -44,7 +39,7 @@ import GHC.Unit.Module
 import qualified Data.List.NonEmpty as NonEmpty
 import Data.List.NonEmpty (NonEmpty ((:|)))
 import GHC.Unit.Module.Imported
-import GHC.Driver.Session
+import GHC.Driver.DynFlags
 import GHC.Types.TypeEnv
 import GHC.Types.Id
 import GHC.Types.Unique.Map
@@ -68,16 +63,17 @@ extractDocs dflags
                , tcg_imports = import_avails
                , tcg_insts = insts
                , tcg_fam_insts = fam_insts
-               , tcg_doc_hdr = mb_doc_hdr
+               , tcg_hdr_info = mb_hdr_info
                , tcg_th_docs = th_docs_var
                , tcg_type_env = ty_env
                } = do
     th_docs <- liftIO $ readIORef th_docs_var
-    let doc_hdr = (unLoc <$> mb_doc_hdr)
+    let doc_hdr = unLoc <$> fst mb_hdr_info
         ExtractedTHDocs th_hdr th_decl_docs th_arg_docs th_inst_docs = extractTHDocs th_docs
         mod_docs
          =  Docs
          { docs_mod_hdr = th_hdr <|> doc_hdr
+         , docs_exports = exports_docs
          -- Left biased union (see #21220)
          , docs_decls = plusUniqMap_C (\a _ -> a)
                           ((:[]) <$> th_decl_docs `plusUniqMap` th_inst_docs)
@@ -105,6 +101,7 @@ extractDocs dflags
                              , isDefaultMethodOcc occ
                              ]
 
+    exports_docs = maybe emptyUniqMap mkExportsDocs mb_rn_exports
     (doc_map, arg_map) = mkMaps def_meths_env local_insts decls_with_docs
     decls_with_docs = topDecls rn_decls
     local_insts = filter (nameIsLocalOrFrom semantic_mdl)
@@ -113,6 +110,25 @@ extractDocs dflags
                                    all_exports def_meths_env
     named_chunks = getNamedChunks (isJust mb_rn_exports) rn_decls
 extractDocs _ _ = pure Nothing
+
+mkExportsDocs :: [(LIE GhcRn, Avails)] -> UniqMap Name (HsDoc GhcRn)
+mkExportsDocs = foldMap f
+  where
+    f :: (LIE GhcRn, Avails) -> UniqMap Name (HsDoc GhcRn)
+    f (L _ ie, avails)
+      | Just (L _ doc) <- ieExportDoc ie =
+        listToUniqMap [ (availName nm, doc) | nm <- avails ]
+    f _ = emptyUniqMap
+
+    ieExportDoc :: IE GhcRn -> Maybe (ExportDoc GhcRn)
+    ieExportDoc (IEVar _ _ doc) = doc
+    ieExportDoc (IEThingAbs _ _ doc) = doc
+    ieExportDoc (IEThingAll _ _ doc) = doc
+    ieExportDoc (IEThingWith _ _ _ _ doc) = doc
+    ieExportDoc (IEModuleContents _ _) = Nothing
+    ieExportDoc (IEGroup _ _ _) = Nothing
+    ieExportDoc (IEDoc _ _) = Nothing
+    ieExportDoc (IEDocNamed _ _) = Nothing
 
 -- | If we have an explicit export list, we extract the documentation structure
 -- from that.
@@ -192,7 +208,13 @@ mkDocStructureFromDecls env all_exports decls =
         Just loc -> L loc (DsiExports [avail])
         -- FIXME: This is just a workaround that we use when handling e.g.
         -- associated data families like in the html-test Instances.hs.
-        Nothing -> noLoc (DsiExports [avail])
+        Nothing -> noLoc (DsiExports [])
+
+        -- This causes the associated data family to be incorrectly documented
+        -- separately from its class:
+        -- Nothing -> noLoc (DsiExports [avail])
+
+        -- This panics on the associated data family:
         -- Nothing -> panicDoc "mkDocStructureFromDecls: No loc found for"
         --                     (ppr avail)
 
@@ -249,7 +271,7 @@ mkMaps env instances decls =
              -> ( [(Name, [HsDoc GhcRn])]
                 , [(Name, IntMap (HsDoc GhcRn))]
                 )
-    mappings (L (SrcSpanAnn _ (RealSrcSpan l _)) decl, doc) =
+    mappings (L (EpAnn (EpaSpan (RealSrcSpan l _)) _ _) decl, doc) =
            (dm, am)
       where
         args = declTypeDocs decl
@@ -263,7 +285,7 @@ mkMaps env instances decls =
         ns = names l decl
         dm = [(n, d) | (n, d) <- zip ns (repeat doc) ++ zip subNs subDocs, not $ all (isEmptyDocString . hsDocString) d]
         am = [(n, args) | n <- ns] ++ zip subNs subArgs
-    mappings (L (SrcSpanAnn _ (UnhelpfulSpan _)) _, _) = ([], [])
+    mappings (L (EpAnn _ _ _) _, _) = ([], [])
 
     instanceMap :: Map RealSrcSpan Name
     instanceMap = M.fromList [(l, n) | n <- instances, RealSrcSpan l _ <- [getSrcSpan n] ]
@@ -412,8 +434,8 @@ h98ConArgDocs con_args = case con_args of
 
 gadtConArgDocs :: HsConDeclGADTDetails GhcRn -> HsType GhcRn -> IntMap (HsDoc GhcRn)
 gadtConArgDocs con_args res_ty = case con_args of
-  PrefixConGADT args -> con_arg_docs 0 $ map (unLoc . hsScaledThing) args ++ [res_ty]
-  RecConGADT _ _     -> con_arg_docs 1 [res_ty]
+  PrefixConGADT _ args -> con_arg_docs 0 $ map (unLoc . hsScaledThing) args ++ [res_ty]
+  RecConGADT _ _       -> con_arg_docs 1 [res_ty]
 
 con_arg_docs :: Int -> [HsType GhcRn] -> IntMap (HsDoc GhcRn)
 con_arg_docs n = IM.fromList . catMaybes . zipWith f [n..]

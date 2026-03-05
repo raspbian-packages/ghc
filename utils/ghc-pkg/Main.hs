@@ -23,6 +23,7 @@
 
 module Main (main) where
 
+import Debug.Trace
 import qualified GHC.Unit.Database as GhcPkg
 import GHC.Unit.Database hiding (mkMungePathUrl)
 import GHC.HandleEncoding
@@ -55,7 +56,8 @@ import System.Directory ( getXdgDirectory, createDirectoryIfMissing, getAppUserD
                           getModificationTime, XdgDirectory ( XdgData ) )
 import Text.Printf
 
-import Prelude
+import Prelude hiding (Foldable(..))
+import Data.Foldable (Foldable(..))
 
 import System.Console.GetOpt
 import qualified Control.Exception as Exception
@@ -74,7 +76,7 @@ import System.IO.Error
 import GHC.IO           ( catchException )
 import GHC.IO.Exception (IOErrorType(InappropriateType))
 import Data.List ( group, sort, sortBy, nub, partition, find
-                 , intercalate, intersperse, foldl', unfoldr
+                 , intercalate, intersperse, unfoldr
                  , isInfixOf, isSuffixOf, isPrefixOf, stripPrefix )
 import Control.Concurrent
 import qualified Data.Foldable as F
@@ -1600,7 +1602,7 @@ listPackages verbosity my_flags mPackageName mModuleName = do
 simplePackageList :: [Flag] -> [InstalledPackageInfo] -> IO ()
 simplePackageList my_flags pkgs = do
    let showPkg :: InstalledPackageInfo -> String
-       showPkg | FlagShowUnitIds `elem` my_flags = display . installedUnitId
+       showPkg | FlagShowUnitIds `elem` my_flags = traceId . display . installedUnitId
                | FlagNamesOnly `elem` my_flags   = display . mungedName . mungedId
                | otherwise                       = display . mungedId
        strs = map showPkg pkgs

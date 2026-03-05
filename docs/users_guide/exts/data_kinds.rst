@@ -8,6 +8,8 @@ Datatype promotion
 
     :since: 7.4.1
 
+    :status: Included in :extension:`GHC2024`
+
     Allow promotion of data types to kind level.
 
 This section describes *data type promotion*, an extension to the kind
@@ -91,17 +93,27 @@ There are only a couple of exceptions to this rule:
    type theory just isn’t up to the task of promoting data families, which
    requires full dependent types.
 
--  Data constructors with contexts that contain non-equality constraints cannot
-   be promoted. For example: ::
+-  Data constructors with contexts cannot be promoted. For example::
 
      data Foo :: Type -> Type where
-       MkFoo1 :: a ~ Int         => Foo a    -- promotable
-       MkFoo2 :: a ~~ Int        => Foo a    -- promotable
-       MkFoo3 :: Show a          => Foo a    -- not promotable
+       MkFoo :: Show a => Foo a    -- not promotable
 
-   ``MkFoo1`` and ``MkFoo2`` can be promoted, since their contexts
-   only involve equality-oriented constraints. However, ``MkFoo3``'s context
-   contains a non-equality constraint ``Show a``, and thus cannot be promoted.
+The following kinds and promoted data constructors can be used even when
+:extension:`DataKinds` is not enabled:
+
+- ``Type``
+- ``TYPE`` (see :ref:`runtime-rep`)
+- ``Constraint`` (see :ref:`constraint-kind`)
+- ``CONSTRAINT``
+- ``Multiplicity`` and its promoted data constructors (see :extension:`LinearTypes`)
+- ``LiftedRep`` (see :ref:`runtime-rep`)
+- ``RuntimeRep`` and its promoted data constructors (see :ref:`runtime-rep`)
+- ``Levity`` and its promoted data constructors (see :ref:`runtime-rep`)
+- ``VecCount`` and its promoted data constructors
+- ``VecElem`` and its promoted data constructors
+
+It is also possible to use kinds declared with ``type data`` (see
+:extension:`TypeData`) without enabling :extension:`DataKinds`.
 
 .. _promotion-syntax:
 
@@ -216,27 +228,149 @@ above code is valid.
 
 See also :ghc-ticket:`7347`.
 
-.. _constraints_in_kinds:
+.. _promotion-type-synonyms:
 
-Constraints in kinds
---------------------
+:extension:`DataKinds` and type synonyms
+----------------------------------------
 
-Kinds can (with :extension:`DataKinds`) contain type constraints. However,
-only equality constraints are supported.
+The :extension:`DataKinds` extension interacts with type synonyms in the
+following ways:
 
-Here is an example of a constrained kind: ::
+1. In a *type* context: :extension:`DataKinds` is not required to use a type
+   synonym that expands to a type that would otherwise require the extension.
+   For example: ::
 
-  type family IsTypeLit a where
-    IsTypeLit Nat    = True
-    IsTypeLit Symbol = True
-    IsTypeLit a      = False
+     {-# LANGUAGE DataKinds #-}
+     module A where
 
-  data T :: forall a. (IsTypeLit a ~ True) => a -> Type where
-    MkNat    :: T 42
-    MkSymbol :: T "Don't panic!"
+       type MyTrue = 'True
 
-The declarations above are accepted. However, if we add ``MkOther :: T Int``,
-we get an error that the equality constraint is not satisfied; ``Int`` is
-not a type literal. Note that explicitly quantifying with ``forall a`` is
-necessary in order for ``T`` to typecheck
-(see :ref:`complete-kind-signatures`).
+     {-# LANGUAGE NoDataKinds #-}
+     module B where
+
+       import A
+       import Data.Proxy
+
+       f :: Proxy MyTrue
+       f = Proxy
+
+   GHC will accept the type signature for ``f`` even though
+   :extension:`DataKinds` is not enabled, as the promoted data constructor
+   ``True`` is tucked underneath the ``MyTrue`` type synonym. If the user
+   had written ``Proxy 'True`` directly, however, then :extension:`DataKinds`
+   would be required.
+
+2. In a *kind* context: :extension:`DataKinds` applies to all types mentioned
+   in the kind, *including the expansions of type synonyms*. For instance,
+   given this module: ::
+
+     module C where
+
+       type MyType = Type
+       type MySymbol = Symbol
+
+   We would accept or reject the following definitions in this module, which
+   makes use of :ref:`standalone-kind-signatures`: ::
+
+     {-# LANGUAGE NoDataKinds #-}
+     module D where
+
+       import C
+
+       -- ACCEPTED: The kind only mentions Type, which doesn't require DataKinds
+       type D1 :: Type -> Type
+       data D1 a
+
+       -- REJECTED: The kind mentions Symbol, which requires DataKinds to use in
+       -- a kind position
+       data D2 :: Symbol -> Type
+       data D2 a
+
+       -- ACCEPTED: The kind mentions a type synonym MyType that expands to
+       -- Type, which doesn't require DataKinds
+       data D3 :: MyType -> Type
+       data D3 a
+
+       -- REJECTED: The kind mentions a type synonym MySymbol that expands to
+       -- Symbol, which requires DataKinds to use in a kind position
+       data D4 :: MySymbol -> Type
+       data D4 a
+
+Unique syntax for type-level lists and tuples
+=============================================
+
+.. extension:: ListTuplePuns
+    :shortdesc: Enable punning for list, tuple and sum types.
+
+    :since: 9.10.1
+
+    Accept bracket syntax to denote type constructors, using single quotes to
+    disambiguate data constructors.
+
+The previously defined mechanism for specifying data constructors with bracket
+syntax and single quotes is governed by this extension, which is enabled by
+default.
+
+With ``NoListTuplePuns``, brackets are unambiguously parsed as data
+constructors, while the single quote is not accepted as a prefix for them
+anymore.
+Type constructors cannot be expressed with brackets anymore; instead, new
+data type declarations in regular syntax have been added to ``ghc-prim``: ::
+
+    data List a = [] | a : List a
+    data Unit = ()
+    data Tuple2 a b = (a, b)
+    data Tuple2# a b = (# a, b #)
+    data Sum2# a b = (# a | #) | (# | b #)
+    class (a, b) => CTuple2 a b
+    instance (c1, c2) => CTuple2 c1 c2
+
+`CTuple2` is a constraint tuple, which historically only concerns declarations
+like: ::
+
+    type C = (Eq Int, Ord String)
+
+These are distinct from the usual specification of multiple constraints on
+functions or instances with parentheses, since those are treated specially by
+GHC.
+
+When the extension is disabled, any occurrence of special syntax in types will
+be treated as the data constructor, so a type of ``(Int, String)`` has kind
+``Tuple2 Type Type``, corresponding to the type ``'(Int, String)`` with kind
+``(Type, Type)`` when ``ListTuplePuns`` is enabled.
+
+The explicit disambiguation syntax using single quotes is invalid syntax when
+the extension is disabled.
+
+The earlier example would need to be rewritten like this: ::
+
+    data HList :: List Type -> Type where
+      HNil  :: HList []
+      HCons :: a -> HList t -> HList (a : t)
+
+    data Tuple :: Tuple2 Type Type -> Type where
+      Tuple :: a -> b -> Tuple2 a b
+
+    foo0 :: HList []
+    foo0 = HNil
+
+    foo1 :: HList [Int]
+    foo1 = HCons (3 :: Int) HNil
+
+    foo2 :: HList [Int, Bool]
+    foo2 = ...
+
+Constraint tuples may be mixed with conventional syntax: ::
+
+    f ::
+      Monad m =>
+      CTuple2 (Monad m) (Monad m) =>
+      (Monad m, CTuple2 (Monad m) (Monad m)) =>
+      m Int
+    f = pure 5
+
+The new type constructors are exported only from the library
+``ghc-experimental``, by the modules ``Data.Tuple.Experimental``,
+``Data.Sum.Experimental`` and ``Prelude.Experimental``.
+
+Please refer to `GHC Proposal #475 <https://github.com/ghc-proposals/ghc-proposals/blob/master/proposals/0475-tuple-syntax.rst>`__ for the full specification of effects and interactions.

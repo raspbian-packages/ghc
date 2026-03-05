@@ -306,9 +306,9 @@ all of the documentation targets:
 You can pass several `--docs=...` flags, Hadrian will combine
 their effects.
 
-To build haddock documentation for upload to hackage you need to pass the `--haddock-base-url` flag,
-by default this will choose a url suitable for uploading to hackage but you might also want to pass something like
-`http://127.0.0.1:8080/package/%pkg%/docs` for testing upload locally on a local hackage server.
+To build haddock documentation for upload to hackage you need to pass the `--haddock-for-hackage` flag,
+This will generate URLs which are appropiate for either uploading to a local hackage
+server or the global hackage server.
 
 #### Source distribution
 
@@ -324,6 +324,13 @@ $ ./configure [--prefix=PATH] && make install
 ```
 
 workflow, for now.
+
+Note: On windows you need to use the `reloc-binary-dist` target.
+
+#### Relocatable Binary Distribution
+
+If you require a relocatable binary distribution (for example on Windows), then you
+can build the `reloc-binary-dist` target.
 
 ### Building and installing GHC
 

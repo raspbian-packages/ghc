@@ -35,11 +35,12 @@
 --     'ldiMatch'. See Section 4.1 of the paper.
 module GHC.HsToCore.Pmc (
         -- Checking and printing
-        pmcPatBind, pmcMatches, pmcGRHSs,
-        isMatchContextPmChecked,
+        pmcPatBind, pmcMatches, pmcGRHSs, pmcRecSel,
+        isMatchContextPmChecked, isMatchContextPmChecked_SinglePat,
 
         -- See Note [Long-distance information]
-        addTyCs, addCoreScrutTmCs, addHsScrutTmCs, getLdiNablas
+        addTyCs, addCoreScrutTmCs, addHsScrutTmCs, getLdiNablas,
+        getNFirstUncovered
     ) where
 
 import GHC.Prelude
@@ -50,30 +51,29 @@ import GHC.HsToCore.Pmc.Utils
 import GHC.HsToCore.Pmc.Desugar
 import GHC.HsToCore.Pmc.Check
 import GHC.HsToCore.Pmc.Solver
-import GHC.Types.Basic (Origin(..))
-import GHC.Core (CoreExpr)
-import GHC.Driver.Session
+import GHC.Types.Basic (Origin(..), isDoExpansionGenerated)
+import GHC.Core
+import GHC.Driver.DynFlags
 import GHC.Hs
 import GHC.Types.Id
 import GHC.Types.SrcLoc
 import GHC.Utils.Misc
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
-import GHC.Types.Var (EvVar)
+import GHC.Types.Var (EvVar, Var (..))
+import GHC.Types.Id.Info
 import GHC.Tc.Utils.TcType (evVarPred)
-import GHC.Tc.Utils.Monad (updTopFlags)
 import {-# SOURCE #-} GHC.HsToCore.Expr (dsLExpr)
 import GHC.HsToCore.Monad
 import GHC.Data.Bag
-import GHC.Data.IOEnv (unsafeInterleaveM)
 import GHC.Data.OrdList
-import GHC.Utils.Monad (mapMaybeM)
 
-import Control.Monad (when, forM_)
+import Control.Monad (when, unless, forM_)
 import qualified Data.Semigroup as Semi
 import Data.List.NonEmpty ( NonEmpty(..) )
 import qualified Data.List.NonEmpty as NE
 import Data.Coerce
+import GHC.Tc.Utils.Monad
 
 --
 -- * Exported entry points to the checker
@@ -98,21 +98,37 @@ noCheckDs :: DsM a -> DsM a
 noCheckDs = updTopFlags (\dflags -> foldl' wopt_unset dflags allPmCheckWarnings)
 
 -- | Check a pattern binding (let, where) for exhaustiveness.
-pmcPatBind :: DsMatchContext -> Id -> Pat GhcTc -> DsM ()
--- See Note [pmcPatBind only checks PatBindRhs]
-pmcPatBind ctxt@(DsMatchContext PatBindRhs loc) var p = do
-  !missing <- getLdiNablas
-  pat_bind <- noCheckDs $ desugarPatBind loc var p
-  tracePm "pmcPatBind {" (vcat [ppr ctxt, ppr var, ppr p, ppr pat_bind, ppr missing])
-  result <- unCA (checkPatBind pat_bind) missing
-  tracePm "}: " (ppr (cr_uncov result))
-  formatReportWarnings ReportPatBind ctxt [var] result
-pmcPatBind _ _ _ = pure ()
+pmcPatBind :: DsMatchContext -> Id -> Pat GhcTc -> DsM Nablas
+pmcPatBind ctxt@(DsMatchContext match_ctxt loc) var p
+  = mb_discard_warnings $ do
+      !missing <- getLdiNablas
+      pat_bind <- noCheckDs $ desugarPatBind loc var p
+      tracePm "pmcPatBind {" (vcat [ppr ctxt, ppr var, ppr p, ppr pat_bind, ppr missing])
+      result <- unCA (checkPatBind pat_bind) missing
+      let ldi = ldiGRHS $ ( \ pb -> case pb of PmPatBind grhs -> grhs) $ cr_ret result
+      tracePm "pmcPatBind }: " $
+        vcat [ text "cr_uncov:" <+> ppr (cr_uncov result)
+             , text "ldi:" <+> ppr ldi ]
+      formatReportWarnings ReportPatBind ctxt [var] result
+      return ldi
+  where
+    -- See Note [pmcPatBind doesn't warn on pattern guards]
+    mb_discard_warnings
+      = if want_pmc match_ctxt
+        then id
+        else discardWarningsDs
+    want_pmc PatBindRhs = True
+    want_pmc LazyPatCtx = True
+    want_pmc (StmtCtxt stmt_ctxt) =
+      case stmt_ctxt of
+        PatGuard {} -> False
+        _           -> True
+    want_pmc _ = False
 
 -- | Exhaustive for guard matches, is used for guards in pattern bindings and
 -- in @MultiIf@ expressions. Returns the 'Nablas' covered by the RHSs.
 pmcGRHSs
-  :: HsMatchContext GhcRn         -- ^ Match context, for warning messages
+  :: HsMatchContextRn             -- ^ Match context, for warning messages
   -> GRHSs GhcTc (LHsExpr GhcTc)  -- ^ The GRHSs to check
   -> DsM (NonEmpty Nablas)        -- ^ Covered 'Nablas' for each RHS, for long
                                   --   distance info
@@ -146,20 +162,21 @@ pmcGRHSs hs_ctxt guards@(GRHSs _ grhss _) = do
 -- checks an @-XEmptyCase@ with only a single match variable.
 -- See Note [Checking EmptyCase].
 pmcMatches
-  :: DsMatchContext                  -- ^ Match context, for warnings messages
+  :: Origin
+  -> DsMatchContext                  -- ^ Match context, for warnings messages
   -> [Id]                            -- ^ Match variables, i.e. x and y above
   -> [LMatch GhcTc (LHsExpr GhcTc)]  -- ^ List of matches
   -> DsM [(Nablas, NonEmpty Nablas)] -- ^ One covered 'Nablas' per Match and
                                      --   GRHS, for long distance info.
-pmcMatches ctxt vars matches = {-# SCC "pmcMatches" #-} do
+pmcMatches origin ctxt vars matches = {-# SCC "pmcMatches" #-} do
   -- We have to force @missing@ before printing out the trace message,
   -- otherwise we get interleaved output from the solver. This function
   -- should be strict in @missing@ anyway!
   !missing <- getLdiNablas
   tracePm "pmcMatches {" $
-          hang (vcat [ppr ctxt, ppr vars, text "Matches:"])
+          hang (vcat [ppr origin, ppr ctxt, ppr vars, text "Matches:"])
                2
-               (vcat (map ppr matches) $$ ppr missing)
+               ((ppr matches) $$ (text "missing:" <+> ppr missing))
   case NE.nonEmpty matches of
     Nothing -> do
       -- This must be an -XEmptyCase. See Note [Checking EmptyCase]
@@ -175,25 +192,116 @@ pmcMatches ctxt vars matches = {-# SCC "pmcMatches" #-} do
       result  <- {-# SCC "checkMatchGroup" #-}
                  unCA (checkMatchGroup matches) missing
       tracePm "}: " (ppr (cr_uncov result))
-      {-# SCC "formatReportWarnings" #-} formatReportWarnings ReportMatchGroup ctxt vars result
+      unless (isDoExpansionGenerated origin) -- Do expansion generated code shouldn't emit overlapping warnings
+        ({-# SCC "formatReportWarnings" #-}
+        formatReportWarnings ReportMatchGroup ctxt vars result)
       return (NE.toList (ldiMatchGroup (cr_ret result)))
 
-{- Note [pmcPatBind only checks PatBindRhs]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-@pmcPatBind@'s sole purpose is to check vanilla pattern bindings, like
+{-
+Note [Detecting incomplete record selectors]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A record selector occurrence is incomplete iff. it could fail due to
+being applied to a data type constructor not present for this record field.
+
+e.g.
+  data T = T1 | T2 {x :: Int}
+  d = x someComputation -- `d` may fail
+
+There are 4 parts to detecting and warning about
+incomplete record selectors to consider:
+
+  - Computing which constructors a general application of a record field will succeed on,
+    and which ones it will fail on. This is stored in the `sel_cons` field of
+    `IdDetails` datatype, which is a part of an `Id` and calculated when renaming a
+    record selector in `mkOneRecordSelector`
+
+  - Emitting a warning whenever a `HasField` constraint is solved.
+    This is checked in `matchHasField` and emitted only for when
+    the constraint is resolved with an implicit instance rather than a
+    custom one (since otherwise the warning will be emitted in
+      the custom implementation anyways)
+
+    e.g.
+      g :: HasField "x" t Int => t -> Int
+      g = getField @"x"
+
+      f :: T -> Int
+      f = g -- warning will be emitted here
+
+  - Emitting a warning for a general occurrence of the record selector
+    This is done during the renaming of a `HsRecSel` expression in `dsExpr`
+    and simply pulls the information about incompleteness from the `Id`
+
+    e.g.
+      l :: T -> Int
+      l a = x a -- warning will be emitted here
+
+  - Emitting a warning for a record selector `sel` applied to a variable `y`.
+    In that case we want to use the long-distance information from the
+    pattern match checker to rule out impossible constructors
+    (See Note [Long-distance information]). We first add constraints to
+    the long-distance `Nablas` that `y` cannot be one of the constructors that
+    contain `sel` (function `checkRecSel` in GHC.HsToCore.Pmc.Check). If the
+    `Nablas` are still inhabited, we emit a warning with the inhabiting constructors
+    as examples of where `sel` may fail.
+
+    e.g.
+      z :: T -> Int
+      z T1 = 0
+      z a = x a -- warning will not be emitted here since `a` can only be `T2`
+-}
+
+pmcRecSel :: Id       -- ^ Id of the selector
+          -> CoreExpr -- ^ Core expression of the argument to the selector
+          -> DsM ()
+pmcRecSel sel_id arg
+  | RecSelId{ sel_cons = (cons_w_field, _ : _) } <- idDetails sel_id = do
+      !missing <- getLdiNablas
+
+      tracePm "pmcRecSel {" (ppr sel_id)
+      CheckResult{ cr_ret = PmRecSel{ pr_arg_var = arg_id }, cr_uncov = uncov_nablas }
+        <- unCA (checkRecSel (PmRecSel () arg cons_w_field)) missing
+      tracePm "}: " $ ppr uncov_nablas
+
+      inhabited <- isInhabited uncov_nablas
+      when inhabited $ warn_incomplete arg_id uncov_nablas
+        where
+          sel_name = varName sel_id
+          warn_incomplete arg_id uncov_nablas = do
+            dflags <- getDynFlags
+            let maxConstructors = maxUncoveredPatterns dflags
+            unc_examples <- getNFirstUncovered MinimalCover [arg_id] (maxConstructors + 1) uncov_nablas
+            let cons = [con | unc_example <- unc_examples
+                      , Just (PACA (PmAltConLike con) _ _) <- [lookupSolution unc_example arg_id]]
+                not_full_examples = length cons == (maxConstructors + 1)
+                cons' = take maxConstructors cons
+            diagnosticDs $ DsIncompleteRecordSelector sel_name cons' not_full_examples
+
+pmcRecSel _ _ = return ()
+
+{- Note [pmcPatBind doesn't warn on pattern guards]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+@pmcPatBind@'s main purpose is to check vanilla pattern bindings, like
 @x :: Int; Just x = e@, which is in a @PatBindRhs@ context.
 But its caller is also called for individual pattern guards in a @StmtCtxt@.
 For example, both pattern guards in @f x y | True <- x, False <- y = ...@ will
-go through this function. It makes no sense to do coverage checking there:
+go through this function. It makes no sense to report pattern match warnings
+for these pattern guards:
+
   * Pattern guards may well fail. Fall-through is not an unrecoverable panic,
     but rather behavior the programmer expects, so inexhaustivity should not be
     reported.
+
   * Redundancy is already reported for the whole GRHS via one of the other
-    exported coverage checking functions. Also reporting individual redundant
+    exported coverage checking functions. Also, reporting individual redundant
     guards is... redundant. See #17646.
-Note that we can't just omit checking of @StmtCtxt@ altogether (by adjusting
-'isMatchContextPmChecked'), because that affects the other checking functions,
-too.
+
+However, we should not skip pattern-match checking altogether, as it may reveal
+important long-distance information. One example is described in
+Note [Long-distance information in do notation] in GHC.HsToCore.Expr.
+
+Instead, we simply discard warnings when in pattern-guards, by using the function
+discardWarningsDs.
 -}
 
 --

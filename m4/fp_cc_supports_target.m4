@@ -10,13 +10,17 @@
 # $1 = CC
 # $2 = CC_OPTS variable
 # $3 = CXX_OPTS variable
-# $4 = GCC_LINK_OPTS variable
 AC_DEFUN([FP_CC_SUPPORTS_TARGET],
 [
    AC_REQUIRE([GHC_LLVM_TARGET_SET_VAR])
    AC_MSG_CHECKING([whether $1 supports --target])
+
    echo 'int main() { return 0; }' > conftest.c
-   if $1 --target=$LlvmTarget -Werror conftest.c > /dev/null 2>&1 ; then
+   if test "$target_cpu" = "javascript" ; then
+       # See Note [Don't pass --target to emscripten toolchain] in GHC.Toolchain.Program
+       CONF_CC_SUPPORTS_TARGET=NO
+       AC_MSG_RESULT([no])
+   elif $1 --target=$LlvmTarget -Werror conftest.c > /dev/null 2>&1 ; then
        CONF_CC_SUPPORTS_TARGET=YES
        AC_MSG_RESULT([yes])
    else
@@ -28,7 +32,6 @@ AC_DEFUN([FP_CC_SUPPORTS_TARGET],
    if test $CONF_CC_SUPPORTS_TARGET = YES ; then
        $2="--target=$LlvmTarget $$2"
        $3="--target=$LlvmTarget $$3"
-       $4="--target=$LlvmTarget $$4"
    fi
 ])
 

@@ -10,6 +10,8 @@ import Text.XHtml.Table
 import Text.XHtml.Strict.Elements
 import Text.XHtml.Strict.Attributes
 
+import Data.List (uncons)
+
 --
 -- * Tree Displaying Combinators
 --
@@ -50,8 +52,8 @@ treeHtml colors h = table ! [
                  </> tl
         where
               -- This stops a column of colors being the same
-              -- color as the immeduately outside nesting bar.
-              morecolors = filter ((/= c).head) (manycolors cs)
+              -- color as the immediately outside nesting bar.
+              morecolors = filter (maybe True ((/= c) . fst) . uncons) (manycolors cs)
               bar = td ! [bgcolor' c,width "10"] << spaceHtml
               hd = td ! [bgcolor' c] << hopen
               tl = td ! [bgcolor' c] << hclose

@@ -9,6 +9,7 @@
 #include "Rts.h"
 #include "RtsAPI.h"
 #include "RtsUtils.h"
+#include "RtsFlags.h"
 
 #include "Capability.h"
 #include "Printer.h"
@@ -244,6 +245,16 @@ StgWord collect_pointers(StgClosure *closure, StgClosure *ptrs[]) {
         case CONTINUATION:
             // See the note in AP_STACK about the stack chunk.
             break;
+
+        case BLOCKING_QUEUE:
+        {
+            StgBlockingQueue *bq = (StgBlockingQueue *) closure;
+            ptrs[nptrs++] = (StgClosure *) bq->link;
+            ptrs[nptrs++] = bq->bh;
+            ptrs[nptrs++] = (StgClosure *) bq->owner;
+            ptrs[nptrs++] = (StgClosure *) bq->queue;
+            break;
+        }
 
         default:
             fprintf(stderr,"closurePtrs: Cannot handle type %s yet\n",

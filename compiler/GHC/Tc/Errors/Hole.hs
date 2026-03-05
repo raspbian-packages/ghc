@@ -1,5 +1,6 @@
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE MultiWayIf #-}
 {-# LANGUAGE ExistentialQuantification #-}
 
 module GHC.Tc.Errors.Hole
@@ -23,7 +24,7 @@ module GHC.Tc.Errors.Hole
    , sortHoleFitsBySize
 
 
-   -- Re-exported from GHC.Tc.Errors.Hole.FitTypes
+   -- Re-exported from GHC.Tc.Errors.Hole.Plugin
    , HoleFitPlugin (..), HoleFitPluginR (..)
    )
 where
@@ -39,12 +40,15 @@ import GHC.Tc.Types.Origin
 import GHC.Tc.Utils.TcMType
 import GHC.Tc.Types.Evidence
 import GHC.Tc.Utils.TcType
+import GHC.Tc.Zonk.TcType
 import GHC.Core.Type
+import GHC.Core.TyCon( TyCon, isGenerativeTyCon )
+import GHC.Core.TyCo.Rep( Type(..) )
 import GHC.Core.DataCon
+import GHC.Core.Predicate( Pred(..), classifyPredType, eqRelRole )
 import GHC.Types.Name
-import GHC.Types.Name.Reader ( pprNameProvenance , GlobalRdrElt (..)
-                             , globalRdrEnvElts, greMangledName, grePrintableName )
-import GHC.Builtin.Names ( gHC_ERR )
+import GHC.Types.Name.Reader
+import GHC.Builtin.Names ( gHC_INTERNAL_ERR, gHC_INTERNAL_UNSAFE_COERCE )
 import GHC.Types.Id
 import GHC.Types.Var.Set
 import GHC.Types.Var.Env
@@ -55,7 +59,7 @@ import GHC.Utils.Misc
 import GHC.Utils.Panic
 import GHC.Tc.Utils.Env (tcLookup)
 import GHC.Utils.Outputable
-import GHC.Driver.Session
+import GHC.Driver.DynFlags
 import GHC.Data.Maybe
 import GHC.Utils.FV ( fvVarList, fvVarSet, unionFV, mkFVs, FV )
 
@@ -78,6 +82,7 @@ import GHC.Iface.Load  ( loadInterfaceForName )
 import GHC.Builtin.Utils (knownKeyNames)
 
 import GHC.Tc.Errors.Hole.FitTypes
+import GHC.Tc.Errors.Hole.Plugin
 import qualified Data.Set as Set
 import GHC.Types.SrcLoc
 import GHC.Data.FastString (NonDetFastString(..))
@@ -397,7 +402,7 @@ is discarded.
 
 Note [Speeding up valid hole-fits]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-To fix #16875 we noted that a lot of time was being spent on unecessary work.
+To fix #16875 we noted that a lot of time was being spent on unnecessary work.
 
 When we'd call `tcCheckHoleFit hole hole_ty ty`, we would end up by generating
 a constraint to show that `hole_ty ~ ty`, including any constraints in `ty`. For
@@ -527,7 +532,7 @@ pprHoleFit (HFDC sWrp sWrpVars sTy sProv sMs) (HoleFit {..}) =
        holeDisp = if sMs then holeVs
                   else sep $ replicate (length hfMatches) $ text "_"
        occDisp = case hfCand of
-                   GreHFCand gre   -> pprPrefixOcc (grePrintableName gre)
+                   GreHFCand gre   -> pprPrefixOcc (greName gre)
                    NameHFCand name -> pprPrefixOcc name
                    IdHFCand id_    -> pprPrefixOcc id_
        tyDisp = ppWhen sTy $ dcolon <+> ppr hfType
@@ -551,8 +556,8 @@ pprHoleFit (HFDC sWrp sWrpVars sTy sProv sMs) (HoleFit {..}) =
 
 getLocalBindings :: TidyEnv -> CtLoc -> TcM [Id]
 getLocalBindings tidy_orig ct_loc
- = do { (env1, _) <- zonkTidyOrigin tidy_orig (ctLocOrigin ct_loc)
-      ; go env1 [] (removeBindingShadowing $ tcl_bndrs lcl_env) }
+ = do { (env1, _) <- liftZonkM $ zonkTidyOrigin tidy_orig (ctLocOrigin ct_loc)
+      ; go env1 [] (removeBindingShadowing $ ctl_bndrs lcl_env) }
   where
     lcl_env = ctLocEnv ct_loc
 
@@ -615,7 +620,7 @@ findValidHoleFits tidy_env implics simples h@(Hole { hole_sort = ExprHole _
      ; traceTc "numPlugins are:" $ ppr (length candidatePlugins)
      ; (searchDiscards, subs) <-
         tcFilterHoleFits findVLimit hole (hole_ty, []) cands
-     ; (tidy_env, tidy_subs) <- zonkSubs tidy_env subs
+     ; (tidy_env, tidy_subs) <- liftZonkM $ zonkSubs tidy_env subs
      ; tidy_sorted_subs <- sortFits sortingAlg tidy_subs
      ; plugin_handled_subs <- foldM (flip ($)) tidy_sorted_subs fitPlugins
      ; let (pVDisc, limited_subs) = possiblyDiscard maxVSubs plugin_handled_subs
@@ -638,13 +643,13 @@ findValidHoleFits tidy_env implics simples h@(Hole { hole_sort = ExprHole _
                                                             else maxRSubs
             ; refDs <- mapM (flip (tcFilterHoleFits findRLimit hole)
                               cands) ref_tys
-            ; (tidy_env, tidy_rsubs) <- zonkSubs tidy_env $ concatMap snd refDs
+            ; (tidy_env, tidy_rsubs) <- liftZonkM $ zonkSubs tidy_env $ concatMap snd refDs
             ; tidy_sorted_rsubs <- sortFits sortingAlg tidy_rsubs
             -- For refinement substitutions we want matches
             -- like id (_ :: t), head (_ :: [t]), asTypeOf (_ :: t),
             -- and others in that vein to appear last, since these are
             -- unlikely to be the most relevant fits.
-            ; (tidy_env, tidy_hole_ty) <- zonkTidyTcType tidy_env hole_ty
+            ; (tidy_env, tidy_hole_ty) <- liftZonkM $ zonkTidyTcType tidy_env hole_ty
             ; let hasExactApp = any (tcEqType tidy_hole_ty) . hfWrap
                   (exact, not_exact) = partition hasExactApp tidy_sorted_rsubs
             ; plugin_handled_rsubs <- foldM (flip ($))
@@ -725,17 +730,17 @@ relevantCtEvidence hole_ty simples
 
 -- We zonk the hole fits so that the output aligns with the rest
 -- of the typed hole error message output.
-zonkSubs :: TidyEnv -> [HoleFit] -> TcM (TidyEnv, [HoleFit])
+zonkSubs :: TidyEnv -> [HoleFit] -> ZonkM (TidyEnv, [HoleFit])
 zonkSubs = zonkSubs' []
   where zonkSubs' zs env [] = return (env, reverse zs)
         zonkSubs' zs env (hf:hfs) = do { (env', z) <- zonkSub env hf
                                         ; zonkSubs' (z:zs) env' hfs }
 
-        zonkSub :: TidyEnv -> HoleFit -> TcM (TidyEnv, HoleFit)
+        zonkSub :: TidyEnv -> HoleFit -> ZonkM (TidyEnv, HoleFit)
         zonkSub env hf@RawHoleFit{} = return (env, hf)
         zonkSub env hf@HoleFit{hfType = ty, hfMatches = m, hfWrap = wrp}
             = do { (env, ty') <- zonkTidyTcType env ty
-                ; (env, m') <- zonkTidyTcTypes env m
+                ; (env, m')   <- zonkTidyTcTypes env m
                 ; (env, wrp') <- zonkTidyTcTypes env wrp
                 ; let zFit = hf {hfType = ty', hfMatches = m', hfWrap = wrp'}
                 ; return (env, zFit ) }
@@ -818,8 +823,8 @@ tcFilterHoleFits limit typed_hole ht@(hole_ty, _) candidates =
                               _ -> discard_it }
                _ -> discard_it }
         where
-          -- We want to filter out undefined and the likes from GHC.Err
-          not_trivial id = nameModule_maybe (idName id) /= Just gHC_ERR
+          -- We want to filter out undefined and the likes from GHC.Err (#17940)
+          not_trivial id = nameModule_maybe (idName id) `notElem` [Just gHC_INTERNAL_ERR, Just gHC_INTERNAL_UNSAFE_COERCE]
 
           lookup :: HoleFitCandidate -> TcM (Maybe (Id, Type))
           lookup (IdHFCand id) = return (Just (id, idType id))
@@ -831,10 +836,7 @@ tcFilterHoleFits limit typed_hole ht@(hole_ty, _) candidates =
                                            Just (dataConWrapId con, dataConNonlinearType con)
                                        _ -> Nothing }
             where name = case hfc of
-#if __GLASGOW_HASKELL__ < 901
-                           IdHFCand id -> idName id
-#endif
-                           GreHFCand gre -> greMangledName gre
+                           GreHFCand gre   -> greName gre
                            NameHFCand name -> name
           discard_it = go subs seen maxleft ty elts
           keep_it eid eid_ty wrp ms = go (fit:subs) (extendVarSet seen eid)
@@ -903,7 +905,7 @@ tcFilterHoleFits limit typed_hole ht@(hole_ty, _) candidates =
          -- holes must be for this to be a match.
          ; if fits then do {
               -- Zonking is expensive, so we only do it if required.
-              z_wrp_tys <- zonkTcTypes (unfoldWrapper wrp)
+              z_wrp_tys <- liftZonkM $ zonkTcTypes (unfoldWrapper wrp)
             ; if null ref_vars
               then return (Just (z_wrp_tys, []))
               else do { let -- To be concrete matches, matches have to
@@ -914,7 +916,7 @@ tcFilterHoleFits limit typed_hole ht@(hole_ty, _) candidates =
                                               Just tv -> tv `elemVarSet` fvSet
                                               _ -> True
                             allConcrete = all notAbstract z_wrp_tys
-                      ; z_vars  <- zonkTcTyVars ref_vars
+                      ; z_vars  <- liftZonkM $ zonkTcTyVars ref_vars
                       ; let z_mtvs = mapMaybe getTyVar_maybe z_vars
                       ; allFilled <- not <$> anyM isFlexiTyVar z_mtvs
                       ; allowAbstract <- goptM Opt_AbstractRefHoleFits
@@ -954,7 +956,7 @@ tcSubsumes ty_a ty_b = fst <$> tcCheckHoleFit dummyHole ty_a ty_b
                               , th_implics      = []
                               , th_hole         = Nothing }
 
--- | A tcSubsumes which takes into account relevant constraints, to fix trac
+-- | A tcSubsumes which takes into account relevant constraints, to fix
 -- #14273. This makes sure that when checking whether a type fits the hole,
 -- the type has to be subsumed by type of the hole as well as fulfill all
 -- constraints on the type of the hole.
@@ -982,28 +984,33 @@ tcCheckHoleFit (TypedHole {..}) hole_ty ty = discardErrs $
                          tcSubTypeSigma orig (ExprSigCtxt NoRRC) ty hole_ty
      ; traceTc "Checking hole fit {" empty
      ; traceTc "wanteds are: " $ ppr wanted
-     ; if isEmptyWC wanted && isEmptyBag th_relevant_cts
-       then do { traceTc "}" empty
-               ; return (True, wrap) }
-       else do { fresh_binds <- newTcEvBinds
-                -- The relevant constraints may contain HoleDests, so we must
-                -- take care to clone them as well (to avoid #15370).
-               ; cloned_relevants <- mapBagM cloneWantedCtEv th_relevant_cts
-                 -- We wrap the WC in the nested implications, for details, see
-                 -- Note [Checking hole fits]
-               ; let wrapInImpls cts = foldl (flip (setWCAndBinds fresh_binds)) cts th_implics
-                     final_wc  = wrapInImpls $ addSimples wanted $
-                                                          mapBag mkNonCanonical cloned_relevants
-                 -- We add the cloned relevants to the wanteds generated
-                 -- by the call to tcSubType_NC, for details, see
-                 -- Note [Relevant constraints]. There's no need to clone
-                 -- the wanteds, because they are freshly generated by the
-                 -- call to`tcSubtype_NC`.
-               ; traceTc "final_wc is: " $ ppr final_wc
-                 -- See Note [Speeding up valid hole-fits]
-               ; (rem, _) <- tryTc $ runTcSEarlyAbort $ simplifyTopWanteds final_wc
-               ; traceTc "}" empty
-               ; return (any isSolvedWC rem, wrap) } }
+     ; if | isEmptyWC wanted, isEmptyBag th_relevant_cts
+          -> do { traceTc "}" empty
+                ; return (True, wrap) }
+
+          | checkInsoluble wanted -- See Note [Fast path for tcCheckHoleFit]
+          -> return (False, wrap)
+
+          | otherwise
+          -> do { fresh_binds <- newTcEvBinds
+                 -- The relevant constraints may contain HoleDests, so we must
+                 -- take care to clone them as well (to avoid #15370).
+                ; cloned_relevants <- mapBagM cloneWantedCtEv th_relevant_cts
+                  -- We wrap the WC in the nested implications, for details, see
+                  -- Note [Checking hole fits]
+                ; let wrapInImpls cts = foldl (flip (setWCAndBinds fresh_binds)) cts th_implics
+                      final_wc  = wrapInImpls $ addSimples wanted $
+                                  mapBag mkNonCanonical cloned_relevants
+                  -- We add the cloned relevants to the wanteds generated
+                  -- by the call to tcSubType_NC, for details, see
+                  -- Note [Relevant constraints]. There's no need to clone
+                  -- the wanteds, because they are freshly generated by the
+                  -- call to`tcSubtype_NC`.
+                ; traceTc "final_wc is: " $ ppr final_wc
+                  -- See Note [Speeding up valid hole-fits]
+                ; (rem, _) <- tryTc $ runTcSEarlyAbort $ simplifyTopWanteds final_wc
+                ; traceTc "}" empty
+                ; return (any isSolvedWC rem, wrap) } }
   where
     orig = ExprHoleOrigin (hole_occ <$> th_hole)
 
@@ -1013,3 +1020,52 @@ tcCheckHoleFit (TypedHole {..}) hole_ty ty = discardErrs $
                   -> WantedConstraints  -- The new constraints.
     setWCAndBinds binds imp wc
       = mkImplicWC $ unitBag $ imp { ic_wanted = wc , ic_binds = binds }
+
+{- Note [Fast path for tcCheckHoleFit]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In `tcCheckHoleFit` we compare (with `tcSubTypeSigma`) the type of the hole
+with the type of zillions of in-scope functions, to see which would "fit".
+Most of these checks fail!  They generate obviously-insoluble constraints.
+For these very-common cases we don't want to crank up the full constraint
+solver.  It's much more efficient to do a quick-and-dirty check for insolubility.
+
+Now, `tcSubTypeSigma` uses the on-the-fly unifier in GHC.Tc.Utils.Unify,
+it has already done the dirt-simple unification. So our quick-and-dirty
+check can simply look for constraints like (Int ~ Bool).  We don't need
+to worry about (Maybe Int ~ Maybe Bool).
+
+The quick-and-dirty check is in `checkInsoluble`. It can make a big
+difference: For test hard_hole_fits, compile-time allocation goes down by 37%!
+-}
+
+
+checkInsoluble :: WantedConstraints -> Bool
+-- See Note [Fast path for tcCheckHoleFit]
+checkInsoluble (WC { wc_simple = simples })
+  = any is_insol simples
+  where
+    is_insol ct = case classifyPredType (ctPred ct) of
+                    EqPred r t1 t2 -> definitelyNotEqual (eqRelRole r) t1 t2
+                    _              -> False
+
+definitelyNotEqual :: Role -> TcType -> TcType -> Bool
+-- See Note [Fast path for tcCheckHoleFit]
+-- Specifically, does not need to recurse under type constructors
+definitelyNotEqual r t1 t2
+  = go t1 t2
+  where
+    go t1 t2
+      | Just t1' <- coreView t1 = go t1' t2
+      | Just t2' <- coreView t2 = go t1 t2'
+
+    go (TyConApp tc _) t2 | isGenerativeTyCon tc r = go_tc tc t2
+    go t1 (TyConApp tc _) | isGenerativeTyCon tc r = go_tc tc t1
+    go (FunTy {ft_af = af1}) (FunTy {ft_af = af2}) = af1 /= af2
+    go _ _ = False
+
+    go_tc :: TyCon -> TcType -> Bool
+    -- The TyCon is generative, and is not a saturated FunTy
+    go_tc tc1 (TyConApp tc2 _) | isGenerativeTyCon tc2 r = tc1 /= tc2
+    go_tc _ (FunTy {})    = True
+    go_tc _ (ForAllTy {}) = True
+    go_tc _ _ = False

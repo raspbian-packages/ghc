@@ -60,7 +60,10 @@ module Data.ByteString.Internal (
         -- * Utilities
         nullForeignPtr,
         deferForeignPtrAvailability,
+        SizeOverflowException,
+        overflowError,
         checkedAdd,
+        checkedMultiply,
 
         -- * Standard C Functions
         c_strlen,

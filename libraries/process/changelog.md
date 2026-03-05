@@ -1,5 +1,55 @@
 # Changelog for [`process` package](http://hackage.haskell.org/package/process)
 
+## 1.6.26.1 *May 2025*
+
+* Regenerate `configure` script (#343)
+
+## 1.6.26.0 *April 2025*
+
+* Add `System.Process.Environment.OsString`.
+* Bumps `base >= 4.12.0.0` (GHC 8.6+), `filepath >= 1.4.100.0`,
+  `unix >= 2.8.0.0`, and `Win32 >= 2.14.1.0`.
+* Drops support for GHC < 8.6.
+
+## 1.6.25.0 *September 2024*
+
+* Fix build with Javascript backend ([#327](https://github.com/haskell/process/issues/327))
+
+## 1.6.24.0 *September 2024*
+
+* Fix detection of `posix_spawn_file_actions_addchdir[_np]` ([#303](https://github.com/haskell/process/issues/303))
+
+## 1.6.23.0 *September 2024*
+
+* Fix command-line escaping logic on Windows when the command file ends with
+  a space or a dot. This is a follow-up for
+  [HSEC-2024-0003](https://github.com/haskell/security-advisories/tree/main/advisories/hackage/process/HSEC-2024-0003.md).
+* Migitate another manifestation of the BatBadBut vulnerability via
+  unescaped `%` expansions. This is another follow-up for 
+  [HSEC-2024-0003](https://github.com/haskell/security-advisories/tree/main/advisories/hackage/process/HSEC-2024-0003.md).
+  ([#313](https://github.com/haskell/process/issues/313))
+
+## 1.6.22.0 *August 2024*
+
+* Allow NUL to appear in arguments under POSIX. See
+  https://github.com/haskell/process/pull/320.  Thanks to @mmhat.
+
+## 1.6.21.0 *July 2024*
+
+* No longer attach finalizers to `Handle`s created by the
+  `System.Process.CommunicationHandle` API. Instead, all file descriptors are
+  manually closed by the API.
+
+  This fixes a bug in which a file descriptor could be closed multiple times.
+
+## 1.6.20.0 *April 2024*
+
+* Introduce `System.Process.CommunicationHandle`, allowing for platform-independent
+  inter-process communication using `Handle`s.
+* Expose `withForkWait` and `ignoreSigPipe` from `System.Process.Internals`.
+* Define new internal functions `rawFdToHandle` and (Windows only) `rawHANDLEToHandle`,
+  exported from `System.Process.Common`.
+
 ## 1.6.19.0 *April 2024*
 
 * Adjust command-line escaping logic on Windows to ensure that occurrences of
@@ -7,6 +57,9 @@
   properly escaped in arguments passed to `.bat` and `.cmd` processes.
   This addresses
   [HSEC-2024-0003](https://github.com/haskell/security-advisories/tree/main/advisories/hackage/process/HSEC-2024-0003.md).
+* Fix double-closing of stdin/stdout/stderr fds with POSIX `fork/exec` backend.
+  [#306](https://github.com/haskell/process/issues/306)
+* Add support for `posix_spawn_file_actions_addchdir_np`
 
 ## 1.6.18.0 *September 2023*
 

@@ -129,8 +129,8 @@ import Data.List(stripPrefix, isSuffixOf, uncons, dropWhileEnd)
 #define STRING String
 #define FILEPATH FilePath
 #else
-import Prelude (fromIntegral)
-import Control.Exception ( SomeException, evaluate, try, displayException )
+import Prelude (fromIntegral, return, IO, Either(..))
+import Control.Exception ( catch, displayException, evaluate, fromException, toException, throwIO, Exception, SomeAsyncException(..), SomeException )
 import Control.DeepSeq (force)
 import GHC.IO (unsafePerformIO)
 import qualified Data.Char as C
@@ -139,8 +139,8 @@ import GHC.IO.Encoding.Failure ( CodingFailureMode(..) )
 import GHC.IO.Encoding.UTF16 ( mkUTF16le )
 import qualified GHC.Foreign as GHC
 import Data.Word ( Word16 )
-import System.OsPath.Data.ByteString.Short.Word16.Hidden
-import System.OsPath.Data.ByteString.Short.Hidden ( packCStringLen )
+import System.OsString.Data.ByteString.Short.Word16
+import System.OsString.Data.ByteString.Short ( packCStringLen )
 #define CHAR Word16
 #define STRING ShortByteString
 #define FILEPATH ShortByteString
@@ -149,7 +149,7 @@ import GHC.IO.Encoding.Failure ( CodingFailureMode(..) )
 import qualified GHC.Foreign as GHC
 import GHC.IO.Encoding.UTF8 ( mkUTF8 )
 import Data.Word ( Word8 )
-import System.OsPath.Data.ByteString.Short.Hidden
+import System.OsString.Data.ByteString.Short
 #define CHAR Word8
 #define STRING ShortByteString
 #define FILEPATH ShortByteString
@@ -426,7 +426,6 @@ stripExtension ext path = case uncons ext of
 -- > splitExtensions "file.tar.gz" == ("file",".tar.gz")
 -- > uncurry (<>) (splitExtensions x) == x
 -- > Valid x => uncurry addExtension (splitExtensions x) == x
--- > splitExtensions "file.tar.gz" == ("file",".tar.gz")
 splitExtensions :: FILEPATH -> (FILEPATH, STRING)
 splitExtensions x = (a <> c, d)
     where
@@ -696,6 +695,7 @@ replaceFileName x y = a </> y where (a,_) = splitFileName_ x
 --
 -- > dropFileName "/directory/file.ext" == "/directory/"
 -- > dropFileName x == fst (splitFileName x)
+-- > isPrefixOf (takeDrive x) (dropFileName x)
 dropFileName :: FILEPATH -> FILEPATH
 dropFileName = fst . splitFileName
 
@@ -1270,15 +1270,31 @@ snoc :: String -> Char -> String
 snoc str = \c -> str <> [c]
 
 #else
+-- | Like 'try', but rethrows async exceptions.
+trySafe :: Exception e => IO a -> IO (Either e a)
+trySafe ioA = catch action eHandler
+ where
+  action = do
+    v <- ioA
+    return (Right v)
+  eHandler e
+    | isAsyncException e = throwIO e
+    | otherwise = return (Left e)
+
+isAsyncException :: Exception e => e -> Bool
+isAsyncException e =
+    case fromException (toException e) of
+        Just (SomeAsyncException _) -> True
+        Nothing -> False
 #ifdef WINDOWS
 fromString :: P.String -> STRING
 fromString str = P.either (P.error . P.show) P.id $ unsafePerformIO $ do
-  r <- try @SomeException $ GHC.withCStringLen (mkUTF16le ErrorOnCodingFailure) str $ \cstr -> packCStringLen cstr
+  r <- trySafe @SomeException $ GHC.withCStringLen (mkUTF16le ErrorOnCodingFailure) str $ \cstr -> packCStringLen cstr
   evaluate $ force $ first displayException r
 #else
 fromString :: P.String -> STRING
 fromString str = P.either (P.error . P.show) P.id $ unsafePerformIO $ do
-  r <- try @SomeException $ GHC.withCStringLen (mkUTF8 ErrorOnCodingFailure) str $ \cstr -> packCStringLen cstr
+  r <- trySafe @SomeException $ GHC.withCStringLen (mkUTF8 ErrorOnCodingFailure) str $ \cstr -> packCStringLen cstr
   evaluate $ force $ first displayException r
 #endif
 

@@ -45,7 +45,6 @@ import GHC.Runtime.Heap.Layout
 import GHC.Data.FastString
 import GHC.Utils.Misc
 import GHC.Utils.Panic
-import GHC.Utils.Panic.Plain
 import Data.Maybe
 
 import Control.Monad (liftM, when, unless)
@@ -141,7 +140,7 @@ shouldInlinePrimOp cfg op args = case emitPrimOp cfg op args of
 --
 -- In more complex cases, there is a foreign call (out of line) fallback. This
 -- might happen e.g. if there's enough static information, such as statically
--- know arguments.
+-- known arguments.
 emitPrimOp
   :: StgToCmmConfig
   -> PrimOp            -- ^ The primop
@@ -255,7 +254,7 @@ emitPrimOp cfg primop =
     emitCCall
         [(res,NoHint)]
         (CmmLit (CmmLabel (mkForeignLabel (fsLit "newSpark") Nothing ForeignLabelInExternalPackage IsFunction)))
-        [(baseExpr, AddrHint), (arg,AddrHint)]
+        [(baseExpr platform, AddrHint), (arg,AddrHint)]
 
   SparkOp -> \[arg] -> opIntoRegs $ \[res] -> do
     -- returns the value of arg in res.  We're going to therefore
@@ -266,7 +265,7 @@ emitPrimOp cfg primop =
     emitCCall
         [(tmp2,NoHint)]
         (CmmLit (CmmLabel (mkForeignLabel (fsLit "newSpark") Nothing ForeignLabelInExternalPackage IsFunction)))
-        [(baseExpr, AddrHint), ((CmmReg (CmmLocal tmp)), AddrHint)]
+        [(baseExpr platform, AddrHint), ((CmmReg (CmmLocal tmp)), AddrHint)]
     emitAssign (CmmLocal res) (CmmReg (CmmLocal tmp))
 
   GetCCSOfOp -> \[arg] -> opIntoRegs $ \[res] -> do
@@ -277,10 +276,10 @@ emitPrimOp cfg primop =
     emitAssign (CmmLocal res) val
 
   GetCurrentCCSOp -> \[_] -> opIntoRegs $ \[res] ->
-    emitAssign (CmmLocal res) cccsExpr
+    emitAssign (CmmLocal res) (cccsExpr platform)
 
   MyThreadIdOp -> \[] -> opIntoRegs $ \[res] ->
-    emitAssign (CmmLocal res) currentTSOExpr
+    emitAssign (CmmLocal res) (currentTSOExpr platform)
 
   ReadMutVarOp -> \[mutv] -> opIntoRegs $ \[res] ->
     emitPrimCall [res] (MO_AtomicRead (wordWidth platform) MemOrderAcquire)
@@ -297,16 +296,12 @@ emitPrimOp cfg primop =
     -- MutVar's value.
     emitPrimCall [] (MO_AtomicWrite (wordWidth platform) MemOrderRelease)
         [ cmmOffsetW platform mutv (fixedHdrSizeW profile), var ]
+    emitDirtyMutVar mutv (CmmReg old_val)
 
-    platform <- getPlatform
-    mkdirtyMutVarCCall <- getCode $! emitCCall
-      [{-no results-}]
-      (CmmLit (CmmLabel mkDirty_MUT_VAR_Label))
-      [(baseExpr, AddrHint), (mutv, AddrHint), (CmmReg old_val, AddrHint)]
-    emit =<< mkCmmIfThen
-      (cmmEqWord platform (mkLblExpr mkMUT_VAR_CLEAN_infoLabel)
-       (closureInfoPtr platform (stgToCmmAlignCheck cfg) mutv))
-      mkdirtyMutVarCCall
+  AtomicSwapMutVarOp -> \[mutv, val] -> opIntoRegs $ \[res] -> do
+    let dst = cmmOffsetW platform mutv (fixedHdrSizeW profile)
+    emitPrimCall [res] (MO_Xchg (wordWidth platform)) [dst, val]
+    emitDirtyMutVar mutv (CmmReg (CmmLocal res))
 
 --  #define sizzeofByteArrayzh(r,a) \
 --     r = ((StgArrBytes *)(a))->bytes
@@ -373,6 +368,10 @@ emitPrimOp cfg primop =
 
 --  #define unsafeFreezzeByteArrayzh(r,a)       r=(a)
   UnsafeFreezeByteArrayOp -> \[arg] -> opIntoRegs $ \[res] ->
+    emitAssign (CmmLocal res) arg
+
+--  #define unsafeThawByteArrayzh(r,a)       r=(a)
+  UnsafeThawByteArrayOp -> \[arg] -> opIntoRegs $ \[res] ->
     emitAssign (CmmLocal res) arg
 
 -- Reading/writing pointer arrays
@@ -471,6 +470,98 @@ emitPrimOp cfg primop =
     doIndexOffAddrOp   Nothing b32 res args
   ReadOffAddrOp_Word64 -> \args -> opIntoRegs $ \res ->
     doIndexOffAddrOp   Nothing b64 res args
+
+-- IndexWord8OffAddrAsXXX
+
+  IndexOffAddrOp_Word8AsChar -> \args -> opIntoRegs $ \res ->
+    doIndexOffAddrOpAs   (Just (mo_u_8ToWord platform)) b8 b8 res args
+  IndexOffAddrOp_Word8AsWideChar -> \args -> opIntoRegs $ \res ->
+    doIndexOffAddrOpAs   (Just (mo_u_32ToWord platform)) b32 b8 res args
+  IndexOffAddrOp_Word8AsInt -> \args -> opIntoRegs $ \res ->
+    doIndexOffAddrOpAs   Nothing (bWord platform) b8 res args
+  IndexOffAddrOp_Word8AsWord -> \args -> opIntoRegs $ \res ->
+    doIndexOffAddrOpAs   Nothing (bWord platform) b8 res args
+  IndexOffAddrOp_Word8AsAddr -> \args -> opIntoRegs $ \res ->
+    doIndexOffAddrOpAs   Nothing (bWord platform) b8 res args
+  IndexOffAddrOp_Word8AsFloat -> \args -> opIntoRegs $ \res ->
+    doIndexOffAddrOpAs   Nothing f32 b8 res args
+  IndexOffAddrOp_Word8AsDouble -> \args -> opIntoRegs $ \res ->
+    doIndexOffAddrOpAs   Nothing f64 b8 res args
+  IndexOffAddrOp_Word8AsStablePtr -> \args -> opIntoRegs $ \res ->
+    doIndexOffAddrOpAs   Nothing (bWord platform) b8 res args
+  IndexOffAddrOp_Word8AsInt16 -> \args -> opIntoRegs $ \res ->
+    doIndexOffAddrOpAs   Nothing b16 b8 res args
+  IndexOffAddrOp_Word8AsInt32 -> \args -> opIntoRegs $ \res ->
+    doIndexOffAddrOpAs   Nothing b32 b8 res args
+  IndexOffAddrOp_Word8AsInt64 -> \args -> opIntoRegs $ \res ->
+    doIndexOffAddrOpAs   Nothing b64 b8 res args
+  IndexOffAddrOp_Word8AsWord16 -> \args -> opIntoRegs $ \res ->
+    doIndexOffAddrOpAs   Nothing b16 b8 res args
+  IndexOffAddrOp_Word8AsWord32 -> \args -> opIntoRegs $ \res ->
+    doIndexOffAddrOpAs   Nothing b32 b8 res args
+  IndexOffAddrOp_Word8AsWord64 -> \args -> opIntoRegs $ \res ->
+    doIndexOffAddrOpAs   Nothing b64 b8 res args
+
+-- ReadWord8OffAddrAsXXX, identical to IndexWord8OffAddrAsXXX
+
+  ReadOffAddrOp_Word8AsChar -> \args -> opIntoRegs $ \res ->
+    doIndexOffAddrOpAs   (Just (mo_u_8ToWord platform)) b8 b8 res args
+  ReadOffAddrOp_Word8AsWideChar -> \args -> opIntoRegs $ \res ->
+    doIndexOffAddrOpAs   (Just (mo_u_32ToWord platform)) b32 b8 res args
+  ReadOffAddrOp_Word8AsInt -> \args -> opIntoRegs $ \res ->
+    doIndexOffAddrOpAs   Nothing (bWord platform) b8 res args
+  ReadOffAddrOp_Word8AsWord -> \args -> opIntoRegs $ \res ->
+    doIndexOffAddrOpAs   Nothing (bWord platform) b8 res args
+  ReadOffAddrOp_Word8AsAddr -> \args -> opIntoRegs $ \res ->
+    doIndexOffAddrOpAs   Nothing (bWord platform) b8 res args
+  ReadOffAddrOp_Word8AsFloat -> \args -> opIntoRegs $ \res ->
+    doIndexOffAddrOpAs   Nothing f32 b8 res args
+  ReadOffAddrOp_Word8AsDouble -> \args -> opIntoRegs $ \res ->
+    doIndexOffAddrOpAs   Nothing f64 b8 res args
+  ReadOffAddrOp_Word8AsStablePtr -> \args -> opIntoRegs $ \res ->
+    doIndexOffAddrOpAs   Nothing (bWord platform) b8 res args
+  ReadOffAddrOp_Word8AsInt16 -> \args -> opIntoRegs $ \res ->
+    doIndexOffAddrOpAs   Nothing b16 b8 res args
+  ReadOffAddrOp_Word8AsInt32 -> \args -> opIntoRegs $ \res ->
+    doIndexOffAddrOpAs   Nothing b32 b8 res args
+  ReadOffAddrOp_Word8AsInt64 -> \args -> opIntoRegs $ \res ->
+    doIndexOffAddrOpAs   Nothing b64 b8 res args
+  ReadOffAddrOp_Word8AsWord16 -> \args -> opIntoRegs $ \res ->
+    doIndexOffAddrOpAs   Nothing b16 b8 res args
+  ReadOffAddrOp_Word8AsWord32 -> \args -> opIntoRegs $ \res ->
+    doIndexOffAddrOpAs   Nothing b32 b8 res args
+  ReadOffAddrOp_Word8AsWord64 -> \args -> opIntoRegs $ \res ->
+    doIndexOffAddrOpAs   Nothing b64 b8 res args
+
+-- WriteWord8ArrayAsXXX
+  WriteOffAddrOp_Word8AsChar -> \args -> opIntoRegs $ \res ->
+    doWriteOffAddrOp (Just (mo_WordTo8 platform))  b8 res args
+  WriteOffAddrOp_Word8AsWideChar -> \args -> opIntoRegs $ \res ->
+    doWriteOffAddrOp (Just (mo_WordTo32 platform)) b8 res args
+  WriteOffAddrOp_Word8AsInt -> \args -> opIntoRegs $ \res ->
+    doWriteOffAddrOp Nothing b8 res args
+  WriteOffAddrOp_Word8AsWord -> \args -> opIntoRegs $ \res ->
+    doWriteOffAddrOp Nothing b8 res args
+  WriteOffAddrOp_Word8AsAddr -> \args -> opIntoRegs $ \res ->
+    doWriteOffAddrOp Nothing b8 res args
+  WriteOffAddrOp_Word8AsFloat -> \args -> opIntoRegs $ \res ->
+    doWriteOffAddrOp Nothing b8 res args
+  WriteOffAddrOp_Word8AsDouble -> \args -> opIntoRegs $ \res ->
+    doWriteOffAddrOp Nothing b8 res args
+  WriteOffAddrOp_Word8AsStablePtr -> \args -> opIntoRegs $ \res ->
+    doWriteOffAddrOp Nothing b8 res args
+  WriteOffAddrOp_Word8AsInt16 -> \args -> opIntoRegs $ \res ->
+    doWriteOffAddrOp Nothing b8 res args
+  WriteOffAddrOp_Word8AsInt32 -> \args -> opIntoRegs $ \res ->
+    doWriteOffAddrOp Nothing b8 res args
+  WriteOffAddrOp_Word8AsInt64 -> \args -> opIntoRegs $ \res ->
+    doWriteOffAddrOp Nothing b8 res args
+  WriteOffAddrOp_Word8AsWord16 -> \args -> opIntoRegs $ \res ->
+    doWriteOffAddrOp Nothing b8 res args
+  WriteOffAddrOp_Word8AsWord32 -> \args -> opIntoRegs $ \res ->
+    doWriteOffAddrOp Nothing b8 res args
+  WriteOffAddrOp_Word8AsWord64 -> \args -> opIntoRegs $ \res ->
+    doWriteOffAddrOp Nothing b8 res args
 
 -- IndexXXXArray
 
@@ -710,14 +801,22 @@ emitPrimOp cfg primop =
     doCopyByteArrayOp src src_off dst dst_off n
   CopyMutableByteArrayOp -> \[src,src_off,dst,dst_off,n] -> opIntoRegs $ \[] ->
     doCopyMutableByteArrayOp src src_off dst dst_off n
+  CopyMutableByteArrayNonOverlappingOp -> \[src,src_off,dst,dst_off,n] -> opIntoRegs $ \[] ->
+    doCopyMutableByteArrayNonOverlappingOp src src_off dst dst_off n
   CopyByteArrayToAddrOp -> \[src,src_off,dst,n] -> opIntoRegs $ \[] ->
     doCopyByteArrayToAddrOp src src_off dst n
   CopyMutableByteArrayToAddrOp -> \[src,src_off,dst,n] -> opIntoRegs $ \[] ->
     doCopyMutableByteArrayToAddrOp src src_off dst n
   CopyAddrToByteArrayOp -> \[src,dst,dst_off,n] -> opIntoRegs $ \[] ->
     doCopyAddrToByteArrayOp src dst dst_off n
+  CopyAddrToAddrOp -> \[src,dst,n] -> opIntoRegs $ \[] ->
+    doCopyAddrToAddrOp src dst n
+  CopyAddrToAddrNonOverlappingOp -> \[src,dst,n] -> opIntoRegs $ \[] ->
+    doCopyAddrToAddrNonOverlappingOp src dst n
   SetByteArrayOp -> \[ba,off,len,c] -> opIntoRegs $ \[] ->
     doSetByteArrayOp ba off len c
+  SetAddrRangeOp -> \[dst,len,c] -> opIntoRegs $ \[] ->
+    doSetAddrRangeOp dst len c
 
 -- Comparing byte arrays
   CompareByteArraysOp -> \[ba1,ba1_off,ba2,ba2_off,n] -> opIntoRegs $ \[res] ->
@@ -1391,6 +1490,11 @@ emitPrimOp cfg primop =
   DoubleDivOp    -> \args -> opTranslate args (MO_F_Quot W64)
   DoubleNegOp    -> \args -> opTranslate args (MO_F_Neg W64)
 
+  DoubleFMAdd    -> fmaOp FMAdd  W64
+  DoubleFMSub    -> fmaOp FMSub  W64
+  DoubleFNMAdd   -> fmaOp FNMAdd W64
+  DoubleFNMSub   -> fmaOp FNMSub W64
+
 -- Float ops
 
   FloatEqOp     -> \args -> opTranslate args (MO_F_Eq W32)
@@ -1405,6 +1509,11 @@ emitPrimOp cfg primop =
   FloatMulOp    -> \args -> opTranslate args (MO_F_Mul  W32)
   FloatDivOp    -> \args -> opTranslate args (MO_F_Quot W32)
   FloatNegOp    -> \args -> opTranslate args (MO_F_Neg  W32)
+
+  FloatFMAdd    -> fmaOp FMAdd  W32
+  FloatFMSub    -> fmaOp FMSub  W32
+  FloatFNMAdd   -> fmaOp FNMAdd W32
+  FloatFNMSub   -> fmaOp FNMSub W32
 
 -- Vector ops
 
@@ -1514,7 +1623,7 @@ emitPrimOp cfg primop =
     else Right genericIntSubCOp
 
   WordMul2Op -> \args -> opCallishHandledLater args $
-    if allowExtAdd
+    if allowWord2Mul
     then Left (MO_U_Mul2     (wordWidth platform))
     else Right genericWordMul2Op
 
@@ -1623,7 +1732,8 @@ emitPrimOp cfg primop =
   SeqOp -> alwaysExternal
   GetSparkOp -> alwaysExternal
   NumSparks -> alwaysExternal
-  DataToTagOp -> alwaysExternal
+  DataToTagSmallOp -> alwaysExternal
+  DataToTagLargeOp -> alwaysExternal
   MkApUpd0_Op -> alwaysExternal
   NewBCOOp -> alwaysExternal
   UnpackClosureOp -> alwaysExternal
@@ -1637,6 +1747,10 @@ emitPrimOp cfg primop =
   TraceMarkerOp -> alwaysExternal
   SetThreadAllocationCounter -> alwaysExternal
   KeepAliveOp -> alwaysExternal
+  CastWord32ToFloatOp -> alwaysExternal
+  CastWord64ToDoubleOp -> alwaysExternal
+  CastDoubleToWord64Op -> alwaysExternal
+  CastFloatToWord32Op -> alwaysExternal
 
  where
   profile  = stgToCmmProfile  cfg
@@ -1665,6 +1779,13 @@ emitPrimOp cfg primop =
     let stmt = mkAssign (CmmLocal res) (CmmMachOp mop args)
     emit stmt
 
+  isQuottishOp :: CallishMachOp -> Bool
+  isQuottishOp MO_I64_Quot = True
+  isQuottishOp MO_I64_Rem = True
+  isQuottishOp MO_W64_Quot = True
+  isQuottishOp MO_W64_Rem = True
+  isQuottishOp _ = False
+
   opTranslate64
     :: [CmmExpr]
     -> (Width -> MachOp)
@@ -1673,7 +1794,8 @@ emitPrimOp cfg primop =
   opTranslate64 args mkMop callish =
     case platformWordSize platform of
       -- LLVM and C `can handle larger than native size arithmetic natively.
-      _ | stgToCmmAllowBigArith cfg -> opTranslate args $ mkMop W64
+      _ | not (isQuottishOp callish), stgToCmmAllowBigArith cfg -> opTranslate args $ mkMop W64
+        | isQuottishOp callish, stgToCmmAllowBigQuot cfg -> opTranslate args $ mkMop W64
       PW4 -> opCallish args callish
       PW8 -> opTranslate args $ mkMop W64
 
@@ -1694,16 +1816,14 @@ emitPrimOp cfg primop =
     -> PrimopCmmEmit
   opIntoRegs f = PrimopCmmEmit_Internal $ \res_ty -> do
     regs <- case result_info of
-      ReturnsPrim VoidRep -> pure []
+      ReturnsVoid -> pure []
       ReturnsPrim rep
         -> do reg <- newTemp (primRepCmmType platform rep)
               pure [reg]
 
-      ReturnsAlg tycon | isUnboxedTupleTyCon tycon
+      ReturnsTuple
         -> do (regs, _hints) <- newUnboxedTupleRegs res_ty
               pure regs
-
-      _ -> panic "cgOpApp"
     f regs
     pure $ map (CmmReg . CmmLocal) regs
 
@@ -1730,6 +1850,28 @@ emitPrimOp cfg primop =
   allowQuotRem2 = stgToCmmAllowQuotRem2             cfg
   allowExtAdd   = stgToCmmAllowExtendedAddSubInstrs cfg
   allowInt2Mul  = stgToCmmAllowIntMul2Instr         cfg
+  allowWord2Mul = stgToCmmAllowWordMul2Instr        cfg
+
+  allowFMA = stgToCmmAllowFMAInstr cfg
+
+  fmaOp :: FMASign -> Width -> [CmmActual] -> PrimopCmmEmit
+  fmaOp signs w args@[arg_x, arg_y, arg_z]
+    | allowFMA signs
+    = opTranslate args (MO_FMA signs w)
+    | otherwise
+    = case signs of
+
+        -- For fused multiply-add x * y + z, we fall back to the C implementation.
+        FMAdd -> opIntoRegs $ \ [res] -> fmaCCall w res arg_x arg_y arg_z
+
+        -- Other fused multiply-add operations are implemented in terms of fmadd
+        -- This is sound: it does not lose any precision.
+        FMSub  -> fmaOp FMAdd w [arg_x, arg_y, neg arg_z]
+        FNMAdd -> fmaOp FMAdd w [neg arg_x, arg_y, arg_z]
+        FNMSub -> fmaOp FMAdd w [neg arg_x, arg_y, neg arg_z]
+    where
+      neg x = CmmMachOp (MO_F_Neg w) [x]
+  fmaOp _ _ _ = panic "fmaOp: wrong number of arguments (expected 3)"
 
 data PrimopCmmEmit
   -- | Out of line fake primop that's actually just a foreign call to other
@@ -2019,6 +2161,19 @@ genericIntMul2Op [res_c, res_h, res_l] both_args@[arg_x, arg_y]
              ]
 genericIntMul2Op _ _ = panic "genericIntMul2Op"
 
+fmaCCall :: Width -> CmmFormal -> CmmActual -> CmmActual -> CmmActual -> FCode ()
+fmaCCall width res arg_x arg_y arg_z =
+  emitCCall
+    [(res,NoHint)]
+    (CmmLit (CmmLabel fma_lbl))
+    [(arg_x,NoHint), (arg_y,NoHint), (arg_z,NoHint)]
+  where
+    fma_lbl = mkForeignLabel fma_op Nothing ForeignLabelInExternalPackage IsFunction
+    fma_op = case width of
+      W32 -> fsLit "fmaf"
+      W64 -> fsLit "fma"
+      _   -> panic ("fmaCall: " ++ show width)
+
 ------------------------------------------------------------------------------
 -- Helpers for translating various minor variants of array indexing.
 
@@ -2251,7 +2406,7 @@ vecCmmCat FloatVec = cmmFloat
 -- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 -- Check to make sure that we can generate code for the specified vector type
 -- given the current set of dynamic flags.
--- Currently these checks are specific to x86 and x86_64 architecture.
+-- Currently these checks are specific to x86, x86_64 and AArch64 architectures.
 -- This should be fixed!
 -- In particular,
 -- 1) Add better support for other architectures! (this may require a redesign)
@@ -2282,27 +2437,40 @@ vecCmmCat FloatVec = cmmFloat
 checkVecCompatibility :: StgToCmmConfig -> PrimOpVecCat -> Length -> Width -> FCode ()
 checkVecCompatibility cfg vcat l w =
   case stgToCmmVecInstrsErr cfg of
-    Nothing  -> check vecWidth vcat l w  -- We are in a compatible backend
-    Just err -> sorry err                -- incompatible backend, do panic
+    Nothing | isX86 -> checkX86 vecWidth vcat l w
+            | platformArch platform == ArchAArch64 -> checkAArch64 vecWidth
+            | otherwise -> sorry "SIMD vector instructions are not supported on this architecture."
+    Just err -> sorry err  -- incompatible backend, do panic
   where
     platform = stgToCmmPlatform cfg
-    check :: Width -> PrimOpVecCat -> Length -> Width -> FCode ()
-    check W128 FloatVec 4 W32 | not (isSseEnabled platform) =
+    isX86 = case platformArch platform of
+      ArchX86_64 -> True
+      ArchX86 -> True
+      _ -> False
+    checkX86 :: Width -> PrimOpVecCat -> Length -> Width -> FCode ()
+    checkX86 W128 FloatVec 4 W32 | isSseEnabled platform = return ()
+                                 | otherwise =
         sorry $ "128-bit wide single-precision floating point " ++
                 "SIMD vector instructions require at least -msse."
-    check W128 _ _ _ | not (isSse2Enabled platform) =
+    checkX86 W128 _ _ _ | not (isSse2Enabled platform) =
         sorry $ "128-bit wide integer and double precision " ++
                 "SIMD vector instructions require at least -msse2."
-    check W256 FloatVec _ _ | not (stgToCmmAvx cfg) =
+    checkX86 W256 FloatVec _ _ | stgToCmmAvx cfg = return ()
+                               | otherwise =
         sorry $ "256-bit wide floating point " ++
                 "SIMD vector instructions require at least -mavx."
-    check W256 _ _ _ | not (stgToCmmAvx2 cfg) =
+    checkX86 W256 _ _ _ | not (stgToCmmAvx2 cfg) =
         sorry $ "256-bit wide integer " ++
                 "SIMD vector instructions require at least -mavx2."
-    check W512 _ _ _ | not (stgToCmmAvx512f cfg) =
+    checkX86 W512 _ _ _ | not (stgToCmmAvx512f cfg) =
         sorry $ "512-bit wide " ++
                 "SIMD vector instructions require -mavx512f."
-    check _ _ _ _ = return ()
+    checkX86 _ _ _ _ = return ()
+
+    checkAArch64 :: Width -> FCode ()
+    checkAArch64 W256 = sorry $ "256-bit wide SIMD vector instructions are not supported."
+    checkAArch64 W512 = sorry $ "512-bit wide SIMD vector instructions are not supported."
+    checkAArch64 _ = return ()
 
     vecWidth = typeWidth (vecVmmType vcat l w)
 
@@ -2465,7 +2633,7 @@ doNewByteArrayOp res_r n = do
 
     let hdr_size = fixedHdrSize profile
 
-    base <- allocHeapClosure rep info_ptr cccsExpr
+    base <- allocHeapClosure rep info_ptr (cccsExpr platform)
                      [ (mkIntExpr platform n,
                         hdr_size + pc_OFFSET_StgArrBytes_bytes (platformConstants platform))
                      ]
@@ -2567,6 +2735,19 @@ doCopyMutableByteArrayOp = emitCopyByteArray copy
             (getCode $ emitMemcpyCall  dst_p src_p bytes align)
         emit =<< mkCmmIfThenElse (cmmEqWord platform src dst) moveCall cpyCall
 
+-- | Takes a source 'MutableByteArray#', an offset in the source
+-- array, a destination 'MutableByteArray#', an offset into the
+-- destination array, and the number of bytes to copy.  Copies the
+-- given number of bytes from the source array to the destination
+-- array.  Assumes the two ranges are disjoint
+doCopyMutableByteArrayNonOverlappingOp :: CmmExpr -> CmmExpr -> CmmExpr -> CmmExpr -> CmmExpr
+                         -> FCode ()
+doCopyMutableByteArrayNonOverlappingOp = emitCopyByteArray copy
+  where
+    copy _src _dst dst_p src_p bytes align = do
+        emitCheckedMemcpyCall dst_p src_p bytes align
+
+
 emitCopyByteArray :: (CmmExpr -> CmmExpr -> CmmExpr -> CmmExpr -> CmmExpr
                       -> Alignment -> FCode ())
                   -> CmmExpr -> CmmExpr -> CmmExpr -> CmmExpr -> CmmExpr
@@ -2620,6 +2801,22 @@ doCopyAddrToByteArrayOp src_p dst dst_off bytes = do
     dst_p <- assignTempE $ cmmOffsetExpr platform (cmmOffsetB platform dst (arrWordsHdrSize profile)) dst_off
     emitCheckedMemcpyCall dst_p src_p bytes (mkAlignment 1)
 
+-- | Takes a source 'Addr#', a destination 'Addr#', and the number of
+-- bytes to copy.  Copies the given number of bytes from the source
+-- memory region to the destination array.
+doCopyAddrToAddrOp :: CmmExpr -> CmmExpr -> CmmExpr -> FCode ()
+doCopyAddrToAddrOp src_p dst_p bytes = do
+    -- Use memmove; the ranges may overlap
+    emitMemmoveCall dst_p src_p bytes (mkAlignment 1)
+
+-- | Takes a source 'Addr#', a destination 'Addr#', and the number of
+-- bytes to copy.  Copies the given number of bytes from the source
+-- memory region to the destination region.  The regions may not overlap.
+doCopyAddrToAddrNonOverlappingOp :: CmmExpr -> CmmExpr -> CmmExpr -> FCode ()
+doCopyAddrToAddrNonOverlappingOp src_p dst_p bytes = do
+    -- Use memcpy; the ranges may not overlap
+    emitCheckedMemcpyCall dst_p src_p bytes (mkAlignment 1)
+
 ifNonZero :: CmmExpr -> FCode () -> FCode ()
 ifNonZero e it = do
     platform <- getPlatform
@@ -2635,7 +2832,7 @@ ifNonZero e it = do
 
 -- | Takes a 'MutableByteArray#', an offset into the array, a length,
 -- and a byte, and sets each of the selected bytes in the array to the
--- character.
+-- given byte.
 doSetByteArrayOp :: CmmExpr -> CmmExpr -> CmmExpr -> CmmExpr
                  -> FCode ()
 doSetByteArrayOp ba off len c = do
@@ -2651,6 +2848,14 @@ doSetByteArrayOp ba off len c = do
 
     p <- assignTempE $ cmmOffsetExpr platform (cmmOffsetB platform ba (arrWordsHdrSize profile)) off
     emitMemsetCall p c len align
+
+-- | Takes an 'Addr#', a length, and a byte, and sets each of the
+-- selected bytes in memory to the given byte.
+doSetAddrRangeOp :: CmmExpr -> CmmExpr -> CmmExpr
+                 -> FCode ()
+doSetAddrRangeOp dst len c = do
+    emitMemsetCall dst c len (mkAlignment 1)
+
 
 -- ----------------------------------------------------------------------------
 -- Allocating arrays
@@ -2673,7 +2878,7 @@ doNewArrayOp res_r rep info payload n init = do
         (mkIntExpr platform (nonHdrSize platform rep))
         (zeroExpr platform)
 
-    base <- allocHeapClosure rep info_ptr cccsExpr payload
+    base <- allocHeapClosure rep info_ptr (cccsExpr platform) payload
 
     arr <- CmmLocal `fmap` newTemp (bWord platform)
     emit $ mkAssign arr base
@@ -2868,7 +3073,7 @@ emitCloneArray info_p res_r src src_off n = do
     let hdr_size = fixedHdrSize profile
         constants = platformConstants platform
 
-    base <- allocHeapClosure rep info_ptr cccsExpr
+    base <- allocHeapClosure rep info_ptr (cccsExpr platform)
                      [ (mkIntExpr platform n,
                         hdr_size + pc_OFFSET_StgMutArrPtrs_ptrs constants)
                      , (mkIntExpr platform (nonHdrSizeW rep),
@@ -2908,7 +3113,7 @@ emitCloneSmallArray info_p res_r src src_off n = do
 
     let hdr_size = fixedHdrSize profile
 
-    base <- allocHeapClosure rep info_ptr cccsExpr
+    base <- allocHeapClosure rep info_ptr (cccsExpr platform)
                      [ (mkIntExpr platform n,
                         hdr_size + pc_OFFSET_StgSmallMutArrPtrs_ptrs (platformConstants platform))
                      ]
@@ -3301,6 +3506,21 @@ doByteArrayBoundsCheck idx arr idx_ty elem_ty = whenCheckBounds $ do
     if elem_w == idx_w
       then emitBoundsCheck idx effective_arr_sz  -- aligned => simpler check
       else assert (idx_w == W8) (emitRangeBoundsCheck idx elem_sz arr_sz)
+
+-- | Write barrier for @MUT_VAR@ modification.
+emitDirtyMutVar :: CmmExpr -> CmmExpr -> FCode ()
+emitDirtyMutVar mutvar old_val = do
+    cfg <- getStgToCmmConfig
+    platform <- getPlatform
+    mkdirtyMutVarCCall <- getCode $! emitCCall
+      [{-no results-}]
+      (CmmLit (CmmLabel mkDirty_MUT_VAR_Label))
+      [(baseExpr platform, AddrHint), (mutvar, AddrHint), (old_val, AddrHint)]
+
+    emit =<< mkCmmIfThen
+      (cmmEqWord platform (mkLblExpr mkMUT_VAR_CLEAN_infoLabel)
+       (closureInfoPtr platform (stgToCmmAlignCheck cfg) mutvar))
+      mkdirtyMutVarCCall
 
 ---------------------------------------------------------------------------
 -- Pushing to the update remembered set

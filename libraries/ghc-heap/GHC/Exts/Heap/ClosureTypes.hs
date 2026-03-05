@@ -7,6 +7,9 @@ module GHC.Exts.Heap.ClosureTypes
     ) where
 
 import Prelude -- See note [Why do we import Prelude here?]
+#if __GLASGOW_HASKELL__ >= 909
+import GHC.Internal.ClosureTypes
+#else
 import GHC.Generics
 
 {- ---------------------------------------------
@@ -83,6 +86,7 @@ data ClosureType
     | CONTINUATION
     | N_CLOSURE_TYPES
  deriving (Enum, Eq, Ord, Show, Generic)
+#endif
 
 -- | Return the size of the closures header in words
 closureTypeHeaderSize :: ClosureType -> Int

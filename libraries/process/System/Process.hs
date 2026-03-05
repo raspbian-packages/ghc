@@ -57,6 +57,9 @@ module System.Process (
     getPid,
     getCurrentPid,
 
+    -- ** Secure process creation on Windows
+    -- $windows-mitigations
+
     -- ** Control-C handling on Unix
     -- $ctlc-handling
 
@@ -89,11 +92,11 @@ import System.Process.Internals
 
 import Control.Concurrent
 import Control.DeepSeq (rnf)
-import Control.Exception (SomeException, mask
+import Control.Exception (
 #if !defined(javascript_HOST_ARCH)
-                         , allowInterrupt
+                           allowInterrupt,
 #endif
-                         , bracket, try, throwIO)
+                           bracket)
 import qualified Control.Exception as C
 import Control.Monad
 import Data.Maybe
@@ -105,14 +108,14 @@ import System.IO.Error (mkIOError, ioeSetErrorString)
 
 #if defined(javascript_HOST_ARCH)
 import System.Process.JavaScript(getProcessId, getCurrentProcessId)
-#elif defined(WINDOWS)
+#elif defined(mingw32_HOST_OS)
 import System.Win32.Process (getProcessId, getCurrentProcessId, ProcessId)
 #else
 import System.Posix.Process (getProcessID)
 import System.Posix.Types (CPid (..))
 #endif
 
-import GHC.IO.Exception ( ioException, IOErrorType(..), IOException(..) )
+import GHC.IO.Exception ( ioException, IOErrorType(..) )
 
 #if defined(wasm32_HOST_ARCH)
 import GHC.IO.Exception ( unsupportedOperation )
@@ -126,7 +129,7 @@ import System.IO.Error
 -- @since 1.6.3.0
 #if defined(javascript_HOST_ARCH)
 type Pid = Int
-#elif defined(WINDOWS)
+#elif defined(mingw32_HOST_OS)
 type Pid = ProcessId
 #else
 type Pid = CPid
@@ -380,6 +383,39 @@ processFailedException fun cmd args exit_code =
 
 
 -- ----------------------------------------------------------------------------
+-- Secure process creation on Windows
+
+-- $windows-migitations
+--
+-- In general it is strongly advised that any untrusted user input be validated before
+-- being passed to a subprocess. One must be especially careful on Windows due to the
+-- crude nature of the platform's argument passing scheme. Specifically, unlike POSIX
+-- platforms, Windows treats the command-line not as a sequence of arguments but rather
+-- as a single string. It is therefore the responsibility of the called process to tokenize
+-- this string into distinct arguments.
+--
+-- While various programs on Windows tend to differ in their precise argument splitting
+-- behavior, the scheme used by @process@'s 'RawCommand' 'CmdSpec' should work for
+-- most reasonable programs. If you find that 'RawCommand' doesn't provide
+-- the behavior you need, it is recommended to instead compose your command-line
+-- manually and rather using the 'shell' 'CmdSpec'.
+--
+-- Additionally, the idiosyncratic escaping and string interpolation behavior of
+-- the Windows @cmd.exe@ command interpreter is known to introduce considerable
+-- complication to secure process creation. For this reason, @process@ implements
+-- specific argument escaping logic when the executable's file extension suggests
+-- that it is a batch file (e.g. @.bat@ or @.cmd@). However, this is not a
+-- completely reliable mitigation as Windows will also silently execute batch files
+-- when starting executables lacking a file extension (e.g. @callProcess "hello" []@
+-- when a @hello.bat@ is present in @PATH@). For this reason, users are encouraged to
+-- specify the file extension of invoked executables where possible, especially
+-- when untrusted input is involved.
+--
+-- Users passed untrusted input to subprocesses on Windows are encouraged to review
+-- <https://flatt.tech/research/posts/batbadbut-you-cant-securely-execute-commands-on-windows/>
+-- for guidance on how to safely navigate these waters.
+
+-- ----------------------------------------------------------------------------
 -- Control-C handling on Unix
 
 -- $ctlc-handling
@@ -617,28 +653,6 @@ readCreateProcessWithExitCode cp input = do
           (_,Nothing,_) -> error "readCreateProcessWithExitCode: Failed to get a stdout handle."
           (_,_,Nothing) -> error "readCreateProcessWithExitCode: Failed to get a stderr handle."
 
--- | Fork a thread while doing something else, but kill it if there's an
--- exception.
---
--- This is important in the cases above because we want to kill the thread
--- that is holding the Handle lock, because when we clean up the process we
--- try to close that handle, which could otherwise deadlock.
---
-withForkWait :: IO () -> (IO () ->  IO a) -> IO a
-withForkWait async body = do
-  waitVar <- newEmptyMVar :: IO (MVar (Either SomeException ()))
-  mask $ \restore -> do
-    tid <- forkIO $ try (restore async) >>= putMVar waitVar
-    let wait = takeMVar waitVar >>= either throwIO return
-    restore (body wait) `C.onException` killThread tid
-
-ignoreSigPipe :: IO () -> IO ()
-ignoreSigPipe = C.handle $ \e -> case e of
-                                   IOError { ioe_type  = ResourceVanished
-                                           , ioe_errno = Just ioe }
-                                     | Errno ioe == ePIPE -> return ()
-                                   _ -> throwIO e
-
 -- ----------------------------------------------------------------------------
 -- showCommandForUser
 
@@ -668,7 +682,7 @@ getPid (ProcessHandle mh _ _) = do
     OpenHandle h -> do
       pid <- getProcessId h
       return $ Just pid
-#elif defined(WINDOWS)
+#elif defined(mingw32_HOST_OS)
     OpenHandle h -> do
       pid <- getProcessId h
       return $ Just pid
@@ -691,7 +705,7 @@ getCurrentPid :: IO Pid
 getCurrentPid =
 #if defined(javascript_HOST_ARCH)
     getCurrentProcessId
-#elif defined(WINDOWS)
+#elif defined(mingw32_HOST_OS)
     getCurrentProcessId
 #else
     getProcessID
@@ -743,7 +757,7 @@ waitForProcess ph@(ProcessHandle _ delegating_ctlc _) = lockWaitpid $ do
         when (was_open && delegating_ctlc) $
           endDelegateControlC e
         return e'
-#if defined(WINDOWS)
+#if defined(mingw32_HOST_OS)
     OpenExtHandle h job -> do
         -- First wait for completion of the job...
         waitForJobCompletion job
@@ -872,7 +886,7 @@ terminateProcess ph = do
   withProcessHandle ph $ \p_ ->
     case p_ of
       ClosedHandle  _ -> return ()
-#if defined(WINDOWS)
+#if defined(mingw32_HOST_OS)
       OpenExtHandle{} -> terminateJobUnsafe p_ 1 >> return ()
 #else
       OpenExtHandle{} -> error "terminateProcess with OpenExtHandle should not happen on POSIX."

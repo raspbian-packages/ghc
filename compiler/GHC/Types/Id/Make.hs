@@ -12,9 +12,8 @@ have a standard form, namely:
 - primitive operations
 -}
 
-
-
 {-# OPTIONS_GHC -Wno-incomplete-uni-patterns #-}
+{-# LANGUAGE DataKinds #-}
 
 module GHC.Types.Id.Make (
         mkDictFunId, mkDictSelId, mkDictSelRhs,
@@ -38,6 +37,9 @@ module GHC.Types.Id.Make (
         noinlineId, noinlineIdName,
         noinlineConstraintId, noinlineConstraintIdName,
         coerceName, leftSectionName, rightSectionName,
+        pcRepPolyId,
+
+        mkRepPolyIdConcreteTyVars,
     ) where
 
 import GHC.Prelude
@@ -65,8 +67,10 @@ import GHC.Core.DataCon
 
 import GHC.Types.Literal
 import GHC.Types.SourceText
+import GHC.Types.RepType ( countFunRepArgs, typePrimRep )
 import GHC.Types.Name.Set
 import GHC.Types.Name
+import GHC.Types.Name.Env
 import GHC.Types.ForeignCall
 import GHC.Types.Id
 import GHC.Types.Id.Info
@@ -74,18 +78,22 @@ import GHC.Types.Demand
 import GHC.Types.Cpr
 import GHC.Types.Unique.Supply
 import GHC.Types.Basic       hiding ( SuccessFlag(..) )
-import GHC.Types.Var (VarBndr(Bndr), visArgConstraintLike)
+import GHC.Types.Var (VarBndr(Bndr), visArgConstraintLike, tyVarName)
 
+import GHC.Tc.Types.Origin
 import GHC.Tc.Utils.TcType as TcType
 
 import GHC.Utils.Misc
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
-import GHC.Utils.Panic.Plain
 
 import GHC.Data.FastString
 import GHC.Data.List.SetOps
 import Data.List        ( zipWith4 )
+
+-- A bit of a shame we must import these here
+import GHC.StgToCmm.Types (LambdaFormInfo(..))
+import GHC.Runtime.Heap.Layout (ArgDescr(ArgUnknown))
 
 {-
 ************************************************************************
@@ -374,7 +382,7 @@ argument is not representation-polymorphic (which it can't be, according to
 Note [Representation polymorphism invariants] in GHC.Core), and it's saturated,
 no representation-polymorphic code ends up in the code generator.
 The saturation condition is effectively checked in
-GHC.Tc.Gen.App.hasFixedRuntimeRep_remainingValArgs.
+GHC.Tc.Gen.Head.rejectRepPolyNewtypes.
 
 However, if we make a *wrapper* for a newtype, we get into trouble.
 In that case, we generate a forbidden representation-polymorphic
@@ -465,7 +473,7 @@ mkDictSelId :: Name          -- Name of one of the *value* selectors
                              -- (dictionary superclass or method)
             -> Class -> Id
 mkDictSelId name clas
-  = mkGlobalId (ClassOpId clas) name sel_ty info
+  = mkGlobalId (ClassOpId clas terminating) name sel_ty info
   where
     tycon          = classTyCon clas
     sel_names      = map idName (classAllSelIds clas)
@@ -476,10 +484,15 @@ mkDictSelId name clas
     arg_tys        = dataConRepArgTys data_con  -- Includes the dictionary superclasses
     val_index      = assoc "MkId.mkDictSelId" (sel_names `zip` [0..]) name
 
-    sel_ty = mkInvisForAllTys tyvars $
-             mkFunctionType ManyTy (mkClassPred clas (mkTyVarTys (binderVars tyvars))) $
-             scaledThing (getNth arg_tys val_index)
-               -- See Note [Type classes and linear types]
+    pred_ty = mkClassPred clas (mkTyVarTys (binderVars tyvars))
+    res_ty  = scaledThing (getNth arg_tys val_index)
+    sel_ty  = mkInvisForAllTys tyvars $
+              mkFunctionType ManyTy pred_ty res_ty
+             -- See Note [Type classes and linear types]
+
+    terminating = isTerminatingType res_ty || definitelyUnliftedType res_ty
+                  -- If the field is unlifted, it can't be bottom
+                  -- Ditto if it's a terminating type
 
     base_info = noCafIdInfo
                 `setArityInfo`  1
@@ -590,10 +603,17 @@ mkDataConWorkId wkr_name data_con
                    `setInlinePragInfo`     wkr_inline_prag
                    `setUnfoldingInfo`      evaldUnfolding  -- Record that it's evaluated,
                                                            -- even if arity = 0
+                   `setLFInfo`             wkr_lf_info
           -- No strictness: see Note [Data-con worker strictness] in GHC.Core.DataCon
 
     wkr_inline_prag = defaultInlinePragma { inl_rule = ConLike }
     wkr_arity = dataConRepArity data_con
+
+    -- See Note [LFInfo of DataCon workers and wrappers]
+    wkr_lf_info
+      | wkr_arity == 0 = LFCon data_con
+      | otherwise      = LFReEntrant TopLevel (countFunRepArgs wkr_arity wkr_ty) True ArgUnknown
+                                            -- LFInfo stores post-unarisation arity
 
     ----------- Workers for newtypes --------------
     univ_tvs = dataConUnivTyVars data_con
@@ -603,6 +623,8 @@ mkDataConWorkId wkr_name data_con
                   `setArityInfo` 1      -- Arity 1
                   `setInlinePragInfo`     dataConWrapperInlinePragma
                   `setUnfoldingInfo`      newtype_unf
+                               -- See W1 in Note [LFInfo of DataCon workers and wrappers]
+                  `setLFInfo` (panic "mkDataConWorkId: we shouldn't look at LFInfo for newtype worker ids")
     id_arg1      = mkScaledTemplateLocal 1 (head arg_tys)
     res_ty_args  = mkTyCoVarTys univ_tvs
     newtype_unf  = assertPpr (null ex_tcvs && isSingleton arg_tys)
@@ -613,6 +635,89 @@ mkDataConWorkId wkr_name data_con
                    wrapNewTypeBody tycon res_ty_args (Var id_arg1)
 
 {-
+Note [LFInfo of DataCon workers and wrappers]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+As noted in Note [The LFInfo of Imported Ids] in GHC.StgToCmm.Closure, it's
+crucial that saturated data con applications are given an LFInfo of `LFCon`.
+
+Since for data constructors we never serialise the worker and the wrapper (only
+the data type declaration), we never serialise their lambda form info either.
+
+Therefore, when making data constructors workers and wrappers, we construct a
+correct `LFInfo` for them right away, and put it it in the `lfInfo` field of the
+worker/wrapper Id, ensuring that:
+
+  The `lfInfo` field of a DataCon worker or wrapper is always populated with the correct LFInfo.
+
+How do we construct a /correct/ LFInfo for workers and wrappers?
+(Remember: `LFCon` means "a saturated constructor application")
+
+(1) Data constructor workers and wrappers with arity > 0 are unambiguously
+functions and should be given `LFReEntrant`, regardless of the runtime
+relevance of the arguments.
+  - For example, `Just :: a -> Maybe a` is given `LFReEntrant`,
+             and `HNil :: (a ~# '[]) -> HList a` is given `LFReEntrant` too.
+
+(2) A datacon /worker/ with zero arity is trivially fully saturated -- it takes
+no arguments whatsoever (not even zero-width args), so it is given `LFCon`.
+
+(3) Perhaps surprisingly, a datacon /wrapper/ can be an `LFCon`. See Wrinkle (W1) below.
+A datacon /wrapper/ with zero arity must be a fully saturated application of
+the worker to zero-width arguments only (which are dropped after unarisation),
+and therefore is also given `LFCon`.
+
+For example, consider the following data constructors:
+
+  data T1 a where
+    TCon1 :: {-# UNPACK #-} !(a :~: True) -> T1 a
+
+  data T2 a where
+    TCon2 :: {-# UNPACK #-} !() -> T2 a
+
+  data T3 a where
+    TCon3 :: T3 '[]
+
+`TCon1`'s wrapper has a lifted argument, which is non-zero-width, while the
+worker has an unlifted equality argument, which is zero-width.
+
+`TCon2`'s wrapper has a lifted argument, which is non-zero-width, while the
+worker has no arguments.
+
+Wrinkle (W1). Perhaps surprisingly, it is possible for the /wrapper/ to be an
+`LFCon` even though the /worker/ is not. Consider `T3` above. Here is the
+Core representation of the worker and wrapper:
+
+  $WTCon3 :: T3 '[]             -- Wrapper
+  $WTCon3 = TCon3 @[] <Refl>    -- A saturated constructor application: LFCon
+
+  TCon3 :: forall (a :: * -> *). (a ~# []) => T a   -- Worker
+  TCon3 = /\a. \(co :: a~#[]). TCon3 co             -- A function: LFReEntrant
+
+For `TCon1`, both the wrapper and worker will be given `LFReEntrant` since they
+both have arity == 1.
+
+For `TCon2`, the wrapper will be given `LFReEntrant` since it has arity == 1
+while the worker is `LFCon` since its arity == 0
+
+For `TCon3`, the wrapper will be given `LFCon` since its arity == 0 and the
+worker `LFReEntrant` since its arity == 1
+
+One might think we could give *workers* with only zero-width-args the `LFCon`
+LambdaFormInfo, e.g. give `LFCon` to the worker of `TCon1` and `TCon3`.
+However, these workers are unambiguously functions
+-- which makes `LFReEntrant`, the LambdaFormInfo we give them, correct.
+See also the discussion in #23158.
+
+Wrinkles:
+
+(W1) Why do we panic when generating `LFInfo` for newtype workers and wrappers?
+
+  We don't generate code for newtype workers/wrappers, so we should never have to
+  look at their LFInfo (and in general we can't; they may be representation-polymorphic).
+
+See also the Note [Imported unlifted nullary datacon wrappers must have correct LFInfo]
+in GHC.StgToCmm.Types.
+
 -------------------------------------------------
 --         Data constructor representation
 --
@@ -704,10 +809,19 @@ mkDataConRep dc_bang_opts fam_envs wrap_name data_con
                              -- We need to get the CAF info right here because GHC.Iface.Tidy
                              -- does not tidy the IdInfo of implicit bindings (like the wrapper)
                              -- so it not make sure that the CAF info is sane
+                         `setLFInfo`            wrap_lf_info
 
              -- The signature is purely for passes like the Simplifier, not for
              -- DmdAnal itself; see Note [DmdAnal for DataCon wrappers].
              wrap_sig = mkClosedDmdSig wrap_arg_dmds topDiv
+
+             -- See Note [LFInfo of DataCon workers and wrappers]
+             wrap_lf_info
+               | wrap_arity == 0  = LFCon data_con
+               -- See W1 in Note [LFInfo of DataCon workers and wrappers]
+               | isNewTyCon tycon = panic "mkDataConRep: we shouldn't look at LFInfo for newtype wrapper ids"
+               | otherwise        = LFReEntrant TopLevel (countFunRepArgs wrap_arity wrap_ty) True ArgUnknown
+                                                      -- LFInfo stores post-unarisation arity
 
              wrap_arg_dmds =
                replicate (length theta) topDmd ++ map mk_dmd arg_ibangs
@@ -788,15 +902,25 @@ mkDataConRep dc_bang_opts fam_envs wrap_name data_con
     -- needs a wrapper. This wrapper is injected into the program later in the
     -- CoreTidy pass. See Note [Injecting implicit bindings] in GHC.Iface.Tidy,
     -- along with the accompanying implementation in getTyConImplicitBinds.
-    wrapper_reqd =
-        (not new_tycon
+    wrapper_reqd
+      | isTypeDataTyCon tycon
+        -- `type data` declarations never have data-constructor wrappers
+        -- Their data constructors only live at the type level, in the
+        -- form of PromotedDataCon, and therefore do not need wrappers.
+        -- See wrinkle (W0) in Note [Type data declarations] in GHC.Rename.Module.
+      = False
+
+      | otherwise
+      = (not new_tycon
                      -- (Most) newtypes have only a worker, with the exception
                      -- of some newtypes written with GADT syntax.
                      -- See dataConUserTyVarsNeedWrapper below.
          && (any isBanged (ev_ibangs ++ arg_ibangs)))
                      -- Some forcing/unboxing (includes eq_spec)
+
       || isFamInstTyCon tycon -- Cast result
-      || (dataConUserTyVarsNeedWrapper data_con
+
+      || dataConUserTyVarsNeedWrapper data_con
                      -- If the data type was written with GADT syntax and
                      -- orders the type variables differently from what the
                      -- worker expects, it needs a data con wrapper to reorder
@@ -805,19 +929,7 @@ mkDataConRep dc_bang_opts fam_envs wrap_name data_con
                      --
                      -- NB: All GADTs return true from this function, but there
                      -- is one exception that we must check below.
-         && not (isTypeDataTyCon tycon))
-                     -- An exception to this rule is `type data` declarations.
-                     -- Their data constructors only live at the type level and
-                     -- therefore do not need wrappers.
-                     -- See Note [Type data declarations] in GHC.Rename.Module.
-                     --
-                     -- Note that the other checks in this definition will
-                     -- return False for `type data` declarations, as:
-                     --
-                     -- - They cannot be newtypes
-                     -- - They cannot have strict fields
-                     -- - They cannot be data family instances
-                     -- - They cannot have datatype contexts
+
       || not (null stupid_theta)
                      -- If the data constructor has a datatype context,
                      -- we need a wrapper in order to drop the stupid arguments.
@@ -832,8 +944,7 @@ mkDataConRep dc_bang_opts fam_envs wrap_name data_con
     mk_boxer boxers = DCB (\ ty_args src_vars ->
                       do { let (ex_vars, term_vars) = splitAtList ex_tvs src_vars
                                subst1 = zipTvSubst univ_tvs ty_args
-                               subst2 = extendTCvSubstList subst1 ex_tvs
-                                                           (mkTyCoVarTys ex_vars)
+                               subst2 = foldl2 extendTvSubstWithClone subst1 ex_tvs ex_vars
                          ; (rep_ids, binds) <- go subst2 boxers term_vars
                          ; return (ex_vars ++ rep_ids, binds) } )
 
@@ -1403,9 +1514,18 @@ shouldUnpackArgTy bang_opts prag fam_envs arg_ty
           | otherwise   -- Wrinkle (W4) of Note [Recursive unboxing]
           -> bang_opt_unbox_strict bang_opts
              || (bang_opt_unbox_small bang_opts
-                 && rep_tys `lengthAtMost` 1)  -- See Note [Unpack one-wide fields]
+                 && is_small_rep)  -- See Note [Unpack one-wide fields]
       where
         (rep_tys, _) = dataConArgUnpack arg_ty
+
+        -- Takes in the list of reps used to represent the dataCon after it's unpacked
+        -- and tells us if they can fit into 8 bytes. See Note [Unpack one-wide fields]
+        is_small_rep =
+          let -- Neccesary to look through unboxed tuples.
+              prim_reps = concatMap (typePrimRep . scaledThing . fst) $ rep_tys
+              -- And then get the actual size of the unpacked constructor.
+              rep_size = sum $ map primRepSizeW64_B prim_reps
+          in rep_size <= 8
 
     is_sum :: [DataCon] -> Bool
     -- We never unpack sum types automatically
@@ -1413,39 +1533,89 @@ shouldUnpackArgTy bang_opts prag fam_envs arg_ty
     is_sum (_:_:_) = True
     is_sum _       = False
 
--- Given a type already assumed to have been normalized by topNormaliseType,
--- unpackable_type_datacons ty = Just datacons
--- iff ty is of the form
---     T ty1 .. tyn
--- and T is an algebraic data type (not newtype), in which no data
--- constructors have existentials, and datacons is the list of data
--- constructors of T.
+
+
 unpackable_type_datacons :: Type -> Maybe [DataCon]
+-- Given a type already assumed to have been normalized by topNormaliseType,
+--    unpackable_type_datacons (T ty1 .. tyn) = Just datacons
+-- iff the type can be unpacked (see Note [Unpacking GADTs and existentials])
+-- and `datacons` are the data constructors of T
 unpackable_type_datacons ty
   | Just (tc, _) <- splitTyConApp_maybe ty
-  , not (isNewTyCon tc)  -- Even though `ty` has been normalised, it could still
-                         -- be a /recursive/ newtype, so we must check for that
+  , not (isNewTyCon tc)
+      -- isNewTyCon: even though `ty` has been normalised, whic includes looking
+      -- through newtypes, it could still be a /recursive/ newtype, so we must
+      -- check for that case
   , Just cons <- tyConDataCons_maybe tc
-  , not (null cons)      -- Don't upack nullary sums; no need.
-                         -- They already take zero bits
-  , all (null . dataConExTyCoVars) cons
-  = Just cons -- See Note [Unpacking GADTs and existentials]
+  , unpackable_cons cons
+  = Just cons
   | otherwise
   = Nothing
+  where
+    unpackable_cons :: [DataCon] -> Bool
+    -- True if we can unpack a value of type (T t1 .. tn),
+    -- where T is an algebraic data type with these constructors
+    -- See Note [Unpacking GADTs and existentials]
+    unpackable_cons []   -- Don't unpack nullary sums; no need.
+      = False            -- They already take zero bits; see (UC0)
+
+    unpackable_cons [con]   -- Exactly one data constructor; see (UC1)
+      = null (dataConExTyCoVars con)
+
+    unpackable_cons cons  -- More than one data constructor; see (UC2)
+      = all isVanillaDataCon cons
 
 {-
 Note [Unpacking GADTs and existentials]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-There is nothing stopping us unpacking a data type with equality
-components, like
-  data Equal a b where
-    Equal :: Equal a a
+Can we unpack a value of an algebraic data type T? For example
+   data D a = MkD {-# UNPACK #-} (T a)
+Can we unpack that (T a) field?
 
-And it'd be fine to unpack a product type with existential components
-too, but that would require a bit more plumbing, so currently we don't.
+Three cases to consider in `unpackable_cons`
 
-So for now we require: null (dataConExTyCoVars data_con)
-See #14978
+(UC0) No data constructors; a nullary sum type.  This already takes zero
+      bits so there is no point in unpacking it.
+
+(UC1) Single-constructor types (products).  We can just represent it by
+   its fields. For example, if `T` is defined as:
+      data T a = MkT a a Int
+   then we can unpack it as follows.  The worker for MkD takes three unpacked fields:
+       data D a = MkD a a Int
+       $MkD :: T a -> D a
+       $MkD (MkT a1 a2 i) = MkD a1 a2 i
+
+   We currently /can't/ do this if T has existentially-bound type variables,
+   hence:   null (dataConExTyCoVars con)   in `unpackable_cons`.
+   But see also (UC3) below.
+
+   But we /can/ do it for (some) GADTs, such as:
+      data Equal a b where { Equal :: Equal a a }
+      data Wom a where { Wom1 :: Int -> Wom Bool }
+   We will get a MkD constructor that includes some coercion arguments,
+   but that is fine.   See #14978.  We still can't accommodate existentials,
+   but these particular examples don't use existentials.
+
+(UC2) Multi-constructor types, e.g.
+        data T a = T1 a | T2 Int a
+  Here we unpack the field to an unboxed sum type, thus:
+    data D a = MkD (# a | (# Int, a #) #)
+
+  However, now we can't deal with GADTs at all, because we'd need an
+  unboxed sum whose component was a unboxed tuple, whose component(s)
+  have kind (CONSTRAINT r); and that's not well-kinded.  Hence the
+    all isVanillaDataCon
+  condition in `unpackable_cons`. See #25672.
+
+(UC3)  For single-constructor types, with some more plumbing we could
+   allow existentials. e.g.
+       data T a = forall b. MkT a (b->Int) b
+   could unpack to
+       data D a = forall b. MkD a (b->Int) b
+       $MkD :: T a -> D a
+       $MkD (MkT @b x f y) = MkD @b x f y
+   Eminently possible, but more plumbing needed.
+
 
 Note [Unpack one-wide fields]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1470,6 +1640,14 @@ However
     data S = S !a
 
 Here we can represent T with an Int#.
+
+Special care has to be taken to make sure we don't mistake fields with unboxed
+tuple/sum rep or very large reps. See #22309
+
+For consistency we unpack anything that fits into 8 bytes on a 64-bit platform,
+even when compiling for 32bit platforms. This way unpacking decisions will be the
+same for 32bit and 64bit systems. To do so we use primRepSizeW64_B instead of
+primRepSizeB. See also the tests in test case T22309.
 
 Note [Recursive unboxing]
 ~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1694,6 +1872,7 @@ which is not supposed to be used in expressions (GHC throws an assertion
 failure when trying.)
 -}
 
+
 nullAddrName, seqName,
    realWorldName, voidPrimIdName, coercionTokenName,
    coerceName, proxyName,
@@ -1741,7 +1920,7 @@ nullAddrId = pcMiscPrelId nullAddrName addrPrimTy info
 
 ------------------------------------------------
 seqId :: Id     -- See Note [seqId magic]
-seqId = pcMiscPrelId seqName ty info
+seqId = pcRepPolyId seqName ty concs info
   where
     info = noCafIdInfo `setInlinePragInfo` inline_prag
                        `setUnfoldingInfo`  mkCompulsoryUnfolding rhs
@@ -1764,6 +1943,9 @@ seqId = pcMiscPrelId seqName ty info
     [x,y] = mkTemplateLocals [alphaTy, openBetaTy]
     rhs = mkLams ([runtimeRep2TyVar, alphaTyVar, openBetaTyVar, x, y]) $
           Case (Var x) x openBetaTy [Alt DEFAULT [] (Var y)]
+
+    concs = mkRepPolyIdConcreteTyVars
+        [ ((openBetaTy, Argument 2 Top), runtimeRep2TyVar)]
 
     arity = 2
 
@@ -1802,12 +1984,13 @@ nospecId = pcMiscPrelId nospecIdName ty info
     info = noCafIdInfo
     ty  = mkSpecForAllTys [alphaTyVar] (mkVisFunTyMany alphaTy alphaTy)
 
-oneShotId :: Id -- See Note [The oneShot function]
-oneShotId = pcMiscPrelId oneShotName ty info
+oneShotId :: Id -- See Note [oneShot magic]
+oneShotId = pcRepPolyId oneShotName ty concs info
   where
     info = noCafIdInfo `setInlinePragInfo` alwaysInlinePragma
                        `setUnfoldingInfo`  mkCompulsoryUnfolding rhs
                        `setArityInfo`      arity
+    -- oneShot :: forall {r1 r2} (a :: TYPE r1) (b :: TYPE r2). (a -> b) -> (a -> b)
     ty  = mkInfForAllTys  [ runtimeRep1TyVar, runtimeRep2TyVar ] $
           mkSpecForAllTys [ openAlphaTyVar, openBetaTyVar ]      $
           mkVisFunTyMany fun_ty fun_ty
@@ -1819,6 +2002,9 @@ oneShotId = pcMiscPrelId oneShotName ty info
                  , body, x'] $
           Var body `App` Var x'
     arity = 2
+
+    concs = mkRepPolyIdConcreteTyVars
+        [((openAlphaTy, Argument 2 Top), runtimeRep1TyVar)]
 
 ----------------------------------------------------------------------
 {- Note [Wired-in Ids for rebindable syntax]
@@ -1844,7 +2030,7 @@ does not linger for long.
 --   is () and not undefined
 -- Important that is is multiplicity-polymorphic (test linear/should_compile/OldList)
 leftSectionId :: Id
-leftSectionId = pcMiscPrelId leftSectionName ty info
+leftSectionId = pcRepPolyId leftSectionName ty concs info
   where
     info = noCafIdInfo `setInlinePragInfo` alwaysInlinePragma
                        `setUnfoldingInfo`  mkCompulsoryUnfolding rhs
@@ -1862,6 +2048,9 @@ leftSectionId = pcMiscPrelId leftSectionName ty info
     body = mkLams [f,xmult] $ App (Var f) (Var xmult)
     arity = 2
 
+    concs = mkRepPolyIdConcreteTyVars
+            [((openAlphaTy, Argument 2 Top), runtimeRep1TyVar)]
+
 -- See Note [Left and right sections] in GHC.Rename.Expr
 -- See Note [Wired-in Ids for rebindable syntax]
 --   rightSection :: forall r1 r2 r3 n1 n2 (a::TYPE r1) (b::TYPE r2) (c::TYPE r3).
@@ -1869,7 +2058,7 @@ leftSectionId = pcMiscPrelId leftSectionName ty info
 --   rightSection f y x = f x y
 -- Again, multiplicity polymorphism is important
 rightSectionId :: Id
-rightSectionId = pcMiscPrelId rightSectionName ty info
+rightSectionId = pcRepPolyId rightSectionName ty concs info
   where
     info = noCafIdInfo `setInlinePragInfo` alwaysInlinePragma
                        `setUnfoldingInfo`  mkCompulsoryUnfolding rhs
@@ -1892,10 +2081,15 @@ rightSectionId = pcMiscPrelId rightSectionName ty info
     body = mkLams [f,ymult,xmult] $ mkVarApps (Var f) [xmult,ymult]
     arity = 3
 
+    concs =
+      mkRepPolyIdConcreteTyVars
+        [ ((openAlphaTy, Argument 3 Top), runtimeRep1TyVar)
+        , ((openBetaTy , Argument 2 Top), runtimeRep2TyVar)]
+
 --------------------------------------------------------------------------------
 
 coerceId :: Id
-coerceId = pcMiscPrelId coerceName ty info
+coerceId = pcRepPolyId coerceName ty concs info
   where
     info = noCafIdInfo `setInlinePragInfo` alwaysInlinePragma
                        `setUnfoldingInfo`  mkCompulsoryUnfolding rhs
@@ -1918,6 +2112,9 @@ coerceId = pcMiscPrelId coerceName ty info
     rhs = mkLams (bndrs ++ [eqR, x]) $
           mkWildCase (Var eqR) (unrestricted eqRTy) b $
           [Alt (DataAlt coercibleDataCon) [eq] (Cast (Var x) (mkCoVarCo eq))]
+
+    concs = mkRepPolyIdConcreteTyVars
+            [((mkTyVarTy av, Argument 1 Top), rv)]
 
 {-
 Note [seqId magic]
@@ -2076,12 +2273,17 @@ Note that this happens *after* unfoldings are exposed in the interface file.
 This is crucial: otherwise, we could import an unfolding in which
 'nospec' has been inlined (= erased), and we would lose the benefit.
 
-'nospec' is used in the implementation of 'withDict': we insert 'nospec'
-so that the typeclass specialiser doesn't assume any two evidence terms
-of the same type are equal. See Note [withDict] in GHC.Tc.Instance.Class,
-and see test case T21575b for an example.
+'nospec' is used:
 
-Note [The oneShot function]
+* In the implementation of 'withDict': we insert 'nospec' so that the
+  typeclass specialiser doesn't assume any two evidence terms of the
+  same type are equal. See Note [withDict] in GHC.Tc.Instance.Class,
+  and see test case T21575b for an example.
+
+* To defeat the specialiser when we have incoherent instances.
+  See Note [Coherence and specialisation: overview] in GHC.Core.InstEnv.
+
+Note [oneShot magic]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
 In the context of making left-folds fuse somewhat okish (see ticket #7994
 and Note [Left folds via right fold]) it was determined that it would be useful
@@ -2106,11 +2308,17 @@ after unfolding the definition `oneShot = \f \x[oneshot]. f x` we get
  --> \x[oneshot] e[x/y]
 which is what we want.
 
-It is only effective if the one-shot info survives as long as possible; in
-particular it must make it into the interface in unfoldings. See Note [Preserve
-OneShotInfo] in GHC.Core.Tidy.
-
 Also see https://gitlab.haskell.org/ghc/ghc/wikis/one-shot.
+
+Wrinkles:
+(OS1)  It is only effective if the one-shot info survives as long as possible; in
+       particular it must make it into the interface in unfoldings. See Note [Preserve
+       OneShotInfo] in GHC.Core.Tidy.
+
+(OS2) (oneShot (error "urk")) rewrites to
+           \x[oneshot]. error "urk" x
+      thereby hiding the `error` under a lambda, which might be surprising,
+      particularly if you have `-fpedantic-bottoms` on.  See #24296.
 
 
 -------------------------------------------------------------
@@ -2163,3 +2371,28 @@ coercionTokenId -- See Note [Coercion tokens] in "GHC.CoreToStg"
 pcMiscPrelId :: Name -> Type -> IdInfo -> Id
 pcMiscPrelId name ty info
   = mkVanillaGlobalWithInfo name ty info
+
+pcRepPolyId :: Name -> Type -> (Name -> ConcreteTyVars) -> IdInfo -> Id
+pcRepPolyId name ty conc_tvs info =
+  mkGlobalId (RepPolyId $ conc_tvs name) name ty info
+
+-- | Directly specify which outer forall'd type variables of a
+-- representation-polymorphic 'Id' such become concrete metavariables when
+-- instantiated.
+mkRepPolyIdConcreteTyVars :: [((Type, Position Neg), TyVar)]
+                               -- ^ ((ty, pos), tv)
+                               -- 'ty' is the type on which the representation-polymorphism
+                               -- check is done
+                               -- 'tv' is the type variable we are checking for concreteness
+                               -- (usually the kind of 'ty')
+                               -- 'pos' is the position of 'ty' in the
+                               -- type of the 'Id'
+                          -> Name -- ^ 'Name' of the rep-poly 'Id'
+                          -> ConcreteTyVars
+mkRepPolyIdConcreteTyVars vars nm =
+  mkNameEnv [ (tyVarName tv, mk_conc_frr ty pos)
+            | ((ty,pos), tv) <- vars ]
+  where
+    mk_conc_frr ty pos =
+      ConcreteFRR $ FixedRuntimeRepOrigin ty
+                  $ FRRRepPolyId nm RepPolyFunction pos

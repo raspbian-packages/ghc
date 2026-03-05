@@ -21,6 +21,8 @@ Types
     representation_polymorphism
     type_literals
     type_applications
+    type_abstractions
+    required_type_arguments
     rank_polymorphism
     impredicative_types
     linear_types

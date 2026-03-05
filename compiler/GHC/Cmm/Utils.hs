@@ -1,5 +1,4 @@
-{-# LANGUAGE GADTs, RankNTypes #-}
-{-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE GADTs #-}
 {-# LANGUAGE LambdaCase #-}
 
 {-# OPTIONS_GHC -Wno-incomplete-uni-patterns #-}
@@ -50,7 +49,7 @@ module GHC.Cmm.Utils(
         cmmConstrTag1, mAX_PTR_TAG, tAG_MASK,
 
         -- Overlap and usage
-        regsOverlap, regUsedIn,
+        regsOverlap, globalRegsOverlap, regUsedIn, globalRegUsedIn,
 
         -- Liveness and bitmaps
         mkLiveness,
@@ -70,7 +69,7 @@ module GHC.Cmm.Utils(
 import GHC.Prelude
 
 import GHC.Core.TyCon     ( PrimRep(..), PrimElemRep(..) )
-import GHC.Types.RepType  ( UnaryType, SlotTy (..), typePrimRep1 )
+import GHC.Types.RepType  ( NvUnaryType, SlotTy (..), typePrimRepU )
 
 import GHC.Platform
 import GHC.Runtime.Heap.Layout
@@ -87,7 +86,6 @@ import qualified Data.ByteString as BS
 import GHC.Cmm.Dataflow.Graph
 import GHC.Cmm.Dataflow.Label
 import GHC.Cmm.Dataflow.Block
-import GHC.Cmm.Dataflow.Collections
 
 ---------------------------------------------------
 --
@@ -97,9 +95,7 @@ import GHC.Cmm.Dataflow.Collections
 
 primRepCmmType :: Platform -> PrimRep -> CmmType
 primRepCmmType platform = \case
-   VoidRep          -> panic "primRepCmmType:VoidRep"
-   LiftedRep        -> gcWord platform
-   UnliftedRep      -> gcWord platform
+   BoxedRep _       -> gcWord platform
    IntRep           -> bWord platform
    WordRep          -> bWord platform
    Int8Rep          -> b8
@@ -137,13 +133,11 @@ primElemRepCmmType Word64ElemRep = b64
 primElemRepCmmType FloatElemRep  = f32
 primElemRepCmmType DoubleElemRep = f64
 
-typeCmmType :: Platform -> UnaryType -> CmmType
-typeCmmType platform ty = primRepCmmType platform (typePrimRep1 ty)
+typeCmmType :: Platform -> NvUnaryType -> CmmType
+typeCmmType platform ty = primRepCmmType platform (typePrimRepU ty)
 
 primRepForeignHint :: PrimRep -> ForeignHint
-primRepForeignHint VoidRep      = panic "primRepForeignHint:VoidRep"
-primRepForeignHint LiftedRep    = AddrHint
-primRepForeignHint UnliftedRep  = AddrHint
+primRepForeignHint (BoxedRep _) = AddrHint
 primRepForeignHint IntRep       = SignedHint
 primRepForeignHint Int8Rep      = SignedHint
 primRepForeignHint Int16Rep     = SignedHint
@@ -159,8 +153,8 @@ primRepForeignHint FloatRep     = NoHint
 primRepForeignHint DoubleRep    = NoHint
 primRepForeignHint (VecRep {})  = NoHint
 
-typeForeignHint :: UnaryType -> ForeignHint
-typeForeignHint = primRepForeignHint . typePrimRep1
+typeForeignHint :: NvUnaryType -> ForeignHint
+typeForeignHint = primRepForeignHint . typePrimRepU
 
 ---------------------------------------------------
 --
@@ -437,12 +431,18 @@ cmmConstrTag1 platform e = cmmAndWord platform e (cmmTagMask platform)
 -- other. This includes the case that the two registers are the same
 -- STG register. See Note [Overlapping global registers] for details.
 regsOverlap :: Platform -> CmmReg -> CmmReg -> Bool
-regsOverlap platform (CmmGlobal g) (CmmGlobal g')
-  | Just real  <- globalRegMaybe platform g,
-    Just real' <- globalRegMaybe platform g',
-    real == real'
-    = True
+regsOverlap platform (CmmGlobal (GlobalRegUse g1 _)) (CmmGlobal (GlobalRegUse g2 _))
+  = globalRegsOverlap platform g1 g2
 regsOverlap _ reg reg' = reg == reg'
+
+globalRegsOverlap :: Platform -> GlobalReg -> GlobalReg -> Bool
+globalRegsOverlap platform g1 g2
+  | Just real  <- globalRegMaybe platform g1
+  , Just real' <- globalRegMaybe platform g2
+  , real == real'
+  = True
+  | otherwise
+  = g1 == g2
 
 -- | Returns True if the STG register is used by the expression, in
 -- the sense that a store to the register might affect the value of
@@ -460,6 +460,27 @@ regUsedIn platform = regUsedIn_ where
   reg `regUsedIn_` CmmRegOff reg' _ = regsOverlap platform reg reg'
   reg `regUsedIn_` CmmMachOp _ es   = any (reg `regUsedIn_`) es
   _   `regUsedIn_` CmmStackSlot _ _ = False
+
+globalRegUsedIn :: Platform -> GlobalReg -> CmmExpr -> Bool
+globalRegUsedIn platform = globalRegUsedIn_ where
+  _   `globalRegUsedIn_` CmmLit _
+    = False
+  reg `globalRegUsedIn_` CmmLoad e _ _
+    = reg `globalRegUsedIn_` e
+  reg `globalRegUsedIn_` CmmReg reg'
+    | CmmGlobal (GlobalRegUse reg' _) <- reg'
+    = globalRegsOverlap platform reg reg'
+    | otherwise
+    = False
+  reg `globalRegUsedIn_` CmmRegOff reg' _
+    | CmmGlobal (GlobalRegUse reg' _) <- reg'
+    = globalRegsOverlap platform reg reg'
+    | otherwise
+    = False
+  reg `globalRegUsedIn_` CmmMachOp _ es
+    = any (reg `globalRegUsedIn_`) es
+  _   `globalRegUsedIn_` CmmStackSlot _ _
+    = False
 
 --------------------------------------------
 --
@@ -571,12 +592,12 @@ blockTicks b = reverse $ foldBlockNodesF goStmt b []
 -- Access to common global registers
 
 baseExpr, spExpr, hpExpr, currentTSOExpr, currentNurseryExpr,
-  spLimExpr, hpLimExpr, cccsExpr :: CmmExpr
-baseExpr = CmmReg baseReg
-spExpr = CmmReg spReg
-spLimExpr = CmmReg spLimReg
-hpExpr = CmmReg hpReg
-hpLimExpr = CmmReg hpLimReg
-currentTSOExpr = CmmReg currentTSOReg
-currentNurseryExpr = CmmReg currentNurseryReg
-cccsExpr = CmmReg cccsReg
+  spLimExpr, hpLimExpr, cccsExpr :: Platform -> CmmExpr
+baseExpr           p = CmmReg $ baseReg           p
+spExpr             p = CmmReg $ spReg             p
+spLimExpr          p = CmmReg $ spLimReg          p
+hpExpr             p = CmmReg $ hpReg             p
+hpLimExpr          p = CmmReg $ hpLimReg          p
+currentTSOExpr     p = CmmReg $ currentTSOReg     p
+currentNurseryExpr p = CmmReg $ currentNurseryReg p
+cccsExpr           p = CmmReg $ cccsReg           p

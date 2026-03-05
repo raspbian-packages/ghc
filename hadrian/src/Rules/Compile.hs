@@ -1,3 +1,5 @@
+{-# LANGUAGE GADTs #-}
+
 module Rules.Compile (compilePackage) where
 
 import Hadrian.BuildPath
@@ -57,8 +59,8 @@ compilePackage rs = do
       -- When building dynamically we depend on the static rule if shared libs
       -- are supported, because it will add the -dynamic-too flag when
       -- compiling to build the dynamic files alongside the static files
-      [ root -/- "**/build/**/*.dyn_o", root -/- "**/build/**/*.dyn_hi" ]
-        &%> \ [dyn_o, _dyn_hi] -> do
+      ( root -/- "**/build/**/*.dyn_o" :& root -/- "**/build/**/*.dyn_hi" :& Nil )
+        &%> \ ( dyn_o :& _dyn_hi :& _ ) -> do
           p <- platformSupportsSharedLibs
           if p
             then do
@@ -80,9 +82,11 @@ compilePackage rs = do
             else compileHsObjectAndHi rs dyn_o
 
       forM_ ((,) <$> hsExts <*> wayPats) $ \ ((oExt, hiExt), wayPat) ->
-        [ root -/- "**/build/**/*." ++ wayPat ++ oExt
-        , root -/- "**/build/**/*." ++ wayPat ++ hiExt ]
-          &%> \ [o, _hi] -> compileHsObjectAndHi rs o
+        (  (root -/- "**/build/**/*." ++ wayPat ++ oExt)
+        :& (root -/- "**/build/**/*." ++ wayPat ++ hiExt)
+        :& Nil ) &%>
+          \ ( o :& _hi :& _ ) ->
+            compileHsObjectAndHi rs o
   where
     hsExts = [ ("o", "hi")
              , ("o-boot", "hi-boot")
@@ -214,6 +218,9 @@ compileHsObjectAndHi rs objpath = do
   ctxPath <- contextPath ctx
   (src, deps) <- lookupDependencies (ctxPath -/- ".dependencies") objpath
   need (src:deps)
+  -- The .conf file is needed when template-haskell is implicitly added as a dependency
+  -- when a module in the template-haskell package is compiled. (See #24737)
+  when  (isLibrary (C.package ctx)) (need . (:[]) =<< pkgConfFile ctx)
 
   -- The .dependencies file lists indicating inputs. ghc will
   -- generally read more *.hi and *.hi-boot files (direct inputs).

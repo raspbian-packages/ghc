@@ -10,7 +10,7 @@
 module GHC.StgToCmm.Env (
         CgIdInfo,
 
-        litIdInfo, lneIdInfo, rhsIdInfo, mkRhsInit,
+        mkCgIdInfo, litIdInfo, lneIdInfo, rhsIdInfo, mkRhsInit,
         idInfoToAmode,
 
         addBindC, addBindsC,
@@ -43,7 +43,6 @@ import GHC.Types.Var.Env
 
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
-import GHC.Utils.Panic.Plain
 
 import GHC.Builtin.Names (getUnique)
 
@@ -149,7 +148,7 @@ getCgIdInfo id
                       | otherwise
                       = pprPanic "GHC.StgToCmm.Env: label not found" (ppr id <+> dcolon <+> ppr (idType id))
               in return $
-                  litIdInfo platform id (mkLFImported id) (CmmLabel ext_lbl)
+                  litIdInfo platform id (importedIdLFInfo id) (CmmLabel ext_lbl)
           else
               cgLookupPanic id -- Bug, id is neither in local binds nor is external
         }}}
@@ -206,4 +205,4 @@ idToReg :: Platform -> NonVoid Id -> LocalReg
 -- about accidental collision
 idToReg platform (NonVoid id)
              = LocalReg (idUnique id)
-                        (primRepCmmType platform (idPrimRep id))
+                        (primRepCmmType platform (idPrimRepU id))

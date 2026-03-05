@@ -368,6 +368,18 @@ Miscellaneous RTS options
     thread can execute its exception handlers. The ``-xq`` controls the
     size of this additional quota.
 
+.. rts-flag:: -xr ⟨size⟩
+
+    :default: 1T
+
+    This option controls the size of virtual memory address space
+    reserved by the two step allocator on a 64-bit platform. It can be
+    useful in scenarios where even reserving a large address range
+    without committing can be expensive (e.g. WSL1), or when you
+    actually have enough physical memory and want to support a Haskell
+    heap larger than 1T. ``-xr`` is a no-op if GHC is configured with
+    ``--disable-large-address-space`` or if the platform is 32-bit.
+
 .. _rts-options-gc:
 
 RTS options to control the garbage collector
@@ -411,6 +423,29 @@ performance.
     Note that :rts-flag:`--nonmoving-gc` cannot be used with ``-G1``,
     :rts-flag:`profiling <-hc>` nor :rts-flag:`-c`.
 
+.. rts-flag:: -xn
+
+    :default: off
+    :since: 8.10.1
+
+    An alias for :rts-flag:`--nonmoving-gc`
+
+.. rts-flag:: --nonmoving-dense-allocator-count=⟨count⟩
+
+    :default: 16
+    :since: 9.10.1
+    :reverse: none
+
+    Specify the amount of dense allocators used by the non-moving garbage collector.
+
+    Increasing this value is likely to decrease the amount of memory lost to
+    internal fragmentation while marginally increasing the baseline memory requirements
+    and potentially regressing other metrics.
+
+    Large values are likely to lead to diminishing returns as
+    , in practice, the Haskell heap tends to be dominated by small objects.
+
+
 .. rts-flag:: -w
 
     :default: off
@@ -421,13 +456,6 @@ performance.
     Note that this cannot be used in conjunction with heap profiling
     (:rts-flag:`-hT`) unless linked against the profiling runtime system with
     :ghc-flag:`-prof`.
-
-.. rts-flag:: -xn
-
-    :default: off
-    :since: 8.10.1
-
-    An alias for :rts-flag:`--nonmoving-gc`
 
 .. rts-flag:: -A ⟨size⟩
 
@@ -1315,6 +1343,35 @@ to stdout (``-Dx`` implies ``-v``), but they may instead be stored in
 the binary eventlog file by using the ``-l`` option.
 
 .. _rts-options-debugging:
+
+
+RTS options for Haskell program coverage
+----------------------------------------
+
+When a program is compiled with the :ghc-flag:`-fhpc` flag, then the generated
+code is instrumented with instructions which keep track of which code was executed
+while the program runs. This functionality is implemented in the runtime system
+and can be controlled by the following flags.
+
+.. index::
+    single: RTS options, hpc
+
+.. rts-flag:: --write-tix-file
+
+    :default: enabled
+    :since: 9.10
+
+    By default, the runtime system writes a file ``<program>.tix`` at the end
+    of execution if the executable is compiled with the ``-fhpc`` option.
+    This file is not written if the ``--write-tix-file=no`` option is passed
+    to the runtime system.
+
+    This option is useful if you want to use the functionality provided by the
+    ``Trace.Hpc.Reflect`` module of the
+    `hpc <https://hackage.haskell.org/package/hpc>`__
+    library. These functions allow to inspect the state of the Tix data structures
+    during runtime, so that the executable can write Tix files to disk itself.
+
 
 RTS options for hackers, debuggers, and over-interested souls
 -------------------------------------------------------------

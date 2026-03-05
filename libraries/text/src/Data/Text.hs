@@ -4,6 +4,8 @@
 {-# LANGUAGE UnliftedFFITypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE PartialTypeSignatures #-}
+{-# LANGUAGE PatternSynonyms #-}
+{-# LANGUAGE ViewPatterns #-}
 
 {-# OPTIONS_GHC -fno-warn-orphans #-}
 {-# OPTIONS_GHC -Wno-partial-type-signatures #-}
@@ -53,12 +55,18 @@ module Data.Text
 
     -- * Types
       Text
+    , StrictText
 
     -- * Creation and elimination
     , pack
     , unpack
     , singleton
     , empty
+
+    -- * Pattern matching
+    , pattern Empty
+    , pattern (:<)
+    , pattern (:>)
 
     -- * Basic interface
     , cons
@@ -102,6 +110,7 @@ module Data.Text
     , foldr
     , foldr'
     , foldr1
+    , foldlM'
 
     -- ** Special folds
     , concat
@@ -154,7 +163,9 @@ module Data.Text
     , group
     , groupBy
     , inits
+    , initsNE
     , tails
+    , tailsNE
 
     -- ** Breaking into many substrings
     -- $split
@@ -198,6 +209,9 @@ module Data.Text
     , zip
     , zipWith
 
+    -- * Showing values
+    , show
+
     -- -* Ordered text
     -- , sort
 
@@ -211,49 +225,54 @@ module Data.Text
 
 import Prelude (Char, Bool(..), Int, Maybe(..), String,
                 Eq, (==), (/=), Ord(..), Ordering(..), (++),
-                Monad(..), pure, Read(..),
+                Monad(..), pure, Read(..), Show,
                 (&&), (||), (+), (-), (.), ($), ($!), (>>),
-                not, return, otherwise, quot, IO)
+                not, return, otherwise, quot)
 import Control.DeepSeq (NFData(rnf))
 #if defined(ASSERTS)
 import Control.Exception (assert)
 #endif
-import Data.Bits ((.&.), shiftR, shiftL)
+import Data.Bits ((.&.))
 import qualified Data.Char as Char
 import Data.Data (Data(gfoldl, toConstr, gunfold, dataTypeOf), constrIndex,
                   Constr, mkConstr, DataType, mkDataType, Fixity(Prefix))
 import Control.Monad (foldM)
 import Control.Monad.ST (ST, runST)
-import Control.Monad.ST.Unsafe (unsafeIOToST)
 import qualified Data.Text.Array as A
 import qualified Data.List as L hiding (head, tail)
+import qualified Data.List.NonEmpty as NonEmptyList
 import Data.Binary (Binary(get, put))
+import Data.Binary.Put (putBuilder)
 import Data.Monoid (Monoid(..))
 import Data.Semigroup (Semigroup(..))
 import Data.String (IsString(..))
-import Data.Text.Internal.Encoding.Utf8 (utf8Length, utf8LengthByLeader, chr2, chr3, chr4, ord2, ord3, ord4)
+import Data.Text.Internal.ArrayUtils (memchr)
+import Data.Text.Internal.IsAscii (isAscii)
+import Data.Text.Internal.Reverse (reverse)
+import Data.Text.Internal.Measure (measure_off)
+import Data.Text.Internal.Encoding.Utf8 (utf8Length, utf8LengthByLeader, chr3, ord2, ord3, ord4)
 import qualified Data.Text.Internal.Fusion as S
-import Data.Text.Internal.Fusion.CaseMapping (foldMapping, lowerMapping, upperMapping)
 import qualified Data.Text.Internal.Fusion.Common as S
-import Data.Text.Encoding (decodeUtf8', encodeUtf8)
+import Data.Text.Encoding (decodeUtf8', encodeUtf8Builder)
 import Data.Text.Internal.Fusion (stream, reverseStream, unstream)
 import Data.Text.Internal.Private (span_)
-import Data.Text.Internal (Text(..), empty, firstf, mul, safe, text, append, pack)
-import Data.Text.Internal.Unsafe.Char (unsafeWrite, unsafeChr8)
+import Data.Text.Internal (Text(..), StrictText, empty, firstf, mul, safe, text, append, pack)
+import Data.Text.Internal.Unsafe.Char (unsafeWrite)
 import Data.Text.Show (singleton, unpack, unpackCString#, unpackCStringAscii#)
 import qualified Prelude as P
 import Data.Text.Unsafe (Iter(..), iter, iter_, lengthWord8, reverseIter,
                          reverseIter_, unsafeHead, unsafeTail, iterArray, reverseIterArray)
 import Data.Text.Internal.Search (indices)
+import Data.Text.Internal.Transformation (mapNonEmpty, toCaseFoldNonEmpty, toLowerNonEmpty, toUpperNonEmpty, toTitleNonEmpty, filter_)
 #if defined(__HADDOCK__)
 import Data.ByteString (ByteString)
 import qualified Data.Text.Lazy as L
 #endif
 import Data.Word (Word8)
 import Foreign.C.Types
-import GHC.Base (eqInt, neInt, gtInt, geInt, ltInt, leInt, ByteArray#)
+import GHC.Base (eqInt, neInt, gtInt, geInt, ltInt, leInt)
 import qualified GHC.Exts as Exts
-import GHC.Int (Int8, Int64(..))
+import GHC.Int (Int8)
 import GHC.Stack (HasCallStack)
 import qualified Language.Haskell.TH.Lib as TH
 import qualified Language.Haskell.TH.Syntax as TH
@@ -351,8 +370,21 @@ instance Read Text where
     readsPrec p str = [(pack x,y) | (x,y) <- readsPrec p str]
 
 -- | @since 1.2.2.0
+--
+-- Beware: @stimes@ will crash if the given number does not fit into
+-- an @Int@.
 instance Semigroup Text where
     (<>) = append
+
+    stimes howManyTimes
+      | howManyTimes < 0 = P.error "Data.Text.stimes: given number is negative!"
+      | otherwise =
+        let howManyTimesInt = P.fromIntegral howManyTimes :: Int
+        in  if P.fromIntegral howManyTimesInt == howManyTimes && howManyTimesInt >= 0
+            then replicate howManyTimesInt
+            else P.error "Data.Text.stimes: given number does not fit into an Int!"
+
+    sconcat = concat . NonEmptyList.toList
 
 instance Monoid Text where
     mempty  = empty
@@ -383,7 +415,11 @@ instance NFData Text where rnf !_ = ()
 
 -- | @since 1.2.1.0
 instance Binary Text where
-    put t = put (encodeUtf8 t)
+    put t = do
+      -- This needs to be in sync with the Binary instance for ByteString
+      -- in the binary package.
+      put (lengthWord8 t)
+      putBuilder (encodeUtf8Builder t)
     get   = do
       bs <- get
       case decodeUtf8' bs of
@@ -418,8 +454,14 @@ instance TH.Lift Text where
 #if MIN_VERSION_template_haskell(2,16,0)
   lift txt = do
     let (ptr, len) = unsafePerformIO $ asForeignPtr txt
-    let lenInt = P.fromIntegral len
-    TH.appE (TH.appE (TH.varE 'unpackCStringLen#) (TH.litE . TH.bytesPrimL $ TH.mkBytes ptr 0 lenInt)) (TH.lift lenInt)
+    case len of
+        0 -> TH.varE 'empty
+        _ ->
+          let
+            bytesQ = TH.litE . TH.bytesPrimL $ TH.mkBytes ptr 0 (P.fromIntegral len)
+            lenQ = liftInt (P.fromIntegral len)
+            liftInt n = (TH.appE (TH.conE 'Exts.I#) (TH.litE (TH.IntPrimL n)))
+          in TH.varE 'unpackCStringLen# `TH.appE` bytesQ `TH.appE` lenQ
 #else
   lift = TH.appE (TH.varE 'pack) . TH.stringE . unpack
 #endif
@@ -497,7 +539,7 @@ uncons t@(Text arr off len)
 -- non-empty. This is a partial function, consider using 'unsnoc' instead.
 last :: HasCallStack => Text -> Char
 last t@(Text _ _ len)
-    | len <= 0  = emptyError "last"
+    | null t = emptyError "last"
     | otherwise = let Iter c _ = reverseIter t (len - 1) in c
 {-# INLINE [1] last #-}
 
@@ -505,7 +547,7 @@ last t@(Text _ _ len)
 -- must be non-empty. This is a partial function, consider using 'uncons' instead.
 tail :: HasCallStack => Text -> Text
 tail t@(Text arr off len)
-    | len <= 0  = emptyError "tail"
+    | null t = emptyError "tail"
     | otherwise = text arr (off+d) (len-d)
     where d = iter_ t 0
 {-# INLINE [1] tail #-}
@@ -514,7 +556,7 @@ tail t@(Text arr off len)
 -- be non-empty. This is a partial function, consider using 'unsnoc' instead.
 init :: HasCallStack => Text -> Text
 init t@(Text arr off len)
-    | len <= 0  = emptyError "init"
+    | null t = emptyError "init"
     | otherwise = text arr off (len + reverseIter_ t (len - 1))
 {-# INLINE [1] init #-}
 
@@ -524,7 +566,7 @@ init t@(Text arr off len)
 -- @since 1.2.3.0
 unsnoc :: Text -> Maybe (Text, Char)
 unsnoc t@(Text arr off len)
-    | len <= 0  = Nothing
+    | null t = Nothing
     | otherwise = Just (text arr off (len + d), c)
         where
             Iter c d = reverseIter t (len - 1)
@@ -538,6 +580,38 @@ null (Text _arr _off len) =
 #endif
     len <= 0
 {-# INLINE [1] null #-}
+
+{-# RULES
+ "TEXT null/empty -> True" null empty = True
+#-}
+
+-- | Bidirectional pattern synonym for 'empty' and 'null' (both /O(1)/),
+-- to be used together with '(:<)' or '(:>)'.
+--
+-- @since 2.1.2
+pattern Empty :: Text
+pattern Empty <- (null -> True) where
+  Empty = empty
+
+-- | Bidirectional pattern synonym for 'cons' (/O(n)/) and 'uncons' (/O(1)/),
+-- to be used together with 'Empty'.
+--
+-- @since 2.1.2
+pattern (:<) :: Char -> Text -> Text
+pattern x :< xs <- (uncons -> Just (x, xs)) where
+  (:<) = cons
+infixr 5 :<
+{-# COMPLETE Empty, (:<) #-}
+
+-- | Bidirectional pattern synonym for 'snoc' (/O(n)/) and 'unsnoc' (/O(1)/)
+-- to be used together with 'Empty'.
+--
+-- @since 2.1.2
+pattern (:>) :: Text -> Char -> Text
+pattern xs :> x <- (unsnoc -> Just (xs, x)) where
+  (:>) = snoc
+infixl 5 :>
+{-# COMPLETE Empty, (:>) #-}
 
 -- | /O(1)/ Tests whether a 'Text' contains exactly one character.
 isSingleton :: Text -> Bool
@@ -574,6 +648,8 @@ length = P.negate . measureOff P.maxBound
     length (intersperse c t) = max 0 (mul 2 (length t) - 1)
 "TEXT length/intercalate -> n*length" forall s ts.
     length (intercalate s ts) = let lenS = length s in max 0 (P.sum (P.map (\t -> length t + lenS) ts) - lenS)
+"TEXT length/empty -> 0"
+    length empty = 0
   #-}
 
 -- | /O(min(n,c))/ Compare the count of characters in a 'Text' to a number.
@@ -637,28 +713,7 @@ compareLength t c = S.compareLengthI (stream t) c
 --
 -- Performs replacement on invalid scalar values.
 map :: (Char -> Char) -> Text -> Text
-map f = go
-  where
-    go (Text src o l) = runST $ do
-      marr <- A.new (l + 4)
-      outer marr (l + 4) o 0
-      where
-        outer :: forall s. A.MArray s -> Int -> Int -> Int -> ST s Text
-        outer !dst !dstLen = inner
-          where
-            inner !srcOff !dstOff
-              | srcOff >= l + o = do
-                A.shrinkM dst dstOff
-                arr <- A.unsafeFreeze dst
-                return (Text arr 0 dstOff)
-              | dstOff + 4 > dstLen = do
-                let !dstLen' = dstLen + (l + o) - srcOff + 4
-                dst' <- A.resizeM dst dstLen'
-                outer dst' dstLen' srcOff dstOff
-              | otherwise = do
-                let !(Iter c d) = iterArray src srcOff
-                d' <- unsafeWrite dst dstOff (safe (f c))
-                inner (srcOff + d) (dstOff + d')
+map f = \t -> if null t then empty else mapNonEmpty f t
 {-# INLINE [1] map #-}
 
 {-# RULES
@@ -688,7 +743,7 @@ intercalate t = concat . L.intersperse t
 --
 -- Performs replacement on invalid scalar values.
 intersperse :: Char -> Text -> Text
-intersperse c t@(Text src o l) = if l == 0 then mempty else runST $ do
+intersperse c t@(Text src o l) = if null t then empty else runST $ do
     let !cLen = utf8Length c
         dstLen = l + length t P.* cLen
 
@@ -744,29 +799,6 @@ intersperse c t@(Text src o l) = if l == 0 then mempty else runST $ do
     return (Text arr 0 (dstLen - cLen))
 {-# INLINE [1] intersperse #-}
 
--- | /O(n)/ Reverse the characters of a string.
---
--- Example:
---
--- >>> T.reverse "desrever"
--- "reversed"
-reverse ::
-#if defined(ASSERTS)
-  HasCallStack =>
-#endif
-  Text -> Text
-reverse (Text (A.ByteArray ba) off len) = runST $ do
-    marr@(A.MutableByteArray mba) <- A.new len
-    unsafeIOToST $ c_reverse mba ba (intToCSize off) (intToCSize len)
-    brr <- A.unsafeFreeze marr
-    return $ Text brr 0 len
-{-# INLINE reverse #-}
-
--- | The input buffer (src :: ByteArray#, off :: CSize, len :: CSize)
--- must specify a valid UTF-8 sequence, this condition is not checked.
-foreign import ccall unsafe "_hs_text_reverse" c_reverse
-    :: Exts.MutableByteArray# s -> ByteArray# -> CSize -> CSize -> IO ()
-
 -- | /O(m+n)/ Replace every non-overlapping occurrence of @needle@ in
 -- @haystack@ with @replacement@.
 --
@@ -805,9 +837,9 @@ replace needle@(Text _      _      neeLen)
                (Text repArr repOff repLen)
       haystack@(Text hayArr hayOff hayLen)
   | neeLen == 0 = emptyError "replace"
+  | len == 0 = empty -- if also haystack is empty, we can't just return 'haystack' as worker/wrapper might duplicate it
   | L.null ixs  = haystack
-  | len > 0     = Text (A.run x) 0 len
-  | otherwise   = empty
+  | otherwise   = Text (A.run x) 0 len
   where
     ixs = indices needle haystack
     len = hayLen - (neeLen - repLen) `mul` L.length ixs
@@ -844,84 +876,6 @@ replace needle@(Text _      _      neeLen)
 -- sensitivity should use appropriate versions of the
 -- <http://hackage.haskell.org/package/text-icu-0.6.3.7/docs/Data-Text-ICU.html#g:4 case mapping functions from the text-icu package >.
 
-caseConvert :: (Word8 -> Word8) -> (Exts.Char# -> _ {- unboxed Int64 -}) -> Text -> Text
-caseConvert ascii remap (Text src o l) = runST $ do
-  -- Case conversion a single code point may produce up to 3 code-points,
-  -- each up to 4 bytes, so 12 in total.
-  dst <- A.new (l + 12)
-  outer dst l o 0
-  where
-    outer :: forall s. A.MArray s -> Int -> Int -> Int -> ST s Text
-    outer !dst !dstLen = inner
-      where
-        inner !srcOff !dstOff
-          | srcOff >= o + l = do
-            A.shrinkM dst dstOff
-            arr <- A.unsafeFreeze dst
-            return (Text arr 0 dstOff)
-          | dstOff + 12 > dstLen = do
-            -- Ensure to extend the buffer by at least 12 bytes.
-            let !dstLen' = dstLen + max 12 (l + o - srcOff)
-            dst' <- A.resizeM dst dstLen'
-            outer dst' dstLen' srcOff dstOff
-          -- If a character is to remain unchanged, no need to decode Char back into UTF8,
-          -- just copy bytes from input.
-          | otherwise = do
-            let m0 = A.unsafeIndex src srcOff
-                m1 = A.unsafeIndex src (srcOff + 1)
-                m2 = A.unsafeIndex src (srcOff + 2)
-                m3 = A.unsafeIndex src (srcOff + 3)
-                !d = utf8LengthByLeader m0
-            case d of
-              1 -> do
-                A.unsafeWrite dst dstOff (ascii m0)
-                inner (srcOff + 1) (dstOff + 1)
-              2 -> do
-                let !(Exts.C# c) = chr2 m0 m1
-                dstOff' <- case I64# (remap c) of
-                  0 -> do
-                    A.unsafeWrite dst dstOff m0
-                    A.unsafeWrite dst (dstOff + 1) m1
-                    pure $ dstOff + 2
-                  i -> writeMapping i dstOff
-                inner (srcOff + 2) dstOff'
-              3 -> do
-                let !(Exts.C# c) = chr3 m0 m1 m2
-                dstOff' <- case I64# (remap c) of
-                  0 -> do
-                    A.unsafeWrite dst dstOff m0
-                    A.unsafeWrite dst (dstOff + 1) m1
-                    A.unsafeWrite dst (dstOff + 2) m2
-                    pure $ dstOff + 3
-                  i -> writeMapping i dstOff
-                inner (srcOff + 3) dstOff'
-              _ -> do
-                let !(Exts.C# c) = chr4 m0 m1 m2 m3
-                dstOff' <- case I64# (remap c) of
-                  0 -> do
-                    A.unsafeWrite dst dstOff m0
-                    A.unsafeWrite dst (dstOff + 1) m1
-                    A.unsafeWrite dst (dstOff + 2) m2
-                    A.unsafeWrite dst (dstOff + 3) m3
-                    pure $ dstOff + 4
-                  i -> writeMapping i dstOff
-                inner (srcOff + 4) dstOff'
-
-        writeMapping :: Int64 -> Int -> ST s Int
-        writeMapping 0 dstOff = pure dstOff
-        writeMapping i dstOff = do
-          let (ch, j) = chopOffChar i
-          d <- unsafeWrite dst dstOff ch
-          writeMapping j (dstOff + d)
-
-        chopOffChar :: Int64 -> (Char, Int64)
-        chopOffChar ab = (chr a, ab `shiftR` 21)
-          where
-            chr (Exts.I# n) = Exts.C# (Exts.chr# n)
-            mask = (1 `shiftL` 21) - 1
-            a = P.fromIntegral $ ab .&. mask
-{-# INLINE caseConvert #-}
-
 -- | /O(n)/ Convert a string to folded case.
 --
 -- This function is mainly useful for performing caseless (also known
@@ -939,7 +893,9 @@ caseConvert ascii remap (Text src o l) = runST $ do
 -- U+00B5) is case folded to \"&#x3bc;\" (small letter mu, U+03BC)
 -- instead of itself.
 toCaseFold :: Text -> Text
-toCaseFold = \xs -> caseConvert (\w -> if w - 65 <= 25 then w + 32 else w) foldMapping xs
+toCaseFold = \t ->
+    if null t then empty
+    else toCaseFoldNonEmpty t
 {-# INLINE toCaseFold #-}
 
 -- | /O(n)/ Convert a string to lower case, using simple case
@@ -950,7 +906,9 @@ toCaseFold = \xs -> caseConvert (\w -> if w - 65 <= 25 then w + 32 else w) foldM
 -- U+0130) maps to the sequence \"i\" (Latin small letter i, U+0069)
 -- followed by \" &#x307;\" (combining dot above, U+0307).
 toLower :: Text -> Text
-toLower = \xs -> caseConvert (\w -> if w - 65 <= 25 then w + 32 else w) lowerMapping xs
+toLower = \t ->
+  if null t then empty
+  else toLowerNonEmpty t
 {-# INLINE toLower #-}
 
 -- | /O(n)/ Convert a string to upper case, using simple case
@@ -960,7 +918,9 @@ toLower = \xs -> caseConvert (\w -> if w - 65 <= 25 then w + 32 else w) lowerMap
 -- instance, the German \"&#xdf;\" (eszett, U+00DF) maps to the
 -- two-letter sequence \"SS\".
 toUpper :: Text -> Text
-toUpper = \xs -> caseConvert (\w -> if w - 97 <= 25 then w - 32 else w) upperMapping xs
+toUpper = \t ->
+  if null t then empty
+  else toUpperNonEmpty t
 {-# INLINE toUpper #-}
 
 -- | /O(n)/ Convert a string to title case, using simple case
@@ -993,7 +953,9 @@ toUpper = \xs -> caseConvert (\w -> if w - 97 <= 25 then w - 32 else w) upperMap
 --
 -- @since 1.0.0.0
 toTitle :: Text -> Text
-toTitle t = unstream (S.toTitle (stream t))
+toTitle = \t ->
+  if null t then empty
+  else toTitleNonEmpty t
 {-# INLINE toTitle #-}
 
 -- | /O(n)/ Left-justify a string to the given length, using the
@@ -1091,6 +1053,13 @@ foldl1' :: HasCallStack => (Char -> Char -> Char) -> Text -> Char
 foldl1' f t = S.foldl1' f (stream t)
 {-# INLINE foldl1' #-}
 
+-- | /O(n)/ A monadic version of 'foldl''.
+--
+-- @since 2.1.2
+foldlM' :: Monad m => (a -> Char -> m a) -> a -> Text -> m a
+foldlM' f z t = S.foldlM' f z (stream t)
+{-# INLINE foldlM' #-}
+
 -- | /O(n)/ 'foldr', applied to a binary operator, a starting value
 -- (typically the right-identity of the operator), and a 'Text',
 -- reduces the 'Text' using the binary operator, from right to left.
@@ -1134,18 +1103,18 @@ foldr' f z t = S.foldl' (P.flip f) z (reverseStream t)
 
 -- | /O(n)/ Concatenate a list of 'Text's.
 concat :: [Text] -> Text
-concat ts = case ts' of
-              [] -> empty
-              [t] -> t
-              _ -> Text (A.run go) 0 len
+concat ts = case ts of
+    [] -> empty
+    [t] -> t
+    _ | len == 0 -> empty
+      | otherwise -> Text (A.run go) 0 len
   where
-    ts' = L.filter (not . null) ts
-    len = sumP "concat" $ L.map lengthWord8 ts'
+    len = sumP "concat" $ L.map lengthWord8 ts
     go :: ST s (A.MArray s)
     go = do
       arr <- A.new len
       let step i (Text a o l) = A.copyI l arr i a o >> return (i + l)
-      foldM step 0 ts' >> return arr
+      foldM step 0 ts >> return arr
 
 -- | /O(n)/ Map a function over a 'Text' that results in a 'Text', and
 -- concatenate the results.
@@ -1176,35 +1145,6 @@ maximum t = S.maximum (stream t)
 minimum :: HasCallStack => Text -> Char
 minimum t = S.minimum (stream t)
 {-# INLINE minimum #-}
-
--- | \O(n)\ Test whether 'Text' contains only ASCII code-points (i.e. only
---   U+0000 through U+007F).
---
--- This is a more efficient version of @'all' 'Data.Char.isAscii'@.
---
--- >>> isAscii ""
--- True
---
--- >>> isAscii "abc\NUL"
--- True
---
--- >>> isAscii "abcd€"
--- False
---
--- prop> isAscii t == all (< '\x80') t
---
--- @since 2.0.2
-isAscii :: Text -> Bool
-isAscii (Text (A.ByteArray arr) off len) =
-    cSizeToInt (c_is_ascii_offset arr (intToCSize off) (intToCSize len)) == len
-{-# INLINE isAscii #-}
-
-cSizeToInt :: CSize -> Int
-cSizeToInt = P.fromIntegral
-{-# INLINE cSizeToInt #-}
-
-foreign import ccall unsafe "_hs_text_is_ascii_offset" c_is_ascii_offset
-    :: ByteArray# -> CSize -> CSize -> CSize
 
 -- -----------------------------------------------------------------------------
 -- * Building 'Text's
@@ -1391,8 +1331,10 @@ unfoldrN n f s = unstream (S.unfoldrN n (firstf safe . f) s)
 take :: Int -> Text -> Text
 take n t@(Text arr off len)
     | n <= 0    = empty
-    | n >= len  = t
-    | otherwise = let m = measureOff n t in if m >= 0 then text arr off m else t
+    | n >= len || m >= len || m < 0  = t
+    | otherwise = Text arr off m
+  where
+    m = measureOff n t
 {-# INLINE [1] take #-}
 
 -- | /O(n)/ If @t@ is long enough to contain @n@ characters, 'measureOff' @n@ @t@
@@ -1407,12 +1349,7 @@ take n t@(Text arr off len)
 measureOff :: Int -> Text -> Int
 measureOff !n (Text (A.ByteArray arr) off len) = if len == 0 then 0 else
   cSsizeToInt $
-    c_measure_off arr (intToCSize off) (intToCSize len) (intToCSize n)
-
--- | The input buffer (arr :: ByteArray#, off :: CSize, len :: CSize)
--- must specify a valid UTF-8 sequence, this condition is not checked.
-foreign import ccall unsafe "_hs_text_measure_off" c_measure_off
-    :: ByteArray# -> CSize -> CSize -> CSize -> CSsize
+    measure_off arr (intToCSize off) (intToCSize len) (intToCSize n)
 
 -- | /O(n)/ 'takeEnd' @n@ @t@ returns the suffix remaining after
 -- taking @n@ characters from the end of @t@.
@@ -1444,8 +1381,8 @@ iterNEnd n t@(Text _arr _off len) = loop (len-1) n
 drop :: Int -> Text -> Text
 drop n t@(Text arr off len)
     | n <= 0    = t
-    | n >= len  = empty
-    | otherwise = if m >= 0 then text arr (off+m) (len-m) else mempty
+    | n >= len || m >= len || m < 0 = empty
+    | otherwise = Text arr (off+m) (len-m)
   where m = measureOff n t
 {-# INLINE [1] drop #-}
 
@@ -1553,9 +1490,10 @@ strip = dropAround Char.isSpace
 splitAt :: Int -> Text -> (Text, Text)
 splitAt n t@(Text arr off len)
     | n <= 0    = (empty, t)
-    | n >= len  = (t, empty)
-    | otherwise = let m = measureOff n t in
-    if m >= 0 then (text arr off m, text arr (off+m) (len-m)) else (t, mempty)
+    | n >= len || m >= len || m < 0  = (t, empty)
+    | otherwise = (Text arr off m, Text arr (off+m) (len-m))
+  where
+    m = measureOff n t
 
 -- | /O(n)/ 'span', applied to a predicate @p@ and text @t@, returns
 -- a pair whose first element is the longest prefix (possibly empty)
@@ -1653,15 +1591,33 @@ group = groupBy (==)
 -- | /O(n)/ Return all initial segments of the given 'Text', shortest
 -- first.
 inits :: Text -> [Text]
-inits t@(Text arr off len) = loop 0
-    where loop i | i >= len = [t]
-                 | otherwise = Text arr off i : loop (i + iter_ t i)
+inits = (NonEmptyList.toList $!) . initsNE
+
+-- | /O(n)/ Return all initial segments of the given 'Text', shortest
+-- first.
+--
+-- @since 2.1.2
+initsNE :: Text -> NonEmptyList.NonEmpty Text
+initsNE t = empty NonEmptyList.:| case t of
+  Text arr off len ->
+    let loop i
+          | i >= len = []
+          | otherwise = let !j = i + iter_ t i in Text arr off j : loop j
+    in loop 0
 
 -- | /O(n)/ Return all final segments of the given 'Text', longest
 -- first.
 tails :: Text -> [Text]
-tails t | null t    = [empty]
-        | otherwise = t : tails (unsafeTail t)
+tails = (NonEmptyList.toList $!) . tailsNE
+
+-- | /O(n)/ Return all final segments of the given 'Text', longest
+-- first.
+--
+-- @since 2.1.2
+tailsNE :: Text -> NonEmptyList.NonEmpty Text
+tailsNE t
+  | null t = empty NonEmptyList.:| []
+  | otherwise = t NonEmptyList.:| tails (unsafeTail t)
 
 -- $split
 --
@@ -1725,8 +1681,9 @@ splitOn pat@(Text _ _ l) src@(Text arr off len)
 -- >>> split (=='a') ""
 -- [""]
 split :: (Char -> Bool) -> Text -> [Text]
-split _ t@(Text _off _arr 0) = [t]
-split p t = loop t
+split p t
+    | null t = [empty]
+    | otherwise = loop t
     where loop s | null s'   = [l]
                  | otherwise = l : loop (unsafeTail s')
               where (# l, s' #) = span_ (not . p) s
@@ -1782,72 +1739,12 @@ partition p t = (filter p t, filter (not . p) t)
 -- returns a 'Text' containing those characters that satisfy the
 -- predicate.
 filter :: (Char -> Bool) -> Text -> Text
-filter p = go
-  where
-    go (Text src o l) = runST $ do
-      -- It's tempting to allocate l elements at once and avoid resizing.
-      -- However, this can be unacceptable in scenarios where a huge array
-      -- is filtered with a rare predicate, resulting in a much shorter buffer.
-      let !dstLen = min l 64
-      dst <- A.new dstLen
-      outer dst dstLen o 0
-      where
-        outer :: forall s. A.MArray s -> Int -> Int -> Int -> ST s Text
-        outer !dst !dstLen = inner
-          where
-            inner !srcOff !dstOff
-              | srcOff >= o + l = do
-                A.shrinkM dst dstOff
-                arr <- A.unsafeFreeze dst
-                return (Text arr 0 dstOff)
-              | dstOff + 4 > dstLen = do
-                -- Double size of the buffer, unless it becomes longer than
-                -- source string. Ensure to extend it by least 4 bytes.
-                let !dstLen' = dstLen + max 4 (min (l + o - srcOff) dstLen)
-                dst' <- A.resizeM dst dstLen'
-                outer dst' dstLen' srcOff dstOff
-              -- In case of success, filter writes exactly the same character
-              -- it just read (this is not a case for map, for example).
-              -- We leverage this fact below: no need to decode Char back into UTF8,
-              -- just copy bytes from input.
-              | otherwise = do
-                let m0 = A.unsafeIndex src srcOff
-                    m1 = A.unsafeIndex src (srcOff + 1)
-                    m2 = A.unsafeIndex src (srcOff + 2)
-                    m3 = A.unsafeIndex src (srcOff + 3)
-                    !d = utf8LengthByLeader m0
-                case d of
-                  1 -> do
-                    let !c = unsafeChr8 m0
-                    if not (p c) then inner (srcOff + 1) dstOff else do
-                      A.unsafeWrite dst dstOff m0
-                      inner (srcOff + 1) (dstOff + 1)
-                  2 -> do
-                    let !c = chr2 m0 m1
-                    if not (p c) then inner (srcOff + 2) dstOff else do
-                      A.unsafeWrite dst dstOff m0
-                      A.unsafeWrite dst (dstOff + 1) m1
-                      inner (srcOff + 2) (dstOff + 2)
-                  3 -> do
-                    let !c = chr3 m0 m1 m2
-                    if not (p c) then inner (srcOff + 3) dstOff else do
-                      A.unsafeWrite dst dstOff m0
-                      A.unsafeWrite dst (dstOff + 1) m1
-                      A.unsafeWrite dst (dstOff + 2) m2
-                      inner (srcOff + 3) (dstOff + 3)
-                  _ -> do
-                    let !c = chr4 m0 m1 m2 m3
-                    if not (p c) then inner (srcOff + 4) dstOff else do
-                      A.unsafeWrite dst dstOff m0
-                      A.unsafeWrite dst (dstOff + 1) m1
-                      A.unsafeWrite dst (dstOff + 2) m2
-                      A.unsafeWrite dst (dstOff + 3) m3
-                      inner (srcOff + 4) (dstOff + 4)
+filter p = filter_ text p
 {-# INLINE [1] filter #-}
 
 {-# RULES
 "TEXT filter/filter -> filter" forall p q t.
-    filter p (filter q t) = filter (\c -> p c && q c) t
+    filter p (filter q t) = filter (\c -> q c && p c) t
 #-}
 
 -- | /O(n+m)/ Find the first instance of @needle@ (which must be
@@ -2053,12 +1950,8 @@ lines (Text arr@(A.ByteArray arr#) off len) = go off
       | delta < 0 = [Text arr n (len + off - n)]
       | otherwise = Text arr n delta : go (n + delta + 1)
       where
-        delta = cSsizeToInt $
-          memchr arr# (intToCSize n) (intToCSize (len + off - n)) 0x0A
+        delta = memchr arr# n (len + off - n) 0x0A
 {-# INLINE lines #-}
-
-foreign import ccall unsafe "_hs_text_memchr" memchr
-    :: ByteArray# -> CSize -> CSize -> Word8 -> CSsize
 
 -- | /O(n)/ Joins lines, after appending a terminating newline to
 -- each.
@@ -2204,18 +2097,24 @@ stripSuffix p@(Text _arr _off plen) t@(Text arr off len)
 
 -- | Add a list of non-negative numbers.  Errors out on overflow.
 sumP :: String -> [Int] -> Int
-sumP fun = go 0
-  where go !a (x:xs)
-            | ax >= 0   = go ax xs
+sumP fun = L.foldl' add 0
+  where add a x
+            | ax >= 0   = ax
             | otherwise = overflowError fun
           where ax = a + x
-        go a  _         = a
+{-# INLINE sumP #-} -- Use foldl' and inline for fusion.
 
 emptyError :: HasCallStack => String -> a
 emptyError fun = P.error $ "Data.Text." ++ fun ++ ": empty input"
 
 overflowError :: HasCallStack => String -> a
 overflowError fun = P.error $ "Data.Text." ++ fun ++ ": size overflow"
+
+-- | Convert a value to 'Text'.
+--
+-- @since 2.1.2
+show :: Show a => a -> Text
+show = pack . P.show
 
 -- | /O(n)/ Make a distinct copy of the given string, sharing no
 -- storage with the original string.
@@ -2226,7 +2125,9 @@ overflowError fun = P.error $ "Data.Text." ++ fun ++ ": size overflow"
 -- copy \"breaks the link\" to the original array, allowing it to be
 -- garbage collected if there are no other live references to it.
 copy :: Text -> Text
-copy (Text arr off len) = Text (A.run go) 0 len
+copy t@(Text arr off len)
+  | null t = empty
+  | otherwise = Text (A.run go) 0 len
   where
     go :: ST s (A.MArray s)
     go = do

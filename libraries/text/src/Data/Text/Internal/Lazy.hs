@@ -1,4 +1,4 @@
-{-# LANGUAGE BangPatterns, DeriveDataTypeable #-}
+{-# LANGUAGE BangPatterns #-}
 {-# OPTIONS_HADDOCK not-home #-}
 
 -- |
@@ -21,6 +21,7 @@
 module Data.Text.Internal.Lazy
     (
       Text(..)
+    , LazyText
     , chunk
     , empty
     , foldrChunks
@@ -42,14 +43,20 @@ module Data.Text.Internal.Lazy
 
 import Data.Bits (shiftL)
 import Data.Text ()
-import Data.Typeable (Typeable)
 import Foreign.Storable (sizeOf)
 import qualified Data.Text.Array as A
 import qualified Data.Text.Internal as T
+import qualified Data.Text as T
 
 data Text = Empty
+          -- ^ Empty text.
+          --
+          -- @since 2.1.2
           | Chunk {-# UNPACK #-} !T.Text Text
-            deriving (Typeable)
+          -- ^ Chunks must be non-empty, this invariant is not checked.
+
+-- | Type synonym for the lazy flavour of 'Text'.
+type LazyText = Text
 
 -- $invariant
 --
@@ -82,9 +89,16 @@ showStructure (Chunk t ts)    =
 
 -- | Smart constructor for 'Chunk'. Guarantees the data type invariant.
 chunk :: T.Text -> Text -> Text
-{-# INLINE chunk #-}
-chunk t@(T.Text _ _ len) ts | len == 0 = ts
-                            | otherwise = Chunk t ts
+{-# INLINE [0] chunk #-}
+chunk t ts | T.null t = ts
+           | otherwise = Chunk t ts
+
+{-# RULES
+"TEXT chunk/text" forall arr off len.
+    chunk (T.text arr off len) = chunk (T.Text arr off len)
+"TEXT chunk/empty" forall ts.
+    chunk T.empty ts = ts
+#-}
 
 -- | Smart constructor for 'Empty'.
 empty :: Text

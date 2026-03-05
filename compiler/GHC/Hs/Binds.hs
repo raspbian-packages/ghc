@@ -1,5 +1,7 @@
+{-# LANGUAGE AllowAmbiguousTypes #-} -- used to pass the phase to ppr_mult_ann since MultAnn is a type family
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE ConstraintKinds #-}
+{-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
@@ -52,6 +54,7 @@ import GHC.Types.Name
 
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
+import GHC.Utils.Misc ((<||>))
 
 import Data.Function
 import Data.List (sortBy)
@@ -84,7 +87,7 @@ data NHsValBindsLR idL
       [(RecFlag, LHsBinds idL)]
       [LSig GhcRn]
 
-type instance XValBinds    (GhcPass pL) (GhcPass pR) = AnnSortKey
+type instance XValBinds    (GhcPass pL) (GhcPass pR) = AnnSortKey BindTag
 type instance XXValBindsLR (GhcPass pL) pR
             = NHsValBindsLR (GhcPass pL)
 
@@ -113,25 +116,53 @@ type instance XFunBind    (GhcPass pL) GhcTc = (HsWrapper, [CoreTickish])
 -- type         Int -> forall a'. a' -> a'
 -- Notice that the coercion captures the free a'.
 
-type instance XPatBind    GhcPs (GhcPass pR) = EpAnn [AddEpAnn]
+type instance XPatBind    GhcPs (GhcPass pR) = NoExtField
 type instance XPatBind    GhcRn (GhcPass pR) = NameSet -- See Note [Bind free vars]
 type instance XPatBind    GhcTc (GhcPass pR) =
     ( Type                  -- Type of the GRHSs
     , ( [CoreTickish]       -- Ticks to put on the rhs, if any
       , [[CoreTickish]] ) ) -- and ticks to put on the bound variables.
 
-type instance XVarBind    (GhcPass pL) (GhcPass pR) = NoExtField
+type instance XVarBind (GhcPass pL) (GhcPass pR) = XVarBindGhc pL pR
+type family XVarBindGhc pL pR where
+  XVarBindGhc 'Typechecked 'Typechecked = NoExtField
+  XVarBindGhc _     _                   = DataConCantHappen
+
 type instance XPatSynBind (GhcPass pL) (GhcPass pR) = NoExtField
 
 type instance XXHsBindsLR GhcPs pR = DataConCantHappen
 type instance XXHsBindsLR GhcRn pR = DataConCantHappen
 type instance XXHsBindsLR GhcTc pR = AbsBinds
 
-type instance XPSB         (GhcPass idL) GhcPs = EpAnn [AddEpAnn]
+type instance XPSB         (GhcPass idL) GhcPs = [AddEpAnn]
 type instance XPSB         (GhcPass idL) GhcRn = NameSet -- Post renaming, FVs. See Note [Bind free vars]
 type instance XPSB         (GhcPass idL) GhcTc = NameSet
 
 type instance XXPatSynBind (GhcPass idL) (GhcPass idR) = DataConCantHappen
+
+type instance XNoMultAnn GhcPs = NoExtField
+type instance XNoMultAnn GhcRn = NoExtField
+type instance XNoMultAnn GhcTc = Mult
+
+type instance XPct1Ann   GhcPs = EpToken "%1"
+type instance XPct1Ann   GhcRn = NoExtField
+type instance XPct1Ann   GhcTc = Mult
+
+type instance XMultAnn   GhcPs = EpToken "%"
+type instance XMultAnn   GhcRn = NoExtField
+type instance XMultAnn   GhcTc = Mult
+
+type instance XXMultAnn  (GhcPass _) = DataConCantHappen
+
+setTcMultAnn :: Mult -> HsMultAnn GhcRn -> HsMultAnn GhcTc
+setTcMultAnn mult (HsPct1Ann _)   = HsPct1Ann mult
+setTcMultAnn mult (HsMultAnn _ p) = HsMultAnn mult p
+setTcMultAnn mult (HsNoMultAnn _) = HsNoMultAnn mult
+
+getTcMultAnn :: HsMultAnn GhcTc -> Mult
+getTcMultAnn (HsPct1Ann mult)   = mult
+getTcMultAnn (HsMultAnn mult _) = mult
+getTcMultAnn (HsNoMultAnn mult) = mult
 
 -- ---------------------------------------------------------------------
 
@@ -503,6 +534,13 @@ plusHsValBinds (XValBindsLR (NValBinds ds1 sigs1))
 plusHsValBinds _ _
   = panic "HsBinds.plusHsValBinds"
 
+-- Used to print, for instance, let bindings:
+--   let %1 x = …
+pprHsMultAnn :: forall id. OutputableBndrId id => HsMultAnn (GhcPass id) -> SDoc
+pprHsMultAnn (HsNoMultAnn _) = empty
+pprHsMultAnn (HsPct1Ann _) = text "%1"
+pprHsMultAnn (HsMultAnn _ p) = text "%" <> ppr p
+
 instance (OutputableBndrId pl, OutputableBndrId pr)
          => Outputable (HsBindLR (GhcPass pl) (GhcPass pr)) where
     ppr mbind = ppr_monobind mbind
@@ -511,8 +549,9 @@ ppr_monobind :: forall idL idR.
                 (OutputableBndrId idL, OutputableBndrId idR)
              => HsBindLR (GhcPass idL) (GhcPass idR) -> SDoc
 
-ppr_monobind (PatBind { pat_lhs = pat, pat_rhs = grhss })
-  = pprPatBind pat grhss
+ppr_monobind (PatBind { pat_lhs = pat, pat_mult = mult_ann, pat_rhs = grhss })
+  = pprHsMultAnn @idL mult_ann
+    <+> pprPatBind pat grhss
 ppr_monobind (VarBind { var_id = var, var_rhs = rhs })
   = sep [pprBndr CasePatBind var, nest 2 $ equals <+> pprExpr (unLoc rhs)]
 ppr_monobind (FunBind { fun_id = fun,
@@ -540,10 +579,6 @@ ppr_monobind (FunBind { fun_id = fun,
 
 ppr_monobind (PatSynBind _ psb) = ppr psb
 ppr_monobind (XHsBindsLR b) = case ghcPass @idL of
-#if __GLASGOW_HASKELL__ <= 900
-  GhcPs -> dataConCantHappen b
-  GhcRn -> dataConCantHappen b
-#endif
   GhcTc -> ppr_absbinds b
     where
       ppr_absbinds (AbsBinds { abs_tvs = tyvars, abs_ev_vars = dictvars
@@ -645,7 +680,7 @@ isEmptyIPBindsTc :: HsIPBinds GhcTc -> Bool
 isEmptyIPBindsTc (IPBinds ds is) = null is && isEmptyTcEvBinds ds
 
 -- EPA annotations in GhcPs, dictionary Id in GhcTc
-type instance XCIPBind GhcPs = EpAnn [AddEpAnn]
+type instance XCIPBind GhcPs = [AddEpAnn]
 type instance XCIPBind GhcRn = NoExtField
 type instance XCIPBind GhcTc = Id
 type instance XXIPBind    (GhcPass p) = DataConCantHappen
@@ -670,23 +705,66 @@ instance OutputableBndrId p => Outputable (IPBind (GhcPass p)) where
 ************************************************************************
 -}
 
-type instance XTypeSig          (GhcPass p) = EpAnn AnnSig
-type instance XPatSynSig        (GhcPass p) = EpAnn AnnSig
-type instance XClassOpSig       (GhcPass p) = EpAnn AnnSig
-type instance XFixSig           (GhcPass p) = EpAnn [AddEpAnn]
-type instance XInlineSig        (GhcPass p) = EpAnn [AddEpAnn]
-type instance XSpecSig          (GhcPass p) = EpAnn [AddEpAnn]
-type instance XSpecInstSig      (GhcPass p) = (EpAnn [AddEpAnn], SourceText)
-type instance XMinimalSig       (GhcPass p) = (EpAnn [AddEpAnn], SourceText)
-type instance XSCCFunSig        (GhcPass p) = (EpAnn [AddEpAnn], SourceText)
-type instance XCompleteMatchSig (GhcPass p) = (EpAnn [AddEpAnn], SourceText)
-    -- SourceText: Note [Pragma source text] in GHC.Types.SourceText
+type instance XTypeSig          (GhcPass p) = AnnSig
+type instance XPatSynSig        (GhcPass p) = AnnSig
+type instance XClassOpSig       (GhcPass p) = AnnSig
+type instance XFixSig           (GhcPass p) = [AddEpAnn]
+type instance XInlineSig        (GhcPass p) = [AddEpAnn]
+type instance XSpecSig          (GhcPass p) = [AddEpAnn]
+type instance XSpecInstSig      (GhcPass p) = ([AddEpAnn], SourceText)
+type instance XMinimalSig       (GhcPass p) = ([AddEpAnn], SourceText)
+type instance XSCCFunSig        (GhcPass p) = ([AddEpAnn], SourceText)
+type instance XCompleteMatchSig (GhcPass p) = ([AddEpAnn], SourceText)
+    -- SourceText: Note [Pragma source text] in "GHC.Types.SourceText"
 type instance XXSig             GhcPs = DataConCantHappen
 type instance XXSig             GhcRn = IdSig
 type instance XXSig             GhcTc = IdSig
 
-type instance XFixitySig  (GhcPass p) = NoExtField
+type instance XFixitySig  GhcPs = NamespaceSpecifier
+type instance XFixitySig  GhcRn = NamespaceSpecifier
+type instance XFixitySig  GhcTc = NoExtField
 type instance XXFixitySig (GhcPass p) = DataConCantHappen
+
+-- | Optional namespace specifier for fixity signatures,
+--  WARNINIG and DEPRECATED pragmas.
+--
+-- Examples:
+--
+--   {-# WARNING in "x-partial" data Head "don't use this pattern synonym" #-}
+--                            -- ↑ DataNamespaceSpecifier
+--
+--   {-# DEPRECATED type D "This type was deprecated" #-}
+--                -- ↑ TypeNamespaceSpecifier
+--
+--   infixr 6 data $
+--          -- ↑ DataNamespaceSpecifier
+data NamespaceSpecifier
+  = NoNamespaceSpecifier
+  | TypeNamespaceSpecifier (EpToken "type")
+  | DataNamespaceSpecifier (EpToken "data")
+  deriving (Eq, Data)
+
+-- | Check if namespace specifiers overlap, i.e. if they are equal or
+-- if at least one of them doesn't specify a namespace
+overlappingNamespaceSpecifiers :: NamespaceSpecifier -> NamespaceSpecifier -> Bool
+overlappingNamespaceSpecifiers NoNamespaceSpecifier _ = True
+overlappingNamespaceSpecifiers _ NoNamespaceSpecifier = True
+overlappingNamespaceSpecifiers TypeNamespaceSpecifier{} TypeNamespaceSpecifier{} = True
+overlappingNamespaceSpecifiers DataNamespaceSpecifier{} DataNamespaceSpecifier{} = True
+overlappingNamespaceSpecifiers _ _ = False
+
+-- | Check if namespace is covered by a namespace specifier:
+--     * NoNamespaceSpecifier covers both namespaces
+--     * TypeNamespaceSpecifier covers the type namespace only
+--     * DataNamespaceSpecifier covers the data namespace only
+coveredByNamespaceSpecifier :: NamespaceSpecifier -> NameSpace -> Bool
+coveredByNamespaceSpecifier NoNamespaceSpecifier = const True
+coveredByNamespaceSpecifier TypeNamespaceSpecifier{} = isTcClsNameSpace <||> isTvNameSpace
+coveredByNamespaceSpecifier DataNamespaceSpecifier{} = isValNameSpace
+instance Outputable NamespaceSpecifier where
+  ppr NoNamespaceSpecifier = empty
+  ppr TypeNamespaceSpecifier{} = text "type"
+  ppr DataNamespaceSpecifier{} = text "data"
 
 -- | A type signature in generated code, notably the code
 -- generated for record selectors. We simply record the desired Id
@@ -701,6 +779,8 @@ data AnnSig
       asRest   :: [AddEpAnn]
       } deriving Data
 
+instance NoAnn AnnSig where
+  noAnn = AnnSig noAnn noAnn
 
 -- | Type checker Specialisation Pragmas
 --
@@ -756,7 +836,7 @@ ppr_sig (InlineSig _ var inl)
   = ppr_pfx <+> pprInline inl <+> pprPrefixOcc (unLoc var) <+> text "#-}"
     where
       ppr_pfx = case inlinePragmaSource inl of
-        SourceText src -> text src
+        SourceText src -> ftext src
         NoSourceText   -> text "{-#" <+> inlinePragmaName (inl_inline inl)
 ppr_sig (SpecInstSig (_, src) ty)
   = pragSrcBrackets src "{-# pragma" (text "instance" <+> ppr ty)
@@ -773,7 +853,7 @@ ppr_sig (SCCFunSig (_, src) fn mlabel)
           GhcTc -> ppr fn
 ppr_sig (CompleteMatchSig (_, src) cs mty)
   = pragSrcBrackets src "{-# COMPLETE"
-      ((hsep (punctuate comma (map ppr_n (unLoc cs))))
+      ((hsep (punctuate comma (map ppr_n cs)))
         <+> opt_sig)
   where
     opt_sig = maybe empty ((\t -> dcolon <+> ppr t) . unLoc) mty
@@ -828,7 +908,7 @@ pragBrackets doc = text "{-#" <+> doc <+> text "#-}"
 -- | Using SourceText in case the pragma was spelled differently or used mixed
 -- case
 pragSrcBrackets :: SourceText -> String -> SDoc -> SDoc
-pragSrcBrackets (SourceText src) _   doc = text src <+> doc <+> text "#-}"
+pragSrcBrackets (SourceText src) _   doc = ftext src <+> doc <+> text "#-}"
 pragSrcBrackets NoSourceText     alt doc = text alt <+> doc <+> text "#-}"
 
 pprVarSig :: (OutputableBndr id) => [id] -> SDoc -> SDoc
@@ -866,14 +946,6 @@ type instance Anno (HsBindLR (GhcPass idL) (GhcPass idR)) = SrcSpanAnnA
 type instance Anno (IPBind (GhcPass p)) = SrcSpanAnnA
 type instance Anno (Sig (GhcPass p)) = SrcSpanAnnA
 
--- For CompleteMatchSig
-type instance Anno [LocatedN RdrName] = SrcSpan
-type instance Anno [LocatedN Name]    = SrcSpan
-type instance Anno [LocatedN Id]      = SrcSpan
-
 type instance Anno (FixitySig (GhcPass p)) = SrcSpanAnnA
 
-type instance Anno StringLiteral = SrcAnn NoEpAnns
-type instance Anno (LocatedN RdrName) = SrcSpan
-type instance Anno (LocatedN Name) = SrcSpan
-type instance Anno (LocatedN Id) = SrcSpan
+type instance Anno StringLiteral = EpAnnCO

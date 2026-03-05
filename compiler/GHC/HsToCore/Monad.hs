@@ -36,16 +36,21 @@ module GHC.HsToCore.Monad (
         -- Getting and setting pattern match oracle states
         getPmNablas, updPmNablas,
 
+        -- Tracking evidence variable coherence
+        addUnspecables, getUnspecables,
+
         -- Get COMPLETE sets of a TyCon
         dsGetCompleteMatches,
 
         -- Warnings and errors
         DsWarning, diagnosticDs, errDsCoreExpr,
         failWithDs, failDs, discardWarningsDs,
+        addMessagesDs, captureMessagesDs,
 
         -- Data types
         DsMatchContext(..),
-        EquationInfo(..), MatchResult (..), runMatchResult, DsWrapper, idDsWrapper,
+        EquationInfo(..), EquationInfoNE, prependPats, mkEqnInfo, eqnMatchResult,
+        MatchResult (..), runMatchResult, DsWrapper, idDsWrapper,
 
         -- Trace injection
         pprRuntimeTrace
@@ -54,7 +59,7 @@ module GHC.HsToCore.Monad (
 import GHC.Prelude
 
 import GHC.Driver.Env
-import GHC.Driver.Session
+import GHC.Driver.DynFlags
 import GHC.Driver.Ppr
 import GHC.Driver.Config.Diagnostic
 
@@ -88,9 +93,9 @@ import GHC.Unit.Module
 import GHC.Unit.Module.ModGuts
 
 import GHC.Types.Name.Reader
-import GHC.Types.Basic ( Origin )
 import GHC.Types.SourceFile
 import GHC.Types.Id
+import GHC.Types.Var (EvId)
 import GHC.Types.SrcLoc
 import GHC.Types.TypeEnv
 import GHC.Types.Unique.Supply
@@ -109,6 +114,7 @@ import qualified GHC.Data.Strict as Strict
 
 import Data.IORef
 import GHC.Driver.Env.KnotVars
+import qualified Data.Set as S
 
 {-
 ************************************************************************
@@ -119,34 +125,49 @@ import GHC.Driver.Env.KnotVars
 -}
 
 data DsMatchContext
-  = DsMatchContext (HsMatchContext GhcRn) SrcSpan
+  = DsMatchContext HsMatchContextRn SrcSpan
   deriving ()
 
 instance Outputable DsMatchContext where
   ppr (DsMatchContext hs_match ss) = ppr ss <+> pprMatchContext hs_match
 
 data EquationInfo
-  = EqnInfo { eqn_pats :: [Pat GhcTc]
-              -- ^ The patterns for an equation
-              --
-              -- NB: We have /already/ applied 'decideBangHood' to
-              -- these patterns.  See Note [decideBangHood] in "GHC.HsToCore.Utils"
+  = EqnMatch  { eqn_pat :: LPat GhcTc
+                -- ^ The first pattern of the equation
+                --
+                -- NB: The location info is used to determine whether the
+                -- pattern is generated or not.
+                -- This helps us avoid warnings on patterns that GHC elaborated.
+                --
+                -- NB: We have /already/ applied 'decideBangHood' to this
+                -- pattern. See Note [decideBangHood] in "GHC.HsToCore.Utils"
 
-            , eqn_orig :: Origin
-              -- ^ Was this equation present in the user source?
-              --
-              -- This helps us avoid warnings on patterns that GHC elaborated.
-              --
-              -- For instance, the pattern @-1 :: Word@ gets desugared into
-              -- @W# -1## :: Word@, but we shouldn't warn about an overflowed
-              -- literal for /both/ of these cases.
+              , eqn_rest :: EquationInfo }
+                -- ^ The rest of the equation after its first pattern
 
-            , eqn_rhs  :: MatchResult CoreExpr
-              -- ^ What to do after match
-            }
+  | EqnDone
+  -- The empty tail of an equation having no more patterns
+            (MatchResult CoreExpr)
+            -- ^ What to do after match
+
+type EquationInfoNE = EquationInfo
+-- An EquationInfo which has at least one pattern
+
+prependPats :: [LPat GhcTc] -> EquationInfo -> EquationInfo
+prependPats [] eqn = eqn
+prependPats (pat:pats) eqn = EqnMatch { eqn_pat = pat, eqn_rest = prependPats pats eqn }
+
+mkEqnInfo :: [LPat GhcTc] -> MatchResult CoreExpr -> EquationInfo
+mkEqnInfo pats = prependPats pats . EqnDone
+
+eqnMatchResult :: EquationInfo -> MatchResult CoreExpr
+eqnMatchResult (EqnDone rhs) = rhs
+eqnMatchResult (EqnMatch { eqn_rest = eq }) = eqnMatchResult eq
 
 instance Outputable EquationInfo where
-    ppr (EqnInfo pats _ _) = ppr pats
+    ppr = ppr . allEqnPats where
+      allEqnPats (EqnDone {}) = []
+      allEqnPats (EqnMatch { eqn_pat = pat, eqn_rest = eq }) = unLoc pat : allEqnPats eq
 
 type DsWrapper = CoreExpr -> CoreExpr
 idDsWrapper :: DsWrapper
@@ -349,9 +370,10 @@ mkDsEnvs unit_env mod rdr_env type_env fam_inst_env ptc msg_var cc_st_var
                            , ds_cc_st   = cc_st_var
                            , ds_next_wrapper_num = next_wrapper_num
                            }
-        lcl_env = DsLclEnv { dsl_meta    = emptyNameEnv
-                           , dsl_loc     = real_span
-                           , dsl_nablas  = initNablas
+        lcl_env = DsLclEnv { dsl_meta        = emptyNameEnv
+                           , dsl_loc         = real_span
+                           , dsl_nablas      = initNablas
+                           , dsl_unspecables = mempty
                            }
     in (gbl_env, lcl_env)
 
@@ -407,6 +429,12 @@ getPmNablas = do { env <- getLclEnv; return (dsl_nablas env) }
 updPmNablas :: Nablas -> DsM a -> DsM a
 updPmNablas nablas = updLclEnv (\env -> env { dsl_nablas = nablas })
 
+addUnspecables :: S.Set EvId -> DsM a -> DsM a
+addUnspecables unspecables = updLclEnv (\env -> env{ dsl_unspecables = unspecables `mappend` dsl_unspecables env })
+
+getUnspecables :: DsM (S.Set EvId)
+getUnspecables = dsl_unspecables <$> getLclEnv
+
 getSrcSpanDs :: DsM SrcSpan
 getSrcSpanDs = do { env <- getLclEnv
                   ; return (RealSrcSpan (dsl_loc env) Strict.Nothing) }
@@ -417,7 +445,7 @@ putSrcSpanDs (UnhelpfulSpan {}) thing_inside
 putSrcSpanDs (RealSrcSpan real_span _) thing_inside
   = updLclEnv (\ env -> env {dsl_loc = real_span}) thing_inside
 
-putSrcSpanDsA :: SrcSpanAnn' ann -> DsM a -> DsM a
+putSrcSpanDsA :: EpAnn ann -> DsM a -> DsM a
 putSrcSpanDsA loc = putSrcSpanDs (locA loc)
 
 -- | Emit a diagnostic for the current source location. In case the diagnostic is a warning,
@@ -430,6 +458,12 @@ diagnosticDs dsMessage
        ; !diag_opts <- initDiagOpts <$> getDynFlags
        ; let msg = mkMsgEnvelope diag_opts loc (ds_name_ppr_ctx env) dsMessage
        ; updMutVar (ds_msgs env) (\ msgs -> msg `addMessage` msgs) }
+
+addMessagesDs :: Messages DsMessage -> DsM ()
+addMessagesDs msgs1
+  = do { msg_var <- ds_msgs <$> getGblEnv
+       ; msgs0 <- liftIO $ readIORef msg_var
+       ; liftIO $ writeIORef msg_var (msgs0 `unionMessages` msgs1) }
 
 -- | Issue an error, but return the expression for (), so that we can continue
 -- reporting errors.
@@ -445,6 +479,13 @@ failWithDs msg
 
 failDs :: DsM a
 failDs = failM
+
+captureMessagesDs :: DsM a -> DsM (Messages DsMessage, a)
+captureMessagesDs thing_inside
+  = do { msg_var <- liftIO $ newIORef emptyMessages
+       ; res <- updGblEnv (\gbl -> gbl {ds_msgs = msg_var}) thing_inside
+       ; msgs <- liftIO $ readIORef msg_var
+       ; return (msgs, res) }
 
 mkNamePprCtxDs :: DsM NamePprCtx
 mkNamePprCtxDs = ds_name_ppr_ctx <$> getGblEnv
