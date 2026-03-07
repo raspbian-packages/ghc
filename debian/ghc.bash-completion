@@ -1,0 +1,2 @@
+utils/completion/ghc.bash ghc
+utils/completion/ghc.bash ghci
