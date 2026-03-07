@@ -51,10 +51,11 @@ parseArch cc arch =
       "mipseb" -> pure ArchMipseb
       "mipsel" -> pure ArchMipsel
       "riscv64" -> pure ArchRISCV64
-      "hppa" -> pure ArchUnknown
+      "hppa" -> pure ArchHPPA
       "wasm32" -> pure ArchWasm32
       "javascript" -> pure ArchJavaScript
       "loongarch64" -> pure ArchLoongArch64
+      "sparc64" -> pure ArchSPARC64
       _ -> throwE $ "Unknown architecture " ++ arch
 
 parseOs :: String -> M OS
