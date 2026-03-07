@@ -223,7 +223,6 @@ linkDynLib logger tmpfs dflags0 unit_env o_files dep_packages
 
             runLink logger tmpfs linker_config (
                     map Option verbFlags
-                 ++ libmLinkOpts platform
                  ++ [ Option "-o"
                     , FileOption "" output_fn
                     ]
@@ -234,6 +233,7 @@ linkDynLib logger tmpfs dflags0 unit_env o_files dep_packages
                     -- Solaris 10 doesn't support the latter:
                  ++ [ Option ("-Wl,-h," ++ takeFileName output_fn) ]
                  ++ extra_ld_inputs
+                 ++ libmLinkOpts platform
                  ++ map Option lib_path_opts
                  ++ map Option pkg_lib_path_opts
                  ++ map Option pkg_link_opts
