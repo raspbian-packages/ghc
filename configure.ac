@@ -523,21 +523,27 @@ AC_SUBST([ConfiguredEmsdkVersion])
 dnl ** Which LLVM llc to use?
 dnl --------------------------------------------------------------
 AC_ARG_VAR(LLC,[Use as the path to LLVM's llc [default=autodetect]])
-FIND_LLVM_PROG([LLC], [llc], [$LlvmMinVersion], [$LlvmMaxVersion])
+if test -z "$LLC"; then
+  FIND_LLVM_PROG([LLC], [llc], [$LlvmMinVersion], [$LlvmMaxVersion])
+fi
 LlcCmd="$LLC"
 AC_SUBST([LlcCmd])
 
 dnl ** Which LLVM opt to use?
 dnl --------------------------------------------------------------
 AC_ARG_VAR(OPT,[Use as the path to LLVM's opt [default=autodetect]])
-FIND_LLVM_PROG([OPT], [opt], [$LlvmMinVersion], [$LlvmMaxVersion])
+if test -z "$OPT"; then
+  FIND_LLVM_PROG([OPT], [opt], [$LlvmMinVersion], [$LlvmMaxVersion])
+fi
 OptCmd="$OPT"
 AC_SUBST([OptCmd])
 
 dnl ** Which LLVM assembler to use?
 dnl --------------------------------------------------------------
 AC_ARG_VAR(LLVMAS,[Use as the path to LLVM's assembler (typically clang) [default=autodetect]])
-FIND_LLVM_PROG([LLVMAS], [clang], [$LlvmMinVersion], [$LlvmMaxVersion])
+if test -z "$LLVMAS"; then
+  FIND_LLVM_PROG([LLVMAS], [clang], [$LlvmMinVersion], [$LlvmMaxVersion])
+fi
 LlvmAsCmd="$LLVMAS"
 AC_SUBST([LlvmAsCmd])
 
