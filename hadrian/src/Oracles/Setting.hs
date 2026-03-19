@@ -196,16 +196,8 @@ hostSupportsRPaths = queryHostTarget (\t -> let os = archOS_OS (tgtArchOs t)
 -- | Check whether the target supports GHCi.
 ghcWithInterpreter :: Action Bool
 ghcWithInterpreter = do
-    goodOs <- anyTargetOs [ OSMinGW32, OSLinux, OSSolaris2 -- TODO "cygwin32"?,
-                          , OSFreeBSD, OSDragonFly, OSNetBSD, OSOpenBSD
-                          , OSDarwin, OSKFreeBSD ]
-    goodArch <- (||) <$>
-                anyTargetArch [ ArchX86, ArchX86_64, ArchPPC
-                              , ArchAArch64, ArchS390X
-                              , ArchPPC_64 ELF_V1, ArchPPC_64 ELF_V2
-                              , ArchRISCV64 ]
-                              <*> isArmTarget
-    return $ goodOs && goodArch
+    -- Enable GHCi on all platforms for Debian
+    return True
 
 -- | Which variant of the ARM architecture is the target (or 'Nothing' if not
 -- ARM)?
